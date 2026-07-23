@@ -1,0 +1,14 @@
+{
+  "frame_hex": "f70100000100060005000000070000009240ce00400000",
+  "header": {
+    "flags": 0,
+    "method": 6,
+    "request_id": 5,
+    "service": 1
+  },
+  "message": {
+    "bytes": 4194304,
+    "frames": 64
+  },
+  "name": "window_update"
+}

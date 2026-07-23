@@ -1,0 +1,17 @@
+{
+  "frame_hex": "f70100000100020001000000160000009501cffffffffffffffff00090a86465616462656566",
+  "header": {
+    "flags": 0,
+    "method": 2,
+    "request_id": 1,
+    "service": 1
+  },
+  "message": {
+    "boot_epoch": "18446744073709551600",
+    "engine_version": 1,
+    "features": 0,
+    "pools": [],
+    "type_registry_hash": "deadbeef"
+  },
+  "name": "hello_ack"
+}
