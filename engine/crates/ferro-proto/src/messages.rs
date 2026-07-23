@@ -7,7 +7,17 @@ fn to_vec<T: Serialize>(v: &T) -> Vec<u8> {
     rmp_serde::to_vec(v).expect("infallible in-memory encode")
 }
 fn from_slice<'a, T: Deserialize<'a>>(b: &'a [u8]) -> Result<T, CodecError> {
-    rmp_serde::from_slice(b).map_err(|e| CodecError::Malformed(e.to_string()))
+    // `Deserializer::new` over a `&[u8]` reader (rather than `from_slice`/`from_read_ref`)
+    // consumes the slice as it decodes, so `get_ref()` afterward yields exactly the
+    // unconsumed remainder — letting us reject a payload that smuggles extra bytes past a
+    // valid message instead of silently ignoring them.
+    let mut de = rmp_serde::Deserializer::new(b);
+    let v = T::deserialize(&mut de).map_err(|e| CodecError::Malformed(e.to_string()))?;
+    let rest: &[u8] = de.get_ref();
+    if !rest.is_empty() {
+        return Err(CodecError::TrailingBytes(rest.len()));
+    }
+    Ok(v)
 }
 
 macro_rules! msg {
@@ -38,6 +48,10 @@ msg!(ErrorPayload {
 /// Terminal outcome envelope `[status, body]` (decision W-4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
+    /// `body` MUST be exactly one complete MessagePack value (the method-specific opaque
+    /// result) — not zero values, not more than one, and not a partial encoding. `encode`
+    /// splices these bytes directly into the outcome array, so a body that is anything else
+    /// corrupts the frame for every downstream reader.
     Ok(Vec<u8>), // opaque method-specific body bytes
     Error(ErrorPayload),
     Cancelled,
@@ -53,6 +67,10 @@ impl Outcome {
             Outcome::Ok(body) => {
                 e::write_pfix(&mut o, outcome::OK).unwrap();
                 // body is raw msgpack already; splice it in
+                debug_assert!(
+                    body.is_empty() || rmp::decode::read_marker(&mut &body[..]).is_ok(),
+                    "Outcome::Ok body must be a single complete MessagePack value"
+                );
                 o.extend_from_slice(body);
             }
             Outcome::Error(ep) => {
@@ -92,6 +110,21 @@ impl Outcome {
                 }
             }
             s => Err(CodecError::Malformed(format!("unknown outcome status {s}"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trailing_bytes_rejected() {
+        let mut b = Ping { token: 7 }.encode();
+        b.push(0xff);
+        match Ping::decode(&b) {
+            Err(CodecError::TrailingBytes(1)) => {}
+            other => panic!("expected TrailingBytes(1), got {other:?}"),
         }
     }
 }

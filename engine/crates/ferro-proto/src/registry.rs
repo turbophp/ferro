@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+// registry-shape change must update BOTH this struct and gen-php.php.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Registry {
     pub protocol_version: u8,

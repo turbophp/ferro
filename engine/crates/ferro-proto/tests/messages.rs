@@ -63,12 +63,30 @@ fn error_payload_roundtrip() {
 }
 
 #[test]
+fn error_payload_populated_optionals_roundtrip() {
+    // Exercises errno's signed path plus all three Option-Some fields (sqlstate, detail,
+    // retry_after_ms), currently uncovered by error_payload_roundtrip's all-None case.
+    use ferro_proto::consts::errc;
+    let e = ErrorPayload {
+        code: errc::DEADLOCK,
+        branch: errc::DEADLOCK_BRANCH,
+        sqlstate: Some("40P01".into()),
+        errno: Some(-5),
+        message: "deadlock".into(),
+        detail: Some("detail".into()),
+        retry_after_ms: Some(100),
+    };
+    assert_eq!(ErrorPayload::decode(&e.encode()).unwrap(), e);
+}
+
+#[test]
 fn outcome_ok_and_error() {
+    use ferro_proto::consts::errc;
     let ok = Outcome::Ok(vec![0x01]); // opaque body bytes
     assert_eq!(Outcome::decode(&ok.encode()).unwrap(), ok);
     let err = Outcome::Error(ErrorPayload {
-        code: 0x3001,
-        branch: 3,
+        code: errc::SYNTAX,
+        branch: errc::SYNTAX_BRANCH,
         sqlstate: Some("42601".into()),
         errno: None,
         message: "syntax error".into(),

@@ -142,7 +142,8 @@ fn main() {
         0,
         0,
         outcome.encode(),
-        serde_json::json!({ "status":1, "error": { "code":0x3009, "branch":3,
+        serde_json::json!({ "status": consts::outcome::ERROR, "error": {
+            "code": consts::errc::PROTOCOL, "branch": consts::errc::PROTOCOL_BRANCH,
             "sqlstate":null, "errno":null, "message":"reused_request_id",
             "detail":null, "retry_after_ms":null } }),
     );

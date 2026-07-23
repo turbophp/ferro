@@ -7,7 +7,9 @@ struct ErrCode {
     code: u16,
     branch: u8,
 }
+// registry-shape change must update BOTH this struct and gen-php.php.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Registry {
     protocol_version: u8,
     magic: u8,

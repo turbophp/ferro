@@ -13,6 +13,10 @@ fuzz_target!(|data: &[u8]| {
         // Try message decode on the core methods; must not panic.
         let _ = ferro_proto::messages::Ping::decode(&body[..take]);
         let _ = ferro_proto::messages::Outcome::decode(&body[..take]);
+        // HelloAck (and Hello) carry a Vec<String> — the length-amplification-interesting
+        // shape not otherwise exercised by the fixed-size messages above.
+        let _ = ferro_proto::messages::HelloAck::decode(&body[..take]);
+        let _ = ferro_proto::messages::Hello::decode(&body[..take]);
         let mut rd = &body[..take];
         let _ = ferro_proto::value::Value::decode(&mut rd);
     }

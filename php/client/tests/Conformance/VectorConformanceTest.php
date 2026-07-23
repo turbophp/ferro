@@ -29,6 +29,8 @@ final class VectorConformanceTest extends TestCase
         $this->assertSame($v['header']['service'], $h->service, "service for {$v['name']}");
         $this->assertSame($v['header']['method'], $h->method, "method for {$v['name']}");
         $this->assertSame(strlen($frame) - 16, $h->payloadLen, "payload_len for {$v['name']}");
+        $this->assertSame($v['header']['flags'], $h->flags, "flags for {$v['name']}");
+        $this->assertSame($v['header']['request_id'], $h->requestId, "request_id for {$v['name']}");
     }
 
     /** @param array<string,mixed> $v */
