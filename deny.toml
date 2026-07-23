@@ -1,0 +1,15 @@
+# deny.toml — enforces SPEC §21 D9 (the pool is hand-rolled) and basic supply-chain hygiene.
+[bans]
+multiple-versions = "allow"
+deny = [
+    { name = "deadpool" },
+    { name = "bb8" },
+]
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Unicode-3.0", "Zlib"]
