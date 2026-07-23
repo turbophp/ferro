@@ -33,7 +33,8 @@ fn lock_path() -> PathBuf {
 fn main() {
     let lock = lock_path();
     println!("cargo:rerun-if-changed={}", lock.display());
-    let reg: Registry = serde_json::from_str(&fs::read_to_string(&lock).unwrap()).unwrap();
+    let lock_bytes = fs::read(&lock).unwrap();
+    let reg: Registry = serde_json::from_slice(&lock_bytes).unwrap();
 
     let mut o = String::new();
     writeln!(
@@ -98,8 +99,31 @@ fn main() {
     }
     writeln!(o, "}}").unwrap();
 
+    // A stable hex fingerprint of the committed registry.lock.json bytes. Sent in HELLO/HELLO_ACK
+    // and hard-checked by ferrod's handshake (SPEC §5): a mismatch means the client and daemon
+    // were built against different protocol registries, which is a session-fatal `Unsupported`
+    // condition, not something to paper over. Deliberately hashes the lock file's bytes (not the
+    // parsed `Registry`) so any byte-level drift — including formatting-only changes the parser
+    // would ignore — is caught. PHP-side parity is a separate slice; this only defines the Rust
+    // constant.
+    let hash = fnv1a_hex(&lock_bytes);
+    writeln!(o, "pub const TYPE_REGISTRY_HASH: &str = \"{hash}\";").unwrap();
+
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("consts.rs");
     fs::write(out, o).unwrap();
+}
+
+/// Inline FNV-1a (64-bit) over raw bytes, rendered as lowercase hex. No new dependency: this is
+/// a fingerprint for drift-detection, not a cryptographic hash.
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
 }
 
 fn emit_mod_u16(o: &mut String, name: &str, m: &BTreeMap<String, u16>) {
