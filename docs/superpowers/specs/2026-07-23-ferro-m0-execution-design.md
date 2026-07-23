@@ -1,0 +1,147 @@
+# Ferro M0 — Execution Design
+
+**Date:** 2026-07-23
+**Status:** Design for review → implementation plan
+**Scope:** Milestone **M0 only** (SPEC §17 M0 bullet + §17.1 task order). Everything here is bounded by M0; later-milestone features are explicitly out and marked where they were encountered.
+**Authority:** `ferro-spec-v0.2.md` is the contract; `CLAUDE.md` is the working agreement. This document is the *execution plan* for M0 — how the spec's M0 tasks become tested, buildable slices. Where it deviates from the spec, §22 of the spec is amended in the same change (see [Deviations](#deviations-to-record-in-spec-22)).
+
+---
+
+## 1. Goal & exit gate
+
+Deliver a working, tested vertical of Ferro's foundation: a client can call `ferrod` over a real socket, `ferrod` pools real Postgres connections, and a trivial call round-trips end to end with typed results — all proven by practical tests against **real Dockerized infrastructure**.
+
+**M0 exit gate (non-negotiable, SPEC §16.1 / §21 D12):** the D12 p99 boundary-latency measurement is recorded in `bench/results/` with a complete environment manifest. M0 does not close until that file exists and `ci/check-d12-recorded.sh` exits 0.
+
+## 2. Infrastructure topology — everything in Docker
+
+Per maintainer decision, M0 infrastructure runs in Docker (not just the database):
+
+- **Postgres 17, digest-pinned** in `testkit/docker-compose.yml` — the real upstream `ferrod` pools against. `pg_isready` healthcheck, `tmpfs` data dir for speed, `init.sql` seed.
+- **`ferrod` runs as a container** (sidecar model, SPEC §18) sharing a socket volume (`emptyDir`-style bind mount) with test/bench containers. This is the production-faithful topology.
+- **Bench runs inside containers** so the D12 path mirrors deployment.
+
+**Fairness rule for the bench:** the PDO baseline and the `ferrod → PG` path run over *identical* containerized transport, so the measured delta isolates Ferro's own overhead rather than container noise. The containerized WSL2 number is recorded **`provisional: true`, `reference: false`**; final D12 sign-off requires a bare-metal (and ideally host-network) re-run. This is a human sign-off, not a CI threshold (SPEC §20.3).
+
+Integration tests read `FERRO_TEST_PG_URL`; when unset they **skip** (not fail), so `cargo test --workspace` is green offline. CI provisions Docker PG and `ext-msgpack` and runs the full matrix.
+
+## 3. Resolved decisions
+
+The extraction surfaced 24 decisions. The three load-bearing ones were put to the maintainer; all are now settled.
+
+### 3.1 Maintainer-decided (load-bearing)
+
+| # | Decision | Choice | Consequence |
+|---|----------|--------|-------------|
+| **M-1** | `?`→`$n` placeholder handling vs charter rule 6 (no SQL rewriting) | **Engine-side fingerprint-cached scanner** in `ferro-backend-pg` | Treated as parameter-syntax normalization, not semantic rewriting. Scanner is literal/comment/dollar-quote/jsonb-operator (`?` `?|` `?&`) aware, paid once per distinct SQL (off the p99 path). **Rule-6 tension explicitly accepted — recorded in §22.** Clean fallback (client emits native `$n`) kept documented if the call is ever revisited. |
+| **M-2** | M0 pin-stub data source, given stock `tokio-postgres` exposes no ReadyForQuery I/T/E byte | **TX-lifecycle stub on stock tokio-postgres** | Pin on the TX-service `BEGIN` (protocol intent), per-conn tx-open flag, defensive `ROLLBACK` on release, **reject bare tx-control SQL via `EXEC` as `Unsupported`** so the stub can't be bypassed. Correctness-equivalent for the M0 happy path. The real RFQ-byte access (fork vs lower-level split connection) becomes a **§21 open item constraining the M1 protocol-first pin engine**; spike it early in M1. |
+| **M-3** | Docker scope | **Everything in Docker** | `ferrod` sidecar + bench containerized (§2). D12 number is provisional; fairness rule applies. |
+
+### 3.2 Internal decisions (decided here, recorded in §22 where they deviate)
+
+- **W-1 Wire — TypedValue** is a 2-element MessagePack array `[tag:int, value]` with a dedicated `NULL` tag (0, nil payload). No MessagePack ext types (ext-msgpack can't reproduce arbitrary raw ext bytes; the array form is byte-identical across rmp / pure-PHP / ext-msgpack). *(SPEC §9, §9.1, §20.3)*
+- **W-2 Wire — messages** are **positional** MessagePack arrays; field order pinned in `/proto/PROTOCOL.md` and enforced by golden vectors. No message-schema IDL/codegen in M0. *(§5, §16.1, §20.2)*
+- **W-3 Constants** all authored in `/proto` now: flags `STREAM=0x1 END=0x2 CANCEL=0x4 OOB_FD=0x8 COMPRESSED=0x10`; services `01..05`; type tags `NULL=0 … VECTOR=17`; error codes grouped by branch range (`Retryable 0x1xxx / Indeterminate 0x2xxx / NonRetryable 0x3xxx`) **and** an explicit `branch:u8` carried in `errors.toml` and on the wire — so an unknown code is still classified by its declared branch (the "never a silent unknown" guarantee). *(§5, §9.2, §20.2)*
+- **W-4 END discriminator** — terminal payload is status-first: `0=Ok, 1=Error, 2=Cancelled`; on Error the trailing element is one canonical `ERROR` payload `{code:u16, branch:u8, sqlstate?, errno?, message, detail?, retry_after_ms?}`. Protocol errors reuse this shape. One END code path (charter rule 4). *(§5.2, §6, §9.2)*
+- **W-5 Frame-size constants** — two distinct: hard codec ceiling `MAX_FRAME_PAYLOAD = 16 MiB` (any larger `payload_len` → Protocol error, **zero allocation**; the DoS/OOM guard the fuzzer exercises) vs default per-request credit window `4 MiB` (flow control). Both codecs read both from `/proto`. *(§5.1, §5.2)*
+- **W-6 Flag/feature handling** — unknown **flag** bits → Protocol error; frames that actually set `OOB_FD`/`COMPRESSED` → `Unsupported` in M0. Unknown **feature** bits in HELLO/HELLO_ACK → ignored (forward-compat negotiation). *(§5, §5.1, D11)*
+- **W-7 CANCEL/WINDOW_UPDATE addressing** — `CANCEL` = header flag with `request_id = target`, empty payload (advisory, idempotent, allocation-free). `WINDOW_UPDATE` = core (01) method, `request_id = target`, payload `{frames,bytes}`. `request_id = 0` reserved for session-scoped control/errors. *(§5, §5.2)*
+- **W-8 Codec placement** — `ferro-proto` stays **runtime-free** (encode/decode on byte slices) so PHP-parity vector tests share the exact codec; `ferrod` owns the `tokio-util` Encoder/Decoder + `Framed` adapter with the `max_frame_size` guard. *(§20.2)*
+- **W-9 PHP constant generation** — Rust `build.rs` emits `/proto/registry.lock.json` from the single TOML source; a committed `gen-php.php` reads that JSON (PHP-native, **no runtime TOML dep**, charter rule 7) and emits `Generated/*.php`. CI sync test asserts lock + Constants regenerate to zero diff. *(§17.1(1), §20.2)*
+- **G-1 boot_epoch** — random `u64` from `getrandom` at startup, held for process life, injectable for deterministic tests (equality is the only semantic; avoids clock skew/restart collisions). *(§5, §19.1)*
+- **G-2 Socket path** — explicit `FERRO_SOCK` / `Ferro::configure(['socket'=>…])`, default `/run/ferro/dev.sock`; `FERRO_ADDR` TCP-loopback fallback. Listener modeled as an enum/trait so TCP and pre-bound-fd (socket activation) slot in later, but M0 wires **UDS only**, no bearer token. `{schema_hash}` templating deferred to packaging (M5). *(§5, §12, §18)*
+- **G-3 Per-request execution** — spawn a tokio task per request with a **Drop-guarded `Responder`** that permits N stream frames + exactly one terminal END and, on drop-without-completion, emits one synthetic terminal error END and removes the registry entry (makes one-END unforgeable under handler panic). Session-fatal (bad magic, bad version, HELLO-not-first, type-registry mismatch, oversize frame, undecodable header, peercred denial) → close; per-request (unknown service/method, reused id, malformed payload, max_inflight) → error END + continue. *(§5.2, charter §4)*
+- **G-4 Protocol-error granularity** — single `NonRetryable{Protocol}` code carrying a machine-readable subcode string (`reused_request_id`, `version_mismatch`, `type_registry_mismatch`, `hello_expected`, `frame_too_large`, `peercred_denied`); peercred/token denial → `NonRetryable{Auth}`. Full enumeration is M1. *(§9.2, §12)*
+- **P-1 Pool architecture** — hand-rolled (charter D9): `PoolBackend` trait in `ferro-pool` (pin state machine + mechanics backend-agnostic) + `PgConn` in `ferro-backend-pg` + a **fake in-memory backend** for fast pool-semantics tests. `cargo-deny` forbids `deadpool`/`bb8`. `max_lifetime`/liveness enforced both at checkout (cheap `is_closed()`/age, no round trip) and via one background reaper. *(§8, §7.7, §21 D9)*
+- **P-2 tx-scoped EXEC** — reuse `sql/EXEC` (service 02) with an optional `tx_id` field; when present, route to the pinned connection/actor instead of a fresh checkout. TX service (03) owns only lifecycle verbs. Avoids duplicating row-framing/stats/credit machinery. *(§6)*
+- **T-1 M0 TypedValue set** — scalar core only: `NULL, BOOL, I64, F64, TEXT, BYTES`. Reserve `DECIMAL/TIMESTAMP/TIMESTAMPTZ/DATE/TIME/UUID/JSON` tags but return `NonRetryable{Unsupported}` if the PG path hits them; `ARRAY/INTERVAL/INET/VECTOR/U64` out of the EXEC path entirely. An out-of-scope type is a loud typed error, never a silent miscast. *(§9, §9.1)*
+- **F-1 Credit/stats accounting** — pre-credit each request to `64 frames / 4 MiB`; emit a DATA frame only when both the per-request window and the shared per-session `16 MiB` budget admit it; `WINDOW_UPDATE` replenishes both. `stats.bytes = Σ MessagePack payload_len of DATA frames` — the same number drives credit debit and the session cap. `queue_us` = dispatch-ready → checkout acquired (pure pool wait); `exec_us` = checkout → last backend row/command-complete, **excluding** time blocked on client credit backpressure (so a slow consumer can't inflate the KPI that grows `max_size`). Row batches ~256 KiB soft cap. *(§5.2, §6, §16)*
+- **X-1 TX deadlines/identity** — `TxDeadline` in the **Retryable** branch. `tx_id` = engine-assigned global monotonic atomic `u64`, session-scoped validity (cross-session/unknown → Protocol; recently-reaped → `Retryable{TxDeadline}`). `idle_in_tx` (10s) recomputed on re-entering Idle, disarmed while Executing; `max_tx_duration` (60s) spans tx life, backend-cancels a mid-flight statement via `CancelToken` then `ROLLBACK`. Idle-fire with no in-flight request → proactively `ROLLBACK`+release and **park the cause for delivery on the client's next frame for that `tx_id`** (never emit a frame with no `request_id`). Savepoints engine-generated `__ferro_sp_<n>`; isolation is a proto enum, never a raw string (zero injection surface). *(§6, §5.2, §9.2)*
+- **R-1 Client resilience v0** — full-jitter backoff `rand(0, min(1000ms, 10ms*2^n))`, seedable RNG, 5s wall-clock deadline. `retry_reads` default **true** (reads auto-retry once on the new epoch); writes **never** auto-retry (no manifest in M0, so every `Indeterminate` surfaces). Client synthesizes `ConnectionLost` for engine death (`epoch_changed` set only after reconnect resolves the new epoch); engine emits `ConnectionLost` only for backend link death (`epoch_changed=false`). `WriteUnconfirmed.cause = engine_restart` when epoch changed, `link_lost` otherwise. Unmapped SQLSTATE → `NonRetryable` (safe default). Sync client detects death at the I/O boundary (EOF/EPIPE/write error/read timeout); background PONG-deadline monitoring deferred to the async/Fibers path (M3). *(§9.2, §19)*
+- **B-1 Workspace/bench** — single Cargo workspace at repo root, `members = ['engine/crates/*','bench']`, so `cargo run -p ferro-bench` and `cargo test --workspace` work verbatim. **Deviates from §20.1's `/engine`-rooted workspace — amend §20.1 + §22.** *(§20.1)*
+- **B-2 PHP tooling** — PHPUnit 11 (not spec's 10; reliable PHP 8.4 support); client advertises `features=0` in HELLO (no MEMFD_RX despite ext-sockets, no FIBERS — advertising them would be a lie the engine could act on); rejects any `OOB_FD` frame as `Unsupported`. **Recorded in §22.** *(§5, §20.2)*
+- **V-1 Vector format** — one JSON descriptor per positive case `{name, header fields, logical payload as JSON, expected full-frame bytes as hex}` + raw negative `.bin` seeds that double as fuzz corpus. Two fuzz targets: `decode_frame` (arbitrary bytes → no panic, bounded allocation) and `roundtrip_frame` (arbitrary valid Frame → encode→decode→eq and byte-stable re-encode). *(§17.1(2), §20.3)*
+- **E-1 v0 error map** — M0 ships a minimal PG SQLSTATE→variant table sufficient for happy-path tests: `23505→Unique, 23503→ForeignKey, 23502→NotNull, 23514→Check, 40001→SerializationFailure, 40P01→Deadlock, 42xxx→Syntax, 08xxx→ConnectionLost, 57014→(query cancel), unmapped→NonRetryable`, raw SQLSTATE preserved. Full table is M1. *(§9.2)*
+
+## 4. Deviations to record in SPEC §22
+
+Each lands in §22 **in the same change** that introduces it (charter DoD):
+
+1. **§20.1 workspace** — single repo-root Cargo workspace (`engine/crates/*` + `bench`) instead of `/engine`-rooted, so charter commands run verbatim (B-1).
+2. **§7.1 / §17.1(4) pin stub** — M0 pin stub driven from TX-service lifecycle, not ReadyForQuery (stock `tokio-postgres` exposes no I/T/E byte). RFQ-byte access raised as a **§21 open item** for the M1 pin engine (M-2, R1).
+3. **Charter rule 6 / §6 placeholders** — engine-side mechanical `?`→`$n` scanner accepted as parameter-syntax normalization (M-1).
+4. **§20.2 PHPUnit** — PHPUnit 11 not 10; M0 client advertises `features=0` (B-2).
+5. **Known M0 limitation** — minimal hygiene (release-time `ROLLBACK` guard only); full conditional/pipelined hygiene is M1. The D12 path (`SELECT 1`) is unaffected (R8).
+
+## 5. The 8 slices
+
+Each slice lands **green with practical tests before the next begins**. `S3` and `S4` parallelize after `S2`. Dependencies noted per slice.
+
+### S1 — Cross-language wire foundation  *(depends: none)*
+Establish `/proto` as the single source of truth and prove **one** wire contract across both languages.
+- **Build:** `methods.toml`/`errors.toml`/`types.toml` with all M0 numeric constants; Rust `build.rs` → constants + `registry.lock.json`; `ferro-proto` 16-byte LE header, canonical MessagePack profile, scalar TypedValue codec, message structs (HELLO/HELLO_ACK/PING/PONG/GOODBYE/WINDOW_UPDATE/CANCEL) + ERROR payload; golden vectors in `/proto/vectors`; committed `gen-php.php` → `Generated/*.php`; pure-PHP **and** ext-msgpack codecs; `cargo-fuzz` decode + roundtrip targets. Minimal repo/workspace bootstrap + `rust-toolchain.toml`. *(SQL/TX message vectors deferred to S5/S6 — thin-vertical, mitigates R6.)*
+- **Gate:** `cargo test -p ferro-proto` (golden vectors encode==bytes/decode==value incl. negatives, header bounds, `registry_lock_sync`); `cargo +nightly fuzz run decode_frame -- -runs=100000` no crash/bounded alloc; regen `registry.lock.json` + `Constants.php` → zero git diff; PHP `PurePhpCodec` byte-matches every vector (ext-msgpack path green in CI).
+- **Key artifacts:** `/proto/{methods,errors,types}.toml`, `/proto/PROTOCOL.md`, `/proto/registry.lock.json`, `/proto/vectors/*` (+ `negative/*.bin`), `/proto/tools/gen-php.php`, `/Cargo.toml`, `/rust-toolchain.toml`, `engine/crates/ferro-proto/{build.rs,src/{lib,header,flags,frame,value,messages,error}.rs,tests/*,fuzz/*}`, `php/client/src/Protocol/{Constants(generated),Frame,PurePhpCodec,MsgpackCodec,CodecFactory}.php`, `php/client/tests/Conformance/VectorConformanceTest.php`.
+
+### S2 — CI + testkit scaffolding  *(depends: S1)*
+Stand up the charter DoD gates and the Dockerized PG backend later slices test against.
+- **Build:** GitHub Actions `ci.yml` (fmt --check, clippy -D warnings, `cargo test --workspace`, PHPUnit + PHPStan L9 with ext-msgpack provisioned, cargo-fuzz nightly smoke, docker-compose PG service); `ci/local-gate.sh` mirroring it; `testkit/docker-compose.yml` (postgres:17 digest-pinned, `pg_isready` healthcheck, tmpfs, `init.sql`) + `wait-for-pg.sh` + **`ferrod` container image** (sidecar, socket volume); `cargo-deny` config banning `deadpool`/`bb8`.
+- **Gate:** `docker compose up -d` → PG healthy within timeout; `ci/local-gate.sh` exits 0 on S1 code, nonzero on any broken gate; `FERRO_TEST_PG_URL` unset → `cargo test --workspace` green offline; fuzz-smoke + both-codec-path jobs execute in CI.
+- **Key artifacts:** `.github/workflows/ci.yml`, `ci/{local-gate,check-d12-recorded}.sh`, `testkit/{docker-compose.yml,postgres/init.sql,wait-for-pg.sh,README.md,Dockerfile.ferrod}`, `bench/results/.gitkeep`, `deny.toml`.
+
+### S3 — `ferrod` session skeleton  *(depends: S1, S2)*
+Daemon core, **no PG dependency**.
+- **Build:** UDS listener with SO_PEERCRED allow-list + stale-socket unlink; `tokio-util` Framed adapter over the runtime-free codec; per-connection task with single writer + Drop-guarded `Responder` (G-3); HELLO/HELLO_ACK with random-u64 `boot_epoch` + type-registry hard check; PING/PONG, GOODBYE drain, CANCEL flag + WINDOW_UPDATE routing, `request_id` reuse rejection, in-flight registry, flow-control primitives (per-request credit + per-session 16 MiB), dispatch table (sql/tx stubbed, stream/admin `Unsupported`), session-fatal vs per-request classification (G-4), SIGTERM drain.
+- **Gate:** `cargo test -p ferrod` — handshake (stable epoch, mismatch closes, HELLO-not-first fatal), reuse rejected while original completes, exactly-one-END (incl. Responder Drop), multiplexed PING mid-request, CANCEL idempotent, GOODBYE drain, peercred allow/deny, SIGTERM drain; core golden vectors byte-match; `session_reader` fuzz never panics, always ends in Protocol-error frame or clean close.
+
+### S4 — Hand-rolled PG pool + stubbed pin  *(depends: S1, S2)*
+- **Build:** `ferro-pool` on a `PoolBackend` trait + **fake in-memory backend**; `ferro-backend-pg` on `tokio-postgres` (NoTls): checkout/release with semaphore-bounded `max_size` + `queue_us`, `checkout_timeout`, `max_lifetime` recycling, background liveness reaper + checkout-time `is_closed()`/age checks, dead-conn eviction, connect backoff. **Stubbed pin (M-2):** `PinState{Unpinned, PinnedTx(tx_id)}` + `PinCause` (only `Tx` emitted) driven by per-conn tx-open flag; defensive release-time `ROLLBACK`; pinned-conn-never-reused invariant. Pool errors → taxonomy v0. `cargo-deny` forbids `deadpool`/`bb8`.
+- **Gate:** `cargo test -p ferro-pool` (checkout/release reuse, `max_size` blocks + timeout→`Retryable{PoolTimeout}`, `max_lifetime` recycles under fake clock, dead-conn eviction, **pin_stub records `PinCause::Tx` on BEGIN** + released on COMMIT/ROLLBACK, pinned conn never double-handed); with `FERRO_TEST_PG_URL`, `pg_pool_it` (live `SELECT 1`, tx pins one `pg_backend_pid`, hygiene leaves conn clean, `pg_terminate_backend`'d conn evicted with **no user-statement retry**, live `max_lifetime` pid change); `cargo-deny` clean. *(Pin-cause assertion satisfies charter DoD.)*
+
+### S5 — SQL EXEC service  *(depends: S3, S4)*
+End-to-end autocommit EXEC.
+- **Build:** `ExecRequest/ExecResponse/Stats/ColMeta` in `ferro-proto/messages/sql.rs` + SQL golden vectors + PHP byte-match; `ferrod/services/sql.rs` decodes EXEC, resolves pool, brackets checkout (`queue_us`), runs via extended protocol (`exec_us`), maps PG OIDs → canonical tags, binds/hydrates M0 scalar set (T-1; else `Unsupported`), frames HEAD(cols)+DATA(row batches ~256 KiB)+terminal END under credits (F-1); engine-side fingerprint-cached `?`→`$n` scanner (M-1); rejects tx-control SQL and `query_id` as `Unsupported`; classifies backend errors via `error_map.rs` (E-1) preserving raw SQLSTATE; **never retries**.
+- **Gate:** SQL golden vectors (Rust encode==bytes) + PHP byte-match both paths; credit unit tests + placeholder-scanner tests green; with PG up: `SELECT 1` → `cols=[{name,I64}]`/`row[I64(1)]` with populated `queue_us`+`exec_us`, one END; parameterized SELECT round-trips the scalar set; `INSERT` `fetch:none` → `affected>0`, no DATA frames; large result under a small window pauses/resumes on WINDOW_UPDATE without exceeding 16 MiB; out-of-M0 type/`query_id`/tx-control → `NonRetryable{Unsupported}`.
+
+### S6 — TX service  *(depends: S3, S4, S5)*
+- **Build:** per-tx **actor task** owning the pinned connection, keyed by `tx_id` (not the socket). Service-03 methods + isolation enum + `TxDeadline(Retryable)` in the registry + tx golden vectors + PHP byte-match. `BEGIN{pool,isolation?,readonly?}` composes the PG BEGIN string, returns global-atomic-u64 `tx_id`; tx-scoped EXEC reuses service 02 with optional `tx_id` (P-2); SAVEPOINT/RELEASE/ROLLBACK_TO engine-named; COMMIT/ROLLBACK release (tainted → pool reset). Two timers (X-1). Unknown/cross-session `tx_id` → Protocol; every path ends in one END; engine never re-runs statements.
+- **Gate:** `begin_sql` composition, `tx_id` monotonicity, savepoint-stack + status-transition unit tests, tx golden vectors (Rust + both PHP paths); with PG up: commit persists / rollback discards, savepoint round-trip, isolation observed (`SHOW transaction_isolation`), readonly rejects writes as one END, `idle_in_tx` (200 ms) and `max_tx` (300 ms mid `pg_sleep`) both → `Retryable{TxDeadline}` with pin released and **no statement re-dispatch**, cross-session/unknown `tx_id` rejected without disturbing the owner.
+
+### S7 — PHP sync client runtime  *(depends: S1, S3, S5, S6)*
+- **Build:** `ferro/client` on the S1 generated constants + codec. Transport over `stream_socket_client` (`unix://` primary, `tcp://` fallback) with read-exact/write-all; `Client\Session` handshake (features=0, epoch cache, type-registry hard check, monotonic-with-wrap `request_id`, one-END read loop, PING/PONG, GOODBYE); `Ferro::pool` → `Pool` with `queryOne/query/scalar/rows/exec` + `transaction(closure, retryPolicy?)`; memoized reflection-free `HydrationPlan`+`PlanCache` for `final readonly` DTOs (snake→camel); canonical→PHP value objects + §9.1 policies (safe-object defaults, `naive_datetime_zone=utc`); v0 `ErrorMapper` + three-branch exception hierarchy keyed off `errors.toml` (branch from the wire byte); `ReconnectLoop` full-jitter backoff + epoch compare + registry re-verify; `FateClassifier` skeleton (R-1); `retry_reads` default true. PHPStan L9 clean.
+- **Gate:** `composer test` green — unit (frame, TypedValue round-trip, HydrationPlan + memoization proving one reflection build per DTO+shape, policy application, ErrorMappingV0, Handshake hard-fail on hash mismatch, ReconnectLoop backoff+epoch, RequestId alloc) + live (`scalar('select 1')===1`, `queryOne` hydration into a `final readonly` DTO, tx commit persists / thrown-exception rolls back, restart mid-session → `Retryable{ConnectionLost, epoch_changed:true}`); `phpstan analyse src --level 9` exits 0.
+
+### S8 — Bench + D12 p99 measurement (M0 close)  *(depends: S5, S7, S2)*
+- **Build:** `ferro-bench` crate orchestrates a trivial-call scenario (client → ferrod → `SELECT 1`) vs a local PDO baseline over **identical containerized transport**, captures a full environment manifest (CPU/kernel/PHP+JIT/ext-msgpack/rust/postgres digest/git/codec/run-params/virtualization), computes min/mean/p50/p90/p99/p999/max, writes one self-contained schema-validated JSON per run under `bench/results/`. `bench_client.php` times the pure-PHP codec path (the D12 number); `bench_pdo.php` the baseline; fanout scenario shipped as a serial placeholder (`placeholder:true, blocked_on:M3-fibers`). Record the WSL2 run tagged `provisional:true/reference:false` under JIT off **and** on, `ext-msgpack=absent` noted. `ci/check-d12-recorded.sh` gates.
+- **Gate:** `cargo run -p ferro-bench -- --baseline pdo --scenario trivial` writes a schema-valid result with both distributions + complete manifest; `ci/check-d12-recorded.sh` finds ≥1 committed file and exits 0 — **the M0 exit condition**. CI bench-smoke stays informational (no p50/p99 threshold).
+
+## 6. Test strategy (charter DoD)
+
+- **Conformance:** golden frame vectors in `/proto/vectors/` are the sole cross-language arbiter; the PHP codec byte-matches them on **both** pure-PHP and ext-msgpack paths (CI provisions ext-msgpack, marks that path REQUIRED-green; locally it skips-with-reason so offline runs pass — R9).
+- **Engine:** per-crate unit tests; integration tests against Dockerized PG via `testkit` (skip when `FERRO_TEST_PG_URL` unset); pin-engine tests assert **pin-cause labels** (S4).
+- **Fuzz:** `cargo-fuzz` on the decoder (`decode_frame`, `roundtrip_frame`, `session_reader`) — CI smoke job; the DoS/OOM guard (`MAX_FRAME_PAYLOAD`) is fuzz-exercised.
+- **Chaos:** full SIGKILL fate-matrix harness (§19.3 / §20.3) is **M1** (G7 acceptance); M0 ships the reconnect-loop skeleton + epoch check + one restart-mid-session integration test.
+- **Bench:** informational in CI; D12 is a human sign-off on recorded numbers (§20.3).
+
+Every gate green means: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, PHPUnit, PHPStan L9 on `php/client`.
+
+## 7. Top risks
+
+| # | Risk | Mitigation |
+|---|------|------------|
+| R1 | No RFQ byte on stock tokio-postgres → pin stub can't literally "pin on BEGIN via ReadyForQuery"; M1 pin engine has an unresolved data source | TX-lifecycle stub + reject bare tx-control via EXEC; §22 deviation + §21 open item; spike lower-level connection early in M1 |
+| R2 | WSL2 timer/scheduler jitter inflates p99 — the exact D12 metric | Tag D12 `provisional/reference:false`, record JIT off+on, isolate transport, require bare-metal re-run; CI bench informational |
+| R3 | Cross-language codec divergence (int width, str vs bin, map order) | Golden vectors sole arbiter; canonical MessagePack profile pinned in PROTOCOL.md; both PHP paths in CI; if ext-msgpack can't reproduce a construct → pure-PHP encode, ext-msgpack decode-only |
+| R4 | one-END invariant silently violated by panic/link-death/timer-with-no-request | Drop-guarded Responder synthetic END; session-reader fuzz asserts termination; TX idle-fire parks cause for next frame; client FateClassifier synthesizes exactly one terminal outcome per id |
+| R5 | `?`→`$n` scanner corrupts SQL (jsonb `?`/`?|`/`?&`, `::`, `$$`, literals) or is judged to violate rule 6 | Real audited scanner + dedicated hazard corpus, fingerprint-cached; rule-6 tension flagged (M-1); clean `$n` fallback documented |
+| R6 | S1 is large and blocks the whole milestone | Scope S1 to control frames + scalar TypedValue + ERROR only; defer SQL/TX vectors to S5/S6; land registry numbers first; parallelize Rust/PHP against shared vectors |
+| R8 | Minimal M0 hygiene leaves autocommit session-state leaks undetected | Documented M0 limitation (§22); D12 path is `SELECT 1`; defensive ROLLBACK belt-and-suspenders; full hygiene M1 |
+
+## 8. Definition of done for M0
+
+- All 8 slices green under the charter gates (fmt/clippy/test/PHPUnit/PHPStan L9).
+- Golden vectors byte-match across Rust + both PHP codec paths.
+- Live integration path proven against Dockerized Postgres: client → ferrod → `SELECT 1` → typed result, plus TX commit/rollback and one restart-mid-session fate test.
+- Fuzz smoke green; DoS guard exercised.
+- **D12 p99 measurement recorded** in `bench/results/` with full manifest; `check-d12-recorded.sh` exits 0.
+- All §4 deviations landed in SPEC §22, and the RFQ-byte question added to §21 open items, **in the same change** that introduced each.
