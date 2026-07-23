@@ -1,0 +1,27 @@
+[package]
+name = "ferrod"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# NOTE: ferrod REQUIRES panic = "unwind" (the workspace default). The exactly-one-END supervisor
+# (later S3 tasks) depends on handler panics unwinding, not aborting the process.
+[dependencies]
+ferro-proto = { path = "../ferro-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "signal", "macros", "io-util", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+getrandom = "0.2"
+rustix = { version = "0.38", features = ["net"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util", "time", "test-util"] }
