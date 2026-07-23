@@ -9,9 +9,11 @@ with_pg=0; [ "${1:-}" = "--with-pg" ] && with_pg=1
 
 if [ "$with_pg" = 1 ]; then
   docker compose -f testkit/docker-compose.yml up -d
+  # Register teardown BEFORE the first thing that can fail (wait-for-pg), so a PG that never
+  # becomes healthy under `set -e` still tears the compose stack down instead of leaking it.
+  trap 'docker compose -f testkit/docker-compose.yml down -v >/dev/null 2>&1 || true' EXIT
   ./testkit/wait-for-pg.sh
   export FERRO_TEST_PG_URL="postgres://ferro:ferro@localhost:55432/ferro"
-  trap 'docker compose -f testkit/docker-compose.yml down -v >/dev/null 2>&1 || true' EXIT
 fi
 
 echo "== rust: fmt =="   ; cargo fmt --check
