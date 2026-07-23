@@ -24,7 +24,8 @@ Copied verbatim from the design doc / spec; every task implicitly includes these
 - **Error codes** grouped by branch range (`Retryable 0x1xxx / Indeterminate 0x2xxx / NonRetryable 0x3xxx`) **and** carry an explicit `branch:u8` on the wire so an unknown code is still classified. *(decision W-3)*
 - **Terminal outcome envelope:** `[status:u8, body]` with `0=Ok, 1=Error, 2=Cancelled`; on Error, `body` is the canonical ERROR array `[code:u16, branch:u8, sqlstate?, errno?, message, detail?, retry_after_ms?]`. *(decision W-4)*
 - **Rust: `thiserror` in libs, `tracing` where relevant, clippy warnings denied, `cargo fmt`.** PHP: PSR-12, PHPStan level 9 on `php/client`, dependency-free at runtime (`ext-msgpack` runtime-detected, never required). *(§20.2, charter rule 7)*
-- **Workspace:** single Cargo workspace at repo root, `members = ["engine/crates/*", "bench"]`. *(decision B-1)*
+- **Workspace:** single Cargo workspace at repo root, `members = ["engine/crates/*"]` in S1 (the `bench` member is added in slice S8 when that crate exists — decision B-1).
+- **TDD ordering (every test-bearing task):** observe a RED state before GREEN. Tasks 3–5 do this explicitly. For the generate-then-verify tasks (6, 8, 9), run the new conformance/vector test **once before** generating its artifact (vectors / `Constants.php`) so the failure is actually seen, then generate and re-run to green — a test never seen red risks being silently vacuous.
 
 ## File Structure
 
@@ -58,7 +59,7 @@ Copied verbatim from the design doc / spec; every task implicitly includes these
   composer.json  phpunit.xml.dist  phpstan.neon.dist
   src/Protocol/Generated/Constants.php           generated from lock.json
   src/Protocol/Msgpack/{PackerInterface,PurePacker,ExtPacker,PackerFactory}.php
-  src/Protocol/{Header,Frame,Value,Codec}.php
+  src/Protocol/{CodecException,Header,Value,Codec,Message}.php
   tests/Conformance/VectorConformanceTest.php  tests/Conformance/RegistrySyncTest.php
   tests/Unit/{HeaderTest,ValueTest,PurePackerTest}.php
 ```
@@ -313,7 +314,7 @@ git commit -m "chore(s1): bootstrap workspace, ferro-proto crate, ferro/client p
 - Create: `/proto/registry.lock.json` (generated), `/engine/crates/ferro-proto/tests/registry_sync.rs`
 
 **Interfaces:**
-- Produces: `ferro_proto::consts` — `PROTOCOL_VERSION: u8`, `MAGIC: u8`, `MAX_FRAME_PAYLOAD: u32`, `DEFAULT_CREDIT_FRAMES: u32`, `DEFAULT_CREDIT_BYTES: u32`; modules `flags`, `service`, `method::core`, `tag`, `errc` (each `pub const … : uN`), `branch`. Consumed by Tasks 3–7 and mirrored into PHP `Constants.php` in Task 8.
+- Produces: `ferro_proto::consts` — `PROTOCOL_VERSION: u8`, `MAGIC: u8`, `MAX_FRAME_PAYLOAD: u32`, `DEFAULT_CREDIT_FRAMES: u32`, `DEFAULT_CREDIT_BYTES: u32`; modules `flags`, `service`, `method_core` (per-service methods are emitted as `method_<service>`), `tag`, `errc` (each `pub const NAME: u16` plus `NAME_BRANCH: u8`), `branch`, `feature_engine`, `feature_client`. Consumed by Tasks 3–7 and mirrored into PHP `Constants.php` in Task 8.
 - Produces: `ferro_proto::registry::Registry` (+ `from_toml_dir`, `to_lock_json`) used by the gen bin and the sync test.
 
 - [ ] **Step 1: Write the registry TOML (single source of truth)**
@@ -536,7 +537,7 @@ fn main() {
 }
 ```
 
-Add `toml` as a normal (not dev) dependency scoped to the bin is not possible; instead move `toml` to `[dependencies]` in the crate manifest (it is small and pure-Rust). Update `Cargo.toml`: move `toml = "0.8"` from `[dev-dependencies]` to `[dependencies]`.
+`toml` and `serde_json` are already in `[dependencies]` (placed there in Task 1) because binaries and the library can only see `[dependencies]`, not `[dev-dependencies]`. No manifest change is needed here — just confirm they are present before building the bin.
 
 - [ ] **Step 4: Generate the lock file**
 
@@ -685,7 +686,7 @@ git commit -m "feat(s1): proto registry + lock generation + rust const codegen w
 - Create: `/engine/crates/ferro-proto/tests/header.rs`
 
 **Interfaces:**
-- Produces: `Header { flags: u16, service: u16, method: u16, request_id: u32, payload_len: u32 }` with `fn encode(&self) -> [u8; 16]` and `fn decode(buf: &[u8]) -> Result<Header, CodecError>`. `magic`/`version` are validated on decode and written on encode from `consts`, never stored. Consumed by Task 5 (`Frame`), Task 6 (vectors), Task 7 (fuzz), and mirrored by PHP `Header` in Task 8.
+- Produces: `Header { flags: u16, service: u16, method: u16, request_id: u32, payload_len: u32 }` with `fn encode(&self) -> [u8; 16]` and `fn decode(buf: &[u8]) -> Result<Header, CodecError>`. `magic`/`version` are validated on decode and written on encode from `consts`, never stored. Consumed by Task 6 (vectors), Task 7 (fuzz), the daemon's `Framed` adapter in S3, and mirrored by PHP `Header` in Task 8. **S1 has no separate `Frame` type** — a frame is `Header::encode()` concatenated with the payload bytes (Rust tests build it inline; PHP has `Ferro\Protocol\Codec::encodeFrame/decodeFrame`).
 - Produces: `flags::has(bits, mask) -> bool`, `flags::validate(bits) -> Result<(), CodecError>` (rejects unknown + reserved bits).
 
 - [ ] **Step 1: Write the failing header tests**
@@ -1344,18 +1345,59 @@ fn positive_vectors_header_decodes_and_frame_len_is_consistent() {
 }
 
 #[test]
+fn message_payloads_are_canonical_and_byte_stable() {
+    // For every positive vector, decode the payload into its typed message and re-encode it;
+    // the bytes MUST be identical. Since gen-vectors produced each vector via `.encode()`, this
+    // proves the on-disk bytes ARE the canonical encoder output (encode==bytes at the message
+    // level), and that decode->encode is a fixpoint. This is the Rust half of the cross-language
+    // byte lock; the PHP half asserts PurePacker re-encodes to these same bytes (Task 9).
+    use ferro_proto::consts::{method_core as mc, service};
+    use ferro_proto::messages::*;
+    for entry in fs::read_dir(vectors_dir()).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+        let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let frame = unhex(v["frame_hex"].as_str().unwrap());
+        let h = Header::decode(&frame).unwrap();
+        let payload = &frame[16..];
+        let reencoded: Vec<u8> = match (h.service, h.method) {
+            (s, m) if s == service::CORE && m == mc::HELLO => Hello::decode(payload).unwrap().encode(),
+            (s, m) if s == service::CORE && m == mc::HELLO_ACK => HelloAck::decode(payload).unwrap().encode(),
+            (s, m) if s == service::CORE && m == mc::PING => Ping::decode(payload).unwrap().encode(),
+            (s, m) if s == service::CORE && m == mc::PONG => Pong::decode(payload).unwrap().encode(),
+            (s, m) if s == service::CORE && m == mc::GOODBYE => Goodbye::decode(payload).unwrap().encode(),
+            (s, m) if s == service::CORE && m == mc::WINDOW_UPDATE => WindowUpdate::decode(payload).unwrap().encode(),
+            // error_protocol vector: an Outcome::Error terminal payload (method 0, END flag).
+            _ => Outcome::decode(payload).unwrap().encode(),
+        };
+        assert_eq!(reencoded, payload.to_vec(),
+                   "payload for {:?} is not canonical / byte-stable", p.file_name().unwrap());
+    }
+}
+
+#[test]
 fn negative_vectors_are_rejected() {
     let neg = vectors_dir().join("negative");
     for entry in fs::read_dir(&neg).unwrap() {
         let p = entry.unwrap().path();
         if p.extension().and_then(|e| e.to_str()) != Some("bin") { continue; }
+        let name = p.file_name().unwrap().to_str().unwrap().to_string();
         let bytes = fs::read(&p).unwrap();
-        assert!(Header::decode(&bytes).is_err(), "negative vector {p:?} was NOT rejected by header decode");
+        if name == "reserved_flag.bin" {
+            // This one has a VALID header (good magic/version/len) but sets the reserved OOB_FD
+            // flag — it is rejected at the flags layer, not by Header::decode. Assert both facts.
+            let h = Header::decode(&bytes).expect("reserved_flag.bin has a structurally valid header");
+            assert_eq!(
+                ferro_proto::flags::validate(h.flags),
+                Err(ferro_proto::CodecError::UnsupportedFlag),
+                "reserved_flag.bin flags must be rejected by flags::validate"
+            );
+        } else {
+            assert!(Header::decode(&bytes).is_err(), "negative vector {name} was NOT rejected by header decode");
+        }
     }
 }
 ```
-
-> The reserved-flag negative is caught by `flags::validate`, not `Header::decode`; extend this test to also assert `ferro_proto::flags::validate(h.flags)` errors for `reserved_flag.bin` after decoding its header.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -1465,12 +1507,12 @@ git commit -m "test(s1): cargo-fuzz decode + roundtrip targets for the frame cod
 - Create: `/proto/tools/gen-php.php`
 - Create (generated): `/php/client/src/Protocol/Generated/Constants.php`
 - Create: `/php/client/src/Protocol/Msgpack/{PackerInterface,PurePacker,ExtPacker,PackerFactory}.php`
-- Create: `/php/client/src/Protocol/{Header,Value,Frame,Codec}.php`
+- Create: `/php/client/src/Protocol/{CodecException,Header,Value,Codec,Message}.php`
 - Create: `/php/client/tests/Unit/{HeaderTest,ValueTest,PurePackerTest}.php`
 
 **Interfaces:**
 - Consumes: `/proto/registry.lock.json`, `/proto/vectors/*`.
-- Produces: `Ferro\Protocol\Codec` with `encodeFrame(Header, string $payload): string` and `decodeFrame(string): array{0:Header,1:string}`; `Ferro\Protocol\Value` with `encode(): string` / static `decode(string, int &$offset): Value`; `Ferro\Protocol\Msgpack\PackerInterface`. Consumed by Task 9 (conformance) and all later PHP client slices.
+- Produces: `Ferro\Protocol\Codec` with `encodeFrame(Header, string $payload): string` and `decodeFrame(string): array{0:Header,1:string}`; `Ferro\Protocol\Value` with `encode(PackerInterface): string` / static `decode(PackerInterface, string, int &$offset): Value`; `Ferro\Protocol\Message::encode(string $name, array $fields, PackerInterface): string` (client-sent core messages); `Ferro\Protocol\Msgpack\PackerInterface`. Consumed by Task 9 (conformance) and all later PHP client slices.
 
 - [ ] **Step 1: Write the PHP constants generator**
 
@@ -1500,7 +1542,15 @@ foreach ($lock['methods'] as $svc => $kv) {
 $out .= "\n";
 foreach ($lock['tags'] as $k => $v) { $out .= "    public const TAG_{$k} = {$v};\n"; }
 $out .= "\n";
-foreach ($lock['branches'] as $k => $v) { $out .= "    public const BRANCH_" . strtoupper($k) . " = {$v};\n"; }
+foreach ($lock['branches'] as $k => $v) {
+    // camel-split to match Rust screaming(): NonRetryable -> NON_RETRYABLE
+    $u = strtoupper(preg_replace('/(?<=[a-z0-9])(?=[A-Z])/', '_', $k));
+    $out .= "    public const BRANCH_{$u} = {$v};\n";
+}
+$out .= "\n";
+foreach ($lock['features'] as $side => $kv) {
+    foreach ($kv as $k => $v) { $out .= "    public const FEATURE_" . strtoupper($side) . "_{$k} = {$v};\n"; }
+}
 $out .= "\n";
 foreach ($lock['codes'] as $name => $ec) {
     $u = strtoupper(preg_replace('/(?<=[a-z0-9])(?=[A-Z])/', '_', $name));
@@ -1866,6 +1916,63 @@ final class Codec
 }
 ```
 ```php
+<?php // /php/client/src/Protocol/Message.php
+declare(strict_types=1);
+namespace Ferro\Protocol;
+use Ferro\Protocol\Msgpack\PackerInterface;
+
+/**
+ * Encodes core-service messages as positional MessagePack arrays whose field order matches
+ * PROTOCOL.md and the Rust structs (compact rmp-serde layout). Byte-identity vs the Rust codec is
+ * locked by golden vectors (Task 9). Server->client-only payloads (error Outcomes) are decode-only.
+ * All integer fields here are unsigned in the Rust structs, so packUint is correct throughout.
+ */
+final class Message
+{
+    /** @param array<string,mixed> $f logical fields (e.g. a golden vector's "message" object) */
+    public static function encode(string $name, array $f, PackerInterface $p): string
+    {
+        return match ($name) {
+            'hello' => self::arr($p, [
+                $p->packUint(self::i($f, 'client_version')),
+                $p->packStr(self::s($f, 'type_registry_hash')),
+                ($f['manifest_hash'] ?? null) === null ? $p->packNil() : $p->packStr(self::s($f, 'manifest_hash')),
+                $p->packUint(self::i($f, 'pid')),
+                $p->packUint(self::i($f, 'features')),
+            ]),
+            'hello_ack' => self::arr($p, [
+                $p->packUint(self::i($f, 'engine_version')),
+                $p->packUint(self::u($f, 'boot_epoch')),   // string-safe for > PHP_INT_MAX
+                $p->packUint(self::i($f, 'features')),
+                self::strArray($p, $f['pools'] ?? []),
+                $p->packStr(self::s($f, 'type_registry_hash')),
+            ]),
+            'ping', 'pong' => self::arr($p, [$p->packUint(self::u($f, 'token'))]),
+            'goodbye' => self::arr($p, []),
+            'window_update' => self::arr($p, [$p->packUint(self::i($f, 'frames')), $p->packUint(self::i($f, 'bytes'))]),
+            default => throw new CodecException("no client encoder for message '$name'"),
+        };
+    }
+
+    /** @param list<string> $items already-encoded field byte-strings */
+    private static function arr(PackerInterface $p, array $items): string
+    {
+        return $p->packArrayLen(count($items)) . implode('', $items);
+    }
+    private static function strArray(PackerInterface $p, mixed $pools): string
+    {
+        $list = is_array($pools) ? $pools : [];
+        $out = $p->packArrayLen(count($list));
+        foreach ($list as $s) { $out .= $p->packStr((string) $s); }
+        return $out;
+    }
+    /** @param array<string,mixed> $f */ private static function i(array $f, string $k): int { return (int) ($f[$k] ?? 0); }
+    /** @param array<string,mixed> $f */ private static function s(array $f, string $k): string { return (string) ($f[$k] ?? ''); }
+    /** @param array<string,mixed> $f @return int|string */ private static function u(array $f, string $k): int|string
+    { $v = $f[$k] ?? 0; return is_string($v) ? $v : (int) $v; }
+}
+```
+```php
 <?php // /php/client/src/Protocol/Msgpack/ExtPacker.php
 declare(strict_types=1);
 namespace Ferro\Protocol\Msgpack;
@@ -1996,6 +2103,7 @@ git commit -m "feat(s1): pure-PHP msgpack + Header/Value/Codec + Constants gener
 declare(strict_types=1);
 namespace Ferro\Tests\Conformance;
 use Ferro\Protocol\Header;
+use Ferro\Protocol\Message;
 use Ferro\Protocol\Msgpack\{PurePacker, ExtPacker};
 use PHPUnit\Framework\TestCase;
 
@@ -2034,8 +2142,29 @@ final class VectorConformanceTest extends TestCase
         $off = 0;
         $decoded = $p->unpack($payload, $off);
         $this->assertSame(strlen($payload), $off, "consumed all payload bytes for {$v['name']}");
-        // Spot-check the first field where the vector's message is a positional array.
-        $this->assertNotNull($decoded, "decoded payload for {$v['name']}");
+        $this->assertIsArray($decoded, "every S1 message payload is a positional array for {$v['name']}");
+    }
+
+    /**
+     * THE cross-language byte lock: PurePacker must re-encode each client-sent message to the EXACT
+     * bytes the Rust codec produced. hello_ack is included (encoding boot_epoch from its decimal
+     * string yields the exact uint64 bytes); error_protocol is an Outcome the client never sends,
+     * so it is decode-only and skipped here. A rmp-serde map-vs-array default mismatch, a field-order
+     * bug, or an integer-width divergence all fail HERE rather than silently in S5.
+     * @param array<string,mixed> $v
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('vectors')]
+    public function testPurePackerEncodesMessageToExactVectorBytes(array $v): void
+    {
+        $name = (string) $v['name'];
+        if (!in_array($name, ['hello', 'hello_ack', 'ping', 'pong', 'goodbye', 'window_update'], true)) {
+            $this->markTestSkipped("{$name} is decode-only for the client in S1 (no message encoder)");
+        }
+        $fields = is_array($v['message']) ? $v['message'] : [];
+        $payload = Message::encode($name, $fields, new PurePacker());
+        $expected = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $this->assertSame(bin2hex($expected), bin2hex($payload),
+            "PHP-encoded {$name} payload must byte-match the Rust-generated vector");
     }
 
     /** @param array<string,mixed> $v */
@@ -2046,9 +2175,30 @@ final class VectorConformanceTest extends TestCase
         $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
         $off = 0;
         $pure = (new PurePacker())->unpack($payload, $off);
+        if (self::hasBigUint($pure)) {
+            // ext-msgpack decodes a uint64 > PHP_INT_MAX to a LOSSY float; PurePacker returns the
+            // exact decimal string and is authoritative. The two are not comparable here — pure-only
+            // coverage lives in PurePackerTest::testUint64BeyondPhpIntDecodesToString.
+            $this->markTestSkipped("vector {$v['name']} carries a uint64 > PHP_INT_MAX (ext-msgpack lossy)");
+        }
+        $off = 0;
         $ext = (new ExtPacker())->unpack($payload, $off);
-        // Normalize: ext may decode top-level array to PHP array; compare JSON shape.
         $this->assertEquals(json_encode($pure), json_encode($ext), "ext vs pure decode for {$v['name']}");
+    }
+
+    /** True if $v (recursively) contains a decimal string that exceeds PHP_INT_MAX — PurePacker's
+     *  representation of a uint64 the msgpack extension cannot decode losslessly. */
+    private static function hasBigUint(mixed $v): bool
+    {
+        if (is_array($v)) {
+            foreach ($v as $x) { if (self::hasBigUint($x)) { return true; } }
+            return false;
+        }
+        if (!is_string($v) || !preg_match('/^\d+$/', $v)) { return false; }
+        $s = ltrim($v, '0');
+        if ($s === '') { $s = '0'; }
+        $max = '9223372036854775807';
+        return strlen($s) > strlen($max) || (strlen($s) === strlen($max) && strcmp($s, $max) > 0);
     }
 }
 ```
@@ -2113,22 +2263,37 @@ git commit -m "test(s1): cross-language vector conformance + constants sync gate
 
 ## Self-Review
 
+> **Plan v2** — revised after an adversarial verification pass (workflow `wf_9022d315`) that empirically checked byte layouts against rmp 0.8.15 and PHP 8.4. Applied: 4 blockers, 3 majors, 4 minors. See the changelog at the end.
+
 **Spec coverage (design doc S1 acceptance gate):**
-- `cargo test -p ferro-proto` (golden vectors, header bounds, registry_lock_sync) → Tasks 3, 6, 2. ✓
+- `cargo test -p ferro-proto` (golden vectors, **message byte-stability**, header bounds, registry_lock_sync) → Tasks 3, 6, 2. ✓
 - Fuzz decode no-crash/bounded-alloc → Task 7. ✓
 - Regen → zero git diff → Task 9 Step 4. ✓
-- PHP pure + ext-msgpack byte-match vectors → Tasks 8–9. ✓ (ext path is decode-conformance per R3; encode stays pure — documented, matches the "both paths" intent while respecting ext-msgpack's whole-value API.)
-- `/proto` single source of truth, both codecs generated → Tasks 2, 8. ✓
+- **PHP encodes each core message to byte-identical vector bytes** (the real cross-language lock, was missing) → Task 9 `testPurePackerEncodesMessageToExactVectorBytes`, backed by the Rust `message_payloads_are_canonical_and_byte_stable` test. ✓
+- ext-msgpack decode conformance where representable; uint64 > PHP_INT_MAX is pure-only (ext lossy) → Task 9. ✓
+- `/proto` single source of truth, both codecs generated (branches + features now mirrored) → Tasks 2, 8. ✓
 - ERROR payload + Outcome envelope + branch-on-wire → Task 5. ✓
 
-**Placeholder scan:** No `TODO`/`TBD`/"handle edge cases". Two explicit *implementation notes* flag `rmp`/`rmp-serde` exact-name/behavior confirmation with the byte-asserting tests as the arbiter — these are verification instructions, not deferred work.
+**Integer canonical rule (the fixed landmine):** both codecs follow rmp `write_sint` — non-negative → uint markers (`200`=`cc c8`), negative → int markers (`-200`=`d1 ff 38`). Locked by a TypedValue in the Rust value tests **and** by the PHP `packInt`/`ValueTest` assertions; a divergence now fails a unit test, not silently in S5.
 
-**Type consistency:** `Header{flags,service,method,request_id,payload_len}` identical in Rust (Task 3) and PHP (`Header{flags,service,method,requestId,payloadLen}`, Task 8). `Value` variants and tags consistent across Tasks 4/8. Constants naming (`service::CORE`↔`SERVICE_CORE`, `method_core::PING`↔`METHOD_CORE_PING`, `errc::PROTOCOL`↔`ERR_PROTOCOL`) consistent between `build.rs` (Task 2) and `gen-php.php` (Task 8).
+**Placeholder scan:** No `TODO`/`TBD`/"handle edge cases". Two *implementation notes* flag `rmp`/`rmp-serde` exact-name/compact-default confirmation with the byte-asserting tests + vectors as the arbiter — verification instructions, not deferred work.
+
+**Type consistency:** `Header` fields identical in Rust (Task 3) and PHP (Task 8). `Value` variants/tags consistent across Tasks 4/8. Constants naming (`service::CORE`↔`SERVICE_CORE`, `method_core::PING`↔`METHOD_CORE_PING`, `errc::PROTOCOL`↔`ERR_PROTOCOL`, `branch::NON_RETRYABLE`↔`BRANCH_NON_RETRYABLE`) consistent between `build.rs` (Task 2) and `gen-php.php` (Task 8). PHP `Value`/`Message` signatures in the interface blocks match their implementations.
 
 **Known execution-time confirmations (not gaps):**
-1. `rmp 0.8` exact function names in Task 4 — tests assert bytes, adjust calls to satisfy.
-2. `rmp-serde 1.x` compact-struct-as-array default in Task 5 — messages roundtrip + vectors are the arbiter.
-3. TOML inline-table syntax in `errors.toml` (Task 2) — fall back to explicit tables if the parser rejects.
+1. `rmp 0.8` exact low-level function names in Task 4 — tests assert exact bytes; adjust calls to satisfy, never the asserted bytes.
+2. `rmp-serde 1.x` compact-struct-as-array default in Task 5 — the message roundtrip tests, the Rust byte-stability test, AND the PHP encode-byte-match test are the arbiter; if rmp-serde defaults to maps, switch it to compact so PHP array-encoding matches.
+3. All three `/proto/*.toml` files are now explicit one-key-per-line / per-code tables — verified to parse; `gen-registry-lock` in Task 2 Step 4 is the parse gate.
+
+## Changelog (plan v1 → v2, from verification `wf_9022d315`)
+- **B1 integer rule:** rmp `write_sint` narrows non-negative ≥128 to unsigned markers (`200`=`cc c8`, not `d1 00 c8`). Aligned Rust test, PHP `packInt`, PHP tests, prose; added a TypedValue-carrying assertion so the ladder is locked.
+- **B2 deps:** `serde_json` + `toml` moved to `[dependencies]` (bins/lib can't see dev-deps).
+- **B3 bins:** Task 1 creates `gen_registry_lock.rs`/`gen_vectors.rs` stub `main()`s (declared `[[bin]]` sources must exist).
+- **B4 TOML:** `types.toml` one-key-per-line with `m0_scalar` hoisted above `[tags]`; `errors.toml` per-code `[codes.X]` tables.
+- **M1 ext/uint64:** ext-vs-pure decode test skips uint64 > PHP_INT_MAX (ext lossy); pure-only coverage retained.
+- **M2 byte-identity:** added Rust message byte-stability test, a PHP `Message` encoder, and a PHP encode-equals-vector test — S1 now actually proves what it claims.
+- **M3 negative vector:** `reserved_flag.bin` asserted via `flags::validate`, excluded from the header `is_err` loop.
+- **Minors:** PHP floor kept at spec's `>=8.2` (untyped constants, parenthesized `new`); `gen-php.php` branch camel-split + features loop; TDD fail-first note for generate-then-verify tasks; prose/interface fixes (`method_core`, no `Frame` type, PHP `Value`/`Message` signatures).
 
 ---
 
