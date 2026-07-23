@@ -35,7 +35,13 @@ final class PurePacker implements PackerInterface
     {
         // Only used for fields known unsigned (e.g. boot_epoch). Accept string for > PHP_INT_MAX.
         if (is_string($n)) {
-            // value > PHP_INT_MAX: emit uint64 big-endian from decimal string.
+            // Canonical narrowing: only genuinely-large values use uint64; small strings narrow like ints.
+            if (!preg_match('/^\d+$/', $n)) { throw new CodecException('packUint: non-numeric string'); }
+            $trimmed = ltrim($n, '0'); if ($trimmed === '') { $trimmed = '0'; }
+            $max = '9223372036854775807';
+            if (strlen($trimmed) < strlen($max) || (strlen($trimmed) === strlen($max) && strcmp($trimmed, $max) <= 0)) {
+                return $this->packUint((int) $n);
+            }
             return "\xcf" . self::decToBe64($n);
         }
         if ($n < 0) { throw new CodecException('packUint got negative'); }
@@ -74,7 +80,8 @@ final class PurePacker implements PackerInterface
 
     public function unpack(string $buf, int &$offset): mixed
     {
-        $c = ord($buf[$offset++]);
+        self::need($buf, $offset, 1);
+        $c = self::readByte($buf, $offset);
         if ($c <= 0x7f) { return $c; }                       // positive fixint
         if ($c >= 0xe0) { return $c - 0x100; }               // negative fixint
         if ($c >= 0x90 && $c <= 0x9f) { return $this->unpackArray($buf, $offset, $c & 0x0f); }
@@ -82,7 +89,7 @@ final class PurePacker implements PackerInterface
         return match ($c) {
             0xc0 => null,
             0xc2 => false, 0xc3 => true,
-            0xcc => ord($buf[$offset++]),
+            0xcc => self::readByte($buf, $offset),
             0xcd => $this->be($buf, $offset, 2, false),
             0xce => $this->be($buf, $offset, 4, false),
             0xcf => $this->be($buf, $offset, 8, false),
@@ -92,10 +99,10 @@ final class PurePacker implements PackerInterface
             0xd3 => $this->be($buf, $offset, 8, true),
             0xca => $this->unpackF32($buf, $offset),
             0xcb => $this->unpackF64($buf, $offset),
-            0xd9 => $this->take($buf, $offset, ord($buf[$offset++])),
+            0xd9 => $this->take($buf, $offset, self::readByte($buf, $offset)),
             0xda => $this->take($buf, $offset, (int) $this->be($buf, $offset, 2, false)),
             0xdb => $this->take($buf, $offset, (int) $this->be($buf, $offset, 4, false)),
-            0xc4 => $this->take($buf, $offset, ord($buf[$offset++])),
+            0xc4 => $this->take($buf, $offset, self::readByte($buf, $offset)),
             0xc5 => $this->take($buf, $offset, (int) $this->be($buf, $offset, 2, false)),
             0xc6 => $this->take($buf, $offset, (int) $this->be($buf, $offset, 4, false)),
             0xdc => $this->unpackArray($buf, $offset, (int) $this->be($buf, $offset, 2, false)),
@@ -104,24 +111,49 @@ final class PurePacker implements PackerInterface
         };
     }
 
+    /**
+     * Bounds check every raw read: a truncated or lying-length frame must throw CodecException
+     * rather than silently fabricate 0/"" (empty-string offset access) or loop unbounded.
+     */
+    private static function need(string $buf, int $offset, int $len): void
+    {
+        if ($len < 0 || $offset + $len > strlen($buf)) {
+            throw new CodecException(sprintf('truncated: need %d bytes at offset %d, have %d', $len, $offset, strlen($buf) - $offset));
+        }
+    }
+    /** Bounds-checked single-byte read; advances $offset. */
+    private static function readByte(string $buf, int &$offset): int
+    {
+        self::need($buf, $offset, 1);
+        return ord($buf[$offset++]);
+    }
+
     /** @return list<mixed> */
     private function unpackArray(string $buf, int &$offset, int $n): array
     {
+        // Each element is >= 1 byte on the wire, so this is a valid, allocation-free bound that
+        // rejects a lying/oversized length (e.g. array32 claiming ~4e9 elements) before looping.
+        if ($n > strlen($buf) - $offset) {
+            throw new CodecException("array length {$n} exceeds remaining bytes");
+        }
         $a = [];
         for ($i = 0; $i < $n; $i++) { $a[] = $this->unpack($buf, $offset); }
         return $a;
     }
     private function take(string $buf, int &$offset, int $len): string
     {
+        self::need($buf, $offset, $len);
         $s = substr($buf, $offset, $len); $offset += $len; return $s;
     }
     private function signed8(string $buf, int &$offset): int
     {
+        self::need($buf, $offset, 1);
         $v = ord($buf[$offset++]); return $v < 128 ? $v : $v - 256;
     }
     /** Big-endian integer of $bytes width; returns int, or decimal string for uint64 > PHP_INT_MAX. */
     private function be(string $buf, int &$offset, int $bytes, bool $signed): int|string
     {
+        self::need($buf, $offset, $bytes);
         $slice = substr($buf, $offset, $bytes); $offset += $bytes;
         if ($bytes < 8) {
             $v = 0; foreach (str_split($slice) as $b) { $v = ($v << 8) | ord($b); }
@@ -133,9 +165,9 @@ final class PurePacker implements PackerInterface
         return self::be64ToDec($slice); // unsigned 64: return decimal string to preserve > PHP_INT_MAX
     }
     private function unpackF32(string $buf, int &$offset): float
-    { $s = substr($buf, $offset, 4); $offset += 4; return self::unpackFloat('G', $s); }
+    { self::need($buf, $offset, 4); $s = substr($buf, $offset, 4); $offset += 4; return self::unpackFloat('G', $s); }
     private function unpackF64(string $buf, int &$offset): float
-    { $s = substr($buf, $offset, 8); $offset += 8; return self::unpackFloat('E', $s); }
+    { self::need($buf, $offset, 8); $s = substr($buf, $offset, 8); $offset += 8; return self::unpackFloat('E', $s); }
 
     /**
      * unpack() with a single-field format string always yields an array{1: mixed} on well-formed
@@ -184,6 +216,7 @@ final class PurePacker implements PackerInterface
         for ($pos = 7; $pos >= 0 && $n !== '0'; $pos--) {
             [$n, $rem] = self::divmod($n, 256); $bytes[$pos] = $rem;
         }
+        if ($n !== '0') { throw new CodecException('packUint value exceeds u64'); }
         return implode('', array_map('chr', $bytes));
     }
     /** @return array{0:string,1:int} */
