@@ -349,6 +349,13 @@ PONG          = 4
 GOODBYE       = 5
 WINDOW_UPDATE = 6
 
+# Terminal outcome-envelope status discriminant (decision W-4). In /proto so both codecs
+# generate it rather than hand-writing 0/1/2 (charter rule 2).
+[outcome]
+OK        = 0
+ERROR     = 1
+CANCELLED = 2
+
 [features.engine]
 MEMFD          = 0x01
 LISTEN_STREAMS = 0x02
@@ -471,6 +478,7 @@ pub struct Registry {
     pub services: BTreeMap<String, u16>,
     pub methods: BTreeMap<String, BTreeMap<String, u16>>,
     pub features: BTreeMap<String, BTreeMap<String, u16>>,
+    pub outcome: BTreeMap<String, u8>,
     pub tags: BTreeMap<String, u8>,
     pub branches: BTreeMap<String, u8>,
     pub codes: BTreeMap<String, ErrCode>,
@@ -495,6 +503,7 @@ struct MethodsToml {
     services: BTreeMap<String, u16>,
     methods: BTreeMap<String, BTreeMap<String, u16>>,
     features: BTreeMap<String, BTreeMap<String, u16>>,
+    outcome: BTreeMap<String, u8>,
 }
 #[derive(Deserialize)]
 struct TypesToml {
@@ -524,6 +533,7 @@ impl Registry {
             services: m.services,
             methods: m.methods,
             features: m.features,
+            outcome: m.outcome,
             tags: t.tags,
             branches: e.branches,
             codes: e.codes,
@@ -584,6 +594,7 @@ struct Registry {
     flags: BTreeMap<String, u16>, services: BTreeMap<String, u16>,
     methods: BTreeMap<String, BTreeMap<String, u16>>,
     features: BTreeMap<String, BTreeMap<String, u16>>,
+    outcome: BTreeMap<String, u8>,
     tags: BTreeMap<String, u8>, branches: BTreeMap<String, u8>,
     codes: BTreeMap<String, ErrCode>,
 }
@@ -613,6 +624,7 @@ fn main() {
     for (side, f) in &reg.features {
         emit_mod_u16(&mut o, &format!("feature_{side}"), f);
     }
+    emit_mod_u8(&mut o, "outcome", &reg.outcome);
     emit_mod_u8(&mut o, "tag", &reg.tags);
     emit_mod_u8(&mut o, "branch", &reg.branches);
 
@@ -1199,28 +1211,48 @@ pub enum Outcome {
 
 impl Outcome {
     pub fn encode(&self) -> Vec<u8> {
+        use crate::consts::outcome;
         use rmp::encode as e;
         let mut o = Vec::new();
         e::write_array_len(&mut o, 2).unwrap();
         match self {
-            Outcome::Ok(body) => { e::write_pfix(&mut o, 0).unwrap();
+            Outcome::Ok(body) => {
+                e::write_pfix(&mut o, outcome::OK).unwrap();
                 // body is raw msgpack already; splice it in
-                o.extend_from_slice(body); }
-            Outcome::Error(ep) => { e::write_pfix(&mut o, 1).unwrap(); o.extend_from_slice(&ep.encode()); }
-            Outcome::Cancelled => { e::write_pfix(&mut o, 2).unwrap(); e::write_nil(&mut o).unwrap(); }
+                o.extend_from_slice(body);
+            }
+            Outcome::Error(ep) => {
+                e::write_pfix(&mut o, outcome::ERROR).unwrap();
+                o.extend_from_slice(&ep.encode());
+            }
+            Outcome::Cancelled => {
+                e::write_pfix(&mut o, outcome::CANCELLED).unwrap();
+                e::write_nil(&mut o).unwrap();
+            }
         }
         o
     }
     pub fn decode(b: &[u8]) -> Result<Outcome, CodecError> {
+        use crate::consts::outcome;
         use rmp::decode as d;
         let mut rd: &[u8] = b;
         let len = d::read_array_len(&mut rd).map_err(|e| CodecError::Malformed(format!("outcome: {e:?}")))?;
-        if len != 2 { return Err(CodecError::Malformed(format!("outcome len {len} != 2"))); }
+        if len != 2 {
+            return Err(CodecError::Malformed(format!("outcome len {len} != 2")));
+        }
         let status: u8 = d::read_pfix(&mut rd).map_err(|e| CodecError::Malformed(format!("status: {e:?}")))?;
         match status {
-            0 => Ok(Outcome::Ok(rd.to_vec())),
-            1 => Ok(Outcome::Error(ErrorPayload::decode(rd)?)),
-            2 => Ok(Outcome::Cancelled),
+            s if s == outcome::OK => Ok(Outcome::Ok(rd.to_vec())),
+            s if s == outcome::ERROR => Ok(Outcome::Error(ErrorPayload::decode(rd)?)),
+            s if s == outcome::CANCELLED => {
+                // Validate the body slot is `nil` rather than silently discarding trailing bytes.
+                match d::read_marker(&mut rd)
+                    .map_err(|e| CodecError::Malformed(format!("cancelled body: {e:?}")))?
+                {
+                    rmp::Marker::Null => Ok(Outcome::Cancelled),
+                    m => Err(CodecError::Malformed(format!("cancelled body expected nil, got {m:?}"))),
+                }
+            }
             s => Err(CodecError::Malformed(format!("unknown outcome status {s}"))),
         }
     }
@@ -1577,6 +1609,8 @@ $out .= "\n";
 foreach ($lock['methods'] as $svc => $kv) {
     foreach ($kv as $k => $v) { $out .= "    public const METHOD_" . strtoupper($svc) . "_{$k} = {$v};\n"; }
 }
+$out .= "\n";
+foreach ($lock['outcome'] as $k => $v) { $out .= "    public const OUTCOME_{$k} = {$v};\n"; }
 $out .= "\n";
 foreach ($lock['tags'] as $k => $v) { $out .= "    public const TAG_{$k} = {$v};\n"; }
 $out .= "\n";
