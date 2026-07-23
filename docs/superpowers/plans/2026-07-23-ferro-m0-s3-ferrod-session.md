@@ -1,375 +1,216 @@
-# Ferro M0 · Slice S3 — `ferrod` Session Skeleton Implementation Plan
+# Ferro M0 · Slice S3 — `ferrod` Session Skeleton Implementation Plan (v2)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`) syntax.
+> **v2** — rewritten after an adversarial plan-verification pass (wf_c18dc460) that found 3 blockers + 13 majors in v1. The concurrency model, terminal-delivery, error-envelope, and one-END scoping are now decided up front so no task is built against an undecided design.
 
-**Goal:** Stand up the `ferrod` daemon's session layer — a tokio UDS server that speaks the S1 wire protocol: peer-cred-gated connections, the `HELLO`/`HELLO_ACK` handshake with a per-boot epoch, request multiplexing with the **exactly-one-END** invariant, `PING`/`PONG`/`GOODBYE` liveness, `CANCEL`/`WINDOW_UPDATE` routing, credit-based flow-control primitives, a dispatch table (SQL/TX stubbed to `Unsupported` until S4/S5), session-fatal-vs-per-request error classification, and `SIGTERM` drain — with a `session_reader` fuzz target and the `ferrod` container image (deferred from S2). **No database yet** (that is S4).
+**Goal:** Stand up the `ferrod` daemon's session layer — a tokio UDS server speaking the S1 wire protocol: peer-cred-gated connections, the `HELLO`/`HELLO_ACK` handshake with a per-boot epoch, request multiplexing with the **exactly-one-END** invariant (a supervisor guarantees it even under handler panic), `PING`/`PONG`/`GOODBYE` liveness, `CANCEL`/`WINDOW_UPDATE` routing, credit flow-control primitives, a dispatch table (SQL/TX stubbed to `Unsupported` until S4/S5), session-fatal-vs-per-request error classification, and `SIGTERM` drain — with a classification-level fuzz target and the `ferrod` container image (deferred from S2). **No database yet** (S4).
 
-**Architecture:** One tokio task per connection. A `tokio_util::codec::Framed` adapts the runtime-free `ferro-proto` codec into a `Stream`/`Sink` of `(Header, payload)` frames. The connection task owns a single writer half; request handlers are spawned tasks that push frames through an mpsc to that writer, each wrapped in a **Drop-guarded `Responder`** that guarantees exactly one terminal `END` per in-flight `request_id` even under panic. An in-flight registry rejects reused ids. Handshake assigns a process-lifetime random `boot_epoch` and hard-fails on a `type_registry_hash` mismatch. The dispatch table answers core-service methods; SQL/TX return `Unsupported` (real handlers land in S4/S5); stream/admin return `Unsupported`.
+## Decided architecture (read before any task)
 
-**Tech Stack:** Rust 1.95 (edition 2024), `tokio` (rt-multi-thread, net, sync, signal, macros), `tokio-util` (codec), `futures`, `tracing`, `thiserror` (lib) + `anyhow` (binary edge), `getrandom` (epoch), `rustix` (SO_PEERCRED via `getsockopt`/`SO_PEERCRED`), `ferro-proto` (path). Dev: `tokio` test macros. Docker for the `ferrod` container.
+One tokio task per accepted connection ("the **session task**"). It owns:
+- a **reader loop** over `Framed<UnixStream, FrameCodec>`;
+- a long-lived **writer task** fed by TWO channels: a small **control channel** (`mpsc`, capacity ~= max_inflight+8) for HELLO_ACK / PONG / GOODBYE / WINDOW_UPDATE-ack / **every terminal END** / session-fatal errors, and a **data channel** (bounded, credit-limited) for streamed result frames (produced starting S5). The writer drains control first, then data. **Terminals and control are never blocked by stream backpressure** — this is how Blocker-3 (silently-dropped mandatory terminal) is prevented.
+- an **in-flight registry** (`std::sync::Mutex<HashMap<u32, InFlight>>`) keyed by `request_id`, holding ONLY request-bearing requests (services SQL/TX/STREAM). Core control/liveness frames never enter it.
+
+**Request handling = spawn-per-request + supervisor (the exactly-one-END mechanism).**
+- A request-bearing frame spawns a handler task that owns a `Responder` (holds a control-channel `Sender` clone + the request id + a shared `terminated: Arc<AtomicBool>`). The handler calls `responder.end_ok/end_error/end_cancelled(...)` exactly once; each `end_*` consumes `self`, enqueues the terminal on the control channel (which always has room — see below), then sets `terminated`.
+- The session task holds each handler's `JoinHandle`. When the handle resolves, the **supervisor** checks: if the task panicked (`JoinError::is_panic()`) OR completed with `terminated == false`, it synthesizes exactly one terminal `END` with a distinct `errc::Protocol` "handler produced no terminal" code and removes the registry entry. This does not rely on `Drop`-during-unwind timing; it works whether the handler returned early or panicked, and the writer task is always still alive (it is owned by the session task, not the handler).
+- **Control-channel deliverability:** at registry-insert the session task reserves a control-channel permit (`Sender::reserve_owned`) and hands it to the `InFlight`/`Responder`, so the terminal always has a slot even if other control traffic is queued. (Equivalently: size the control channel to `max_inflight + slack` and treat control as never-full; the reservation is the belt-and-suspenders.)
+- **`panic = "unwind"` is pinned** for the ferrod profile (documented as load-bearing); the supervisor's `JoinError::is_panic()` path also covers it. (`panic = "abort"` would kill the process, so it is forbidden for ferrod.)
+
+**Terminal envelope:** every terminal END encodes `ferro_proto::messages::Outcome` — `Outcome::Ok(body)` / `Outcome::Error(ErrorPayload)` / `Outcome::Cancelled` — via `Outcome::encode()`, on a frame with the `END` flag. There is no bare-`ErrorPayload` terminal anywhere.
+
+**Session-fatal errors** send ONE frame: `service=CORE, request_id=0, flags=END, payload=Outcome::Error(ErrorPayload{code, ...})`, then close.
 
 ## Global Constraints
 
-- **Exactly one END per in-flight request** (SPEC §5.2, charter rule 4). Every request_id, from first client frame to terminal, ends in one frame carrying the `END` flag — success, error, or cancelled. Enforced structurally by a Drop-guard, unforgeable under handler panic.
-- **`boot_epoch`**: random `u64` from `getrandom` at startup, constant for process life, injectable for tests (decision G-1). A changed epoch on reconnect voids all session state.
-- **`type_registry_hash` mismatch is a hard error** — close the connection (versioning story, SPEC §5).
-- **Session-fatal vs per-request** (decision G-4): session-fatal (bad magic, unsupported version, HELLO-not-first, type-registry mismatch, oversize frame > `MAX_FRAME_PAYLOAD`, undecodable header, peercred denial) → send one Protocol/Auth error frame then CLOSE. Per-request (unknown service/method, reused id, malformed payload, max_inflight) → error `END` on that id, keep the session.
-- **Protocol constants come only from `ferro_proto::consts`** — no hand-written method/flag/service/error/outcome numbers (charter rule 2).
-- **`MAX_FRAME_PAYLOAD` (16 MiB) is the codec's hard ceiling**; the `Framed` decoder rejects an oversize declared length with zero payload allocation (reuses the S1 header guard).
-- **Flow control** (SPEC §5.2, decision F-1): per-request credit window default 64 frames / 4 MiB (`consts::DEFAULT_CREDIT_*`); per-session aggregate cap 16 MiB. S3 builds the primitives + `WINDOW_UPDATE` routing; streaming consumers arrive in S5.
-- **No panics reachable from client bytes** — the reader/decoder returns typed errors; the `session_reader` fuzz target asserts arbitrary input always ends in a Protocol error frame or clean close, never a panic.
-- **UDS only in M0** (decision G-2): socket path from `FERRO_SOCK` env / default `/run/ferro/dev.sock`; `SO_PEERCRED` uid allow-list; stale socket unlinked on bind. TCP/bearer-token deferred.
-- **Charter gates**: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, and (unchanged) the PHP gates.
+- **Exactly one END per request-bearing request** (SPEC §5.2, charter rule 4), scoped to services SQL/TX/STREAM. Core control/liveness responses (HELLO_ACK, PONG, WINDOW_UPDATE-ack, GOODBYE) are **non-terminal `flags=0` frames**, not in the registry, not subject to one-END. Guaranteed by the supervisor (panic + no-terminal both covered); the diagnostic rejection of a reused id is a separate frame, not part of the original's lifecycle.
+- **Every terminal END = `Outcome::encode()`**; session-fatal frame = `CORE / rid=0 / END / Outcome::Error`.
+- **CANCEL and drain are flag-based**, never abort-based: the handler observes a cancel/drain flag and itself calls `end_cancelled()` (or the raced result). The supervisor's synthetic terminal is reserved strictly for the panic / no-terminal bug path and uses a distinct code.
+- **`boot_epoch`**: random `u64` from `getrandom` at startup, **constant across all connections of one running instance**, injectable for tests (G-1). Changes only on real restart.
+- **`type_registry_hash` mismatch is a hard error** → session-fatal close with `errc::UNSUPPORTED` (§5: forces regen/redeploy). The daemon's hash is `ferro_proto::TYPE_REGISTRY_HASH` (added in Task 3 by hashing `registry.lock.json` in build.rs).
+- **Session-fatal set (G-4):** bad magic, unsupported version, HELLO-not-first, type-registry mismatch, oversize frame (`FrameTooLarge`), undecodable/truncated header, **a set RESERVED flag (`OOB_FD`/`COMPRESSED` → `UnsupportedFlag`)**, peercred denial. **Per-request:** unknown service/method, reused in-flight id, malformed payload, `max_inflight` exceeded, **unknown non-reserved flag bits (`UnknownFlags`)** (payload_len is known so the frame is skippable). Session-fatal → one `rid=0` error frame + close; per-request → error `END` on that id, session survives.
+- **Protocol constants only from `ferro_proto::consts`** (charter rule 2). Terminal status uses `consts::outcome::*`; error codes `consts::errc::*`.
+- **`MAX_FRAME_PAYLOAD` (16 MiB)** is the codec's hard ceiling; the `Framed` decoder rejects an oversize declared length with zero payload allocation (S1 `Header::decode` guard, surfaced as a fatal `FrameError::Codec`).
+- **Flow control** (F-1): per-request credit default 64 frames / 4 MiB (`consts::DEFAULT_CREDIT_*`); **per-session aggregate cap `session_cap_bytes` defaults to its OWN literal `16*1024*1024`** (a distinct concept from `MAX_FRAME_PAYLOAD`, not coupled to it). S3 builds the primitives + WINDOW_UPDATE routing; stream producers arrive in S5.
+- **No panics reachable from client bytes** — the reader's byte→classification step is a pure function returning typed outcomes; the fuzz target asserts arbitrary input always terminates in a typed Protocol error or clean close, never a panic.
+- **UDS only** (G-2): socket path from `FERRO_SOCK` / default `/run/ferro/dev.sock`; `SO_PEERCRED` uid allow-list; stale socket unlinked on bind. `unsafe_code = "forbid"` is inherited from the workspace — peercred MUST use a safe wrapper (`rustix`/`nix`), never raw `libc::getsockopt`.
+- **request_id conventions** (from the committed vectors): HELLO_ACK echoes HELLO's request_id; PONG echoes PING's request_id (and token); GOODBYE + session-fatal control use request_id=0.
+- **Charter gates**: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`, plus the unchanged PHP gates.
 
 ## File Structure
 
 ```
 /engine/crates/ferrod/
-  Cargo.toml
-  src/main.rs               binary edge: config, tracing init, runtime, listener, signal wiring (anyhow)
+  Cargo.toml                (profile note: ferrod requires panic = "unwind")
+  src/main.rs               binary edge: config, tracing, runtime, listener, signal (anyhow)
   src/lib.rs                pub surface for integration tests
-  src/config.rs             Config { socket_path, peer_allow_uids, credit_frames/bytes, session_cap_bytes, drain_deadline }
+  src/config.rs             Config { socket_path, peer_allow_uids, credit_frames/bytes, session_cap_bytes, max_inflight, drain_deadline }
   src/epoch.rs              BootEpoch(u64) + EpochSource (real getrandom / injectable)
-  src/listener.rs           UDS bind (stale-unlink) + accept loop; TCP behind a Listener enum stub
-  src/peercred.rs           SO_PEERCRED read + uid allow-list check
-  src/shutdown.rs           SIGTERM -> drain token; drain deadline
-  src/dispatch.rs           method dispatch table -> handler or Unsupported
+  src/listener.rs           UDS bind (stale-unlink) + accept loop (peercred gate here)
+  src/peercred.rs           SO_PEERCRED via safe wrapper + uid allow-list
+  src/shutdown.rs           injectable drain signal + deadline
+  src/dispatch.rs           (service, method) -> Route { CoreControl | Request(handler) | Unsupported }
   src/session/
-    mod.rs                  Session::run(conn) orchestrator
-    codec.rs                tokio_util Encoder/Decoder over ferro-proto (Frame = (Header, Bytes))
-    reader.rs               frame read loop; session-fatal vs per-request classification
-    writer.rs               single-writer task fed by an mpsc<OutFrame>
-    registry.rs             in-flight request_id set; reuse rejection; max_inflight
-    responder.rs            Drop-guarded Responder (exactly-one-END)
+    mod.rs                  Session::run — reader loop + writer task + supervisor
+    codec.rs                FrameCodec (Encoder/Decoder) with FrameError { Codec, Io }
+    writer.rs               writer task draining control (priority) + data channels
+    registry.rs             in-flight registry (std::sync::Mutex), reuse rejection, max_inflight
+    responder.rs            consuming-typestate Responder (control permit) + terminated flag
+    supervisor.rs           awaits handler JoinHandles, synthesizes terminal on panic/no-terminal
     handshake.rs            HELLO/HELLO_ACK, epoch, type-registry hard check
     liveness.rs             PING/PONG, GOODBYE
-    flow.rs                 per-request credit + per-session cap + WINDOW_UPDATE apply
-    error.rs                SessionError (fatal vs per-request), -> ERROR frame mapping
-  tests/common/mod.rs       in-process client: connect a UDS pair, send frames, read frames
-  tests/handshake.rs  tests/session_rules.rs  tests/peercred.rs
-  fuzz/fuzz_targets/session_reader.rs
-/testkit/Dockerfile.ferrod  multi-stage build of the ferrod binary (deferred-from-S2)
+    flow.rs                 per-request Credit + per-session cap + WINDOW_UPDATE apply
+    classify.rs             pure bytes/decode-result -> Classification { Frame | PerRequestErr | FatalErr | NeedMore }
+    error.rs                SessionError (fatal vs per-request) -> Outcome::Error mapping
+  tests/common/mod.rs       in-process harness: real bound UnixListener + connect; recv() with real-time timeout
+  tests/handshake.rs  tests/session_rules.rs  tests/peercred.rs  tests/shutdown.rs
+  fuzz/fuzz_targets/session_classify.rs
+/proto (build.rs adds TYPE_REGISTRY_HASH by hashing registry.lock.json)
+/testkit/Dockerfile.ferrod  multi-stage ferrod build
 /testkit/docker-compose.yml (extended) ferrod sidecar sharing a socket volume with pg
 ```
 
 ---
 
-### Task 1: `ferrod` crate bootstrap + `Framed` codec adapter
+### Task 1: crate bootstrap + `Framed` codec adapter (with `FrameError`)
 
-**Files:**
-- Create: `engine/crates/ferrod/Cargo.toml`, `src/lib.rs`, `src/main.rs` (minimal), `src/session/codec.rs`, `src/session/mod.rs` (stub)
-- Create: `engine/crates/ferrod/tests/codec.rs`
+**Files:** Create `engine/crates/ferrod/{Cargo.toml, src/lib.rs, src/main.rs (minimal), src/session/mod.rs (stub: `pub mod codec;`), src/session/codec.rs}`, `tests/codec.rs`.
 
-**Interfaces:**
-- Produces: `session::codec::FrameCodec` implementing `tokio_util::codec::{Encoder<OutFrame>, Decoder}` where a decoded item is `InFrame { header: ferro_proto::header::Header, payload: bytes::Bytes }` and `OutFrame { header, payload }`. `Decoder::decode` rejects oversize/`bad-header` via the S1 `Header::decode` and buffers until the full payload is present. Consumed by every later task.
+**Interfaces:** Produces `session::codec::{FrameCodec, InFrame{header,payload:Bytes}, OutFrame{header,payload:Bytes}, FrameError}`. `FrameCodec` impls `tokio_util::codec::{Decoder, Encoder<OutFrame>}` with `type Error = FrameError`. `FrameError { Codec(ferro_proto::CodecError), Io(std::io::Error) }` with `From<io::Error>` (satisfies the tokio-util bound) and `From<ferro_proto::CodecError>` (so `Header::decode(..)?` works inside `decode`).
 
-- [ ] **Step 1: Crate manifest**
+- [ ] **Step 1: Cargo.toml** (as v1) — deps: `ferro-proto` (path), `tokio` (rt-multi-thread,net,sync,signal,macros,io-util,time), `tokio-util` (codec), `bytes`, `futures`, `tracing`, `tracing-subscriber`(env-filter), `thiserror`, `anyhow`, `getrandom`="0.2", `rustix`(net). dev: `tokio`(...,test-util). **Add a comment**: `# ferrod REQUIRES panic = "unwind" (see the workspace profile); the exactly-one-END supervisor depends on it.`
 
-```toml
-# engine/crates/ferrod/Cargo.toml
-[package]
-name = "ferrod"
-version = "0.0.0"
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+- [ ] **Step 2: failing codec test** — same three tests as v1 (`encode_then_decode_roundtrips_a_frame`, `decode_waits_for_full_payload`, `decode_rejects_bad_magic`) BUT the error type in assertions is `FrameError` (e.g. `assert!(matches!(codec.decode(&mut buf), Err(FrameError::Codec(_))))`).
 
-[lints]
-workspace = true
+- [ ] **Step 3: run → FAIL.**
 
-[dependencies]
-ferro-proto = { path = "../ferro-proto" }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "signal", "macros", "io-util", "time"] }
-tokio-util = { version = "0.7", features = ["codec"] }
-bytes = "1"
-futures = "0.3"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = "2"
-anyhow = "1"
-getrandom = "0.2"
-rustix = { version = "0.38", features = ["net"] }
-
-[dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util", "time", "test-util"] }
-```
-
-- [ ] **Step 2: Write the failing codec test**
+- [ ] **Step 4: implement `codec.rs`** — the `InFrame`/`OutFrame`/`FrameCodec` from v1, plus:
 
 ```rust
-// engine/crates/ferrod/tests/codec.rs
-use bytes::BytesMut;
-use ferro_proto::consts::{method_core, service};
-use ferro_proto::header::Header;
-use ferro_proto::messages::Ping;
-use ferrod::session::codec::{FrameCodec, InFrame, OutFrame};
-use tokio_util::codec::{Decoder, Encoder};
-
-fn ping_frame() -> OutFrame {
-    let payload = Ping { token: 7 }.encode();
-    OutFrame {
-        header: Header { flags: 0, service: service::CORE, method: method_core::PING,
-                         request_id: 1, payload_len: payload.len() as u32 },
-        payload: payload.into(),
-    }
-}
-
-#[test]
-fn encode_then_decode_roundtrips_a_frame() {
-    let mut codec = FrameCodec::default();
-    let mut buf = BytesMut::new();
-    codec.encode(ping_frame(), &mut buf).unwrap();
-
-    let decoded: InFrame = codec.decode(&mut buf).unwrap().expect("a full frame");
-    assert_eq!(decoded.header.service, service::CORE);
-    assert_eq!(decoded.header.method, method_core::PING);
-    assert_eq!(Ping::decode(&decoded.payload).unwrap(), Ping { token: 7 });
-    assert!(codec.decode(&mut buf).unwrap().is_none(), "buffer fully consumed");
-}
-
-#[test]
-fn decode_waits_for_full_payload() {
-    let mut codec = FrameCodec::default();
-    let mut buf = BytesMut::new();
-    codec.encode(ping_frame(), &mut buf).unwrap();
-    // Truncate to header + 1 byte: decoder must return Ok(None) (need more), not error/panic.
-    let full = buf.split();
-    let mut partial = BytesMut::from(&full[..17]);
-    assert!(codec.decode(&mut partial).unwrap().is_none());
-}
-
-#[test]
-fn decode_rejects_bad_magic() {
-    let mut codec = FrameCodec::default();
-    let mut buf = BytesMut::new();
-    codec.encode(ping_frame(), &mut buf).unwrap();
-    buf[0] = 0x00; // corrupt magic
-    assert!(codec.decode(&mut buf).is_err());
+// src/session/codec.rs (error type)
+#[derive(Debug, thiserror::Error)]
+pub enum FrameError {
+    #[error("codec: {0}")]
+    Codec(#[from] ferro_proto::CodecError),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 ```
+and `impl Decoder for FrameCodec { type Error = FrameError; ... Header::decode(&src[..HEADER_LEN])? ... }` (the `?` converts `CodecError -> FrameError` via the `#[from]`), `impl Encoder<OutFrame> for FrameCodec { type Error = FrameError; ... }`. Body identical to v1's codec logic (header decode/bounds, `split_to`/`advance`/`freeze`, oversize guard on encode).
 
-- [ ] **Step 3: Run to verify FAIL**
-
-Run: `cargo test -p ferrod --test codec`
-Expected: FAIL (module `session::codec` missing).
-
-- [ ] **Step 4: Implement the codec**
-
-```rust
-// engine/crates/ferrod/src/session/codec.rs
-use bytes::{Buf, Bytes, BytesMut};
-use ferro_proto::consts::MAX_FRAME_PAYLOAD;
-use ferro_proto::header::{Header, HEADER_LEN};
-use ferro_proto::CodecError;
-use tokio_util::codec::{Decoder, Encoder};
-
-#[derive(Debug, Clone)]
-pub struct InFrame {
-    pub header: Header,
-    pub payload: Bytes,
-}
-#[derive(Debug, Clone)]
-pub struct OutFrame {
-    pub header: Header,
-    pub payload: Bytes,
-}
-
-#[derive(Default)]
-pub struct FrameCodec;
-
-impl Decoder for FrameCodec {
-    type Item = InFrame;
-    type Error = CodecError;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<InFrame>, CodecError> {
-        if src.len() < HEADER_LEN {
-            return Ok(None); // need the header
-        }
-        // Validate header (magic/version/oversize) WITHOUT consuming yet.
-        let header = Header::decode(&src[..HEADER_LEN])?; // FrameTooLarge etc. bubble up = fatal
-        let need = HEADER_LEN + header.payload_len as usize;
-        if src.len() < need {
-            src.reserve(need - src.len());
-            return Ok(None); // need the payload
-        }
-        src.advance(HEADER_LEN);
-        let payload = src.split_to(header.payload_len as usize).freeze();
-        Ok(Some(InFrame { header, payload }))
-    }
-}
-
-impl Encoder<OutFrame> for FrameCodec {
-    type Error = CodecError;
-    fn encode(&mut self, item: OutFrame, dst: &mut BytesMut) -> Result<(), CodecError> {
-        debug_assert_eq!(item.header.payload_len as usize, item.payload.len());
-        if item.payload.len() > MAX_FRAME_PAYLOAD as usize {
-            return Err(CodecError::FrameTooLarge { len: item.payload.len() as u32, max: MAX_FRAME_PAYLOAD });
-        }
-        dst.extend_from_slice(&item.header.encode());
-        dst.extend_from_slice(&item.payload);
-        Ok(())
-    }
-}
-```
-
-```rust
-// engine/crates/ferrod/src/session/mod.rs  (stub — filled by later tasks)
-pub mod codec;
-```
-```rust
-// engine/crates/ferrod/src/lib.rs
-pub mod session;
-```
-```rust
-// engine/crates/ferrod/src/main.rs  (minimal — real wiring in Task 2/7)
-fn main() {
-    eprintln!("ferrod skeleton — session server wired in later S3 tasks");
-}
-```
-
-- [ ] **Step 5: Run to verify PASS + gates**
-
-Run: `cargo test -p ferrod --test codec` → PASS.
-Run: `cargo fmt --check && cargo clippy -p ferrod -- -D warnings` → clean.
-
-- [ ] **Step 6: Commit** — `git commit -m "feat(s3): ferrod crate + tokio-util Framed codec over ferro-proto"`
+- [ ] **Step 5: run → PASS; fmt/clippy clean.**  **Step 6: commit** `feat(s3): ferrod crate + Framed codec (FrameError over ferro-proto CodecError + io::Error)`.
 
 ---
 
-### Task 2: UDS listener + SO_PEERCRED allow-list + stale-socket unlink + config
+### Task 2: UDS listener + SO_PEERCRED (safe) + stale-unlink + config + epoch
 
-**Files:**
-- Create: `src/config.rs`, `src/peercred.rs`, `src/listener.rs`, `src/epoch.rs`
-- Create: `engine/crates/ferrod/tests/peercred.rs`
+**Files:** Create `src/config.rs`, `src/peercred.rs`, `src/listener.rs`, `src/epoch.rs`; `tests/peercred.rs`.
 
-**Interfaces:**
-- Produces: `Config` (from env + defaults); `peercred::peer_uid(&UnixStream) -> io::Result<u32>` and `Config::uid_allowed(uid) -> bool`; `listener::bind_uds(&Config) -> io::Result<UnixListener>` (unlinks a stale socket first); `epoch::BootEpoch` with a real and an injectable source.
+**Interfaces:** `Config` (env + defaults, incl. `session_cap_bytes = 16*1024*1024` literal, `max_inflight`, `peer_allow_uids: Vec<u32>` where empty = allow only the daemon's own uid); `peercred::peer_uid(&impl AsFd) -> io::Result<u32>` via a **safe** rustix/nix wrapper (NO raw libc — `unsafe_code` is forbidden); `Config::uid_allowed(uid)`; `listener::bind_uds(&Config)` (unlink stale path first); `epoch::{BootEpoch, EpochSource}` (real `getrandom` + injectable).
 
-- [ ] **Step 1..N** (TDD): tests assert `peer_uid` returns the current uid for a connected `UnixStream` pair; `uid_allowed` honors an allow-list (empty list = allow the daemon's own uid only, or all — pick per config default and TEST it); `bind_uds` unlinks a pre-existing socket file and succeeds; binding twice from one process errors cleanly. Implement `peercred` via `rustix::net::sockopt::socket_peercred` (or `getsockopt(SO_PEERCRED)`), `listener` via `tokio::net::UnixListener` with `std::fs::remove_file` on `AddrInUse`/existing path, `epoch` via `getrandom` with an injectable `EpochSource` trait for deterministic tests.
-
-*(Reviewer/implementer note: keep peercred Linux-only behind `#[cfg(target_os = "linux")]`; the acceptance suite runs on Linux/WSL2. Provide the exact `rustix` call the installed version exposes; the tests assert behavior, not the API name.)*
-
-- [ ] **Final Step: Commit** — `git commit -m "feat(s3): UDS listener (stale-unlink) + SO_PEERCRED allow-list + config + boot epoch"`
+- [ ] **TDD tests:** `peer_uid` on a `UnixStream::pair()` returns the current uid; `uid_allowed` honors the allow-list AND the empty-list=self-only default (test both); `bind_uds` unlinks a pre-existing socket file and succeeds; the **deny path** is tested in Task 3's peercred integration test (needs the accept loop), not here — this task unit-tests `peer_uid`/`uid_allowed`/`bind_uds` only.
+- [ ] **Implement** peercred with the exact safe rustix 0.38 symbol (confirm at impl against `AsFd`; if 0.38 lacks a safe peercred getter, use `nix::sys::socket::getsockopt(.., PeerCredentials)` — add `nix` and keep it safe). listener via `tokio::net::UnixListener` + `std::fs::remove_file` guard. epoch via `getrandom` behind an `EpochSource` trait.
+- [ ] **Commit** `feat(s3): UDS listener (stale-unlink) + safe SO_PEERCRED + config + boot epoch`.
 
 ---
 
-### Task 3: Session task + handshake (HELLO/HELLO_ACK, epoch, type-registry hard check)
+### Task 3: session task + handshake + `TYPE_REGISTRY_HASH` + writer task
 
-**Files:**
-- Create: `src/session/writer.rs`, `src/session/handshake.rs`, `src/session/error.rs`; extend `src/session/mod.rs`
-- Create: `engine/crates/ferrod/tests/common/mod.rs`, `engine/crates/ferrod/tests/handshake.rs`
+**Files:** Create `src/session/{writer.rs, handshake.rs, error.rs}`, extend `mod.rs`; `tests/common/mod.rs`, `tests/handshake.rs`. **Also** `engine/crates/ferro-proto/build.rs` (+ maybe a tiny helper): add `pub const TYPE_REGISTRY_HASH: &str` = a hex hash (inline FNV-1a is fine) of the committed `registry.lock.json` bytes (build.rs already has `rerun-if-changed` on it — no registry-schema change, no gen-php/registry_sync churn; PHP-side parity deferred to the PHP client slice).
 
-**Interfaces:**
-- Produces: `Session::run(stream, config, epoch)` that (a) reads the first frame, requires it to be `core/HELLO` (else session-fatal), (b) verifies `type_registry_hash` against `ferro_proto` (mismatch → hard error frame + close), (c) replies `HELLO_ACK { engine_version, boot_epoch, features: 0, pools: [], type_registry_hash }`, then enters the frame loop (stubbed to answer PING in this task, extended later). `tests/common` exposes an in-process harness: `connect() -> (client_io, server JoinHandle)` over a `UnixStream::pair()`, plus `send(frame)` / `recv() -> InFrame` helpers.
+**Interfaces:** `Session::run(stream, config, epoch)`: spawn the writer task (owns the write half, drains control-then-data); read the first frame — require `core/HELLO` else session-fatal (`rid=0` Outcome::Error close); verify `hello.type_registry_hash == ferro_proto::TYPE_REGISTRY_HASH` else session-fatal `Unsupported` close; reply `HELLO_ACK{engine_version, boot_epoch, features:0, pools:[], type_registry_hash}` echoing the HELLO request_id (control channel, flags=0); then enter the reader loop (answers PING in this task; extended in T4-T6). `tests/common` = a **real bound `UnixListener` + client `UnixStream::connect`** harness (so the accept-loop/peercred path is exercisable), with `send(OutFrame)` and `recv() -> InFrame` where **recv wraps `Framed::next()` in a real-time `tokio::time::timeout`** (a missing/mis-ordered frame or a writer deadlock fails fast, never hangs CI).
 
-- [ ] **TDD tests (handshake.rs):** HELLO→HELLO_ACK round-trips and the ACK carries the injected `boot_epoch`; a first frame that is not HELLO closes the connection (server task ends, client sees EOF after an error frame); a HELLO with a wrong `type_registry_hash` yields a Protocol/Unsupported error frame then close; the same server started twice yields the same epoch only if the same injected source is used (proves epoch is injected, not re-randomized per connection).
-
-- [ ] **Implement** the writer task (owns the write half, drains an `mpsc::Receiver<OutFrame>`), the handshake, and `SessionError` (fatal vs per-request) with `-> ferro_proto::messages::ErrorPayload` mapping using `consts::errc`. The type-registry hash the daemon compares against is `ferro_proto`'s own registry hash — expose it from `ferro-proto` if not already (a `pub const TYPE_REGISTRY_HASH: &str` generated from the lock, or hash the lock at build time); if adding it, that is a `/proto`+build.rs change (charter rule 2) — do it in this task and note it.
-
-- [ ] **Commit** — `git commit -m "feat(s3): session task + HELLO/HELLO_ACK handshake with epoch + type-registry hard check"`
+- [ ] **TDD tests:** HELLO→HELLO_ACK round-trips, ACK echoes the HELLO request_id and carries the injected `boot_epoch`; a non-HELLO first frame → one `rid=0` Outcome::Error frame then EOF; a wrong `type_registry_hash` → `Unsupported` Outcome::Error then EOF; **two separate connections to the SAME running instance receive identical `boot_epoch`** (the §19.1 property), and a real `getrandom` source yields some value (injected-equality kept only as a determinism aid).
+- [ ] **Implement** writer task (select over control + data receivers, control prioritized), handshake, and `error.rs` mapping `SessionError -> Outcome::Error(ErrorPayload)` using `consts::errc` (type-registry mismatch → `UNSUPPORTED`; header faults → `PROTOCOL`; peercred → `AUTH`).
+- [ ] **Commit** `feat(s3): session/writer/handshake + ferro-proto TYPE_REGISTRY_HASH + timeout harness`.
 
 ---
 
-### Task 4: Drop-guarded Responder + in-flight registry + exactly-one-END + request_id reuse
+### Task 4: in-flight registry + consuming-typestate Responder + supervisor (exactly-one-END)
 
-**Files:**
-- Create: `src/session/responder.rs`, `src/session/registry.rs`; extend `mod.rs`
-- Create/extend: `engine/crates/ferrod/tests/session_rules.rs`
+**Files:** Create `src/session/{registry.rs, responder.rs, supervisor.rs}`, extend `mod.rs`; extend `tests/session_rules.rs`.
 
 **Interfaces:**
-- Produces: `Registry` (tracks in-flight `request_id`s, rejects reuse with a per-request Protocol error, enforces `max_inflight`); `Responder { id, tx }` with `stream_frame(...)`, `end_ok(payload)`, `end_error(ErrorPayload)`, `end_cancelled()`, and a `Drop` impl that, if no terminal was sent, pushes exactly one synthetic terminal error `END` and removes the registry entry.
+- `Registry` (`std::sync::Mutex<HashMap<u32, InFlight>>`): `insert(id) -> Result<Guard, ReuseOrFull>` (rejects a reused in-flight id and `max_inflight`); entry removed by the **supervisor** when the handler resolves (NOT from Drop).
+- `Responder` (consuming typestate): `end_ok(self, body: Bytes)`, `end_error(self, ErrorPayload)`, `end_cancelled(self)` — each enqueues the terminal (`Outcome::encode`) on the reserved control permit, **then** sets `terminated: Arc<AtomicBool>`; returns a `Terminated` token. Holds the request id + control permit + `terminated`.
+- `supervisor`: for each request, `tokio::spawn` the handler returning its `JoinHandle`; the session task awaits handles; on resolve, if `join.is_err() && is_panic()` OR `terminated == false`, emit exactly one terminal `Outcome::Error(ErrorPayload{code: errc::PROTOCOL})` with a **distinct "no terminal from handler" detail string** on that id, then remove the registry entry.
 
-- [ ] **TDD tests:** a handler that returns without ending yields exactly one terminal `END` (Drop synthesizes it); a handler that panics yields exactly one terminal error `END` (catch via the spawned task's `JoinHandle` being aborted/dropped — the Responder Drop still fires); reusing an in-flight `request_id` yields a Protocol error on that id and does NOT disturb the original; exceeding `max_inflight` yields a per-request error, session stays up. Assert "exactly one END" by counting `END`-flagged frames per id at the client.
-
-- [ ] **Implement** the Responder with an `ended: bool` (or a consumed-on-terminal typestate) and a `Drop` that emits the synthetic END through the writer mpsc (best-effort; ignore send error if the session is already gone). The registry is a `HashMap<u32, ()>`/`HashSet<u32>` guarded per-session (single-threaded per connection task, so a `RefCell`/plain field suffices if handlers report back via the mpsc; if handlers are spawned tasks, use `Arc<Mutex<..>>` or an actor channel — pick one and document the concurrency model).
-
-- [ ] **Commit** — `git commit -m "feat(s3): Drop-guarded Responder (exactly-one-END) + in-flight registry + reuse rejection"`
+- [ ] **TDD tests (deterministic, barrier-gated — no sleeps):**
+  - `end_ok yields exactly one END, supervisor adds none`: a handler that calls `end_ok` → client reads one END for the id; then a `tokio::time::timeout` read asserts **no second frame** (at-most-one).
+  - `panic without end_* → exactly one supervisor terminal with the distinct code`: the handler panics WITHOUT calling any `end_*` (so the ONLY route to an END is the supervisor); assert one END whose ERROR payload carries the distinct "no terminal" detail; then assert the **session still answers a subsequent PING** (panic isolation — the connection survives).
+  - `reused in-flight id → diagnostic Protocol error on that (nonzero) id, original undisturbed`: use a barrier (`tokio::sync::Notify`) to hold request A in-flight; send a second frame reusing A's id → client gets a Protocol error frame for the reuse (counted separately, NOT via a Responder), then release A → A still emits its own single terminal END.
+  - `max_inflight exceeded → per-request error, session survives`.
+- [ ] **Implement** per the decided architecture; document the concurrency model at the top of `mod.rs`.
+- [ ] **Commit** `feat(s3): registry + consuming-typestate Responder + supervisor (exactly-one-END incl. panic)`.
 
 ---
 
-### Task 5: Liveness (PING/PONG) + GOODBYE drain + CANCEL + WINDOW_UPDATE routing
+### Task 5: liveness (PING/PONG) + GOODBYE drain + CANCEL (flag-based) + WINDOW_UPDATE
 
-**Files:**
-- Create: `src/session/liveness.rs`, `src/session/flow.rs`; extend `dispatch.rs`, `mod.rs`
-- Extend: `tests/session_rules.rs`
+**Files:** `src/session/liveness.rs`, `src/session/flow.rs` (primitive), extend `dispatch.rs`, `mod.rs`; extend `tests/session_rules.rs`.
 
-**Interfaces:**
-- Produces: PING→PONG (echoing token) answered even while another request is in flight (multiplexing); `GOODBYE` initiates graceful drain (stop accepting new requests, finish in-flight, then close); `CANCEL` (flag on a frame with `request_id`=target, empty payload) marks the target cancelled — advisory + idempotent (no-op if already done); `WINDOW_UPDATE` (core method, `request_id`=target, `{frames, bytes}`) applies credit to that request's flow window (primitive only; no streaming producer yet).
+**Interfaces:** PING→PONG (echo request_id + token, control channel, flags=0) answered while a request is in flight (multiplexing); `GOODBYE` → stop accepting new requests, let in-flight finish, then close; `CANCEL` (flag on a frame, request_id=target, empty payload) sets a per-request cancel flag — the handler observes it and calls `end_cancelled()` (advisory + idempotent; no-op if already terminated/unknown); `WINDOW_UPDATE` (core method, request_id=target, `{frames,bytes}`) applies credit to that request's `flow::Credit`.
 
-- [ ] **TDD tests:** a PING sent while a long (stubbed-slow) request is in flight gets a PONG before the slow request's END (multiplexing works); `CANCEL` on an in-flight id is idempotent and the request still terminates in exactly one END (`Cancelled` or raced result); `CANCEL` on an unknown/completed id is a no-op; `GOODBYE` lets in-flight finish then closes (client sees the in-flight END then EOF); `WINDOW_UPDATE` on a request replenishes its credit counters (unit-test the `flow` primitive directly).
-
-- [ ] **Commit** — `git commit -m "feat(s3): PING/PONG liveness, GOODBYE drain, CANCEL, WINDOW_UPDATE routing"`
+- [ ] **TDD tests (barrier-gated):** a PING sent while request A is held in-flight (via Notify) gets its PONG **before** A's terminal (multiplexing); `CANCEL` on the held A is idempotent and A terminates in exactly one END with **`Outcome::Cancelled`** (assert the status is Cancelled, not Error); `CANCEL` on an unknown/completed id is a no-op (no frame); `GOODBYE` with A in-flight → A's terminal is delivered, then EOF; `WINDOW_UPDATE` unit-tests `flow::Credit` debit/replenish directly.
+- [ ] **Commit** `feat(s3): PING/PONG, GOODBYE drain, flag-based CANCEL (Cancelled terminal), WINDOW_UPDATE`.
 
 ---
 
-### Task 6: Flow-control primitives + dispatch table + error classification
+### Task 6: reader classification + flag validation + dispatch table + flow cap
 
-**Files:**
-- Extend: `src/session/flow.rs`, `src/dispatch.rs`, `src/session/reader.rs`, `src/session/error.rs`
-- Extend: `tests/session_rules.rs`
+**Files:** Create `src/session/classify.rs`, extend `src/session/flow.rs`, `src/dispatch.rs`, `mod.rs`, `error.rs`; extend `tests/session_rules.rs`.
 
 **Interfaces:**
-- Produces: `flow::Credit` (per-request window: 64 frames / 4 MiB default from `consts`, debited per stream frame, replenished by WINDOW_UPDATE) + a per-session 16 MiB aggregate cap; `dispatch::dispatch(service, method) -> Route` where core methods route to their handlers, `sql`/`tx` return `NonRetryable{Unsupported}` (real handlers in S4/S5), `stream`/`admin` return `Unsupported`; the reader's session-fatal-vs-per-request classification (decision G-4) with the exact fatal set from Global Constraints.
+- `classify.rs`: a **pure** step mapping a decode result → `Classification { Frame(InFrame) | PerRequestErr{rid, ErrorPayload} | FatalErr(ErrorPayload) | NeedMore }`, applying `flags::validate` (RESERVED set → fatal `UnsupportedFlag`; `UnknownFlags` → per-request skip) and the G-4 fatal/per-request split. This function is what the fuzz target (Task 8) exercises.
+- `dispatch.rs`: `(service, method) -> Route`: core control methods → their handlers (non-registry); SQL/TX → per-request `NonRetryable{Unsupported}` stub (real handlers S4/S5); STREAM/ADMIN → `Unsupported`.
+- `flow.rs`: per-session `session_cap_bytes` aggregate cap alongside the per-request `Credit`.
 
-- [ ] **TDD tests:** unknown service/method → per-request `Unsupported` error END, session survives; an unsupported reserved flag set on a frame → session-fatal close; a frame with `payload_len > MAX_FRAME_PAYLOAD` → session-fatal close (Protocol) with zero payload read (the codec guard); credit debit/replenish + the session cap are unit-tested; a `sql`/`tx` method returns `Unsupported` (stub) not a panic.
-
-- [ ] **Commit** — `git commit -m "feat(s3): flow-control primitives + dispatch table (sql/tx stubbed) + fatal/per-request classification"`
+- [ ] **TDD tests:** unknown service/method → per-request `Unsupported` END, session survives; a set reserved flag (`OOB_FD`) → session-fatal close; an unknown non-reserved flag bit → per-request skip + session survives; `payload_len > MAX_FRAME_PAYLOAD` → session-fatal close, zero payload read; `sql`/`tx` method → `Unsupported` stub (no panic); credit + session-cap unit-tested.
+- [ ] **Commit** `feat(s3): pure reader classification + flag validation + dispatch stubs + session flow cap`.
 
 ---
 
 ### Task 7: SIGTERM drain + main wiring
 
-**Files:**
-- Create: `src/shutdown.rs`; finalize `src/main.rs`
-- Extend: `tests/session_rules.rs` (or a `tests/shutdown.rs`)
+**Files:** `src/shutdown.rs`, finalize `src/main.rs`; `tests/shutdown.rs`.
 
-**Interfaces:**
-- Produces: `shutdown::drain_on_sigterm() -> CancellationToken`-like signal; `main` builds the runtime, binds the listener, spawns a session task per accept, and on `SIGTERM` stops accepting, lets in-flight sessions drain up to `drain_deadline`, then hard-closes. Binary runs: `ferrod` listens on the configured socket.
+**Interfaces:** injectable drain token; `main` builds the multi-thread runtime, binds the listener, peercred-gates + spawns a session task per accept, and on drain stops accepting, lets in-flight sessions drain up to `drain_deadline`, then hard-closes. Drain sets the per-session drain flag so handlers can `end_cancelled()` cooperatively (never abort).
 
-- [ ] **TDD/integration test:** start the server in-process, connect, begin an in-flight request, send the drain signal, assert new connections are refused while the in-flight request still finishes with its one END, then the server exits within the deadline. (Simulate SIGTERM via the injectable drain token in tests rather than a real signal.)
-
-- [ ] **Manual run:** `cargo run -p ferrod` binds `/run/ferro/dev.sock` (or `$FERRO_SOCK`); a scratch client (or `tests/common`) completes a HELLO/PING/GOODBYE cycle. Capture it.
-
-- [ ] **Commit** — `git commit -m "feat(s3): SIGTERM drain + main wiring (bind, accept loop, graceful shutdown)"`
+- [ ] **TDD/integration test (injected token, not a real signal):** with request A in-flight (barrier), trigger drain → new connections refused while A finishes with its one END → server exits within the deadline.
+- [ ] **Manual run:** `cargo run -p ferrod` binds `$FERRO_SOCK`/default; the harness completes HELLO/PING/GOODBYE. Capture it.
+- [ ] **Commit** `feat(s3): SIGTERM drain + main wiring (bind, peercred accept loop, graceful shutdown)`.
 
 ---
 
-### Task 8: `session_reader` fuzz target
+### Task 8: `session_classify` fuzz target
 
-**Files:**
-- Create: `engine/crates/ferrod/fuzz/Cargo.toml`, `fuzz/fuzz_targets/session_reader.rs`
+**Files:** `engine/crates/ferrod/fuzz/{Cargo.toml, fuzz_targets/session_classify.rs}`.
 
-**Interfaces:**
-- Consumes: the codec + reader classification. The target feeds arbitrary bytes to `FrameCodec::decode` in a loop (simulating the read side) and asserts it never panics and always either yields frames or returns a typed error (which the reader maps to a Protocol error + close). Optionally drive a full in-memory session read loop over the arbitrary bytes.
+**Interfaces:** fuzz the **pure `classify` step** (Task 6) — arbitrary bytes → drive `FrameCodec::decode` + `classify` in a loop that **breaks on `NeedMore`/empty** — asserting it never panics and every input terminates in a typed `FatalErr`/`PerRequestErr` or clean end (not just re-fuzzing S1's `Header::decode`). Own `[workspace]` table; deps `libfuzzer-sys`, `ferrod` + `ferro-proto` paths.
 
-- [ ] **Implement** the fuzz crate (own `[workspace]` table, `libfuzzer-sys`, `ferrod`/`ferro-proto` path deps) and the target. **Run it in nightly Docker** (host has no nightly): `docker run --rm -v "$PWD":/w -w /w rustlang/rust:nightly bash -c 'cargo install cargo-fuzz --locked && cd engine/crates/ferrod && cargo +nightly fuzz run session_reader -- -runs=50000 -max_total_time=90'` — no crash. Fall back to CI-deferred (documented) only if the container path is infeasible. Add the target to CI's fuzz-smoke lane.
-
-- [ ] **Commit** — `git commit -m "test(s3): session_reader cargo-fuzz target (no-panic on arbitrary bytes)"`
+- [ ] **Run in nightly Docker** (host has no nightly): `docker run --rm -v "$PWD":/w -w /w rustlang/rust:nightly bash -c 'cargo install cargo-fuzz --locked && cd engine/crates/ferrod && cargo +nightly fuzz run session_classify -- -runs=50000 -max_total_time=90'` — no crash. Add to CI's fuzz-smoke lane. Fallback: CI-deferred (documented) if the container path is infeasible.
+- [ ] **Commit** `test(s3): session_classify fuzz (reader classification never panics)`.
 
 ---
 
 ### Task 9: `ferrod` container image + sidecar compose (deferred from S2)
 
-**Files:**
-- Create: `testkit/Dockerfile.ferrod`
-- Extend: `testkit/docker-compose.yml` (add a `ferrod` service sharing a socket volume; note pg is present for later slices)
+**Files:** `testkit/Dockerfile.ferrod`; extend `testkit/docker-compose.yml` (add `ferrod` sidecar sharing a `/run/ferro` socket volume with `pg`).
 
-**Interfaces:**
-- Produces: a multi-stage Docker build of the `ferrod` binary (rust:1.95 builder → slim runtime), and a compose `ferrod` service mounting a shared `emptyDir`-style volume for `/run/ferro` (the UDS), started alongside `pg`. Validates the daemon runs in a container.
-
-- [ ] **Build + run:** `docker build -f testkit/Dockerfile.ferrod -t ferrod:dev .` succeeds; `docker compose -f testkit/docker-compose.yml up -d ferrod` starts the daemon; a client (or an exec'd smoke) completes a HELLO/PING over the shared socket volume. Capture it. (No DB interaction yet — that is S4/S5.)
-
-- [ ] **Commit** — `git commit -m "feat(s3): ferrod container image + sidecar compose (shared socket volume)"`
+- [ ] **Build + run:** `docker build -f testkit/Dockerfile.ferrod -t ferrod:dev .` (multi-stage rust:1.95 builder → slim runtime); `docker compose up -d ferrod`; an exec'd or mounted client completes HELLO/PING over the shared socket volume. Capture it. (No DB yet.)
+- [ ] **Commit** `feat(s3): ferrod container image + sidecar compose (shared socket volume)`.
 
 ---
 
-## Self-Review
+## Self-Review (v2)
 
-- **Spec coverage (design S3 gate):** handshake+epoch+registry-hard-check → T3; request_id reuse rejected → T4; exactly-one-END incl. Responder Drop → T4; multiplexed PING → T5; CANCEL idempotent / GOODBYE drain → T5; peercred allow/deny → T2; SIGTERM drain → T7; core golden vectors byte-match (reuses S1 vectors via the codec) → T1; `session_reader` fuzz never panics → T8; flow-control primitives + dispatch stubs + fatal/per-request → T5/T6; ferrod container → T9.
-- **Deferred (noted):** real SQL/TX handlers (S4/S5 replace the `Unsupported` stubs); streaming producers that consume the credit windows (S5); the whole-branch review's S3 items — Rust rejects map-encoded messages (harden the reader here or at S5) and PHP flags::validate parity (PHP client slice).
-- **Concurrency model decision (call it in T4 and keep it consistent):** either (a) all frame handling on the single connection task with cooperative async (no per-request spawns; simplest, and PING-while-busy needs `select!` over reader + a work queue), or (b) spawn a task per request with an mpsc back to the single writer (true multiplexing, needs `Arc<Mutex>`/actor for the registry). Pick based on what makes multiplexed-PING (T5) pass cleanly; document it in `session/mod.rs`.
-- **Execution-time confirmations:** exact `rustix`/`tokio-util 0.7`/`getrandom` API names (tests assert behavior); nightly Docker availability for the fuzz run (fallback documented); `ferro-proto` type-registry-hash constant may need adding (a `/proto`+build.rs change in T3).
+- **Blockers fixed:** FrameError codec Error type (B1); spawn-per-request + supervisor committed up front, no undecided model (B2); two-channel writer + reserved control permit so terminals are never backpressure-dropped, Full-vs-Closed moot (B3).
+- **Majors fixed:** every terminal is `Outcome::encode()` incl. session-fatal + synthetic (M1); one-END/registry scoped to request-bearing services, control/liveness excluded (M2); synthetic terminal reserved for panic/no-terminal with a distinct code, CANCEL/drain flag-based → Cancelled status (M3, M6); reused-id diagnostic frame separate, original undisturbed, oracle refined (M4); `std::sync::Mutex` registry, removal off the Drop path (into the supervisor) (M5); flag-validation added to reader + G-4 set, agrees with Task 6 (M7); session-fatal frame pinned to CORE/rid=0/END/Outcome::Error (M8); peercred safe-wrapper only, libc fallback deleted (M9); deny tested via allow-list-excludes-self + real accept loop (M10); barrier-gated in-flight tests, no sleeps (M11); fuzz targets the classify step (M12); one-END test asserts at-most-one via timeout + distinct synthetic code + panic-without-end (M13).
+- **Minors fixed:** panic=unwind pinned + supervisor JoinError path (m1); rid conventions stated (m2); type-registry mismatch code pinned to Unsupported (m3); session_cap_bytes own literal (m4); TYPE_REGISTRY_HASH by hashing the lock, no schema churn, PHP parity deferred (m5); harness recv() real-time timeout (m6); epoch test = two connections same instance (m7).
+- **Deferred (noted):** real SQL/TX handlers + stream producers consuming credit (S4/S5); Rust rejecting map-encoded messages (harden at S5 decode of untrusted client EXEC); PHP flags::validate + TYPE_REGISTRY_HASH parity (PHP client slice).
+- **Execution-time confirmations:** exact `rustix`/`nix` peercred symbol, `tokio-util 0.7` codec signatures, `getrandom 0.2` API, `Sender::reserve_owned` availability — tests assert behavior; nightly Docker for fuzz (fallback documented).
 
 ## Execution Handoff
 
-Subagent-driven: fresh implementer per task (TDD, gates), review after each (this slice is concurrency-critical — reviewers should probe the one-END invariant, panic-safety, and the fatal/per-request split hard), then a whole-branch adversarial review before S4.
+Subagent-driven: fresh implementer per task (TDD, gates), review after each (probe one-END at-most-one, panic isolation + session survival, the fatal/per-request split, terminal envelope), then a whole-branch adversarial review before S4.
