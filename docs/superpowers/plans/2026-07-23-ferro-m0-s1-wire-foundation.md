@@ -315,7 +315,7 @@ git commit -m "chore(s1): bootstrap workspace, ferro-proto crate, ferro/client p
 
 **Interfaces:**
 - Produces: `ferro_proto::consts` — `PROTOCOL_VERSION: u8`, `MAGIC: u8`, `MAX_FRAME_PAYLOAD: u32`, `DEFAULT_CREDIT_FRAMES: u32`, `DEFAULT_CREDIT_BYTES: u32`; modules `flags`, `service`, `method_core` (per-service methods are emitted as `method_<service>`), `tag`, `errc` (each `pub const NAME: u16` plus `NAME_BRANCH: u8`), `branch`, `feature_engine`, `feature_client`. Consumed by Tasks 3–7 and mirrored into PHP `Constants.php` in Task 8.
-- Produces: `ferro_proto::registry::Registry` (+ `from_toml_dir`, `to_lock_json`) used by the gen bin and the sync test.
+- Produces: `ferro_proto::registry::Registry` with `to_lock_json()`, used by the gen bin and the sync test. (The gen bin parses the three TOML files into a `Registry` via local deserialize structs — there is no `Registry::from_toml_dir` method.)
 
 - [ ] **Step 1: Write the registry TOML (single source of truth)**
 
