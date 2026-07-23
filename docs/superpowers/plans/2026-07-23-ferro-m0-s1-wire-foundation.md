@@ -943,6 +943,18 @@ fn roundtrip_all_scalars() {
         assert_eq!(dec(&enc(&v)), v);
     }
 }
+
+#[test]
+fn lying_length_prefix_is_rejected_before_allocating() {
+    // str32 (0xdb) claiming ~4 GiB with no body must error via the bound check, NOT pre-allocate.
+    let s = [0x92u8, 0x06, 0xdb, 0xff, 0xff, 0xff, 0xff];
+    let mut r = &s[..];
+    assert!(Value::decode(&mut r).is_err());
+    // bin32 (0xc6) claiming ~4 GiB with no body: same.
+    let b = [0x92u8, 0x07, 0xc6, 0xff, 0xff, 0xff, 0xff];
+    let mut r = &b[..];
+    assert!(Value::decode(&mut r).is_err());
+}
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -999,8 +1011,8 @@ impl Value {
     pub fn decode(rd: &mut &[u8]) -> Result<Value, CodecError> {
         let len = dec::read_array_len(rd).map_err(|e| CodecError::Malformed(format!("array: {e:?}")))?;
         if len != 2 { return Err(CodecError::Malformed(format!("TypedValue array len {len} != 2"))); }
-        let tag: u8 = dec::read_pfix(rd).map_err(|e| CodecError::Malformed(format!("tag: {e:?}")))?;
-        match tag {
+        let value_tag: u8 = dec::read_pfix(rd).map_err(|e| CodecError::Malformed(format!("tag: {e:?}")))?;
+        match value_tag {
             t if t == tag::NULL => { read_nil(rd)?; Ok(Value::Null) }
             t if t == tag::BOOL => Ok(Value::Bool(read_bool(rd)?)),
             t if t == tag::I64 => Ok(Value::I64(
@@ -1029,15 +1041,27 @@ fn read_bool(rd: &mut &[u8]) -> Result<bool, CodecError> {
 }
 fn read_str(rd: &mut &[u8]) -> Result<String, CodecError> {
     let len = dec::read_str_len(rd).map_err(|e| CodecError::Malformed(format!("str len: {e:?}")))? as usize;
+    bound_len(len, rd.len())?;
     let mut buf = vec![0u8; len];
     rd.read_exact_buf(&mut buf).map_err(|e| CodecError::Malformed(format!("str body: {e:?}")))?;
     String::from_utf8(buf).map_err(|_| CodecError::Malformed("invalid utf8".into()))
 }
 fn read_bin(rd: &mut &[u8]) -> Result<Vec<u8>, CodecError> {
     let len = dec::read_bin_len(rd).map_err(|e| CodecError::Malformed(format!("bin len: {e:?}")))? as usize;
+    bound_len(len, rd.len())?;
     let mut buf = vec![0u8; len];
     rd.read_exact_buf(&mut buf).map_err(|e| CodecError::Malformed(format!("bin body: {e:?}")))?;
     Ok(buf)
+}
+
+/// Reject a length prefix that exceeds the bytes actually remaining BEFORE allocating, so a lying
+/// str/bin length (up to u32::MAX) cannot force a huge pre-allocation. The frame payload is already
+/// capped at MAX_FRAME_PAYLOAD, so `remaining` is bounded; this bounds the allocation to it.
+fn bound_len(len: usize, remaining: usize) -> Result<(), CodecError> {
+    if len > remaining {
+        return Err(CodecError::Truncated { need: len, have: remaining });
+    }
+    Ok(())
 }
 ```
 
