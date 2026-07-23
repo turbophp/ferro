@@ -20,7 +20,7 @@ Copied verbatim from the design doc / spec; every task implicitly includes these
 - **TypedValue** is a 2-element MessagePack array `[tag:int, value]`; `NULL` tag `0` with a `nil` value. No MessagePack ext types. *(§9, decision W-1)*
 - **M0 scalar TypedValue set:** `NULL, BOOL, I64, F64, TEXT, BYTES` are encoded/decoded in S1. All other tags are defined as constants but unimplemented. *(decision T-1)*
 - **Messages are positional** MessagePack arrays; field order pinned in `/proto/PROTOCOL.md` and enforced by golden vectors. No message-schema IDL. *(decision W-2)*
-- **Canonical MessagePack profile (locked by vectors):** signed integer fields use signed-smallest encoding (`rmp::encode::write_sint` semantics: positive fixint / negative fixint / int8/16/32/64); unsigned fields (`boot_epoch`) use unsigned-smallest; floats always float64 (`0xcb`); strings use the `str` family (fixstr/str8/16/32); byte payloads use the `bin` family; `None`/`null` → `nil` (`0xc0`); arrays use fixarray/array16/array32. *(decision W-1/W-2, R3)*
+- **Canonical MessagePack profile (locked by vectors, verified against rmp 0.8.15):** integer fields follow `rmp::encode::write_sint` semantics — **non-negative** values narrow to positive-fixint / uint8 (`0xcc`) / uint16 (`0xcd`) / uint32 (`0xce`) / uint64 (`0xcf`); **negative** values narrow to negative-fixint / int8 (`0xd0`) / int16 (`0xd1`) / int32 (`0xd2`) / int64 (`0xd3`). Unsigned fields (`boot_epoch`) use the same non-negative ladder. Floats always float64 (`0xcb`, big-endian); strings use the `str` family (fixstr/str8/16/32); byte payloads use the `bin` family (`0xc4`+); `None`/`null` → `nil` (`0xc0`); arrays use fixarray/array16/array32. **A uint64 > PHP_INT_MAX decodes in pure PHP to a decimal string** — ext-msgpack cannot represent it losslessly, so pure PHP is authoritative there. *(W-1/W-2, R3; CONFIRMED: `write_sint(200)` = `cc c8` uint8, NOT `d1 00 c8` — positive ≥128 uses unsigned markers)*
 - **Error codes** grouped by branch range (`Retryable 0x1xxx / Indeterminate 0x2xxx / NonRetryable 0x3xxx`) **and** carry an explicit `branch:u8` on the wire so an unknown code is still classified. *(decision W-3)*
 - **Terminal outcome envelope:** `[status:u8, body]` with `0=Ok, 1=Error, 2=Cancelled`; on Error, `body` is the canonical ERROR array `[code:u16, branch:u8, sqlstate?, errno?, message, detail?, retry_after_ms?]`. *(decision W-4)*
 - **Rust: `thiserror` in libs, `tracing` where relevant, clippy warnings denied, `cargo fmt`.** PHP: PSR-12, PHPStan level 9 on `php/client`, dependency-free at runtime (`ext-msgpack` runtime-detected, never required). *(§20.2, charter rule 7)*
@@ -123,20 +123,20 @@ license.workspace = true
 [lints]
 workspace = true
 
+# serde_json + toml are in [dependencies] (NOT dev-only): the `registry` module and the two
+# gen binaries use them, and binaries/lib can only see [dependencies], not [dev-dependencies].
 [dependencies]
 rmp = "0.8"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+serde_json = "1"
 thiserror = "2"
+toml = "0.8"
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[dev-dependencies]
-serde_json = "1"
-toml = "0.8"
 
 [[bin]]
 name = "gen-registry-lock"
@@ -226,6 +226,17 @@ fn main() {
     let out = env::var("OUT_DIR").unwrap();
     fs::write(Path::new(&out).join("consts.rs"), "// generated in Task 2\n").unwrap();
 }
+```
+
+The manifest declares two `[[bin]]` targets whose real sources are created later (`gen_registry_lock.rs` in Task 2, `gen_vectors.rs` in Task 6). `cargo build` HARD-ERRORS on a declared `[[bin]]` whose source file is absent, so create placeholder stubs now (both overwritten later):
+
+```rust
+// /engine/crates/ferro-proto/src/bin/gen_registry_lock.rs
+fn main() {}
+```
+```rust
+// /engine/crates/ferro-proto/src/bin/gen_vectors.rs
+fn main() {}
 ```
 
 - [ ] **Step 6: Write the PHP package manifests**
@@ -348,41 +359,96 @@ FIBERS   = 0x02
 ```
 ```toml
 # /proto/types.toml
-[tags]
-NULL=0  BOOL=1  I64=2  U64=3  F64=4  DECIMAL=5  TEXT=6  BYTES=7
-DATE=8  TIME=9  TIMESTAMP=10  TIMESTAMPTZ=11  UUID=12  JSON=13
-ARRAY=14  INTERVAL=15  INET=16  VECTOR=17
+# Canonical TypedValue tags (SPEC §9). [tag, value] 2-element msgpack array (W-1).
 
 # M0 EXEC/PG path implements only these (T-1); others => NonRetryable{Unsupported}.
-m0_scalar = ["NULL","BOOL","I64","F64","TEXT","BYTES"]
+# MUST precede the [tags] table so it is a TOP-LEVEL key, not absorbed as tags.m0_scalar.
+m0_scalar = ["NULL", "BOOL", "I64", "F64", "TEXT", "BYTES"]
+
+[tags]
+NULL = 0
+BOOL = 1
+I64 = 2
+U64 = 3
+F64 = 4
+DECIMAL = 5
+TEXT = 6
+BYTES = 7
+DATE = 8
+TIME = 9
+TIMESTAMP = 10
+TIMESTAMPTZ = 11
+UUID = 12
+JSON = 13
+ARRAY = 14
+INTERVAL = 15
+INET = 16
+VECTOR = 17
 ```
 ```toml
 # /proto/errors.toml
+# Branch carried explicitly on the wire (W-3): unknown code still classified by branch.
 [branches]
-Retryable     = 1
+Retryable = 1
 Indeterminate = 2
-NonRetryable  = 3
+NonRetryable = 3
 
-[codes.ConnectionLost]       { code = 0x1001, branch = 1 }
-[codes.PoolTimeout]          { code = 0x1002, branch = 1 }
-[codes.TxDeadline]           { code = 0x1003, branch = 1 }
-[codes.Deadlock]             { code = 0x1004, branch = 1 }
-[codes.SerializationFailure] { code = 0x1005, branch = 1 }
-[codes.ReplicaUnavailable]   { code = 0x1006, branch = 1 }
-[codes.WriteUnconfirmed]     { code = 0x2001, branch = 2 }
-[codes.Syntax]               { code = 0x3001, branch = 3 }
-[codes.Unique]               { code = 0x3002, branch = 3 }
-[codes.ForeignKey]           { code = 0x3003, branch = 3 }
-[codes.NotNull]              { code = 0x3004, branch = 3 }
-[codes.Check]                { code = 0x3005, branch = 3 }
-[codes.Auth]                 { code = 0x3006, branch = 3 }
-[codes.QueryTimeout]         { code = 0x3007, branch = 3 }
-[codes.Cancelled]            { code = 0x3008, branch = 3 }
-[codes.Protocol]             { code = 0x3009, branch = 3 }
-[codes.Unsupported]          { code = 0x300A, branch = 3 }
+# Each code is its own [codes.<Name>] table (NOT an inline-table on the header line — that is
+# invalid TOML). code = 0xBxxx where B is the branch nibble.
+[codes.ConnectionLost]
+code = 0x1001
+branch = 1
+[codes.PoolTimeout]
+code = 0x1002
+branch = 1
+[codes.TxDeadline]
+code = 0x1003
+branch = 1
+[codes.Deadlock]
+code = 0x1004
+branch = 1
+[codes.SerializationFailure]
+code = 0x1005
+branch = 1
+[codes.ReplicaUnavailable]
+code = 0x1006
+branch = 1
+[codes.WriteUnconfirmed]
+code = 0x2001
+branch = 2
+[codes.Syntax]
+code = 0x3001
+branch = 3
+[codes.Unique]
+code = 0x3002
+branch = 3
+[codes.ForeignKey]
+code = 0x3003
+branch = 3
+[codes.NotNull]
+code = 0x3004
+branch = 3
+[codes.Check]
+code = 0x3005
+branch = 3
+[codes.Auth]
+code = 0x3006
+branch = 3
+[codes.QueryTimeout]
+code = 0x3007
+branch = 3
+[codes.Cancelled]
+code = 0x3008
+branch = 3
+[codes.Protocol]
+code = 0x3009
+branch = 3
+[codes.Unsupported]
+code = 0x300A
+branch = 3
 ```
 
-> Note: TOML inline-table rows above use the `[codes.Name] { … }` shorthand — if the `toml` crate rejects it, use the explicit form `[codes.ConnectionLost]` on its own line followed by `code = …` / `branch = …`. The `registry_sync` test is the arbiter of a valid parse.
+> These three TOML files MUST parse before anything downstream works — verify with a quick `cargo run -p ferro-proto --bin gen-registry-lock` immediately after writing them (Step 4), before trusting the sync test.
 
 - [ ] **Step 2: Write the shared registry model**
 
@@ -823,9 +889,16 @@ fn i64_small_positive_is_fixint() {
 }
 
 #[test]
-fn i64_200_is_signed_int16_not_uint8() {
-    // Canonical rule: signed-smallest. 200 does not fit i8 (max 127) -> int16 (0xd1 0x00 0xc8).
-    assert_eq!(enc(&Value::I64(200)), vec![0x92, 0x02, 0xd1, 0x00, 0xc8]);
+fn i64_200_is_uint8() {
+    // Canonical rule = rmp write_sint: non-negative 200 fits uint8 -> 0xcc 0xc8 (NOT int16).
+    // This is the load-bearing cross-language byte: PHP PurePacker::packInt MUST match it.
+    assert_eq!(enc(&Value::I64(200)), vec![0x92, 0x02, 0xcc, 0xc8]);
+}
+
+#[test]
+fn i64_negative_uses_signed_marker() {
+    // -200 does not fit i8; narrows to int16 0xd1. Negatives keep the signed ladder.
+    assert_eq!(enc(&Value::I64(-200)), vec![0x92, 0x02, 0xd1, 0xff, 0x38]);
 }
 
 #[test]
@@ -958,7 +1031,7 @@ fn read_bin(rd: &mut &[u8]) -> Result<Vec<u8>, CodecError> {
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test -p ferro-proto --test value`
-Expected: PASS (all 8 tests). If `i64_200_is_signed_int16_not_uint8` fails, `rmp::encode::write_sint` chose a different width — that becomes the canonical truth; update the *assertion* to the actual bytes AND note the exact rule in `PROTOCOL.md` so PHP mirrors it.
+Expected: PASS (all tests). The `i64(200)` = `cc c8` (uint8) and `i64(-200)` = `d1 ff 38` (int16) bytes are confirmed against rmp 0.8.15 and are the canonical truth PHP mirrors in Task 8. Do NOT change these assertions to make a mismatched PHP codec pass — fix the PHP side instead.
 
 - [ ] **Step 5: Commit**
 
@@ -1407,32 +1480,32 @@ declare(strict_types=1);
 $root = dirname(__DIR__, 2);
 $lock = json_decode(file_get_contents("$root/proto/registry.lock.json"), true, 512, JSON_THROW_ON_ERROR);
 $out = "<?php\n\ndeclare(strict_types=1);\n\n// @generated from /proto/registry.lock.json — do not edit.\n\nnamespace Ferro\\Protocol\\Generated;\n\nfinal class Constants\n{\n";
-$out .= "    public const int PROTOCOL_VERSION = {$lock['protocol_version']};\n";
-$out .= "    public const int MAGIC = {$lock['magic']};\n";
-$out .= "    public const int MAX_FRAME_PAYLOAD = {$lock['max_frame_payload']};\n";
-$out .= "    public const int DEFAULT_CREDIT_FRAMES = {$lock['default_credit_frames']};\n";
-$out .= "    public const int DEFAULT_CREDIT_BYTES = {$lock['default_credit_bytes']};\n\n";
+$out .= "    public const PROTOCOL_VERSION = {$lock['protocol_version']};\n";
+$out .= "    public const MAGIC = {$lock['magic']};\n";
+$out .= "    public const MAX_FRAME_PAYLOAD = {$lock['max_frame_payload']};\n";
+$out .= "    public const DEFAULT_CREDIT_FRAMES = {$lock['default_credit_frames']};\n";
+$out .= "    public const DEFAULT_CREDIT_BYTES = {$lock['default_credit_bytes']};\n\n";
 $emit = function (string $prefix, array $kv) {
     $s = '';
-    foreach ($kv as $k => $v) { $s .= "    public const int {$prefix}_{$k} = {$v};\n"; }
+    foreach ($kv as $k => $v) { $s .= "    public const {$prefix}_{$k} = {$v};\n"; }
     return $s;
 };
-foreach ($lock['flags'] as $k => $v) { $out .= "    public const int FLAG_{$k} = {$v};\n"; }
+foreach ($lock['flags'] as $k => $v) { $out .= "    public const FLAG_{$k} = {$v};\n"; }
 $out .= "\n";
-foreach ($lock['services'] as $k => $v) { $out .= "    public const int SERVICE_{$k} = {$v};\n"; }
+foreach ($lock['services'] as $k => $v) { $out .= "    public const SERVICE_{$k} = {$v};\n"; }
 $out .= "\n";
 foreach ($lock['methods'] as $svc => $kv) {
-    foreach ($kv as $k => $v) { $out .= "    public const int METHOD_" . strtoupper($svc) . "_{$k} = {$v};\n"; }
+    foreach ($kv as $k => $v) { $out .= "    public const METHOD_" . strtoupper($svc) . "_{$k} = {$v};\n"; }
 }
 $out .= "\n";
-foreach ($lock['tags'] as $k => $v) { $out .= "    public const int TAG_{$k} = {$v};\n"; }
+foreach ($lock['tags'] as $k => $v) { $out .= "    public const TAG_{$k} = {$v};\n"; }
 $out .= "\n";
-foreach ($lock['branches'] as $k => $v) { $out .= "    public const int BRANCH_" . strtoupper($k) . " = {$v};\n"; }
+foreach ($lock['branches'] as $k => $v) { $out .= "    public const BRANCH_" . strtoupper($k) . " = {$v};\n"; }
 $out .= "\n";
 foreach ($lock['codes'] as $name => $ec) {
     $u = strtoupper(preg_replace('/(?<=[a-z0-9])(?=[A-Z])/', '_', $name));
-    $out .= "    public const int ERR_{$u} = {$ec['code']};\n";
-    $out .= "    public const int ERR_{$u}_BRANCH = {$ec['branch']};\n";
+    $out .= "    public const ERR_{$u} = {$ec['code']};\n";
+    $out .= "    public const ERR_{$u}_BRANCH = {$ec['branch']};\n";
 }
 $out .= "}\n";
 $dir = "$root/php/client/src/Protocol/Generated";
@@ -1460,8 +1533,9 @@ final class PurePackerTest extends TestCase
         $p = new PurePacker();
         $this->assertSame("\xc0", $p->packNil());
         $this->assertSame("\xc3", $p->packBool(true));
-        $this->assertSame("\x01", $p->packInt(1));           // positive fixint
-        $this->assertSame("\xd1\x00\xc8", $p->packInt(200)); // signed-smallest -> int16
+        $this->assertSame("\x01", $p->packInt(1));            // positive fixint
+        $this->assertSame("\xcc\xc8", $p->packInt(200));      // uint8 (matches rmp write_sint)
+        $this->assertSame("\xd1\xff\x38", $p->packInt(-200)); // int16 (negatives keep the signed marker)
         $this->assertSame("\xcb" . pack('E', 1.5), $p->packFloat64(1.5)); // 'E' = big-endian double
         $this->assertSame("\xa2hi", $p->packStr('hi'));      // fixstr
         $this->assertSame("\xc4\x03\x01\x02\x03", $p->packBin("\x01\x02\x03"));
@@ -1523,12 +1597,20 @@ final class PurePacker implements PackerInterface
 
     public function packInt(int $n): string
     {
-        if ($n >= 0 && $n <= 0x7f) { return chr($n); }              // positive fixint
-        if ($n < 0 && $n >= -32) { return chr(0xe0 | ($n & 0x1f)); } // negative fixint
-        if ($n >= -128 && $n <= 127) { return "\xd0" . pack('c', $n); }          // int8
-        if ($n >= -32768 && $n <= 32767) { return "\xd1" . pack('n', $n & 0xffff); } // int16 BE
-        if ($n >= -2147483648 && $n <= 2147483647) { return "\xd2" . pack('N', $n & 0xffffffff); } // int32 BE
-        return "\xd3" . pack('J', $n);                              // int64 BE (J = 64-bit BE)
+        // Canonical = rmp write_sint: NON-NEGATIVE narrows to unsigned markers (cc/cd/ce/cf),
+        // NEGATIVE to signed markers (d0/d1/d2/d3). This is the load-bearing cross-language rule.
+        if ($n >= 0) {
+            if ($n <= 0x7f) { return chr($n); }                      // positive fixint
+            if ($n <= 0xff) { return "\xcc" . chr($n); }             // uint8
+            if ($n <= 0xffff) { return "\xcd" . pack('n', $n); }     // uint16 BE
+            if ($n <= 0xffffffff) { return "\xce" . pack('N', $n); } // uint32 BE
+            return "\xcf" . pack('J', $n);                           // uint64 BE
+        }
+        if ($n >= -32) { return chr(0xe0 | ($n & 0x1f)); }           // negative fixint
+        if ($n >= -128) { return "\xd0" . pack('c', $n); }           // int8
+        if ($n >= -32768) { return "\xd1" . pack('n', $n & 0xffff); } // int16 BE
+        if ($n >= -2147483648) { return "\xd2" . pack('N', $n & 0xffffffff); } // int32 BE
+        return "\xd3" . pack('J', $n);                               // int64 BE
     }
 
     public function packUint(int|string $n): string
@@ -1847,13 +1929,13 @@ final class HeaderTest extends TestCase
     }
     public function testRejectsBadMagic(): void
     {
-        $b = new Header(0, 1, 3, 1, 0)->encode(); $b[0] = "\x00";
+        $b = (new Header(0, 1, 3, 1, 0))->encode(); $b[0] = "\x00";
         $this->expectException(CodecException::class);
         Header::decode($b);
     }
     public function testRejectsOversizeLen(): void
     {
-        $b = new Header(0, 2, 1, 1, 0)->encode();
+        $b = (new Header(0, 2, 1, 1, 0))->encode();
         $big = pack('V', C::MAX_FRAME_PAYLOAD + 1);
         $b = substr($b, 0, 12) . $big;
         $this->expectException(CodecException::class);
@@ -1877,7 +1959,8 @@ final class ValueTest extends TestCase
         $this->assertSame("\x92\x00\xc0", Value::null()->encode($p));
         $this->assertSame("\x92\x01\xc3", Value::bool(true)->encode($p));
         $this->assertSame("\x92\x02\x01", Value::i64(1)->encode($p));
-        $this->assertSame("\x92\x02\xd1\x00\xc8", Value::i64(200)->encode($p));
+        $this->assertSame("\x92\x02\xcc\xc8", Value::i64(200)->encode($p)); // uint8, matches Rust
+        $this->assertSame("\x92\x02\xd1\xff\x38", Value::i64(-200)->encode($p)); // int16
         $this->assertSame("\x92\x06\xa2hi", Value::text('hi')->encode($p));
         $this->assertSame("\x92\x07\xc4\x03\x01\x02\x03", Value::bytes("\x01\x02\x03")->encode($p));
     }

@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["engine/crates/*"]
+# NOTE: `bench` (decision B-1) is added to `members` in slice S8 when the crate is created.
+# Listing a non-existent path here fails workspace resolution, so it is added just-in-time.
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[profile.release]
+lto = "thin"
