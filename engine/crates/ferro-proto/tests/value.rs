@@ -80,3 +80,15 @@ fn roundtrip_all_scalars() {
         assert_eq!(dec(&enc(&v)), v);
     }
 }
+
+#[test]
+fn lying_length_prefix_is_rejected_before_allocating() {
+    // str32 (0xdb) claiming ~4 GiB with no body must error via the bound check, NOT pre-allocate.
+    let s = [0x92u8, 0x06, 0xdb, 0xff, 0xff, 0xff, 0xff];
+    let mut r = &s[..];
+    assert!(Value::decode(&mut r).is_err());
+    // bin32 (0xc6) claiming ~4 GiB with no body: same.
+    let b = [0x92u8, 0x07, 0xc6, 0xff, 0xff, 0xff, 0xff];
+    let mut r = &b[..];
+    assert!(Value::decode(&mut r).is_err());
+}

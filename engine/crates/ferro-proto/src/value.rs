@@ -55,9 +55,9 @@ impl Value {
                 "TypedValue array len {len} != 2"
             )));
         }
-        let tag: u8 =
+        let value_tag: u8 =
             dec::read_pfix(rd).map_err(|e| CodecError::Malformed(format!("tag: {e:?}")))?;
-        match tag {
+        match value_tag {
             t if t == tag::NULL => {
                 read_nil(rd)?;
                 Ok(Value::Null)
@@ -98,6 +98,7 @@ fn read_bool(rd: &mut &[u8]) -> Result<bool, CodecError> {
 fn read_str(rd: &mut &[u8]) -> Result<String, CodecError> {
     let len = dec::read_str_len(rd).map_err(|e| CodecError::Malformed(format!("str len: {e:?}")))?
         as usize;
+    bound_len(len, rd.len())?;
     let mut buf = vec![0u8; len];
     rd.read_exact_buf(&mut buf)
         .map_err(|e| CodecError::Malformed(format!("str body: {e:?}")))?;
@@ -106,8 +107,22 @@ fn read_str(rd: &mut &[u8]) -> Result<String, CodecError> {
 fn read_bin(rd: &mut &[u8]) -> Result<Vec<u8>, CodecError> {
     let len = dec::read_bin_len(rd).map_err(|e| CodecError::Malformed(format!("bin len: {e:?}")))?
         as usize;
+    bound_len(len, rd.len())?;
     let mut buf = vec![0u8; len];
     rd.read_exact_buf(&mut buf)
         .map_err(|e| CodecError::Malformed(format!("bin body: {e:?}")))?;
     Ok(buf)
+}
+
+/// Reject a length prefix that exceeds the bytes actually remaining BEFORE allocating, so a lying
+/// str/bin length (up to u32::MAX) cannot force a huge pre-allocation. The frame payload is already
+/// capped at MAX_FRAME_PAYLOAD, so `remaining` is bounded; this bounds the allocation to it.
+fn bound_len(len: usize, remaining: usize) -> Result<(), CodecError> {
+    if len > remaining {
+        return Err(CodecError::Truncated {
+            need: len,
+            have: remaining,
+        });
+    }
+    Ok(())
 }
