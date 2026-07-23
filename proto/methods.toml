@@ -26,6 +26,13 @@ PONG          = 4
 GOODBYE       = 5
 WINDOW_UPDATE = 6
 
+# Terminal outcome-envelope status discriminant (decision W-4). In /proto so both codecs
+# generate it rather than hand-writing 0/1/2 (charter rule 2).
+[outcome]
+OK        = 0
+ERROR     = 1
+CANCELLED = 2
+
 [features.engine]
 MEMFD          = 0x01
 LISTEN_STREAMS = 0x02

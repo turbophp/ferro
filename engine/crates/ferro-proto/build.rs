@@ -18,6 +18,7 @@ struct Registry {
     services: BTreeMap<String, u16>,
     methods: BTreeMap<String, BTreeMap<String, u16>>,
     features: BTreeMap<String, BTreeMap<String, u16>>,
+    outcome: BTreeMap<String, u8>,
     tags: BTreeMap<String, u8>,
     branches: BTreeMap<String, u8>,
     codes: BTreeMap<String, ErrCode>,
@@ -72,6 +73,7 @@ fn main() {
     for (side, f) in &reg.features {
         emit_mod_u16(&mut o, &format!("feature_{side}"), f);
     }
+    emit_mod_u8(&mut o, "outcome", &reg.outcome);
     emit_mod_u8(&mut o, "tag", &reg.tags);
     emit_mod_u8(&mut o, "branch", &reg.branches);
 

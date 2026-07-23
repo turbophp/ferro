@@ -45,27 +45,29 @@ pub enum Outcome {
 
 impl Outcome {
     pub fn encode(&self) -> Vec<u8> {
+        use crate::consts::outcome;
         use rmp::encode as e;
         let mut o = Vec::new();
         e::write_array_len(&mut o, 2).unwrap();
         match self {
             Outcome::Ok(body) => {
-                e::write_pfix(&mut o, 0).unwrap();
+                e::write_pfix(&mut o, outcome::OK).unwrap();
                 // body is raw msgpack already; splice it in
                 o.extend_from_slice(body);
             }
             Outcome::Error(ep) => {
-                e::write_pfix(&mut o, 1).unwrap();
+                e::write_pfix(&mut o, outcome::ERROR).unwrap();
                 o.extend_from_slice(&ep.encode());
             }
             Outcome::Cancelled => {
-                e::write_pfix(&mut o, 2).unwrap();
+                e::write_pfix(&mut o, outcome::CANCELLED).unwrap();
                 e::write_nil(&mut o).unwrap();
             }
         }
         o
     }
     pub fn decode(b: &[u8]) -> Result<Outcome, CodecError> {
+        use crate::consts::outcome;
         use rmp::decode as d;
         let mut rd: &[u8] = b;
         let len = d::read_array_len(&mut rd)
@@ -76,9 +78,19 @@ impl Outcome {
         let status: u8 =
             d::read_pfix(&mut rd).map_err(|e| CodecError::Malformed(format!("status: {e:?}")))?;
         match status {
-            0 => Ok(Outcome::Ok(rd.to_vec())),
-            1 => Ok(Outcome::Error(ErrorPayload::decode(rd)?)),
-            2 => Ok(Outcome::Cancelled),
+            s if s == outcome::OK => Ok(Outcome::Ok(rd.to_vec())),
+            s if s == outcome::ERROR => Ok(Outcome::Error(ErrorPayload::decode(rd)?)),
+            s if s == outcome::CANCELLED => {
+                // Validate the body slot is `nil` rather than silently discarding trailing bytes.
+                match d::read_marker(&mut rd)
+                    .map_err(|e| CodecError::Malformed(format!("cancelled body: {e:?}")))?
+                {
+                    rmp::Marker::Null => Ok(Outcome::Cancelled),
+                    m => Err(CodecError::Malformed(format!(
+                        "cancelled body expected nil, got {m:?}"
+                    ))),
+                }
+            }
             s => Err(CodecError::Malformed(format!("unknown outcome status {s}"))),
         }
     }

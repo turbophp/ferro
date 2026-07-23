@@ -14,6 +14,7 @@ pub struct Registry {
     pub services: BTreeMap<String, u16>,
     pub methods: BTreeMap<String, BTreeMap<String, u16>>,
     pub features: BTreeMap<String, BTreeMap<String, u16>>,
+    pub outcome: BTreeMap<String, u8>,
     pub tags: BTreeMap<String, u8>,
     pub branches: BTreeMap<String, u8>,
     pub codes: BTreeMap<String, ErrCode>,
@@ -38,6 +39,7 @@ struct MethodsToml {
     services: BTreeMap<String, u16>,
     methods: BTreeMap<String, BTreeMap<String, u16>>,
     features: BTreeMap<String, BTreeMap<String, u16>>,
+    outcome: BTreeMap<String, u8>,
 }
 #[derive(Deserialize)]
 struct TypesToml {
@@ -67,6 +69,7 @@ impl Registry {
             services: m.services,
             methods: m.methods,
             features: m.features,
+            outcome: m.outcome,
             tags: t.tags,
             branches: e.branches,
             codes: e.codes,

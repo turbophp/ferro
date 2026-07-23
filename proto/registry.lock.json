@@ -39,6 +39,11 @@
       "MEMFD": 1
     }
   },
+  "outcome": {
+    "CANCELLED": 2,
+    "ERROR": 1,
+    "OK": 0
+  },
   "tags": {
     "ARRAY": 14,
     "BOOL": 1,
