@@ -21,7 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 getrandom = "0.2"
-rustix = { version = "0.38", features = ["net"] }
+nix = { version = "0.29", features = ["socket", "user"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util", "time", "test-util"] }
