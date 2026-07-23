@@ -112,6 +112,7 @@ fn emit_mod_u8(o: &mut String, name: &str, m: &BTreeMap<String, u8>) {
     }
     writeln!(o, "}}").unwrap();
 }
+// NOTE: assumes each CamelCase boundary has a lowercase run between caps; consecutive-caps acronyms (e.g. "SQLError") would collapse to "SQLERROR". No current registry identifier triggers this.
 fn screaming(s: &str) -> String {
     // ConnectionLost -> CONNECTION_LOST ; HELLO -> HELLO ; MEMFD_RX -> MEMFD_RX
     let mut out = String::new();
