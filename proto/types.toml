@@ -1,0 +1,25 @@
+# Canonical TypedValue tags (SPEC §9). [tag, value] 2-element msgpack array (W-1).
+
+# M0 EXEC/PG path implements only these (T-1); others => NonRetryable{Unsupported}.
+# MUST precede the [tags] table so it is a TOP-LEVEL key, not absorbed as tags.m0_scalar.
+m0_scalar = ["NULL", "BOOL", "I64", "F64", "TEXT", "BYTES"]
+
+[tags]
+NULL = 0
+BOOL = 1
+I64 = 2
+U64 = 3
+F64 = 4
+DECIMAL = 5
+TEXT = 6
+BYTES = 7
+DATE = 8
+TIME = 9
+TIMESTAMP = 10
+TIMESTAMPTZ = 11
+UUID = 12
+JSON = 13
+ARRAY = 14
+INTERVAL = 15
+INET = 16
+VECTOR = 17

@@ -1,0 +1,137 @@
+{
+  "protocol_version": 1,
+  "magic": 247,
+  "max_frame_payload": 16777216,
+  "default_credit_frames": 64,
+  "default_credit_bytes": 4194304,
+  "flags": {
+    "CANCEL": 4,
+    "COMPRESSED": 16,
+    "END": 2,
+    "OOB_FD": 8,
+    "STREAM": 1
+  },
+  "services": {
+    "ADMIN": 5,
+    "CORE": 1,
+    "SQL": 2,
+    "STREAM": 4,
+    "TX": 3
+  },
+  "methods": {
+    "core": {
+      "GOODBYE": 5,
+      "HELLO": 1,
+      "HELLO_ACK": 2,
+      "PING": 3,
+      "PONG": 4,
+      "WINDOW_UPDATE": 6
+    }
+  },
+  "features": {
+    "client": {
+      "FIBERS": 2,
+      "MEMFD_RX": 1
+    },
+    "engine": {
+      "LISTEN_STREAMS": 2,
+      "MANIFEST": 4,
+      "MEMFD": 1
+    }
+  },
+  "tags": {
+    "ARRAY": 14,
+    "BOOL": 1,
+    "BYTES": 7,
+    "DATE": 8,
+    "DECIMAL": 5,
+    "F64": 4,
+    "I64": 2,
+    "INET": 16,
+    "INTERVAL": 15,
+    "JSON": 13,
+    "NULL": 0,
+    "TEXT": 6,
+    "TIME": 9,
+    "TIMESTAMP": 10,
+    "TIMESTAMPTZ": 11,
+    "U64": 3,
+    "UUID": 12,
+    "VECTOR": 17
+  },
+  "branches": {
+    "Indeterminate": 2,
+    "NonRetryable": 3,
+    "Retryable": 1
+  },
+  "codes": {
+    "Auth": {
+      "code": 12294,
+      "branch": 3
+    },
+    "Cancelled": {
+      "code": 12296,
+      "branch": 3
+    },
+    "Check": {
+      "code": 12293,
+      "branch": 3
+    },
+    "ConnectionLost": {
+      "code": 4097,
+      "branch": 1
+    },
+    "Deadlock": {
+      "code": 4100,
+      "branch": 1
+    },
+    "ForeignKey": {
+      "code": 12291,
+      "branch": 3
+    },
+    "NotNull": {
+      "code": 12292,
+      "branch": 3
+    },
+    "PoolTimeout": {
+      "code": 4098,
+      "branch": 1
+    },
+    "Protocol": {
+      "code": 12297,
+      "branch": 3
+    },
+    "QueryTimeout": {
+      "code": 12295,
+      "branch": 3
+    },
+    "ReplicaUnavailable": {
+      "code": 4102,
+      "branch": 1
+    },
+    "SerializationFailure": {
+      "code": 4101,
+      "branch": 1
+    },
+    "Syntax": {
+      "code": 12289,
+      "branch": 3
+    },
+    "TxDeadline": {
+      "code": 4099,
+      "branch": 1
+    },
+    "Unique": {
+      "code": 12290,
+      "branch": 3
+    },
+    "Unsupported": {
+      "code": 12298,
+      "branch": 3
+    },
+    "WriteUnconfirmed": {
+      "code": 8193,
+      "branch": 2
+    }
+  }
+}
