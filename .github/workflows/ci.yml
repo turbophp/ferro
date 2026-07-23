@@ -1,0 +1,58 @@
+# .github/workflows/ci.yml
+name: ci
+on:
+  push: { branches: [main, m0-build] }
+  pull_request:
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo test --workspace          # offline: integration tests skip (no FERRO_TEST_PG_URL)
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      pg:
+        image: postgres:17
+        env: { POSTGRES_USER: ferro, POSTGRES_PASSWORD: ferro, POSTGRES_DB: ferro }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ferro -d ferro" --health-interval 1s
+          --health-timeout 3s --health-retries 30
+    env:
+      FERRO_TEST_PG_URL: postgres://ferro:ferro@localhost:5432/ferro
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace          # integration lane: FERRO_TEST_PG_URL is set
+
+  php:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with: { php-version: "8.4", extensions: msgpack, tools: composer }
+      - run: (cd php/client && composer install --no-interaction)
+      - run: (cd php/client && ./vendor/bin/phpunit)
+      - run: (cd php/client && ./vendor/bin/phpstan analyse src --level 9)
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with: { command: check bans }
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: cd engine/crates/ferro-proto && cargo +nightly fuzz run decode_frame -- -runs=20000 -max_total_time=60
+      - run: cd engine/crates/ferro-proto && cargo +nightly fuzz run roundtrip_frame -- -runs=20000 -max_total_time=60
