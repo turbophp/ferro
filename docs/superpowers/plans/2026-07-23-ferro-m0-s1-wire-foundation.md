@@ -1448,6 +1448,7 @@ fn message_payloads_are_canonical_and_byte_stable() {
 #[test]
 fn negative_vectors_are_rejected() {
     let neg = vectors_dir().join("negative");
+    let mut seen = std::collections::HashSet::new();
     for entry in fs::read_dir(&neg).unwrap() {
         let p = entry.unwrap().path();
         if p.extension().and_then(|e| e.to_str()) != Some("bin") { continue; }
@@ -1465,6 +1466,12 @@ fn negative_vectors_are_rejected() {
         } else {
             assert!(Header::decode(&bytes).is_err(), "negative vector {name} was NOT rejected by header decode");
         }
+        seen.insert(name);
+    }
+    // Completeness guard: every required negative must be present, so a deleted/renamed .bin cannot
+    // make this test (especially the reserved_flag branch) pass vacuously.
+    for required in ["bad_magic.bin", "bad_version.bin", "oversize_len.bin", "reserved_flag.bin"] {
+        assert!(seen.contains(required), "missing required negative vector: {required}");
     }
 }
 ```
