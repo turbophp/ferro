@@ -1,0 +1,31 @@
+[package]
+name = "ferro-proto-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.ferro-proto]
+path = ".."
+
+[[bin]]
+name = "decode_frame"
+path = "fuzz_targets/decode_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_frame"
+path = "fuzz_targets/roundtrip_frame.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
