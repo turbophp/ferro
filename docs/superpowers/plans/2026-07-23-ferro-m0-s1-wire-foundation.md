@@ -458,6 +458,7 @@ branch = 3
 //! TOML registry -> lock model. Used by the gen bin and the sync test only (not the hot path).
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Registry {
@@ -481,7 +482,54 @@ pub struct ErrCode {
     pub branch: u8,
 }
 
+// Deserialize shapes for the three TOML files. serde ignores unknown keys, so `m0_scalar` in
+// types.toml is simply not read here.
+#[derive(Deserialize)]
+struct MethodsToml {
+    protocol_version: u8,
+    magic: u8,
+    max_frame_payload: u32,
+    default_credit_frames: u32,
+    default_credit_bytes: u32,
+    flags: BTreeMap<String, u16>,
+    services: BTreeMap<String, u16>,
+    methods: BTreeMap<String, BTreeMap<String, u16>>,
+    features: BTreeMap<String, BTreeMap<String, u16>>,
+}
+#[derive(Deserialize)]
+struct TypesToml {
+    tags: BTreeMap<String, u8>,
+}
+#[derive(Deserialize)]
+struct ErrorsToml {
+    branches: BTreeMap<String, u8>,
+    codes: BTreeMap<String, ErrCode>,
+}
+
 impl Registry {
+    /// Parse the three `/proto/*.toml` files in-process into a `Registry`. Shared by the gen bin
+    /// (which serializes the result) and the sync test (which compares it) so both parse identically.
+    pub fn from_toml_dir(dir: &Path) -> Registry {
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        let m: MethodsToml = toml::from_str(&read("methods.toml")).unwrap();
+        let t: TypesToml = toml::from_str(&read("types.toml")).unwrap();
+        let e: ErrorsToml = toml::from_str(&read("errors.toml")).unwrap();
+        Registry {
+            protocol_version: m.protocol_version,
+            magic: m.magic,
+            max_frame_payload: m.max_frame_payload,
+            default_credit_frames: m.default_credit_frames,
+            default_credit_bytes: m.default_credit_bytes,
+            flags: m.flags,
+            services: m.services,
+            methods: m.methods,
+            features: m.features,
+            tags: t.tags,
+            branches: e.branches,
+            codes: e.codes,
+        }
+    }
+
     /// Produce the canonical lock JSON (stable key order via BTreeMap, 2-space indent).
     pub fn to_lock_json(&self) -> String {
         let mut s = serde_json::to_string_pretty(self).expect("serialize registry");
@@ -496,42 +544,17 @@ impl Registry {
 ```rust
 // /engine/crates/ferro-proto/src/bin/gen_registry_lock.rs
 //! Parse /proto/*.toml -> /proto/registry.lock.json. Run after editing any TOML.
-use ferro_proto::registry::{ErrCode, Registry};
-use std::collections::BTreeMap;
+use ferro_proto::registry::Registry;
 use std::path::PathBuf;
 
-// Local mirrors of the TOML shape (the src Registry is the *output* shape).
-#[derive(serde::Deserialize)]
-struct Methods {
-    protocol_version: u8, magic: u8, max_frame_payload: u32,
-    default_credit_frames: u32, default_credit_bytes: u32,
-    flags: BTreeMap<String, u16>, services: BTreeMap<String, u16>,
-    methods: BTreeMap<String, BTreeMap<String, u16>>,
-    features: BTreeMap<String, BTreeMap<String, u16>>,
-}
-#[derive(serde::Deserialize)]
-struct Types { tags: BTreeMap<String, u8>, #[allow(dead_code)] m0_scalar: Vec<String> }
-#[derive(serde::Deserialize)]
-struct Errors { branches: BTreeMap<String, u8>, codes: BTreeMap<String, ErrCode> }
-
 fn proto_dir() -> PathBuf {
-    // bin runs from crate dir under `cargo run`; repo root is three up.
+    // bin runs from the crate dir under `cargo run`; repo root is three up.
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../proto")
 }
 
 fn main() {
     let dir = proto_dir();
-    let m: Methods = toml::from_str(&std::fs::read_to_string(dir.join("methods.toml")).unwrap()).unwrap();
-    let t: Types = toml::from_str(&std::fs::read_to_string(dir.join("types.toml")).unwrap()).unwrap();
-    let e: Errors = toml::from_str(&std::fs::read_to_string(dir.join("errors.toml")).unwrap()).unwrap();
-    let reg = Registry {
-        protocol_version: m.protocol_version, magic: m.magic,
-        max_frame_payload: m.max_frame_payload,
-        default_credit_frames: m.default_credit_frames,
-        default_credit_bytes: m.default_credit_bytes,
-        flags: m.flags, services: m.services, methods: m.methods, features: m.features,
-        tags: t.tags, branches: e.branches, codes: e.codes,
-    };
+    let reg = Registry::from_toml_dir(&dir);
     std::fs::write(dir.join("registry.lock.json"), reg.to_lock_json()).unwrap();
     eprintln!("wrote {}", dir.join("registry.lock.json").display());
 }
@@ -634,25 +657,16 @@ Add `serde` + `serde_json` are already `[build-dependencies]`; keep them.
 ```rust
 // /engine/crates/ferro-proto/tests/registry_sync.rs
 //! Fails if /proto/*.toml was edited without regenerating registry.lock.json.
+//! PURE and side-effect-free: parses the TOML in-process via `Registry::from_toml_dir` and compares
+//! to the committed lock file. Does NOT run the gen binary and does NOT write to disk.
+use ferro_proto::registry::Registry;
 use std::path::PathBuf;
-use std::process::Command;
 
 #[test]
 fn lock_matches_toml() {
     let proto = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../proto");
     let committed = std::fs::read_to_string(proto.join("registry.lock.json")).unwrap();
-
-    // Regenerate into a temp copy by invoking the gen bin against a scratch dir is heavier than
-    // needed; instead re-parse the TOML here with the same model and compare JSON.
-    // (Kept in one place by calling the bin in --check mode would be ideal; simple re-parse is fine.)
-    let out = Command::new(env!("CARGO_BIN_EXE_gen-registry-lock"))
-        .env("FERRO_GEN_STDOUT", "1")
-        .output()
-        .expect("run gen bin");
-    assert!(out.status.success(), "gen bin failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    // gen bin (Step 3) writes the file; re-read and compare.
-    let regenerated = std::fs::read_to_string(proto.join("registry.lock.json")).unwrap();
+    let regenerated = Registry::from_toml_dir(&proto).to_lock_json();
     assert_eq!(
         committed, regenerated,
         "registry.lock.json is stale — run `cargo run -p ferro-proto --bin gen-registry-lock` and commit"
