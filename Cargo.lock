@@ -218,6 +218,8 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "ferro-backend-pg",
+ "ferro-pool",
  "ferro-proto",
  "futures",
  "getrandom 0.2.17",

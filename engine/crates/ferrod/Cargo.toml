@@ -12,6 +12,8 @@ workspace = true
 # (later S3 tasks) depends on handler panics unwinding, not aborting the process.
 [dependencies]
 ferro-proto = { path = "../ferro-proto" }
+ferro-pool = { path = "../ferro-pool" }
+ferro-backend-pg = { path = "../ferro-backend-pg" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "signal", "macros", "io-util", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"

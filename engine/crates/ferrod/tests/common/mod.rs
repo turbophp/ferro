@@ -6,6 +6,11 @@
 //! `TestClient::recv` wraps every read in a real-time `tokio::time::timeout` so a missing,
 //! mis-ordered, or deadlocked frame fails the test fast with a clear panic instead of hanging
 //! CI indefinitely.
+//!
+//! This module is compiled independently into EVERY `tests/*.rs` binary that `mod common;`s it, and
+//! each binary uses only the subset of helpers it needs — so `dead_code` (per-binary) is expected
+//! and allowed here rather than forcing every helper to be used by every binary.
+#![allow(dead_code)]
 
 use ferro_proto::consts::{TYPE_REGISTRY_HASH, flags, method_core, service};
 use ferro_proto::header::Header;

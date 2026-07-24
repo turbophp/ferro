@@ -25,6 +25,28 @@ const DEFAULT_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 /// fd-exhaustion vector, not just a wasted connection.
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A configured connection pool: the logical `name` a client references in `ExecRequest.pool`,
+/// plus the upstream `dsn`.
+///
+/// Per SPEC §12 the DSN is a SERVER-side secret: the client never sees it, and it must never be
+/// logged. The manual `Debug` impl below REDACTS `dsn`, so a `{:?}` on a `Config` (or anywhere a
+/// `PoolSpec` is formatted) can never leak a credential-bearing DSN into a log line — the field is
+/// deliberately not exposed to the derived `Config` Debug.
+#[derive(Clone)]
+pub struct PoolSpec {
+    pub name: String,
+    pub dsn: String,
+}
+
+impl std::fmt::Debug for PoolSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolSpec")
+            .field("name", &self.name)
+            .field("dsn", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// UDS bind path. From `FERRO_SOCK`, default `/run/ferro/dev.sock`.
@@ -45,6 +67,11 @@ pub struct Config {
     /// Deadline for the mandatory first frame (`core/HELLO`) to arrive before the connection is
     /// dropped silently (no reply — there was never a valid session to fail).
     pub handshake_timeout: Duration,
+    /// Configured upstream connection pools (S5). Each `PoolSpec` names a pool and carries its DSN
+    /// (§12 server-side secret — never sent to the client, never logged). Default: empty (the EXEC
+    /// handler then answers every request with `Unsupported: unknown pool`). From `FERRO_POOLS`
+    /// (comma-separated names) + per-pool `FERRO_POOL_<NAME>_DSN`.
+    pub pools: Vec<PoolSpec>,
 }
 
 impl Default for Config {
@@ -58,6 +85,7 @@ impl Default for Config {
             max_inflight: DEFAULT_MAX_INFLIGHT,
             drain_deadline: DEFAULT_DRAIN_DEADLINE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            pools: Vec::new(),
         }
     }
 }
@@ -74,6 +102,10 @@ impl Config {
 
         if let Ok(list) = std::env::var("FERRO_ALLOW_UIDS") {
             cfg.peer_allow_uids = parse_allow_uids(&list);
+        }
+
+        if let Ok(names) = std::env::var("FERRO_POOLS") {
+            cfg.pools = parse_pools(&names);
         }
 
         cfg
@@ -121,9 +153,74 @@ fn parse_allow_uids(list: &str) -> Vec<u32> {
         .collect()
 }
 
+/// Parse `FERRO_POOLS` (comma-separated pool names) into `PoolSpec`s, reading each pool's DSN from
+/// `FERRO_POOL_<NAME>_DSN` (NAME per [`env_name`]). A named pool whose DSN env var is unset or
+/// empty is `tracing::warn!`-ed and SKIPPED — never defaulted to a bogus DSN (a silent
+/// self-connection surprise). The DSN value itself is never logged (§12).
+fn parse_pools(names: &str) -> Vec<PoolSpec> {
+    names
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|name| {
+            let env_key = format!("FERRO_POOL_{}_DSN", env_name(name));
+            match std::env::var(&env_key) {
+                Ok(dsn) if !dsn.is_empty() => Some(PoolSpec {
+                    name: name.to_string(),
+                    dsn,
+                }),
+                _ => {
+                    tracing::warn!(
+                        pool = name,
+                        env = %env_key,
+                        "FERRO_POOLS: no DSN set for pool; skipping (set the env var to enable it)"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// The env-var-safe form of a pool name: ASCII-uppercased, every non-alphanumeric byte mapped to
+/// `_` (so `read-replica` → `READ_REPLICA`, keying `FERRO_POOL_READ_REPLICA_DSN`).
+fn env_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_spec_debug_redacts_dsn() {
+        let s = PoolSpec {
+            name: "default".to_string(),
+            dsn: "postgres://user:hunter2@db.internal/app".to_string(),
+        };
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("default"), "the pool name is shown");
+        assert!(
+            !dbg.contains("hunter2"),
+            "the DSN (a §12 secret) must NOT appear in Debug output, got {dbg}"
+        );
+        assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
+    fn env_name_uppercases_and_sanitizes() {
+        assert_eq!(env_name("default"), "DEFAULT");
+        assert_eq!(env_name("read-replica"), "READ_REPLICA");
+        assert_eq!(env_name("pool.1"), "POOL_1");
+    }
 
     #[test]
     fn parse_allow_uids_skips_malformed_tokens_and_keeps_valid_ones() {

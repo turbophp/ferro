@@ -21,7 +21,7 @@ fn ping_frame() -> OutFrame {
 
 #[test]
 fn encode_then_decode_roundtrips_a_frame() {
-    let mut codec = FrameCodec::default();
+    let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     codec.encode(ping_frame(), &mut buf).unwrap();
     let decoded: InFrame = codec.decode(&mut buf).unwrap().expect("a full frame");
@@ -33,7 +33,7 @@ fn encode_then_decode_roundtrips_a_frame() {
 
 #[test]
 fn decode_waits_for_full_payload() {
-    let mut codec = FrameCodec::default();
+    let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     codec.encode(ping_frame(), &mut buf).unwrap();
     let full = buf.split();
@@ -43,7 +43,7 @@ fn decode_waits_for_full_payload() {
 
 #[test]
 fn decode_rejects_bad_magic() {
-    let mut codec = FrameCodec::default();
+    let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     codec.encode(ping_frame(), &mut buf).unwrap();
     buf[0] = 0x00;

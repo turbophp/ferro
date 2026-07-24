@@ -3,6 +3,8 @@ pub mod dispatch;
 pub mod epoch;
 pub mod listener;
 pub mod peercred;
+pub mod pools;
 pub mod serve;
+pub mod services;
 pub mod session;
 pub mod shutdown;
