@@ -14,6 +14,7 @@ use tokio::time::Instant;
 use crate::backend::PoolBackend;
 use crate::config::PoolConfig;
 use crate::error::PoolError;
+use crate::pin::{self, PinCause, PinState, TxId};
 
 /// A connection sitting idle in the pool, plus the bookkeeping needed to recycle it safely on
 /// the next checkout.
@@ -188,6 +189,13 @@ pub struct Checkout<B: PoolBackend> {
     queue_us: u64,
     tx_open: bool,
     tainted: bool,
+    /// S4 Task 4 pin stub: set by `begin_tx`, cleared by `commit_tx`/`rollback_tx`. Always starts
+    /// `Unpinned` — a fresh `Checkout` (even one that recycled an idle conn with a stale `tx_open`
+    /// flag) never inherits pin state from a previous holder.
+    pin: PinState,
+    /// The most recent pin cause observed on this `Checkout` (for the pin-cause DoD assertion).
+    /// Only ever `Some(PinCause::Tx)` in S4.
+    last_pin_cause: Option<PinCause>,
 }
 
 impl<B: PoolBackend> Checkout<B> {
@@ -206,6 +214,8 @@ impl<B: PoolBackend> Checkout<B> {
             queue_us,
             tx_open: false,
             tainted: false,
+            pin: PinState::Unpinned,
+            last_pin_cause: None,
         }
     }
 
@@ -237,6 +247,72 @@ impl<B: PoolBackend> Checkout<B> {
     /// task (Task 4).
     pub fn set_tainted(&mut self, tainted: bool) {
         self.tainted = tainted;
+    }
+
+    /// The pin hook: BEGINs a transaction on the underlying connection and pins this `Checkout` to
+    /// `tx_id`. Drives the RAW, unguarded `PoolBackend::simple_query` (never `Checkout::exec` —
+    /// that guarded entry rejects bare tx-control, which would reject the pin hook's own BEGIN).
+    /// For S4 this is called directly by tests; the TX service (S6) calls it on a real BEGIN.
+    pub async fn begin_tx(&mut self, tx_id: TxId) -> Result<(), PoolError> {
+        let pool = Arc::clone(&self.pool);
+        let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
+        pool.backend.simple_query(conn, "BEGIN").await?;
+        self.pin = PinState::PinnedTx(tx_id);
+        self.last_pin_cause = Some(PinCause::Tx);
+        self.tx_open = true;
+        Ok(())
+    }
+
+    /// COMMITs the pinned transaction and unpins this `Checkout`. Raw `simple_query`, same
+    /// rationale as `begin_tx`.
+    pub async fn commit_tx(&mut self) -> Result<(), PoolError> {
+        let pool = Arc::clone(&self.pool);
+        let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
+        pool.backend.simple_query(conn, "COMMIT").await?;
+        self.pin = PinState::Unpinned;
+        self.tx_open = false;
+        Ok(())
+    }
+
+    /// ROLLBACKs the pinned transaction and unpins this `Checkout`. Raw `simple_query`, same
+    /// rationale as `begin_tx`. Distinct from the defensive ROLLBACK the pool runs on the *next*
+    /// checkout of a conn dropped mid-transaction (v2/B1) — this is the explicit, caller-driven
+    /// rollback.
+    pub async fn rollback_tx(&mut self) -> Result<(), PoolError> {
+        let pool = Arc::clone(&self.pool);
+        let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
+        pool.backend.simple_query(conn, "ROLLBACK").await?;
+        self.pin = PinState::Unpinned;
+        self.tx_open = false;
+        Ok(())
+    }
+
+    /// Current pin state (`Unpinned` or `PinnedTx(tx_id)`).
+    pub fn pin_state(&self) -> PinState {
+        self.pin
+    }
+
+    /// The most recent pin cause observed on this `Checkout` (the pin-cause DoD assertion). Only
+    /// ever `Some(PinCause::Tx)` in S4.
+    pub fn last_pin_cause(&self) -> Option<PinCause> {
+        self.last_pin_cause
+    }
+
+    /// The guarded, user-facing statement entry (v2/M1). Rejects bare transaction-control
+    /// statements (`BEGIN`, `START TRANSACTION`, `SAVEPOINT`, `COMMIT`, `END`, `ROLLBACK`,
+    /// `ABORT`, `RELEASE`, `PREPARE TRANSACTION` — case-insensitive leading keyword, v2/M2) with
+    /// `PoolError::Unsupported` so the pin stub cannot be bypassed; the real TX path is the TX
+    /// service (S6). Anything else goes straight to the raw `PoolBackend::simple_query`.
+    pub async fn exec(&mut self, sql: &str) -> Result<u64, PoolError> {
+        if pin::is_bare_tx_control(sql) {
+            return Err(PoolError::Unsupported(format!(
+                "bare transaction-control statement not allowed via exec(): {sql:?} \
+                 (use the TX service instead)"
+            )));
+        }
+        let pool = Arc::clone(&self.pool);
+        let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
+        pool.backend.simple_query(conn, sql).await
     }
 }
 
