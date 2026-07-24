@@ -56,3 +56,8 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - run: cd engine/crates/ferro-proto && cargo +nightly fuzz run decode_frame -- -runs=20000 -max_total_time=60
       - run: cd engine/crates/ferro-proto && cargo +nightly fuzz run roundtrip_frame -- -runs=20000 -max_total_time=60
+      # NOTE: engine/crates/ferrod/fuzz/session_classify exists but is NOT run here yet: cargo-fuzz
+      # compiles tokio (a ferrod dep) under coverage instrumentation, which ICEs on current nightly
+      # rustc. Fix = extract the tokio-free `classify`/codec types into their own crate the fuzz
+      # target can depend on without tokio (tracked in S3 report / progress ledger). classify's
+      # no-panic property is covered by ferrod unit tests meanwhile.
