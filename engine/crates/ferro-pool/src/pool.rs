@@ -32,13 +32,14 @@ pub(crate) struct IdleConn<B: PoolBackend> {
     tainted: bool,
 }
 
-/// `pub(crate)` (+ the fields the reaper needs) so `health::spawn_reaper`/`reap_once` can read
-/// `backend`/`config` and lock `idle` directly; `semaphore` stays private since only the checkout
-/// path in this module touches it.
+/// `pub(crate)` (+ every field) so `health::spawn_reaper`/`reap_once` can read `backend`/`config`,
+/// lock `idle`, and (S4 CRITICAL fix) acquire its own owned permit from `semaphore` while pinging
+/// a connection it has pulled out of `idle` — the mechanism that makes a pinged conn count against
+/// `max_size` exactly like a checked-out one.
 pub(crate) struct PoolInner<B: PoolBackend> {
     pub(crate) backend: B,
     pub(crate) config: PoolConfig,
-    semaphore: Arc<Semaphore>,
+    pub(crate) semaphore: Arc<Semaphore>,
     pub(crate) idle: Mutex<Vec<IdleConn<B>>>,
 }
 
@@ -165,6 +166,13 @@ impl<B: PoolBackend> Pool<B> {
         if let Some(idle_conn) = idle.last_mut() {
             f(&mut idle_conn.conn);
         }
+    }
+
+    /// Read-only access to the backend this pool was constructed with. Mainly for tests that need
+    /// to observe backend-internal state (e.g. `FakeBackend::total_connected()`/`pings_waiting()`)
+    /// that isn't otherwise visible through the pool's own public surface.
+    pub fn backend(&self) -> &B {
+        &self.inner.backend
     }
 }
 

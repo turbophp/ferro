@@ -142,6 +142,21 @@ async fn exec_rejects_bare_tx_control() {
         matches!(c.exec("  RollBack  ").await, Err(PoolError::Unsupported(_))),
         "whitespace-padded, mixed-case ROLLBACK via exec() must be rejected"
     );
+    // MINOR 4 (S4 review): a leading comment must not hide the tx-control keyword from the guard.
+    assert!(
+        matches!(
+            c.exec("/* c */ BEGIN").await,
+            Err(PoolError::Unsupported(_))
+        ),
+        "a bare BEGIN behind a leading block comment via exec() must still be rejected"
+    );
+    assert!(
+        matches!(
+            c.exec("-- c\nROLLBACK").await,
+            Err(PoolError::Unsupported(_))
+        ),
+        "a bare ROLLBACK behind a leading line comment via exec() must still be rejected"
+    );
 
     let affected = c
         .exec("SELECT 1")

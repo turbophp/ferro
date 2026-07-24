@@ -12,12 +12,18 @@
 //!
 //! The reaper only *evicts* dead/expired idle connections; it does not proactively reconnect.
 //! Reconnecting from the reaper would create a brand-new backend connection *outside* the
-//! checkout path's semaphore permit — the mechanism that actually bounds `max_size` — which could
+//! semaphore permit accounting — the mechanism that actually bounds `max_size` — which could
 //! transiently push the pool's live connection count above `max_size` if a concurrent checkout is
 //! also connecting fresh. Keeping the pool warm is left entirely to the next `checkout()` (Task
 //! 2's connect-on-demand path), which is already permit-bounded. `backoff_delay` is still
 //! implemented and unit-tested here as the schedule any future connect-retry logic should use
 //! (per v2/M5 — backoff belongs to background reconnection, never to blocking a checkout).
+//!
+//! **Permit-per-pinged-conn (S4 CRITICAL fix):** pinging an idle connection also removes it from
+//! `idle` for the duration of the round trip, so `reap_once` holds an owned semaphore permit for
+//! that whole window too — otherwise a concurrent `checkout()` would see `idle` empty, no permit
+//! held against the pinged connection, and `connect()` a fresh one past `max_size`. See
+//! `reap_once`'s doc comment for the full account.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -61,26 +67,71 @@ pub(crate) fn spawn_reaper<B: PoolBackend>(inner: &Arc<PoolInner<B>>, interval: 
     });
 }
 
-/// One reaper pass. Pulls every idle connection out of the shared idle stack (a brief,
-/// synchronous lock — never held across an `.await`), pings each one (short-circuited away if
-/// it's already past `max_lifetime`), and puts back only the ones still healthy and young enough.
-/// Anything dead or expired is simply dropped here; the next `checkout()` reconnects lazily.
+/// One reaper pass.
+///
+/// **S4 CRITICAL fix:** the old implementation pulled *every* idle connection out of the shared
+/// idle stack in one `mem::take` (no semaphore permit involved), pinged them all with the lock
+/// released, and reinserted the survivors. During that window `idle` was empty but nobody held a
+/// permit for the pinged connections, so a concurrent `checkout()` — bounded only by its OWN
+/// permit — could see `idle` empty and `connect()` a brand-new connection, and the reaper would
+/// then reinsert the ones it had pulled out. Total live connections could exceed `max_size` and
+/// the surplus never got cleaned up (an accumulating capacity leak, breaking G1 "M ≪ N").
+///
+/// The fix: process idle connections ONE AT A TIME, each gated behind an *owned* semaphore permit
+/// for as long as it is out of the idle stack for pinging. Holding that permit is what makes a
+/// pinged connection count against `max_size` exactly like a checked-out one — a concurrent
+/// `checkout()` simply queues on the semaphore instead of falling through to `connect()`.
+///
+/// The `idle` mutex is still never held across an `.await`: each iteration pops ONE connection
+/// under a brief, synchronous lock, pings it with the lock released, then re-locks only to push it
+/// back (if healthy) — anything stale or dead is just dropped, releasing its resources, and the
+/// next `checkout()` reconnects lazily.
+///
+/// Bounded to the number of idle connections observed at the START of this tick, so a healthy
+/// connection that gets popped and immediately reinserted cannot make this loop spin forever. Note
+/// that bound does not guarantee every *distinct* idle connection is examined exactly once this
+/// tick (an adversarial reinsert order could see the same connection popped more than once while
+/// another sits untouched) — but that doesn't matter for the invariant this fixes: the pool-size
+/// guarantee only depends on a pinged connection being permit-gated while it's out of `idle`, not
+/// on which connection that happens to be. A connection that isn't reached this tick simply waits
+/// for the next one.
 async fn reap_once<B: PoolBackend>(inner: &Arc<PoolInner<B>>) {
-    let candidates = {
-        let mut idle = inner.idle.lock().unwrap();
-        std::mem::take(&mut *idle)
-    };
+    let budget = { inner.idle.lock().unwrap().len() };
 
-    let mut kept = Vec::with_capacity(candidates.len());
-    for mut idle_conn in candidates {
-        let too_old = idle_conn.created_at.elapsed() > inner.config.max_lifetime;
-        let alive = !too_old && inner.backend.ping(&mut idle_conn.conn).await.is_ok();
-        if alive {
-            kept.push(idle_conn);
+    for _ in 0..budget {
+        // No permit available means every slot up to `max_size` is already spoken for by
+        // concurrent checkouts (or other reaper iterations, though this loop only ever holds one
+        // at a time) — stop this tick rather than block; the reaper must never hold up a
+        // checkout.
+        let permit = match Arc::clone(&inner.semaphore).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+
+        let popped = {
+            let mut idle = inner.idle.lock().unwrap();
+            idle.pop()
+        };
+        let Some(mut idle_conn) = popped else {
+            drop(permit);
+            break; // no idle conns left to reap this tick
+        };
+
+        let stale = idle_conn.created_at.elapsed() > inner.config.max_lifetime;
+        // Short-circuited exactly like the previous implementation: a connection already past
+        // `max_lifetime` is evicted without spending a round trip on it.
+        let dead = !stale
+            && (inner.backend.is_closed(&idle_conn.conn)
+                || inner.backend.ping(&mut idle_conn.conn).await.is_err());
+
+        if stale || dead {
+            // Evicted: `idle_conn` drops here, releasing its connection resources. `permit`
+            // releases right after, so the vacated capacity is available to the next checkout (or
+            // the next reap iteration) only once this connection is truly gone.
+        } else {
+            let mut idle = inner.idle.lock().unwrap();
+            idle.push(idle_conn);
         }
-        // else: evicted — `idle_conn` is dropped here, releasing its connection resources.
+        drop(permit);
     }
-
-    let mut idle = inner.idle.lock().unwrap();
-    idle.extend(kept);
 }

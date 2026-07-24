@@ -25,6 +25,16 @@ pub enum PoolError {
 
 /// SPEC §9.2 taxonomy branch. The engine never transparently retries user statements (charter
 /// rule 3); `Retryable` only licenses the *caller* to retry per its own policy.
+///
+/// **PRE-INDETERMINATE COARSENING (S4):** this two-branch mapping (`Retryable`/`NonRetryable`) is
+/// a simplification of the full SPEC §9.2 error tree, not the whole thing. In particular, a
+/// `ConnectionLost` classified here as `Retryable` may in reality be a lost write or a COMMIT
+/// whose response never arrived — which per SPEC §19.3 is actually **Indeterminate** (the
+/// statement's fate is unknown), not safely retryable at all. The pool itself never auto-retries
+/// either way (charter rule 3), so this coarsening changes no pool-level behavior today. But S5/S6
+/// (the SQL/TX services) MUST layer the real Indeterminate classification on TOP of this label
+/// before deciding whether re-dispatching a statement is safe — do not treat a pool
+/// `Retryable`/`PoolError::ConnectionLost` alone as license to blindly re-send a write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Branch {
     Retryable,

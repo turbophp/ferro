@@ -58,13 +58,49 @@ fn leading_words(sql: &str, max: usize) -> Vec<String> {
         .collect()
 }
 
+/// Skips leading ASCII whitespace and any leading `--` line comments / `/* ... */` block comments
+/// (looping, since more than one can precede a statement) before the tx-control guard extracts its
+/// leading keyword(s).
+///
+/// Without this, a leading comment's own letters become the "first word" under `leading_words`'s
+/// non-alphabetic-is-a-separator rule — e.g. `/* x */ BEGIN` would extract `"X"` as the first
+/// word, never seeing `BEGIN` at all, letting a commented-out-looking `BEGIN`/`ROLLBACK`/etc slip
+/// past `is_bare_tx_control` and bypass the pin stub via `Checkout::exec` (MINOR 4, S4 review).
+fn skip_leading_noise(sql: &str) -> &str {
+    let mut rest = sql;
+    loop {
+        let trimmed = rest.trim_start();
+        if let Some(after) = trimmed.strip_prefix("--") {
+            // Line comment: skip to (but not including) the next newline, or to end-of-input if
+            // there isn't one.
+            rest = match after.find('\n') {
+                Some(idx) => &after[idx + 1..],
+                None => "",
+            };
+            continue;
+        }
+        if let Some(after) = trimmed.strip_prefix("/*") {
+            // Block comment: skip to (but not including) the closing "*/". An unterminated block
+            // comment consumes the rest of the input either way -- there's no keyword left to
+            // find.
+            rest = match after.find("*/") {
+                Some(idx) => &after[idx + 2..],
+                None => "",
+            };
+            continue;
+        }
+        return trimmed;
+    }
+}
+
 /// True if `sql` starts with a bare transaction-control verb (`BEGIN`, `START TRANSACTION`,
 /// `SAVEPOINT`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, `RELEASE`, `PREPARE TRANSACTION`),
-/// case-insensitively, after skipping leading whitespace. Used by `Checkout::exec` (the guarded,
-/// user-facing entry) to reject statements that would bypass the pin stub; the pin hook itself
-/// (`begin_tx`/`commit_tx`/`rollback_tx`) goes through the raw, unguarded
-/// `PoolBackend::simple_query` instead and is never subject to this check.
+/// case-insensitively, after skipping leading whitespace and leading `--`/`/* */` comments. Used
+/// by `Checkout::exec` (the guarded, user-facing entry) to reject statements that would bypass the
+/// pin stub; the pin hook itself (`begin_tx`/`commit_tx`/`rollback_tx`) goes through the raw,
+/// unguarded `PoolBackend::simple_query` instead and is never subject to this check.
 pub(crate) fn is_bare_tx_control(sql: &str) -> bool {
+    let sql = skip_leading_noise(sql);
     let words = leading_words(sql, 2);
     let Some(first) = words.first() else {
         return false;
@@ -108,5 +144,25 @@ mod tests {
         assert!(!is_bare_tx_control("insert into t values (1)"));
         assert!(!is_bare_tx_control(""));
         assert!(!is_bare_tx_control("   "));
+    }
+
+    #[test]
+    fn guard_skips_leading_comments() {
+        // MINOR 4 (S4 review): a leading block or line comment must not hide the real leading
+        // keyword from the guard -- both of these are bare tx-control and must be rejected.
+        assert!(
+            is_bare_tx_control("/* c */ BEGIN"),
+            "a leading block comment must not hide BEGIN from the guard"
+        );
+        assert!(
+            is_bare_tx_control("-- c\nROLLBACK"),
+            "a leading line comment must not hide ROLLBACK from the guard"
+        );
+        // A couple of adjacent variations, since the fix loops over multiple leading comments.
+        assert!(is_bare_tx_control("/* a */ /* b */ COMMIT"));
+        assert!(is_bare_tx_control("-- a\n-- b\nSTART TRANSACTION"));
+        assert!(is_bare_tx_control("/* c */\n  Abort"));
+        // An ordinary statement behind a leading comment must still be allowed.
+        assert!(!is_bare_tx_control("/* c */ SELECT 1"));
     }
 }

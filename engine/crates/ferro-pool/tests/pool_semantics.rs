@@ -304,6 +304,108 @@ async fn reaper_stops_on_pool_drop() {
     );
 }
 
+// --- S4 whole-branch review, CRITICAL fix: the reaper must hold a permit per pinged conn -------
+//
+// Regression coverage for the over-provisioning bug: the OLD `reap_once` pulled every idle conn
+// out of the shared idle stack via `mem::take` (no semaphore permit involved) and pinged them with
+// the lock released. During that window `idle` was empty but nobody held a permit for the pinged
+// conns, so a concurrent `checkout()` -- bounded only by ITS OWN permit -- could see `idle` empty
+// and `connect()` a brand-new conn, and the reaper would then reinsert the ones it pulled out:
+// total live connections could exceed `max_size` and the surplus never got cleaned up.
+//
+// This test uses REAL time (no `start_paused`) since it needs the background reaper's own real
+// timer to fire, so it deliberately does NOT join the `pool_semantics.rs` deterministic
+// `start_paused` tests above. Determinism instead comes from `FakeBackend::block_pings()`: the
+// reaper's ping is parked on a `Notify` (confirmed via `pings_waiting()`) for as long as the test
+// needs to run its concurrent burst, so there is no timing race to get right.
+#[tokio::test]
+async fn reaper_holds_permit_while_pinging_no_overprovision_under_burst() {
+    let backend = FakeBackend::new();
+    let config = PoolConfig {
+        max_size: 1,
+        checkout_timeout: Duration::from_secs(10),
+        reap_interval: Some(Duration::from_millis(5)),
+        ..Default::default()
+    };
+    let pool = Pool::new(backend, config);
+
+    // Get the pool's one and only connection (id 0) sitting idle for the reaper to find.
+    let c0 = pool.checkout().await.expect("checkout should succeed");
+    drop(c0);
+
+    // Arm the gate: the reaper's next ping (its very first tick, since `reap_interval` is only
+    // 5ms) will park here, holding its owned semaphore permit for as long as it's parked -- the
+    // exact invariant under test.
+    pool.backend().block_pings();
+
+    // Wait (bounded, so a genuine regression fails fast instead of hanging) until the reaper is
+    // PROVABLY mid-ping: `pings_waiting() > 0` can only become true after the reaper has popped
+    // the idle conn under `idle`'s lock, acquired a permit for it, called `ping()`, and reached
+    // the (now parked) `.await` inside it.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.backend().pings_waiting() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("reaper should reach its blocked ping within 5s");
+
+    // With max_size=1 and the reaper holding the sole permit for the conn it's pinging, `idle` is
+    // empty AND no permit is free. A burst of concurrent checkouts must therefore ALL queue on the
+    // semaphore -- none can fall through to `connect()` a fresh conn, because (post-fix) the
+    // reaper's pinged conn is accounted for by a real permit, not merely absent from `idle`.
+    let burst: Vec<_> = (0..8)
+        .map(|_| {
+            let p = pool.clone();
+            tokio::spawn(async move { p.checkout().await })
+        })
+        .collect();
+
+    // Give the burst plenty of scheduling turns to actually attempt (and queue on) the semaphore
+    // before we assert. This is not a sleep race: every one of these checkouts is either queued on
+    // the semaphore (Pending) or -- if this test were run against the pre-fix reaper -- has
+    // already connected a fresh conn; either way, more yields cannot change today's answer, they
+    // just guarantee the burst has been given its chance to run.
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        pool.backend().total_connected(),
+        1,
+        "no fresh connection should have been created while the reaper held the only permit \
+         mid-ping -- that would be over-provisioning past max_size"
+    );
+
+    // Release the reaper's ping: it observes the (still healthy) conn, reinserts it into `idle`,
+    // and drops its permit -- exactly like a `checkout()`'s own release. The burst's abort below
+    // doesn't race this: aborting a task queued on the semaphore just drops its `Acquire` future,
+    // which cleans up the wait-queue registration safely.
+    pool.backend().release_pings();
+    for h in &burst {
+        h.abort();
+    }
+
+    // The pool must still be perfectly usable afterward, still bounded at max_size=1 and still
+    // reusing the same single connection (not creating a second one).
+    let after = pool
+        .checkout()
+        .await
+        .expect("pool must still work after the reaper's tick completes");
+    assert_eq!(
+        after.conn().id,
+        0,
+        "the pool's one conn must still be conn 0"
+    );
+    drop(after);
+
+    assert_eq!(
+        pool.backend().total_connected(),
+        1,
+        "max_size=1 must never have produced more than one distinct connection, start to finish"
+    );
+}
+
 #[test]
 fn backoff_delay_schedule() {
     let cases = [

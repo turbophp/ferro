@@ -3,8 +3,10 @@
 //! the pool's mechanics are tested without a Docker dependency.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::backend::PoolBackend;
@@ -43,6 +45,14 @@ pub struct FakeBackend {
     /// `ConnectionLost` and decrements the counter. Armed via `arm_fail_connect` (used by later
     /// tasks' backoff/reconnect tests; Task 1 only needs the mechanism to exist).
     fail_connect_remaining: AtomicU64,
+    /// When `Some`, every `ping()` call parks on this `Notify` until `release_pings()` clears it
+    /// and wakes any waiters. Armed via `block_pings` -- lets a test deterministically freeze the
+    /// reaper mid-ping (holding its owned semaphore permit) before issuing a concurrent burst of
+    /// checkouts (S4 reaper-cap regression test).
+    ping_gate: Mutex<Option<Arc<Notify>>>,
+    /// Number of `ping()` calls currently parked on `ping_gate`. Tests poll this until it is `> 0`
+    /// to prove the reaper has actually entered the blocked ping, rather than racing on timing.
+    pings_waiting: AtomicU64,
 }
 
 impl FakeBackend {
@@ -50,12 +60,41 @@ impl FakeBackend {
         Self {
             next_id: AtomicU64::new(0),
             fail_connect_remaining: AtomicU64::new(0),
+            ping_gate: Mutex::new(None),
+            pings_waiting: AtomicU64::new(0),
         }
     }
 
     /// Arms the next `n` `connect()` calls to fail with `PoolError::ConnectionLost`.
     pub fn arm_fail_connect(&self, n: u64) {
         self.fail_connect_remaining.store(n, Ordering::SeqCst);
+    }
+
+    /// Arms every subsequent `ping()` call to block until `release_pings()` is called. Used by the
+    /// reaper-cap regression test to freeze the reaper mid-ping -- and thus holding its owned
+    /// semaphore permit -- while a concurrent burst of checkouts runs.
+    pub fn block_pings(&self) {
+        *self.ping_gate.lock().unwrap() = Some(Arc::new(Notify::new()));
+    }
+
+    /// Releases every `ping()` call currently parked by `block_pings()` and clears the gate so
+    /// future `ping()` calls are no longer affected.
+    pub fn release_pings(&self) {
+        if let Some(notify) = self.ping_gate.lock().unwrap().take() {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Number of `ping()` calls currently parked on the gate armed by `block_pings()`.
+    pub fn pings_waiting(&self) -> u64 {
+        self.pings_waiting.load(Ordering::SeqCst)
+    }
+
+    /// Total number of DISTINCT connections ever created by `connect()` (i.e. the next id that
+    /// would be handed out). Used by the reaper-cap test to assert the pool never over-provisions
+    /// past `max_size`.
+    pub fn total_connected(&self) -> u64 {
+        self.next_id.load(Ordering::SeqCst)
     }
 }
 
@@ -89,6 +128,16 @@ impl PoolBackend for FakeBackend {
         if conn.fail_next_ping {
             conn.fail_next_ping = false;
             return Err(PoolError::ConnectionLost);
+        }
+        // Test-only gate (see `block_pings`/`release_pings`): if armed, park here until released.
+        // The counter is bumped *before* the (only) await point below, in the same synchronous
+        // span -- so once a test observes `pings_waiting() > 0` this call has already registered
+        // as a waiter on `notify`, and a later `release_pings()` cannot race a lost wakeup.
+        let gate = self.ping_gate.lock().unwrap().clone();
+        if let Some(notify) = gate {
+            self.pings_waiting.fetch_add(1, Ordering::SeqCst);
+            notify.notified().await;
+            self.pings_waiting.fetch_sub(1, Ordering::SeqCst);
         }
         Ok(())
     }

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use ferro_backend_pg::PgBackend;
 use ferro_pool::config::PoolConfig;
-use ferro_pool::error::PoolError;
+use ferro_pool::error::{Branch, PoolError};
 use ferro_pool::pin::{PinCause, PinState, TxId};
 use ferro_pool::pool::{Checkout, Pool};
 
@@ -202,6 +202,12 @@ async fn pg_killed_backend_evicted_no_retry() {
         Some(PoolError::ConnectionLost),
         "a killed backend must surface as ConnectionLost (Retryable), never a silent success"
     );
+    assert_eq!(
+        last_err.as_ref().map(PoolError::taxonomy_branch),
+        Some(Branch::Retryable),
+        "ConnectionLost must classify as Retryable -- the arm the pg_syntax_error_... test below \
+         proves is distinct from the Backend/NonRetryable arm"
+    );
 
     // Charter rule 3 (no transparent retry): the loop above made exactly one *user* statement
     // attempt per iteration and stopped at the first error -- there is no hidden retry loop
@@ -251,5 +257,58 @@ async fn pg_max_lifetime_recycles_live() {
     assert_ne!(
         pid1, pid2,
         "a connection past max_lifetime should be recycled (fresh pid), not reused"
+    );
+}
+
+/// IMPORTANT 2 (S4 review): the FATAL-severity-vs-DbError classification in `conn.rs`'s
+/// `simple_query` had zero coverage of the `Backend`/`NonRetryable` arm -- only the
+/// `ConnectionLost`/`Retryable` arm (a killed backend, `pg_killed_backend_evicted_no_retry` above)
+/// was exercised live. A genuine SQL error (severity ERROR, not FATAL/PANIC) must classify as
+/// `PoolError::Backend` + `Branch::NonRetryable`, never be misclassified as the retryable
+/// `ConnectionLost` -- and the connection itself must stay alive and reusable afterward, since
+/// nothing about the session actually ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_syntax_error_classifies_as_backend_nonretryable() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let mut co = pool.checkout().await.expect("checkout");
+
+    let err = co
+        .exec("SELECT * FROM nonexistent_table_xyz")
+        .await
+        .expect_err("querying a nonexistent table must fail");
+    assert!(
+        matches!(err, PoolError::Backend(_)),
+        "a genuine SQL error (undefined table) must classify as PoolError::Backend, got {err:?}"
+    );
+    assert_eq!(
+        err.taxonomy_branch(),
+        Branch::NonRetryable,
+        "a statement-level SQL error must be NonRetryable -- misclassifying it as the retryable \
+         ConnectionLost would license a caller to blindly retry a query that will always fail"
+    );
+
+    // A second, independent flavor of statement-level error (a syntax error) must classify the
+    // same way -- this isn't specific to "undefined table".
+    let err2 = co
+        .exec("SEL ECT 1")
+        .await
+        .expect_err("a syntax error must fail");
+    assert!(
+        matches!(err2, PoolError::Backend(_)),
+        "a syntax error must also classify as PoolError::Backend, got {err2:?}"
+    );
+    assert_eq!(err2.taxonomy_branch(), Branch::NonRetryable);
+
+    // The connection itself must still be alive and usable afterward: proof the errors above were
+    // statement-level, not connection-level. A FATAL/PANIC (ConnectionLost) misclassification
+    // would have ended the session and this would fail.
+    let one = query_i32(&mut co, "SELECT 1").await;
+    assert_eq!(
+        one, 1,
+        "the connection must still be alive and usable after plain statement-level SQL errors"
     );
 }
