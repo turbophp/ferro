@@ -1,5 +1,7 @@
 pub mod backend;
+pub mod config;
 pub mod error;
 pub mod fake;
+pub mod pool;
 
-// config/pool/pin/health land in later S4 tasks.
+// pin/health land in later S4 tasks.
