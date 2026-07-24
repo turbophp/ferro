@@ -12,14 +12,17 @@ use ferro_proto::header::Header;
 use ferro_proto::messages::{Goodbye, Hello, HelloAck, Ping, WindowUpdate};
 use ferrod::config::Config;
 use ferrod::epoch::BootEpoch;
-use ferrod::session::codec::{FrameCodec, InFrame, OutFrame};
+use ferrod::serve::serve;
+use ferrod::session::codec::{FrameCodec, FrameError, InFrame, OutFrame};
 use ferrod::session::{HandlerFn, Session};
+use ferrod::shutdown::Drain;
 use futures::{SinkExt, StreamExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 
 /// How long `recv`/`recv_eof` wait before panicking. A real deadline (not a sleep loop) so a
@@ -116,13 +119,51 @@ impl TestServer {
 
     /// Connect a new client to this server.
     pub async fn connect(&self) -> TestClient {
-        let stream = UnixStream::connect(&self.socket_path)
-            .await
-            .expect("client connect to test server");
-        TestClient {
-            framed: Framed::new(stream, FrameCodec),
-        }
+        connect(&self.socket_path).await
     }
+}
+
+/// Connect a new client directly to a bound socket path (for use with `spawn_serve*`, which —
+/// unlike `TestServer` — has no `connect` method of its own since a `serve` call, not a
+/// `TestServer`, owns the listener).
+pub async fn connect(socket_path: &Path) -> TestClient {
+    let stream = UnixStream::connect(socket_path)
+        .await
+        .expect("client connect to test server");
+    TestClient {
+        framed: Framed::new(stream, FrameCodec),
+    }
+}
+
+/// Spawn the REAL `serve` accept loop (peercred-gated + drain-aware, S3 Task 7) on a fresh bound
+/// listener, via `tokio::spawn`, using `Config::default()` plus a fresh temp socket path. Returns
+/// the socket path (pass to `connect` above) and `serve`'s own `JoinHandle` so a test can await it
+/// — after triggering `drain` — and assert it returns within `config.drain_deadline`.
+pub fn spawn_serve(
+    epoch: BootEpoch,
+    drain: Drain,
+    handler: HandlerFn,
+) -> (PathBuf, JoinHandle<()>) {
+    spawn_serve_with_config(Config::default(), epoch, drain, handler)
+}
+
+/// Like `spawn_serve`, but starting from a caller-supplied `Config` (e.g. to override
+/// `peer_allow_uids` for a peercred-deny test, or `drain_deadline` for a hard-close test). The
+/// `socket_path` field of `config` is always overwritten with a fresh temp path.
+pub fn spawn_serve_with_config(
+    config: Config,
+    epoch: BootEpoch,
+    drain: Drain,
+    handler: HandlerFn,
+) -> (PathBuf, JoinHandle<()>) {
+    let socket_path = tmp_socket_path();
+    let config = Config {
+        socket_path: socket_path.clone(),
+        ..config
+    };
+    let listener = ferrod::listener::bind_uds(&config).expect("bind_uds in test harness");
+    let handle = tokio::spawn(serve(listener, config, epoch, drain, handler));
+    (socket_path, handle)
 }
 
 /// The result of a successful HELLO/HELLO_ACK exchange: the decoded `HelloAck` plus the raw
@@ -140,6 +181,13 @@ impl TestClient {
     /// Encode and send `frame` to the server.
     pub async fn send(&mut self, frame: OutFrame) {
         self.framed.send(frame).await.expect("client send");
+    }
+
+    /// Like `send`, but returns the encode/write result instead of panicking on failure — for
+    /// tests where the send itself might fail (e.g. the server already dropped its side of the
+    /// socket right after a peercred deny; that's an EXPECTED outcome there, not a test bug).
+    pub async fn try_send(&mut self, frame: OutFrame) -> Result<(), FrameError> {
+        self.framed.send(frame).await
     }
 
     /// Write raw bytes directly to the underlying socket, bypassing `FrameCodec`'s encoder
@@ -175,9 +223,22 @@ impl TestClient {
         }
     }
 
-    /// Send a `HELLO` with an explicit (possibly bogus) `type_registry_hash`, without asserting
-    /// anything about the reply — for tests that expect the handshake to fail.
-    pub async fn send_hello(&mut self, request_id: u32, type_registry_hash: &str) {
+    /// Wait up to `dur` for a frame. Returns `Some(frame)` if a well-formed frame arrived in time;
+    /// `None` on timeout, EOF, OR a codec error alike — for tests asserting "nothing ever arrives"
+    /// (e.g. a connection `serve`'s accept loop never got around to spawning a session for), where
+    /// the exact failure mode isn't the point, only that no valid reply ever showed up.
+    pub async fn recv_or_none(&mut self, dur: Duration) -> Option<InFrame> {
+        match tokio::time::timeout(dur, self.framed.next()).await {
+            Ok(Some(Ok(frame))) => Some(frame),
+            _ => None,
+        }
+    }
+
+    /// Build a `HELLO` `OutFrame` with an explicit (possibly bogus) `type_registry_hash`, without
+    /// sending it — shared by `send_hello` and tests that need `try_send`'s non-panicking send
+    /// (e.g. a peercred-deny test, where the send itself may fail because the server already
+    /// closed its side of the socket).
+    pub fn hello_out_frame(request_id: u32, type_registry_hash: &str) -> OutFrame {
         let hello = Hello {
             client_version: 1,
             type_registry_hash: type_registry_hash.to_string(),
@@ -186,7 +247,7 @@ impl TestClient {
             features: 0,
         };
         let payload = hello.encode();
-        self.send(OutFrame {
+        OutFrame {
             header: Header {
                 flags: 0,
                 service: service::CORE,
@@ -195,8 +256,14 @@ impl TestClient {
                 payload_len: payload.len() as u32,
             },
             payload: payload.into(),
-        })
-        .await;
+        }
+    }
+
+    /// Send a `HELLO` with an explicit (possibly bogus) `type_registry_hash`, without asserting
+    /// anything about the reply — for tests that expect the handshake to fail.
+    pub async fn send_hello(&mut self, request_id: u32, type_registry_hash: &str) {
+        self.send(Self::hello_out_frame(request_id, type_registry_hash))
+            .await;
     }
 
     /// Send a well-formed `HELLO` (the correct `TYPE_REGISTRY_HASH`) and assert the `HELLO_ACK`

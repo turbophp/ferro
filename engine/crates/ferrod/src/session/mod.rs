@@ -157,8 +157,7 @@ impl Session {
     /// Drive one accepted connection end to end using the default handler (declares
     /// `Unsupported` for every request-bearing frame — real dispatch lands in Task 6).
     pub async fn run(stream: UnixStream, config: Config, epoch: BootEpoch) {
-        let handler: HandlerFn = Arc::new(default_handler);
-        Self::run_with_handler(stream, config, epoch, handler).await;
+        Self::run_with_handler(stream, config, epoch, default_handler_fn()).await;
     }
 
     /// Drive one accepted connection end to end: split the framed stream, spawn the writer task,
@@ -404,6 +403,14 @@ fn default_handler(
         responder.end_error(unsupported_error_payload());
     }
     .boxed()
+}
+
+/// A `HandlerFn` equivalent to `Session::run`'s built-in stub: declares `Unsupported` for every
+/// request-bearing frame. Exposed (unlike the private `default_handler` it wraps) so `serve`'s
+/// real, non-test callers (`main`) can hand `serve` a `HandlerFn` the same way a test hands it a
+/// scripted one, without duplicating `Session::run`'s default dispatch.
+pub fn default_handler_fn() -> HandlerFn {
+    Arc::new(default_handler)
 }
 
 fn unsupported_error_payload() -> ErrorPayload {
