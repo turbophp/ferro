@@ -58,6 +58,55 @@ impl Credit {
     }
 }
 
+/// The per-session aggregate byte cap (`Config::session_cap_bytes`, its OWN literal default
+/// `16 * 1024 * 1024` — see `config.rs` — deliberately NOT `ferro_proto::consts::MAX_FRAME_PAYLOAD`,
+/// a distinct concept: the codec's per-frame ceiling vs. this session-wide running total across
+/// every in-flight request's streamed bytes). No stream producer reserves against it yet (S5's
+/// DATA frames are the first consumer); this is the primitive plus its own tests.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionCap {
+    used: u64,
+    cap: u64,
+}
+
+impl SessionCap {
+    /// A fresh cap with nothing reserved yet.
+    pub fn new(cap: u64) -> Self {
+        SessionCap { used: 0, cap }
+    }
+
+    /// Attempt to reserve `bytes` against the remaining aggregate cap. Returns `false` — leaving
+    /// `used` entirely unchanged — if reserving would push the running total past `cap` (checked
+    /// via `checked_add` so a pathological huge `bytes` can't wrap around and appear to fit);
+    /// otherwise reserves and returns `true`.
+    pub fn try_reserve(&mut self, bytes: u64) -> bool {
+        match self.used.checked_add(bytes) {
+            Some(new_used) if new_used <= self.cap => {
+                self.used = new_used;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Release a previously reserved `bytes`. Saturating at zero: a caller releasing more than is
+    /// currently reserved (which should never happen if reserve/release calls are paired
+    /// correctly) cannot underflow `used` into a wraparound.
+    pub fn release(&mut self, bytes: u64) {
+        self.used = self.used.saturating_sub(bytes);
+    }
+
+    /// The currently reserved total.
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+
+    /// The configured aggregate cap.
+    pub fn cap(&self) -> u64 {
+        self.cap
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +150,45 @@ mod tests {
         credit.replenish(1, 1);
         assert_eq!(credit.frames(), u32::MAX);
         assert_eq!(credit.bytes(), u32::MAX);
+    }
+
+    #[test]
+    fn session_cap_try_reserve_rejects_without_partially_applying() {
+        let mut cap = SessionCap::new(100);
+
+        assert!(cap.try_reserve(60));
+        assert_eq!(cap.used(), 60);
+
+        // Would exceed the cap: rejected, and `used` is untouched.
+        assert!(!cap.try_reserve(50));
+        assert_eq!(cap.used(), 60);
+
+        assert!(cap.try_reserve(40));
+        assert_eq!(cap.used(), 100);
+        assert!(!cap.try_reserve(1));
+    }
+
+    #[test]
+    fn session_cap_release_frees_capacity_and_saturates_at_zero() {
+        let mut cap = SessionCap::new(100);
+        cap.try_reserve(60);
+
+        cap.release(20);
+        assert_eq!(cap.used(), 40);
+        assert!(cap.try_reserve(60));
+        assert_eq!(cap.used(), 100);
+
+        // Releasing more than is reserved saturates at zero rather than underflowing.
+        cap.release(u64::MAX);
+        assert_eq!(cap.used(), 0);
+    }
+
+    #[test]
+    fn session_cap_try_reserve_rejects_overflowing_addition() {
+        let mut cap = SessionCap::new(u64::MAX);
+        cap.try_reserve(10);
+        // A reserve so large it would overflow `used + bytes` must be rejected, not wrap.
+        assert!(!cap.try_reserve(u64::MAX));
+        assert_eq!(cap.used(), 10);
     }
 }

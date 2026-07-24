@@ -56,7 +56,10 @@ impl SessionError {
     }
 }
 
-fn error_payload(code: u16, branch: u8, detail: impl Into<String>) -> ErrorPayload {
+/// Shared with `session::classify`, which builds the same shape of `ErrorPayload` for its own
+/// fatal/per-request classifications (header-level codec faults, a set RESERVED flag, an unknown
+/// flag bit) — one construction path for "this is what a Ferro error payload looks like".
+pub(crate) fn error_payload(code: u16, branch: u8, detail: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code,
         branch,

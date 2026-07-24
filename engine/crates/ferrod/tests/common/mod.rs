@@ -18,6 +18,7 @@ use futures::{SinkExt, StreamExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 
@@ -139,6 +140,19 @@ impl TestClient {
     /// Encode and send `frame` to the server.
     pub async fn send(&mut self, frame: OutFrame) {
         self.framed.send(frame).await.expect("client send");
+    }
+
+    /// Write raw bytes directly to the underlying socket, bypassing `FrameCodec`'s encoder
+    /// entirely (which asserts `header.payload_len == payload.len()` and would reject/assert on
+    /// a deliberately malformed frame). For tests that need to put bytes on the wire the encoder
+    /// itself would never let through — e.g. a header claiming an oversize `payload_len` with no
+    /// body at all, to exercise the S1 zero-allocation header guard end to end.
+    pub async fn send_raw_bytes(&mut self, bytes: &[u8]) {
+        self.framed
+            .get_mut()
+            .write_all(bytes)
+            .await
+            .expect("client send_raw_bytes");
     }
 
     /// Receive the next frame, panicking if none arrives within `RECV_TIMEOUT`.

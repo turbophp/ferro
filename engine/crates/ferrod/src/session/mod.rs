@@ -46,10 +46,11 @@
 //!
 //! **Dispatch is an injectable seam.** `Session::run_with_handler` takes a `HandlerFn` used for
 //! every request-bearing frame; `Session::run` is `run_with_handler` with a `default_handler`
-//! that declares `end_error(Unsupported)` for anything (real dispatch lands in Task 6). Tests use
-//! the seam to script handler behaviour (panic, hang on a `Notify`, declare immediately) without
-//! needing a real SQL/TX backend. The handler is also handed a `CancellationToken` (this module's
-//! Task 5 addition) alongside its `InFrame`/`Responder` — see below.
+//! that declares `end_error(Unsupported)` for anything (real SQL/TX handlers land in S4/S5).
+//! Tests use the seam to script handler behaviour (panic, hang on a `Notify`, declare
+//! immediately) without needing a real SQL/TX backend. The handler is also handed a
+//! `CancellationToken` (this module's Task 5 addition) alongside its `InFrame`/`Responder` — see
+//! below.
 //!
 //! **Liveness and drain (this module's Task 5 addition).** The reader loop now also routes:
 //! - **`CANCEL`** (a flag on ANY frame, `flags::CANCEL`, target = that frame's `request_id`, empty
@@ -77,12 +78,28 @@
 //!
 //! **This module's Task 3 baseline** (still true) lays down the session task itself, the
 //! `HELLO`/`HELLO_ACK` handshake (incl. the `TYPE_REGISTRY_HASH` hard check), and the writer
-//! task, plus a `PING`→`PONG` stub in the reader loop. Task 6 still owes the full
-//! fatal/per-request classification (`classify.rs`, reserved-flag rejection, unknown-flag skip)
-//! and the real SQL/TX/STREAM/ADMIN dispatch table — until then any CORE method other than
-//! `HELLO`/`PING`/`GOODBYE`/`WINDOW_UPDATE`, and any ADMIN/unknown-service frame, is simply
-//! ignored.
+//! task, plus a `PING`→`PONG` stub in the reader loop.
+//!
+//! **Classification and dispatch (this module's Task 6 addition).** Every decode result from the
+//! reader loop is first run through `session::classify::classify` — a PURE function (no
+//! awaiting, no I/O; it's what the Task 8 fuzz target drives directly) that applies
+//! `ferro_proto::flags::validate` and the session-fatal-vs-per-request split (SPEC's Global
+//! Constraints) BEFORE any dispatch happens: a set RESERVED flag (`OOB_FD`/`COMPRESSED`) or a
+//! header-level codec fault (bad magic/version, oversize `payload_len`, a truncated header)
+//! yields `Classification::Fatal` — one `service=CORE, request_id=0, flags=END,
+//! Outcome::Error(ep)` frame, then the connection closes; an unknown non-reserved flag bit yields
+//! `Classification::PerRequestErr` — one error `END` on that frame's own `request_id`, and the
+//! session survives. Only a `Classification::Frame` ever reaches CANCEL-checking and
+//! `dispatch::route`, the `(service, method) -> Route` table: `CoreControl` for
+//! `PING`/`GOODBYE`/`WINDOW_UPDATE` (answered as before); `Request` for SQL/TX/STREAM (goes
+//! through the registry/handler/supervisor mechanism above, regardless of the specific method id
+//! — no method is registered yet, so `default_handler` declares `Unsupported` for all of them);
+//! `Unsupported` for anything else (ADMIN, an unrecognized service, or a CORE method this build
+//! doesn't recognize) — which, like the reused-id/`max_inflight` diagnostics, sends a per-request
+//! `Unsupported` error `END` directly, without ever touching the registry (nothing was spawned
+//! for it, so there is no request lifecycle to guard).
 
+pub mod classify;
 pub mod codec;
 pub mod error;
 pub mod flow;
@@ -108,7 +125,9 @@ use ferro_proto::header::Header;
 use ferro_proto::messages::{ErrorPayload, Outcome, Ping, WindowUpdate};
 
 use crate::config::Config;
+use crate::dispatch::{self, CoreMethod, Route};
 use crate::epoch::BootEpoch;
+use classify::Classification;
 use codec::{FrameCodec, InFrame, OutFrame};
 use error::SessionError;
 use flow::Credit;
@@ -203,19 +222,42 @@ impl Session {
             return;
         }
 
-        // 2. Reader loop. Answers PING with PONG; routes CANCEL/WINDOW_UPDATE/GOODBYE; routes
-        // request-bearing frames (SQL/TX/STREAM) through the registry + spawned-handler +
-        // supervisor mechanism; everything else is a stub until Task 6 (full dispatch
-        // classification).
+        // 2. Reader loop. `session::classify` (pure) turns every decode result into a typed
+        // `Classification` BEFORE any dispatch happens: `Fatal` sends one `rid=0` error `END`
+        // then closes the session; `PerRequestErr` sends one error `END` on that id and the
+        // session continues; `NeedMore`/`Closed` are handled directly from `Stream::next()`'s
+        // shape (see `classify`'s own doc comment for why `Ok(None)`/`NeedMore` never actually
+        // arises on this path — `Framed`'s `Stream` impl already absorbs "wait for more bytes"
+        // internally). Only a `Classification::Frame` ever reaches CANCEL-checking and
+        // `dispatch::route`, the `(service, method) -> Route` table that decides between core
+        // control traffic, the request-bearing registry/handler/supervisor mechanism, and a
+        // per-request `Unsupported` for anything else (ADMIN, an unknown service, or a CORE
+        // method this build doesn't recognize).
         let registry = Arc::new(Registry::new(config.max_inflight));
 
-        while let Some(next) = reader.next().await {
-            let frame = match next {
-                Ok(frame) => frame,
-                // A decode error mid-session is a protocol fault; the full fatal/per-request
-                // classification (Task 6) isn't wired yet, so for now just stop reading and let
-                // the connection close.
-                Err(_) => break,
+        loop {
+            let classification = match reader.next().await {
+                None => Classification::Closed,
+                Some(Ok(frame)) => classify::classify(Ok(Some(frame))),
+                Some(Err(err)) => classify::classify(Err(&err)),
+            };
+
+            let frame = match classification {
+                Classification::NeedMore => continue,
+                Classification::Closed => break,
+                Classification::Fatal(ep) => {
+                    let fatal = SessionError::Fatal(ep).into_out_frame();
+                    let _ = control_tx.send(fatal).await;
+                    break;
+                }
+                Classification::PerRequestErr { rid, err } => {
+                    let diagnostic = SessionError::PerRequest { rid, err }.into_out_frame();
+                    if control_tx.send(diagnostic).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                Classification::Frame(frame) => frame,
             };
 
             // CANCEL is flag-based and checked BEFORE any other dispatch, regardless of the
@@ -226,59 +268,52 @@ impl Session {
                 continue;
             }
 
-            if frame.header.service == service::CORE {
-                match frame.header.method {
-                    method_core::PING => {
-                        if let Ok(ping) = Ping::decode(&frame.payload) {
-                            let pong = pong_frame(frame.header.request_id, ping.token);
-                            if control_tx.send(pong).await.is_err() {
-                                break;
-                            }
+            match dispatch::route(frame.header.service, frame.header.method) {
+                Route::CoreControl(CoreMethod::Ping) => {
+                    if let Ok(ping) = Ping::decode(&frame.payload) {
+                        let pong = pong_frame(frame.header.request_id, ping.token);
+                        if control_tx.send(pong).await.is_err() {
+                            break;
                         }
-                        continue;
-                    }
-                    method_core::GOODBYE => {
-                        // Drain: stop reading (so no new request-bearing frame is ever
-                        // dispatched); already in-flight requests still deliver their one
-                        // terminal because the writer/control-channel stay alive until every
-                        // outstanding supervisor's reserved permit is consumed (see this module's
-                        // top doc comment).
-                        break;
-                    }
-                    method_core::WINDOW_UPDATE => {
-                        if let Ok(wu) = WindowUpdate::decode(&frame.payload) {
-                            registry.replenish(frame.header.request_id, wu.frames, wu.bytes);
-                        }
-                        continue;
-                    }
-                    _ => {
-                        // Stub: any other CORE method (Task 6 lands the rest of dispatch).
-                        continue;
                     }
                 }
-            }
-
-            if is_request_bearing(frame.header.service) {
-                if !handle_request_frame(frame, &registry, &control_tx, &handler, &config).await {
+                Route::CoreControl(CoreMethod::Goodbye) => {
+                    // Drain: stop reading (so no new request-bearing frame is ever dispatched);
+                    // already in-flight requests still deliver their one terminal because the
+                    // writer/control-channel stay alive until every outstanding supervisor's
+                    // reserved permit is consumed (see this module's top doc comment).
                     break;
                 }
-                continue;
+                Route::CoreControl(CoreMethod::WindowUpdate) => {
+                    if let Ok(wu) = WindowUpdate::decode(&frame.payload) {
+                        registry.replenish(frame.header.request_id, wu.frames, wu.bytes);
+                    }
+                }
+                Route::Request => {
+                    if !handle_request_frame(frame, &registry, &control_tx, &handler, &config).await
+                    {
+                        break;
+                    }
+                }
+                Route::Unsupported => {
+                    // No route in this build: ADMIN, an unknown service, or a CORE method this
+                    // build doesn't recognize. Nothing was ever spawned for it, so there is no
+                    // registry entry to guard — send the per-request diagnostic directly.
+                    let unsupported = SessionError::PerRequest {
+                        rid: frame.header.request_id,
+                        err: unsupported_error_payload(),
+                    }
+                    .into_out_frame();
+                    if control_tx.send(unsupported).await.is_err() {
+                        break;
+                    }
+                }
             }
-
-            // Stub: ADMIN/unknown services are ignored until the real dispatch/classification
-            // table (Task 6).
         }
 
         drop(control_tx);
         let _ = writer_handle.await;
     }
-}
-
-/// Whether `service` is one of the request-bearing services (SQL/TX/STREAM) that go through the
-/// in-flight registry + spawned-handler + supervisor mechanism. CORE (control/liveness) and
-/// ADMIN are handled elsewhere (or, for now, ignored — see the reader loop's stub comment).
-fn is_request_bearing(svc: u16) -> bool {
-    svc == service::SQL || svc == service::TX || svc == service::STREAM
 }
 
 /// Route one request-bearing frame: insert into the registry (sending a per-request diagnostic

@@ -19,7 +19,8 @@ use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use common::TestServer;
-use ferro_proto::consts::{errc, flags, method_core, service};
+use ferro_proto::consts::{MAX_FRAME_PAYLOAD, errc, flags, method_core, service};
+use ferro_proto::header::Header;
 use ferro_proto::messages::{Outcome, Pong};
 use ferrod::epoch::BootEpoch;
 use ferrod::session::HandlerFn;
@@ -39,8 +40,8 @@ fn test_credit() -> Credit {
 }
 
 /// A stable placeholder method id for request-bearing test frames. SQL/TX/STREAM don't have
-/// registry-defined method ids yet (that lands with the dispatch table in Task 6); the mechanism
-/// under test here only routes on `service`.
+/// registry-defined method ids yet (that lands with the real S4/S5 handlers); the mechanism under
+/// test here only routes on `service`.
 const SOME_METHOD: u16 = 1;
 
 // ---------------------------------------------------------------------------------------------
@@ -600,6 +601,175 @@ async fn window_update_through_live_session_survives_unknown_target() {
     client.window_update(123, 4, 4096).await;
 
     client.ping(9, 5).await;
+    let pong_frame = client.recv().await;
+    assert_eq!(pong_frame.header.method, method_core::PONG);
+    assert_eq!(pong_frame.header.request_id, 9);
+}
+
+// ---------------------------------------------------------------------------------------------
+// S3 Task 6: pure reader classification (session::classify) + flag validation + the dispatch
+// table (session::dispatch::route) wired into a live Session — the session-fatal-vs-per-request
+// split from the plan's Global Constraints, end to end.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn unknown_service_method_is_per_request_unsupported() {
+    // ADMIN has no route at all in this build (no admin handlers exist yet, and it is never a
+    // request-bearing service) — `dispatch::route` sends it straight to `Route::Unsupported`,
+    // which produces a per-request `Unsupported` error `END` directly, without ever touching the
+    // registry (nothing was spawned for it).
+    let server = TestServer::spawn(BootEpoch(1));
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    client
+        .send_request(77, service::ADMIN, SOME_METHOD, vec![])
+        .await;
+
+    let terminal = client.recv().await;
+    assert_eq!(terminal.header.request_id, 77);
+    assert_eq!(terminal.header.flags, flags::END);
+    match Outcome::decode(&terminal.payload).expect("decode Outcome") {
+        Outcome::Error(ep) => assert_eq!(ep.code, errc::UNSUPPORTED),
+        other => panic!("expected Outcome::Error, got {other:?}"),
+    }
+
+    // The session survived: PING still gets a PONG.
+    client.ping(9, 41).await;
+    let pong_frame = client.recv().await;
+    assert_eq!(pong_frame.header.method, method_core::PONG);
+    assert_eq!(pong_frame.header.request_id, 9);
+}
+
+#[tokio::test]
+async fn reserved_flag_is_session_fatal() {
+    // A RESERVED-but-known bit (OOB_FD) actually set is session-fatal: `classify` maps it to
+    // `errc::UNSUPPORTED` (M0 recognizes the bit but implements neither OOB_FD nor COMPRESSED —
+    // see `ferro_proto::flags::validate`'s own doc comment for that split), one rid=0 frame, then
+    // close.
+    let server = TestServer::spawn(BootEpoch(1));
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    client
+        .send(OutFrame {
+            header: Header {
+                flags: flags::OOB_FD,
+                service: service::SQL,
+                method: SOME_METHOD,
+                request_id: 55,
+                payload_len: 0,
+            },
+            payload: Bytes::new(),
+        })
+        .await;
+
+    let fatal = client.recv().await;
+    assert_eq!(fatal.header.request_id, 0);
+    assert_eq!(fatal.header.flags, flags::END);
+    match Outcome::decode(&fatal.payload).expect("decode Outcome") {
+        Outcome::Error(ep) => assert_eq!(ep.code, errc::UNSUPPORTED),
+        other => panic!("expected Outcome::Error, got {other:?}"),
+    }
+
+    // Session-fatal: the connection closes right after, nothing else is ever sent.
+    client.recv_eof().await;
+}
+
+#[tokio::test]
+async fn unknown_flag_bit_is_per_request() {
+    // A non-reserved, non-`KNOWN` bit (0x8000) is a per-request skip, not session-fatal:
+    // `payload_len` was already known from the header, so the one offending frame is cleanly
+    // skippable and the session survives.
+    let server = TestServer::spawn(BootEpoch(1));
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    client
+        .send(OutFrame {
+            header: Header {
+                flags: 0x8000,
+                service: service::SQL,
+                method: SOME_METHOD,
+                request_id: 66,
+                payload_len: 0,
+            },
+            payload: Bytes::new(),
+        })
+        .await;
+
+    let diagnostic = client.recv().await;
+    assert_eq!(diagnostic.header.request_id, 66);
+    assert_eq!(diagnostic.header.flags, flags::END);
+    match Outcome::decode(&diagnostic.payload).expect("decode Outcome") {
+        Outcome::Error(ep) => assert_eq!(ep.code, errc::PROTOCOL),
+        other => panic!("expected Outcome::Error, got {other:?}"),
+    }
+
+    // Session survives: PING still gets a PONG.
+    client.ping(9, 13).await;
+    let pong_frame = client.recv().await;
+    assert_eq!(pong_frame.header.method, method_core::PONG);
+    assert_eq!(pong_frame.header.request_id, 9);
+}
+
+#[tokio::test]
+async fn oversize_payload_len_is_fatal() {
+    // Craft a bare 16-byte header claiming a `payload_len` beyond `MAX_FRAME_PAYLOAD`, with NO
+    // body bytes at all, and write it straight to the socket (bypassing `FrameCodec`'s encoder,
+    // which would refuse to build such a frame). `Header::decode`'s S1 guard must reject this
+    // from the header alone — before ever trying to read/allocate a payload of that declared
+    // size — which is exactly why this test can complete without ever sending a body: if the
+    // codec instead waited for `payload_len` more bytes, `recv()` would time out rather than
+    // observe a fatal frame immediately.
+    let server = TestServer::spawn(BootEpoch(1));
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    let header = Header {
+        flags: 0,
+        service: service::SQL,
+        method: SOME_METHOD,
+        request_id: 99,
+        payload_len: MAX_FRAME_PAYLOAD + 1,
+    };
+    client.send_raw_bytes(&header.encode()).await;
+
+    let fatal = client.recv().await;
+    assert_eq!(fatal.header.request_id, 0);
+    assert_eq!(fatal.header.flags, flags::END);
+    match Outcome::decode(&fatal.payload).expect("decode Outcome") {
+        Outcome::Error(ep) => assert_eq!(ep.code, errc::PROTOCOL),
+        other => panic!("expected Outcome::Error, got {other:?}"),
+    }
+
+    client.recv_eof().await;
+}
+
+#[tokio::test]
+async fn sql_service_returns_unsupported_stub() {
+    // A `service=SQL` request frame goes through `Route::Request` (the registry/handler/
+    // supervisor mechanism) exactly like any other request-bearing frame; with the default
+    // handler in place (no real SQL handler until S4/S5), it declares `Unsupported` — no panic,
+    // exactly one terminal.
+    let server = TestServer::spawn(BootEpoch(1));
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    client
+        .send_request(88, service::SQL, SOME_METHOD, vec![])
+        .await;
+
+    let terminal = client.recv().await;
+    assert_eq!(terminal.header.request_id, 88);
+    assert_eq!(terminal.header.flags, flags::END);
+    match Outcome::decode(&terminal.payload).expect("decode Outcome") {
+        Outcome::Error(ep) => assert_eq!(ep.code, errc::UNSUPPORTED),
+        other => panic!("expected Outcome::Error, got {other:?}"),
+    }
+
+    // Session survives (no panic): PING still gets a PONG.
+    client.ping(9, 3).await;
     let pong_frame = client.recv().await;
     assert_eq!(pong_frame.header.method, method_core::PONG);
     assert_eq!(pong_frame.header.request_id, 9);
