@@ -26,6 +26,9 @@
       "PING": 3,
       "PONG": 4,
       "WINDOW_UPDATE": 6
+    },
+    "sql": {
+      "EXEC": 1
     }
   },
   "features": {

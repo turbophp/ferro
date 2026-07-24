@@ -1,0 +1,25 @@
+{
+  "frame_hex": "f7010200020001000f0000000f0000009200959090019202ccc89409580000",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 15,
+    "service": 2
+  },
+  "message": {
+    "affected": 1,
+    "cols": [],
+    "last_insert_id": {
+      "data": 200,
+      "tag": 2
+    },
+    "rows": [],
+    "stats": {
+      "bytes": 0,
+      "exec_us": 88,
+      "queue_us": 9,
+      "rows": 0
+    }
+  },
+  "name": "sql_exec_response_lastid"
+}

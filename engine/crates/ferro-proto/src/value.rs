@@ -88,14 +88,14 @@ fn read_nil(rd: &mut &[u8]) -> Result<(), CodecError> {
         m => Err(CodecError::Malformed(format!("expected nil, got {m:?}"))),
     }
 }
-fn read_bool(rd: &mut &[u8]) -> Result<bool, CodecError> {
+pub(crate) fn read_bool(rd: &mut &[u8]) -> Result<bool, CodecError> {
     match dec::read_marker(rd).map_err(|e| CodecError::Malformed(format!("bool: {e:?}")))? {
         Marker::True => Ok(true),
         Marker::False => Ok(false),
         m => Err(CodecError::Malformed(format!("expected bool, got {m:?}"))),
     }
 }
-fn read_str(rd: &mut &[u8]) -> Result<String, CodecError> {
+pub(crate) fn read_str(rd: &mut &[u8]) -> Result<String, CodecError> {
     let len = dec::read_str_len(rd).map_err(|e| CodecError::Malformed(format!("str len: {e:?}")))?
         as usize;
     bound_len(len, rd.len())?;
@@ -115,9 +115,11 @@ fn read_bin(rd: &mut &[u8]) -> Result<Vec<u8>, CodecError> {
 }
 
 /// Reject a length prefix that exceeds the bytes actually remaining BEFORE allocating, so a lying
-/// str/bin length (up to u32::MAX) cannot force a huge pre-allocation. The frame payload is already
-/// capped at MAX_FRAME_PAYLOAD, so `remaining` is bounded; this bounds the allocation to it.
-fn bound_len(len: usize, remaining: usize) -> Result<(), CodecError> {
+/// str/bin/array length (up to u32::MAX) cannot force a huge pre-allocation. The frame payload is
+/// already capped at MAX_FRAME_PAYLOAD, so `remaining` is bounded; this bounds the allocation to it.
+/// Shared with the bespoke SQL codec (`messages::sql`), which applies the identical discipline to
+/// every decoded array length (a MessagePack element is ≥1 byte, so `len > remaining` is a lie).
+pub(crate) fn bound_len(len: usize, remaining: usize) -> Result<(), CodecError> {
     if len > remaining {
         return Err(CodecError::Truncated {
             need: len,

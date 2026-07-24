@@ -26,6 +26,10 @@ PONG          = 4
 GOODBYE       = 5
 WINDOW_UPDATE = 6
 
+# SQL service (§6). EXEC is the single request-bearing autocommit statement method (S5).
+[methods.sql]
+EXEC = 1
+
 # Terminal outcome-envelope status discriminant (decision W-4). In /proto so both codecs
 # generate it rather than hand-writing 0/1/2 (charter rule 2).
 [outcome]

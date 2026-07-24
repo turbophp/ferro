@@ -1,0 +1,22 @@
+{
+  "frame_hex": "f7010200020001000e0000000c000000920095909003c09407780000",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 14,
+    "service": 2
+  },
+  "message": {
+    "affected": 3,
+    "cols": [],
+    "last_insert_id": null,
+    "rows": [],
+    "stats": {
+      "bytes": 0,
+      "exec_us": 120,
+      "queue_us": 7,
+      "rows": 0
+    }
+  },
+  "name": "sql_exec_response_none"
+}

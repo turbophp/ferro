@@ -1,12 +1,18 @@
 use crate::CodecError;
 use serde::{Deserialize, Serialize};
 
+/// SQL-service messages carry `Value`s, which cannot ride the `msg!`/rmp-serde path, so they live
+/// in a submodule with a bespoke positional codec. Declared after `to_vec`/`from_slice` and the
+/// `msg!` macro so the Value-free `ColMeta`/`Stats` there can reuse the same rmp-serde helpers.
+pub mod sql;
+pub use sql::{ColMeta, ExecOk, ExecRequest, Stats};
+
 /// rmp-serde in default (compact) mode encodes a struct as a fixarray of its fields in
 /// declaration order — exactly the positional layout PROTOCOL.md pins.
-fn to_vec<T: Serialize>(v: &T) -> Vec<u8> {
+pub(crate) fn to_vec<T: Serialize>(v: &T) -> Vec<u8> {
     rmp_serde::to_vec(v).expect("infallible in-memory encode")
 }
-fn from_slice<'a, T: Deserialize<'a>>(b: &'a [u8]) -> Result<T, CodecError> {
+pub(crate) fn from_slice<'a, T: Deserialize<'a>>(b: &'a [u8]) -> Result<T, CodecError> {
     // `Deserializer::new` over a `&[u8]` reader (rather than `from_slice`/`from_read_ref`)
     // consumes the slice as it decodes, so `get_ref()` afterward yields exactly the
     // unconsumed remainder — letting us reject a payload that smuggles extra bytes past a

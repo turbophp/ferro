@@ -1,0 +1,34 @@
+{
+  "frame_hex": "f7010200020001000d0000001d0000009200959192a83f636f6c756d6e3f02919192020100c0940ccd01590108",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 13,
+    "service": 2
+  },
+  "message": {
+    "affected": 0,
+    "cols": [
+      {
+        "name": "?column?",
+        "tag": 2
+      }
+    ],
+    "last_insert_id": null,
+    "rows": [
+      [
+        {
+          "data": 1,
+          "tag": 2
+        }
+      ]
+    ],
+    "stats": {
+      "bytes": 8,
+      "exec_us": 345,
+      "queue_us": 12,
+      "rows": 1
+    }
+  },
+  "name": "sql_exec_response_select1"
+}

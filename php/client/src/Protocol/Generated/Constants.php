@@ -32,6 +32,7 @@ final class Constants
     public const METHOD_CORE_PING = 3;
     public const METHOD_CORE_PONG = 4;
     public const METHOD_CORE_WINDOW_UPDATE = 6;
+    public const METHOD_SQL_EXEC = 1;
 
     public const OUTCOME_CANCELLED = 2;
     public const OUTCOME_ERROR = 1;

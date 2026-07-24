@@ -1,6 +1,9 @@
 <?php // /php/client/tests/Conformance/VectorConformanceTest.php
 declare(strict_types=1);
 namespace Ferro\Tests\Conformance;
+use Ferro\Protocol\ExecOk;
+use Ferro\Protocol\ExecRequest;
+use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Header;
 use Ferro\Protocol\Message;
 use Ferro\Protocol\Msgpack\{PurePacker, ExtPacker};
@@ -85,6 +88,70 @@ final class VectorConformanceTest extends TestCase
         $off = 0;
         $ext = (new ExtPacker())->unpack($payload, $off);
         $this->assertEquals(json_encode($pure), json_encode($ext), "ext vs pure decode for {$v['name']}");
+    }
+
+    /** @return iterable<string, array{0:array<string,mixed>}> only the SQL EXEC vectors (Task S5). */
+    public static function sqlVectors(): iterable
+    {
+        foreach (self::vectors() as $name => [$v]) {
+            if (str_starts_with((string) ($v['name'] ?? ''), 'sql_exec_')) {
+                yield $name => [$v];
+            }
+        }
+    }
+
+    /**
+     * THE SQL cross-language byte lock (bespoke Value-splicing codec). For every sql_exec_* vector,
+     * PHP must (a) re-encode the "message" JSON to the EXACT Rust-produced payload bytes, (b) decode
+     * those bytes back to the message value, and (c) round-trip decode->encode to the same bytes.
+     * Requests are the ExecRequest payload directly; responses are the terminal Outcome::Ok(ExecOk)
+     * envelope, so PHP wraps the ExecOk body in `[OUTCOME_OK, body]`.
+     * @param array<string,mixed> $v
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('sqlVectors')]
+    public function testSqlVectorByteMatchesBothDirections(array $v): void
+    {
+        $name = (string) $v['name'];
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $message = is_array($v['message']) ? $v['message'] : [];
+        $p = new PurePacker();
+
+        if (str_starts_with($name, 'sql_exec_request')) {
+            // (a) encode direction
+            $this->assertSame(bin2hex($payload), bin2hex(ExecRequest::encode($message, $p)),
+                "PHP ExecRequest encode must byte-match {$name}");
+            // (b) decode direction + full consumption
+            $off = 0;
+            $wire = $p->unpack($payload, $off);
+            $this->assertSame(strlen($payload), $off, "consumed all payload bytes for {$name}");
+            $this->assertIsArray($wire);
+            $decoded = ExecRequest::mapFromWire($wire);
+            $this->assertEquals($message, $decoded, "PHP ExecRequest decode==value for {$name}");
+            // (c) fixpoint
+            $this->assertSame(bin2hex($payload), bin2hex(ExecRequest::encode($decoded, $p)),
+                "ExecRequest decode->encode fixpoint for {$name}");
+            return;
+        }
+
+        // sql_exec_response*: the terminal Outcome::Ok(ExecOk) envelope.
+        $this->assertSame(bin2hex($payload), bin2hex(self::wrapOk($p, ExecOk::encode($message, $p))),
+            "PHP Outcome::Ok(ExecOk) encode must byte-match {$name}");
+        $off = 0;
+        $outcome = $p->unpack($payload, $off);
+        $this->assertSame(strlen($payload), $off, "consumed all payload bytes for {$name}");
+        $this->assertIsArray($outcome);
+        $outcome = array_values($outcome);
+        $this->assertSame(C::OUTCOME_OK, (int) $outcome[0], "terminal status is Ok for {$name}");
+        $this->assertIsArray($outcome[1]);
+        $decoded = ExecOk::mapFromWire($outcome[1]);
+        $this->assertEquals($message, $decoded, "PHP ExecOk decode==value for {$name}");
+        $this->assertSame(bin2hex($payload), bin2hex(self::wrapOk($p, ExecOk::encode($decoded, $p))),
+            "ExecOk decode->encode fixpoint for {$name}");
+    }
+
+    private static function wrapOk(PurePacker $p, string $body): string
+    {
+        return $p->packArrayLen(2) . $p->packUint(C::OUTCOME_OK) . $body;
     }
 
     /** True if $v (recursively) contains a decimal string that exceeds PHP_INT_MAX — PurePacker's

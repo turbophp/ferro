@@ -1,8 +1,9 @@
 //! Emit deterministic golden vectors: for each case, build the full frame (header+payload),
 //! and write {name, header, message(json), frame_hex}. Also emit malformed negative .bin seeds.
-use ferro_proto::consts::{self, flags, method_core, service};
+use ferro_proto::consts::{self, flags, method_core, method_sql, service};
 use ferro_proto::header::Header;
 use ferro_proto::messages::*;
+use ferro_proto::value::Value;
 use std::path::PathBuf;
 
 fn dir() -> PathBuf {
@@ -43,6 +44,71 @@ fn write_case(
     });
     let out = dir().join(format!("{name}.json"));
     std::fs::write(out, serde_json::to_string_pretty(&v).unwrap() + "\n").unwrap();
+}
+
+/// Emit a SQL response vector: payload = the terminal `Outcome::Ok(ExecOk.encode())`, flag END,
+/// service SQL, method EXEC. The "message" JSON carries the ExecOk fields (PHP wraps in Outcome::Ok).
+fn write_sql_response(name: &str, req: u32, ok: &ExecOk) {
+    let payload = Outcome::Ok(ok.encode()).encode();
+    write_case(
+        name,
+        flags::END,
+        service::SQL,
+        method_sql::EXEC,
+        req,
+        payload,
+        exec_ok_json(ok),
+    );
+}
+
+/// A single `Value` as `{tag, data}` — `data` mirrors the on-wire payload family (BYTES => array of
+/// byte ints, so a non-UTF8 blob survives JSON and re-encodes byte-for-byte in PHP).
+fn v_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::Null => serde_json::json!({ "tag": 0, "data": null }),
+        Value::Bool(b) => serde_json::json!({ "tag": 1, "data": b }),
+        Value::I64(n) => serde_json::json!({ "tag": 2, "data": n }),
+        Value::F64(f) => serde_json::json!({ "tag": 4, "data": f }),
+        Value::Text(s) => serde_json::json!({ "tag": 6, "data": s }),
+        Value::Bytes(b) => {
+            let ints: Vec<u64> = b.iter().map(|x| *x as u64).collect();
+            serde_json::json!({ "tag": 7, "data": ints })
+        }
+    }
+}
+fn values_json(vs: &[Value]) -> serde_json::Value {
+    serde_json::Value::Array(vs.iter().map(v_json).collect())
+}
+fn exec_request_json(r: &ExecRequest) -> serde_json::Value {
+    serde_json::json!({
+        "pool": r.pool,
+        "sql": r.sql,
+        "query_id": r.query_id,
+        "params": values_json(&r.params),
+        "timeout_ms": r.timeout_ms,
+        "readonly": r.readonly,
+        "fetch": r.fetch,
+    })
+}
+fn exec_ok_json(ok: &ExecOk) -> serde_json::Value {
+    let cols: Vec<serde_json::Value> = ok
+        .cols
+        .iter()
+        .map(|c| serde_json::json!({ "name": c.name, "tag": c.tag }))
+        .collect();
+    let rows: Vec<serde_json::Value> = ok.rows.iter().map(|r| values_json(r)).collect();
+    serde_json::json!({
+        "cols": cols,
+        "rows": rows,
+        "affected": ok.affected,
+        "last_insert_id": ok.last_insert_id.as_ref().map(v_json),
+        "stats": {
+            "queue_us": ok.stats.queue_us,
+            "exec_us": ok.stats.exec_us,
+            "rows": ok.stats.rows,
+            "bytes": ok.stats.bytes,
+        },
+    })
 }
 
 fn main() {
@@ -147,6 +213,126 @@ fn main() {
             "sqlstate":null, "errno":null, "message":"reused_request_id",
             "detail":null, "retry_after_ms":null } }),
     );
+
+    // --- SQL EXEC vectors (bespoke Value-splicing codec; /proto/PROTOCOL.md §8) ---
+    // Request vectors: payload = ExecRequest.encode(), flags 0. Response vectors: the terminal
+    // Outcome::Ok(ExecOk.encode()) body, flag END. The "message" JSON carries the ExecRequest fields
+    // (requests) or the ExecOk fields (responses); the PHP byte-match re-encodes from it and, for
+    // responses, wraps in the Outcome::Ok envelope. request-vs-response is keyed off the name prefix.
+    let req_select1 = ExecRequest {
+        pool: "main".into(),
+        sql: Some("SELECT 1".into()),
+        query_id: None,
+        params: vec![],
+        timeout_ms: None,
+        readonly: true,
+        fetch: 0,
+    };
+    write_case(
+        "sql_exec_request_select1",
+        0,
+        service::SQL,
+        method_sql::EXEC,
+        11,
+        req_select1.encode(),
+        exec_request_json(&req_select1),
+    );
+
+    // The full M0 scalar set, including the divergent-range ints I64(200)=`cc c8` / I64(-200)=`d1 ff 38`.
+    let req_params = ExecRequest {
+        pool: "main".into(),
+        sql: Some("INSERT INTO t (a,b,c,d,e,f,g) VALUES (?,?,?,?,?,?,?)".into()),
+        query_id: None,
+        params: vec![
+            Value::Null,
+            Value::Bool(true),
+            Value::I64(200),
+            Value::I64(-200),
+            Value::F64(1.5),
+            Value::Text("hi".into()),
+            Value::Bytes(vec![1, 2, 3]),
+        ],
+        timeout_ms: Some(5000),
+        readonly: false,
+        fetch: 0,
+    };
+    write_case(
+        "sql_exec_request_params",
+        0,
+        service::SQL,
+        method_sql::EXEC,
+        12,
+        req_params.encode(),
+        exec_request_json(&req_params),
+    );
+
+    let resp_select1 = ExecOk {
+        cols: vec![ColMeta {
+            name: "?column?".into(),
+            tag: consts::tag::I64,
+        }],
+        rows: vec![vec![Value::I64(1)]],
+        affected: 0,
+        last_insert_id: None,
+        stats: Stats {
+            queue_us: 12,
+            exec_us: 345,
+            rows: 1,
+            bytes: 8,
+        },
+    };
+    write_sql_response("sql_exec_response_select1", 13, &resp_select1);
+
+    let resp_none = ExecOk {
+        cols: vec![],
+        rows: vec![],
+        affected: 3,
+        last_insert_id: None,
+        stats: Stats {
+            queue_us: 7,
+            exec_us: 120,
+            rows: 0,
+            bytes: 0,
+        },
+    };
+    write_sql_response("sql_exec_response_none", 14, &resp_none);
+
+    // Some(last_insert_id) in the divergent integer range locks the Option<Value> peek path.
+    let resp_lastid = ExecOk {
+        cols: vec![],
+        rows: vec![],
+        affected: 1,
+        last_insert_id: Some(Value::I64(200)),
+        stats: Stats {
+            queue_us: 9,
+            exec_us: 88,
+            rows: 0,
+            bytes: 0,
+        },
+    };
+    write_sql_response("sql_exec_response_lastid", 15, &resp_lastid);
+
+    // 16 cols + a 16-cell row force the array16 marker (0xdc) on both the cols and inner-row lengths.
+    let wide_cols: Vec<ColMeta> = (0..16)
+        .map(|i| ColMeta {
+            name: format!("c{i}"),
+            tag: consts::tag::I64,
+        })
+        .collect();
+    let wide_row: Vec<Value> = (0..16).map(|i| Value::I64(i as i64)).collect();
+    let resp_wide = ExecOk {
+        cols: wide_cols,
+        rows: vec![wide_row],
+        affected: 0,
+        last_insert_id: None,
+        stats: Stats {
+            queue_us: 3,
+            exec_us: 41,
+            rows: 1,
+            bytes: 16,
+        },
+    };
+    write_sql_response("sql_exec_response_wide", 16, &resp_wide);
 
     // Negative seeds (decoder must reject; also fuzz corpus).
     let mut bad_magic = frame(

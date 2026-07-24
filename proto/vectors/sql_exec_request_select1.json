@@ -1,0 +1,19 @@
+{
+  "frame_hex": "f7010000020001000b0000001400000097a46d61696ea853454c4543542031c090c0c300",
+  "header": {
+    "flags": 0,
+    "method": 1,
+    "request_id": 11,
+    "service": 2
+  },
+  "message": {
+    "fetch": 0,
+    "params": [],
+    "pool": "main",
+    "query_id": null,
+    "readonly": true,
+    "sql": "SELECT 1",
+    "timeout_ms": null
+  },
+  "name": "sql_exec_request_select1"
+}
