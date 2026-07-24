@@ -510,3 +510,14 @@ Rust: latest stable pinned in `rust-toolchain.toml`, edition 2024, tokio multi-t
 - §18 rewritten: templated `ferrod@` units + socket activation holding the listener fd; old/new coexistence during rollout.
 - Doctrine/Eloquent incompat lists extended with credential-dependent tooling (D8); DBAL 4-first (D2).
 - Min PHP raised to 8.2 (readonly classes). All v0.1 §19 open questions resolved or defaulted in §21.
+
+### 22.1 M0 implementation deviations (thin-slice scope)
+
+These record where the M0 build (milestone §17.1) intentionally implements a *subset* of the target design above; each is a scope/milestone note, not a change to the target spec. See `docs/superpowers/specs/2026-07-23-ferro-m0-execution-design.md` §4 for the decision context.
+
+- **§20.1 workspace** — single repo-root Cargo workspace (`engine/crates/*` + `bench`) instead of an `/engine`-rooted one, so the charter commands run verbatim (B-1).
+- **§7.1 / §17.1(4) pin stub** — the M0 pin stub is driven from the TX-service lifecycle, not from the PG ReadyForQuery I/T/E byte (stock `tokio-postgres` exposes none). RFQ-byte access is raised as a §21 open item for the M1 pin engine (M-2).
+- **Charter rule 6 / §6 placeholders** — an engine-side mechanical `?`→`$n` scanner is accepted as parameter-syntax normalization (not SQL rewriting); a bare jsonb `?` must be written `??` or the client emits native `$n` (M-1).
+- **§20.2 tooling** — PHPUnit 11 (not 10); the M0 client advertises `features=0` (B-2).
+- **§7.2 hygiene** — M0 does minimal hygiene (release-time `ROLLBACK` guard only, applied at the *next* checkout since `Drop` is sync); full conditional/pipelined hygiene is M1. The D12 `SELECT 1` path is unaffected (R8).
+- **§5.2 / §6 EXEC framing (D-S5-1)** — M0's EXEC **buffers** each result into the single `Outcome::Ok` terminal frame; the windowed streaming DATA-channel producer (per-request credit wakeup, per-session cap accounting/release, cross-channel terminal ordering, HEAD/DATA framing, `fetch:stream`) is **deferred to post-M0**. Building it before the D12 bench (§16.1) demands it is speculative optimization (charter rule 5). A result whose encoded terminal body exceeds `MAX_FRAME_PAYLOAD` → `NonRetryable{Unsupported}`. The Indeterminate write-fate guarantee (§19.3) is upheld in M0: a non-readonly conn-loss surfaces `WriteUnconfirmed{Indeterminate}`, never an auto-retry.
