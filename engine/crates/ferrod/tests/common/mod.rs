@@ -12,8 +12,8 @@ use ferro_proto::header::Header;
 use ferro_proto::messages::{Hello, HelloAck, Ping};
 use ferrod::config::Config;
 use ferrod::epoch::BootEpoch;
-use ferrod::session::Session;
 use ferrod::session::codec::{FrameCodec, InFrame, OutFrame};
+use ferrod::session::{HandlerFn, Session};
 use futures::{SinkExt, StreamExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,6 +66,47 @@ impl TestServer {
                     Err(_) => break,
                 };
                 tokio::spawn(Session::run(stream, config.clone(), epoch));
+            }
+        });
+
+        TestServer { socket_path }
+    }
+
+    /// Like `spawn`, but drives every accepted connection through
+    /// `Session::run_with_handler(.., handler)` instead of the default dispatch stub — the seam
+    /// S3 Task 4 tests use to script handler behaviour (panic, block on a `Notify`, declare
+    /// immediately) without a real SQL/TX backend.
+    pub fn spawn_with_handler(epoch: BootEpoch, handler: HandlerFn) -> Self {
+        Self::spawn_with_handler_and_max_inflight(epoch, Config::default().max_inflight, handler)
+    }
+
+    /// Like `spawn_with_handler`, but also overrides `max_inflight` — for tests that need to
+    /// exercise the registry's capacity limit directly.
+    pub fn spawn_with_handler_and_max_inflight(
+        epoch: BootEpoch,
+        max_inflight: usize,
+        handler: HandlerFn,
+    ) -> Self {
+        let socket_path = tmp_socket_path();
+        let config = Config {
+            socket_path: socket_path.clone(),
+            max_inflight,
+            ..Config::default()
+        };
+        let listener = ferrod::listener::bind_uds(&config).expect("bind_uds in test harness");
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _addr) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(Session::run_with_handler(
+                    stream,
+                    config.clone(),
+                    epoch,
+                    handler.clone(),
+                ));
             }
         });
 
@@ -156,6 +197,30 @@ impl TestClient {
             request_id: frame.header.request_id,
             ack,
         }
+    }
+
+    /// Send a request-bearing frame with an arbitrary `service`/`method`/payload — for driving
+    /// the registry + spawned-handler + supervisor mechanism directly. `method` has no
+    /// registry-defined meaning yet for SQL/TX/STREAM (real method ids land with the dispatch
+    /// table in Task 6); tests just need a stable placeholder to route on `service`.
+    pub async fn send_request(
+        &mut self,
+        request_id: u32,
+        service: u16,
+        method: u16,
+        payload: Vec<u8>,
+    ) {
+        self.send(OutFrame {
+            header: Header {
+                flags: 0,
+                service,
+                method,
+                request_id,
+                payload_len: payload.len() as u32,
+            },
+            payload: payload.into(),
+        })
+        .await;
     }
 
     /// Send a `PING` with the given `request_id`/`token`.
