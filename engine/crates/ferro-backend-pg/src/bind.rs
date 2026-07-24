@@ -50,6 +50,44 @@ fn value_to_boxed(v: &Value) -> Box<dyn ToSql + Sync + Send> {
     }
 }
 
+/// Whether the concrete `ToSql` impl `value_to_boxed` would box this `Value` as `accepts` the
+/// prepared statement's inferred `Type` for this parameter slot.
+///
+/// This is the **pre-flight of the exact bind `query_raw` will perform** — it MUST mirror
+/// `value_to_boxed` arm-for-arm, because `query_raw`'s own `to_sql_checked` calls `accepts` on
+/// precisely these concrete types. `query.rs` runs this BEFORE sending the statement so a bind
+/// error (an uncastable param — the canonical `Value::I64`→`i64`→`int8` bound against an
+/// `int4`/serial column being the common one) surfaces as a KNOWN-FATE error (the statement
+/// provably never executed), never the fate-unknown `ConnectionLost` a post-send transport failure
+/// yields. Surfacing it as `ConnectionLost` is exactly what would let the SQL service mint a FALSE
+/// `WriteUnconfirmed{Indeterminate}` for a write that never happened (§19.3).
+///
+/// `Value::Null` accepts every type: it is bound via [`PgNull`], whose `accepts` is `true` for any
+/// `Type`, so a NULL never mis-binds.
+pub fn accepts(v: &Value, ty: &Type) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Bool(_) => <bool as ToSql>::accepts(ty),
+        Value::I64(_) => <i64 as ToSql>::accepts(ty),
+        Value::F64(_) => <f64 as ToSql>::accepts(ty),
+        Value::Text(_) => <String as ToSql>::accepts(ty),
+        Value::Bytes(_) => <Vec<u8> as ToSql>::accepts(ty),
+    }
+}
+
+/// The canonical-type label for a `Value`, used only to build a clear diagnostic bind-error
+/// message ("parameter N: canonical I64 cannot bind to PG type int4 …").
+pub fn value_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NULL",
+        Value::Bool(_) => "BOOL",
+        Value::I64(_) => "I64",
+        Value::F64(_) => "F64",
+        Value::Text(_) => "TEXT",
+        Value::Bytes(_) => "BYTES",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +114,40 @@ mod tests {
         let is_null = PgNull.to_sql(&Type::TEXT, &mut buf).unwrap();
         assert!(matches!(is_null, IsNull::Yes));
         assert!(buf.is_empty(), "a NULL writes no value bytes");
+    }
+
+    /// `accepts` mirrors `value_to_boxed`: it is the pre-flight of the exact bind `query_raw`
+    /// performs. The load-bearing case is `I64` vs `int4` — the common false-Indeterminate trigger
+    /// (a canonical `I64` bound against an `int4`/serial PK): `i64` boxes as `int8`, which does NOT
+    /// accept `int4`. Offline (no Docker) proof of the COMMIT-1 fix's core predicate.
+    #[test]
+    fn accepts_mirrors_boxed_binding() {
+        // The trigger: I64 -> i64 -> int8 does NOT accept int4/int2 (narrower column).
+        assert!(accepts(&Value::I64(1), &Type::INT8));
+        assert!(!accepts(&Value::I64(1), &Type::INT4));
+        assert!(!accepts(&Value::I64(1), &Type::INT2));
+        // F64 -> f64 -> float8 does NOT accept float4.
+        assert!(accepts(&Value::F64(1.0), &Type::FLOAT8));
+        assert!(!accepts(&Value::F64(1.0), &Type::FLOAT4));
+        // The straightforward same-type binds accept.
+        assert!(accepts(&Value::Bool(true), &Type::BOOL));
+        assert!(accepts(&Value::Text("x".to_string()), &Type::TEXT));
+        assert!(accepts(&Value::Text("x".to_string()), &Type::VARCHAR));
+        assert!(accepts(&Value::Bytes(vec![0xde]), &Type::BYTEA));
+        // NULL binds against anything (PgNull::accepts is universally true).
+        assert!(accepts(&Value::Null, &Type::INT4));
+        assert!(accepts(&Value::Null, &Type::TEXT));
+        // A canonical mismatch is caught (Text cannot bind int4).
+        assert!(!accepts(&Value::Text("x".to_string()), &Type::INT4));
+    }
+
+    #[test]
+    fn value_kind_labels_each_variant() {
+        assert_eq!(value_kind(&Value::Null), "NULL");
+        assert_eq!(value_kind(&Value::I64(1)), "I64");
+        assert_eq!(value_kind(&Value::F64(1.0)), "F64");
+        assert_eq!(value_kind(&Value::Text(String::new())), "TEXT");
+        assert_eq!(value_kind(&Value::Bytes(vec![])), "BYTES");
+        assert_eq!(value_kind(&Value::Bool(true)), "BOOL");
     }
 }

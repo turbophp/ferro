@@ -29,9 +29,11 @@ pub enum PoolError {
     /// build the wire `ErrorPayload` without re-deriving anything.
     ///
     /// This is deliberately a DISTINCT variant from [`PoolError::ConnectionLost`]: a `Sql` error
-    /// means the server answered (the statement's fate is *known* — it failed), so the service
-    /// must NOT apply the §19.3 `readonly`→`Indeterminate` override to it. Only a true
-    /// transport/FATAL `ConnectionLost` (no answer, fate unknown) gets that override.
+    /// means the statement's fate is *KNOWN* — either the server answered and rejected it, OR a
+    /// client-side bind pre-validation (`ferro-backend-pg`'s `query.rs`: wrong param arity / an
+    /// uncastable param type) rejected it BEFORE it was ever sent, so it provably never executed.
+    /// Either way the service must NOT apply the §19.3 `readonly`→`Indeterminate` override to it.
+    /// Only a true transport/FATAL `ConnectionLost` (no answer, fate unknown) gets that override.
     #[error("sql error {code:#06x} (sqlstate {sqlstate:?}): {message}")]
     Sql {
         code: u16,

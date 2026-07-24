@@ -181,6 +181,91 @@ async fn query_out_of_m0_column_is_unsupported() {
     assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
 }
 
+/// A wrong param COUNT is a KNOWN-FATE bind error, NOT the fate-unknown `ConnectionLost` (§19.3
+/// safety — the S5 Task-2 review defect). The statement (`SELECT $1::bigint` needs one param) is
+/// given zero: pre-validation catches the arity mismatch BEFORE anything is sent, so the fate is
+/// known (never executed) and the connection is untouched → still usable afterward. Were this
+/// classified `ConnectionLost`, the service would emit a false `WriteUnconfirmed{Indeterminate}`.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_wrong_param_count_is_known_fate_not_connection_lost() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    let err = co
+        .query("SELECT ?::bigint", &[])
+        .await
+        .expect_err("one placeholder, zero params supplied must fail");
+    match err {
+        PoolError::Sql {
+            code, branch: b, ..
+        } => {
+            assert_eq!(
+                code,
+                errc::UNSUPPORTED,
+                "a bind arity mismatch is a known-fate Unsupported Sql error"
+            );
+            assert_eq!(b, branch::NON_RETRYABLE);
+        }
+        PoolError::ConnectionLost => panic!(
+            "REGRESSION: a wrong param count was classified ConnectionLost \
+             (fate-unknown) — this is the false-Indeterminate defect"
+        ),
+        other => panic!("expected known-fate PoolError::Sql{{Unsupported}}, got {other:?}"),
+    }
+
+    // The connection was never touched by a bad bind (we rejected before query_raw) — still usable.
+    let ok = co.query("SELECT 1", &[]).await.expect("conn still usable");
+    assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
+}
+
+/// `Value::I64` bound against an `int4` PK column is a KNOWN-FATE bind error, NOT `ConnectionLost`
+/// (§19.3). This is the EXACT input that would have produced a false `WriteUnconfirmed`: the
+/// canonical `I64` boxes as `int8`, which does not `accept` the `int4` the column (a serial-style
+/// PK) inferred for the parameter. Pre-validation rejects it before the INSERT is sent, so the row
+/// provably never inserted and the connection stays clean.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_i64_against_int4_is_known_fate_not_connection_lost() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    // int4 PK — PG infers the INSERT's `$1` parameter type as int4 from the target column.
+    co.query("CREATE TEMP TABLE ferro_s5_pk (id int4 primary key)", &[])
+        .await
+        .expect("create temp table");
+
+    let err = co
+        .query("INSERT INTO ferro_s5_pk (id) VALUES (?)", &[Value::I64(1)])
+        .await
+        .expect_err("I64 (int8) cannot bind an int4 column in M0");
+    match err {
+        PoolError::Sql {
+            code, branch: b, ..
+        } => {
+            assert_eq!(
+                code,
+                errc::UNSUPPORTED,
+                "an uncastable bind is a known-fate Unsupported Sql error"
+            );
+            assert_eq!(b, branch::NON_RETRYABLE);
+        }
+        PoolError::ConnectionLost => panic!(
+            "REGRESSION: an I64-vs-int4 bind was classified ConnectionLost (fate-unknown) — \
+             this is the exact false-Indeterminate the pre-validation fix prevents"
+        ),
+        other => panic!("expected known-fate PoolError::Sql{{Unsupported}}, got {other:?}"),
+    }
+
+    // Nothing was inserted (bind rejected pre-send) and the conn is clean: still usable.
+    let ok = co.query("SELECT 1", &[]).await.expect("conn still usable");
+    assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
+}
+
 /// A DML statement reports `affected` from the command tag — NEVER a hardcoded 0 (the S4
 /// `batch_execute` defect). Two inserted rows → `affected == 2`, with an empty row set.
 #[tokio::test(flavor = "multi_thread")]
