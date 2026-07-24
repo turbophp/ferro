@@ -19,6 +19,12 @@ const DEFAULT_MAX_INFLIGHT: usize = 1024;
 /// Default deadline for a graceful (SIGTERM) drain before hard-closing remaining sessions.
 const DEFAULT_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Default deadline for the mandatory first frame (`core/HELLO`) to arrive on a newly accepted
+/// connection. Without this bound, a peer that passes the `SO_PEERCRED` gate and then simply
+/// never sends anything pins an fd, a session task, and a writer task forever — a slowloris /
+/// fd-exhaustion vector, not just a wasted connection.
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// UDS bind path. From `FERRO_SOCK`, default `/run/ferro/dev.sock`.
@@ -36,6 +42,9 @@ pub struct Config {
     pub max_inflight: usize,
     /// Deadline for a graceful drain (SIGTERM) before hard-closing remaining sessions.
     pub drain_deadline: Duration,
+    /// Deadline for the mandatory first frame (`core/HELLO`) to arrive before the connection is
+    /// dropped silently (no reply — there was never a valid session to fail).
+    pub handshake_timeout: Duration,
 }
 
 impl Default for Config {
@@ -48,6 +57,7 @@ impl Default for Config {
             session_cap_bytes: DEFAULT_SESSION_CAP_BYTES,
             max_inflight: DEFAULT_MAX_INFLIGHT,
             drain_deadline: DEFAULT_DRAIN_DEADLINE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
     }
 }

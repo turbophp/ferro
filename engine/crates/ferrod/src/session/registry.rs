@@ -99,6 +99,19 @@ impl Registry {
         }
     }
 
+    /// Cancel EVERY currently in-flight request's token. Called once, at session shutdown (any
+    /// exit path — EOF, GOODBYE-drain, a session-fatal classification, the writer exiting early),
+    /// to nudge every cooperative handler still running toward finishing quickly before the
+    /// session's own bounded per-request drain (see `session::mod`'s `drain_supervisors`) gives up
+    /// and hard-aborts its supervisor task. A no-op on an empty registry; cancelling an
+    /// already-cancelled token is itself a documented no-op, so this is safe to call more than
+    /// once too.
+    pub fn cancel_all(&self) {
+        for inflight in self.inner.lock().unwrap().values() {
+            inflight.cancel.cancel();
+        }
+    }
+
     /// Apply a routed `WINDOW_UPDATE {frames, bytes}` to `id`'s stored credit. An unknown `id` is
     /// silently a no-op (the target may never have existed, or may have already completed).
     pub fn replenish(&self, id: u32, frames: u32, bytes: u32) {
@@ -163,6 +176,27 @@ mod tests {
 
         // Unknown id: silently a no-op.
         registry.cancel(999);
+    }
+
+    #[test]
+    fn cancel_all_cancels_every_inflight_token_and_is_safe_when_empty() {
+        let registry = Registry::new(4);
+        // Safe on an empty registry: no panic, nothing to cancel.
+        registry.cancel_all();
+
+        let a = registry.insert(1, test_credit()).unwrap();
+        let b = registry.insert(2, test_credit()).unwrap();
+        assert!(!a.is_cancelled());
+        assert!(!b.is_cancelled());
+
+        registry.cancel_all();
+        assert!(a.is_cancelled());
+        assert!(b.is_cancelled());
+
+        // Idempotent: calling again does not panic or otherwise misbehave.
+        registry.cancel_all();
+        assert!(a.is_cancelled());
+        assert!(b.is_cancelled());
     }
 
     #[test]

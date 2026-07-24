@@ -135,6 +135,41 @@ pub async fn connect(socket_path: &Path) -> TestClient {
     }
 }
 
+/// Bind a fresh listener, accept exactly ONE connection, and drive it directly via
+/// `Session::run_with_handler`, returning that session's OWN `JoinHandle<()>` — unlike
+/// `TestServer` (whose internal accept loop spawns a session per connection with the `JoinHandle`
+/// dropped, mirroring how the real daemon treats every connection independently), a test that
+/// needs to observe the SESSION TASK ITSELF finishing (e.g. after the client disconnects
+/// mid-request, leaving no more frames to read and thus no way to infer session health from
+/// `TestClient::recv`) needs this handle directly. Uses `Config::default()`.
+pub fn spawn_one_session(epoch: BootEpoch, handler: HandlerFn) -> (PathBuf, JoinHandle<()>) {
+    spawn_one_session_with_config(Config::default(), epoch, handler)
+}
+
+/// Like `spawn_one_session`, but starting from a caller-supplied `Config` (e.g. to override
+/// `handshake_timeout` or `drain_deadline`). The `socket_path` field of `config` is always
+/// overwritten with a fresh temp path.
+pub fn spawn_one_session_with_config(
+    config: Config,
+    epoch: BootEpoch,
+    handler: HandlerFn,
+) -> (PathBuf, JoinHandle<()>) {
+    let socket_path = tmp_socket_path();
+    let config = Config {
+        socket_path: socket_path.clone(),
+        ..config
+    };
+    let listener = ferrod::listener::bind_uds(&config).expect("bind_uds in test harness");
+    let handle = tokio::spawn(async move {
+        let (stream, _addr) = listener
+            .accept()
+            .await
+            .expect("accept the one test connection");
+        Session::run_with_handler(stream, config, epoch, handler).await;
+    });
+    (socket_path, handle)
+}
+
 /// Spawn the REAL `serve` accept loop (peercred-gated + drain-aware, S3 Task 7) on a fresh bound
 /// listener, via `tokio::spawn`, using `Config::default()` plus a fresh temp socket path. Returns
 /// the socket path (pass to `connect` above) and `serve`'s own `JoinHandle` so a test can await it

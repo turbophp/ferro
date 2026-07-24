@@ -8,14 +8,20 @@
 //! unreadable peer's stream is dropped immediately — no HELLO_ACK, no writer task, nothing put on
 //! the wire at all. Only an allowed peer's connection is spawned as a session task.
 //!
-//! **Drain.** The accept loop is a `tokio::select!` between `drain.wait()` and `listener.accept()`
-//! — `biased` so that once draining has started, a connection already queued in the kernel's
-//! accept backlog is never additionally accepted, even if it happened to be ready in the same
-//! poll (SPEC's "stop accepting on drain" is a hard edge, not a race). Every spawned session task
-//! is tracked in a `JoinSet`; once the accept loop breaks, `serve` waits for that `JoinSet` to
-//! drain up to `config.drain_deadline`, then — if anything is still outstanding — hard-closes by
-//! aborting whatever remains (`JoinSet::drop` aborts every task still in the set) rather than
-//! waiting indefinitely.
+//! **Drain.** The accept loop is a `tokio::select!` between `drain.wait()`, an opportunistic
+//! **reap** of finished session tasks, and `listener.accept()` — `biased` so that (1) once
+//! draining has started, a connection already queued in the kernel's accept backlog is never
+//! additionally accepted, even if it happened to be ready in the same poll (SPEC's "stop accepting
+//! on drain" is a hard edge, not a race), and (2) a finished session task is reaped before we
+//! accept another connection, rather than after. Every spawned session task is tracked in a
+//! `JoinSet`; the reap arm (`sessions.join_next()`, guarded by `!sessions.is_empty()` so an empty
+//! set never yields a spurious-but-harmless `Ready(None)`) calls `join_next` DURING the accept
+//! loop's normal operation, not only at drain time — without it, every accepted connection leaves
+//! one dead entry in the `JoinSet` for the rest of the daemon's uptime (an unbounded task/memory
+//! leak, weaponizable by nothing more than connect/close churn). Once the accept loop breaks,
+//! `serve` waits for that same `JoinSet` to drain up to `config.drain_deadline`, then — if
+//! anything is still outstanding — hard-closes by aborting whatever remains (`JoinSet::drop`
+//! aborts every task still in the set) rather than waiting indefinitely.
 
 use std::time::Duration;
 
@@ -49,6 +55,16 @@ pub async fn serve(
             _ = drain.wait() => {
                 tracing::info!("drain triggered: no longer accepting new connections");
                 break;
+            }
+
+            // Reap a finished session task's `JoinSet` slot. Checked ahead of `accept` (still
+            // `biased`) so cleanup isn't starved by a steady stream of new connections; this is
+            // pure bookkeeping — it never refuses/delays a connection, it only frees capacity a
+            // completed session task is done using.
+            Some(res) = sessions.join_next(), if !sessions.is_empty() => {
+                if let Err(join_err) = res {
+                    tracing::warn!(error = %join_err, "session task ended abnormally");
+                }
             }
 
             accepted = listener.accept() => {

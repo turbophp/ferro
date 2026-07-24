@@ -98,6 +98,32 @@
 //! doesn't recognize) — which, like the reused-id/`max_inflight` diagnostics, sends a per-request
 //! `Unsupported` error `END` directly, without ever touching the registry (nothing was spawned
 //! for it, so there is no request lifecycle to guard).
+//!
+//! **Handshake hardening + per-session task ownership (S3 fix pass).** Three additions on top of
+//! the above, none of them weakening exactly-one-`END`:
+//! - The mandatory first frame is read under `tokio::time::timeout(config.handshake_timeout,
+//!   ..)`: a peercred-passing peer that connects and then never sends anything no longer pins an
+//!   fd + tasks forever (slowloris/fd-exhaustion) — past the deadline, the connection is dropped
+//!   silently (there was never a valid HELLO to fail). Whatever the first read's outcome, it is
+//!   routed through the SAME `classify::classify` split the reader loop uses for every later
+//!   frame, so a header-level codec fault (bad magic/version, oversize length, a truncated header)
+//!   produces the same `rid=0` fatal `Outcome::Error(PROTOCOL)` frame here too — never a silent
+//!   close — and a reserved flag (`OOB_FD`/`COMPRESSED`) set on the HELLO frame itself is likewise
+//!   caught for free (`flags::validate` runs inside `classify`).
+//! - `request_id == 0` is reserved for session-context terminals (session-fatal / GOODBYE /
+//!   no-request-context) — a request-bearing (SQL/TX/STREAM) frame claiming it is rejected by
+//!   `handle_request_frame` directly, the same way a reused id or an over-quota one is: a
+//!   per-request diagnostic sent straight on the control channel, the registry never touched.
+//! - Every per-request supervisor task is spawned into a **per-session `JoinSet`** (`supervisors`,
+//!   local to `run_with_handler`) instead of being detached — reaped opportunistically during the
+//!   reader loop itself (a guarded `supervisors.join_next()` arm, mirroring `serve`'s own
+//!   accept-loop reap, so this JoinSet never accumulates one dead entry per historical request for
+//!   the connection's whole lifetime) and, once the reader loop ends for any reason, drained with
+//!   a bound (`drain_supervisors`, `config.drain_deadline`) after `registry.cancel_all()` nudges
+//!   still-running handlers to wrap up. This closes the "writer exits early on a `sink.send()`
+//!   error, detached handler/supervisor tasks are orphaned" hole: no per-request task outlives its
+//!   session. The supervisor remains the sole terminal-sender throughout — this only changes who
+//!   *owns* (and, past a bound, hard-aborts) the task that awaits it.
 
 pub mod classify;
 pub mod codec;
@@ -110,12 +136,14 @@ pub mod supervisor;
 pub mod writer;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
@@ -182,16 +210,60 @@ impl Session {
             mpsc::channel::<OutFrame>(config.max_inflight + CONTROL_CHANNEL_SLACK);
         let writer_handle = tokio::spawn(writer::run(sink, control_rx));
 
-        // 1. The mandatory first frame must be core/HELLO; anything else is session-fatal.
-        let first = match reader.next().await {
-            Some(Ok(frame)) => frame,
-            Some(Err(_)) | None => {
+        // 1. The mandatory first frame must arrive within `config.handshake_timeout` and decode as
+        // core/HELLO. Whatever the read's outcome, route it through the SAME `classify` split the
+        // reader loop below uses for every later frame — so a header-level codec fault (bad
+        // magic/version, oversize length, a truncated header) yields the same rid=0 fatal
+        // `Outcome::Error(PROTOCOL)` frame here too, not a silent close; only a genuine I/O
+        // error/clean EOF (`Classification::Closed`) or a handshake timeout stay silent (there was
+        // never a valid HELLO in hand to reply about). This also runs `flags::validate` against
+        // the HELLO frame itself for free: a reserved flag (`OOB_FD`/`COMPRESSED`) set on it is
+        // `Classification::Fatal`, exactly like on any later frame.
+        let first_classification =
+            match tokio::time::timeout(config.handshake_timeout, reader.next()).await {
+                Err(_elapsed) => {
+                    // No HELLO within the handshake deadline: drop silently, same shape as a clean
+                    // EOF — nothing was ever agreed upon, so there is nothing to reply to.
+                    drop(control_tx);
+                    let _ = writer_handle.await;
+                    return;
+                }
+                Ok(None) => Classification::Closed,
+                Ok(Some(Ok(frame))) => classify::classify(Ok(Some(frame))),
+                Ok(Some(Err(err))) => classify::classify(Err(&err)),
+            };
+
+        let first = match first_classification {
+            // `Framed`'s `Stream` impl never actually surfaces `Ok(None)` as an item on this path
+            // (see `classify`'s own doc comment) — handled defensively so this match stays total.
+            Classification::NeedMore | Classification::Closed => {
                 // Never got a decodable first frame at all — nothing to reply to; just let the
                 // writer task see the control channel close and exit.
                 drop(control_tx);
                 let _ = writer_handle.await;
                 return;
             }
+            Classification::Fatal(ep) => {
+                // A header-level codec fault, OR a reserved flag set on the first frame: the SAME
+                // rid=0 session-fatal `END` the reader loop sends for any later frame — not a
+                // silent close.
+                let fatal = SessionError::Fatal(ep).into_out_frame();
+                let _ = control_tx.send(fatal).await;
+                drop(control_tx);
+                let _ = writer_handle.await;
+                return;
+            }
+            Classification::PerRequestErr { rid, err } => {
+                // An otherwise-decodable first frame with an unknown, non-reserved flag bit set.
+                // There is no valid HELLO in hand and thus no session to keep alive past this
+                // point — send the diagnostic on the frame's own id, then close.
+                let diagnostic = SessionError::PerRequest { rid, err }.into_out_frame();
+                let _ = control_tx.send(diagnostic).await;
+                drop(control_tx);
+                let _ = writer_handle.await;
+                return;
+            }
+            Classification::Frame(frame) => frame,
         };
 
         if !handshake::is_hello(&first) {
@@ -234,11 +306,29 @@ impl Session {
         // method this build doesn't recognize).
         let registry = Arc::new(Registry::new(config.max_inflight));
 
+        // Owns every per-request supervisor task spawned below (S3 fix pass — see this module's
+        // top doc comment): reaped opportunistically inside the loop's own `select!` (mirroring
+        // `serve`'s accept-loop reap, one level down) so it never accumulates one dead entry per
+        // historical request for the connection's whole lifetime, and drained-then-aborted once
+        // the loop ends, below, so no per-request task outlives this session.
+        let mut supervisors: JoinSet<()> = JoinSet::new();
+
         loop {
-            let classification = match reader.next().await {
-                None => Classification::Closed,
-                Some(Ok(frame)) => classify::classify(Ok(Some(frame))),
-                Some(Err(err)) => classify::classify(Err(&err)),
+            let classification = tokio::select! {
+                biased;
+
+                // Pure bookkeeping: frees a finished supervisor task's slot. Never delays or
+                // otherwise affects frame delivery — the terminal it sent already went out on the
+                // control channel independently of when this JoinSet gets around to reaping it.
+                Some(_res) = supervisors.join_next(), if !supervisors.is_empty() => {
+                    continue;
+                }
+
+                next = reader.next() => match next {
+                    None => Classification::Closed,
+                    Some(Ok(frame)) => classify::classify(Ok(Some(frame))),
+                    Some(Err(err)) => classify::classify(Err(&err)),
+                },
             };
 
             let frame = match classification {
@@ -289,7 +379,15 @@ impl Session {
                     }
                 }
                 Route::Request => {
-                    if !handle_request_frame(frame, &registry, &control_tx, &handler, &config).await
+                    if !handle_request_frame(
+                        frame,
+                        &registry,
+                        &control_tx,
+                        &handler,
+                        &config,
+                        &mut supervisors,
+                    )
+                    .await
                     {
                         break;
                     }
@@ -310,23 +408,67 @@ impl Session {
             }
         }
 
+        // Shutdown, whatever the reader loop's exit reason (EOF, a session-fatal classification,
+        // GOODBYE-drain, or the writer having gone away): nudge every still-running handler toward
+        // finishing quickly (cooperative — a handler that ignores its `CancellationToken` is
+        // unaffected), then give the per-session supervisor `JoinSet` a bounded chance to drain
+        // before hard-aborting whatever is left, so no per-request task outlives this session
+        // (S3 fix pass). Exactly-one-`END` is untouched: whichever way a given supervisor task
+        // ends up finishing (normally, or hard-aborted past the deadline), it was already — and
+        // remains — the sole sender of its request's one terminal frame.
+        registry.cancel_all();
+        drain_supervisors(&mut supervisors, config.drain_deadline).await;
+
         drop(control_tx);
         let _ = writer_handle.await;
     }
 }
 
+/// Wait for every per-request supervisor task in `supervisors` to finish, up to `deadline`.
+/// Mirrors `serve::drain_sessions`'s identical shape one level up: anything still outstanding past
+/// the deadline is hard-closed via `abort_all` (and the `JoinSet`'s own `Drop`, belt-and-
+/// suspenders) rather than waited on indefinitely. Aborting a supervisor task does NOT forcibly
+/// stop the handler task it was awaiting — this design never aborts a handler's `JoinHandle` (see
+/// `session::supervisor`'s doc comment) — so this bounds how long THIS session's own shutdown can
+/// be blocked by a handler that ignores the cancellation `registry.cancel_all()` already sent it;
+/// it does not guarantee a truly non-cooperative handler's task stops running.
+async fn drain_supervisors(supervisors: &mut JoinSet<()>, deadline: Duration) {
+    let wait_all = async { while supervisors.join_next().await.is_some() {} };
+
+    if tokio::time::timeout(deadline, wait_all).await.is_err() {
+        tracing::warn!(
+            ?deadline,
+            "per-session request drain deadline exceeded: hard-closing remaining request tasks"
+        );
+        supervisors.abort_all();
+    }
+}
+
 /// Route one request-bearing frame: insert into the registry (sending a per-request diagnostic
-/// and returning early on `Reused`/`Full`), reserve a control-channel permit, then spawn the
-/// handler task and a supervisor task to await it. Returns `false` if the control channel is
-/// gone (writer task exited) and the reader loop should stop.
+/// and returning early on `Reused`/`Full`/a reserved `request_id == 0`), reserve a control-channel
+/// permit, then spawn the handler task and a supervisor task (owned by the caller's per-session
+/// `supervisors` `JoinSet`) to await it. Returns `false` if the control channel is gone (writer
+/// task exited) and the reader loop should stop.
 async fn handle_request_frame(
     frame: InFrame,
     registry: &Arc<Registry>,
     control_tx: &mpsc::Sender<OutFrame>,
     handler: &HandlerFn,
     config: &Config,
+    supervisors: &mut JoinSet<()>,
 ) -> bool {
     let id = frame.header.request_id;
+
+    // request_id 0 is reserved for session-context terminals (session-fatal / GOODBYE / no-
+    // request-context) — see this module's top doc comment. A request-bearing frame claiming it
+    // is rejected the same way a reused id or an over-quota one is: a per-request diagnostic sent
+    // directly, the registry never touched.
+    if id == 0 {
+        let diagnostic =
+            diagnostic_error_frame(&frame, "request_id 0 is reserved for session context");
+        return control_tx.send(diagnostic).await.is_ok();
+    }
+
     let credit = Credit::new(config.credit_frames, config.credit_bytes);
 
     let cancel = match registry.insert(id, credit) {
@@ -357,7 +499,11 @@ async fn handle_request_frame(
     let handler = handler.clone();
     let handle = tokio::spawn(async move { handler(frame, responder, cancel).await });
 
-    tokio::spawn(supervisor::supervise(
+    // Owned by the per-session `supervisors` JoinSet (S3 fix pass) rather than a detached
+    // `tokio::spawn` — see `drain_supervisors` and this module's top doc comment for why: without
+    // this, a writer that exits early (a `sink.send()` error, e.g. a mid-request client
+    // disconnect with other requests still in flight) left this task orphaned, tracked by nothing.
+    supervisors.spawn(supervisor::supervise(
         id,
         service,
         method,

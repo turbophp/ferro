@@ -18,10 +18,13 @@ use futures::FutureExt;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use std::time::Duration;
+
 use common::TestServer;
 use ferro_proto::consts::{MAX_FRAME_PAYLOAD, errc, flags, method_core, service};
 use ferro_proto::header::Header;
 use ferro_proto::messages::{Outcome, Pong};
+use ferrod::config::Config;
 use ferrod::epoch::BootEpoch;
 use ferrod::session::HandlerFn;
 use ferrod::session::codec::{InFrame, OutFrame};
@@ -29,6 +32,7 @@ use ferrod::session::flow::Credit;
 use ferrod::session::registry::{InsertErr, Registry};
 use ferrod::session::responder::Responder;
 use ferrod::session::supervisor;
+use ferrod::shutdown::Drain;
 
 /// A default-ish credit window for tests that don't care about flow control, only registry
 /// membership/lifecycle.
@@ -773,4 +777,141 @@ async fn sql_service_returns_unsupported_stub() {
     let pong_frame = client.recv().await;
     assert_eq!(pong_frame.header.method, method_core::PONG);
     assert_eq!(pong_frame.header.request_id, 9);
+}
+
+// ---------------------------------------------------------------------------------------------
+// S3 fix pass, m3: request_id 0 is reserved for session-context terminals (session-fatal /
+// GOODBYE / no-request-context) -- a request-bearing frame must never be allowed to claim it.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn request_bearing_frame_with_rid_zero_is_rejected_without_touching_registry() {
+    let server = TestServer::spawn(BootEpoch(1));
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    client
+        .send_request(0, service::SQL, SOME_METHOD, vec![])
+        .await;
+
+    let diagnostic = client.recv().await;
+    assert_eq!(diagnostic.header.request_id, 0);
+    assert_eq!(diagnostic.header.flags, flags::END);
+    match Outcome::decode(&diagnostic.payload).expect("decode Outcome") {
+        Outcome::Error(ep) => assert_eq!(ep.code, errc::PROTOCOL),
+        other => panic!("expected Outcome::Error, got {other:?}"),
+    }
+
+    // The registry was never touched for this frame (nothing was spawned) -- the session is
+    // completely unaffected and keeps answering normally.
+    client.ping(9, 4).await;
+    let pong_frame = client.recv().await;
+    assert_eq!(pong_frame.header.method, method_core::PONG);
+    assert_eq!(pong_frame.header.request_id, 9);
+}
+
+// ---------------------------------------------------------------------------------------------
+// S3 fix pass, MAJOR 3 + m1: client disconnect mid-request must not orphan the per-request
+// handler/supervisor tasks -- `run_with_handler` owns them in a per-session `JoinSet` and drains
+// it (bounded by `config.drain_deadline`) before returning, so the session task itself always
+// finishes rather than leaving detached work unaccounted for.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn client_disconnect_midrequest_cleans_up() {
+    let notify = Arc::new(Notify::new());
+    let handler_notify = notify.clone();
+    let handler: HandlerFn = Arc::new(
+        move |_frame: InFrame, responder: Responder, _cancel: CancellationToken| {
+            let notify = handler_notify.clone();
+            async move {
+                notify.notified().await;
+                responder.end_ok(Bytes::new());
+            }
+            .boxed()
+        },
+    );
+
+    let (socket_path, mut session) = common::spawn_one_session(BootEpoch(1), handler);
+    let mut client = common::connect(&socket_path).await;
+    client.hello(1).await;
+    client
+        .send_request(42, service::SQL, SOME_METHOD, vec![])
+        .await;
+
+    // The handler is genuinely still blocked on `notify` -- the session task must not have
+    // finished yet (proves this isn't a vacuously-fast test).
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut session)
+            .await
+            .is_err(),
+        "session must still be running while its one handler is blocked"
+    );
+
+    // Simulate an abrupt client disconnect MID-request: drop the client's framed UnixStream
+    // entirely (no GOODBYE, no clean shutdown) while request 42 is still in flight.
+    drop(client);
+
+    // Disconnecting alone must not abandon the in-flight request -- the session keeps waiting for
+    // its handler exactly as before (this is what distinguishes "drains" from "abandons").
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut session)
+            .await
+            .is_err(),
+        "session must still be waiting on its handler right after the client disconnects"
+    );
+
+    // Release the handler: it completes normally, its supervisor sends the (now unreadable, since
+    // the peer is gone) terminal and removes the registry entry, the per-session `JoinSet` drains,
+    // and the session task returns -- no hang, no orphaned task.
+    notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), session)
+        .await
+        .expect(
+            "the session task must return once its handler completes, even after the client \
+             already disconnected -- no leaked/orphaned per-request task",
+        )
+        .expect("session task must not panic");
+}
+
+#[tokio::test]
+async fn disconnect_with_stuck_handler_hard_closes() {
+    // A handler that never completes and never observes cancellation -- the ONLY way its session
+    // winds down is the bounded drain-then-abort path (m1), racing `config.drain_deadline`, and/or
+    // `serve`'s own SIGTERM-triggered hard-close (`drain_sessions`) one level up.
+    let handler: HandlerFn = Arc::new(
+        |_frame: InFrame, responder: Responder, _cancel: CancellationToken| {
+            async move {
+                let _responder = responder; // held, never declares, never observes cancellation
+                futures::future::pending::<()>().await;
+            }
+            .boxed()
+        },
+    );
+
+    let drain = Drain::new();
+    let config = Config {
+        drain_deadline: Duration::from_millis(100),
+        ..Config::default()
+    };
+    let (socket_path, served) =
+        common::spawn_serve_with_config(config, BootEpoch(1), drain.clone(), handler);
+
+    let mut client = common::connect(&socket_path).await;
+    client.hello(1).await;
+    client
+        .send_request(1, service::SQL, SOME_METHOD, vec![])
+        .await;
+
+    // Abrupt mid-request disconnect -- no GOODBYE.
+    drop(client);
+
+    drain.trigger();
+
+    // Even with a stuck handler AND a client that already vanished mid-request, `serve` must
+    // still return within its (short) `drain_deadline` rather than hang forever.
+    tokio::time::timeout(Duration::from_secs(2), served)
+        .await
+        .expect("serve must return even after a mid-request disconnect with a stuck handler")
+        .expect("serve's task must not panic");
 }
