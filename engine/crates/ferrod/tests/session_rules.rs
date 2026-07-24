@@ -16,6 +16,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::FutureExt;
 use tokio::sync::{Notify, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use common::TestServer;
 use ferro_proto::consts::{errc, flags, method_core, service};
@@ -23,9 +24,19 @@ use ferro_proto::messages::{Outcome, Pong};
 use ferrod::epoch::BootEpoch;
 use ferrod::session::HandlerFn;
 use ferrod::session::codec::{InFrame, OutFrame};
+use ferrod::session::flow::Credit;
 use ferrod::session::registry::{InsertErr, Registry};
 use ferrod::session::responder::Responder;
 use ferrod::session::supervisor;
+
+/// A default-ish credit window for tests that don't care about flow control, only registry
+/// membership/lifecycle.
+fn test_credit() -> Credit {
+    Credit::new(
+        ferro_proto::consts::DEFAULT_CREDIT_FRAMES,
+        ferro_proto::consts::DEFAULT_CREDIT_BYTES,
+    )
+}
 
 /// A stable placeholder method id for request-bearing test frames. SQL/TX/STREAM don't have
 /// registry-defined method ids yet (that lands with the dispatch table in Task 6); the mechanism
@@ -41,12 +52,18 @@ fn registry_reuse_and_full() {
     let max_inflight = 2;
     let registry = Registry::new(max_inflight);
 
-    assert!(registry.insert(1).is_ok());
-    assert_eq!(registry.insert(1), Err(InsertErr::Reused));
+    assert!(registry.insert(1, test_credit()).is_ok());
+    assert_eq!(
+        registry.insert(1, test_credit()).map(|_| ()),
+        Err(InsertErr::Reused)
+    );
 
-    assert!(registry.insert(2).is_ok());
+    assert!(registry.insert(2, test_credit()).is_ok());
     assert_eq!(registry.len(), 2);
-    assert_eq!(registry.insert(3), Err(InsertErr::Full));
+    assert_eq!(
+        registry.insert(3, test_credit()).map(|_| ()),
+        Err(InsertErr::Full)
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -57,7 +74,7 @@ fn registry_reuse_and_full() {
 async fn supervisor_sends_declared_ok_exactly_once() {
     let (control_tx, mut control_rx) = mpsc::channel::<OutFrame>(8);
     let registry = Arc::new(Registry::new(4));
-    registry.insert(7).unwrap();
+    registry.insert(7, test_credit()).unwrap();
 
     let (responder, cell) = Responder::new_pair();
     let permit = control_tx.clone().reserve_owned().await.unwrap();
@@ -102,7 +119,7 @@ async fn supervisor_sends_declared_ok_exactly_once() {
 async fn supervisor_synthesizes_on_panic_with_distinct_code() {
     let (control_tx, mut control_rx) = mpsc::channel::<OutFrame>(8);
     let registry = Arc::new(Registry::new(4));
-    registry.insert(11).unwrap();
+    registry.insert(11, test_credit()).unwrap();
 
     let (responder, cell) = Responder::new_pair();
     let permit = control_tx.clone().reserve_owned().await.unwrap();
@@ -147,7 +164,7 @@ async fn declare_then_panic_yields_single_synth_terminal() {
     // declared outcome on panic would be a behavior change, and this test would catch it.
     let (control_tx, mut control_rx) = mpsc::channel::<OutFrame>(8);
     let registry = Arc::new(Registry::new(4));
-    registry.insert(31).unwrap();
+    registry.insert(31, test_credit()).unwrap();
 
     let (responder, cell) = Responder::new_pair();
     let permit = control_tx.clone().reserve_owned().await.unwrap();
@@ -195,7 +212,7 @@ async fn declare_then_panic_yields_single_synth_terminal() {
 async fn supervisor_synthesizes_on_no_terminal() {
     let (control_tx, mut control_rx) = mpsc::channel::<OutFrame>(8);
     let registry = Arc::new(Registry::new(4));
-    registry.insert(21).unwrap();
+    registry.insert(21, test_credit()).unwrap();
 
     let (responder, cell) = Responder::new_pair();
     let permit = control_tx.clone().reserve_owned().await.unwrap();
@@ -236,12 +253,14 @@ async fn supervisor_synthesizes_on_no_terminal() {
 
 #[tokio::test]
 async fn panic_isolation_session_survives() {
-    let handler: HandlerFn = Arc::new(|_frame: InFrame, _responder: Responder| {
-        async move {
-            panic!("intentional: handler panics without declaring (panic-isolation test)");
-        }
-        .boxed()
-    });
+    let handler: HandlerFn = Arc::new(
+        |_frame: InFrame, _responder: Responder, _cancel: CancellationToken| {
+            async move {
+                panic!("intentional: handler panics without declaring (panic-isolation test)");
+            }
+            .boxed()
+        },
+    );
 
     let server = TestServer::spawn_with_handler(BootEpoch(1), handler);
     let mut client = server.connect().await;
@@ -276,14 +295,16 @@ async fn panic_isolation_session_survives() {
 async fn reused_inflight_id_diagnostic_original_undisturbed() {
     let notify = Arc::new(Notify::new());
     let handler_notify = notify.clone();
-    let handler: HandlerFn = Arc::new(move |_frame: InFrame, responder: Responder| {
-        let notify = handler_notify.clone();
-        async move {
-            notify.notified().await;
-            responder.end_ok(Bytes::from_static(b"done"));
-        }
-        .boxed()
-    });
+    let handler: HandlerFn = Arc::new(
+        move |_frame: InFrame, responder: Responder, _cancel: CancellationToken| {
+            let notify = handler_notify.clone();
+            async move {
+                notify.notified().await;
+                responder.end_ok(Bytes::from_static(b"done"));
+            }
+            .boxed()
+        },
+    );
 
     let server = TestServer::spawn_with_handler(BootEpoch(1), handler);
     let mut client = server.connect().await;
@@ -330,14 +351,16 @@ async fn max_inflight_exceeded_is_per_request_error() {
     let max_inflight = 2;
     let notify = Arc::new(Notify::new());
     let handler_notify = notify.clone();
-    let handler: HandlerFn = Arc::new(move |_frame: InFrame, responder: Responder| {
-        let notify = handler_notify.clone();
-        async move {
-            notify.notified().await;
-            responder.end_ok(Bytes::new());
-        }
-        .boxed()
-    });
+    let handler: HandlerFn = Arc::new(
+        move |_frame: InFrame, responder: Responder, _cancel: CancellationToken| {
+            let notify = handler_notify.clone();
+            async move {
+                notify.notified().await;
+                responder.end_ok(Bytes::new());
+            }
+            .boxed()
+        },
+    );
 
     let server =
         TestServer::spawn_with_handler_and_max_inflight(BootEpoch(1), max_inflight, handler);
@@ -379,4 +402,205 @@ async fn max_inflight_exceeded_is_per_request_error() {
         seen.insert(frame.header.request_id);
     }
     assert_eq!(seen, HashSet::from([1, 2]));
+}
+
+// ---------------------------------------------------------------------------------------------
+// S3 Task 5: PING/PONG multiplexing, flag-based CANCEL, GOODBYE drain, WINDOW_UPDATE + Credit.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn multiplexed_ping_while_inflight() {
+    let notify = Arc::new(Notify::new());
+    let handler_notify = notify.clone();
+    let handler: HandlerFn = Arc::new(
+        move |_frame: InFrame, responder: Responder, _cancel: CancellationToken| {
+            let notify = handler_notify.clone();
+            async move {
+                notify.notified().await;
+                responder.end_ok(Bytes::new());
+            }
+            .boxed()
+        },
+    );
+
+    let server = TestServer::spawn_with_handler(BootEpoch(1), handler);
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    // Start request A: the handler blocks on `notify` until we release it below.
+    client
+        .send_request(100, service::SQL, SOME_METHOD, vec![])
+        .await;
+
+    // PING (a distinct request_id/token from A) must be answered BEFORE A's terminal — the
+    // reader loop answers PING synchronously per-frame, independent of the spawned handler task
+    // that owns A, so this is deterministic without any sleep: if PONG were somehow queued
+    // behind A, this recv would time out instead of returning PONG.
+    client.ping(9, 7).await;
+    let pong_frame = client.recv().await;
+    assert_eq!(pong_frame.header.service, service::CORE);
+    assert_eq!(pong_frame.header.method, method_core::PONG);
+    assert_eq!(pong_frame.header.request_id, 9);
+    let pong = Pong::decode(&pong_frame.payload).expect("decode PONG");
+    assert_eq!(pong.token, 7);
+
+    // Only now release A: it must still terminate normally.
+    notify.notify_one();
+    let terminal = client.recv().await;
+    assert_eq!(terminal.header.request_id, 100);
+    assert_eq!(terminal.header.flags, flags::END);
+    match Outcome::decode(&terminal.payload).expect("decode Outcome") {
+        Outcome::Ok(_) => {}
+        other => panic!("expected Outcome::Ok, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cancel_inflight_yields_cancelled_terminal() {
+    let handler: HandlerFn = Arc::new(
+        |_frame: InFrame, responder: Responder, cancel: CancellationToken| {
+            async move {
+                // The CancellationToken itself provides the synchronization: `cancelled()`
+                // resolves immediately if the token is already cancelled by the time this task
+                // gets to run, or waits until it is — either way, no sleep/barrier needed here.
+                cancel.cancelled().await;
+                responder.end_cancelled();
+            }
+            .boxed()
+        },
+    );
+
+    let server = TestServer::spawn_with_handler(BootEpoch(1), handler);
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    client
+        .send_request(5, service::SQL, SOME_METHOD, vec![])
+        .await;
+    client.cancel(5).await;
+
+    let terminal = client.recv().await;
+    assert_eq!(terminal.header.request_id, 5);
+    assert_eq!(terminal.header.flags, flags::END);
+    match Outcome::decode(&terminal.payload).expect("decode Outcome") {
+        Outcome::Cancelled => {}
+        other => panic!("expected Outcome::Cancelled (not Error), got {other:?}"),
+    }
+
+    // A second CANCEL on the now-completed id 5 is a no-op: no extra frame, session stays
+    // healthy (PING still answered).
+    client.cancel(5).await;
+    client.ping(9, 3).await;
+    let pong_frame = client.recv().await;
+    assert_eq!(pong_frame.header.method, method_core::PONG);
+    assert_eq!(pong_frame.header.request_id, 9);
+}
+
+#[tokio::test]
+async fn cancel_unknown_id_is_noop() {
+    let server = TestServer::spawn(BootEpoch(1));
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    // rid 999 was never started — CANCEL on it is a silent no-op (no frame at all).
+    client.cancel(999).await;
+
+    // The session must still answer PING (proving it did not misbehave/close on the unknown
+    // CANCEL).
+    client.ping(9, 11).await;
+    let pong_frame = client.recv().await;
+    assert_eq!(pong_frame.header.method, method_core::PONG);
+    assert_eq!(pong_frame.header.request_id, 9);
+}
+
+#[tokio::test]
+async fn goodbye_drains_inflight_then_closes() {
+    let notify = Arc::new(Notify::new());
+    let handler_notify = notify.clone();
+    let handler: HandlerFn = Arc::new(
+        move |_frame: InFrame, responder: Responder, _cancel: CancellationToken| {
+            let notify = handler_notify.clone();
+            async move {
+                notify.notified().await;
+                responder.end_ok(Bytes::new());
+            }
+            .boxed()
+        },
+    );
+
+    let server = TestServer::spawn_with_handler(BootEpoch(1), handler);
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    // Request A: held in-flight by `notify`.
+    client
+        .send_request(1, service::SQL, SOME_METHOD, vec![])
+        .await;
+    client.goodbye().await;
+    // A NEW request-bearing frame sent after GOODBYE: the reader loop already broke out of its
+    // accept-new loop on GOODBYE (before this frame is ever read), so it is never dispatched —
+    // no handler starts for id 2, and no terminal for id 2 will ever arrive.
+    client
+        .send_request(2, service::SQL, SOME_METHOD, vec![])
+        .await;
+
+    // Release A: its terminal must still arrive (draining lets outstanding requests finish).
+    notify.notify_one();
+    let terminal = client.recv().await;
+    assert_eq!(terminal.header.request_id, 1);
+    assert_eq!(terminal.header.flags, flags::END);
+    match Outcome::decode(&terminal.payload).expect("decode Outcome") {
+        Outcome::Ok(_) => {}
+        other => panic!("expected Outcome::Ok, got {other:?}"),
+    }
+
+    // Then, and only then, the connection closes — no terminal for id 2 ever showed up; the
+    // very next thing the client observes is EOF.
+    client.recv_eof().await;
+}
+
+#[tokio::test]
+async fn window_update_applies_credit() {
+    // Unit-level: `flow::Credit` debit/replenish directly (see also `flow.rs`'s own tests).
+    let mut credit = Credit::new(2, 100);
+    assert!(credit.try_debit(60));
+    assert_eq!(credit.frames(), 1);
+    assert_eq!(credit.bytes(), 40);
+    assert!(
+        !credit.try_debit(50),
+        "must not exceed the remaining byte budget"
+    );
+    credit.replenish(5, 900);
+    assert_eq!(credit.frames(), 6);
+    assert_eq!(credit.bytes(), 940);
+
+    // Routing, at the `Registry` layer that `session::mod`'s reader loop calls directly for a
+    // `WINDOW_UPDATE {request_id, frames, bytes}` frame: replenishing a known in-flight id
+    // updates its stored credit; an unknown id is silently a no-op.
+    let registry = Registry::new(4);
+    registry.insert(10, Credit::new(2, 100)).unwrap();
+    registry.replenish(10, 5, 900);
+    let updated = registry.credit_snapshot(10).expect("id 10 is in-flight");
+    assert_eq!(updated.frames(), 7);
+    assert_eq!(updated.bytes(), 1000);
+
+    registry.replenish(999, 1, 1);
+    assert!(registry.credit_snapshot(999).is_none());
+}
+
+#[tokio::test]
+async fn window_update_through_live_session_survives_unknown_target() {
+    // End-to-end through a real `Session`: an unknown-target `WINDOW_UPDATE` must not crash or
+    // hang the reader loop (it produces no reply frame of its own either way), and the session
+    // must remain fully responsive afterward.
+    let server = TestServer::spawn(BootEpoch(1));
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    client.window_update(123, 4, 4096).await;
+
+    client.ping(9, 5).await;
+    let pong_frame = client.recv().await;
+    assert_eq!(pong_frame.header.method, method_core::PONG);
+    assert_eq!(pong_frame.header.request_id, 9);
 }

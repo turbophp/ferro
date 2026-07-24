@@ -7,9 +7,9 @@
 //! mis-ordered, or deadlocked frame fails the test fast with a clear panic instead of hanging
 //! CI indefinitely.
 
-use ferro_proto::consts::{TYPE_REGISTRY_HASH, method_core, service};
+use ferro_proto::consts::{TYPE_REGISTRY_HASH, flags, method_core, service};
 use ferro_proto::header::Header;
-use ferro_proto::messages::{Hello, HelloAck, Ping};
+use ferro_proto::messages::{Goodbye, Hello, HelloAck, Ping, WindowUpdate};
 use ferrod::config::Config;
 use ferrod::epoch::BootEpoch;
 use ferrod::session::codec::{FrameCodec, InFrame, OutFrame};
@@ -231,6 +231,56 @@ impl TestClient {
                 flags: 0,
                 service: service::CORE,
                 method: method_core::PING,
+                request_id,
+                payload_len: payload.len() as u32,
+            },
+            payload: payload.into(),
+        })
+        .await;
+    }
+
+    /// Send a flag-based `CANCEL` targeting `request_id` (empty payload) — advisory and
+    /// idempotent (SPEC §5.2). Routed purely by the `CANCEL` flag bit + `request_id`; the frame's
+    /// own `service`/`method` are otherwise unused by the routing, so `CORE`/`0` is as good a
+    /// placeholder as any.
+    pub async fn cancel(&mut self, request_id: u32) {
+        self.send(OutFrame {
+            header: Header {
+                flags: flags::CANCEL,
+                service: service::CORE,
+                method: 0,
+                request_id,
+                payload_len: 0,
+            },
+            payload: Vec::new().into(),
+        })
+        .await;
+    }
+
+    /// Send `core/GOODBYE` (the graceful-drain announcement), `request_id = 0` per convention.
+    pub async fn goodbye(&mut self) {
+        let payload = Goodbye {}.encode();
+        self.send(OutFrame {
+            header: Header {
+                flags: 0,
+                service: service::CORE,
+                method: method_core::GOODBYE,
+                request_id: 0,
+                payload_len: payload.len() as u32,
+            },
+            payload: payload.into(),
+        })
+        .await;
+    }
+
+    /// Send `core/WINDOW_UPDATE {frames, bytes}` targeting `request_id`.
+    pub async fn window_update(&mut self, request_id: u32, frames: u32, bytes: u32) {
+        let payload = WindowUpdate { frames, bytes }.encode();
+        self.send(OutFrame {
+            header: Header {
+                flags: 0,
+                service: service::CORE,
+                method: method_core::WINDOW_UPDATE,
                 request_id,
                 payload_len: payload.len() as u32,
             },

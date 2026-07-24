@@ -11,16 +11,19 @@
 //!   second, credit-limited **data channel** for streamed result frames arrives in S5;
 //!   `writer::run`'s `tokio::select!` loop is written so that second receiver can be added as
 //!   another arm without restructuring it.
-//! - an **in-flight registry** (`session::registry::Registry`, a `std::sync::Mutex<HashSet<u32>>`
-//!   under the hood) keyed by `request_id`, populated only by request-bearing services (SQL/TX/
-//!   STREAM) — core control/liveness frames (`HELLO_ACK`, `PONG`, `WINDOW_UPDATE`-ack, `GOODBYE`)
-//!   are non-terminal, never enter the registry, and are not subject to the one-`END` rule.
+//! - an **in-flight registry** (`session::registry::Registry`, a
+//!   `std::sync::Mutex<HashMap<u32, InFlight>>` under the hood, `InFlight` holding a
+//!   `CancellationToken` + a `flow::Credit` — this module's Task 5 addition) keyed by
+//!   `request_id`, populated only by request-bearing services (SQL/TX/STREAM) — core
+//!   control/liveness frames (`HELLO_ACK`, `PONG`, `WINDOW_UPDATE`-ack, `GOODBYE`) are
+//!   non-terminal, never enter the registry, and are not subject to the one-`END` rule.
 //!
 //! **Request handling is spawn-per-request + supervisor (this module's Task 4 addition).** For
 //! every request-bearing frame (`service` is SQL, TX, or STREAM), the reader loop:
-//! 1. `registry.insert(id)` — on `Reused`/`Full` it sends a per-request diagnostic error `END`
-//!    directly on the control channel (NOT through a `Responder`, NOT via a registry entry of its
-//!    own) and does not spawn anything; the original in-flight request (if any) is untouched.
+//! 1. `registry.insert(id, credit)` — on `Reused`/`Full` it sends a per-request diagnostic error
+//!    `END` directly on the control channel (NOT through a `Responder`, NOT via a registry entry
+//!    of its own) and does not spawn anything; the original in-flight request (if any) is
+//!    untouched.
 //! 2. Reserves a control-channel permit (`control_tx.clone().reserve_owned().await`) — this
 //!    guarantees a delivery slot for the eventual terminal regardless of whatever else is queued
 //!    on the control channel, BEFORE the handler ever runs.
@@ -45,17 +48,44 @@
 //! every request-bearing frame; `Session::run` is `run_with_handler` with a `default_handler`
 //! that declares `end_error(Unsupported)` for anything (real dispatch lands in Task 6). Tests use
 //! the seam to script handler behaviour (panic, hang on a `Notify`, declare immediately) without
-//! needing a real SQL/TX backend.
+//! needing a real SQL/TX backend. The handler is also handed a `CancellationToken` (this module's
+//! Task 5 addition) alongside its `InFrame`/`Responder` — see below.
+//!
+//! **Liveness and drain (this module's Task 5 addition).** The reader loop now also routes:
+//! - **`CANCEL`** (a flag on ANY frame, `flags::CANCEL`, target = that frame's `request_id`, empty
+//!   payload) — checked BEFORE any other dispatch, regardless of the frame's `service`/`method`.
+//!   It is advisory and idempotent (SPEC §5.2): `registry.cancel(id)` cancels that id's
+//!   `CancellationToken` if it is in-flight, or is a silent no-op if the id is unknown/already
+//!   completed. CANCEL itself never produces a reply frame — the in-flight handler observes the
+//!   token (`cancel.cancelled().await`, or a race against its own natural completion) and decides
+//!   itself whether to call `responder.end_cancelled()`; the supervisor then sends that declared
+//!   `Outcome::Cancelled` exactly like any other declared outcome. The supervisor's OWN synthetic
+//!   terminal path (panic / no-terminal) is unrelated and still always `Outcome::Error`.
+//! - **`core/GOODBYE`** — a graceful-drain announcement. The reader loop simply `break`s: no new
+//!   frame (including a new request-bearing one) is read or dispatched after this point. Already
+//!   in-flight requests are unaffected — they keep running to completion — because the writer
+//!   task and its control channel stay alive until every outstanding supervisor's reserved permit
+//!   is consumed (see the concurrency-model paragraph above: "the writer task outlives all
+//!   supervisors"). Once the last one finishes, the control channel's last `Sender` drops, the
+//!   writer task exits, and `run_with_handler` itself returns — closing the connection. So the
+//!   client observes: in-flight terminals still arrive, then EOF.
+//! - **`core/WINDOW_UPDATE {request_id, frames, bytes}`** — replenishes that request id's stored
+//!   `flow::Credit` via `registry.replenish`. An unknown target id is a silent no-op. No stream
+//!   producer consumes credit yet (that arrives with DATA frames in S5), so today this is purely a
+//!   plumbing primitive: the credit value is stored and updatable, nothing yet reads it back
+//!   except tests.
 //!
 //! **This module's Task 3 baseline** (still true) lays down the session task itself, the
 //! `HELLO`/`HELLO_ACK` handshake (incl. the `TYPE_REGISTRY_HASH` hard check), and the writer
-//! task, plus a `PING`→`PONG` stub in the reader loop. Task 5/6 add `GOODBYE` drain, flag-based
-//! `CANCEL`/`WINDOW_UPDATE`, and the full dispatch table — until then any non-CORE, non-request-
-//! bearing frame (there are none yet, since SQL/TX/STREAM already cover all request-bearing
-//! services) and any CORE frame that isn't `HELLO`/`PING` is simply ignored.
+//! task, plus a `PING`→`PONG` stub in the reader loop. Task 6 still owes the full
+//! fatal/per-request classification (`classify.rs`, reserved-flag rejection, unknown-flag skip)
+//! and the real SQL/TX/STREAM/ADMIN dispatch table — until then any CORE method other than
+//! `HELLO`/`PING`/`GOODBYE`/`WINDOW_UPDATE`, and any ADMIN/unknown-service frame, is simply
+//! ignored.
 
 pub mod codec;
 pub mod error;
+pub mod flow;
 pub mod handshake;
 pub mod registry;
 pub mod responder;
@@ -70,15 +100,18 @@ use futures::future::BoxFuture;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
 
-use ferro_proto::consts::{errc, method_core, service};
+use ferro_proto::consts::{errc, flags, method_core, service};
+use ferro_proto::flags::has as flag_has;
 use ferro_proto::header::Header;
-use ferro_proto::messages::{ErrorPayload, Outcome, Ping};
+use ferro_proto::messages::{ErrorPayload, Outcome, Ping, WindowUpdate};
 
 use crate::config::Config;
 use crate::epoch::BootEpoch;
 use codec::{FrameCodec, InFrame, OutFrame};
 use error::SessionError;
+use flow::Credit;
 use registry::{InsertErr, Registry};
 use responder::Responder;
 
@@ -89,10 +122,14 @@ use responder::Responder;
 const CONTROL_CHANNEL_SLACK: usize = 8;
 
 /// A pluggable handler for request-bearing frames (`service` SQL/TX/STREAM): given the decoded
-/// `InFrame` and a `Responder` it owns, the handler declares exactly one terminal outcome (it may
-/// also stream DATA frames in S5, via a channel not yet wired). `Session::run` uses
-/// `default_handler`; tests and (from Task 6 on) the real dispatch table provide their own.
-pub type HandlerFn = Arc<dyn Fn(InFrame, Responder) -> BoxFuture<'static, ()> + Send + Sync>;
+/// `InFrame`, a `Responder` it owns, and a `CancellationToken` it may observe (set by a routed
+/// `CANCEL` targeting this request's id — advisory; the handler decides whether/when to honor it
+/// by calling `responder.end_cancelled()`), the handler declares exactly one terminal outcome (it
+/// may also stream DATA frames in S5, via a channel not yet wired). `Session::run` uses
+/// `default_handler` (which ignores the token — an `Unsupported` stub has nothing to cancel);
+/// tests and (from Task 6 on) the real dispatch table provide their own.
+pub type HandlerFn =
+    Arc<dyn Fn(InFrame, Responder, CancellationToken) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// The session task's entry point, one call per accepted connection.
 pub struct Session;
@@ -166,9 +203,10 @@ impl Session {
             return;
         }
 
-        // 2. Reader loop. Answers PING with PONG; routes request-bearing frames (SQL/TX/STREAM)
-        // through the registry + spawned-handler + supervisor mechanism; everything else is a
-        // stub until Tasks 5/6 (GOODBYE, CANCEL, WINDOW_UPDATE, full dispatch classification).
+        // 2. Reader loop. Answers PING with PONG; routes CANCEL/WINDOW_UPDATE/GOODBYE; routes
+        // request-bearing frames (SQL/TX/STREAM) through the registry + spawned-handler +
+        // supervisor mechanism; everything else is a stub until Task 6 (full dispatch
+        // classification).
         let registry = Arc::new(Registry::new(config.max_inflight));
 
         while let Some(next) = reader.next().await {
@@ -180,25 +218,55 @@ impl Session {
                 Err(_) => break,
             };
 
-            if frame.header.service == service::CORE && frame.header.method == method_core::PING {
-                if let Ok(ping) = Ping::decode(&frame.payload) {
-                    let pong = pong_frame(frame.header.request_id, ping.token);
-                    if control_tx.send(pong).await.is_err() {
-                        break;
-                    }
-                }
+            // CANCEL is flag-based and checked BEFORE any other dispatch, regardless of the
+            // frame's service/method: it always targets `header.request_id`, carries an empty
+            // payload, and never produces a reply frame of its own (SPEC §5.2).
+            if flag_has(frame.header.flags, flags::CANCEL) {
+                registry.cancel(frame.header.request_id);
                 continue;
             }
 
+            if frame.header.service == service::CORE {
+                match frame.header.method {
+                    method_core::PING => {
+                        if let Ok(ping) = Ping::decode(&frame.payload) {
+                            let pong = pong_frame(frame.header.request_id, ping.token);
+                            if control_tx.send(pong).await.is_err() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    method_core::GOODBYE => {
+                        // Drain: stop reading (so no new request-bearing frame is ever
+                        // dispatched); already in-flight requests still deliver their one
+                        // terminal because the writer/control-channel stay alive until every
+                        // outstanding supervisor's reserved permit is consumed (see this module's
+                        // top doc comment).
+                        break;
+                    }
+                    method_core::WINDOW_UPDATE => {
+                        if let Ok(wu) = WindowUpdate::decode(&frame.payload) {
+                            registry.replenish(frame.header.request_id, wu.frames, wu.bytes);
+                        }
+                        continue;
+                    }
+                    _ => {
+                        // Stub: any other CORE method (Task 6 lands the rest of dispatch).
+                        continue;
+                    }
+                }
+            }
+
             if is_request_bearing(frame.header.service) {
-                if !handle_request_frame(frame, &registry, &control_tx, &handler).await {
+                if !handle_request_frame(frame, &registry, &control_tx, &handler, &config).await {
                     break;
                 }
                 continue;
             }
 
-            // Stub: every other frame (CORE non-PING, ADMIN, unknown services) is ignored until
-            // the real dispatch/classification table (Task 6).
+            // Stub: ADMIN/unknown services are ignored until the real dispatch/classification
+            // table (Task 6).
         }
 
         drop(control_tx);
@@ -222,17 +290,22 @@ async fn handle_request_frame(
     registry: &Arc<Registry>,
     control_tx: &mpsc::Sender<OutFrame>,
     handler: &HandlerFn,
+    config: &Config,
 ) -> bool {
     let id = frame.header.request_id;
+    let credit = Credit::new(config.credit_frames, config.credit_bytes);
 
-    if let Err(err) = registry.insert(id) {
-        let message = match err {
-            InsertErr::Reused => "reused in-flight request id",
-            InsertErr::Full => "max_inflight exceeded",
-        };
-        let diagnostic = diagnostic_error_frame(&frame, message);
-        return control_tx.send(diagnostic).await.is_ok();
-    }
+    let cancel = match registry.insert(id, credit) {
+        Ok(cancel) => cancel,
+        Err(err) => {
+            let message = match err {
+                InsertErr::Reused => "reused in-flight request id",
+                InsertErr::Full => "max_inflight exceeded",
+            };
+            let diagnostic = diagnostic_error_frame(&frame, message);
+            return control_tx.send(diagnostic).await.is_ok();
+        }
+    };
 
     // Reserve the terminal's delivery slot BEFORE the handler ever runs, so the supervisor's
     // eventual send cannot fail for lack of channel capacity no matter what else happens.
@@ -248,7 +321,7 @@ async fn handle_request_frame(
     let service = frame.header.service;
     let method = frame.header.method;
     let handler = handler.clone();
-    let handle = tokio::spawn(async move { handler(frame, responder).await });
+    let handle = tokio::spawn(async move { handler(frame, responder, cancel).await });
 
     tokio::spawn(supervisor::supervise(
         id,
@@ -285,8 +358,13 @@ fn diagnostic_error_frame(frame: &InFrame, message: &str) -> OutFrame {
 }
 
 /// The default handler used by `Session::run`: every request-bearing frame declares
-/// `Unsupported` immediately. Real dispatch (SQL/TX handlers) lands in Task 6/S4.
-fn default_handler(_frame: InFrame, responder: Responder) -> BoxFuture<'static, ()> {
+/// `Unsupported` immediately (ignoring the cancel token — there is nothing in-flight to cancel).
+/// Real dispatch (SQL/TX handlers) lands in Task 6/S4.
+fn default_handler(
+    _frame: InFrame,
+    responder: Responder,
+    _cancel: CancellationToken,
+) -> BoxFuture<'static, ()> {
     async move {
         responder.end_error(unsupported_error_payload());
     }
