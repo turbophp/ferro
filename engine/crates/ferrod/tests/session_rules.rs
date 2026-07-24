@@ -79,6 +79,11 @@ async fn supervisor_sends_declared_ok_exactly_once() {
     let frame = control_rx.try_recv().expect("exactly one terminal frame");
     assert_eq!(frame.header.request_id, 7);
     assert_eq!(frame.header.flags, flags::END);
+    // The terminal frame must carry the ORIGINAL request's service/method, not a hard-coded
+    // value — a regression that hard-codes these (e.g. to CORE/0) would slip past a test that
+    // only checks request_id/flags/payload.
+    assert_eq!(frame.header.service, service::SQL);
+    assert_eq!(frame.header.method, SOME_METHOD);
     match Outcome::decode(&frame.payload).expect("decode Outcome") {
         Outcome::Ok(body) => assert_eq!(body, b"x"),
         other => panic!("expected Outcome::Ok, got {other:?}"),
@@ -128,6 +133,59 @@ async fn supervisor_synthesizes_on_panic_with_distinct_code() {
             assert_eq!(ep.detail.as_deref(), Some(supervisor::NO_TERMINAL_DETAIL));
         }
         other => panic!("expected Outcome::Error, got {other:?}"),
+    }
+    assert!(control_rx.try_recv().is_err(), "expected no second frame");
+    assert_eq!(registry.len(), 0);
+}
+
+#[tokio::test]
+async fn declare_then_panic_yields_single_synth_terminal() {
+    // A handler that DOES declare an outcome, then panics afterward. `supervise`'s
+    // `Err(join_err)` branch (a panicked JoinHandle) synthesizes unconditionally — it never
+    // inspects the cell — so the declared `Ok` is discarded in favor of the synthetic error.
+    // This pins that semantic explicitly: a future refactor that tried to "recover" the
+    // declared outcome on panic would be a behavior change, and this test would catch it.
+    let (control_tx, mut control_rx) = mpsc::channel::<OutFrame>(8);
+    let registry = Arc::new(Registry::new(4));
+    registry.insert(31).unwrap();
+
+    let (responder, cell) = Responder::new_pair();
+    let permit = control_tx.clone().reserve_owned().await.unwrap();
+    let handle = tokio::spawn(async move {
+        responder.end_ok(Bytes::from_static(b"declared-before-panic"));
+        panic!("intentional: handler declares Ok, then panics anyway");
+    });
+
+    supervisor::supervise(
+        31,
+        service::SQL,
+        SOME_METHOD,
+        permit,
+        cell,
+        handle,
+        registry.clone(),
+    )
+    .await;
+
+    let frame = control_rx
+        .try_recv()
+        .expect("exactly one synthesized terminal");
+    assert_eq!(frame.header.flags, flags::END);
+    match Outcome::decode(&frame.payload).expect("decode Outcome") {
+        Outcome::Error(ep) => {
+            assert_eq!(ep.code, errc::PROTOCOL);
+            assert!(
+                ep.detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains(supervisor::NO_TERMINAL_DETAIL)),
+                "expected detail to contain {:?}, got {:?}",
+                supervisor::NO_TERMINAL_DETAIL,
+                ep.detail
+            );
+        }
+        other => panic!(
+            "expected the synthetic Outcome::Error (declared Ok must be discarded on panic), got {other:?}"
+        ),
     }
     assert!(control_rx.try_recv().is_err(), "expected no second frame");
     assert_eq!(registry.len(), 0);
