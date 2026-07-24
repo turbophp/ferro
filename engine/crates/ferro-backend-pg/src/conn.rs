@@ -98,29 +98,7 @@ impl PoolBackend for PgBackend {
 
     async fn simple_query(&self, conn: &mut Self::Conn, sql: &str) -> Result<u64, PoolError> {
         conn.client.batch_execute(sql).await.map(|_| 0u64).map_err(|e| {
-            // Tell "the connection itself is dead" apart from "the statement was rejected".
-            // Two cases surface as ConnectionLost, neither of which `Error::is_closed()` alone
-            // catches on its own (that only trips once the connection driver task has already
-            // dropped its receiver, which lags a round trip's own error by a tick — the exact
-            // race v2/M4 flags):
-            //   1. No DB error at all (`as_db_error() == None`): a closed request channel, an
-            //      I/O error reading/writing the socket mid-flight, a protocol violation, etc —
-            //      the transport itself failed.
-            //   2. A well-formed DB error whose severity is FATAL/PANIC: Postgres itself ended
-            //      the session (e.g. `pg_terminate_backend`, an idle-session/admin disconnect,
-            //      a crash) and says so over the wire *before* closing the socket — so this
-            //      still parses as a `DbError`, but per Postgres's own semantics FATAL/PANIC
-            //      means "this session is over", never "retry within the same connection".
-            // Anything else (severity ERROR/WARNING/...) is a genuine statement-level failure;
-            // the connection itself is still fine — `PoolError::Backend` (NonRetryable).
-            let is_session_fatal = match e.as_db_error() {
-                None => true,
-                Some(db_err) => matches!(
-                    db_err.parsed_severity(),
-                    Some(tokio_postgres::error::Severity::Fatal | tokio_postgres::error::Severity::Panic)
-                ),
-            };
-            if is_session_fatal {
+            if is_session_fatal(&e) {
                 tracing::warn!(
                     error = %e,
                     "ferro-backend-pg: simple_query hit a session-ending failure (connection considered lost)"
@@ -130,5 +108,37 @@ impl PoolBackend for PgBackend {
                 PoolError::Backend(e.to_string())
             }
         })
+    }
+
+    async fn query(
+        &self,
+        conn: &mut Self::Conn,
+        sql: &str,
+        params: &[crate::Value],
+    ) -> Result<ferro_pool::backend::QueryResult, PoolError> {
+        crate::query::run(&conn.client, sql, params).await
+    }
+}
+
+/// Whether a `tokio_postgres::Error` means "this session is over" (connection lost) rather than
+/// "this statement was rejected". Shared by `simple_query` (S4) and `error_map` (S5), which is why
+/// it lives here as a named helper (v2/M4 + MAJOR-9). Two cases are session-fatal, neither caught
+/// by `Error::is_closed()` alone (that only trips once the connection-driver task has dropped its
+/// receiver — a tick behind a round trip's own error):
+///   1. No DB error at all (`as_db_error() == None`): a closed request channel, an I/O error on
+///      the socket mid-flight, a protocol violation — the transport itself failed.
+///   2. A well-formed DB error whose severity is FATAL/PANIC: Postgres itself ended the session
+///      (`pg_terminate_backend`, an idle-session/admin disconnect, a crash) and says so over the
+///      wire before closing the socket, so it still parses as a `DbError` — but FATAL/PANIC means
+///      "this session is over", never "retry on the same connection".
+///
+/// Anything else (severity ERROR/WARNING/…) is a statement-level failure; the connection is fine.
+pub(crate) fn is_session_fatal(e: &tokio_postgres::Error) -> bool {
+    match e.as_db_error() {
+        None => true,
+        Some(db_err) => matches!(
+            db_err.parsed_severity(),
+            Some(tokio_postgres::error::Severity::Fatal | tokio_postgres::error::Severity::Panic)
+        ),
     }
 }

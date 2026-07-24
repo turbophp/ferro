@@ -181,6 +181,8 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "ferro-pool",
+ "ferro-proto",
+ "futures-util",
  "tokio",
  "tokio-postgres",
  "tracing",

@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
-use crate::backend::PoolBackend;
+use ferro_proto::value::Value;
+
+use crate::backend::{PoolBackend, QueryResult};
 use crate::config::PoolConfig;
 use crate::error::PoolError;
 use crate::pin::{self, PinCause, PinState, TxId};
@@ -321,6 +323,25 @@ impl<B: PoolBackend> Checkout<B> {
         let pool = Arc::clone(&self.pool);
         let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
         pool.backend.simple_query(conn, sql).await
+    }
+
+    /// The guarded, user-facing **row-returning** statement entry (S5, BLOCKER-2). Mirrors
+    /// [`Checkout::exec`]'s guard structure EXACTLY: it runs `pin::is_bare_tx_control(sql)` FIRST
+    /// and rejects a bare transaction-control statement (`BEGIN`/`COMMIT`/`ROLLBACK`/…, leading
+    /// comment/whitespace tolerant) with `PoolError::Unsupported` — so an `EXEC BEGIN` can never
+    /// reach the raw client and open an untracked transaction that the next tenant on this pooled
+    /// connection would inherit (a cross-tenant leak; charter rule 6). Only a non-tx-control
+    /// statement is delegated to `PoolBackend::query`.
+    pub async fn query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, PoolError> {
+        if pin::is_bare_tx_control(sql) {
+            return Err(PoolError::Unsupported(format!(
+                "bare transaction-control statement not allowed via query(): {sql:?} \
+                 (use the TX service instead)"
+            )));
+        }
+        let pool = Arc::clone(&self.pool);
+        let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
+        pool.backend.query(conn, sql, params).await
     }
 }
 

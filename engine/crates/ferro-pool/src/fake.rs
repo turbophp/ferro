@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use crate::backend::PoolBackend;
+use crate::backend::{PoolBackend, QueryResult};
 use crate::error::PoolError;
 
 /// The fake's connection handle. Fields are `pub` so tests can inspect/mutate state directly
@@ -53,6 +53,10 @@ pub struct FakeBackend {
     /// Number of `ping()` calls currently parked on `ping_gate`. Tests poll this until it is `> 0`
     /// to prove the reaper has actually entered the blocked ping, rather than racing on timing.
     pings_waiting: AtomicU64,
+    /// Canned result returned by `query()` (S5). Defaults to an empty `QueryResult`; a test arms
+    /// it via `set_query_result` so the guarded `Checkout::query` path can be exercised (both the
+    /// tx-control rejection AND a normal row-returning return) without a live Postgres.
+    canned_query: Mutex<QueryResult>,
 }
 
 impl FakeBackend {
@@ -62,7 +66,15 @@ impl FakeBackend {
             fail_connect_remaining: AtomicU64::new(0),
             ping_gate: Mutex::new(None),
             pings_waiting: AtomicU64::new(0),
+            canned_query: Mutex::new(QueryResult::default()),
         }
+    }
+
+    /// Arms the `QueryResult` that every subsequent `query()` returns (S5). Lets a test drive the
+    /// guarded `Checkout::query` path — assert a bare `BEGIN` is rejected BEFORE the backend is
+    /// reached, and that a normal statement returns exactly these canned rows.
+    pub fn set_query_result(&self, result: QueryResult) {
+        *self.canned_query.lock().unwrap() = result;
     }
 
     /// Arms the next `n` `connect()` calls to fail with `PoolError::ConnectionLost`.
@@ -155,5 +167,18 @@ impl PoolBackend for FakeBackend {
     async fn simple_query(&self, conn: &mut Self::Conn, sql: &str) -> Result<u64, PoolError> {
         conn.recorded.push(sql.to_string());
         Ok(0)
+    }
+
+    async fn query(
+        &self,
+        conn: &mut Self::Conn,
+        sql: &str,
+        _params: &[ferro_proto::value::Value],
+    ) -> Result<QueryResult, PoolError> {
+        // Record the SQL that actually reached the backend: a guard-rejected statement never
+        // reaches here, so a test can assert `recorded` to prove `Checkout::query`'s guard fired
+        // (or didn't) before delegation.
+        conn.recorded.push(sql.to_string());
+        Ok(self.canned_query.lock().unwrap().clone())
     }
 }

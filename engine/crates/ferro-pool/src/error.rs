@@ -15,12 +15,30 @@ pub enum PoolError {
     #[error("pool is closed")]
     Closed,
     /// An operation this backend/pool does not support in M0 (e.g. bare tx-control SQL bypassing
-    /// the pin stub — v2/M1).
+    /// the pin stub — v2/M1; an out-of-M0 column/param type on the row-returning path — S5).
     #[error("unsupported: {0}")]
     Unsupported(String),
-    /// Any other backend-reported failure (e.g. a SQL error surfaced through the raw path).
+    /// Any other backend-reported failure surfaced through the raw `simple_query` path (S4). Kept
+    /// distinct from the richer [`PoolError::Sql`] the row-returning `query` path produces so the
+    /// S4 raw-path tests (which match on `Backend(_)`) stay valid.
     #[error("backend error: {0}")]
     Backend(String),
+    /// A statement-level SQL error from a **present, non-fatal** `DbError` on the row-returning
+    /// `query` path (S5, MAJOR-9). Carries the proto classification (`code` + `branch`, off the
+    /// SQLSTATE table) AND the raw SQLSTATE + server message, so the SQL service (S5 Task 3) can
+    /// build the wire `ErrorPayload` without re-deriving anything.
+    ///
+    /// This is deliberately a DISTINCT variant from [`PoolError::ConnectionLost`]: a `Sql` error
+    /// means the server answered (the statement's fate is *known* — it failed), so the service
+    /// must NOT apply the §19.3 `readonly`→`Indeterminate` override to it. Only a true
+    /// transport/FATAL `ConnectionLost` (no answer, fate unknown) gets that override.
+    #[error("sql error {code:#06x} (sqlstate {sqlstate:?}): {message}")]
+    Sql {
+        code: u16,
+        branch: u8,
+        sqlstate: Option<String>,
+        message: String,
+    },
 }
 
 /// SPEC §9.2 taxonomy branch. The engine never transparently retries user statements (charter
@@ -48,11 +66,24 @@ impl PoolError {
             PoolError::Closed | PoolError::Unsupported(_) | PoolError::Backend(_) => {
                 Branch::NonRetryable
             }
+            // A `Sql` error carries its own proto branch (off the SQLSTATE table): the retryable
+            // classes (serialization failure / deadlock / connection-exception SQLSTATE) coarsen to
+            // `Retryable`; everything else (incl. the Indeterminate branch, which the pool itself
+            // never mints) coarsens to `NonRetryable`. The pool still never auto-retries either way
+            // (charter rule 3) — this label only informs the caller's own policy.
+            PoolError::Sql { branch, .. } => {
+                if *branch == ferro_proto::consts::branch::RETRYABLE {
+                    Branch::Retryable
+                } else {
+                    Branch::NonRetryable
+                }
+            }
         }
     }
 
     /// Maps to a `ferro_proto::consts::errc` code (the `/proto` registry — SPEC §20.2). There is
-    /// no dedicated wire code for `Closed`/`Backend` yet, so both fall back to `PROTOCOL`.
+    /// no dedicated wire code for `Closed`/`Backend` yet, so both fall back to `PROTOCOL`; a `Sql`
+    /// error already carries its registry code verbatim.
     pub fn errc(&self) -> u16 {
         use ferro_proto::consts::errc;
         match self {
@@ -60,6 +91,7 @@ impl PoolError {
             PoolError::ConnectionLost => errc::CONNECTION_LOST,
             PoolError::Unsupported(_) => errc::UNSUPPORTED,
             PoolError::Closed | PoolError::Backend(_) => errc::PROTOCOL,
+            PoolError::Sql { code, .. } => *code,
         }
     }
 }
