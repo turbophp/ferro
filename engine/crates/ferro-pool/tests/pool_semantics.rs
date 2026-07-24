@@ -10,6 +10,7 @@ use std::time::Duration;
 use ferro_pool::config::PoolConfig;
 use ferro_pool::error::PoolError;
 use ferro_pool::fake::FakeBackend;
+use ferro_pool::health::backoff_delay;
 use ferro_pool::pool::Pool;
 
 #[tokio::test]
@@ -195,4 +196,130 @@ async fn connect_failure_releases_permit() {
         .await
         .expect("second checkout should succeed: the failed connect's permit was released");
     assert_eq!(c.conn().id, 0);
+}
+
+// --- S4 Task 3: max_lifetime recycling, the cancel-safe reaper, and the backoff schedule -------
+//
+// Per v2/M3, the reaper-less tests above (and `max_lifetime_recycles` below) keep
+// `reap_interval: None` so `start_paused` + manual `advance` stay fully deterministic — nothing
+// but the test itself can move pool state when the clock moves. The reaper-specific tests
+// (`reaper_closes_stale_idle`, `reaper_stops_on_pool_drop`) turn the reaper on deliberately and
+// are kept separate for exactly that reason.
+
+#[tokio::test(start_paused = true)]
+async fn max_lifetime_recycles() {
+    let backend = FakeBackend::new();
+    let config = PoolConfig {
+        max_size: 4,
+        max_lifetime: Duration::from_secs(60),
+        reap_interval: None, // reaper-less: deterministic under start_paused (v2/M3)
+        ..Default::default()
+    };
+    let pool = Pool::new(backend, config);
+
+    let c0 = pool.checkout().await.expect("checkout should succeed");
+    let id0 = c0.conn().id;
+    drop(c0); // conn goes idle
+
+    // Advance well past max_lifetime; no reaper exists to act on this, so the eviction can only
+    // come from the checkout-time age check (Task 2's `too_old` branch).
+    tokio::time::advance(Duration::from_secs(61)).await;
+
+    let c1 = pool
+        .checkout()
+        .await
+        .expect("checkout after max_lifetime should reconnect, not error");
+    assert_ne!(
+        c1.conn().id,
+        id0,
+        "a conn older than max_lifetime must be evicted and replaced with a fresh one"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn reaper_closes_stale_idle() {
+    let backend = FakeBackend::new();
+    let config = PoolConfig {
+        max_size: 4,
+        max_lifetime: Duration::from_millis(20),
+        reap_interval: Some(Duration::from_millis(50)),
+        ..Default::default()
+    };
+    let pool = Pool::new(backend, config);
+
+    let c0 = pool.checkout().await.expect("checkout should succeed");
+    let stale_id = c0.conn().id;
+    drop(c0); // conn goes idle
+
+    // Advance past max_lifetime + reap_interval so the reaper's sleep fires with the conn already
+    // past max_lifetime (evicted on the reaper's very first tick — no need for multiple periodic
+    // firings to line up), then yield so the woken reaper task actually runs its tick (a sync
+    // point, not a real sleep).
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+
+    let fresh = pool
+        .checkout()
+        .await
+        .expect("checkout should reconnect after the reaper evicted the stale idle conn");
+    assert_ne!(
+        fresh.conn().id,
+        stale_id,
+        "the reaper should have evicted the stale idle conn before this checkout"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn reaper_stops_on_pool_drop() {
+    let backend = FakeBackend::new();
+    let config = PoolConfig {
+        max_size: 4,
+        max_lifetime: Duration::from_millis(20),
+        reap_interval: Some(Duration::from_millis(50)),
+        ..Default::default()
+    };
+    let pool = Pool::new(backend, config);
+
+    // Put a conn idle so there would be something for a (hypothetical, still-alive) reaper tick
+    // to touch.
+    let c0 = pool.checkout().await.expect("checkout should succeed");
+    drop(c0);
+
+    // Drop every strong handle to the pool. The reaper's `Weak` should no longer `upgrade()`.
+    drop(pool);
+
+    // Advancing time / yielding past where the reaper would have ticked must not hang or panic:
+    // `Weak::upgrade()` returns `None` on the next tick and the reaper task exits. Wrapped in a
+    // timeout so a genuine regression (the reaper somehow kept alive/looping) fails fast with a
+    // clear message instead of hanging the test run.
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "advancing time after dropping the pool must not hang (reaper should have stopped)"
+    );
+}
+
+#[test]
+fn backoff_delay_schedule() {
+    let cases = [
+        (0u32, Duration::from_millis(10)),
+        (3u32, Duration::from_millis(80)),
+        (7u32, Duration::from_secs(1)),
+        (20u32, Duration::from_secs(1)),
+    ];
+    for (attempt, upper_bound) in cases {
+        // Sample repeatedly since the jitter is randomized; every sample must respect the bound.
+        for _ in 0..50 {
+            let d = backoff_delay(attempt);
+            assert!(
+                d <= upper_bound,
+                "backoff_delay({attempt}) = {d:?} exceeds bound {upper_bound:?}"
+            );
+        }
+    }
 }

@@ -17,9 +17,13 @@ use crate::error::PoolError;
 
 /// A connection sitting idle in the pool, plus the bookkeeping needed to recycle it safely on
 /// the next checkout.
-struct IdleConn<B: PoolBackend> {
-    conn: B::Conn,
-    created_at: Instant,
+///
+/// `pub(crate)` (struct + the two fields the reaper touches) so `health.rs`'s reaper can inspect
+/// age and ping the connection directly; `tx_open`/`tainted` stay module-private since the reaper
+/// never needs them (it only evicts or keeps a candidate whole, never reconstructs one).
+pub(crate) struct IdleConn<B: PoolBackend> {
+    pub(crate) conn: B::Conn,
+    pub(crate) created_at: Instant,
     /// Set when the connection served a transaction that was not explicitly committed/rolled
     /// back before release; the next checkout runs a defensive `ROLLBACK` before handing it out.
     tx_open: bool,
@@ -27,11 +31,14 @@ struct IdleConn<B: PoolBackend> {
     tainted: bool,
 }
 
-struct PoolInner<B: PoolBackend> {
-    backend: B,
-    config: PoolConfig,
+/// `pub(crate)` (+ the fields the reaper needs) so `health::spawn_reaper`/`reap_once` can read
+/// `backend`/`config` and lock `idle` directly; `semaphore` stays private since only the checkout
+/// path in this module touches it.
+pub(crate) struct PoolInner<B: PoolBackend> {
+    pub(crate) backend: B,
+    pub(crate) config: PoolConfig,
     semaphore: Arc<Semaphore>,
-    idle: Mutex<Vec<IdleConn<B>>>,
+    pub(crate) idle: Mutex<Vec<IdleConn<B>>>,
 }
 
 /// A cloneable handle to a pool. Cloning shares the same underlying connections/semaphore/idle
@@ -49,18 +56,23 @@ impl<B: PoolBackend> Clone for Pool<B> {
 }
 
 impl<B: PoolBackend> Pool<B> {
-    /// Builds a pool over `backend` with `config`. Does not spawn a reaper — Task 3 wires that up
-    /// when `config.reap_interval` is `Some`; Task 2's `Pool` is always reaper-less.
+    /// Builds a pool over `backend` with `config`. Spawns the background liveness reaper (Task 3,
+    /// `health::spawn_reaper`) iff `config.reap_interval` is `Some`; a `None` interval leaves the
+    /// pool exactly as reaper-less as Task 2 left it (needed for deterministic `start_paused`
+    /// tests — v2/M3).
     pub fn new(backend: B, config: PoolConfig) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_size));
-        Self {
-            inner: Arc::new(PoolInner {
-                backend,
-                config,
-                semaphore,
-                idle: Mutex::new(Vec::new()),
-            }),
+        let reap_interval = config.reap_interval;
+        let inner = Arc::new(PoolInner {
+            backend,
+            config,
+            semaphore,
+            idle: Mutex::new(Vec::new()),
+        });
+        if let Some(interval) = reap_interval {
+            crate::health::spawn_reaper(&inner, interval);
         }
+        Self { inner }
     }
 
     /// Checks out a connection, waiting up to `config.checkout_timeout` for a free permit and a
