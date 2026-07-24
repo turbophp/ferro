@@ -5,8 +5,12 @@
 //!
 //! **Accept-time peercred gate.** Every accepted connection is checked (`peercred::peer_uid` +
 //! `config.uid_allowed`) BEFORE any part of `Session::run_with_handler` ever runs: a denied or
-//! unreadable peer's stream is dropped immediately — no HELLO_ACK, no writer task, nothing put on
-//! the wire at all. Only an allowed peer's connection is spawned as a session task.
+//! unreadable peer never gets a HELLO_ACK, never gets a writer task, and is never spawned as a
+//! session — but the rejection itself is session-fatal per SPEC G-4, so it is not a silent
+//! `drop(stream)`. `deny_connection` below wraps the raw stream in a one-shot
+//! `Framed<_, FrameCodec>` just long enough to send a single `rid=0, flags=END,
+//! Outcome::Error{code: AUTH}` frame (`SessionError::peercred_denied`), then closes it. Only an
+//! allowed peer's connection is spawned as a session task.
 //!
 //! **Drain.** The accept loop is a `tokio::select!` between `drain.wait()`, an opportunistic
 //! **reap** of finished session tasks, and `listener.accept()` — `biased` so that (1) once
@@ -25,12 +29,16 @@
 
 use std::time::Duration;
 
-use tokio::net::UnixListener;
+use futures::SinkExt;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinSet;
+use tokio_util::codec::Framed;
 
 use crate::config::Config;
 use crate::epoch::BootEpoch;
 use crate::peercred;
+use crate::session::codec::FrameCodec;
+use crate::session::error::SessionError;
 use crate::session::{HandlerFn, Session};
 use crate::shutdown::Drain;
 
@@ -87,11 +95,16 @@ pub async fn serve(
                     }
                     Ok(uid) => {
                         tracing::warn!(uid, "peercred denied: rejecting connection");
-                        drop(stream);
+                        let err = SessionError::peercred_denied(format!(
+                            "peer uid {uid} is not permitted to connect"
+                        ));
+                        deny_connection(stream, err).await;
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "peercred lookup failed: rejecting connection");
-                        drop(stream);
+                        let err =
+                            SessionError::peercred_denied(format!("peercred lookup failed: {err}"));
+                        deny_connection(stream, err).await;
                     }
                 }
             }
@@ -99,6 +112,18 @@ pub async fn serve(
     }
 
     drain_sessions(sessions, config.drain_deadline).await;
+}
+
+/// Send one session-fatal Auth frame on a just-accepted, not-yet-a-`Session` stream, then close
+/// it: `rid=0, flags=END, Outcome::Error{code: errc::AUTH}` (SPEC G-4 — a peercred denial is
+/// session-fatal, never a silent close). `Framed::send` both encodes and flushes the frame; a
+/// write/flush failure (the peer already gone) is logged and otherwise ignored — either way the
+/// stream is dropped right after, closing the connection.
+async fn deny_connection(stream: UnixStream, err: SessionError) {
+    let mut framed = Framed::new(stream, FrameCodec);
+    if let Err(send_err) = framed.send(err.into_out_frame()).await {
+        tracing::warn!(error = %send_err, "failed to send peercred-deny frame");
+    }
 }
 
 /// Wait for every session task in `sessions` to finish, up to `deadline`. Anything still

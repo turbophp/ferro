@@ -15,8 +15,10 @@
 //!   `std::sync::Mutex<HashMap<u32, InFlight>>` under the hood, `InFlight` holding a
 //!   `CancellationToken` + a `flow::Credit` — this module's Task 5 addition) keyed by
 //!   `request_id`, populated only by request-bearing services (SQL/TX/STREAM) — core
-//!   control/liveness frames (`HELLO_ACK`, `PONG`, `WINDOW_UPDATE`-ack, `GOODBYE`) are
-//!   non-terminal, never enter the registry, and are not subject to the one-`END` rule.
+//!   control/liveness frames (`HELLO_ACK`, `PONG`, `GOODBYE`, `WINDOW_UPDATE`) are non-terminal,
+//!   never enter the registry, and are not subject to the one-`END` rule. `WINDOW_UPDATE` and
+//!   `GOODBYE` in particular are inbound-only control frames — the reader loop applies/acts on
+//!   them and never sends a reply of any kind (there is no `WINDOW_UPDATE_ACK` method).
 //!
 //! **Request handling is spawn-per-request + supervisor (this module's Task 4 addition).** For
 //! every request-bearing frame (`service` is SQL, TX, or STREAM), the reader loop:

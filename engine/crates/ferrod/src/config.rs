@@ -73,12 +73,7 @@ impl Config {
         }
 
         if let Ok(list) = std::env::var("FERRO_ALLOW_UIDS") {
-            cfg.peer_allow_uids = list
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .filter_map(|s| s.parse::<u32>().ok())
-                .collect();
+            cfg.peer_allow_uids = parse_allow_uids(&list);
         }
 
         cfg
@@ -98,5 +93,54 @@ impl Config {
         } else {
             self.peer_allow_uids.contains(&uid)
         }
+    }
+}
+
+/// Parse a comma-separated `FERRO_ALLOW_UIDS` value into the uids it names. An unparseable token
+/// (empty after trimming aside) is `tracing::warn!`-ed and skipped, NOT silently discarded: a
+/// wrong delimiter (e.g. `"33;44"`, a single token that fails to parse as `u32`) would otherwise
+/// yield an empty allow-list, which falls back to self-only (`uid_allowed`) — a silent,
+/// security-relevant surprise for an operator who intended to allow those other uids. Parsing
+/// continues past a bad token (fail-fast is not required here, per the charter's "when uncertain"
+/// guidance — a warn is the minimum).
+fn parse_allow_uids(list: &str) -> Vec<u32> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match s.parse::<u32>() {
+            Ok(uid) => Some(uid),
+            Err(err) => {
+                tracing::warn!(
+                    token = s,
+                    error = %err,
+                    "FERRO_ALLOW_UIDS: skipping unparseable uid token"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_allow_uids_skips_malformed_tokens_and_keeps_valid_ones() {
+        // "33;44" is a single token with the wrong delimiter -- not parseable as a u32 -- and
+        // must not silently swallow the whole list: 55 and 66 on either side of it still make it
+        // into the result.
+        let uids = parse_allow_uids("55, 33;44 ,66,not-a-uid,");
+        assert_eq!(uids, vec![55, 66]);
+    }
+
+    #[test]
+    fn parse_allow_uids_all_malformed_yields_empty_not_a_panic() {
+        assert_eq!(parse_allow_uids("nope;nope"), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn parse_allow_uids_empty_string_yields_empty() {
+        assert_eq!(parse_allow_uids(""), Vec::<u32>::new());
     }
 }

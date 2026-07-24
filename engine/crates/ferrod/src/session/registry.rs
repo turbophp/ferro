@@ -42,8 +42,9 @@ struct InFlight {
 }
 
 /// The in-flight registry for one session. Holds only request-bearing (SQL/TX/STREAM) request
-/// ids; core control/liveness frames (HELLO_ACK, PONG, WINDOW_UPDATE-ack, GOODBYE) never enter it
-/// and are not subject to the one-`END` rule.
+/// ids; core control/liveness frames (HELLO_ACK, PONG, GOODBYE, WINDOW_UPDATE) never enter it and
+/// are not subject to the one-`END` rule. WINDOW_UPDATE and GOODBYE are inbound-only control
+/// frames — there is no WINDOW_UPDATE_ACK method; they are acted on and never get a reply.
 pub struct Registry {
     inner: Mutex<HashMap<u32, InFlight>>,
     max_inflight: usize,

@@ -19,7 +19,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY engine ./engine
 COPY proto ./proto
 
-RUN cargo build -p ferrod --release
+RUN cargo build -p ferrod --release --locked
 
 FROM debian:bookworm-slim
 

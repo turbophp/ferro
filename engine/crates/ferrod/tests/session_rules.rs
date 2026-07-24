@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -354,12 +354,27 @@ async fn reused_inflight_id_diagnostic_original_undisturbed() {
 #[tokio::test]
 async fn max_inflight_exceeded_is_per_request_error() {
     let max_inflight = 2;
-    let notify = Arc::new(Notify::new());
-    let handler_notify = notify.clone();
+    // One release signal PER held handler, keyed by request_id -- NOT one shared `Notify`.
+    // `tokio::sync::Notify` stores at most one permit: if both handler tasks aren't already
+    // parked in `.notified().await` by the time the test fires two consecutive `notify_one()`
+    // calls, the second call can be dropped on the floor (whichever handler calls `.notified()`
+    // second then waits forever, hanging the test) rather than deterministically waking both.
+    // Giving each in-flight handler its own `Notify` makes the release deterministic regardless
+    // of scheduling.
+    let notify_1 = Arc::new(Notify::new());
+    let notify_2 = Arc::new(Notify::new());
+    let notify_by_id: Arc<HashMap<u32, Arc<Notify>>> = Arc::new(HashMap::from([
+        (1, notify_1.clone()),
+        (2, notify_2.clone()),
+    ]));
     let handler: HandlerFn = Arc::new(
-        move |_frame: InFrame, responder: Responder, _cancel: CancellationToken| {
-            let notify = handler_notify.clone();
+        move |frame: InFrame, responder: Responder, _cancel: CancellationToken| {
+            let notify_by_id = notify_by_id.clone();
             async move {
+                let notify = notify_by_id
+                    .get(&frame.header.request_id)
+                    .expect("test only ever sends request ids 1 and 2 to this handler")
+                    .clone();
                 notify.notified().await;
                 responder.end_ok(Bytes::new());
             }
@@ -397,9 +412,10 @@ async fn max_inflight_exceeded_is_per_request_error() {
     let pong_frame = client.recv().await;
     assert_eq!(pong_frame.header.method, method_core::PONG);
 
-    // Release both held requests so the connection winds down cleanly.
-    notify.notify_one();
-    notify.notify_one();
+    // Release both held requests, deterministically (each on its own signal), so the connection
+    // winds down cleanly.
+    notify_1.notify_one();
+    notify_2.notify_one();
     let mut seen: HashSet<u32> = HashSet::new();
     for _ in 0..2 {
         let frame = client.recv().await;
@@ -564,34 +580,13 @@ async fn goodbye_drains_inflight_then_closes() {
     client.recv_eof().await;
 }
 
-#[tokio::test]
-async fn window_update_applies_credit() {
-    // Unit-level: `flow::Credit` debit/replenish directly (see also `flow.rs`'s own tests).
-    let mut credit = Credit::new(2, 100);
-    assert!(credit.try_debit(60));
-    assert_eq!(credit.frames(), 1);
-    assert_eq!(credit.bytes(), 40);
-    assert!(
-        !credit.try_debit(50),
-        "must not exceed the remaining byte budget"
-    );
-    credit.replenish(5, 900);
-    assert_eq!(credit.frames(), 6);
-    assert_eq!(credit.bytes(), 940);
-
-    // Routing, at the `Registry` layer that `session::mod`'s reader loop calls directly for a
-    // `WINDOW_UPDATE {request_id, frames, bytes}` frame: replenishing a known in-flight id
-    // updates its stored credit; an unknown id is silently a no-op.
-    let registry = Registry::new(4);
-    registry.insert(10, Credit::new(2, 100)).unwrap();
-    registry.replenish(10, 5, 900);
-    let updated = registry.credit_snapshot(10).expect("id 10 is in-flight");
-    assert_eq!(updated.frames(), 7);
-    assert_eq!(updated.bytes(), 1000);
-
-    registry.replenish(999, 1, 1);
-    assert!(registry.credit_snapshot(999).is_none());
-}
+// `flow::Credit` debit/replenish is covered directly by `flow.rs`'s own unit tests, and
+// `WINDOW_UPDATE` routing at the `Registry` layer (a known in-flight id's credit is updated; an
+// unknown id is silently a no-op) is covered directly by `registry.rs`'s own unit tests -- both
+// exercised at the same layer a duplicate integration test here would only restate. Live-session
+// coverage of an actual credit DEBIT (i.e. `WINDOW_UPDATE` replenishing a window some in-flight
+// consumer is drawing down through a real `Session`) is deferred to S5, when a DATA-frame stream
+// producer first exists to consume credit; today nothing in the live session reads it back.
 
 #[tokio::test]
 async fn window_update_through_live_session_survives_unknown_target() {

@@ -13,6 +13,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo test --workspace          # offline: integration tests skip (no FERRO_TEST_PG_URL)
+      # Stable-toolchain type-check for the ferrod fuzz target's standalone workspace (see
+      # fuzz-smoke's NOTE below for why its actual `cargo fuzz run` is nightly-only/deferred):
+      # `cargo check` alone doesn't need coverage instrumentation, so it compiles cleanly on
+      # stable and catches API drift between session_classify.rs and ferrod without waiting on
+      # the nightly ICE fix.
+      - run: cd engine/crates/ferrod/fuzz && cargo check
 
   integration:
     runs-on: ubuntu-latest

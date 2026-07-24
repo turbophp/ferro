@@ -1,6 +1,7 @@
 mod common;
 
-use ferro_proto::consts::TYPE_REGISTRY_HASH;
+use ferro_proto::consts::{TYPE_REGISTRY_HASH, errc, flags, method_core, service};
+use ferro_proto::messages::Outcome;
 use ferrod::config::Config;
 use ferrod::epoch::BootEpoch;
 use ferrod::peercred::peer_uid;
@@ -78,26 +79,41 @@ async fn peercred_deny_rejects_connection() {
     let mut client = common::connect(&socket_path).await;
 
     // Send HELLO -- the send itself may fail (the server may have already dropped its side of
-    // the socket right after the peercred check, causing a broken pipe): that is ALSO "rejects
-    // it immediately", not a test bug, so it's asserted as an acceptable outcome, not unwrapped.
-    let send_result = client
+    // the socket right after sending its deny frame, causing a broken pipe): that is ALSO fine,
+    // not a test bug -- the deny path never reads anything from the client, so whether this send
+    // itself succeeds is incidental to what the test actually asserts below.
+    let _ = client
         .try_send(common::TestClient::hello_out_frame(1, TYPE_REGISTRY_HASH))
         .await;
 
-    if send_result.is_ok() {
-        // The send was buffered locally before the server's rejection was visible client-side.
-        // Either way, no HELLO_ACK is EVER sent: the connection is torn down instead, observed
-        // client-side as either a clean EOF or a reset (the server dropped its accepted stream
-        // without reading/writing anything, so which one the kernel reports is incidental --
-        // `recv_or_none` treats both alike as "nothing valid ever arrived").
-        assert!(
-            client
-                .recv_or_none(std::time::Duration::from_millis(300))
-                .await
-                .is_none(),
-            "expected no HELLO_ACK after a peercred deny"
-        );
+    // A peercred deny is session-fatal (SPEC G-4), never a silent close: the server sends exactly
+    // one `rid=0, flags=END, Outcome::Error{code: AUTH}` frame -- and, in particular, never a
+    // HELLO_ACK -- before the connection closes.
+    let frame = client.recv().await;
+    assert_eq!(frame.header.request_id, 0, "peercred deny must use rid=0");
+    assert_eq!(frame.header.flags, flags::END);
+    assert_eq!(frame.header.service, service::CORE);
+    assert_ne!(
+        frame.header.method,
+        method_core::HELLO_ACK,
+        "a peercred deny must never look like a HELLO_ACK"
+    );
+    match Outcome::decode(&frame.payload).expect("decode Outcome") {
+        Outcome::Error(ep) => assert_eq!(ep.code, errc::AUTH),
+        other => panic!("expected Outcome::Error(AUTH), got {other:?}"),
     }
+
+    // Nothing else follows. The client's own un-read HELLO bytes may still be sitting in the
+    // kernel's receive buffer when the server drops its side, so the close can surface as either
+    // a clean EOF or a reset (`ECONNRESET`) -- both mean "nothing else was ever sent" here, which
+    // is exactly what `recv_or_none` treats alike (see its own doc comment).
+    assert!(
+        client
+            .recv_or_none(std::time::Duration::from_millis(300))
+            .await
+            .is_none(),
+        "expected nothing after the one deny frame"
+    );
 }
 
 /// A unique temp directory under the OS temp dir, cleaned up best-effort by the OS.
