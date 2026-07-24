@@ -1,6 +1,13 @@
 # testkit/docker-compose.yml
 # Postgres 17 pinned by digest for a reproducible reference backend (SPEC §16).
 # To refresh the digest: docker pull postgres:17 && docker inspect --format '{{index .RepoDigests 0}}' postgres:17
+#
+# `ferrod` is a sidecar sharing a named UDS socket volume with (future) client containers —
+# the shared-socket-volume deployment model from SPEC §18. It does NOT connect to `pg` yet
+# (no DB wiring until S4); `depends_on: pg` just keeps the two coexisting in one `up`.
+volumes:
+  ferro_sock:
+
 services:
   pg:
     image: postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d
@@ -19,3 +26,14 @@ services:
       interval: 1s
       timeout: 3s
       retries: 30
+
+  ferrod:
+    build:
+      context: ..
+      dockerfile: testkit/Dockerfile.ferrod
+    environment:
+      FERRO_SOCK: /run/ferro/dev.sock
+    volumes:
+      - ferro_sock:/run/ferro
+    depends_on:
+      - pg
