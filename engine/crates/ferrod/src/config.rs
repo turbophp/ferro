@@ -25,6 +25,17 @@ const DEFAULT_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 /// fd-exhaustion vector, not just a wasted connection.
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default `idle_in_transaction` deadline (S6): the max time a transaction may sit pinned between
+/// statements before the engine cancels + rolls it back and reports `TxDeadline{Retryable}` (SPEC
+/// §7). Reset on every processed command; modest, not tuned (charter rule 5).
+const DEFAULT_IDLE_IN_TX: Duration = Duration::from_secs(10);
+
+/// Default absolute transaction-lifetime deadline (S6): the max total time a transaction may stay
+/// pinned, measured from BEGIN and never reset, before the engine cancels + rolls it back and
+/// reports `TxDeadline{Retryable}` (SPEC §7). A running statement is bounded by this (not the idle
+/// deadline, which only applies while the tx sits idle between statements).
+const DEFAULT_MAX_TX: Duration = Duration::from_secs(60);
+
 /// A configured connection pool: the logical `name` a client references in `ExecRequest.pool`,
 /// plus the upstream `dsn`.
 ///
@@ -67,6 +78,14 @@ pub struct Config {
     /// Deadline for the mandatory first frame (`core/HELLO`) to arrive before the connection is
     /// dropped silently (no reply — there was never a valid session to fail).
     pub handshake_timeout: Duration,
+    /// `idle_in_transaction` deadline (S6): the max a pinned transaction may sit idle between
+    /// statements before it is cancelled + rolled back and reported `TxDeadline{Retryable}`. Reset
+    /// on every processed command. Small values are injectable for deterministic actor tests.
+    pub idle_in_tx: Duration,
+    /// Absolute transaction-lifetime deadline (S6): the max total time a transaction may stay
+    /// pinned, from BEGIN, never reset, before it is cancelled + rolled back and reported
+    /// `TxDeadline{Retryable}`. Bounds a runaway statement. Injectable small for tests.
+    pub max_tx: Duration,
     /// Configured upstream connection pools (S5). Each `PoolSpec` names a pool and carries its DSN
     /// (§12 server-side secret — never sent to the client, never logged). Default: empty (the EXEC
     /// handler then answers every request with `Unsupported: unknown pool`). From `FERRO_POOLS`
@@ -85,6 +104,8 @@ impl Default for Config {
             max_inflight: DEFAULT_MAX_INFLIGHT,
             drain_deadline: DEFAULT_DRAIN_DEADLINE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            idle_in_tx: DEFAULT_IDLE_IN_TX,
+            max_tx: DEFAULT_MAX_TX,
             pools: Vec::new(),
         }
     }

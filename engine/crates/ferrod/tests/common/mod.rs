@@ -497,7 +497,12 @@ pub fn exec_server(url: String) -> TestServer {
     };
     let registry = PoolRegistry::build(&config);
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
-    let factory = sql::make_handler(registry, tx_registry.clone());
+    let factory = sql::make_handler(
+        registry,
+        tx_registry.clone(),
+        config.idle_in_tx,
+        config.max_tx,
+    );
     TestServer::spawn_with_factory(BootEpoch(1), tx_registry, factory)
 }
 

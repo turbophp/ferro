@@ -2,14 +2,16 @@
 //! (checkout/release, max_lifetime, pin stub) drive this backend instead of a live Postgres so
 //! the pool's mechanics are tested without a Docker dependency.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use crate::backend::{PoolBackend, QueryResult};
+use ferro_proto::consts::{branch, errc};
+
+use crate::backend::{Cancel, PoolBackend, QueryResult};
 use crate::error::PoolError;
 
 /// The fake's connection handle. Fields are `pub` so tests can inspect/mutate state directly
@@ -35,11 +37,38 @@ impl FakeConn {
     }
 }
 
-/// The fake backend's no-op cancel handle (S6). There is no server statement to cancel, so this is
-/// inert — its purpose is to exercise the `Checkout::cancel_handle` -> `B::CancelHandle` surface
-/// (that it is callable on `&self` and returns a `Send + 'static` handle) without a live Postgres.
+/// A gate a test arms to freeze `query()` mid-flight, plus the `cancelled` flag the matching
+/// [`FakeCancelHandle`] flips to release it. Modelling a real Postgres statement cancel WITHOUT a
+/// live server: while the gate is armed, `query()` parks on `notify`; a `FakeCancelHandle::cancel`
+/// sets `cancelled` and wakes the waiter, which then returns a `57014`-shaped `Sql` error — exactly
+/// the shape the pg `error_map` produces for a cancelled statement — so the tx actor's out-of-band
+/// cancel path (deadline → cancel → drain the query future to its erroring completion → rollback)
+/// is exercised deterministically.
+#[derive(Debug)]
+struct QueryGate {
+    notify: Notify,
+    cancelled: AtomicBool,
+}
+
+/// The fake backend's out-of-band cancel handle (S6). Carries a clone of the armed [`QueryGate`]
+/// (if any) so [`Cancel::cancel`] can release a `query()` frozen on that gate — standing in for a
+/// server-side statement cancel. When no gate is armed it is inert (its `gate` is `None`); either
+/// way it exercises the `Checkout::cancel_handle` -> `B::CancelHandle` surface (grabbed on `&self`,
+/// `Send + 'static`, fired fire-once by value) without a live Postgres.
 #[derive(Debug, Clone)]
-pub struct FakeCancelHandle;
+pub struct FakeCancelHandle {
+    gate: Option<Arc<QueryGate>>,
+}
+
+#[async_trait]
+impl Cancel for FakeCancelHandle {
+    async fn cancel(self) {
+        if let Some(gate) = self.gate {
+            gate.cancelled.store(true, Ordering::SeqCst);
+            gate.notify.notify_waiters();
+        }
+    }
+}
 
 /// A `FakeBackend` connects instantly and never touches the network. `next_id` is atomic so
 /// `connect()` only needs `&self` (matching the trait), matching how a real pool shares one
@@ -67,6 +96,14 @@ pub struct FakeBackend {
     /// clears it (S6). Lets a test freeze the checkout-time recycle ROLLBACK to prove the
     /// bounded-recycle timeout EVICTS the poisoned conn rather than hanging a future checkout.
     simple_query_gate: Mutex<Option<Arc<Notify>>>,
+    /// When `Some`, every `query()` call parks on this gate until a matching `FakeCancelHandle`
+    /// fires (S6). Lets the tx-actor deadline test freeze a tx-scoped user statement so the actor's
+    /// max/idle timer fires, then prove the out-of-band cancel unblocks the query into its erroring
+    /// (`57014`) completion — the pin released, the tx tombstoned, nothing re-run.
+    query_gate: Mutex<Option<Arc<QueryGate>>>,
+    /// Number of `query()` calls currently parked on `query_gate`. A test polls this until `> 0` to
+    /// prove the statement is actually in flight before relying on a timer to fire.
+    queries_waiting: AtomicU64,
 }
 
 impl FakeBackend {
@@ -78,6 +115,8 @@ impl FakeBackend {
             pings_waiting: AtomicU64::new(0),
             canned_query: Mutex::new(QueryResult::default()),
             simple_query_gate: Mutex::new(None),
+            query_gate: Mutex::new(None),
+            queries_waiting: AtomicU64::new(0),
         }
     }
 
@@ -133,6 +172,21 @@ impl FakeBackend {
     pub fn total_connected(&self) -> u64 {
         self.next_id.load(Ordering::SeqCst)
     }
+
+    /// Arms every subsequent `query()` call to park until a `FakeCancelHandle` for this backend is
+    /// fired (S6). Used by the tx-actor deadline test to freeze a tx-scoped statement so a deadline
+    /// timer fires while it is in flight, then prove the out-of-band cancel path drains it.
+    pub fn block_query(&self) {
+        *self.query_gate.lock().unwrap() = Some(Arc::new(QueryGate {
+            notify: Notify::new(),
+            cancelled: AtomicBool::new(false),
+        }));
+    }
+
+    /// Number of `query()` calls currently parked on the gate armed by `block_query()`.
+    pub fn queries_waiting(&self) -> u64 {
+        self.queries_waiting.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
@@ -141,7 +195,11 @@ impl PoolBackend for FakeBackend {
     type CancelHandle = FakeCancelHandle;
 
     fn cancel_handle(&self, _conn: &Self::Conn) -> Self::CancelHandle {
-        FakeCancelHandle
+        // Capture a clone of the armed query gate (if any) so a later `cancel()` can release a
+        // `query()` frozen on it — the fake stand-in for a server-side statement cancel.
+        FakeCancelHandle {
+            gate: self.query_gate.lock().unwrap().clone(),
+        }
     }
 
     async fn connect(&self) -> Result<Self::Conn, PoolError> {
@@ -216,6 +274,25 @@ impl PoolBackend for FakeBackend {
         // reaches here, so a test can assert `recorded` to prove `Checkout::query`'s guard fired
         // (or didn't) before delegation.
         conn.recorded.push(sql.to_string());
+
+        // Test-only gate (see `block_query`): if armed, park until a `FakeCancelHandle` for this
+        // backend fires. A fired cancel returns the `57014`-shaped `Sql` error the pg `error_map`
+        // produces for a cancelled statement, so the tx actor drains the query future to an
+        // erroring completion exactly as it would against a live Postgres.
+        let gate = self.query_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            self.queries_waiting.fetch_add(1, Ordering::SeqCst);
+            gate.notify.notified().await;
+            self.queries_waiting.fetch_sub(1, Ordering::SeqCst);
+            if gate.cancelled.load(Ordering::SeqCst) {
+                return Err(PoolError::Sql {
+                    code: errc::CANCELLED,
+                    branch: branch::NON_RETRYABLE,
+                    sqlstate: Some("57014".to_string()),
+                    message: "canceling statement due to user request (fake)".to_string(),
+                });
+            }
+        }
         Ok(self.canned_query.lock().unwrap().clone())
     }
 }

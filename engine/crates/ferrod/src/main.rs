@@ -37,7 +37,12 @@ async fn main() -> anyhow::Result<()> {
     // One process-global transaction registry, shared by every connection `serve` spawns (S6
     // seam). Its `abort_session` teardown wait mirrors the graceful-drain deadline.
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
-    let factory = sql::make_handler(registry, tx_registry.clone());
+    let factory = sql::make_handler(
+        registry,
+        tx_registry.clone(),
+        config.idle_in_tx,
+        config.max_tx,
+    );
 
     // Drawn once per running instance and handed to every connection `serve` spawns (SPEC
     // §19.1: every connection served by this instance observes the identical `boot_epoch`).

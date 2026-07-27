@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use ferro_pool::backend::PoolBackend;
+use ferro_pool::backend::{Cancel, PoolBackend};
 use ferro_pool::error::PoolError;
 
 /// A pooled Postgres connection.
@@ -46,10 +46,29 @@ impl PgBackend {
     }
 }
 
+/// A local newtype around `tokio_postgres::CancelToken` so this crate can implement ferro-pool's
+/// [`Cancel`] trait for it (the orphan rule forbids `impl Cancel for tokio_postgres::CancelToken`
+/// directly — both are foreign to this crate).
+pub struct PgCancel(pub tokio_postgres::CancelToken);
+
+/// Fire the out-of-band statement cancel over a SIDE connection (S6). `CancelToken::cancel_query`
+/// opens its own short-lived connection using the captured backend key data, so it can run while
+/// the pinned connection's own query future still holds `&mut Client`. Best-effort: a failure
+/// (server already gone, or the statement finished first) is logged and swallowed — the actor tears
+/// the transaction down regardless and NEVER re-runs the statement (charter rule 3).
+#[async_trait]
+impl Cancel for PgCancel {
+    async fn cancel(self) {
+        if let Err(e) = self.0.cancel_query(tokio_postgres::NoTls).await {
+            tracing::debug!(error = %e, "ferro-backend-pg: out-of-band cancel_query failed (best-effort)");
+        }
+    }
+}
+
 #[async_trait]
 impl PoolBackend for PgBackend {
     type Conn = PgConn;
-    type CancelHandle = tokio_postgres::CancelToken;
+    type CancelHandle = PgCancel;
 
     /// The out-of-band cancel handle (S6): `tokio_postgres::Client::cancel_token` captures this
     /// connection's backend key data into a `Send + 'static` `CancelToken`. Cancelling it runs
@@ -57,7 +76,7 @@ impl PoolBackend for PgBackend {
     /// query future is still live (which holds `&mut Client`) — the engine grabs it BEFORE starting
     /// an interruptible statement.
     fn cancel_handle(&self, conn: &Self::Conn) -> Self::CancelHandle {
-        conn.client.cancel_token()
+        PgCancel(conn.client.cancel_token())
     }
 
     async fn connect(&self) -> Result<Self::Conn, PoolError> {

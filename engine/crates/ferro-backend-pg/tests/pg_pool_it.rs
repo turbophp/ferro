@@ -434,7 +434,8 @@ async fn pg_cancel_handle_cancels_in_flight_query() {
     let cancel = co.cancel_handle();
     let canceller = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = cancel.cancel_query(tokio_postgres::NoTls).await;
+        // Fire via the `Cancel` trait — exactly what the TX actor does with `B::CancelHandle`.
+        ferro_pool::backend::Cancel::cancel(cancel).await;
     });
 
     // A ~2s statement via the GUARDED query() path (the int8 projection keeps the result column an

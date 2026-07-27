@@ -58,7 +58,12 @@ async fn main() -> Result<(), BoxErr> {
     };
     let registry = PoolRegistry::build(&config);
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
-    let handler = sql::make_handler(registry, tx_registry.clone());
+    let handler = sql::make_handler(
+        registry,
+        tx_registry.clone(),
+        config.idle_in_tx,
+        config.max_tx,
+    );
     let listener = ferrod::listener::bind_uds(&config)?;
     let epoch = RandomEpoch.epoch();
     let drain = Drain::new();

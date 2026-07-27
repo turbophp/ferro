@@ -28,22 +28,32 @@
 //! informs the client's own policy.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::FutureExt;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
 use ferro_pool::backend::QueryResult;
 use ferro_pool::error::PoolError;
-use ferro_proto::consts::{MAX_FRAME_PAYLOAD, errc, method_sql, service};
+use ferro_proto::consts::{MAX_FRAME_PAYLOAD, errc, method_sql, method_tx, service};
 use ferro_proto::messages::ErrorPayload;
 use ferro_proto::messages::sql::{ExecOk, ExecRequest, Stats};
+use ferro_proto::messages::tx::{BeginRequest, BeginResponse, SavepointRequest, TxControl};
 
 use crate::pools::PoolRegistry;
 use crate::session::codec::InFrame;
 use crate::session::responder::Responder;
-use crate::session::{HandlerFactory, HandlerFn};
-use crate::tx::TxRegistry;
+use crate::session::{HandlerFactory, HandlerFn, SessionId};
+use crate::tx::{
+    CtlReply, ExecReply, TxCommand, TxHandle, TxLookupErr, TxRegistry, actor, next_tx_id,
+};
+
+/// Bound on a per-`tx_id` actor's command mpsc. Commands are processed one at a time; a modest
+/// buffer absorbs a client that pipelines a few tx commands without waiting for each terminal, and
+/// otherwise applies backpressure on the (spawned, per-request) forwarding handler tasks.
+const TX_CMD_CHANNEL_CAP: usize = 16;
 
 /// `ExecRequest.fetch` modes. 0 = rows, 1 = none (affected only), 2 = stream (reserved — `Unsupported`
 /// in M0 per D-S5-1). Kept as named constants (not magic numbers) at the handler boundary.
@@ -59,39 +69,105 @@ const FETCH_STREAM: u8 = 2;
 /// AND every other in-flight terminal). Locked against the codec by `outcome_ok_overhead_is_two`.
 const OUTCOME_OK_OVERHEAD: usize = 2;
 
-/// Build the real EXEC `HandlerFactory`, capturing the pool registry and the shared
-/// `Arc<TxRegistry>` (S6 seam). The factory mints one `HandlerFn` per connection given its
-/// `SessionId`. Any request-bearing frame that is NOT `service=SQL, method=EXEC` (a TX/STREAM
-/// method, or an unrecognized SQL method) still declares `Unsupported`.
+/// Build the real SQL/TX `HandlerFactory`, capturing the pool registry, the shared
+/// `Arc<TxRegistry>` (S6 seam), and the transaction deadlines. The factory mints one `HandlerFn`
+/// per connection given its `SessionId` — which is load-bearing: it is the OWNER key every
+/// tx-scoped request is checked against (a tx opened by one session is invisible to any other).
 ///
-/// S6-Task3: `session_id` + `tx_registry` become load-bearing here — a tx-scoped `EXEC`
-/// (`tx_id.is_some()`) will look the actor up by `(tx_id, session_id)` and forward the statement,
-/// while the autocommit path (`tx_id == None`) stays byte-for-byte identical to S5. For now the
-/// factory ignores the session id and behaves exactly as S5 did.
-pub fn make_handler(registry: Arc<PoolRegistry>, tx_registry: Arc<TxRegistry>) -> HandlerFactory {
-    Arc::new(move |_session_id| -> HandlerFn {
+/// Routing (S6): `service=SQL, method=EXEC` with `tx_id == None` is the S5 autocommit path,
+/// byte-for-byte unchanged; with `tx_id.is_some()` it is forwarded to that tx's actor. `service=TX`
+/// BEGIN opens a tx (spawns the actor); COMMIT/ROLLBACK/SAVEPOINT/RELEASE/ROLLBACK_TO are forwarded
+/// to the owning actor. Anything else declares `Unsupported`.
+pub fn make_handler(
+    registry: Arc<PoolRegistry>,
+    tx_registry: Arc<TxRegistry>,
+    idle_in_tx: Duration,
+    max_tx: Duration,
+) -> HandlerFactory {
+    Arc::new(move |session_id| -> HandlerFn {
         let registry = registry.clone();
-        // Captured now so the S6-Task3 tx-scoped routing has it in hand; unused on the autocommit
-        // path (the only path this task builds).
-        let _tx_registry = tx_registry.clone();
+        let tx_registry = tx_registry.clone();
         Arc::new(move |frame, responder, _cancel| {
             let registry = registry.clone();
+            let tx_registry = tx_registry.clone();
             async move {
-                handle(frame, responder, &registry).await;
+                handle(
+                    frame,
+                    responder,
+                    &registry,
+                    &tx_registry,
+                    session_id,
+                    idle_in_tx,
+                    max_tx,
+                )
+                .await;
             }
             .boxed()
         })
     })
 }
 
-async fn handle(frame: InFrame, responder: Responder, registry: &PoolRegistry) {
-    // Only service=SQL, method=EXEC is implemented in M0. Anything else routed here (TX/STREAM, or
-    // an unrecognized SQL method) is a clean per-request Unsupported — one END, session survives.
-    if frame.header.service != service::SQL || frame.header.method != method_sql::EXEC {
-        responder.end_error(unsupported("service/method not yet implemented"));
-        return;
+async fn handle(
+    frame: InFrame,
+    responder: Responder,
+    registry: &PoolRegistry,
+    tx_registry: &TxRegistry,
+    session_id: SessionId,
+    idle_in_tx: Duration,
+    max_tx: Duration,
+) {
+    match (frame.header.service, frame.header.method) {
+        (service::SQL, method_sql::EXEC) => {
+            handle_exec(frame, responder, registry, tx_registry, session_id).await
+        }
+        (service::TX, method_tx::BEGIN) => {
+            handle_begin(
+                frame,
+                responder,
+                registry,
+                tx_registry,
+                session_id,
+                idle_in_tx,
+                max_tx,
+            )
+            .await
+        }
+        (service::TX, method_tx::COMMIT) => {
+            handle_tx_control(frame, responder, tx_registry, session_id, CtlKind::Commit).await
+        }
+        (service::TX, method_tx::ROLLBACK) => {
+            handle_tx_control(frame, responder, tx_registry, session_id, CtlKind::Rollback).await
+        }
+        (service::TX, method_tx::SAVEPOINT) => {
+            handle_savepoint(frame, responder, tx_registry, session_id, SpKind::Savepoint).await
+        }
+        (service::TX, method_tx::RELEASE) => {
+            handle_savepoint(frame, responder, tx_registry, session_id, SpKind::Release).await
+        }
+        (service::TX, method_tx::ROLLBACK_TO) => {
+            handle_savepoint(
+                frame,
+                responder,
+                tx_registry,
+                session_id,
+                SpKind::RollbackTo,
+            )
+            .await
+        }
+        // Any other routed frame (an unrecognized SQL/TX method, or STREAM) → one END, session lives.
+        _ => responder.end_error(unsupported("service/method not yet implemented")),
     }
+}
 
+/// `service=SQL, method=EXEC`. Validates the request shape (shared by both paths), then branches on
+/// `tx_id`: `None` → the S5 autocommit path (unchanged); `Some` → forward to the owning tx actor.
+async fn handle_exec(
+    frame: InFrame,
+    responder: Responder,
+    registry: &PoolRegistry,
+    tx_registry: &TxRegistry,
+    session_id: SessionId,
+) {
     // (1) decode the per-request payload.
     let req = match ExecRequest::decode(&frame.payload) {
         Ok(r) => r,
@@ -130,47 +206,327 @@ async fn handle(frame: InFrame, responder: Responder, registry: &PoolRegistry) {
             return;
         }
     };
+
+    match req.tx_id {
+        // ---- tx-scoped EXEC: forward to the owning actor (the conn is already pinned) ----
+        Some(tx_id) => {
+            // `req.pool` is ignored here — the transaction is already pinned to its pool's conn.
+            let handle = match resolve_active(tx_registry, tx_id, session_id) {
+                Ok(h) => h,
+                Err(ep) => {
+                    responder.end_error(ep);
+                    return;
+                }
+            };
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let cmd = TxCommand::Exec {
+                sql: sql.to_string(),
+                params: req.params.clone(),
+                reply: reply_tx,
+            };
+            if handle.cmd_tx.send(cmd).await.is_err() {
+                responder.end_error(actor_gone_terminal(tx_registry, tx_id, session_id));
+                return;
+            }
+            match reply_rx.await {
+                Ok(ExecReply::Completed { result, exec_us }) => match result {
+                    // queue_us is 0: a pinned conn is never queued for.
+                    Ok(qr) => match build_terminal_body(qr, req.fetch, 0, exec_us) {
+                        Ok(body) => responder.end_ok(Bytes::from(body)),
+                        Err(ep) => responder.end_error(ep),
+                    },
+                    // The statement WAS transmitted on the pinned conn → §19.3 still applies
+                    // (readonly gates Indeterminate), exactly as on the autocommit path (sent=true).
+                    Err(e) => responder.end_error(pool_error_to_payload(e, req.readonly, true)),
+                },
+                // A deadline cancelled the statement mid-flight → the ONE TxDeadline terminal. The
+                // statement is never re-run (charter rule 3).
+                Ok(ExecReply::Deadline) => responder.end_error(tx_deadline(
+                    "transaction deadline exceeded mid-statement; the statement was cancelled and \
+                     the transaction rolled back (retryable — the engine never re-runs)",
+                )),
+                Err(_recv) => {
+                    responder.end_error(actor_gone_terminal(tx_registry, tx_id, session_id))
+                }
+            }
+        }
+
+        // ---- autocommit EXEC: the S5 path, byte-for-byte unchanged ----
+        None => {
+            let Some(pool) = registry.get(&req.pool) else {
+                responder.end_error(unsupported(format!("unknown pool {:?}", req.pool)));
+                return;
+            };
+
+            // (3) checkout → queue_us (the pool-wait, including any recycle cleanup on the popped conn).
+            let mut co = match pool.checkout().await {
+                Ok(co) => co,
+                Err(e) => {
+                    // A checkout failure means NO connection was established, so the user statement
+                    // was NEVER transmitted → known "did-not-apply", never Indeterminate (sent=false).
+                    responder.end_error(pool_error_to_payload(e, req.readonly, false));
+                    return;
+                }
+            };
+            let queue_us = co.stats().queue_us;
+
+            // (4) run the GUARDED row-returning entry. exec_us times ONLY the DB query — the conn is
+            // released (below) before framing, so a slow client cannot inflate it (D-S5-1). NEVER
+            // conn_mut()/the raw client here (that bypasses the tx-control guard → cross-tenant leak).
+            let exec_start = Instant::now();
+            let result = co.query(sql, &req.params).await;
+            let exec_us = exec_start.elapsed().as_micros() as u64;
+
+            // Release the pooled connection BEFORE framing/sending (RAII): held only for the query.
+            drop(co);
+
+            let result = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    // The statement WAS transmitted (checkout succeeded, `co.query` ran), so a
+                    // connection loss here has a genuinely UNKNOWN fate → §19.3 eligible (sent=true).
+                    responder.end_error(pool_error_to_payload(e, req.readonly, true));
+                    return;
+                }
+            };
+
+            // (5)+(6) shape, size-check the ENCODED terminal payload, declare the single terminal.
+            match build_terminal_body(result, req.fetch, queue_us, exec_us) {
+                Ok(body) => responder.end_ok(Bytes::from(body)),
+                Err(ep) => responder.end_error(ep),
+            }
+        }
+    }
+}
+
+/// `service=TX, method=BEGIN`: resolve the pool, compose the engine `BEGIN`, checkout + open the tx
+/// on the pinned conn, allocate a `tx_id`, spawn the actor (MOVING the `Checkout` in), register, and
+/// reply the terminal `BeginResponse{tx_id}`. Any failure before the spawn → a mapped error, one
+/// END, nothing registered, the conn released.
+#[allow(clippy::too_many_arguments)]
+async fn handle_begin(
+    frame: InFrame,
+    responder: Responder,
+    registry: &PoolRegistry,
+    tx_registry: &TxRegistry,
+    session_id: SessionId,
+    idle_in_tx: Duration,
+    max_tx: Duration,
+) {
+    let req = match BeginRequest::decode(&frame.payload) {
+        Ok(r) => r,
+        Err(e) => {
+            responder.end_error(protocol(format!("malformed BeginRequest: {e}")));
+            return;
+        }
+    };
     let Some(pool) = registry.get(&req.pool) else {
         responder.end_error(unsupported(format!("unknown pool {:?}", req.pool)));
         return;
     };
+    let begin_sql = match actor::compose_begin_sql(req.isolation, req.readonly) {
+        Ok(s) => s,
+        Err(msg) => {
+            responder.end_error(protocol(msg));
+            return;
+        }
+    };
 
-    // (3) checkout → queue_us (the pool-wait, including any recycle cleanup on the popped conn).
     let mut co = match pool.checkout().await {
         Ok(co) => co,
         Err(e) => {
-            // A checkout failure means NO connection was established, so the user statement was
-            // NEVER transmitted → fate is a KNOWN "did-not-apply", never Indeterminate (`sent=false`).
+            // No conn established: BEGIN never ran, no user statement sent → known-fate (sent=false).
             responder.end_error(pool_error_to_payload(e, req.readonly, false));
             return;
         }
     };
-    let queue_us = co.stats().queue_us;
+    let tx_id = next_tx_id();
+    if let Err(e) = co
+        .begin_tx_with(ferro_pool::pin::TxId(tx_id), &begin_sql)
+        .await
+    {
+        // BEGIN (engine tx-control) failed: nothing registered, `co` drops → conn released, one END.
+        // BEGIN is not a user write and no user statement was sent → known-fate (sent=false).
+        responder.end_error(pool_error_to_payload(e, req.readonly, false));
+        return;
+    }
 
-    // (4) run the GUARDED row-returning entry. exec_us times ONLY the DB query — the conn is
-    // released (below) before framing, so a slow client cannot inflate it (D-S5-1). NEVER
-    // conn_mut()/the raw client here (that bypasses the tx-control guard → cross-tenant leak).
-    let exec_start = Instant::now();
-    let result = co.query(sql, &req.params).await;
-    let exec_us = exec_start.elapsed().as_micros() as u64;
+    // Spawn the actor MOVING the pinned `Checkout` in, then register its control surface.
+    let (cmd_tx, cmd_rx) = mpsc::channel(TX_CMD_CHANNEL_CAP);
+    let (done_tx, done_rx) = watch::channel(false);
+    let abort = CancellationToken::new();
+    tx_registry.register(
+        tx_id,
+        TxHandle {
+            owner: session_id,
+            cmd_tx,
+            abort: abort.clone(),
+            done: done_rx,
+        },
+    );
+    tokio::spawn(actor::run(
+        tx_id,
+        co,
+        cmd_rx,
+        abort,
+        done_tx,
+        tx_registry.clone(),
+        idle_in_tx,
+        max_tx,
+    ));
 
-    // Release the pooled connection BEFORE framing/sending (RAII): held only for the query.
-    drop(co);
+    responder.end_ok(Bytes::from(BeginResponse { tx_id }.encode()));
+}
 
-    let result = match result {
+/// COMMIT / ROLLBACK.
+enum CtlKind {
+    Commit,
+    Rollback,
+}
+
+/// SAVEPOINT / RELEASE / ROLLBACK_TO.
+enum SpKind {
+    Savepoint,
+    Release,
+    RollbackTo,
+}
+
+/// `service=TX` COMMIT/ROLLBACK: look up the owning actor, forward the control command, await the
+/// reply, and declare the mapped terminal.
+async fn handle_tx_control(
+    frame: InFrame,
+    responder: Responder,
+    tx_registry: &TxRegistry,
+    session_id: SessionId,
+    kind: CtlKind,
+) {
+    let req = match TxControl::decode(&frame.payload) {
         Ok(r) => r,
         Err(e) => {
-            // The statement WAS transmitted (checkout succeeded, `co.query` ran), so a connection
-            // loss here has a genuinely UNKNOWN fate → eligible for §19.3 Indeterminate (`sent=true`).
-            responder.end_error(pool_error_to_payload(e, req.readonly, true));
+            responder.end_error(protocol(format!("malformed TxControl: {e}")));
             return;
         }
     };
+    let handle = match resolve_active(tx_registry, req.tx_id, session_id) {
+        Ok(h) => h,
+        Err(ep) => {
+            responder.end_error(ep);
+            return;
+        }
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    // A COMMIT loss is a potential lost write (§19.3 Indeterminate); a ROLLBACK loss is not (the tx
+    // is gone either way) — so map COMMIT errors as a write (readonly=false) and ROLLBACK as not.
+    let (cmd, readonly) = match kind {
+        CtlKind::Commit => (TxCommand::Commit { reply: reply_tx }, false),
+        CtlKind::Rollback => (TxCommand::Rollback { reply: reply_tx }, true),
+    };
+    if handle.cmd_tx.send(cmd).await.is_err() {
+        responder.end_error(actor_gone_terminal(tx_registry, req.tx_id, session_id));
+        return;
+    }
+    match reply_rx.await {
+        Ok(reply) => declare_ctl(responder, reply, readonly),
+        Err(_recv) => responder.end_error(actor_gone_terminal(tx_registry, req.tx_id, session_id)),
+    }
+}
 
-    // (5)+(6) shape, size-check the ENCODED terminal payload, declare the single terminal.
-    match build_terminal_body(result, req.fetch, queue_us, exec_us) {
-        Ok(body) => responder.end_ok(Bytes::from(body)),
-        Err(ep) => responder.end_error(ep),
+/// `service=TX` SAVEPOINT/RELEASE/ROLLBACK_TO: look up the owning actor, forward the (engine-named)
+/// savepoint command, await the reply, and declare the mapped terminal. A savepoint control op is
+/// never a lost write, so its error mapping uses `readonly=true` (never Indeterminate).
+async fn handle_savepoint(
+    frame: InFrame,
+    responder: Responder,
+    tx_registry: &TxRegistry,
+    session_id: SessionId,
+    kind: SpKind,
+) {
+    let req = match SavepointRequest::decode(&frame.payload) {
+        Ok(r) => r,
+        Err(e) => {
+            responder.end_error(protocol(format!("malformed SavepointRequest: {e}")));
+            return;
+        }
+    };
+    let handle = match resolve_active(tx_registry, req.tx_id, session_id) {
+        Ok(h) => h,
+        Err(ep) => {
+            responder.end_error(ep);
+            return;
+        }
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let cmd = match kind {
+        SpKind::Savepoint => TxCommand::Savepoint {
+            name: req.name,
+            reply: reply_tx,
+        },
+        SpKind::Release => TxCommand::Release {
+            name: req.name,
+            reply: reply_tx,
+        },
+        SpKind::RollbackTo => TxCommand::RollbackTo {
+            name: req.name,
+            reply: reply_tx,
+        },
+    };
+    if handle.cmd_tx.send(cmd).await.is_err() {
+        responder.end_error(actor_gone_terminal(tx_registry, req.tx_id, session_id));
+        return;
+    }
+    match reply_rx.await {
+        Ok(reply) => declare_ctl(responder, reply, true),
+        Err(_recv) => responder.end_error(actor_gone_terminal(tx_registry, req.tx_id, session_id)),
+    }
+}
+
+/// Resolve a tx-scoped request to its live `TxHandle`, or the terminal `ErrorPayload` to declare:
+/// `NotFoundOrForbidden` (unknown OR cross-session) → `Protocol`; the owner's own `Tombstoned` tx →
+/// `TxDeadline{Retryable}`. A client can never tell a cross-session id from an unknown one.
+fn resolve_active(
+    tx_registry: &TxRegistry,
+    tx_id: u64,
+    session_id: SessionId,
+) -> Result<TxHandle, ErrorPayload> {
+    match tx_registry.lookup(tx_id, session_id) {
+        Ok(h) => Ok(h),
+        Err(TxLookupErr::NotFoundOrForbidden) => Err(protocol(
+            "unknown or forbidden tx_id (committed, rolled back, aborted, or another session's)",
+        )),
+        Err(TxLookupErr::Tombstoned) => Err(tx_deadline(
+            "transaction deadline exceeded; the pinned connection was rolled back and released \
+             (retryable — the engine never re-runs)",
+        )),
+    }
+}
+
+/// Declare a tx-control reply's terminal: `Ok` → an empty `Outcome::Ok` ack; a backend `Err` →
+/// mapped via `pool_error_to_payload` (the COMMIT-loss `WriteUnconfirmed` §19.3 case rides in on
+/// `readonly=false`); an `UnknownSavepoint` → `Protocol` (client misuse, never touched the backend).
+fn declare_ctl(responder: Responder, reply: CtlReply, readonly: bool) {
+    match reply {
+        CtlReply::Ok => responder.end_ok(Bytes::new()),
+        CtlReply::Err(e) => responder.end_error(pool_error_to_payload(e, readonly, true)),
+        CtlReply::UnknownSavepoint => {
+            responder.end_error(protocol("no such savepoint in this transaction"))
+        }
+    }
+}
+
+/// The prompt terminal to declare when the actor is gone mid-teardown (an mpsc send-Err or a
+/// oneshot recv-Err): a fresh lookup decides — a now-tombstoned id → `TxDeadline`, otherwise
+/// `Protocol`. Never a hang; the supervisor stays the sole terminal-sender so exactly-one-END holds.
+fn actor_gone_terminal(
+    tx_registry: &TxRegistry,
+    tx_id: u64,
+    session_id: SessionId,
+) -> ErrorPayload {
+    match tx_registry.lookup(tx_id, session_id) {
+        Err(TxLookupErr::Tombstoned) => tx_deadline(
+            "transaction deadline exceeded; the pinned connection was rolled back and released \
+             (retryable — the engine never re-runs)",
+        ),
+        _ => protocol("transaction is no longer active"),
     }
 }
 
@@ -352,6 +708,21 @@ fn protocol(message: impl Into<String>) -> ErrorPayload {
     }
 }
 
+/// A `TxDeadline{Retryable}` terminal (0x1003, §7): the tx was cancelled + rolled back by a deadline
+/// (idle or max) or the owner is retrying a timed-out tx. Retryable is CLIENT policy — the engine
+/// never re-runs the statement (charter rule 3).
+fn tx_deadline(message: impl Into<String>) -> ErrorPayload {
+    ErrorPayload {
+        code: errc::TX_DEADLINE,
+        branch: errc::TX_DEADLINE_BRANCH,
+        sqlstate: None,
+        errno: None,
+        message: message.into(),
+        detail: None,
+        retry_after_ms: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +894,121 @@ mod tests {
         assert_eq!(ok.affected, 2);
         assert_eq!(ok.cols.len(), 1, "cols are kept even for fetch=none");
         assert_eq!(ok.stats.rows, 0);
+    }
+
+    // ---- S6 tx-routing helpers -----------------------------------------------------------------
+
+    use crate::session::responder::Terminal;
+    use crate::tx::TxRegistry;
+
+    fn dummy_handle(owner: SessionId) -> TxHandle {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<TxCommand>(1);
+        let (_done_tx, done_rx) = watch::channel(false);
+        TxHandle {
+            owner,
+            cmd_tx,
+            abort: CancellationToken::new(),
+            done: done_rx,
+        }
+    }
+
+    /// A `TxDeadline` terminal is `0x1003 / Retryable` — the retry is client policy; the engine
+    /// never re-runs (charter rule 3).
+    #[test]
+    fn tx_deadline_is_retryable_1003() {
+        let ep = tx_deadline("x");
+        assert_eq!(ep.code, errc::TX_DEADLINE);
+        assert_eq!(ep.branch, branch::RETRYABLE);
+    }
+
+    /// `resolve_active`: unknown/cross-session → `Protocol` (indistinguishable); the owner's own
+    /// tombstone → `TxDeadline{Retryable}`; a live entry → the handle.
+    #[test]
+    fn resolve_active_maps_lookup_states() {
+        let reg = TxRegistry::new(Duration::from_secs(5));
+        let owner = reg.next_session_id();
+        let other = reg.next_session_id();
+
+        // Unknown id → Protocol.
+        assert_eq!(
+            resolve_active(&reg, 1, owner).unwrap_err().code,
+            errc::PROTOCOL
+        );
+
+        // Live entry → the handle for the owner; Protocol (NOT leaked) for anyone else.
+        reg.register(1, dummy_handle(owner));
+        assert!(resolve_active(&reg, 1, owner).is_ok());
+        assert_eq!(
+            resolve_active(&reg, 1, other).unwrap_err().code,
+            errc::PROTOCOL,
+            "a cross-session lookup is Protocol, indistinguishable from unknown"
+        );
+
+        // The owner's tombstone → TxDeadline{Retryable}.
+        reg.tombstone(1);
+        let ep = resolve_active(&reg, 1, owner).unwrap_err();
+        assert_eq!(ep.code, errc::TX_DEADLINE);
+        assert_eq!(ep.branch, branch::RETRYABLE);
+    }
+
+    /// `actor_gone_terminal` (send-Err / recv-Err mid-teardown): a now-tombstoned id → `TxDeadline`,
+    /// otherwise `Protocol`. Never a hang — a PROMPT declared terminal so exactly-one-END holds.
+    #[test]
+    fn actor_gone_terminal_prompt_maps_tombstone_else_protocol() {
+        let reg = TxRegistry::new(Duration::from_secs(5));
+        let owner = reg.next_session_id();
+
+        // Actor gone + id already deregistered → Protocol.
+        assert_eq!(actor_gone_terminal(&reg, 7, owner).code, errc::PROTOCOL);
+
+        // Actor gone + id tombstoned (deadline raced the send) → TxDeadline.
+        reg.register(7, dummy_handle(owner));
+        reg.tombstone(7);
+        let ep = actor_gone_terminal(&reg, 7, owner);
+        assert_eq!(ep.code, errc::TX_DEADLINE);
+        assert_eq!(ep.branch, branch::RETRYABLE);
+    }
+
+    /// `declare_ctl` reply → terminal mapping, including the COMMIT-loss §19.3 case.
+    #[test]
+    fn declare_ctl_maps_replies_including_commit_loss_indeterminate() {
+        // Ok → an empty Outcome::Ok ack.
+        let (r, cell) = Responder::new_pair();
+        declare_ctl(r, CtlReply::Ok, true);
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Ok(b)) => assert!(b.is_empty(), "a control-op ack is an empty Ok body"),
+            other => panic!("expected empty Ok, got {other:?}"),
+        }
+
+        // UnknownSavepoint → Protocol.
+        let (r, cell) = Responder::new_pair();
+        declare_ctl(r, CtlReply::UnknownSavepoint, true);
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Error(ep)) => assert_eq!(ep.code, errc::PROTOCOL),
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+
+        // A COMMIT (readonly=false) that loses the connection → §19.3 WriteUnconfirmed{Indeterminate}.
+        let (r, cell) = Responder::new_pair();
+        declare_ctl(r, CtlReply::Err(PoolError::ConnectionLost), false);
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Error(ep)) => {
+                assert_eq!(ep.code, errc::WRITE_UNCONFIRMED);
+                assert_eq!(ep.branch, branch::INDETERMINATE);
+            }
+            other => panic!("expected WriteUnconfirmed, got {other:?}"),
+        }
+
+        // A ROLLBACK (readonly=true) that loses the connection → known-fate ConnectionLost{Retryable},
+        // NOT Indeterminate (a failed rollback is not a lost write).
+        let (r, cell) = Responder::new_pair();
+        declare_ctl(r, CtlReply::Err(PoolError::ConnectionLost), true);
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Error(ep)) => {
+                assert_eq!(ep.code, errc::CONNECTION_LOST);
+                assert_eq!(ep.branch, branch::RETRYABLE);
+            }
+            other => panic!("expected ConnectionLost, got {other:?}"),
+        }
     }
 }
