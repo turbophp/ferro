@@ -55,9 +55,12 @@ abstract class LiveTestCase extends TestCase
 
         // sockaddr_un.sun_path is 108 bytes — a long path (e.g. a deep session scratch dir)
         // overflows it and UnixListener::bind fails at ferrod startup. Keep it under sys temp.
-        $this->socketPath = sys_get_temp_dir() . '/ferro-test-' . getmypid() . '.sock';
+        // A per-CLASS token (short hash of the concrete test class) is folded in alongside the pid
+        // so two live test classes in one run never collide on the same socket/log (Task-2 review).
+        $token = getmypid() . '-' . substr(hash('crc32b', static::class), 0, 8);
+        $this->socketPath = sys_get_temp_dir() . '/ferro-test-' . $token . '.sock';
         $this->assertLessThan(104, strlen($this->socketPath), 'socket path must fit sun_path (108B)');
-        $this->stderrPath = sys_get_temp_dir() . '/ferro-test-' . getmypid() . '.log';
+        $this->stderrPath = sys_get_temp_dir() . '/ferro-test-' . $token . '.log';
 
         if (file_exists($this->socketPath)) { @unlink($this->socketPath); }
 
