@@ -17,98 +17,13 @@
 
 mod common;
 
-use common::{TestClient, TestServer};
-use ferro_proto::consts::{branch, errc, flags, method_core, method_sql, service, tag};
-use ferro_proto::messages::sql::{ExecOk, ExecRequest};
-use ferro_proto::messages::{ErrorPayload, Outcome};
+// The shared EXEC harness (`pg_url`/`exec_server`/`req`/`exec_ok`/`exec_err`/`assert_session_alive`)
+// now lives in `common/mod.rs` so `sql_e2e_scenarios.rs` reuses ONE copy — see that module.
+use common::{assert_session_alive, exec_err, exec_ok, exec_server, pg_url, req};
+use ferro_proto::consts::{branch, errc, flags, method_sql, service, tag};
+use ferro_proto::messages::Outcome;
+use ferro_proto::messages::sql::ExecOk;
 use ferro_proto::value::Value;
-use ferrod::config::{Config, PoolSpec};
-use ferrod::epoch::BootEpoch;
-use ferrod::pools::PoolRegistry;
-use ferrod::services::sql;
-
-/// The DSN under test, or `None` (→ the test returns early / skips) when unset.
-fn pg_url() -> Option<String> {
-    match std::env::var("FERRO_TEST_PG_URL") {
-        Ok(u) => Some(u),
-        Err(_) => {
-            eprintln!("skip: FERRO_TEST_PG_URL unset");
-            None
-        }
-    }
-}
-
-/// A live `ferrod` session server whose EXEC handler owns a real `Pool<PgBackend>` named "default"
-/// pointing at `url`. Uses `TestServer::spawn_with_handler` (no peercred gate) with the real
-/// `sql::make_handler`, so this is a genuine client→ferrod→pool→PG round trip.
-fn exec_server(url: String) -> TestServer {
-    let config = Config {
-        pools: vec![PoolSpec {
-            name: "default".to_string(),
-            dsn: url,
-        }],
-        ..Config::default()
-    };
-    let registry = PoolRegistry::build(&config);
-    let handler = sql::make_handler(registry);
-    TestServer::spawn_with_handler(BootEpoch(1), handler)
-}
-
-/// A base read-only `EXEC "sql"` against the "default" pool, fetch=rows, no params.
-fn req(sql: &str) -> ExecRequest {
-    ExecRequest {
-        pool: "default".to_string(),
-        sql: Some(sql.to_string()),
-        query_id: None,
-        params: Vec::new(),
-        timeout_ms: None,
-        readonly: true,
-        fetch: 0,
-    }
-}
-
-/// Send an EXEC and read back its single terminal, asserting the one-END frame shape (flags::END,
-/// service SQL, method EXEC, echoed request_id). Returns the decoded `Outcome`.
-async fn exec(client: &mut TestClient, rid: u32, req: &ExecRequest) -> Outcome {
-    client
-        .send_request(rid, service::SQL, method_sql::EXEC, req.encode())
-        .await;
-    let t = client.recv().await;
-    assert_eq!(t.header.request_id, rid, "terminal echoes the request id");
-    assert_eq!(
-        t.header.flags & flags::END,
-        flags::END,
-        "the EXEC terminal carries flags::END (exactly one END)"
-    );
-    assert_eq!(t.header.service, service::SQL);
-    assert_eq!(t.header.method, method_sql::EXEC);
-    Outcome::decode(&t.payload).expect("decode terminal Outcome")
-}
-
-/// Unwrap an EXEC terminal expected to be `Outcome::Ok(ExecOk)`.
-async fn exec_ok(client: &mut TestClient, rid: u32, req: &ExecRequest) -> ExecOk {
-    match exec(client, rid, req).await {
-        Outcome::Ok(body) => ExecOk::decode(&body).expect("decode ExecOk"),
-        other => panic!("expected Outcome::Ok, got {other:?}"),
-    }
-}
-
-/// Unwrap an EXEC terminal expected to be `Outcome::Error(ErrorPayload)`.
-async fn exec_err(client: &mut TestClient, rid: u32, req: &ExecRequest) -> ErrorPayload {
-    match exec(client, rid, req).await {
-        Outcome::Error(ep) => ep,
-        other => panic!("expected Outcome::Error, got {other:?}"),
-    }
-}
-
-/// Prove the session is still alive after a terminal (⇒ exactly one END was produced): PING→PONG.
-async fn assert_session_alive(client: &mut TestClient, token: u64) {
-    client.ping(9, token).await;
-    let pong = client.recv().await;
-    assert_eq!(pong.header.service, service::CORE);
-    assert_eq!(pong.header.method, method_core::PONG);
-    assert_eq!(pong.header.request_id, 9);
-}
 
 // -------------------------------------------------------------------------------------------------
 // THE MILESTONE: a live SELECT 1 client→ferrod→pool→PG→client.
