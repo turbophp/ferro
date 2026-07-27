@@ -25,6 +25,8 @@
 
 mod common;
 
+use std::time::Instant;
+
 use common::{TestServer, assert_session_alive, exec_err, exec_ok, exec_server, pg_url, req};
 use ferro_proto::consts::{errc, flags, method_core, method_sql, service};
 use ferro_proto::messages::Outcome;
@@ -52,11 +54,16 @@ async fn concurrent_multiplexed_execs() {
     let mut client = server.connect().await;
     client.hello(1).await;
 
-    // N=8 < the hardcoded pool max_size (16) and ≪ max_inflight (1024): all 8 checkouts are admitted
-    // concurrently, so this proves MULTIPLEXING (not queuing). request_id = 100 + i, sql = SELECT i,
-    // so every terminal is self-identifying by BOTH its echoed rid and its row value.
+    // N=8 < the hardcoded pool max_size (16) and ≪ max_inflight (1024), so all 8 checkouts are
+    // admitted at once. Each EXEC is a ~200 ms `SELECT i FROM pg_sleep(0.2)` (slow AND
+    // self-identifying: the projected constant `i` is the int4→I64 row). We fire all N without
+    // awaiting, then assert the WALL-CLOCK to collect all N is far below the SERIALIZED floor
+    // (N×200 ms = 1600 ms) — the only way that holds is genuine overlap, so this proves MULTIPLEXING,
+    // not queuing (not merely demux correctness). request_id = 100 + i self-identifies each terminal.
     const N: u32 = 8;
+    const SLEEP_S: f64 = 0.2;
 
+    let start = Instant::now();
     // Fire all N without awaiting any terminal.
     for i in 1..=N {
         let rid = 100 + i;
@@ -65,7 +72,7 @@ async fn concurrent_multiplexed_execs() {
                 rid,
                 service::SQL,
                 method_sql::EXEC,
-                req(&format!("SELECT {i}")).encode(),
+                req(&format!("SELECT {i} FROM pg_sleep({SLEEP_S})")).encode(),
             )
             .await;
     }
@@ -107,6 +114,18 @@ async fn concurrent_multiplexed_execs() {
     for i in 1..=N {
         assert!(seen[i as usize], "no terminal ever arrived for SELECT {i}");
     }
+
+    // THE concurrency proof: all N ~200 ms queries completed in far less than the serialized floor
+    // (N × 200 ms = 1600 ms). A server that ran them one-at-a-time could not finish under 1600 ms;
+    // observing < 1000 ms is only possible if the handlers overlapped — i.e. real multiplexing, not
+    // queuing. (Generous margin: concurrent actual ≈ 200–500 ms; serial ≥ 1600 ms; RECV_TIMEOUT 2 s.)
+    let elapsed = start.elapsed();
+    let serial_floor = std::time::Duration::from_secs_f64(N as f64 * SLEEP_S);
+    assert!(
+        elapsed < std::time::Duration::from_millis(1000),
+        "collected {N} concurrent {SLEEP_S}s EXECs in {elapsed:?}; serialized floor is {serial_floor:?} \
+         — this exceeds the concurrency budget, suggesting the session serialized (queued) them"
+    );
 
     // Exactly N terminals, each a unique id with one END, and nothing else: the session is alive and
     // never produced a stray extra frame for any of the 8 ids.
