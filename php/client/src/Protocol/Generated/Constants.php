@@ -107,4 +107,6 @@ final class Constants
     public const ERR_UNSUPPORTED_BRANCH = 3;
     public const ERR_WRITE_UNCONFIRMED = 8193;
     public const ERR_WRITE_UNCONFIRMED_BRANCH = 2;
+
+    public const TYPE_REGISTRY_HASH = '67b32e3e616e27f5';
 }
