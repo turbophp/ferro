@@ -22,10 +22,12 @@ use ferrod::pools::PoolRegistry;
 use ferrod::serve::serve;
 use ferrod::services::sql;
 use ferrod::session::codec::{FrameCodec, FrameError, InFrame, OutFrame};
-use ferrod::session::{HandlerFn, Session};
+use ferrod::session::{HandlerFactory, HandlerFn, Session};
 use ferrod::shutdown::Drain;
+use ferrod::tx::TxRegistry;
 use futures::{SinkExt, StreamExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -107,6 +109,12 @@ impl TestServer {
         };
         let listener = ferrod::listener::bind_uds(&config).expect("bind_uds in test harness");
 
+        // Wrap the plain `HandlerFn` as a session-agnostic factory + mint a throwaway `TxRegistry`
+        // (S6 seam): these scripted-handler tests never open a transaction, so `abort_session` at
+        // cleanup is a no-op and behaviour is identical to the pre-seam harness.
+        let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+        let factory: HandlerFactory = Arc::new(move |_sid| handler.clone());
+
         tokio::spawn(async move {
             loop {
                 let (stream, _addr) = match listener.accept().await {
@@ -117,7 +125,43 @@ impl TestServer {
                     stream,
                     config.clone(),
                     epoch,
-                    handler.clone(),
+                    tx_registry.clone(),
+                    factory.clone(),
+                ));
+            }
+        });
+
+        TestServer { socket_path }
+    }
+
+    /// Like `spawn_with_handler`, but drives every accepted connection through a full
+    /// `HandlerFactory` + a shared `Arc<TxRegistry>` — the real S6 wiring the SQL/TX services use
+    /// (a fresh per-connection `HandlerFn` per `SessionId`, all sharing one tx registry).
+    /// `exec_server` uses this so its EXEC handler is built exactly as `main` builds it.
+    pub fn spawn_with_factory(
+        epoch: BootEpoch,
+        tx_registry: Arc<TxRegistry>,
+        factory: HandlerFactory,
+    ) -> Self {
+        let socket_path = tmp_socket_path();
+        let config = Config {
+            socket_path: socket_path.clone(),
+            ..Config::default()
+        };
+        let listener = ferrod::listener::bind_uds(&config).expect("bind_uds in test harness");
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _addr) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(Session::run_with_handler(
+                    stream,
+                    config.clone(),
+                    epoch,
+                    tx_registry.clone(),
+                    factory.clone(),
                 ));
             }
         });
@@ -168,12 +212,15 @@ pub fn spawn_one_session_with_config(
         ..config
     };
     let listener = ferrod::listener::bind_uds(&config).expect("bind_uds in test harness");
+    // Wrap the plain `HandlerFn` as a session-agnostic factory + a throwaway `TxRegistry` (S6 seam).
+    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let factory: HandlerFactory = Arc::new(move |_sid| handler.clone());
     let handle = tokio::spawn(async move {
         let (stream, _addr) = listener
             .accept()
             .await
             .expect("accept the one test connection");
-        Session::run_with_handler(stream, config, epoch, handler).await;
+        Session::run_with_handler(stream, config, epoch, tx_registry, factory).await;
     });
     (socket_path, handle)
 }
@@ -205,7 +252,10 @@ pub fn spawn_serve_with_config(
         ..config
     };
     let listener = ferrod::listener::bind_uds(&config).expect("bind_uds in test harness");
-    let handle = tokio::spawn(serve(listener, config, epoch, drain, handler));
+    // Wrap the plain `HandlerFn` as a session-agnostic factory + a throwaway `TxRegistry` (S6 seam).
+    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let factory: HandlerFactory = Arc::new(move |_sid| handler.clone());
+    let handle = tokio::spawn(serve(listener, config, epoch, drain, tx_registry, factory));
     (socket_path, handle)
 }
 
@@ -434,8 +484,9 @@ pub fn pg_url() -> Option<String> {
 }
 
 /// A live `ferrod` session server whose EXEC handler owns a real `Pool<PgBackend>` named "default"
-/// pointing at `url`. Uses `TestServer::spawn_with_handler` (no peercred gate) with the real
-/// `sql::make_handler`, so this is a genuine client→ferrod→pool→PG round trip.
+/// pointing at `url`. Uses `TestServer::spawn_with_factory` (no peercred gate) with the real
+/// `sql::make_handler` + a shared `Arc<TxRegistry>` — built exactly as `main` builds it — so this
+/// is a genuine client→ferrod→pool→PG round trip.
 pub fn exec_server(url: String) -> TestServer {
     let config = Config {
         pools: vec![PoolSpec {
@@ -445,8 +496,9 @@ pub fn exec_server(url: String) -> TestServer {
         ..Config::default()
     };
     let registry = PoolRegistry::build(&config);
-    let handler = sql::make_handler(registry);
-    TestServer::spawn_with_handler(BootEpoch(1), handler)
+    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let factory = sql::make_handler(registry, tx_registry.clone());
+    TestServer::spawn_with_factory(BootEpoch(1), tx_registry, factory)
 }
 
 /// A base read-only `EXEC "sql"` against the "default" pool, fetch=rows, no params.

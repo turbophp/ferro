@@ -25,12 +25,15 @@ use client::{BoxErr, DemoClient};
 use ferro_proto::messages::Outcome;
 use ferro_proto::messages::sql::ExecOk;
 use ferro_proto::value::Value;
+use std::sync::Arc;
+
 use ferrod::config::{Config, PoolSpec};
 use ferrod::epoch::{EpochSource, RandomEpoch};
 use ferrod::pools::PoolRegistry;
 use ferrod::serve::serve;
 use ferrod::services::sql;
 use ferrod::shutdown::Drain;
+use ferrod::tx::TxRegistry;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), BoxErr> {
@@ -54,11 +57,19 @@ async fn main() -> Result<(), BoxErr> {
         ..Config::default()
     };
     let registry = PoolRegistry::build(&config);
-    let handler = sql::make_handler(registry);
+    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let handler = sql::make_handler(registry, tx_registry.clone());
     let listener = ferrod::listener::bind_uds(&config)?;
     let epoch = RandomEpoch.epoch();
     let drain = Drain::new();
-    let serve_handle = tokio::spawn(serve(listener, config, epoch, drain.clone(), handler));
+    let serve_handle = tokio::spawn(serve(
+        listener,
+        config,
+        epoch,
+        drain.clone(),
+        tx_registry,
+        handler,
+    ));
 
     // Run the narrated sequence against the socket. Capture the result so teardown always runs.
     let result = run_demo(&socket_path).await;

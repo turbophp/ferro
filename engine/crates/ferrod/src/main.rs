@@ -4,6 +4,8 @@
 //! this file is deliberately thin so `tests/shutdown.rs`/`tests/peercred.rs` can drive `serve`
 //! directly with an injected `Drain` instead of a real OS signal.
 
+use std::sync::Arc;
+
 use ferrod::config::Config;
 use ferrod::epoch::{EpochSource, RandomEpoch};
 use ferrod::listener::bind_uds;
@@ -11,6 +13,7 @@ use ferrod::pools::PoolRegistry;
 use ferrod::serve::serve;
 use ferrod::services::sql;
 use ferrod::shutdown::Drain;
+use ferrod::tx::TxRegistry;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -30,7 +33,11 @@ async fn main() -> anyhow::Result<()> {
     // pool names are logged. The EXEC handler resolves pools by name out of this registry.
     let registry = PoolRegistry::build(&config);
     tracing::info!(pools = registry.len(), "ferrod: pool registry ready");
-    let handler = sql::make_handler(registry);
+
+    // One process-global transaction registry, shared by every connection `serve` spawns (S6
+    // seam). Its `abort_session` teardown wait mirrors the graceful-drain deadline.
+    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let factory = sql::make_handler(registry, tx_registry.clone());
 
     // Drawn once per running instance and handed to every connection `serve` spawns (SPEC
     // §19.1: every connection served by this instance observes the identical `boot_epoch`).
@@ -39,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let drain = Drain::new();
     spawn_signal_watchers(drain.clone())?;
 
-    serve(listener, config, epoch, drain, handler).await;
+    serve(listener, config, epoch, drain, tx_registry, factory).await;
 
     tracing::info!("ferrod exiting");
     Ok(())

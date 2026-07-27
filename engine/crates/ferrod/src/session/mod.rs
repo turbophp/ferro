@@ -46,13 +46,15 @@
 //! (see `Cargo.toml`): the supervisor's `JoinError::is_panic()` path depends on panics unwinding
 //! rather than aborting the process.
 //!
-//! **Dispatch is an injectable seam.** `Session::run_with_handler` takes a `HandlerFn` used for
-//! every request-bearing frame; `Session::run` is `run_with_handler` with a `default_handler`
-//! that declares `end_error(Unsupported)` for anything (real SQL/TX handlers land in S4/S5).
-//! Tests use the seam to script handler behaviour (panic, hang on a `Notify`, declare
-//! immediately) without needing a real SQL/TX backend. The handler is also handed a
-//! `CancellationToken` (this module's Task 5 addition) alongside its `InFrame`/`Responder` — see
-//! below.
+//! **Dispatch is an injectable seam.** `Session::run_with_handler` takes a `HandlerFactory` (S6:
+//! `Fn(SessionId) -> HandlerFn`) plus the shared `Arc<TxRegistry>`; it draws a `SessionId` once,
+//! builds this connection's `HandlerFn` via `factory(session_id)`, and uses that for every
+//! request-bearing frame. `Session::run` is `run_with_handler` with a throwaway registry + a
+//! trivial factory whose `default_handler` declares `end_error(Unsupported)` for anything (real
+//! SQL/TX handlers land in S5/S6). Tests use the seam to script handler behaviour (panic, hang on
+//! a `Notify`, declare immediately) without needing a real SQL/TX backend. The handler is also
+//! handed a `CancellationToken` (this module's Task 5 addition) alongside its
+//! `InFrame`/`Responder` — see below.
 //!
 //! **Liveness and drain (this module's Task 5 addition).** The reader loop now also routes:
 //! - **`CANCEL`** (a flag on ANY frame, `flags::CANCEL`, target = that frame's `request_id`, empty
@@ -157,6 +159,7 @@ use ferro_proto::messages::{ErrorPayload, Outcome, Ping, WindowUpdate};
 use crate::config::Config;
 use crate::dispatch::{self, CoreMethod, Route};
 use crate::epoch::BootEpoch;
+use crate::tx::TxRegistry;
 use classify::Classification;
 use codec::{FrameCodec, InFrame, OutFrame};
 use error::SessionError;
@@ -180,20 +183,44 @@ const CONTROL_CHANNEL_SLACK: usize = 8;
 pub type HandlerFn =
     Arc<dyn Fn(InFrame, Responder, CancellationToken) -> BoxFuture<'static, ()> + Send + Sync>;
 
+/// A process-monotonic id for one accepted connection's session, drawn once per connection from
+/// [`TxRegistry::next_session_id`] (S6). It is the OWNER key a transaction is registered under, so
+/// a tx-scoped request from a different session is indistinguishable from an unknown `tx_id` (see
+/// `crate::tx`). Distinct from the wire `request_id` (per-request, client-chosen).
+pub type SessionId = u64;
+
+/// Builds the per-connection [`HandlerFn`] given that connection's [`SessionId`] (S6 seam). We
+/// inject a FACTORY rather than a bare `HandlerFn` so a handler can capture its own session id (the
+/// tx service keys tx ownership off it) without threading a `SessionId` through `HandlerFn`'s own
+/// signature — which would churn the ~8 scripted-handler test closures and the mod.rs call site.
+/// `Session::run` and the pure-session tests use a trivial factory that ignores the id.
+pub type HandlerFactory = Arc<dyn Fn(SessionId) -> HandlerFn + Send + Sync>;
+
 /// The session task's entry point, one call per accepted connection.
 pub struct Session;
 
 impl Session {
     /// Drive one accepted connection end to end using the default handler (declares
     /// `Unsupported` for every request-bearing frame — real dispatch lands in Task 6).
+    ///
+    /// A standalone session with no tx service of its own: mint a throwaway [`TxRegistry`] + a
+    /// trivial factory whose default handler creates no transactions (so the `abort_session` at
+    /// cleanup is a guaranteed no-op). This keeps every pure-session test path (`common::spawn` /
+    /// `Session::run`) untouched by the S6 seam.
     pub async fn run(stream: UnixStream, config: Config, epoch: BootEpoch) {
-        Self::run_with_handler(stream, config, epoch, default_handler_fn()).await;
+        let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+        let factory: HandlerFactory = Arc::new(|_session_id| default_handler_fn());
+        Self::run_with_handler(stream, config, epoch, tx_registry, factory).await;
     }
 
     /// Drive one accepted connection end to end: split the framed stream, spawn the writer task,
     /// perform the `HELLO`/`HELLO_ACK` handshake, then answer liveness (`PING`) and route
     /// request-bearing frames (SQL/TX/STREAM) through `registry` + a spawned handler +
-    /// supervisor, using `handler` for every such frame, until the peer disconnects.
+    /// supervisor, until the peer disconnects.
+    ///
+    /// `tx_registry` is the shared, process-global transaction registry (S6 seam): a `SessionId` is
+    /// drawn from it once here, the per-connection handler is built via `factory(session_id)`, and
+    /// on every session-end route the owned transactions are aborted (see the cleanup path below).
     ///
     /// `epoch` is the daemon's single boot-time draw, passed in (not redrawn per connection) so
     /// every connection served by this running instance observes the identical `boot_epoch`
@@ -203,8 +230,17 @@ impl Session {
         stream: UnixStream,
         config: Config,
         epoch: BootEpoch,
-        handler: HandlerFn,
+        tx_registry: Arc<TxRegistry>,
+        factory: HandlerFactory,
     ) {
+        // Draw this connection's SessionId once (S6 seam) and build its handler. `session_id` is
+        // used both to key tx ownership (inside the handler) and to abort this session's
+        // transactions at cleanup. No transaction can exist before the reader loop below (the
+        // handler only runs for request-bearing frames, and none are dispatched during the
+        // handshake), so the handshake-phase early returns need not — and do not — abort.
+        let session_id = tx_registry.next_session_id();
+        let handler = factory(session_id);
+
         let framed = Framed::new(stream, FrameCodec);
         let (sink, mut reader) = framed.split();
 
@@ -410,15 +446,24 @@ impl Session {
             }
         }
 
-        // Shutdown, whatever the reader loop's exit reason (EOF, a session-fatal classification,
-        // GOODBYE-drain, or the writer having gone away): nudge every still-running handler toward
+        // Shutdown, whatever the reader loop's exit reason (clean EOF, a session-fatal
+        // classification, GOODBYE-drain, or the writer having gone away — every route that could
+        // have opened a transaction `break`s here): nudge every still-running handler toward
         // finishing quickly (cooperative — a handler that ignores its `CancellationToken` is
-        // unaffected), then give the per-session supervisor `JoinSet` a bounded chance to drain
-        // before hard-aborting whatever is left, so no per-request task outlives this session
-        // (S3 fix pass). Exactly-one-`END` is untouched: whichever way a given supervisor task
-        // ends up finishing (normally, or hard-aborted past the deadline), it was already — and
-        // remains — the sole sender of its request's one terminal frame.
+        // unaffected), ABORT this session's transactions, then give the per-session supervisor
+        // `JoinSet` a bounded chance to drain before hard-aborting whatever is left, so no
+        // per-request task outlives this session (S3 fix pass). Exactly-one-`END` is untouched:
+        // whichever way a given supervisor task ends up finishing (normally, or hard-aborted past
+        // the deadline), it was already — and remains — the sole sender of its request's one
+        // terminal frame.
+        //
+        // ORDER IS LOAD-BEARING (S6 seam): `cancel_all()` only fires each request's
+        // `CancellationToken`, which a tx-scoped handler blocked on a `oneshot` recv does NOT
+        // observe — so `abort_session` runs BETWEEN it and the drain: aborting the actors drops
+        // their reply senders, the in-flight handler's recv returns `Err`, it declares its one
+        // terminal, and the supervisor delivers the `END` inside the drain window.
         registry.cancel_all();
+        tx_registry.abort_session(session_id).await;
         drain_supervisors(&mut supervisors, config.drain_deadline).await;
 
         drop(control_tx);

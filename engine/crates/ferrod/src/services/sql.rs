@@ -40,9 +40,10 @@ use ferro_proto::messages::ErrorPayload;
 use ferro_proto::messages::sql::{ExecOk, ExecRequest, Stats};
 
 use crate::pools::PoolRegistry;
-use crate::session::HandlerFn;
 use crate::session::codec::InFrame;
 use crate::session::responder::Responder;
+use crate::session::{HandlerFactory, HandlerFn};
+use crate::tx::TxRegistry;
 
 /// `ExecRequest.fetch` modes. 0 = rows, 1 = none (affected only), 2 = stream (reserved — `Unsupported`
 /// in M0 per D-S5-1). Kept as named constants (not magic numbers) at the handler boundary.
@@ -58,16 +59,28 @@ const FETCH_STREAM: u8 = 2;
 /// AND every other in-flight terminal). Locked against the codec by `outcome_ok_overhead_is_two`.
 const OUTCOME_OK_OVERHEAD: usize = 2;
 
-/// Build the real EXEC `HandlerFn`, capturing the pool registry. Any request-bearing frame that is
-/// NOT `service=SQL, method=EXEC` (a TX/STREAM method, or an unrecognized SQL method) still declares
-/// `Unsupported` — the real TX service is S6.
-pub fn make_handler(registry: Arc<PoolRegistry>) -> HandlerFn {
-    Arc::new(move |frame, responder, _cancel| {
+/// Build the real EXEC `HandlerFactory`, capturing the pool registry and the shared
+/// `Arc<TxRegistry>` (S6 seam). The factory mints one `HandlerFn` per connection given its
+/// `SessionId`. Any request-bearing frame that is NOT `service=SQL, method=EXEC` (a TX/STREAM
+/// method, or an unrecognized SQL method) still declares `Unsupported`.
+///
+/// S6-Task3: `session_id` + `tx_registry` become load-bearing here — a tx-scoped `EXEC`
+/// (`tx_id.is_some()`) will look the actor up by `(tx_id, session_id)` and forward the statement,
+/// while the autocommit path (`tx_id == None`) stays byte-for-byte identical to S5. For now the
+/// factory ignores the session id and behaves exactly as S5 did.
+pub fn make_handler(registry: Arc<PoolRegistry>, tx_registry: Arc<TxRegistry>) -> HandlerFactory {
+    Arc::new(move |_session_id| -> HandlerFn {
         let registry = registry.clone();
-        async move {
-            handle(frame, responder, &registry).await;
-        }
-        .boxed()
+        // Captured now so the S6-Task3 tx-scoped routing has it in hand; unused on the autocommit
+        // path (the only path this task builds).
+        let _tx_registry = tx_registry.clone();
+        Arc::new(move |frame, responder, _cancel| {
+            let registry = registry.clone();
+            async move {
+                handle(frame, responder, &registry).await;
+            }
+            .boxed()
+        })
     })
 }
 

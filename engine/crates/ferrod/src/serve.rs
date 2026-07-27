@@ -27,6 +27,7 @@
 //! anything is still outstanding — hard-closes by aborting whatever remains (`JoinSet::drop`
 //! aborts every task still in the set) rather than waiting indefinitely.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::SinkExt;
@@ -39,18 +40,21 @@ use crate::epoch::BootEpoch;
 use crate::peercred;
 use crate::session::codec::FrameCodec;
 use crate::session::error::SessionError;
-use crate::session::{HandlerFn, Session};
+use crate::session::{HandlerFactory, Session};
 use crate::shutdown::Drain;
+use crate::tx::TxRegistry;
 
 /// Drive `listener`'s peercred-gated accept loop until `drain` is triggered, then let already-
 /// spawned session tasks finish (up to `config.drain_deadline`) before returning. Every accepted
-/// connection is driven via `Session::run_with_handler(.., handler.clone())`.
+/// connection is driven via `Session::run_with_handler(.., tx_registry.clone(), factory.clone())`;
+/// the one `tx_registry` is shared by every session (S6 seam).
 pub async fn serve(
     listener: UnixListener,
     config: Config,
     epoch: BootEpoch,
     drain: Drain,
-    handler: HandlerFn,
+    tx_registry: Arc<TxRegistry>,
+    factory: HandlerFactory,
 ) {
     let mut sessions: JoinSet<()> = JoinSet::new();
 
@@ -87,10 +91,17 @@ pub async fn serve(
                 match peercred::peer_uid(&stream) {
                     Ok(uid) if config.uid_allowed(uid) => {
                         let session_config = config.clone();
-                        let session_handler = handler.clone();
+                        let session_factory = factory.clone();
+                        let session_tx_registry = tx_registry.clone();
                         sessions.spawn(async move {
-                            Session::run_with_handler(stream, session_config, epoch, session_handler)
-                                .await;
+                            Session::run_with_handler(
+                                stream,
+                                session_config,
+                                epoch,
+                                session_tx_registry,
+                                session_factory,
+                            )
+                            .await;
                         });
                     }
                     Ok(uid) => {
