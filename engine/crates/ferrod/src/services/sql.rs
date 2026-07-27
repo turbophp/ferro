@@ -126,7 +126,9 @@ async fn handle(frame: InFrame, responder: Responder, registry: &PoolRegistry) {
     let mut co = match pool.checkout().await {
         Ok(co) => co,
         Err(e) => {
-            responder.end_error(pool_error_to_payload(e, req.readonly));
+            // A checkout failure means NO connection was established, so the user statement was
+            // NEVER transmitted → fate is a KNOWN "did-not-apply", never Indeterminate (`sent=false`).
+            responder.end_error(pool_error_to_payload(e, req.readonly, false));
             return;
         }
     };
@@ -145,7 +147,9 @@ async fn handle(frame: InFrame, responder: Responder, registry: &PoolRegistry) {
     let result = match result {
         Ok(r) => r,
         Err(e) => {
-            responder.end_error(pool_error_to_payload(e, req.readonly));
+            // The statement WAS transmitted (checkout succeeded, `co.query` ran), so a connection
+            // loss here has a genuinely UNKNOWN fate → eligible for §19.3 Indeterminate (`sent=true`).
+            responder.end_error(pool_error_to_payload(e, req.readonly, true));
             return;
         }
     };
@@ -216,7 +220,14 @@ fn build_terminal_body(
 /// read/write inference — charter rule 6). A known-fate `PoolError::Sql` (server rejection OR a
 /// client-side bind pre-validation, both fate-known) passes through VERBATIM — the override never
 /// touches it.
-fn pool_error_to_payload(err: PoolError, readonly: bool) -> ErrorPayload {
+///
+/// `sent` gates the Indeterminate branch: a `ConnectionLost` is only Indeterminate if the statement
+/// was actually TRANSMITTED (`sent=true`, a mid-`co.query()` loss whose fate is unknown). A
+/// checkout-time connect failure (`sent=false` — DB down/restarting, the §19 bounce) means the SQL
+/// was never sent, so its fate is a KNOWN "did-not-apply" → `ConnectionLost{Retryable}`, never a
+/// false `WriteUnconfirmed`. Reporting fate-unknown for a provably-not-applied write would corrupt
+/// the §19.3 guarantee just as much as a spurious auto-retry would.
+fn pool_error_to_payload(err: PoolError, readonly: bool, sent: bool) -> ErrorPayload {
     match err {
         // Known-fate: pass the proto classification through verbatim. Never Indeterminate.
         PoolError::Sql {
@@ -233,22 +244,25 @@ fn pool_error_to_payload(err: PoolError, readonly: bool) -> ErrorPayload {
             detail: None,
             retry_after_ms: None,
         },
-        // A true connection loss (no answer, fate UNKNOWN). Branch on `readonly` ONLY:
-        //  - readonly=false → a possibly-applied write whose fate is unknown = §19.3 Indeterminate.
-        //  - readonly=true  → a read that observed no result = Retryable (client policy).
+        // A connection loss. Indeterminate ONLY if the statement was transmitted AND non-readonly:
+        //  - !sent (checkout failed, never transmitted) → known did-not-apply → Retryable.
+        //  - sent & readonly=false → a possibly-applied write, fate UNKNOWN → §19.3 Indeterminate.
+        //  - sent & readonly=true  → a read that observed no result → Retryable (client policy).
         PoolError::ConnectionLost => {
-            if readonly {
-                payload(
-                    errc::CONNECTION_LOST,
-                    errc::CONNECTION_LOST_BRANCH,
-                    "connection lost on a readonly statement (retryable — the engine never retries)",
-                )
-            } else {
+            if sent && !readonly {
                 payload(
                     errc::WRITE_UNCONFIRMED,
                     errc::WRITE_UNCONFIRMED_BRANCH,
-                    "connection lost during a non-readonly statement; the write may or may not have \
-                     applied (§19.3 indeterminate — the engine never retries; retry is client policy)",
+                    "connection lost during an in-flight non-readonly statement; the write may or \
+                     may not have applied (§19.3 indeterminate — the engine never retries; retry \
+                     is client policy)",
+                )
+            } else {
+                payload(
+                    errc::CONNECTION_LOST,
+                    errc::CONNECTION_LOST_BRANCH,
+                    "connection lost with a known-fate outcome (statement not transmitted, or a \
+                     readonly read) — retryable; the engine never retries",
                 )
             }
         }
@@ -337,18 +351,40 @@ mod tests {
         );
     }
 
-    /// The DETERMINISTIC proof of §19.3: a true `ConnectionLost` becomes `WriteUnconfirmed`
-    /// {Indeterminate} on a non-readonly statement and `ConnectionLost{Retryable}` on a readonly
-    /// one — branching on the `readonly` flag ALONE (no SQL inference).
+    /// The DETERMINISTIC proof of §19.3, across BOTH the `sent` and `readonly` axes:
+    ///  - a TRANSMITTED (`sent=true`) non-readonly loss → `WriteUnconfirmed{Indeterminate}` (fate unknown);
+    ///  - a transmitted readonly loss → `ConnectionLost{Retryable}`;
+    ///  - a NOT-transmitted loss (`sent=false` — a checkout-time connect failure, the §19 DB-bounce)
+    ///    → `ConnectionLost{Retryable}` EVEN on a write, because the statement provably never ran.
+    /// Indeterminate requires `sent && !readonly`; nothing else. (No SQL read/write inference.)
     #[test]
-    fn connection_lost_is_indeterminate_on_write_and_retryable_on_read() {
-        let write = pool_error_to_payload(PoolError::ConnectionLost, false);
-        assert_eq!(write.code, errc::WRITE_UNCONFIRMED);
-        assert_eq!(write.branch, branch::INDETERMINATE);
+    fn connection_lost_indeterminate_only_when_sent_and_write() {
+        // sent + write → the ONE Indeterminate case.
+        let sent_write = pool_error_to_payload(PoolError::ConnectionLost, false, true);
+        assert_eq!(sent_write.code, errc::WRITE_UNCONFIRMED);
+        assert_eq!(sent_write.branch, branch::INDETERMINATE);
 
-        let read = pool_error_to_payload(PoolError::ConnectionLost, true);
-        assert_eq!(read.code, errc::CONNECTION_LOST);
-        assert_eq!(read.branch, branch::RETRYABLE);
+        // sent + readonly → Retryable.
+        let sent_read = pool_error_to_payload(PoolError::ConnectionLost, true, true);
+        assert_eq!(sent_read.code, errc::CONNECTION_LOST);
+        assert_eq!(sent_read.branch, branch::RETRYABLE);
+
+        // NOT sent (checkout failure) + write → Retryable, NOT Indeterminate (the T3-review fix:
+        // a write that provably never left the client is known-fate, not fate-unknown).
+        let unsent_write = pool_error_to_payload(PoolError::ConnectionLost, false, false);
+        assert_eq!(
+            unsent_write.code,
+            errc::CONNECTION_LOST,
+            "a checkout-time (never-transmitted) loss must be known-fate Retryable, not Indeterminate"
+        );
+        assert_eq!(unsent_write.branch, branch::RETRYABLE);
+        assert_ne!(unsent_write.code, errc::WRITE_UNCONFIRMED);
+        assert_ne!(unsent_write.branch, branch::INDETERMINATE);
+
+        // NOT sent + readonly → Retryable.
+        let unsent_read = pool_error_to_payload(PoolError::ConnectionLost, true, false);
+        assert_eq!(unsent_read.code, errc::CONNECTION_LOST);
+        assert_eq!(unsent_read.branch, branch::RETRYABLE);
     }
 
     /// A known-fate `PoolError::Sql` passes through VERBATIM regardless of `readonly` — the
@@ -362,22 +398,25 @@ mod tests {
             sqlstate: Some("42601".to_string()),
             message: "syntax error".to_string(),
         };
+        // Verbatim regardless of readonly AND sent — a known-fate Sql is never Indeterminate.
         for readonly in [true, false] {
-            let ep = pool_error_to_payload(sql.clone(), readonly);
-            assert_eq!(ep.code, errc::SYNTAX);
-            assert_eq!(ep.branch, branch::NON_RETRYABLE);
-            assert_eq!(ep.sqlstate.as_deref(), Some("42601"));
+            for sent in [true, false] {
+                let ep = pool_error_to_payload(sql.clone(), readonly, sent);
+                assert_eq!(ep.code, errc::SYNTAX);
+                assert_eq!(ep.branch, branch::NON_RETRYABLE);
+                assert_eq!(ep.sqlstate.as_deref(), Some("42601"));
+            }
         }
 
-        // The exact COMMIT-1 bind-error shape (Sql{Unsupported}) on a WRITE (readonly=false) stays
-        // Unsupported — NOT WriteUnconfirmed/Indeterminate.
+        // The exact COMMIT-1 bind-error shape (Sql{Unsupported}) on a WRITE (readonly=false), even
+        // if it were reported at the sent=true site, stays Unsupported — NOT WriteUnconfirmed.
         let bind = PoolError::Sql {
             code: errc::UNSUPPORTED,
             branch: errc::UNSUPPORTED_BRANCH,
             sqlstate: None,
             message: "parameter 0 type mismatch".to_string(),
         };
-        let ep = pool_error_to_payload(bind, false);
+        let ep = pool_error_to_payload(bind, false, true);
         assert_eq!(ep.code, errc::UNSUPPORTED);
         assert_ne!(ep.code, errc::WRITE_UNCONFIRMED);
         assert_ne!(ep.branch, branch::INDETERMINATE);
