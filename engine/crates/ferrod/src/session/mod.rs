@@ -323,7 +323,11 @@ impl Session {
             }
         };
 
-        let ack = handshake::hello_ack_frame(first.header.request_id, epoch);
+        let ack = handshake::hello_ack_frame(
+            first.header.request_id,
+            epoch,
+            config.pools.iter().map(|p| p.name.clone()).collect(),
+        );
         if control_tx.send(ack).await.is_err() {
             // Writer already gone; nothing left to do.
             drop(control_tx);

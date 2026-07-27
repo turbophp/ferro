@@ -41,12 +41,16 @@ pub fn validate_hello(frame: &InFrame) -> Result<Hello, SessionError> {
 /// the wire convention that `HELLO_ACK` echoes it), with `flags=0` — `HELLO_ACK` is a
 /// non-terminal core control frame, never a request-bearing terminal (see `session::mod`'s
 /// concurrency-model doc comment).
-pub fn hello_ack_frame(request_id: u32, epoch: BootEpoch) -> OutFrame {
+///
+/// `pool_names` are the configured pool names (`config.pools[].name`) the client may reference in
+/// `ExecRequest.pool`; they are advertised in `HelloAck.pools` so a client discovers them from the
+/// handshake (PROTOCOL.md §4). Only the NAMES are exposed — never the DSNs (§12 server secret).
+pub fn hello_ack_frame(request_id: u32, epoch: BootEpoch, pool_names: Vec<String>) -> OutFrame {
     let ack = HelloAck {
         engine_version: ENGINE_VERSION,
         boot_epoch: epoch.0,
         features: 0,
-        pools: vec![],
+        pools: pool_names,
         type_registry_hash: TYPE_REGISTRY_HASH.to_string(),
     };
     let payload = ack.encode();
