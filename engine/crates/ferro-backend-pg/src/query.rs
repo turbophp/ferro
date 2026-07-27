@@ -22,9 +22,10 @@
 //!    (the pre-validation above already excluded every client-side bind fault) → `ConnectionLost`
 //!    is the correct, honest classification.
 //! 6. `affected` comes from the command tag (`RowStream::rows_affected()`) — NEVER a hardcoded 0
-//!    (the S4 `batch_execute` defect). A SELECT reports 0 affected with its rows; a DML reports its
-//!    row count with an empty row set. `query` always returns rows + affected + cols; the
-//!    SELECT-vs-DML shaping (`fetch:none`) is the SERVICE's job (Task 3).
+//!    (the S4 `batch_execute` defect). Note PG's command tag reports the ROW COUNT for a SELECT too
+//!    (so a `SELECT 1` yields `affected == 1` alongside its one row); a DML reports its affected-row
+//!    count with an empty row set. `query` always returns rows + affected + cols; the SELECT-vs-DML
+//!    shaping (`fetch:none` drops the rows, keeps `affected`) is the SERVICE's job (Task 3).
 //!
 //! **M0 bind mapping (deliberate, fails LOUDLY):** the canonical scalars map DIRECTLY —
 //! `I64`→`int8`, `F64`→`float8`, `Bool`→`bool`, `Text`→`text`, `Bytes`→`bytea`. A narrower target

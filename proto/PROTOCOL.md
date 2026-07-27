@@ -264,5 +264,8 @@ cursor (a whole-slice decode would spuriously reject the trailing bytes that alw
 (the full M0 scalar set including the divergent-range ints `I64(200)` = `cc c8` / `I64(-200)` =
 `d1 ff 38`), `sql_exec_response_select1` (a one-col/one-row terminal body),
 `sql_exec_response_none` (`fetch:none` `affected` with empty rows), `sql_exec_response_lastid`
-(`Some(last_insert_id)` — locks the Option<Value> peek path), `sql_exec_response_wide` (≥16 cols
-and a ≥16-cell row — locks the `array16` marker `0xdc`).
+(`Some(last_insert_id)` = `Some(I64)` — locks the Option<Value> peek path), `sql_exec_response_wide`
+(≥16 cols and a ≥16-cell row — locks the `array16` marker `0xdc`), `sql_exec_response_nullid`
+(`Some(Value::Null)` — locks the `[NULL, nil]` = `92 00 c0` vs bare-`c0` `None` disambiguation),
+`sql_exec_response_typedvalue` (a row carrying the full M0 scalar set — the S1-deferral shared
+cross-language arbiter, including a `Bytes` whose first byte is the `0xc0` nil marker).
