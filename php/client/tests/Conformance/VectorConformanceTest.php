@@ -1,12 +1,18 @@
 <?php // /php/client/tests/Conformance/VectorConformanceTest.php
 declare(strict_types=1);
 namespace Ferro\Tests\Conformance;
+use Ferro\Protocol\BeginRequest;
+use Ferro\Protocol\BeginResponse;
+use Ferro\Protocol\ErrorPayload;
 use Ferro\Protocol\ExecOk;
 use Ferro\Protocol\ExecRequest;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Header;
 use Ferro\Protocol\Message;
 use Ferro\Protocol\Msgpack\{PurePacker, ExtPacker};
+use Ferro\Protocol\Outcome;
+use Ferro\Protocol\SavepointRequest;
+use Ferro\Protocol\TxControl;
 use PHPUnit\Framework\TestCase;
 
 final class VectorConformanceTest extends TestCase
@@ -147,6 +153,157 @@ final class VectorConformanceTest extends TestCase
         $this->assertEquals($message, $decoded, "PHP ExecOk decode==value for {$name}");
         $this->assertSame(bin2hex($payload), bin2hex(self::wrapOk($p, ExecOk::encode($decoded, $p))),
             "ExecOk decode->encode fixpoint for {$name}");
+    }
+
+    /** @return iterable<string, array{0:array<string,mixed>}> the request-bearing TX vectors (Task S7). */
+    public static function txRequestVectors(): iterable
+    {
+        foreach (self::vectors() as $name => [$v]) {
+            if (in_array((string) ($v['name'] ?? ''), ['tx_begin_request', 'tx_commit', 'tx_savepoint'], true)) {
+                yield $name => [$v];
+            }
+        }
+    }
+
+    /**
+     * THE TX cross-language byte lock (Value-free rmp-serde positional layout). For each request-bearing
+     * TX vector, PHP must (a) re-encode the "message" JSON to the EXACT Rust-produced payload bytes,
+     * (b) decode those bytes back to the message value with full consumption, and (c) round-trip
+     * decode->encode to the same bytes. Closes the S6 deferral: PHP is now an independent arbiter of the
+     * TX request wire.
+     * @param array<string,mixed> $v
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('txRequestVectors')]
+    public function testTxRequestVectorByteMatchesBothDirections(array $v): void
+    {
+        $name = (string) $v['name'];
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $message = is_array($v['message']) ? $v['message'] : [];
+        $p = new PurePacker();
+
+        // (a) encode direction
+        $this->assertSame(bin2hex($payload), bin2hex($this->encodeTxRequest($name, $message, $p)),
+            "PHP {$name} encode must byte-match the Rust vector");
+
+        // (b) decode direction + full consumption
+        $off = 0;
+        $wire = $p->unpack($payload, $off);
+        $this->assertSame(strlen($payload), $off, "consumed all payload bytes for {$name}");
+        $this->assertIsArray($wire);
+        $decoded = $this->decodeTxRequest($name, $wire);
+        $this->assertEquals($message, $decoded, "PHP {$name} decode==value");
+
+        // (c) fixpoint
+        $this->assertSame(bin2hex($payload), bin2hex($this->encodeTxRequest($name, $decoded, $p)),
+            "{$name} decode->encode fixpoint");
+    }
+
+    /**
+     * `tx_begin_response`: the terminal `Outcome::Ok(BeginResponse)` envelope. Encode by wrapping the
+     * one-field BeginResponse body in `[OUTCOME_OK, body]`; decode by cracking the outer Outcome (raw
+     * opaque body) then the inner BeginResponse. `tx_id` is a bounded native int (< 2^63), never a
+     * decimal string.
+     */
+    public function testTxBeginResponseVectorByteMatchesBothDirections(): void
+    {
+        $v = self::loadVector('tx_begin_response.json');
+        $message = is_array($v['message']) ? $v['message'] : [];
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $p = new PurePacker();
+
+        // (a) encode: wrap the BeginResponse body in Outcome::Ok.
+        $encoded = Outcome::ok(BeginResponse::encode($message, $p))->encode($p);
+        $this->assertSame(bin2hex($payload), bin2hex($encoded),
+            'PHP Outcome::Ok(BeginResponse) encode must byte-match tx_begin_response');
+
+        // (b) decode: crack the outer Outcome, then the inner BeginResponse body.
+        $outcome = Outcome::decode($payload, $p);
+        $this->assertTrue($outcome->isOk(), 'tx_begin_response is an Outcome::Ok');
+        $this->assertSame(C::OUTCOME_OK, $outcome->status);
+        $this->assertSame($message['status'], $outcome->status, 'status matches vector');
+        $off = 0;
+        $bodyWire = $p->unpack($outcome->body(), $off);
+        $this->assertSame(strlen($outcome->body()), $off, 'consumed all BeginResponse body bytes');
+        $this->assertIsArray($bodyWire);
+        $begin = BeginResponse::mapFromWire($bodyWire);
+        $this->assertSame($message['tx_id'], $begin['tx_id'], 'decoded tx_id matches vector');
+        $this->assertIsInt($begin['tx_id'], 'tx_id is a bounded native int (< 2^63), not a decimal string');
+
+        // (c) fixpoint
+        $this->assertSame(bin2hex($payload), bin2hex(Outcome::ok(BeginResponse::encode($begin, $p))->encode($p)),
+            'tx_begin_response decode->encode fixpoint');
+    }
+
+    /**
+     * `error_protocol`: the terminal `Outcome::Error(ErrorPayload)` wire. Encode by wrapping the 7-field
+     * ErrorPayload in `[OUTCOME_ERROR, body]`; decode by cracking the outer Outcome then the inner
+     * ErrorPayload — exposing `branch` (`ErrorPayload[1]`), the byte the Task-3 taxonomy classifies on.
+     * Grounds the three-branch error mapping in a real vector and closes the S6 error-wire boundary.
+     */
+    public function testErrorProtocolVectorByteMatchesBothDirections(): void
+    {
+        $v = self::loadVector('error_protocol.json');
+        $message = is_array($v['message']) ? $v['message'] : [];
+        $errorFields = is_array($message['error'] ?? null) ? $message['error'] : [];
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $p = new PurePacker();
+
+        // (a) encode: wrap the ErrorPayload in Outcome::Error.
+        $encoded = Outcome::error(ErrorPayload::fromArray($errorFields))->encode($p);
+        $this->assertSame(bin2hex($payload), bin2hex($encoded),
+            'PHP Outcome::Error(ErrorPayload) encode must byte-match error_protocol');
+
+        // (b) decode: crack the outer Outcome, then read the ErrorPayload fields.
+        $outcome = Outcome::decode($payload, $p);
+        $this->assertTrue($outcome->isError(), 'error_protocol is an Outcome::Error');
+        $this->assertSame(C::OUTCOME_ERROR, $outcome->status);
+        $this->assertSame($message['status'], $outcome->status, 'status matches vector');
+        $err = $outcome->errorPayload();
+        // `branch` is the wire byte the ErrorMapper classifies on (ErrorPayload[1]).
+        $this->assertSame($errorFields['branch'], $err->branch, 'decoded branch matches vector (ErrorPayload[1])');
+        $this->assertSame(C::BRANCH_NON_RETRYABLE, $err->branch, 'error_protocol is a NonRetryable branch');
+        $this->assertSame($errorFields['code'], $err->code, 'decoded code matches vector');
+        $this->assertSame($errorFields['message'], $err->message, 'decoded message matches vector');
+        $this->assertEquals($errorFields, $err->toArray(), 'PHP ErrorPayload decode==value for error_protocol');
+
+        // (c) fixpoint
+        $this->assertSame(bin2hex($payload), bin2hex(Outcome::error($err)->encode($p)),
+            'error_protocol decode->encode fixpoint');
+    }
+
+    /**
+     * @param array<string,mixed> $message
+     */
+    private function encodeTxRequest(string $name, array $message, PurePacker $p): string
+    {
+        return match ($name) {
+            'tx_begin_request' => BeginRequest::encode($message, $p),
+            'tx_commit' => TxControl::encode($message, $p),
+            'tx_savepoint' => SavepointRequest::encode($message, $p),
+            default => throw new \LogicException("unexpected tx request vector {$name}"),
+        };
+    }
+
+    /**
+     * @param array<int,mixed> $wire
+     * @return array<string,mixed>
+     */
+    private function decodeTxRequest(string $name, array $wire): array
+    {
+        return match ($name) {
+            'tx_begin_request' => BeginRequest::mapFromWire($wire),
+            'tx_commit' => TxControl::mapFromWire($wire),
+            'tx_savepoint' => SavepointRequest::mapFromWire($wire),
+            default => throw new \LogicException("unexpected tx request vector {$name}"),
+        };
+    }
+
+    /** @return array<string,mixed> */
+    private static function loadVector(string $file): array
+    {
+        /** @var array<string,mixed> $v */
+        $v = json_decode((string) file_get_contents(self::DIR . '/' . $file), true, 512, JSON_THROW_ON_ERROR);
+        return $v;
     }
 
     private static function wrapOk(PurePacker $p, string $body): string
