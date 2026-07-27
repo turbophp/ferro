@@ -25,8 +25,21 @@ pub struct QueryResult {
 pub trait PoolBackend: Send + Sync + 'static {
     type Conn: Send + 'static;
 
+    /// An out-of-band handle that cancels the connection's in-flight server statement (S6). It is
+    /// `Send + 'static` so it can be grabbed BEFORE a query future starts and moved into a separate
+    /// task that fires the cancel WITHOUT borrowing the `Checkout` while the query future is live —
+    /// a `tokio-postgres` query future keeps `&mut Client`, so the cancel MUST come from a SIDE
+    /// connection. Kept as an associated type so `ferro-pool` stays backend-agnostic (no pg type in
+    /// the trait); for Postgres it is a `tokio_postgres::CancelToken`.
+    type CancelHandle: Send + 'static;
+
     /// Establish a brand-new backend connection.
     async fn connect(&self) -> Result<Self::Conn, PoolError>;
+
+    /// Produce an out-of-band [`Self::CancelHandle`] for `conn`. Synchronous and borrows nothing
+    /// from `conn` beyond the handshake it needs to build the handle (for Postgres, the backend
+    /// key data captured by `Client::cancel_token`). The handle cancels via a SIDE connection.
+    fn cancel_handle(&self, conn: &Self::Conn) -> Self::CancelHandle;
 
     /// Cheap liveness check (e.g. `SELECT 1`). Used by the checkout-time health check and the
     /// background reaper.

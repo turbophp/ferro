@@ -35,6 +35,12 @@ impl FakeConn {
     }
 }
 
+/// The fake backend's no-op cancel handle (S6). There is no server statement to cancel, so this is
+/// inert — its purpose is to exercise the `Checkout::cancel_handle` -> `B::CancelHandle` surface
+/// (that it is callable on `&self` and returns a `Send + 'static` handle) without a live Postgres.
+#[derive(Debug, Clone)]
+pub struct FakeCancelHandle;
+
 /// A `FakeBackend` connects instantly and never touches the network. `next_id` is atomic so
 /// `connect()` only needs `&self` (matching the trait), matching how a real pool shares one
 /// backend across many concurrent checkouts.
@@ -57,6 +63,10 @@ pub struct FakeBackend {
     /// it via `set_query_result` so the guarded `Checkout::query` path can be exercised (both the
     /// tx-control rejection AND a normal row-returning return) without a live Postgres.
     canned_query: Mutex<QueryResult>,
+    /// When `Some`, every `simple_query()` call parks on this `Notify` until `release_simple_query`
+    /// clears it (S6). Lets a test freeze the checkout-time recycle ROLLBACK to prove the
+    /// bounded-recycle timeout EVICTS the poisoned conn rather than hanging a future checkout.
+    simple_query_gate: Mutex<Option<Arc<Notify>>>,
 }
 
 impl FakeBackend {
@@ -67,6 +77,7 @@ impl FakeBackend {
             ping_gate: Mutex::new(None),
             pings_waiting: AtomicU64::new(0),
             canned_query: Mutex::new(QueryResult::default()),
+            simple_query_gate: Mutex::new(None),
         }
     }
 
@@ -102,6 +113,20 @@ impl FakeBackend {
         self.pings_waiting.load(Ordering::SeqCst)
     }
 
+    /// Arms every subsequent `simple_query()` call to block until `release_simple_query()` (S6).
+    /// Used by the bounded-recycle test to freeze the checkout-time defensive ROLLBACK.
+    pub fn block_simple_query(&self) {
+        *self.simple_query_gate.lock().unwrap() = Some(Arc::new(Notify::new()));
+    }
+
+    /// Releases every `simple_query()` call currently parked by `block_simple_query()` and clears
+    /// the gate so future calls are unaffected.
+    pub fn release_simple_query(&self) {
+        if let Some(notify) = self.simple_query_gate.lock().unwrap().take() {
+            notify.notify_waiters();
+        }
+    }
+
     /// Total number of DISTINCT connections ever created by `connect()` (i.e. the next id that
     /// would be handed out). Used by the reaper-cap test to assert the pool never over-provisions
     /// past `max_size`.
@@ -113,6 +138,11 @@ impl FakeBackend {
 #[async_trait]
 impl PoolBackend for FakeBackend {
     type Conn = FakeConn;
+    type CancelHandle = FakeCancelHandle;
+
+    fn cancel_handle(&self, _conn: &Self::Conn) -> Self::CancelHandle {
+        FakeCancelHandle
+    }
 
     async fn connect(&self) -> Result<Self::Conn, PoolError> {
         let should_fail = self
@@ -166,6 +196,13 @@ impl PoolBackend for FakeBackend {
 
     async fn simple_query(&self, conn: &mut Self::Conn, sql: &str) -> Result<u64, PoolError> {
         conn.recorded.push(sql.to_string());
+        // Test-only gate (see `block_simple_query`/`release_simple_query`): if armed, park here so
+        // the bounded-recycle test can freeze a checkout-time defensive ROLLBACK and prove the
+        // recycle timeout evicts the conn instead of hanging.
+        let gate = self.simple_query_gate.lock().unwrap().clone();
+        if let Some(notify) = gate {
+            notify.notified().await;
+        }
         Ok(0)
     }
 

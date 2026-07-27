@@ -127,22 +127,32 @@ impl<B: PoolBackend> Pool<B> {
                 continue;
             }
 
-            if idle_conn.tx_open {
-                match self
-                    .inner
-                    .backend
-                    .simple_query(&mut idle_conn.conn, "ROLLBACK")
-                    .await
-                {
-                    Ok(_) => idle_conn.tx_open = false,
-                    Err(_) => continue, // cleanup failed: evict + try again
-                }
-            }
-
-            if idle_conn.tainted {
-                match self.inner.backend.reset(&mut idle_conn.conn).await {
-                    Ok(_) => idle_conn.tainted = false,
-                    Err(_) => continue, // cleanup failed: evict + try again
+            // BOUNDED recycle (S6 BLOCKER-half): a poisoned `tx_open`/`tainted` conn whose
+            // defensive ROLLBACK/reset HANGS must not block a future checkout unboundedly, so the
+            // cleanup runs under a timeout. On timeout — OR a cleanup error — EVICT the conn (drop
+            // it and try the next idle one / connect fresh), never wait on it forever. NOTE: the
+            // `checkout_timeout` at the top of `checkout()` wraps ONLY the permit acquire, not this
+            // pop/rollback/reset loop, so without this bound a single wedged conn could stall every
+            // subsequent checkout. Reuses `checkout_timeout` as the per-conn cleanup bound.
+            if idle_conn.tx_open || idle_conn.tainted {
+                let cleanup = async {
+                    if idle_conn.tx_open {
+                        self.inner
+                            .backend
+                            .simple_query(&mut idle_conn.conn, "ROLLBACK")
+                            .await?;
+                        idle_conn.tx_open = false;
+                    }
+                    if idle_conn.tainted {
+                        self.inner.backend.reset(&mut idle_conn.conn).await?;
+                        idle_conn.tainted = false;
+                    }
+                    Ok::<(), PoolError>(())
+                };
+                match tokio::time::timeout(self.inner.config.checkout_timeout, cleanup).await {
+                    Ok(Ok(())) => {}        // cleaned: hand it out below
+                    Ok(Err(_)) => continue, // cleanup errored: evict + try again
+                    Err(_) => continue,     // cleanup timed out: evict (drop) + try again
                 }
             }
 
@@ -259,18 +269,56 @@ impl<B: PoolBackend> Checkout<B> {
         self.tainted = tainted;
     }
 
-    /// The pin hook: BEGINs a transaction on the underlying connection and pins this `Checkout` to
-    /// `tx_id`. Drives the RAW, unguarded `PoolBackend::simple_query` (never `Checkout::exec` —
-    /// that guarded entry rejects bare tx-control, which would reject the pin hook's own BEGIN).
-    /// For S4 this is called directly by tests; the TX service (S6) calls it on a real BEGIN.
-    pub async fn begin_tx(&mut self, tx_id: TxId) -> Result<(), PoolError> {
+    /// The pin hook: opens a transaction on the underlying connection with an ENGINE-COMPOSED
+    /// `begin_sql` (e.g. `BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY`) and pins this `Checkout`
+    /// to `tx_id` (S6). Drives the RAW, unguarded `PoolBackend::simple_query` (never
+    /// `Checkout::query`/`exec` — those guarded entries reject bare tx-control, which would reject
+    /// the pin hook's own BEGIN). `begin_sql` MUST be engine-composed, never client-raw SQL — the
+    /// TX service composes it from the isolation/readonly request fields.
+    ///
+    /// Sets `pin`/`last_pin_cause(Tx)`/`tx_open` identically to the plain [`Checkout::begin_tx`]
+    /// (which is just `begin_tx_with(id, "BEGIN")`).
+    pub async fn begin_tx_with(&mut self, tx_id: TxId, begin_sql: &str) -> Result<(), PoolError> {
         let pool = Arc::clone(&self.pool);
         let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
-        pool.backend.simple_query(conn, "BEGIN").await?;
+        pool.backend.simple_query(conn, begin_sql).await?;
         self.pin = PinState::PinnedTx(tx_id);
         self.last_pin_cause = Some(PinCause::Tx);
         self.tx_open = true;
         Ok(())
+    }
+
+    /// Plain BEGIN pin hook — `begin_tx_with(tx_id, "BEGIN")`. For S4 this is called directly by
+    /// tests; the TX service (S6) uses `begin_tx_with` with a composed BEGIN.
+    pub async fn begin_tx(&mut self, tx_id: TxId) -> Result<(), PoolError> {
+        self.begin_tx_with(tx_id, "BEGIN").await
+    }
+
+    /// ENGINE-ONLY transaction-control passthrough (S6): runs `sql` via the RAW, UNGUARDED
+    /// `PoolBackend::simple_query` — with **NO `is_bare_tx_control` guard** — for engine-COMPOSED
+    /// `SAVEPOINT sp_n` / `RELEASE sp_n` / `ROLLBACK TO sp_n` on a pinned connection.
+    ///
+    /// MUST NEVER receive client-raw SQL. The guard on the user-facing [`Checkout::query`] /
+    /// [`Checkout::exec`] is what stops an `EXEC BEGIN`/`SAVEPOINT` from opening/managing an
+    /// untracked transaction the next tenant on this pooled connection inherits (a cross-tenant
+    /// leak — charter rule 6); this method deliberately bypasses that guard, so ONLY the engine's
+    /// own composed savepoint statements (names the engine generates, never a client string) may
+    /// flow through it.
+    pub async fn tx_control(&mut self, sql: &str) -> Result<(), PoolError> {
+        let pool = Arc::clone(&self.pool);
+        let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
+        pool.backend.simple_query(conn, sql).await.map(|_| ())
+    }
+
+    /// An out-of-band handle to cancel this connection's in-flight server statement (S6), WITHOUT
+    /// borrowing the `Checkout` while a query future is live. Grab it BEFORE starting an
+    /// interruptible statement (it borrows nothing the query future needs) and move it into a
+    /// separate task/`select!` arm that fires the cancel on a deadline/abort. For Postgres it is a
+    /// `tokio_postgres::CancelToken` that cancels via a SIDE connection; the pool stays
+    /// backend-agnostic (returns `B::CancelHandle`).
+    pub fn cancel_handle(&self) -> B::CancelHandle {
+        let conn = self.conn.as_ref().expect("Checkout conn taken before Drop");
+        self.pool.backend.cancel_handle(conn)
     }
 
     /// COMMITs the pinned transaction and unpins this `Checkout`. Raw `simple_query`, same

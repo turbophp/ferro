@@ -49,6 +49,16 @@ impl PgBackend {
 #[async_trait]
 impl PoolBackend for PgBackend {
     type Conn = PgConn;
+    type CancelHandle = tokio_postgres::CancelToken;
+
+    /// The out-of-band cancel handle (S6): `tokio_postgres::Client::cancel_token` captures this
+    /// connection's backend key data into a `Send + 'static` `CancelToken`. Cancelling it runs
+    /// `CancelToken::cancel_query` over a SIDE connection, so it can fire while the connection's own
+    /// query future is still live (which holds `&mut Client`) — the engine grabs it BEFORE starting
+    /// an interruptible statement.
+    fn cancel_handle(&self, conn: &Self::Conn) -> Self::CancelHandle {
+        conn.client.cancel_token()
+    }
 
     async fn connect(&self) -> Result<Self::Conn, PoolError> {
         let (client, connection) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)

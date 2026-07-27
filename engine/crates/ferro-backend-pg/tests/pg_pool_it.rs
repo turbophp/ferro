@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use ferro_backend_pg::PgBackend;
+use ferro_backend_pg::{PgBackend, Value};
 use ferro_pool::config::PoolConfig;
 use ferro_pool::error::{Branch, PoolError};
 use ferro_pool::pin::{PinCause, PinState, TxId};
@@ -54,6 +54,26 @@ async fn query_i32(co: &mut Checkout<PgBackend>, sql: &str) -> i32 {
 
 async fn backend_pid(co: &mut Checkout<PgBackend>) -> i32 {
     query_i32(co, "SELECT pg_backend_pid()").await
+}
+
+/// Runs `sql` through the GUARDED, row-returning `Checkout::query` (the real S6 tx-scoped exec
+/// path) and returns the first cell as a `String` (panicking if it is not a text cell). Used to
+/// OBSERVE server state (e.g. `current_setting('transaction_isolation')`) via the pool's public
+/// query surface rather than the raw client.
+async fn query_first_text(co: &mut Checkout<PgBackend>, sql: &str) -> String {
+    let result = co
+        .query(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("Checkout::query {sql:?} failed: {e:?}"));
+    match result
+        .rows
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().next())
+    {
+        Some(Value::Text(s)) => s,
+        other => panic!("expected a text cell from {sql:?}, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -310,5 +330,132 @@ async fn pg_syntax_error_classifies_as_backend_nonretryable() {
     assert_eq!(
         one, 1,
         "the connection must still be alive and usable after plain statement-level SQL errors"
+    );
+}
+
+/// S6 live: `begin_tx_with` a COMPOSED BEGIN opens the tx at the composed isolation level (observed
+/// via the guarded `Checkout::query`), and the pinned conn keeps the SAME `pg_backend_pid` across
+/// statements inside the tx.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_begin_tx_with_composed_isolation_and_same_pid() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let mut co = pool.checkout().await.expect("checkout");
+    co.begin_tx_with(TxId(1), "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY")
+        .await
+        .expect("begin_tx_with a composed BEGIN");
+    assert_eq!(co.pin_state(), PinState::PinnedTx(TxId(1)));
+    assert_eq!(co.last_pin_cause(), Some(PinCause::Tx));
+
+    // `current_setting('transaction_isolation')` is the query-friendly equivalent of `SHOW
+    // transaction_isolation` — it reflects the composed level inside the open tx.
+    let pid_before = backend_pid(&mut co).await;
+    let iso = query_first_text(&mut co, "SELECT current_setting('transaction_isolation')").await;
+    assert_eq!(
+        iso, "serializable",
+        "the composed BEGIN must set the tx isolation to serializable, got {iso:?}"
+    );
+    let pid_after = backend_pid(&mut co).await;
+    assert_eq!(
+        pid_before, pid_after,
+        "every statement inside the tx must stay pinned to the SAME backend pid"
+    );
+
+    co.rollback_tx().await.expect("rollback the read-only tx");
+    assert_eq!(co.pin_state(), PinState::Unpinned);
+}
+
+/// S6 live: `tx_control` runs engine-composed SAVEPOINT/RELEASE on a pinned conn via the UNGUARDED
+/// passthrough (the guarded `query` would reject them as bare tx-control), and the conn stays on
+/// the same backend pid throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_tx_control_savepoint_roundtrip() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let mut co = pool.checkout().await.expect("checkout");
+    co.begin_tx(TxId(9)).await.expect("begin tx");
+    let pid = backend_pid(&mut co).await;
+
+    co.tx_control("SAVEPOINT s1")
+        .await
+        .expect("SAVEPOINT s1 via tx_control");
+    co.tx_control("RELEASE s1")
+        .await
+        .expect("RELEASE s1 via tx_control");
+
+    // A fresh savepoint + ROLLBACK TO also succeeds on the pinned conn.
+    co.tx_control("SAVEPOINT s2")
+        .await
+        .expect("SAVEPOINT s2 via tx_control");
+    co.tx_control("ROLLBACK TO s2")
+        .await
+        .expect("ROLLBACK TO s2 via tx_control");
+
+    assert_eq!(
+        backend_pid(&mut co).await,
+        pid,
+        "the savepoint statements must all run on the SAME pinned backend pid"
+    );
+
+    // Sanity: the guarded query() still rejects a bare SAVEPOINT (the bypass is tx_control ONLY).
+    assert!(
+        matches!(
+            co.query("SAVEPOINT s3", &[]).await,
+            Err(PoolError::Unsupported(_))
+        ),
+        "the guarded query() must still reject bare tx-control even on a pinned conn"
+    );
+
+    co.commit_tx().await.expect("commit the tx");
+}
+
+/// S6 live: the out-of-band `cancel_handle` cancels an in-flight `Checkout::query` (`pg_sleep`),
+/// which errors with SQLSTATE 57014 (query_canceled) — NOT a hang and NOT a silent success — and
+/// the pinned conn is usable again after a `rollback_tx`. This is the deadline/abort mechanism the
+/// TX actor (next task) uses: grab the handle BEFORE the query, fire the cancel from a side task.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_cancel_handle_cancels_in_flight_query() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let mut co = pool.checkout().await.expect("checkout");
+    co.begin_tx(TxId(5)).await.expect("begin tx");
+
+    // Grab the cancel handle BEFORE starting the query — it borrows nothing from `co`, so it can
+    // fire while `co.query(..)` (which holds `&mut co`) is still live.
+    let cancel = co.cancel_handle();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = cancel.cancel_query(tokio_postgres::NoTls).await;
+    });
+
+    // A ~2s statement via the GUARDED query() path (the int8 projection keeps the result column an
+    // M0-supported type while `pg_sleep` runs in FROM). The out-of-band cancel makes it error 57014.
+    let res = co.query("SELECT 42::int8 FROM pg_sleep(2)", &[]).await;
+    canceller.await.expect("canceller task");
+
+    match res {
+        Err(PoolError::Sql { sqlstate, .. }) => assert_eq!(
+            sqlstate.as_deref(),
+            Some("57014"),
+            "an out-of-band cancel must surface as query_canceled (57014)"
+        ),
+        other => panic!("expected a 57014 Sql error from the cancelled query, got {other:?}"),
+    }
+
+    // The tx is now in an aborted state; rollback_tx brings the conn back to usable.
+    co.rollback_tx().await.expect("rollback after cancel");
+    let one = query_i32(&mut co, "SELECT 1").await;
+    assert_eq!(
+        one, 1,
+        "the pinned conn must be usable again after cancel + rollback_tx"
     );
 }
