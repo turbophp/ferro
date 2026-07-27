@@ -1,0 +1,15 @@
+{
+  "frame_hex": "f701000003000100140000000800000093a46d61696e02c2",
+  "header": {
+    "flags": 0,
+    "method": 1,
+    "request_id": 20,
+    "service": 3
+  },
+  "message": {
+    "isolation": 2,
+    "pool": "main",
+    "readonly": false
+  },
+  "name": "tx_begin_request"
+}

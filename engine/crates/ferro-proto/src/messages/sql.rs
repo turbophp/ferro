@@ -29,7 +29,7 @@ use rmp::decode as dec;
 use rmp::encode as enc;
 use serde::{Deserialize, Serialize};
 
-/// `EXEC` request (service `SQL`, method `EXEC` = 1) — client → server. A positional fixarray of 7
+/// `EXEC` request (service `SQL`, method `EXEC` = 1) — client → server. A positional fixarray of 8
 /// fields in declaration order (`/proto/PROTOCOL.md` §8.1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecRequest {
@@ -41,12 +41,16 @@ pub struct ExecRequest {
     pub readonly: bool,
     /// 0 = rows, 1 = none (affected only), 2 = stream (reserved; rejected `Unsupported` in M0).
     pub fetch: u8,
+    /// Optional transaction id (S6): `Some` routes this EXEC to the actor pinning that tx's conn,
+    /// `None` is the autocommit path. Bounded < 2^63, so an opt-u64 native int (NOT the u32 opt
+    /// helpers, which would truncate it).
+    pub tx_id: Option<u64>,
 }
 
 impl ExecRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        enc::write_array_len(&mut out, 7).unwrap();
+        enc::write_array_len(&mut out, 8).unwrap();
         enc::write_str(&mut out, &self.pool).unwrap();
         write_opt_str(&mut out, &self.sql);
         write_opt_str(&mut out, &self.query_id);
@@ -58,6 +62,7 @@ impl ExecRequest {
         enc::write_bool(&mut out, self.readonly).unwrap();
         // fetch is unsigned; write_uint narrows 0/1/2 to a positive fixint (mirrors PHP packUint).
         enc::write_uint(&mut out, self.fetch as u64).unwrap();
+        write_opt_u64(&mut out, &self.tx_id);
         out
     }
 
@@ -65,8 +70,8 @@ impl ExecRequest {
         let mut rd: &[u8] = b;
         let n = dec::read_array_len(&mut rd)
             .map_err(|e| CodecError::Malformed(format!("ExecRequest array: {e:?}")))?;
-        if n != 7 {
-            return Err(CodecError::Malformed(format!("ExecRequest len {n} != 7")));
+        if n != 8 {
+            return Err(CodecError::Malformed(format!("ExecRequest len {n} != 8")));
         }
         let pool = read_str(&mut rd)?;
         let sql = read_opt_str(&mut rd)?;
@@ -83,6 +88,7 @@ impl ExecRequest {
         let readonly = read_bool(&mut rd)?;
         let fetch: u8 =
             dec::read_int(&mut rd).map_err(|e| CodecError::Malformed(format!("fetch: {e:?}")))?;
+        let tx_id = read_opt_u64(&mut rd)?;
         if !rd.is_empty() {
             return Err(CodecError::TrailingBytes(rd.len()));
         }
@@ -94,6 +100,7 @@ impl ExecRequest {
             timeout_ms,
             readonly,
             fetch,
+            tx_id,
         })
     }
 }
@@ -273,6 +280,17 @@ fn write_opt_u32(out: &mut Vec<u8>, v: &Option<u32>) {
     }
 }
 
+/// Opt-u64 sibling of `write_opt_u32`. `tx_id` is a full 64-bit counter (bounded < 2^63 but wider
+/// than u32), so it MUST use this — the u32 helper would truncate any value above `u32::MAX`.
+fn write_opt_u64(out: &mut Vec<u8>, v: &Option<u64>) {
+    match v {
+        None => enc::write_nil(out).unwrap(),
+        Some(n) => {
+            enc::write_uint(out, *n).unwrap();
+        }
+    }
+}
+
 fn write_opt_value(out: &mut Vec<u8>, v: &Option<Value>) {
     match v {
         None => enc::write_nil(out).unwrap(),
@@ -292,6 +310,16 @@ fn read_opt_u32(rd: &mut &[u8]) -> Result<Option<u32>, CodecError> {
         return Ok(None);
     }
     let n: u32 = dec::read_int(rd).map_err(|e| CodecError::Malformed(format!("opt u32: {e:?}")))?;
+    Ok(Some(n))
+}
+
+/// Opt-u64 sibling of `read_opt_u32` (same bare-nil peek rule); reads `tx_id` at full width so a
+/// value above `u32::MAX` survives the round trip instead of being truncated.
+fn read_opt_u64(rd: &mut &[u8]) -> Result<Option<u64>, CodecError> {
+    if peek_nil(rd)? {
+        return Ok(None);
+    }
+    let n: u64 = dec::read_int(rd).map_err(|e| CodecError::Malformed(format!("opt u64: {e:?}")))?;
     Ok(Some(n))
 }
 

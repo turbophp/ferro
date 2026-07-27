@@ -138,6 +138,7 @@ impl DemoClient {
             timeout_ms: None,
             readonly,
             fetch,
+            tx_id: None,
         };
         self.send(Self::frame(
             service::SQL,

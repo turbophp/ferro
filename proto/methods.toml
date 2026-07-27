@@ -30,6 +30,17 @@ WINDOW_UPDATE = 6
 [methods.sql]
 EXEC = 1
 
+# TX service (§6/§7, S6). Transaction lifecycle over a connection pinned to a `tx_id` (NOT the
+# client socket). BEGIN mints a tx_id; COMMIT/ROLLBACK end it and release the pinned conn;
+# SAVEPOINT/RELEASE/ROLLBACK_TO drive the engine-named savepoint stack. (Service `TX = 3` above.)
+[methods.tx]
+BEGIN       = 1
+COMMIT      = 2
+ROLLBACK    = 3
+SAVEPOINT   = 4
+RELEASE     = 5
+ROLLBACK_TO = 6
+
 # Terminal outcome-envelope status discriminant (decision W-4). In /proto so both codecs
 # generate it rather than hand-writing 0/1/2 (charter rule 2).
 [outcome]

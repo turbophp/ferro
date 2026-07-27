@@ -35,6 +35,7 @@ fn exec_request_roundtrip_full() {
         timeout_ms: Some(5000),
         readonly: false,
         fetch: 0,
+        tx_id: Some(7),
     };
     assert_eq!(ExecRequest::decode(&r.encode()).unwrap(), r);
 }
@@ -49,8 +50,38 @@ fn exec_request_roundtrip_minimal_options_absent() {
         timeout_ms: None,
         readonly: true,
         fetch: 1,
+        tx_id: None,
     };
     assert_eq!(ExecRequest::decode(&r.encode()).unwrap(), r);
+}
+
+#[test]
+fn exec_request_tx_id_opt_u64_roundtrip_no_truncation() {
+    // `None` => a bare nil in slot 8; `Some` => a native uint at full u64 width. A value ABOVE
+    // u32::MAX proves opt-u64 (not the u32 opt helper) is on the path — a truncating helper would
+    // drop the high 32 bits and fail this round trip.
+    let none = ExecRequest {
+        pool: "p".into(),
+        sql: Some("SELECT 1".into()),
+        query_id: None,
+        params: vec![],
+        timeout_ms: None,
+        readonly: true,
+        fetch: 0,
+        tx_id: None,
+    };
+    assert_eq!(
+        none.encode().last(),
+        Some(&0xc0),
+        "tx_id None is a trailing bare nil"
+    );
+    assert_eq!(ExecRequest::decode(&none.encode()).unwrap(), none);
+
+    let wide = ExecRequest {
+        tx_id: Some(0x1_0000_0000), // > u32::MAX, < 2^63
+        ..none.clone()
+    };
+    assert_eq!(ExecRequest::decode(&wide.encode()).unwrap(), wide);
 }
 
 #[test]
@@ -65,6 +96,7 @@ fn exec_request_params_carry_divergent_range_ints() {
         timeout_ms: None,
         readonly: true,
         fetch: 0,
+        tx_id: None,
     };
     let bytes = r.encode();
     assert!(contains_subslice(&bytes, &[0xcc, 0xc8]), "I64(200) uint8");
@@ -168,6 +200,7 @@ fn exec_request_trailing_bytes_rejected() {
         timeout_ms: None,
         readonly: true,
         fetch: 0,
+        tx_id: None,
     };
     let mut b = r.encode();
     b.push(0xff);
@@ -202,8 +235,10 @@ fn exec_ok_trailing_bytes_rejected() {
 
 #[test]
 fn exec_request_oversized_params_len_refused() {
-    // fixarray(7), pool "", sql nil, query_id nil, params array32(u32::MAX)
-    let b = [0x97u8, 0xa0, 0xc0, 0xc0, 0xdd, 0xff, 0xff, 0xff, 0xff];
+    // fixarray(8), pool "", sql nil, query_id nil, params array32(u32::MAX). The leading byte MUST
+    // be 0x98 (arity 8): with the old 0x97 the decode would fail the `n != 8` arity check BEFORE
+    // reaching the params `bound_len` path this test exists to exercise (a vacuous pass).
+    let b = [0x98u8, 0xa0, 0xc0, 0xc0, 0xdd, 0xff, 0xff, 0xff, 0xff];
     assert!(ExecRequest::decode(&b).is_err());
 }
 

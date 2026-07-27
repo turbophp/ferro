@@ -1,0 +1,13 @@
+{
+  "frame_hex": "f7010000030002001500000002000000912a",
+  "header": {
+    "flags": 0,
+    "method": 2,
+    "request_id": 21,
+    "service": 3
+  },
+  "message": {
+    "tx_id": 42
+  },
+  "name": "tx_commit"
+}

@@ -42,7 +42,7 @@ fn message_payloads_are_canonical_and_byte_stable() {
     // proves the on-disk bytes ARE the canonical encoder output (encode==bytes at the message
     // level), and that decode->encode is a fixpoint. This is the Rust half of the cross-language
     // byte lock; the PHP half asserts PurePacker re-encodes to these same bytes (Task 9).
-    use ferro_proto::consts::{flags, method_core as mc, method_sql, service};
+    use ferro_proto::consts::{flags, method_core as mc, method_sql, method_tx, service};
     use ferro_proto::messages::*;
     for entry in fs::read_dir(vectors_dir()).unwrap() {
         let p = entry.unwrap().path();
@@ -87,6 +87,31 @@ fn message_payloads_are_canonical_and_byte_stable() {
                         ExecOk::decode(body).unwrap().encode(),
                         *body,
                         "ExecOk body for {:?} is not canonical / byte-stable",
+                        p.file_name().unwrap()
+                    );
+                }
+                outcome.encode()
+            }
+            // TX request messages (no END flag): positional message payloads.
+            (s, m) if s == service::TX && m == method_tx::BEGIN && (h.flags & flags::END) == 0 => {
+                BeginRequest::decode(payload).unwrap().encode()
+            }
+            (s, m) if s == service::TX && m == method_tx::COMMIT => {
+                TxControl::decode(payload).unwrap().encode()
+            }
+            (s, m) if s == service::TX && m == method_tx::SAVEPOINT => {
+                SavepointRequest::decode(payload).unwrap().encode()
+            }
+            // A TX BEGIN response (END flag) is a terminal Outcome::Ok(BeginResponse body). CRACK
+            // the body so Rust is an independent arbiter for the tx_id response, then re-encode the
+            // whole Outcome for the outer byte-stability assertion below.
+            (s, m) if s == service::TX && m == method_tx::BEGIN => {
+                let outcome = Outcome::decode(payload).unwrap();
+                if let Outcome::Ok(body) = &outcome {
+                    assert_eq!(
+                        BeginResponse::decode(body).unwrap().encode(),
+                        *body,
+                        "BeginResponse body for {:?} is not canonical / byte-stable",
                         p.file_name().unwrap()
                     );
                 }

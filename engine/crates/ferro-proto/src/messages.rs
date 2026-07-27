@@ -51,6 +51,12 @@ msg!(ErrorPayload {
     message: String, detail: Option<String>, retry_after_ms: Option<u32>
 });
 
+/// TX-service messages (`Value`-free) ride the `msg!`/rmp-serde path, so `tx` is declared AFTER the
+/// `msg!` definition above — a `macro_rules!` macro is in textual scope only for modules that follow
+/// it. (`sql` sits at the top of this file and cannot use `msg!`, which is why its codec is hand-rolled.)
+pub mod tx;
+pub use tx::{BeginRequest, BeginResponse, Isolation, SavepointRequest, TxControl};
+
 /// Terminal outcome envelope `[status, body]` (decision W-4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {

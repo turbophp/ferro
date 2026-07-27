@@ -459,6 +459,7 @@ pub fn req(sql: &str) -> ExecRequest {
         timeout_ms: None,
         readonly: true,
         fetch: 0,
+        tx_id: None,
     }
 }
 

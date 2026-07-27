@@ -70,11 +70,13 @@ locked by the golden vectors, not by this prose, but this prose explains what th
   authoritative for this case and MUST decode such a value to a decimal string instead. Rust has no
   such limit (`u64` is native). Only **full-range** `u64` fields need this treatment. The wire has
   exactly one today: `HelloAck.boot_epoch` (a random per-start id, §19.1). All OTHER `u64` fields
-  are contractually **bounded < 2^63** and are decoded as native PHP ints: `ExecOk.affected` and the
-  four `Stats` fields (`queue_us`, `exec_us`, `rows`, `bytes`) — rows affected, microsecond timings,
-  and a frame-bounded byte count cannot approach 2^63. (The Rust encoder carries a debug-mode
-  `debug_assert!` tripwire on these fields; a future field that outgrows the bound must either adopt
-  the `boot_epoch` decimal-string treatment or be documented here.)
+  are contractually **bounded < 2^63** and are decoded as native PHP ints: `ExecOk.affected`, the
+  four `Stats` fields (`queue_us`, `exec_us`, `rows`, `bytes`), and the TX `tx_id`
+  (`ExecRequest.tx_id`, `BeginResponse.tx_id`, `TxControl.tx_id`, `SavepointRequest.tx_id` — a
+  monotonic never-reused counter, §7) — rows affected, microsecond timings, a frame-bounded byte
+  count, and a per-daemon transaction counter cannot approach 2^63. (The Rust encoder carries a
+  debug-mode `debug_assert!` tripwire on the `Stats`/`affected` fields; a future field that outgrows
+  the bound must either adopt the `boot_epoch` decimal-string treatment or be documented here.)
 
 ## 3. TypedValue (`Value`)
 
@@ -211,14 +213,14 @@ Three rules apply throughout §8:
 
 - **Strict arity.** Every positional array is fixed-shape, and a conforming decoder MUST read the
   declared array length and REJECT a mismatch (it MUST NOT read a fixed number of fields and ignore
-  the prefix). The required lengths: `ExecRequest` = 7, `ExecOk` = 5, `ColMeta` = 2 (`[name, tag]`),
+  the prefix). The required lengths: `ExecRequest` = 8, `ExecOk` = 5, `ColMeta` = 2 (`[name, tag]`),
   and each `Value` = 2 (`[tag, payload]`, §3). Both reference codecs enforce this; a lax third
   implementation that trusted a shorter/longer prefix would mis-frame every following field.
 - **`Option<Value>` peek rule.** An optional `Value` slot (`ExecOk.last_insert_id`) is a bare
   `nil` (`0xc0`) when absent, else the value's own `[tag, payload]` encoding. Decoders peek the
   first byte: `0xc0` ⇒ absent; anything else ⇒ decode a `Value`. This is unambiguous because a
   present `Value::Null` encodes as the fixarray `[NULL, nil]` (first byte `0x92`), never a bare
-  `0xc0`. (Optional scalars — `sql`, `query_id`, `timeout_ms` — follow the same nil-vs-value rule.)
+  `0xc0`. (Optional scalars — `sql`, `query_id`, `timeout_ms`, `tx_id` — follow the same nil-vs-value rule.)
 - **`array16` threshold.** Array length prefixes narrow by count: fixarray (`0x9_`) for ≤15
   elements, `array16` (`0xdc` + `u16` BE) for 16..=65535, `array32` (`0xdd` + `u32` BE) beyond.
   A result with ≥16 columns or ≥16 cells in a row therefore emits `0xdc`; both codecs must agree at
@@ -228,7 +230,7 @@ Three rules apply throughout §8:
 
 ### 8.1 `ExecRequest` (service `SQL`, method `EXEC` = 1) — client → server
 
-A positional fixarray of 7 fields in declaration order (payload of a non-`END` `EXEC` frame):
+A positional fixarray of 8 fields in declaration order (payload of a non-`END` `EXEC` frame):
 
 | # | field | type | notes |
 |---|---|---|---|
@@ -239,6 +241,7 @@ A positional fixarray of 7 fields in declaration order (payload of a non-`END` `
 | 5 | `timeout_ms` | `u32 \| nil` | per-statement deadline hint |
 | 6 | `readonly` | `bool` | client-declared; drives the write-loss → `Indeterminate` split (no engine inference) |
 | 7 | `fetch` | `u8` | `0` = rows, `1` = none (affected only), `2` = stream (reserved; `Unsupported` in M0) |
+| 8 | `tx_id` | `u64 \| nil` | S6: `nil` = autocommit; a value routes this EXEC to the actor pinning that tx's conn (§9). Bounded < 2^63 (native int, §2); the opt-u64 nil/value peek rule (below) applies |
 
 ### 8.2 `ExecOk` — terminal `Outcome::Ok` body — server → client
 
@@ -268,4 +271,81 @@ cursor (a whole-slice decode would spuriously reject the trailing bytes that alw
 (≥16 cols and a ≥16-cell row — locks the `array16` marker `0xdc`), `sql_exec_response_nullid`
 (`Some(Value::Null)` — locks the `[NULL, nil]` = `92 00 c0` vs bare-`c0` `None` disambiguation),
 `sql_exec_response_typedvalue` (a row carrying the full M0 scalar set — the S1-deferral shared
-cross-language arbiter, including a `Bytes` whose first byte is the `0xc0` nil marker).
+cross-language arbiter, including a `Bytes` whose first byte is the `0xc0` nil marker), and
+`sql_exec_request_intx` (a tx-scoped EXEC with `tx_id = Some(7)` — locks the field-8 opt-u64
+`Some` path; the regenerated `select1`/`params` request vectors lock the `None` path as a trailing
+bare `nil`).
+
+## 9. TX service messages (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`/`RELEASE`/`ROLLBACK_TO`)
+
+The TX service (`SERVICE_TX = 3`, S6) runs a transaction on a pooled connection **pinned to a
+`tx_id`, not to the client socket** (SPEC §4/§7). `BEGIN` mints a `tx_id`; tx-scoped `EXEC` (§8.1
+with `tx_id = Some(..)`) and the savepoint methods run on that pinned conn; `COMMIT`/`ROLLBACK` end
+it and release the conn. The methods are registry `methods.tx` (`/proto/registry.lock.json`): `BEGIN
+= 1`, `COMMIT = 2`, `ROLLBACK = 3`, `SAVEPOINT = 4`, `RELEASE = 5`, `ROLLBACK_TO = 6`.
+
+Unlike `EXEC`, the TX messages are **`Value`-free**, so they use the same plain rmp-serde positional
+layout (fixarray of fields in declaration order, `Option<T>` present as bare `nil` when absent) as
+the core messages (§4) — not the bespoke `Value`-splicing codec. `tx_id` is a monotonic never-reused
+counter, contractually **bounded < 2^63** (§2), so it is a native PHP int, NOT the `boot_epoch`
+decimal-string treatment.
+
+### 9.1 `Isolation` (a message-field `u8`, not a registry constant)
+
+`BeginRequest.isolation` is an optional `u8`. It is a message-field VALUE, not a `/proto` registry
+constant (it is neither a method id, flag, error code, nor type tag — charter rule 2's
+source-of-truth scope), so the mapping is fixed HERE and in `ferro-proto` `messages::tx::Isolation`,
+never in `methods.toml`:
+
+| value | level |
+|---|---|
+| 0 | `READ COMMITTED` |
+| 1 | `REPEATABLE READ` |
+| 2 | `SERIALIZABLE` |
+
+There is no fourth value: PostgreSQL's `READ UNCOMMITTED` is an alias for `READ COMMITTED` and maps
+to `0`. `nil` means "engine/pool default".
+
+### 9.2 `BeginRequest` (service `TX`, method `BEGIN` = 1) — client → server
+
+A positional fixarray of 3 fields:
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `pool` | `str` | target pool name |
+| 2 | `isolation` | `u8 \| nil` | §9.1; `nil` = default |
+| 3 | `readonly` | `bool` | client-declared read-only tx (a write → PG `25006` → `NonRetryable`) |
+
+### 9.3 `BeginResponse` — terminal `Outcome::Ok` body — server → client
+
+`BEGIN`'s success result is the single `END` frame's `Outcome::Ok` body (§6): `[OUTCOME_OK,
+<BeginResponse>]`. `BeginResponse` is a positional fixarray of 1 field, and composes into the
+envelope exactly as `ExecOk` does because its encoding is one complete MessagePack value:
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `tx_id` | `u64` | the minted transaction id; bounded < 2^63 (§2) |
+
+### 9.4 `TxControl` (service `TX`, methods `COMMIT` = 2 / `ROLLBACK` = 3) — client → server
+
+The method id in the frame header selects commit vs rollback; the body is a positional fixarray of
+1 field:
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `tx_id` | `u64` | the transaction to end |
+
+### 9.5 `SavepointRequest` (service `TX`, methods `SAVEPOINT` = 4 / `RELEASE` = 5 / `ROLLBACK_TO` = 6) — client → server
+
+The method id selects the savepoint operation; the body is a positional fixarray of 2 fields:
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `tx_id` | `u64` | the owning transaction |
+| 2 | `name` | `str \| nil` | savepoint name; `nil` ⇒ the engine names it (`sp_<n>` stack) |
+
+### 9.6 TX vector index
+
+`tx_begin_request` (`SERIALIZABLE`, not readonly), `tx_begin_response` (the terminal
+`Outcome::Ok(BeginResponse)` envelope, locking the one-field-msg-composes-with-`Outcome::Ok` path),
+`tx_commit` (a bare `TxControl`), and `tx_savepoint` (a named `SavepointRequest`).

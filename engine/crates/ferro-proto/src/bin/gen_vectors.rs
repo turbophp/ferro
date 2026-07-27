@@ -1,6 +1,6 @@
 //! Emit deterministic golden vectors: for each case, build the full frame (header+payload),
 //! and write {name, header, message(json), frame_hex}. Also emit malformed negative .bin seeds.
-use ferro_proto::consts::{self, flags, method_core, method_sql, service};
+use ferro_proto::consts::{self, flags, method_core, method_sql, method_tx, service};
 use ferro_proto::header::Header;
 use ferro_proto::messages::*;
 use ferro_proto::value::Value;
@@ -88,6 +88,7 @@ fn exec_request_json(r: &ExecRequest) -> serde_json::Value {
         "timeout_ms": r.timeout_ms,
         "readonly": r.readonly,
         "fetch": r.fetch,
+        "tx_id": r.tx_id,
     })
 }
 fn exec_ok_json(ok: &ExecOk) -> serde_json::Value {
@@ -227,6 +228,7 @@ fn main() {
         timeout_ms: None,
         readonly: true,
         fetch: 0,
+        tx_id: None,
     };
     write_case(
         "sql_exec_request_select1",
@@ -255,6 +257,7 @@ fn main() {
         timeout_ms: Some(5000),
         readonly: false,
         fetch: 0,
+        tx_id: None,
     };
     write_case(
         "sql_exec_request_params",
@@ -264,6 +267,29 @@ fn main() {
         12,
         req_params.encode(),
         exec_request_json(&req_params),
+    );
+
+    // A tx-scoped EXEC (S6): the S5 EXEC method carrying an optional `tx_id`. The value is SMALL
+    // (7) because `tx_id` is bounded < 2^63 — a > PHP_INT_MAX value would make PurePacker emit a
+    // decimal string that `(int)`-casts wrong and redden the PHP byte-match. Locks opt-u64 `Some`.
+    let req_intx = ExecRequest {
+        pool: "main".into(),
+        sql: Some("SELECT 1".into()),
+        query_id: None,
+        params: vec![],
+        timeout_ms: None,
+        readonly: false,
+        fetch: 0,
+        tx_id: Some(7),
+    };
+    write_case(
+        "sql_exec_request_intx",
+        0,
+        service::SQL,
+        method_sql::EXEC,
+        19,
+        req_intx.encode(),
+        exec_request_json(&req_intx),
     );
 
     let resp_select1 = ExecOk {
@@ -404,6 +430,64 @@ fn main() {
         },
     };
     write_sql_response("sql_exec_response_typedvalue", 18, &resp_typedvalue);
+
+    // --- TX service vectors (S6; /proto/PROTOCOL.md §9). Requests are the positional message
+    // payload (flags 0). tx_begin_response is the terminal Outcome::Ok(BeginResponse) envelope
+    // (flag END), mirroring how sql_exec_response_* wrap ExecOk. `tx_id` is a small native int. ---
+    let begin_req = BeginRequest {
+        pool: "main".into(),
+        isolation: Some(Isolation::Serializable.into()), // 2
+        readonly: false,
+    };
+    write_case(
+        "tx_begin_request",
+        0,
+        service::TX,
+        method_tx::BEGIN,
+        20,
+        begin_req.encode(),
+        serde_json::json!({
+            "pool": begin_req.pool,
+            "isolation": begin_req.isolation,
+            "readonly": begin_req.readonly,
+        }),
+    );
+
+    let begin_resp = BeginResponse { tx_id: 42 };
+    write_case(
+        "tx_begin_response",
+        flags::END,
+        service::TX,
+        method_tx::BEGIN,
+        20,
+        Outcome::Ok(begin_resp.encode()).encode(),
+        serde_json::json!({ "status": consts::outcome::OK, "tx_id": begin_resp.tx_id }),
+    );
+
+    let commit = TxControl { tx_id: 42 };
+    write_case(
+        "tx_commit",
+        0,
+        service::TX,
+        method_tx::COMMIT,
+        21,
+        commit.encode(),
+        serde_json::json!({ "tx_id": commit.tx_id }),
+    );
+
+    let savepoint = SavepointRequest {
+        tx_id: 42,
+        name: Some("sp_1".into()),
+    };
+    write_case(
+        "tx_savepoint",
+        0,
+        service::TX,
+        method_tx::SAVEPOINT,
+        22,
+        savepoint.encode(),
+        serde_json::json!({ "tx_id": savepoint.tx_id, "name": savepoint.name }),
+    );
 
     // Negative seeds (decoder must reject; also fuzz corpus).
     let mut bad_magic = frame(

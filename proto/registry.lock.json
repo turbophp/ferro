@@ -29,6 +29,14 @@
     },
     "sql": {
       "EXEC": 1
+    },
+    "tx": {
+      "BEGIN": 1,
+      "COMMIT": 2,
+      "RELEASE": 5,
+      "ROLLBACK": 3,
+      "ROLLBACK_TO": 6,
+      "SAVEPOINT": 4
     }
   },
   "features": {

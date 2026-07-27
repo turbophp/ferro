@@ -33,6 +33,12 @@ final class Constants
     public const METHOD_CORE_PONG = 4;
     public const METHOD_CORE_WINDOW_UPDATE = 6;
     public const METHOD_SQL_EXEC = 1;
+    public const METHOD_TX_BEGIN = 1;
+    public const METHOD_TX_COMMIT = 2;
+    public const METHOD_TX_RELEASE = 5;
+    public const METHOD_TX_ROLLBACK = 3;
+    public const METHOD_TX_ROLLBACK_TO = 6;
+    public const METHOD_TX_SAVEPOINT = 4;
 
     public const OUTCOME_CANCELLED = 2;
     public const OUTCOME_ERROR = 1;

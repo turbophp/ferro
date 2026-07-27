@@ -5,15 +5,16 @@ use Ferro\Protocol\Msgpack\PackerInterface;
 
 /**
  * Bespoke positional codec for the SQL EXEC request (service SQL, method EXEC = 1). Mirrors the Rust
- * `messages::sql::ExecRequest` BYTES (a fixarray of 7 fields in declaration order — pool, sql?,
- * query_id?, params, timeout_ms?, readonly, fetch — see /proto/PROTOCOL.md §8.1). Not msg!/rmp-serde
- * on the Rust side because it carries TypedValues; the two languages mirror bytes, not decode
- * structure, so PHP unpacks the whole body and walks the nested arrays. Encodes from / decodes to the
- * golden-vector "message" JSON shape; the S7 runtime binds real DTOs.
+ * `messages::sql::ExecRequest` BYTES (a fixarray of 8 fields in declaration order — pool, sql?,
+ * query_id?, params, timeout_ms?, readonly, fetch, tx_id? — see /proto/PROTOCOL.md §8.1). Not
+ * msg!/rmp-serde on the Rust side because it carries TypedValues; the two languages mirror bytes, not
+ * decode structure, so PHP unpacks the whole body and walks the nested arrays. `tx_id` is bounded
+ * < 2^63 so it stays a native int (optUint/nullableInt). Encodes from / decodes to the golden-vector
+ * "message" JSON shape; the S7 runtime binds real DTOs.
  */
 final class ExecRequest
 {
-    /** @param array<string,mixed> $m @return string the encoded fixarray(7) payload */
+    /** @param array<string,mixed> $m @return string the encoded fixarray(8) payload */
     public static function encode(array $m, PackerInterface $p): string
     {
         $params = SqlValueCodec::listOf($m['params'] ?? null);
@@ -28,19 +29,20 @@ final class ExecRequest
             self::optUint($p, $m['timeout_ms'] ?? null),
             $p->packBool((bool) ($m['readonly'] ?? false)),
             $p->packUint(SqlValueCodec::toInt($m['fetch'] ?? 0)),
+            self::optUint($p, $m['tx_id'] ?? null),
         ];
-        return $p->packArrayLen(7) . implode('', $fields);
+        return $p->packArrayLen(8) . implode('', $fields);
     }
 
     /**
-     * Map an already-unpacked 7-element wire array back to the "message" JSON shape.
+     * Map an already-unpacked 8-element wire array back to the "message" JSON shape.
      * @param array<int,mixed> $w
      * @return array<string,mixed>
      */
     public static function mapFromWire(array $w): array
     {
         $w = array_values($w);
-        if (count($w) !== 7) { throw new CodecException('ExecRequest arity != 7'); }
+        if (count($w) !== 8) { throw new CodecException('ExecRequest arity != 8'); }
         $params = SqlValueCodec::listOf($w[3]);
         return [
             'pool' => SqlValueCodec::toStr($w[0]),
@@ -50,6 +52,7 @@ final class ExecRequest
             'timeout_ms' => SqlValueCodec::nullableInt($w[4]),
             'readonly' => (bool) $w[5],
             'fetch' => SqlValueCodec::toInt($w[6]),
+            'tx_id' => SqlValueCodec::nullableInt($w[7]),
         ];
     }
 

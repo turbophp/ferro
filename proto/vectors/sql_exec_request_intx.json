@@ -1,9 +1,9 @@
 {
-  "frame_hex": "f7010000020001000b0000001500000098a46d61696ea853454c4543542031c090c0c300c0",
+  "frame_hex": "f701000002000100130000001500000098a46d61696ea853454c4543542031c090c0c20007",
   "header": {
     "flags": 0,
     "method": 1,
-    "request_id": 11,
+    "request_id": 19,
     "service": 2
   },
   "message": {
@@ -11,10 +11,10 @@
     "params": [],
     "pool": "main",
     "query_id": null,
-    "readonly": true,
+    "readonly": false,
     "sql": "SELECT 1",
     "timeout_ms": null,
-    "tx_id": null
+    "tx_id": 7
   },
-  "name": "sql_exec_request_select1"
+  "name": "sql_exec_request_intx"
 }
