@@ -1,0 +1,27 @@
+[package]
+name = "ferro-bench"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# ferro-bench is a PURE ORCHESTRATOR (decision B-1). It launches a release `ferrod` and the PHP
+# bench scripts as child processes and aggregates their emitted samples — it deliberately does NOT
+# link the Rust client or any engine crate, so the measured path is exactly the shipped PHP client
+# -> ferrod wire path, not an in-process shortcut.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `signal` gives us nix::sys::signal::kill for the panic-safe ferrod teardown Drop guard [V8].
+nix = { version = "0.29", features = ["signal"] }
+
+[lib]
+name = "ferro_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferro-bench"
+path = "src/main.rs"

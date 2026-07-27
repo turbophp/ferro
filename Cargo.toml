@@ -1,8 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["engine/crates/*"]
-# NOTE: `bench` (decision B-1) is added to `members` in slice S8 when the crate is created.
-# Listing a non-existent path here fails workspace resolution, so it is added just-in-time.
+members = ["engine/crates/*", "bench"]
+# NOTE: `bench` (decision B-1) was added to `members` in slice S8 when the crate was created
+# (the D12 boundary-latency benchmark / M0 exit gate). Listing a non-existent path here fails
+# workspace resolution, so it stayed out until the crate existed.
 
 [workspace.package]
 edition = "2024"

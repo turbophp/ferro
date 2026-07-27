@@ -189,6 +189,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferro-bench"
+version = "0.0.0"
+dependencies = [
+ "nix",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ferro-e2e"
 version = "0.0.0"
 dependencies = [

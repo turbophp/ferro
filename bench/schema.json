@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ferro.dev/bench/schema.json",
+  "title": "Ferro D12 bench result",
+  "description": "Self-contained, schema-validated D12 boundary-latency measurement (the M0 exit gate, SPEC §16.1 / §21 D12). Reference schema for bench/results/*.json; the authoritative structural check is BenchResult::validate() in bench/src/result.rs.",
+  "type": "object",
+  "required": ["schema_version", "d12", "params", "manifest", "runs", "overhead_vs_pdo", "fanout"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "d12": {
+      "type": "object",
+      "required": ["provisional", "reference", "target_p50_ns", "target_p99_ns"],
+      "additionalProperties": false,
+      "properties": {
+        "provisional": { "type": "boolean", "const": true },
+        "reference": { "type": "boolean", "const": false },
+        "target_p50_ns": { "type": "integer" },
+        "target_p99_ns": { "type": "integer" }
+      }
+    },
+    "params": {
+      "type": "object",
+      "required": ["scenario", "warmup", "measured", "transport"],
+      "additionalProperties": false,
+      "properties": {
+        "scenario": { "type": "string" },
+        "warmup": { "type": "integer" },
+        "measured": { "type": "integer" },
+        "transport": { "type": "string" }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "required": [
+        "cpu_model", "cpu_cores", "scaling_governor", "kernel", "virtualization",
+        "rustc_version", "ferrod_build_profile", "pg_image", "pg_digest",
+        "git_sha", "git_dirty", "timestamp_utc",
+        "php_version", "ext_msgpack", "pdo_pgsql", "gc_enabled", "packer_class"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "cpu_model": { "type": "string" },
+        "cpu_cores": { "type": "integer" },
+        "scaling_governor": { "type": "string" },
+        "kernel": { "type": "string" },
+        "virtualization": { "type": "string" },
+        "rustc_version": { "type": "string" },
+        "ferrod_build_profile": { "type": "string", "const": "release" },
+        "pg_image": { "type": "string" },
+        "pg_digest": { "type": "string" },
+        "git_sha": { "type": "string" },
+        "git_dirty": { "type": "boolean" },
+        "timestamp_utc": { "type": "string" },
+        "php_version": { "type": "string" },
+        "ext_msgpack": { "type": "boolean" },
+        "pdo_pgsql": { "type": "boolean" },
+        "gc_enabled": { "type": "boolean" },
+        "packer_class": { "type": "string" }
+      }
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "required": [
+          "label", "target", "jit_intended", "jit_effective", "jit_status",
+          "php_directives", "skipped", "skip_reason", "summary"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "label": { "type": "string" },
+          "target": { "type": "string", "enum": ["ferro", "pdo"] },
+          "jit_intended": { "type": "string", "enum": ["off", "on", "n/a"] },
+          "jit_effective": { "type": "string" },
+          "jit_status": {},
+          "php_directives": { "type": "array", "items": { "type": "string" } },
+          "skipped": { "type": "boolean" },
+          "skip_reason": { "type": ["string", "null"] },
+          "summary": { "$ref": "#/$defs/summary" }
+        }
+      }
+    },
+    "overhead_vs_pdo": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["jit", "p50_ns", "p99_ns"],
+        "additionalProperties": false,
+        "properties": {
+          "jit": { "type": "string" },
+          "p50_ns": { "type": "integer" },
+          "p99_ns": { "type": "integer" }
+        }
+      }
+    },
+    "fanout": {
+      "type": "object",
+      "required": ["placeholder", "blocked_on"],
+      "additionalProperties": false,
+      "properties": {
+        "placeholder": { "type": "boolean" },
+        "blocked_on": { "type": "string" }
+      }
+    }
+  },
+  "$defs": {
+    "summary": {
+      "type": "object",
+      "required": ["samples_n", "min", "mean", "p50", "p90", "p99", "p999", "max"],
+      "additionalProperties": false,
+      "properties": {
+        "samples_n": { "type": "integer" },
+        "min": { "type": "integer" },
+        "mean": { "type": "number" },
+        "p50": { "type": "integer" },
+        "p90": { "type": "integer" },
+        "p99": { "type": "integer" },
+        "p999": { "type": "integer" },
+        "max": { "type": "integer" }
+      }
+    }
+  }
+}
