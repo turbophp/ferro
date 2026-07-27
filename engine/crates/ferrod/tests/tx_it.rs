@@ -1,0 +1,770 @@
+//! S6 Task 4 — the LIVE TX service end to end: a real client → `ferrod` session → the per-`tx_id`
+//! actor (a pinned `ferro-pool` `Checkout`) → live Dockerized Postgres → single terminal `END` →
+//! client. Proves the transaction contract on a real backend: commit/rollback persistence,
+//! savepoints, isolation, readonly rejection, connection PINNING, the two deadlines (idle + the
+//! out-of-band mid-statement cancel), and cross-session / unknown-id rejection.
+//!
+//! Every DB-touching test SKIPS (does not fail) when `FERRO_TEST_PG_URL` is unset — same discipline
+//! as `sql_exec_it.rs` — so `cargo test --workspace` stays green offline.
+//!
+//! ```text
+//! docker compose -f testkit/docker-compose.yml up -d
+//! FERRO_TEST_PG_URL=postgres://ferro:ferro@localhost:55432/ferro \
+//!   cargo test -p ferrod --test tx_it -- --nocapture
+//! ```
+//!
+//! Every test asserts the terminal is a single `flags::END` frame with the echoed service/method,
+//! and (where the session outlives the request) that the session is still alive afterwards
+//! (PING→PONG) — i.e. exactly one END was produced (charter rule 4) and nothing else. No statement
+//! is ever re-run on a deadline/loss (charter rule 3): a mid-statement `max_tx` yields a single
+//! `TxDeadline{Retryable}` (NOT `Indeterminate` — a rolled-back in-tx statement persisted nothing).
+
+mod common;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use common::{TestClient, TestServer, assert_session_alive, exec, exec_ok, pg_url, req};
+use ferro_proto::consts::{branch, errc, flags, method_tx, service, tag};
+use ferro_proto::messages::Outcome;
+use ferro_proto::messages::sql::ExecRequest;
+use ferro_proto::messages::tx::{
+    BeginRequest, BeginResponse, Isolation, SavepointRequest, TxControl,
+};
+use ferro_proto::value::Value;
+use ferrod::config::{Config, PoolSpec};
+use ferrod::epoch::BootEpoch;
+use ferrod::pools::PoolRegistry;
+use ferrod::services::sql;
+use ferrod::tx::TxRegistry;
+
+// -------------------------------------------------------------------------------------------------
+// Server builders + TX client helpers (mirroring `common::{exec_server, req, exec}`).
+// -------------------------------------------------------------------------------------------------
+
+/// Like `common::exec_server`, but with caller-supplied transaction deadlines (`idle_in_tx`,
+/// `max_tx`) so the deadline tests can drive SHORT timers. Built exactly as `main` builds it (the
+/// real `sql::make_handler` + a shared `Arc<TxRegistry>`) so it is a genuine client→ferrod→actor→PG
+/// round trip.
+fn exec_server_with_deadlines(url: String, idle_in_tx: Duration, max_tx: Duration) -> TestServer {
+    let config = Config {
+        pools: vec![PoolSpec {
+            name: "default".to_string(),
+            dsn: url,
+        }],
+        idle_in_tx,
+        max_tx,
+        ..Config::default()
+    };
+    let registry = PoolRegistry::build(&config);
+    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let factory = sql::make_handler(
+        registry,
+        tx_registry.clone(),
+        config.idle_in_tx,
+        config.max_tx,
+        config.tx_teardown_timeout,
+    );
+    TestServer::spawn_with_factory(BootEpoch(1), tx_registry, factory)
+}
+
+/// `service=TX, method=BEGIN` — assert the one-END terminal shape and decode the `BeginResponse`,
+/// returning the allocated `tx_id`.
+async fn begin(
+    client: &mut TestClient,
+    rid: u32,
+    pool: &str,
+    isolation: Option<u8>,
+    readonly: bool,
+) -> u64 {
+    let breq = BeginRequest {
+        pool: pool.to_string(),
+        isolation,
+        readonly,
+    };
+    client
+        .send_request(rid, service::TX, method_tx::BEGIN, breq.encode())
+        .await;
+    let t = client.recv().await;
+    assert_eq!(t.header.request_id, rid, "BEGIN terminal echoes the rid");
+    assert_eq!(
+        t.header.flags & flags::END,
+        flags::END,
+        "BEGIN terminal carries exactly one END"
+    );
+    assert_eq!(t.header.service, service::TX);
+    assert_eq!(t.header.method, method_tx::BEGIN);
+    match Outcome::decode(&t.payload).expect("decode BEGIN Outcome") {
+        Outcome::Ok(body) => {
+            BeginResponse::decode(&body)
+                .expect("decode BeginResponse")
+                .tx_id
+        }
+        other => panic!("BEGIN expected Outcome::Ok(BeginResponse), got {other:?}"),
+    }
+}
+
+/// A tx-scoped `ExecRequest` (`tx_id: Some(..)`); `pool` is ignored by the handler (the tx is
+/// already pinned to its conn), but set for realism.
+fn tx_req(tx_id: u64, sql: &str, params: Vec<Value>, fetch: u8, readonly: bool) -> ExecRequest {
+    ExecRequest {
+        pool: "default".to_string(),
+        sql: Some(sql.to_string()),
+        query_id: None,
+        params,
+        timeout_ms: None,
+        readonly,
+        fetch,
+        tx_id: Some(tx_id),
+    }
+}
+
+/// A tx-scoped `EXEC` (rides `service=SQL, method=EXEC` with `tx_id` set). Reuses `common::exec`,
+/// which asserts the one-END shape + SQL/EXEC echoes, and returns the decoded `Outcome`.
+async fn exec_in_tx(
+    client: &mut TestClient,
+    rid: u32,
+    tx_id: u64,
+    sql: &str,
+    params: Vec<Value>,
+    fetch: u8,
+    readonly: bool,
+) -> Outcome {
+    exec(client, rid, &tx_req(tx_id, sql, params, fetch, readonly)).await
+}
+
+/// A `service=TX` control frame (`COMMIT`/`ROLLBACK`) carrying a `TxControl{tx_id}`. Asserts the
+/// one-END shape + TX/method echoes and returns the decoded `Outcome`.
+async fn tx_control(client: &mut TestClient, rid: u32, tx_id: u64, method: u16) -> Outcome {
+    client
+        .send_request(rid, service::TX, method, TxControl { tx_id }.encode())
+        .await;
+    let t = client.recv().await;
+    assert_eq!(
+        t.header.request_id, rid,
+        "tx-control terminal echoes the rid"
+    );
+    assert_eq!(
+        t.header.flags & flags::END,
+        flags::END,
+        "tx-control terminal carries exactly one END"
+    );
+    assert_eq!(t.header.service, service::TX);
+    assert_eq!(t.header.method, method);
+    Outcome::decode(&t.payload).expect("decode tx-control Outcome")
+}
+
+async fn commit(client: &mut TestClient, rid: u32, tx_id: u64) -> Outcome {
+    tx_control(client, rid, tx_id, method_tx::COMMIT).await
+}
+
+async fn rollback(client: &mut TestClient, rid: u32, tx_id: u64) -> Outcome {
+    tx_control(client, rid, tx_id, method_tx::ROLLBACK).await
+}
+
+/// A `service=TX` savepoint control frame (`SAVEPOINT`/`RELEASE`/`ROLLBACK_TO`) carrying a
+/// `SavepointRequest{tx_id, name}`. Asserts the one-END shape + TX/method echoes.
+async fn savepoint_ctl(
+    client: &mut TestClient,
+    rid: u32,
+    tx_id: u64,
+    name: Option<&str>,
+    method: u16,
+) -> Outcome {
+    let sreq = SavepointRequest {
+        tx_id,
+        name: name.map(str::to_string),
+    };
+    client
+        .send_request(rid, service::TX, method, sreq.encode())
+        .await;
+    let t = client.recv().await;
+    assert_eq!(
+        t.header.request_id, rid,
+        "savepoint terminal echoes the rid"
+    );
+    assert_eq!(
+        t.header.flags & flags::END,
+        flags::END,
+        "savepoint terminal carries exactly one END"
+    );
+    assert_eq!(t.header.service, service::TX);
+    assert_eq!(t.header.method, method);
+    Outcome::decode(&t.payload).expect("decode savepoint Outcome")
+}
+
+async fn savepoint(client: &mut TestClient, rid: u32, tx_id: u64, name: Option<&str>) -> Outcome {
+    savepoint_ctl(client, rid, tx_id, name, method_tx::SAVEPOINT).await
+}
+
+#[allow(dead_code)]
+async fn release(client: &mut TestClient, rid: u32, tx_id: u64, name: Option<&str>) -> Outcome {
+    savepoint_ctl(client, rid, tx_id, name, method_tx::RELEASE).await
+}
+
+async fn rollback_to(client: &mut TestClient, rid: u32, tx_id: u64, name: Option<&str>) -> Outcome {
+    savepoint_ctl(client, rid, tx_id, name, method_tx::ROLLBACK_TO).await
+}
+
+/// An autocommit write EXEC (`readonly=false`, `fetch=none`) against the default pool — for the
+/// test-fixture DDL / cross-conn setup that must not ride a transaction.
+async fn autocommit_write(client: &mut TestClient, rid: u32, sql: &str) {
+    let mut w = req(sql);
+    w.readonly = false;
+    w.fetch = 1;
+    match exec(client, rid, &w).await {
+        Outcome::Ok(_) => {}
+        other => panic!("autocommit write {sql:?} failed: {other:?}"),
+    }
+}
+
+/// The `I64` in the first cell of the first row (e.g. a `pg_backend_pid()` / `count(*)` scalar).
+fn first_i64(ok: &ferro_proto::messages::sql::ExecOk) -> i64 {
+    match ok.rows.first().and_then(|r| r.first()) {
+        Some(Value::I64(v)) => *v,
+        other => panic!("expected an I64 scalar in row 0 col 0, got {other:?}"),
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Commit / rollback persistence (a FRESH autocommit SELECT on a DIFFERENT pooled conn).
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_commit_persists() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = common::exec_server(url);
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    autocommit_write(&mut client, 10, "DROP TABLE IF EXISTS ferro_s6_commit").await;
+    autocommit_write(&mut client, 11, "CREATE TABLE ferro_s6_commit (id bigint)").await;
+
+    let tx_id = begin(&mut client, 12, "default", None, false).await;
+    // INSERT inside the tx.
+    match exec_in_tx(
+        &mut client,
+        13,
+        tx_id,
+        "INSERT INTO ferro_s6_commit (id) VALUES (?)",
+        vec![Value::I64(42)],
+        1,
+        false,
+    )
+    .await
+    {
+        Outcome::Ok(_) => {}
+        other => panic!("in-tx INSERT failed: {other:?}"),
+    }
+    assert!(matches!(
+        commit(&mut client, 14, tx_id).await,
+        Outcome::Ok(_)
+    ));
+
+    // A fresh autocommit SELECT (a DIFFERENT pooled conn) sees the committed row.
+    let ok = exec_ok(&mut client, 15, &req("SELECT id FROM ferro_s6_commit")).await;
+    assert_eq!(
+        ok.rows,
+        vec![vec![Value::I64(42)]],
+        "COMMIT persisted the row"
+    );
+    assert_session_alive(&mut client, 100).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_rollback_discards() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = common::exec_server(url);
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    autocommit_write(&mut client, 10, "DROP TABLE IF EXISTS ferro_s6_rollback").await;
+    autocommit_write(
+        &mut client,
+        11,
+        "CREATE TABLE ferro_s6_rollback (id bigint)",
+    )
+    .await;
+
+    let tx_id = begin(&mut client, 12, "default", None, false).await;
+    match exec_in_tx(
+        &mut client,
+        13,
+        tx_id,
+        "INSERT INTO ferro_s6_rollback (id) VALUES (?)",
+        vec![Value::I64(7)],
+        1,
+        false,
+    )
+    .await
+    {
+        Outcome::Ok(_) => {}
+        other => panic!("in-tx INSERT failed: {other:?}"),
+    }
+    assert!(matches!(
+        rollback(&mut client, 14, tx_id).await,
+        Outcome::Ok(_)
+    ));
+
+    // A fresh autocommit SELECT does NOT see the rolled-back row.
+    let ok = exec_ok(&mut client, 15, &req("SELECT id FROM ferro_s6_rollback")).await;
+    assert!(
+        ok.rows.is_empty(),
+        "ROLLBACK discarded the row: {:?}",
+        ok.rows
+    );
+    assert_session_alive(&mut client, 101).await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Savepoint round-trip: INSERT a; SAVEPOINT; INSERT b; ROLLBACK_TO; COMMIT → a persists, b does not.
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_savepoint_roundtrip() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = common::exec_server(url);
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    autocommit_write(&mut client, 10, "DROP TABLE IF EXISTS ferro_s6_sp").await;
+    autocommit_write(&mut client, 11, "CREATE TABLE ferro_s6_sp (id bigint)").await;
+
+    let tx_id = begin(&mut client, 12, "default", None, false).await;
+    // a (id=1) before the savepoint.
+    assert!(matches!(
+        exec_in_tx(
+            &mut client,
+            13,
+            tx_id,
+            "INSERT INTO ferro_s6_sp (id) VALUES (1)",
+            vec![],
+            1,
+            false,
+        )
+        .await,
+        Outcome::Ok(_)
+    ));
+    assert!(matches!(
+        savepoint(&mut client, 14, tx_id, Some("sp")).await,
+        Outcome::Ok(_)
+    ));
+    // b (id=2) after the savepoint.
+    assert!(matches!(
+        exec_in_tx(
+            &mut client,
+            15,
+            tx_id,
+            "INSERT INTO ferro_s6_sp (id) VALUES (2)",
+            vec![],
+            1,
+            false,
+        )
+        .await,
+        Outcome::Ok(_)
+    ));
+    // ROLLBACK TO the savepoint discards b but keeps a.
+    assert!(matches!(
+        rollback_to(&mut client, 16, tx_id, Some("sp")).await,
+        Outcome::Ok(_)
+    ));
+    assert!(matches!(
+        commit(&mut client, 17, tx_id).await,
+        Outcome::Ok(_)
+    ));
+
+    let ok = exec_ok(
+        &mut client,
+        18,
+        &req("SELECT id FROM ferro_s6_sp ORDER BY id"),
+    )
+    .await;
+    assert_eq!(
+        ok.rows,
+        vec![vec![Value::I64(1)]],
+        "ROLLBACK_TO kept a (id=1), discarded b (id=2): {:?}",
+        ok.rows
+    );
+    assert_session_alive(&mut client, 102).await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Isolation observed: BEGIN RepeatableRead → current_setting('transaction_isolation') inside the tx.
+// current_setting(...) (NOT SHOW) so it prepares through the guarded Checkout::query.
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_isolation_observed() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = common::exec_server(url);
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    let tx_id = begin(
+        &mut client,
+        12,
+        "default",
+        Some(u8::from(Isolation::RepeatableRead)),
+        false,
+    )
+    .await;
+    let iso = match exec_in_tx(
+        &mut client,
+        13,
+        tx_id,
+        "SELECT current_setting('transaction_isolation')",
+        vec![],
+        0,
+        true,
+    )
+    .await
+    {
+        Outcome::Ok(body) => ferro_proto::messages::sql::ExecOk::decode(&body).expect("ExecOk"),
+        other => panic!("isolation SELECT failed: {other:?}"),
+    };
+    assert_eq!(
+        iso.rows,
+        vec![vec![Value::Text("repeatable read".to_string())]],
+        "the composed isolation level is observed inside the tx: {:?}",
+        iso.rows
+    );
+    assert!(matches!(
+        commit(&mut client, 14, tx_id).await,
+        Outcome::Ok(_)
+    ));
+    assert_session_alive(&mut client, 103).await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Readonly tx rejects a write: reads work; a write → 25006 (mapped NonRetryable, raw SQLSTATE on the
+// wire), one END, session survives; PG then aborts the tx block, so ROLLBACK is the recovery and the
+// pinned conn is released clean (a fresh autocommit SELECT works).
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_readonly_rejects_write() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = common::exec_server(url);
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    // The target must EXIST so the read-only check (25006) fires, not undefined-table (42P01).
+    autocommit_write(&mut client, 10, "DROP TABLE IF EXISTS ferro_s6_ro").await;
+    autocommit_write(&mut client, 11, "CREATE TABLE ferro_s6_ro (id bigint)").await;
+
+    let tx_id = begin(&mut client, 12, "default", None, true).await; // READ ONLY
+
+    // Reads are allowed in a read-only tx.
+    let ro_read = exec_in_tx(&mut client, 13, tx_id, "SELECT 1", vec![], 0, true).await;
+    assert!(
+        matches!(&ro_read, Outcome::Ok(_)),
+        "a read is allowed in a read-only tx: {ro_read:?}"
+    );
+
+    // A write is rejected: SQLSTATE 25006, NonRetryable, one END, and NEVER the §19.3 Indeterminate
+    // branch (a rejected write is known-fate — it did not apply).
+    let ep = match exec_in_tx(
+        &mut client,
+        14,
+        tx_id,
+        "INSERT INTO ferro_s6_ro (id) VALUES (1)",
+        vec![],
+        1,
+        false,
+    )
+    .await
+    {
+        Outcome::Error(ep) => ep,
+        other => panic!("a write in a RO tx must be rejected, got {other:?}"),
+    };
+    assert_eq!(
+        ep.sqlstate.as_deref(),
+        Some("25006"),
+        "the raw read-only-transaction SQLSTATE is preserved on the wire"
+    );
+    assert_eq!(
+        ep.branch,
+        branch::NON_RETRYABLE,
+        "a rejected write is NonRetryable"
+    );
+    assert_ne!(ep.code, errc::WRITE_UNCONFIRMED);
+    assert_ne!(ep.branch, branch::INDETERMINATE);
+    assert_session_alive(&mut client, 104).await;
+
+    // PG has aborted the tx block on the error (25P02); ROLLBACK cleanly ends it, and the pinned
+    // conn is released clean — a fresh autocommit SELECT works.
+    assert!(
+        matches!(rollback(&mut client, 15, tx_id).await, Outcome::Ok(_)),
+        "ROLLBACK cleanly ends the aborted tx"
+    );
+    let ok = exec_ok(&mut client, 16, &req("SELECT 1")).await;
+    assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
+    assert_session_alive(&mut client, 105).await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Pinning: two in-tx pg_backend_pid() reads return the SAME backend pid (one pinned conn); after
+// COMMIT a fresh autocommit pid MAY differ (the conn was released back to the pool).
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_pins_one_backend_pid() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = common::exec_server(url);
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    let tx_id = begin(&mut client, 12, "default", None, false).await;
+
+    let pid1 = match exec_in_tx(
+        &mut client,
+        13,
+        tx_id,
+        "SELECT pg_backend_pid()",
+        vec![],
+        0,
+        true,
+    )
+    .await
+    {
+        Outcome::Ok(body) => {
+            first_i64(&ferro_proto::messages::sql::ExecOk::decode(&body).expect("ExecOk"))
+        }
+        other => panic!("pid read 1 failed: {other:?}"),
+    };
+    let pid2 = match exec_in_tx(
+        &mut client,
+        14,
+        tx_id,
+        "SELECT pg_backend_pid()",
+        vec![],
+        0,
+        true,
+    )
+    .await
+    {
+        Outcome::Ok(body) => {
+            first_i64(&ferro_proto::messages::sql::ExecOk::decode(&body).expect("ExecOk"))
+        }
+        other => panic!("pid read 2 failed: {other:?}"),
+    };
+    assert_eq!(
+        pid1, pid2,
+        "both in-tx statements ran on the SAME pinned backend (pid {pid1} vs {pid2})"
+    );
+    assert!(matches!(
+        commit(&mut client, 15, tx_id).await,
+        Outcome::Ok(_)
+    ));
+
+    // After release, a fresh autocommit statement may land on any pooled backend (MAY differ).
+    let ok = exec_ok(&mut client, 16, &req("SELECT pg_backend_pid()")).await;
+    let pid3 = first_i64(&ok);
+    eprintln!(
+        "TX PINNING >>> in-tx pid1={pid1} pid2={pid2} (equal ⇒ pinned); post-commit autocommit pid3={pid3}"
+    );
+    assert_eq!(ok.cols[0].tag, tag::I64, "pg_backend_pid() int4 → I64");
+    assert_session_alive(&mut client, 106).await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// idle_in_transaction deadline: BEGIN, sit idle past the deadline, then a tx-scoped EXEC finds the
+// tx tombstoned → TxDeadline{Retryable} (the pin was already rolled back + released).
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_idle_deadline() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = exec_server_with_deadlines(
+        url,
+        Duration::from_millis(200), // idle_in_tx: short
+        Duration::from_secs(60),    // max_tx: generous
+    );
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    let tx_id = begin(&mut client, 12, "default", None, false).await;
+    // Sit idle well past idle_in_tx: the actor's idle timer fires → rollback + tombstone.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let ep = match exec_in_tx(&mut client, 13, tx_id, "SELECT 1", vec![], 0, true).await {
+        Outcome::Error(ep) => ep,
+        other => panic!("a command after the idle deadline must be TxDeadline, got {other:?}"),
+    };
+    assert_eq!(ep.code, errc::TX_DEADLINE, "idle deadline → TxDeadline");
+    assert_eq!(
+        ep.branch,
+        branch::RETRYABLE,
+        "TxDeadline is Retryable (client policy)"
+    );
+    assert_session_alive(&mut client, 107).await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// max_tx deadline via the OUT-OF-BAND cancel: a long statement is cancelled server-side (57014) when
+// the absolute deadline fires; the terminal is a SINGLE TxDeadline{Retryable} (NOT Indeterminate —
+// the in-tx statement was rolled back, so nothing persisted), the pin is released, and a subsequent
+// checkout gets a clean conn PROMPTLY (bounded). The statement is NEVER re-dispatched (rule 3).
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_max_deadline() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = exec_server_with_deadlines(
+        url,
+        Duration::from_secs(60),    // idle_in_tx: generous
+        Duration::from_millis(500), // max_tx: short — fires mid pg_sleep
+    );
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    let tx_id = begin(&mut client, 12, "default", None, false).await;
+
+    // pg_sleep(10) would take 10s if it ran to completion (>> the 2s recv timeout): a fast
+    // TxDeadline terminal PROVES the out-of-band cancel fired mid-statement, not a natural finish.
+    let ep = match exec_in_tx(
+        &mut client,
+        13,
+        tx_id,
+        "SELECT 1 FROM pg_sleep(10)",
+        vec![],
+        0,
+        true,
+    )
+    .await
+    {
+        Outcome::Error(ep) => ep,
+        other => panic!("a mid-statement max deadline must be TxDeadline, got {other:?}"),
+    };
+    eprintln!(
+        "TX MAX-DEADLINE (via out-of-band cancel) >>> terminal code={:#06x} branch={} sqlstate={:?}",
+        ep.code, ep.branch, ep.sqlstate
+    );
+    assert_eq!(
+        ep.code,
+        errc::TX_DEADLINE,
+        "the mid-statement cancel → a single TxDeadline terminal"
+    );
+    assert_eq!(
+        ep.branch,
+        branch::RETRYABLE,
+        "TxDeadline is Retryable, NOT Indeterminate"
+    );
+    assert_ne!(
+        ep.code,
+        errc::WRITE_UNCONFIRMED,
+        "a rolled-back in-tx statement persisted nothing — never Indeterminate"
+    );
+    assert_ne!(ep.branch, branch::INDETERMINATE);
+
+    // Exactly one END (the session is alive), and the pin was released: a subsequent autocommit
+    // checkout gets a clean, working conn PROMPTLY (bounded by the recv timeout). Re-touching the
+    // dead tx_id yields TxDeadline again (tombstoned) — the statement is never re-run.
+    assert_session_alive(&mut client, 108).await;
+    let ok = exec_ok(&mut client, 14, &req("SELECT 1")).await;
+    assert_eq!(
+        ok.rows,
+        vec![vec![Value::I64(1)]],
+        "the pin was released — a fresh autocommit checkout works promptly"
+    );
+    match exec_in_tx(&mut client, 15, tx_id, "SELECT 1", vec![], 0, true).await {
+        Outcome::Error(ep) => assert_eq!(
+            ep.code,
+            errc::TX_DEADLINE,
+            "the timed-out tx stays tombstoned (never re-dispatched)"
+        ),
+        other => panic!("a re-touch of the dead tx must be TxDeadline, got {other:?}"),
+    }
+    assert_session_alive(&mut client, 109).await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Cross-session: session A opens a tx; session B using A's tx_id → Protocol (indistinguishable from
+// unknown); A's tx is undisturbed and commits.
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_cross_session_rejected() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = common::exec_server(url);
+    let mut client_a = server.connect().await;
+    client_a.hello(1).await;
+    let mut client_b = server.connect().await;
+    client_b.hello(1).await;
+
+    let tx_id = begin(&mut client_a, 12, "default", None, false).await;
+
+    // B forwards a tx-scoped EXEC with A's tx_id → Protocol (owner mismatch, indistinguishable from
+    // an unknown id).
+    match exec_in_tx(&mut client_b, 20, tx_id, "SELECT 1", vec![], 0, true).await {
+        Outcome::Error(ep) => assert_eq!(
+            ep.code,
+            errc::PROTOCOL,
+            "a cross-session tx-scoped EXEC is Protocol"
+        ),
+        other => panic!("expected Protocol, got {other:?}"),
+    }
+    // B's COMMIT of A's tx_id is likewise Protocol.
+    match commit(&mut client_b, 21, tx_id).await {
+        Outcome::Error(ep) => assert_eq!(
+            ep.code,
+            errc::PROTOCOL,
+            "a cross-session COMMIT is Protocol"
+        ),
+        other => panic!("expected Protocol, got {other:?}"),
+    }
+    assert_session_alive(&mut client_b, 110).await;
+
+    // A's tx is undisturbed: a read works and COMMIT succeeds.
+    assert!(matches!(
+        exec_in_tx(&mut client_a, 13, tx_id, "SELECT 1", vec![], 0, true).await,
+        Outcome::Ok(_)
+    ));
+    assert!(matches!(
+        commit(&mut client_a, 14, tx_id).await,
+        Outcome::Ok(_)
+    ));
+    assert_session_alive(&mut client_a, 111).await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Unknown tx_id: a COMMIT for a never-issued tx_id → Protocol; the session survives.
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_unknown_id_protocol() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = common::exec_server(url);
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    match commit(&mut client, 12, 999_999).await {
+        Outcome::Error(ep) => assert_eq!(
+            ep.code,
+            errc::PROTOCOL,
+            "a COMMIT for a never-issued tx_id is Protocol"
+        ),
+        other => panic!("expected Protocol, got {other:?}"),
+    }
+    assert_session_alive(&mut client, 112).await;
+}
