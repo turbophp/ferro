@@ -1,0 +1,14 @@
+{
+  "frame_hex": "f70102000300010014000000040000009200912a",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 20,
+    "service": 3
+  },
+  "message": {
+    "status": 0,
+    "tx_id": 42
+  },
+  "name": "tx_begin_response"
+}

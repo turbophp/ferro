@@ -1,0 +1,11 @@
+{
+  "frame_hex": "f701000001000500000000000100000090",
+  "header": {
+    "flags": 0,
+    "method": 5,
+    "request_id": 0,
+    "service": 1
+  },
+  "message": {},
+  "name": "goodbye"
+}

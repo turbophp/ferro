@@ -1,0 +1,13 @@
+{
+  "frame_hex": "f70100000100030009000000020000009107",
+  "header": {
+    "flags": 0,
+    "method": 3,
+    "request_id": 9,
+    "service": 1
+  },
+  "message": {
+    "token": 7
+  },
+  "name": "ping"
+}

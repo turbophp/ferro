@@ -1,0 +1,462 @@
+//! Live `ferro-backend-pg` integration tests (S4 Task 5) against a real Postgres.
+//!
+//! Every test SKIPS (does not fail) when `FERRO_TEST_PG_URL` is unset, so `cargo test --workspace`
+//! stays green offline (S2 convention). Point it at the S2 Dockerized Postgres:
+//!
+//! ```text
+//! docker compose -f testkit/docker-compose.yml up -d
+//! FERRO_TEST_PG_URL=postgres://ferro:ferro@localhost:55432/ferro cargo test -p ferro-backend-pg
+//! ```
+
+use std::time::Duration;
+
+use ferro_backend_pg::{PgBackend, Value};
+use ferro_pool::config::PoolConfig;
+use ferro_pool::error::{Branch, PoolError};
+use ferro_pool::pin::{PinCause, PinState, TxId};
+use ferro_pool::pool::{Checkout, Pool};
+
+/// Returns the test DSN, or `None` (after printing a skip notice) if `FERRO_TEST_PG_URL` is
+/// unset. Every test below returns immediately when this is `None` — that early return IS the
+/// skip.
+fn test_url() -> Option<String> {
+    match std::env::var("FERRO_TEST_PG_URL") {
+        Ok(u) => Some(u),
+        Err(_) => {
+            eprintln!("skip: FERRO_TEST_PG_URL unset");
+            None
+        }
+    }
+}
+
+fn config(max_size: usize) -> PoolConfig {
+    PoolConfig {
+        max_size,
+        checkout_timeout: Duration::from_secs(5),
+        max_lifetime: Duration::from_secs(30 * 60),
+        reap_interval: None,
+    }
+}
+
+/// Runs `sql` (a single-row, single-column query) on `co`'s connection and returns the `i32`
+/// result. Goes straight at the raw `tokio_postgres::Client` (`PgConn::client` is `pub` for
+/// exactly this) since the pool-internal `exec`/`simple_query` surface only reports
+/// success/failure, never row data.
+async fn query_i32(co: &mut Checkout<PgBackend>, sql: &str) -> i32 {
+    let row = co
+        .conn_mut()
+        .client
+        .query_one(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("query {sql:?} failed: {e}"));
+    row.get(0)
+}
+
+async fn backend_pid(co: &mut Checkout<PgBackend>) -> i32 {
+    query_i32(co, "SELECT pg_backend_pid()").await
+}
+
+/// Runs `sql` through the GUARDED, row-returning `Checkout::query` (the real S6 tx-scoped exec
+/// path) and returns the first cell as a `String` (panicking if it is not a text cell). Used to
+/// OBSERVE server state (e.g. `current_setting('transaction_isolation')`) via the pool's public
+/// query surface rather than the raw client.
+async fn query_first_text(co: &mut Checkout<PgBackend>, sql: &str) -> String {
+    let result = co
+        .query(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("Checkout::query {sql:?} failed: {e:?}"));
+    match result
+        .rows
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().next())
+    {
+        Some(Value::Text(s)) => s,
+        other => panic!("expected a text cell from {sql:?}, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_checkout_select1_release() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(2));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        let one = query_i32(&mut co, "SELECT 1").await;
+        assert_eq!(one, 1);
+        backend_pid(&mut co).await
+        // `co` drops at the end of this block -> released back to the pool.
+    };
+
+    let pid2 = {
+        let mut co = pool.checkout().await.expect("checkout again");
+        backend_pid(&mut co).await
+    };
+
+    assert_eq!(
+        pid1, pid2,
+        "expected the released connection to be reused, not a fresh one"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_tx_pins_single_backend_pid() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    // v2/m1: max_size >= 2 so a concurrent checkout has somewhere else to go, proving pinning
+    // actually kept it off the pinned connection (rather than there being nothing else to give).
+    let pool = Pool::new(PgBackend::new(url), config(2));
+
+    let mut a = pool.checkout().await.expect("checkout A");
+    a.begin_tx(TxId(1)).await.expect("begin tx on A");
+    assert_eq!(a.pin_state(), PinState::PinnedTx(TxId(1)));
+    assert_eq!(a.last_pin_cause(), Some(PinCause::Tx));
+
+    let pid_a1 = backend_pid(&mut a).await;
+    let pid_a2 = backend_pid(&mut a).await;
+    assert_eq!(
+        pid_a1, pid_a2,
+        "both statements inside the tx must stay pinned to the same backend pid"
+    );
+
+    // While A is still pinned, a concurrent checkout must land on a DIFFERENT backend pid --
+    // proof that pinning kept the load off the pinned connection rather than there being no
+    // other connection to hand out.
+    let mut b = pool.checkout().await.expect("checkout B while A is pinned");
+    let pid_b = backend_pid(&mut b).await;
+    assert_ne!(
+        pid_a1, pid_b,
+        "a concurrent checkout must not be handed the pinned tx connection"
+    );
+    drop(b);
+
+    a.commit_tx().await.expect("commit A");
+    assert_eq!(a.pin_state(), PinState::Unpinned);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_release_hygiene_leaves_conn_clean() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    // max_size = 1: the only connection this pool will ever create MUST be the one reused below,
+    // so the defensive-rollback assertion isn't at the mercy of which idle conn gets popped.
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    {
+        let mut co = pool.checkout().await.expect("checkout");
+        co.begin_tx(TxId(42)).await.expect("begin tx");
+        co.exec("CREATE TEMP TABLE ferro_s4_hygiene_probe (id int)")
+            .await
+            .expect("create temp table inside tx");
+        // Dropped here WITHOUT commit/rollback: `tx_open` stays set on release, so the *next*
+        // checkout performs the defensive ROLLBACK (v2/B1) before handing this conn out again.
+        // DDL is transactional in Postgres, so rolling back also undoes the temp table create.
+    }
+
+    let mut co2 = pool
+        .checkout()
+        .await
+        .expect("checkout again (defensive rollback should have run)");
+    let result = co2
+        .conn_mut()
+        .client
+        .simple_query("SELECT count(*) FROM ferro_s4_hygiene_probe")
+        .await;
+    assert!(
+        result.is_err(),
+        "temp table created inside the uncommitted tx should be gone after the defensive \
+         ROLLBACK, got {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_killed_backend_evicted_no_retry() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url.clone()), config(2));
+
+    let mut a = pool.checkout().await.expect("checkout A");
+    let pid_a = backend_pid(&mut a).await;
+
+    // Deterministic kill from a SEPARATE connection (v2/M4): `pg_terminate_backend(pg_backend_pid())`
+    // races its own result on the killing connection, so use a second, independent connection.
+    let (killer, killer_conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("connect killer");
+    tokio::spawn(async move {
+        let _ = killer_conn.await;
+    });
+    let terminated: bool = killer
+        .query_one("SELECT pg_terminate_backend($1)", &[&pid_a])
+        .await
+        .expect("pg_terminate_backend")
+        .get(0);
+    assert!(terminated, "pg_terminate_backend should report success");
+
+    // Detect death via a ROUND TRIP on A's next use (v2/M4), not via `is_closed()` timing: the
+    // backend needs a moment to actually die once the terminate signal lands, so retry briefly.
+    let mut last_err = None;
+    let mut detected = false;
+    for _ in 0..100 {
+        match a.exec("SELECT 1").await {
+            Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            Err(e) => {
+                last_err = Some(e);
+                detected = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        detected,
+        "expected the round trip to eventually detect the killed backend"
+    );
+    assert_eq!(
+        last_err,
+        Some(PoolError::ConnectionLost),
+        "a killed backend must surface as ConnectionLost (Retryable), never a silent success"
+    );
+    assert_eq!(
+        last_err.as_ref().map(PoolError::taxonomy_branch),
+        Some(Branch::Retryable),
+        "ConnectionLost must classify as Retryable -- the arm the pg_syntax_error_... test below \
+         proves is distinct from the Backend/NonRetryable arm"
+    );
+
+    // Charter rule 3 (no transparent retry): the loop above made exactly one *user* statement
+    // attempt per iteration and stopped at the first error -- there is no hidden retry loop
+    // inside `exec`/`checkout` that could have silently re-issued "SELECT 1" on a fresh
+    // connection in place of the failed one.
+
+    drop(a);
+    // Give the connection-driver task a moment to flip its `closed` flag, so the next checkout's
+    // eviction check isn't itself racing that async update.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut b = pool
+        .checkout()
+        .await
+        .expect("checkout after the kill should reconnect fresh");
+    let pid_b = backend_pid(&mut b).await;
+    assert_ne!(
+        pid_a, pid_b,
+        "the pool must have evicted the dead connection and reconnected to a fresh backend pid"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_max_lifetime_recycles_live() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let mut cfg = config(1);
+    cfg.max_lifetime = Duration::from_millis(50);
+    let pool = Pool::new(PgBackend::new(url), cfg);
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        backend_pid(&mut co).await
+    };
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let pid2 = {
+        let mut co = pool
+            .checkout()
+            .await
+            .expect("checkout after max_lifetime elapsed");
+        backend_pid(&mut co).await
+    };
+
+    assert_ne!(
+        pid1, pid2,
+        "a connection past max_lifetime should be recycled (fresh pid), not reused"
+    );
+}
+
+/// IMPORTANT 2 (S4 review): the FATAL-severity-vs-DbError classification in `conn.rs`'s
+/// `simple_query` had zero coverage of the `Backend`/`NonRetryable` arm -- only the
+/// `ConnectionLost`/`Retryable` arm (a killed backend, `pg_killed_backend_evicted_no_retry` above)
+/// was exercised live. A genuine SQL error (severity ERROR, not FATAL/PANIC) must classify as
+/// `PoolError::Backend` + `Branch::NonRetryable`, never be misclassified as the retryable
+/// `ConnectionLost` -- and the connection itself must stay alive and reusable afterward, since
+/// nothing about the session actually ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_syntax_error_classifies_as_backend_nonretryable() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let mut co = pool.checkout().await.expect("checkout");
+
+    let err = co
+        .exec("SELECT * FROM nonexistent_table_xyz")
+        .await
+        .expect_err("querying a nonexistent table must fail");
+    assert!(
+        matches!(err, PoolError::Backend(_)),
+        "a genuine SQL error (undefined table) must classify as PoolError::Backend, got {err:?}"
+    );
+    assert_eq!(
+        err.taxonomy_branch(),
+        Branch::NonRetryable,
+        "a statement-level SQL error must be NonRetryable -- misclassifying it as the retryable \
+         ConnectionLost would license a caller to blindly retry a query that will always fail"
+    );
+
+    // A second, independent flavor of statement-level error (a syntax error) must classify the
+    // same way -- this isn't specific to "undefined table".
+    let err2 = co
+        .exec("SEL ECT 1")
+        .await
+        .expect_err("a syntax error must fail");
+    assert!(
+        matches!(err2, PoolError::Backend(_)),
+        "a syntax error must also classify as PoolError::Backend, got {err2:?}"
+    );
+    assert_eq!(err2.taxonomy_branch(), Branch::NonRetryable);
+
+    // The connection itself must still be alive and usable afterward: proof the errors above were
+    // statement-level, not connection-level. A FATAL/PANIC (ConnectionLost) misclassification
+    // would have ended the session and this would fail.
+    let one = query_i32(&mut co, "SELECT 1").await;
+    assert_eq!(
+        one, 1,
+        "the connection must still be alive and usable after plain statement-level SQL errors"
+    );
+}
+
+/// S6 live: `begin_tx_with` a COMPOSED BEGIN opens the tx at the composed isolation level (observed
+/// via the guarded `Checkout::query`), and the pinned conn keeps the SAME `pg_backend_pid` across
+/// statements inside the tx.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_begin_tx_with_composed_isolation_and_same_pid() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let mut co = pool.checkout().await.expect("checkout");
+    co.begin_tx_with(TxId(1), "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY")
+        .await
+        .expect("begin_tx_with a composed BEGIN");
+    assert_eq!(co.pin_state(), PinState::PinnedTx(TxId(1)));
+    assert_eq!(co.last_pin_cause(), Some(PinCause::Tx));
+
+    // `current_setting('transaction_isolation')` is the query-friendly equivalent of `SHOW
+    // transaction_isolation` — it reflects the composed level inside the open tx.
+    let pid_before = backend_pid(&mut co).await;
+    let iso = query_first_text(&mut co, "SELECT current_setting('transaction_isolation')").await;
+    assert_eq!(
+        iso, "serializable",
+        "the composed BEGIN must set the tx isolation to serializable, got {iso:?}"
+    );
+    let pid_after = backend_pid(&mut co).await;
+    assert_eq!(
+        pid_before, pid_after,
+        "every statement inside the tx must stay pinned to the SAME backend pid"
+    );
+
+    co.rollback_tx().await.expect("rollback the read-only tx");
+    assert_eq!(co.pin_state(), PinState::Unpinned);
+}
+
+/// S6 live: `tx_control` runs engine-composed SAVEPOINT/RELEASE on a pinned conn via the UNGUARDED
+/// passthrough (the guarded `query` would reject them as bare tx-control), and the conn stays on
+/// the same backend pid throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_tx_control_savepoint_roundtrip() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let mut co = pool.checkout().await.expect("checkout");
+    co.begin_tx(TxId(9)).await.expect("begin tx");
+    let pid = backend_pid(&mut co).await;
+
+    co.tx_control("SAVEPOINT s1")
+        .await
+        .expect("SAVEPOINT s1 via tx_control");
+    co.tx_control("RELEASE s1")
+        .await
+        .expect("RELEASE s1 via tx_control");
+
+    // A fresh savepoint + ROLLBACK TO also succeeds on the pinned conn.
+    co.tx_control("SAVEPOINT s2")
+        .await
+        .expect("SAVEPOINT s2 via tx_control");
+    co.tx_control("ROLLBACK TO s2")
+        .await
+        .expect("ROLLBACK TO s2 via tx_control");
+
+    assert_eq!(
+        backend_pid(&mut co).await,
+        pid,
+        "the savepoint statements must all run on the SAME pinned backend pid"
+    );
+
+    // Sanity: the guarded query() still rejects a bare SAVEPOINT (the bypass is tx_control ONLY).
+    assert!(
+        matches!(
+            co.query("SAVEPOINT s3", &[]).await,
+            Err(PoolError::Unsupported(_))
+        ),
+        "the guarded query() must still reject bare tx-control even on a pinned conn"
+    );
+
+    co.commit_tx().await.expect("commit the tx");
+}
+
+/// S6 live: the out-of-band `cancel_handle` cancels an in-flight `Checkout::query` (`pg_sleep`),
+/// which errors with SQLSTATE 57014 (query_canceled) — NOT a hang and NOT a silent success — and
+/// the pinned conn is usable again after a `rollback_tx`. This is the deadline/abort mechanism the
+/// TX actor (next task) uses: grab the handle BEFORE the query, fire the cancel from a side task.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_cancel_handle_cancels_in_flight_query() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let mut co = pool.checkout().await.expect("checkout");
+    co.begin_tx(TxId(5)).await.expect("begin tx");
+
+    // Grab the cancel handle BEFORE starting the query — it borrows nothing from `co`, so it can
+    // fire while `co.query(..)` (which holds `&mut co`) is still live.
+    let cancel = co.cancel_handle();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Fire via the `Cancel` trait — exactly what the TX actor does with `B::CancelHandle`.
+        ferro_pool::backend::Cancel::cancel(cancel).await;
+    });
+
+    // A ~2s statement via the GUARDED query() path (the int8 projection keeps the result column an
+    // M0-supported type while `pg_sleep` runs in FROM). The out-of-band cancel makes it error 57014.
+    let res = co.query("SELECT 42::int8 FROM pg_sleep(2)", &[]).await;
+    canceller.await.expect("canceller task");
+
+    match res {
+        Err(PoolError::Sql { sqlstate, .. }) => assert_eq!(
+            sqlstate.as_deref(),
+            Some("57014"),
+            "an out-of-band cancel must surface as query_canceled (57014)"
+        ),
+        other => panic!("expected a 57014 Sql error from the cancelled query, got {other:?}"),
+    }
+
+    // The tx is now in an aborted state; rollback_tx brings the conn back to usable.
+    co.rollback_tx().await.expect("rollback after cancel");
+    let one = query_i32(&mut co, "SELECT 1").await;
+    assert_eq!(
+        one, 1,
+        "the pinned conn must be usable again after cancel + rollback_tx"
+    );
+}

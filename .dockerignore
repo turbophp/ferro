@@ -1,0 +1,12 @@
+# Keep the docker build context (repo root) small — only Cargo.toml/Cargo.lock/
+# rust-toolchain.toml/engine//proto/ are needed to build `ferrod` (testkit/Dockerfile.ferrod).
+.git
+target
+**/target
+/php
+/docs
+/bench
+/testkit
+/.superpowers
+/.github
+*.md

@@ -1,0 +1,26 @@
+# Rust
+/target
+**/target
+Cargo.lock.orig
+# cargo-fuzz
+**/fuzz/target
+**/fuzz/corpus
+**/fuzz/artifacts
+
+# PHP
+**/vendor
+**/.phpunit.cache
+**/.phpunit.result.cache
+**/composer.lock.orig
+
+# Bench outputs are COMMITTED (bench/results/*.json) per SPEC §16 — do not ignore them.
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local env / secrets (DSNs live in ferrod config, never committed)
+.env
+*.local.toml

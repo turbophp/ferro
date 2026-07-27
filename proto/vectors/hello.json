@@ -1,0 +1,17 @@
+{
+  "frame_hex": "f70100000100010001000000100000009501a86465616462656566c0cd109200",
+  "header": {
+    "flags": 0,
+    "method": 1,
+    "request_id": 1,
+    "service": 1
+  },
+  "message": {
+    "client_version": 1,
+    "features": 0,
+    "manifest_hash": null,
+    "pid": 4242,
+    "type_registry_hash": "deadbeef"
+  },
+  "name": "hello"
+}

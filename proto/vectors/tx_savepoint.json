@@ -1,0 +1,14 @@
+{
+  "frame_hex": "f7010000030004001600000007000000922aa473705f31",
+  "header": {
+    "flags": 0,
+    "method": 4,
+    "request_id": 22,
+    "service": 3
+  },
+  "message": {
+    "name": "sp_1",
+    "tx_id": 42
+  },
+  "name": "tx_savepoint"
+}

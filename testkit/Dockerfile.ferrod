@@ -1,0 +1,37 @@
+# testkit/Dockerfile.ferrod
+# Multi-stage build for the `ferrod` daemon container image (SPEC §18: systemd-socket-activation
+# in production; this image is the sidecar/testkit shape — a shared UDS volume, no socket
+# activation here).
+#
+# Build context MUST be the REPO ROOT so this stage can COPY the whole Cargo workspace: `ferrod`
+# depends on the in-tree `ferro-proto` crate, whose build.rs reads `/proto/registry.lock.json`
+# (the single source of truth for wire constants, charter rule 2 / SPEC §20.2).
+#
+#   docker build -f testkit/Dockerfile.ferrod -t ferrod:dev .
+
+FROM rust:1.95 AS builder
+WORKDIR /app
+
+# Workspace manifests + toolchain pin, then the crates + the /proto registry ferro-proto's
+# build.rs reads. No other repo directories (php/, bench/, docs/, .git/) are needed to compile
+# ferrod, so they are left out of the image build context via .dockerignore.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY engine ./engine
+COPY proto ./proto
+
+RUN cargo build -p ferrod --release --locked
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/ferro
+
+COPY --from=builder /app/target/release/ferrod /usr/local/bin/ferrod
+
+# Default UDS bind path (SPEC §5 / engine/crates/ferrod/src/config.rs). Overridable per
+# environment; the compose sidecar below binds it under the shared `/run/ferro` volume.
+ENV FERRO_SOCK=/run/ferro/dev.sock
+
+ENTRYPOINT ["/usr/local/bin/ferrod"]

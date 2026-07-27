@@ -1,0 +1,24 @@
+[package]
+name = "ferrod-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.ferrod]
+path = ".."
+
+[[bin]]
+name = "session_classify"
+path = "fuzz_targets/session_classify.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

@@ -1,0 +1,85 @@
+{
+  "frame_hex": "f70102000200010012000000520000009200959792a16e0092a1620192a3706f730292a36e65670292a1660492a1740692a262790791979200c09201c39202ccc89202d1ff389204cb3ff80000000000009206a1789207c402c00100c094040c0100",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 18,
+    "service": 2
+  },
+  "message": {
+    "affected": 0,
+    "cols": [
+      {
+        "name": "n",
+        "tag": 0
+      },
+      {
+        "name": "b",
+        "tag": 1
+      },
+      {
+        "name": "pos",
+        "tag": 2
+      },
+      {
+        "name": "neg",
+        "tag": 2
+      },
+      {
+        "name": "f",
+        "tag": 4
+      },
+      {
+        "name": "t",
+        "tag": 6
+      },
+      {
+        "name": "by",
+        "tag": 7
+      }
+    ],
+    "last_insert_id": null,
+    "rows": [
+      [
+        {
+          "data": null,
+          "tag": 0
+        },
+        {
+          "data": true,
+          "tag": 1
+        },
+        {
+          "data": 200,
+          "tag": 2
+        },
+        {
+          "data": -200,
+          "tag": 2
+        },
+        {
+          "data": 1.5,
+          "tag": 4
+        },
+        {
+          "data": "x",
+          "tag": 6
+        },
+        {
+          "data": [
+            192,
+            1
+          ],
+          "tag": 7
+        }
+      ]
+    ],
+    "stats": {
+      "bytes": 0,
+      "exec_us": 12,
+      "queue_us": 4,
+      "rows": 1
+    }
+  },
+  "name": "sql_exec_response_typedvalue"
+}

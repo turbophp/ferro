@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "d12": {
+    "provisional": true,
+    "reference": false,
+    "target_p50_ns": 60000,
+    "target_p99_ns": 200000
+  },
+  "params": {
+    "scenario": "trivial",
+    "warmup": 2000,
+    "measured": 100000,
+    "transport": "UDS"
+  },
+  "manifest": {
+    "cpu_model": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+    "cpu_cores": 16,
+    "scaling_governor": "unknown",
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "virtualization": "WSL2",
+    "rustc_version": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "ferrod_build_profile": "release",
+    "pg_image": "postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d",
+    "pg_digest": "postgres@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d",
+    "git_sha": "96dc0a678dfb1ad98e06c06d42abd123ac0e768c",
+    "git_dirty": false,
+    "timestamp_utc": "2026-07-27T14:58:58Z",
+    "php_version": "8.4.18",
+    "ext_msgpack": false,
+    "pdo_pgsql": true,
+    "gc_enabled": true,
+    "packer_class": "Ferro\\Protocol\\Msgpack\\PurePacker"
+  },
+  "runs": [
+    {
+      "label": "ferro-jit-off",
+      "target": "ferro",
+      "jit_intended": "off",
+      "jit_effective": "off",
+      "jit_status": {
+        "buffer_free": 67106315,
+        "buffer_size": 67108848,
+        "enabled": true,
+        "kind": 0,
+        "on": false,
+        "opt_flags": 0,
+        "opt_level": 0
+      },
+      "php_directives": [
+        "opcache.enable_cli=1",
+        "opcache.jit=off"
+      ],
+      "skipped": false,
+      "skip_reason": null,
+      "summary": {
+        "samples_n": 100000,
+        "min": 414404,
+        "mean": 910755.59404,
+        "p50": 840326,
+        "p90": 1289826,
+        "p99": 1618662,
+        "p999": 1974864,
+        "max": 19856462
+      }
+    },
+    {
+      "label": "ferro-jit-on",
+      "target": "ferro",
+      "jit_intended": "on",
+      "jit_effective": "on",
+      "jit_status": {
+        "buffer_free": 67106315,
+        "buffer_size": 67108848,
+        "enabled": true,
+        "kind": 5,
+        "on": true,
+        "opt_flags": 6,
+        "opt_level": 4
+      },
+      "php_directives": [
+        "opcache.enable_cli=1",
+        "opcache.jit=tracing",
+        "opcache.jit_buffer_size=64M"
+      ],
+      "skipped": false,
+      "skip_reason": null,
+      "summary": {
+        "samples_n": 100000,
+        "min": 463953,
+        "mean": 916187.50898,
+        "p50": 847637,
+        "p90": 1285620,
+        "p99": 1633460,
+        "p999": 2414149,
+        "max": 24067925
+      }
+    },
+    {
+      "label": "pdo",
+      "target": "pdo",
+      "jit_intended": "on",
+      "jit_effective": "on",
+      "jit_status": {
+        "buffer_free": 67106315,
+        "buffer_size": 67108848,
+        "enabled": true,
+        "kind": 5,
+        "on": true,
+        "opt_flags": 6,
+        "opt_level": 4
+      },
+      "php_directives": [
+        "opcache.enable_cli=1",
+        "opcache.jit=tracing",
+        "opcache.jit_buffer_size=64M"
+      ],
+      "skipped": false,
+      "skip_reason": null,
+      "summary": {
+        "samples_n": 100000,
+        "min": 358919,
+        "mean": 736463.57807,
+        "p50": 677680,
+        "p90": 1095598,
+        "p99": 1509769,
+        "p999": 1805713,
+        "max": 8761095
+      }
+    }
+  ],
+  "overhead_vs_pdo": [
+    {
+      "jit": "off",
+      "p50_ns": 162646,
+      "p99_ns": 108893
+    },
+    {
+      "jit": "on",
+      "p50_ns": 169957,
+      "p99_ns": 123691
+    }
+  ],
+  "fanout": {
+    "placeholder": true,
+    "blocked_on": "M3-fibers"
+  }
+}

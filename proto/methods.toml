@@ -1,0 +1,58 @@
+protocol_version    = 1
+magic               = 0xF7
+max_frame_payload   = 16777216   # 16 MiB hard codec ceiling (W-5)
+default_credit_frames = 64
+default_credit_bytes  = 4194304  # 4 MiB per-request credit window (W-5)
+
+[flags]
+STREAM     = 0x01
+END        = 0x02
+CANCEL     = 0x04
+OOB_FD     = 0x08
+COMPRESSED = 0x10
+
+[services]
+CORE   = 1
+SQL    = 2
+TX     = 3
+STREAM = 4
+ADMIN  = 5
+
+[methods.core]
+HELLO         = 1
+HELLO_ACK     = 2
+PING          = 3
+PONG          = 4
+GOODBYE       = 5
+WINDOW_UPDATE = 6
+
+# SQL service (§6). EXEC is the single request-bearing autocommit statement method (S5).
+[methods.sql]
+EXEC = 1
+
+# TX service (§6/§7, S6). Transaction lifecycle over a connection pinned to a `tx_id` (NOT the
+# client socket). BEGIN mints a tx_id; COMMIT/ROLLBACK end it and release the pinned conn;
+# SAVEPOINT/RELEASE/ROLLBACK_TO drive the engine-named savepoint stack. (Service `TX = 3` above.)
+[methods.tx]
+BEGIN       = 1
+COMMIT      = 2
+ROLLBACK    = 3
+SAVEPOINT   = 4
+RELEASE     = 5
+ROLLBACK_TO = 6
+
+# Terminal outcome-envelope status discriminant (decision W-4). In /proto so both codecs
+# generate it rather than hand-writing 0/1/2 (charter rule 2).
+[outcome]
+OK        = 0
+ERROR     = 1
+CANCELLED = 2
+
+[features.engine]
+MEMFD          = 0x01
+LISTEN_STREAMS = 0x02
+MANIFEST       = 0x04
+
+[features.client]
+MEMFD_RX = 0x01
+FIBERS   = 0x02

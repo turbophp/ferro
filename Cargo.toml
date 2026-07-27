@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["engine/crates/*", "bench"]
+# NOTE: `bench` (decision B-1) was added to `members` in slice S8 when the crate was created
+# (the D12 boundary-latency benchmark / M0 exit gate). Listing a non-existent path here fails
+# workspace resolution, so it stayed out until the crate existed.
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[profile.release]
+lto = "thin"

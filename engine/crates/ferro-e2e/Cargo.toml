@@ -1,0 +1,24 @@
+[package]
+name = "ferro-e2e"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Auto-resolved by the workspace `members = ["engine/crates/*"]` glob — no root Cargo.toml edit
+# (an explicit member entry would risk a duplicate-member error).
+
+[lints]
+workspace = true
+
+# A dev/demo tool, NOT shipped runtime: it spins ferrod up in-process purely from ferrod's public
+# API + ferro-proto to give a one-command "watch the wire path work" artifact. It therefore depends
+# on ferrod (serve/config/pools/services::sql/epoch/session) and ferro-proto ONLY — never on
+# ferro-pool / ferro-backend-pg directly (it never names Pool/PgBackend; the pool lives behind
+# `ferrod::pools::PoolRegistry`).
+[dependencies]
+ferrod = { path = "../ferrod" }
+ferro-proto = { path = "../ferro-proto" }
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"

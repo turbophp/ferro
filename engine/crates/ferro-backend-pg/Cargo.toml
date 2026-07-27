@@ -1,0 +1,22 @@
+[package]
+name = "ferro-backend-pg"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ferro-pool = { path = "../ferro-pool" }
+ferro-proto = { path = "../ferro-proto" }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio-postgres = "0.7"
+futures-util = "0.3"
+async-trait = "0.1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "time"] }
+ferro-pool = { path = "../ferro-pool" }
