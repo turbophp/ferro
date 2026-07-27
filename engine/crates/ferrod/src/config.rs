@@ -36,6 +36,14 @@ const DEFAULT_IDLE_IN_TX: Duration = Duration::from_secs(10);
 /// deadline, which only applies while the tx sits idle between statements).
 const DEFAULT_MAX_TX: Duration = Duration::from_secs(60);
 
+/// Default bound on the per-`tx_id` actor's teardown ROLLBACK (S6 hardening). On abort/deadline the
+/// actor rolls the pinned connection back before releasing it; if that ROLLBACK hangs (a wedged
+/// upstream), the actor must NOT hold the connection + its pool permit until an OS TCP timeout — so
+/// the teardown ROLLBACK runs under this bound, and on timeout OR error the connection is TAINTED
+/// and dropped, letting the pool's (also-bounded) recycle-at-next-checkout reset or evict it.
+/// Symmetric with the pool's bounded recycle (`PoolConfig::checkout_timeout`).
+const DEFAULT_TX_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A configured connection pool: the logical `name` a client references in `ExecRequest.pool`,
 /// plus the upstream `dsn`.
 ///
@@ -86,6 +94,10 @@ pub struct Config {
     /// pinned, from BEGIN, never reset, before it is cancelled + rolled back and reported
     /// `TxDeadline{Retryable}`. Bounds a runaway statement. Injectable small for tests.
     pub max_tx: Duration,
+    /// Bound on the actor's teardown ROLLBACK (S6 hardening, see [`DEFAULT_TX_TEARDOWN_TIMEOUT`]):
+    /// on abort/deadline the pinned conn is rolled back before release; if that hangs, the conn is
+    /// tainted + dropped rather than held (with its pool permit) until an OS TCP timeout.
+    pub tx_teardown_timeout: Duration,
     /// Configured upstream connection pools (S5). Each `PoolSpec` names a pool and carries its DSN
     /// (§12 server-side secret — never sent to the client, never logged). Default: empty (the EXEC
     /// handler then answers every request with `Unsupported: unknown pool`). From `FERRO_POOLS`
@@ -106,6 +118,7 @@ impl Default for Config {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             idle_in_tx: DEFAULT_IDLE_IN_TX,
             max_tx: DEFAULT_MAX_TX,
+            tx_teardown_timeout: DEFAULT_TX_TEARDOWN_TIMEOUT,
             pools: Vec::new(),
         }
     }

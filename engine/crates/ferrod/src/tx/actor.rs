@@ -161,6 +161,7 @@ pub async fn run<B: PoolBackend>(
     registry: TxRegistry,
     idle_timeout: Duration,
     max_timeout: Duration,
+    teardown_timeout: Duration,
 ) {
     // `idle_timeout` is reset on every processed command (inter-statement idle); `max_timeout` is
     // absolute from BEGIN and never reset.
@@ -292,7 +293,7 @@ pub async fn run<B: PoolBackend>(
             .reset(tokio::time::Instant::now() + idle_timeout);
     };
 
-    teardown(tx_id, co, end, &registry).await;
+    teardown(tx_id, co, end, &registry, teardown_timeout).await;
     // Signal LAST — after the conn is back in the pool — so an `abort_session` awaiter that sees
     // `done` can rely on the connection already being released.
     let _ = done_tx.send(true);
@@ -310,17 +311,29 @@ fn ctl_reply(r: Result<(), PoolError>) -> CtlReply {
 /// rollback errors, so the pool's recycle path resets/evicts it rather than handing out a dirty
 /// conn); then drop `co` (RAII → conn to pool) and update the registry — TOMBSTONE on a deadline
 /// (`TxDeadline`), otherwise DEREGISTER.
+///
+/// The teardown ROLLBACK is BOUNDED by `teardown_timeout` (S6 hardening): a wedged upstream must not
+/// keep the actor holding the pinned conn + its pool permit until an OS TCP timeout. On timeout OR
+/// error the conn is TAINTED and dropped, and the pool's own (bounded) recycle-at-next-checkout then
+/// resets or evicts it — symmetric with `Pool::checkout`'s bounded recycle.
 async fn teardown<B: PoolBackend>(
     tx_id: u64,
     mut co: Checkout<B>,
     end: TxEnd,
     registry: &TxRegistry,
+    teardown_timeout: Duration,
 ) {
     match end {
         // COMMIT/ROLLBACK already ran; nothing more to do to the conn.
         TxEnd::Ended => {}
         TxEnd::Abort | TxEnd::Deadline => {
-            if co.rollback_tx().await.is_err() {
+            // A clean rollback within the bound leaves the conn reusable; a timeout OR an error
+            // taints it (tx still open on the wire) so the next checkout's recycle handles it.
+            let rolled_back = matches!(
+                tokio::time::timeout(teardown_timeout, co.rollback_tx()).await,
+                Ok(Ok(()))
+            );
+            if !rolled_back {
                 co.set_tainted(true);
             }
         }
@@ -458,6 +471,9 @@ mod tests {
             registry.clone(),
             idle,
             max,
+            // A generous teardown bound: these tests never block the teardown ROLLBACK, so it always
+            // completes well inside this. The bounded-teardown behaviour has its own test below.
+            Duration::from_secs(600),
         ));
         (tx_id, cmd_tx, done_rx)
     }
@@ -585,6 +601,74 @@ mod tests {
         assert!(
             co2.conn().recorded.contains(&"ROLLBACK".to_string()),
             "the actor rolled back on abort: {:?}",
+            co2.conn().recorded
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn teardown_rollback_timeout_taints_and_releases_the_conn() {
+        // A wedged upstream must not keep the actor holding the pinned conn + its pool permit until
+        // an OS TCP timeout: the teardown ROLLBACK is bounded, and on timeout the conn is tainted +
+        // dropped so the pool's recycle (also bounded) resets/evicts it at the next checkout.
+        let backend = FakeBackend::new();
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+
+        // Open a tx on the size-1 pool's only conn (BEGIN runs before the gate is armed).
+        let mut co = pool.checkout().await.expect("checkout");
+        let tx_id = next_tx_id();
+        co.begin_tx_with(TxId(tx_id), "BEGIN").await.expect("begin");
+
+        // Freeze every SUBSEQUENT simple_query so the teardown ROLLBACK hangs.
+        pool.backend().block_simple_query();
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (done_tx, done_rx) = watch::channel(false);
+        let abort = CancellationToken::new();
+        registry.register(
+            tx_id,
+            TxHandle {
+                owner,
+                cmd_tx,
+                abort: abort.clone(),
+                done: done_rx,
+            },
+        );
+        // A SHORT teardown bound: the blocked ROLLBACK is abandoned at 50ms, not held forever.
+        tokio::spawn(run(
+            tx_id,
+            co,
+            cmd_rx,
+            abort,
+            done_tx,
+            registry.clone(),
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            Duration::from_millis(50),
+        ));
+
+        // Session death aborts the actor. Despite the wedged ROLLBACK, `abort_session` returns
+        // PROMPTLY (bounded by the teardown timeout, well inside the registry's abort deadline) —
+        // the actor taints, releases the conn + permit, and signals done rather than pinning them.
+        registry.abort_session(owner).await;
+        assert_eq!(
+            registry.lookup(tx_id, owner).unwrap_err(),
+            TxLookupErr::NotFoundOrForbidden,
+            "an abort deregisters (never tombstones)"
+        );
+
+        // Un-freeze so the next checkout's recycle can complete, then prove the permit was NOT
+        // leaked behind the wedged teardown: a fresh checkout on the size-1 pool succeeds, and the
+        // recycled conn shows a hygiene RESET (it was TAINTED because the teardown ROLLBACK timed out).
+        pool.backend().release_simple_query();
+        let co2 = pool
+            .checkout()
+            .await
+            .expect("permit released despite the wedged teardown ROLLBACK");
+        assert!(
+            co2.conn().recorded.contains(&"RESET".to_string()),
+            "a timed-out teardown taints the conn → the recycle resets it: {:?}",
             co2.conn().recorded
         );
     }

@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         tx_registry.clone(),
         config.idle_in_tx,
         config.max_tx,
+        config.tx_teardown_timeout,
     );
 
     // Drawn once per running instance and handed to every connection `serve` spawns (SPEC

@@ -28,7 +28,7 @@
 
 pub mod actor;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -47,6 +47,16 @@ use crate::session::SessionId;
 /// PHP int, NOT a full-range/`boot_epoch`-style u64); from 1 and incrementing, that bound is
 /// unreachable in practice.
 static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Maximum number of deadline tombstones the registry retains at once (S6 hardening). A tombstone
+/// lets a timed-out tx's OWNER see `TxDeadline` (retryable) rather than an opaque `Protocol` on its
+/// next touch of the id. Tombstones are normally purged with the session ([`TxRegistry::abort_session`]),
+/// but a single long-lived session that times out many transactions would otherwise accumulate them
+/// unboundedly — so the registry keeps at most this many, evicting OLDEST-first. An evicted (very
+/// old) tombstone degrades its owner's next lookup from `TxDeadline` → `Protocol`, which is
+/// acceptable: the tx is long dead either way and `tx_id`s are never reused, so a stale id can never
+/// be confused with a live transaction.
+const TOMBSTONE_CAP: usize = 4096;
 
 /// Draw the next `tx_id`: monotonic, distinct per call, never reused, bounded < 2^63 (see
 /// [`NEXT_TX_ID`]). Called by the BEGIN handler immediately before spawning the actor.
@@ -184,11 +194,24 @@ impl TxEntry {
     }
 }
 
+/// The `tx_id → entry` map plus the bounded tombstone-retention bookkeeping, both under ONE mutex so
+/// a `tombstone` that evicts the oldest tombstone is atomic with the insertion.
+#[derive(Default)]
+struct TxTable {
+    /// `tx_id` -> its entry (a live actor, or a deadline tombstone).
+    map: HashMap<u64, TxEntry>,
+    /// Insertion-ordered `tx_id`s of the tombstones currently held, for oldest-first eviction once
+    /// the count would exceed [`TOMBSTONE_CAP`]. The deque length is the bound; a stale id (a
+    /// tombstone already purged by [`TxRegistry::abort_session`], or superseded) may linger here
+    /// harmlessly — eviction skips any id no longer present as a tombstone in `map`.
+    tombstone_order: VecDeque<u64>,
+}
+
 struct Inner {
     /// Monotonic, never-reused session ids, one drawn per accepted connection.
     next_session_id: AtomicU64,
-    /// `tx_id` -> its entry (live actor, or a deadline tombstone).
-    txs: Mutex<HashMap<u64, TxEntry>>,
+    /// The transaction table (live actors + bounded deadline tombstones).
+    txs: Mutex<TxTable>,
     /// Bounds [`TxRegistry::abort_session`]'s teardown wait — wired to `config.drain_deadline`.
     abort_deadline: Duration,
 }
@@ -207,7 +230,7 @@ impl TxRegistry {
         Self {
             inner: Arc::new(Inner {
                 next_session_id: AtomicU64::new(0),
-                txs: Mutex::new(HashMap::new()),
+                txs: Mutex::new(TxTable::default()),
                 abort_deadline,
             }),
         }
@@ -226,22 +249,39 @@ impl TxRegistry {
             .txs
             .lock()
             .unwrap()
+            .map
             .insert(tx_id, TxEntry::Active(handle));
     }
 
     /// Remove a transaction from the registry entirely (a later lookup → `NotFoundOrForbidden`).
     /// Called by the actor as it tears down on a clean COMMIT/ROLLBACK or an abort.
     pub fn deregister(&self, tx_id: u64) {
-        self.inner.txs.lock().unwrap().remove(&tx_id);
+        self.inner.txs.lock().unwrap().map.remove(&tx_id);
     }
 
     /// Replace a transaction's entry with a `TxDeadline` tombstone, preserving its owner (a later
     /// owner lookup → `Tombstoned`; anyone else → `NotFoundOrForbidden`). Called by the actor as it
     /// tears down on a deadline. A no-op if the id is already gone.
+    ///
+    /// Tombstone retention is BOUNDED by [`TOMBSTONE_CAP`]: recording this tombstone may evict the
+    /// OLDEST one (a very old timed-out id then degrades from `Tombstoned` → `NotFoundOrForbidden`
+    /// on its owner's next touch — acceptable, see the const's doc), so a long-lived session that
+    /// times out many transactions can never accumulate tombstones without bound.
     pub fn tombstone(&self, tx_id: u64) {
-        let mut txs = self.inner.txs.lock().unwrap();
-        if let Some(owner) = txs.get(&tx_id).map(TxEntry::owner) {
-            txs.insert(tx_id, TxEntry::Tombstoned { owner });
+        let t = &mut *self.inner.txs.lock().unwrap();
+        if let Some(owner) = t.map.get(&tx_id).map(TxEntry::owner) {
+            t.map.insert(tx_id, TxEntry::Tombstoned { owner });
+            t.tombstone_order.push_back(tx_id);
+            // Evict oldest-first until back within the cap. Skip (but still drop from the order
+            // deque) any id that is no longer a live tombstone — already purged by a session abort,
+            // so the deque, not the map, is what stays bounded.
+            while t.tombstone_order.len() > TOMBSTONE_CAP {
+                if let Some(oldest) = t.tombstone_order.pop_front()
+                    && matches!(t.map.get(&oldest), Some(TxEntry::Tombstoned { .. }))
+                {
+                    t.map.remove(&oldest);
+                }
+            }
         }
     }
 
@@ -252,7 +292,7 @@ impl TxRegistry {
     /// - the caller's OWN tombstoned tx → [`TxLookupErr::Tombstoned`] (→ wire `TxDeadline`).
     pub fn lookup(&self, tx_id: u64, caller: SessionId) -> Result<TxHandle, TxLookupErr> {
         let txs = self.inner.txs.lock().unwrap();
-        match txs.get(&tx_id) {
+        match txs.map.get(&tx_id) {
             Some(TxEntry::Active(h)) if h.owner == caller => Ok(h.clone()),
             Some(TxEntry::Tombstoned { owner }) if *owner == caller => Err(TxLookupErr::Tombstoned),
             _ => Err(TxLookupErr::NotFoundOrForbidden),
@@ -276,7 +316,8 @@ impl TxRegistry {
         // hold a std::sync::Mutex across an await point).
         let handles: Vec<TxHandle> = {
             let txs = self.inner.txs.lock().unwrap();
-            txs.values()
+            txs.map
+                .values()
                 .filter_map(|e| match e {
                     TxEntry::Active(h) if h.owner == sid => Some(h.clone()),
                     _ => None,
@@ -302,10 +343,13 @@ impl TxRegistry {
 
         // Purge anything still owned by this session (belt-and-suspenders against a lingering
         // aborted-active whose actor has not finished, plus this session's deadline tombstones).
+        // The `tombstone_order` deque is left as-is: it stays bounded by `TOMBSTONE_CAP` regardless,
+        // and eviction already skips any id no longer present as a tombstone in `map`.
         self.inner
             .txs
             .lock()
             .unwrap()
+            .map
             .retain(|_, e| e.owner() != sid);
     }
 }
@@ -429,6 +473,48 @@ mod tests {
         assert_eq!(
             reg.lookup(1, owner).unwrap_err(),
             TxLookupErr::NotFoundOrForbidden
+        );
+    }
+
+    #[test]
+    fn tombstone_retention_is_bounded_evicting_oldest() {
+        let reg = TxRegistry::new(Duration::from_secs(5));
+        let owner = reg.next_session_id();
+
+        // Fill exactly to the cap: all CAP tombstones are retained.
+        for id in 1..=TOMBSTONE_CAP as u64 {
+            reg.register(id, dummy_handle(owner));
+            reg.tombstone(id);
+        }
+        assert_eq!(
+            reg.inner.txs.lock().unwrap().map.len(),
+            TOMBSTONE_CAP,
+            "the map holds exactly CAP tombstones at the cap"
+        );
+        assert_eq!(reg.lookup(1, owner).unwrap_err(), TxLookupErr::Tombstoned);
+
+        // One more tombstone pushes over the cap → the OLDEST (id 1) is evicted; the map stays
+        // bounded at CAP (a long-lived session that times out many txs cannot grow it unboundedly).
+        let extra = TOMBSTONE_CAP as u64 + 1;
+        reg.register(extra, dummy_handle(owner));
+        reg.tombstone(extra);
+        assert_eq!(
+            reg.inner.txs.lock().unwrap().map.len(),
+            TOMBSTONE_CAP,
+            "the map stays bounded at CAP after oldest-eviction"
+        );
+
+        // The evicted oldest id degrades TxDeadline → Protocol (acceptable — the tx is long dead
+        // and ids are never reused); more-recent tombstones stay retryable.
+        assert_eq!(
+            reg.lookup(1, owner).unwrap_err(),
+            TxLookupErr::NotFoundOrForbidden,
+            "the oldest tombstone is evicted"
+        );
+        assert_eq!(reg.lookup(2, owner).unwrap_err(), TxLookupErr::Tombstoned);
+        assert_eq!(
+            reg.lookup(extra, owner).unwrap_err(),
+            TxLookupErr::Tombstoned
         );
     }
 }

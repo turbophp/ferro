@@ -83,6 +83,7 @@ pub fn make_handler(
     tx_registry: Arc<TxRegistry>,
     idle_in_tx: Duration,
     max_tx: Duration,
+    teardown_timeout: Duration,
 ) -> HandlerFactory {
     Arc::new(move |session_id| -> HandlerFn {
         let registry = registry.clone();
@@ -99,6 +100,7 @@ pub fn make_handler(
                     session_id,
                     idle_in_tx,
                     max_tx,
+                    teardown_timeout,
                 )
                 .await;
             }
@@ -107,6 +109,7 @@ pub fn make_handler(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     frame: InFrame,
     responder: Responder,
@@ -115,6 +118,7 @@ async fn handle(
     session_id: SessionId,
     idle_in_tx: Duration,
     max_tx: Duration,
+    teardown_timeout: Duration,
 ) {
     match (frame.header.service, frame.header.method) {
         (service::SQL, method_sql::EXEC) => {
@@ -129,6 +133,7 @@ async fn handle(
                 session_id,
                 idle_in_tx,
                 max_tx,
+                teardown_timeout,
             )
             .await
         }
@@ -312,6 +317,7 @@ async fn handle_begin(
     session_id: SessionId,
     idle_in_tx: Duration,
     max_tx: Duration,
+    teardown_timeout: Duration,
 ) {
     let req = match BeginRequest::decode(&frame.payload) {
         Ok(r) => r,
@@ -373,6 +379,7 @@ async fn handle_begin(
         tx_registry.clone(),
         idle_in_tx,
         max_tx,
+        teardown_timeout,
     ));
 
     responder.end_ok(Bytes::from(BeginResponse { tx_id }.encode()));

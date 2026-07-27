@@ -502,6 +502,7 @@ pub fn exec_server(url: String) -> TestServer {
         tx_registry.clone(),
         config.idle_in_tx,
         config.max_tx,
+        config.tx_teardown_timeout,
     );
     TestServer::spawn_with_factory(BootEpoch(1), tx_registry, factory)
 }

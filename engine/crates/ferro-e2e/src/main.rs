@@ -63,6 +63,7 @@ async fn main() -> Result<(), BoxErr> {
         tx_registry.clone(),
         config.idle_in_tx,
         config.max_tx,
+        config.tx_teardown_timeout,
     );
     let listener = ferrod::listener::bind_uds(&config)?;
     let epoch = RandomEpoch.epoch();
