@@ -141,8 +141,22 @@ pub struct Stats {
     pub bytes: u64,
 }
 
+/// `Stats`/`affected`/`ExecOk` u64 fields are contractually bounded < 2^63 in the M0 domain (rows
+/// affected, µs timings, and frame-bounded byte counts cannot approach 2^63) — unlike
+/// `HelloAck.boot_epoch`, which is a random full-range u64 preserved as a decimal string in PHP.
+/// This tripwire catches a future field that outgrows the bound before the PHP `(int)` cast would
+/// silently truncate it (see PROTOCOL.md §2). Debug-only: never a release-mode panic on the wire.
+const U64_WIRE_BOUND: u64 = 1 << 63;
+
 impl Stats {
     pub fn encode(&self) -> Vec<u8> {
+        debug_assert!(
+            self.queue_us < U64_WIRE_BOUND
+                && self.exec_us < U64_WIRE_BOUND
+                && self.rows < U64_WIRE_BOUND
+                && self.bytes < U64_WIRE_BOUND,
+            "Stats u64 fields are contractually bounded < 2^63 (PHP int limit); got {self:?}"
+        );
         to_vec(self)
     }
     pub fn decode(b: &[u8]) -> Result<Stats, CodecError> {
@@ -164,6 +178,11 @@ pub struct ExecOk {
 
 impl ExecOk {
     pub fn encode(&self) -> Vec<u8> {
+        debug_assert!(
+            self.affected < U64_WIRE_BOUND,
+            "ExecOk.affected is contractually bounded < 2^63 (PHP int limit); got {}",
+            self.affected
+        );
         let mut out = Vec::new();
         enc::write_array_len(&mut out, 5).unwrap();
         // cols: array of ColMeta [name, tag]

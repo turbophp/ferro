@@ -283,6 +283,42 @@ async fn exec_wrong_param_type_not_indeterminate() {
 }
 
 // -------------------------------------------------------------------------------------------------
+// §19.3 checkout-loss fix (T3-review MAJOR), END TO END and OFFLINE: a checkout-time connect failure
+// on a NON-READONLY (write) EXEC is a KNOWN-FATE ConnectionLost{Retryable}, NEVER a false
+// WriteUnconfirmed{Indeterminate} — the statement was never transmitted. Needs a DSN that FAILS to
+// connect (port 1 → connection refused), not a live PG, so it runs without Docker.
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_checkout_connect_failure_is_retryable_not_indeterminate() {
+    // 127.0.0.1:1 refuses immediately → the pool's fresh-connect at checkout returns
+    // PoolError::ConnectionLost (pool.rs: "a connect failure surfaces immediately — no hidden retry").
+    let server = exec_server("postgres://ferro:ferro@127.0.0.1:1/ferro".to_string());
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    let mut write = req("INSERT INTO whatever (id) VALUES (1)");
+    write.readonly = false; // the readonly→Indeterminate override would fire IF this were sent=true
+
+    let ep = exec_err(&mut client, 70, &write).await;
+    assert_eq!(
+        ep.code,
+        errc::CONNECTION_LOST,
+        "a never-transmitted (checkout-time) connect failure is known-fate ConnectionLost"
+    );
+    assert_eq!(ep.branch, branch::RETRYABLE);
+    assert_ne!(
+        ep.code,
+        errc::WRITE_UNCONFIRMED,
+        "REGRESSION: a write that never left the client must NOT be reported Indeterminate"
+    );
+    assert_ne!(ep.branch, branch::INDETERMINATE);
+
+    // A statement-level error: the session survives (exactly one END).
+    assert_session_alive(&mut client, 4).await;
+}
+
+// -------------------------------------------------------------------------------------------------
 // query_id / unknown pool / fetch=stream → Unsupported; session survives each.
 // -------------------------------------------------------------------------------------------------
 

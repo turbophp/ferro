@@ -249,3 +249,28 @@ fn outcome_ok_composes_with_exec_ok_body() {
         other => panic!("expected Outcome::Ok, got {other:?}"),
     }
 }
+
+/// F64 specials byte-identity (T1-review #3 — the S1 F64 gap, first travels in a Value here).
+/// JSON can't carry NaN/±Inf/-0.0, so a golden vector can't lock them — this is the code-level
+/// lock: the codec MUST emit `[fixarray(2), F64_tag, float64(0xcb), <8 big-endian IEEE-754 bytes>]`
+/// equal to `f64::to_be_bytes()`, which the PHP side mirrors via `pack('E', $f)` (see the PHP
+/// F64-specials test). Also proves a bit-exact round trip (NaN != NaN, so compare bit patterns).
+#[test]
+fn f64_specials_byte_identity() {
+    use ferro_proto::consts::tag;
+    for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0f64] {
+        let mut out = Vec::new();
+        Value::F64(f).encode(&mut out);
+        assert_eq!(out.len(), 11, "2 array + 1 tag + 1 marker + 8 float bytes");
+        assert_eq!(out[0], 0x92, "fixarray(2) marker");
+        assert_eq!(out[1], tag::F64, "F64 tag as a positive fixint");
+        assert_eq!(out[2], 0xcb, "msgpack float64 marker");
+        assert_eq!(&out[3..11], &f.to_be_bytes(), "8 big-endian IEEE-754 bytes");
+        let mut rd: &[u8] = &out;
+        match Value::decode(&mut rd).unwrap() {
+            Value::F64(g) => assert_eq!(g.to_bits(), f.to_bits(), "bit-exact f64 round trip"),
+            other => panic!("expected F64, got {other:?}"),
+        }
+        assert!(rd.is_empty(), "decode consumes exactly the value");
+    }
+}

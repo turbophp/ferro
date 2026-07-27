@@ -334,6 +334,77 @@ fn main() {
     };
     write_sql_response("sql_exec_response_wide", 16, &resp_wide);
 
+    // Some(Value::Null) last_insert_id: the ONE case the Option<Value> peek must disambiguate —
+    // `Some(Null)` encodes as the fixarray `[NULL, nil]` (0x92 00 c0), which the peek must read as
+    // Some, NOT confuse the inner nil with a bare-nil `None` (0xc0). (T1-review MINOR #1.)
+    let resp_nullid = ExecOk {
+        cols: vec![],
+        rows: vec![],
+        affected: 0,
+        last_insert_id: Some(Value::Null),
+        stats: Stats {
+            queue_us: 2,
+            exec_us: 7,
+            rows: 0,
+            bytes: 0,
+        },
+    };
+    write_sql_response("sql_exec_response_nullid", 17, &resp_nullid);
+
+    // S1-deferral shared arbiter: a response row carrying the FULL M0 scalar set incl. the divergent
+    // integer ladder (200 = cc c8, -200 = d1 ff 38) and a BYTES whose first byte is 0xc0, locked by
+    // BOTH Rust encode==bytes AND PHP re-encode==bytes (not just independently-typed asserts).
+    let resp_typedvalue = ExecOk {
+        cols: vec![
+            ColMeta {
+                name: "n".into(),
+                tag: consts::tag::NULL,
+            },
+            ColMeta {
+                name: "b".into(),
+                tag: consts::tag::BOOL,
+            },
+            ColMeta {
+                name: "pos".into(),
+                tag: consts::tag::I64,
+            },
+            ColMeta {
+                name: "neg".into(),
+                tag: consts::tag::I64,
+            },
+            ColMeta {
+                name: "f".into(),
+                tag: consts::tag::F64,
+            },
+            ColMeta {
+                name: "t".into(),
+                tag: consts::tag::TEXT,
+            },
+            ColMeta {
+                name: "by".into(),
+                tag: consts::tag::BYTES,
+            },
+        ],
+        rows: vec![vec![
+            Value::Null,
+            Value::Bool(true),
+            Value::I64(200),
+            Value::I64(-200),
+            Value::F64(1.5),
+            Value::Text("x".into()),
+            Value::Bytes(vec![0xc0, 0x01]),
+        ]],
+        affected: 0,
+        last_insert_id: None,
+        stats: Stats {
+            queue_us: 4,
+            exec_us: 12,
+            rows: 1,
+            bytes: 0,
+        },
+    };
+    write_sql_response("sql_exec_response_typedvalue", 18, &resp_typedvalue);
+
     // Negative seeds (decoder must reject; also fuzz corpus).
     let mut bad_magic = frame(
         0,

@@ -65,11 +65,16 @@ locked by the golden vectors, not by this prose, but this prose explains what th
 - **Arrays** use fixarray / `array16` / `array32` by length. Messages are positional arrays of
   their fields in declaration order (§4) — there is no map-keyed message encoding and no
   message-schema IDL; this document plus the golden vectors are the schema.
-- **uint64 overflow:** a `uint64` value greater than `PHP_INT_MAX` cannot be represented losslessly
-  by `ext-msgpack`, which decodes it to a lossy float. The pure-PHP decoder is authoritative for
-  this case and MUST decode such a value to a decimal string instead. Rust has no such limit
-  (`u64` is native). This only matters for `HelloAck.boot_epoch`, the one field wide enough to
-  hit it in practice.
+- **uint64 overflow:** a `uint64` value greater than `PHP_INT_MAX` (2^63−1) cannot be represented
+  losslessly by `ext-msgpack`, which decodes it to a lossy float. The pure-PHP decoder is
+  authoritative for this case and MUST decode such a value to a decimal string instead. Rust has no
+  such limit (`u64` is native). Only **full-range** `u64` fields need this treatment. The wire has
+  exactly one today: `HelloAck.boot_epoch` (a random per-start id, §19.1). All OTHER `u64` fields
+  are contractually **bounded < 2^63** and are decoded as native PHP ints: `ExecOk.affected` and the
+  four `Stats` fields (`queue_us`, `exec_us`, `rows`, `bytes`) — rows affected, microsecond timings,
+  and a frame-bounded byte count cannot approach 2^63. (The Rust encoder carries a debug-mode
+  `debug_assert!` tripwire on these fields; a future field that outgrows the bound must either adopt
+  the `boot_epoch` decimal-string treatment or be documented here.)
 
 ## 3. TypedValue (`Value`)
 
@@ -202,8 +207,13 @@ codec (`ExecRequest`/`ExecOk`/`SqlValueCodec`) mirror these BYTES — not their 
 structure (PHP unpacks the whole body and walks the nested arrays). The layout below is locked by
 the `sql_exec_*` golden vectors.
 
-Two rules apply throughout §8:
+Three rules apply throughout §8:
 
+- **Strict arity.** Every positional array is fixed-shape, and a conforming decoder MUST read the
+  declared array length and REJECT a mismatch (it MUST NOT read a fixed number of fields and ignore
+  the prefix). The required lengths: `ExecRequest` = 7, `ExecOk` = 5, `ColMeta` = 2 (`[name, tag]`),
+  and each `Value` = 2 (`[tag, payload]`, §3). Both reference codecs enforce this; a lax third
+  implementation that trusted a shorter/longer prefix would mis-frame every following field.
 - **`Option<Value>` peek rule.** An optional `Value` slot (`ExecOk.last_insert_id`) is a bare
   `nil` (`0xc0`) when absent, else the value's own `[tag, payload]` encoding. Decoders peek the
   first byte: `0xc0` ⇒ absent; anything else ⇒ decode a `Value`. This is unambiguous because a

@@ -319,6 +319,20 @@ mod tests {
     }
 
     #[test]
+    fn odd_runs_and_end_of_input_edges() {
+        // `???` = an escaped `??` (literal `?`) followed by a lone `?` placeholder → `?$1`.
+        assert_eq!(scan("a ??? b"), "a ?$1 b");
+        // `????` = two escaped pairs → two literal `?`.
+        assert_eq!(scan("a ???? b"), "a ?? b");
+        // A lone `?` as the final byte is still a placeholder.
+        assert_eq!(scan("WHERE x = ?"), "WHERE x = $1");
+        // A trailing `??` (no following char) is an escaped literal `?`, not a dangling placeholder.
+        assert_eq!(scan("data ??"), "data ?");
+        // `?|` / `?&` at end-of-input stay intact (the lookahead char is the last byte).
+        assert_eq!(scan("data ?|"), "data ?|");
+    }
+
+    #[test]
     fn bounded_cache_evicts_past_cap() {
         let mut cache = PlaceholderCache::new(2);
         cache.get_or_insert("SELECT ?");

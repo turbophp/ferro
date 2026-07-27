@@ -72,12 +72,27 @@ fn message_payloads_are_canonical_and_byte_stable() {
             (s, m) if s == service::CORE && m == mc::WINDOW_UPDATE => {
                 WindowUpdate::decode(payload).unwrap().encode()
             }
-            // A SQL EXEC request (no END flag) is an ExecRequest; a SQL EXEC response (END flag) is a
-            // terminal Outcome::Ok(ExecOk) and decodes via the Outcome arm below.
+            // A SQL EXEC request (no END flag) is an ExecRequest.
             (s, m) if s == service::SQL && m == method_sql::EXEC && (h.flags & flags::END) == 0 => {
                 ExecRequest::decode(payload).unwrap().encode()
             }
-            // error_protocol + sql_exec_response_* vectors: an Outcome terminal payload (END flag).
+            // A SQL EXEC response (END flag) is a terminal Outcome::Ok(ExecOk body). CRACK the body
+            // so Rust is an independent arbiter for RESPONSES, not just requests (T1-review #7):
+            // ExecOk::decode(body) must re-encode to the exact body bytes. Then re-encode the whole
+            // Outcome for the outer byte-stability assertion below.
+            (s, m) if s == service::SQL && m == method_sql::EXEC => {
+                let outcome = Outcome::decode(payload).unwrap();
+                if let Outcome::Ok(body) = &outcome {
+                    assert_eq!(
+                        ExecOk::decode(body).unwrap().encode(),
+                        *body,
+                        "ExecOk body for {:?} is not canonical / byte-stable",
+                        p.file_name().unwrap()
+                    );
+                }
+                outcome.encode()
+            }
+            // error_protocol vectors: an Outcome terminal payload (END flag).
             _ => Outcome::decode(payload).unwrap().encode(),
         };
         assert_eq!(

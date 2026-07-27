@@ -195,13 +195,21 @@ fn build_terminal_body(
         },
     };
 
-    // `stats.bytes` is the encoded terminal body length. It is self-referential (the body carries
-    // stats), so measure with a `0` placeholder first, then set it. Widening the placeholder can
-    // grow the FINAL body by a few bytes for very large results — harmless, because the size-check
-    // below is against the FINAL body, so the honest one-frame bound always holds.
-    let provisional = exec_ok.encode();
-    exec_ok.stats.bytes = provisional.len() as u64;
-    let body = exec_ok.encode();
+    // `stats.bytes` IS the encoded terminal body length, but the body carries `stats.bytes`, so
+    // setting it can widen that field and grow the body. Iterate to a FIXED POINT so the reported
+    // count is EXACT: body length is monotonic non-decreasing in the `bytes` value (a larger value
+    // is the same-or-wider msgpack uint), and each step sets `bytes` to the current length, so the
+    // sequence increases and converges in a couple of steps. (Bounded defensively; the size-check
+    // below always uses the FINAL body regardless, so the one-frame bound is exact either way.)
+    let mut body = exec_ok.encode();
+    for _ in 0..8 {
+        let len = body.len() as u64;
+        if exec_ok.stats.bytes == len {
+            break;
+        }
+        exec_ok.stats.bytes = len;
+        body = exec_ok.encode();
+    }
 
     // Size-check the FULLY-ENCODED Outcome::Ok payload (body + the 2-byte envelope), NOT the raw
     // body (BLOCKER-v2). A per-request Unsupported is the clean alternative to a session teardown.
@@ -351,12 +359,13 @@ mod tests {
         );
     }
 
-    /// The DETERMINISTIC proof of §19.3, across BOTH the `sent` and `readonly` axes:
-    ///  - a TRANSMITTED (`sent=true`) non-readonly loss → `WriteUnconfirmed{Indeterminate}` (fate unknown);
-    ///  - a transmitted readonly loss → `ConnectionLost{Retryable}`;
-    ///  - a NOT-transmitted loss (`sent=false` — a checkout-time connect failure, the §19 DB-bounce)
-    ///    → `ConnectionLost{Retryable}` EVEN on a write, because the statement provably never ran.
-    /// Indeterminate requires `sent && !readonly`; nothing else. (No SQL read/write inference.)
+    /// The DETERMINISTIC proof of §19.3, across BOTH the `sent` and `readonly` axes. Indeterminate
+    /// requires `sent && !readonly`; nothing else (and no SQL read/write inference):
+    ///
+    /// - a TRANSMITTED (`sent=true`) non-readonly loss → `WriteUnconfirmed{Indeterminate}` (fate unknown);
+    /// - a transmitted readonly loss → `ConnectionLost{Retryable}`;
+    /// - a NOT-transmitted loss (`sent=false` — a checkout-time connect failure, the §19 DB-bounce)
+    ///   → `ConnectionLost{Retryable}` EVEN on a write, because the statement provably never ran.
     #[test]
     fn connection_lost_indeterminate_only_when_sent_and_write() {
         // sent + write → the ONE Indeterminate case.
@@ -455,7 +464,32 @@ mod tests {
         assert_eq!(ok.stats.queue_us, 5);
         assert_eq!(ok.stats.exec_us, 9);
         assert_eq!(ok.stats.rows, 1);
-        assert!(ok.stats.bytes > 0, "bytes must be the encoded body length");
+        assert_eq!(
+            ok.stats.bytes as usize,
+            body.len(),
+            "stats.bytes is the EXACT encoded body length (fixpoint)"
+        );
+    }
+
+    /// `stats.bytes` stays EXACT even when the body length crosses the msgpack uint-width boundary
+    /// (>127 → the `bytes` field widens from fixint to uint8, growing the body). The old two-pass
+    /// (`0` placeholder, set once) undercounted here; the fixpoint converges. A ~200-byte text cell
+    /// pushes the body over 127 bytes.
+    #[test]
+    fn stats_bytes_exact_across_uint_width_boundary() {
+        let result = QueryResult {
+            cols: vec![],
+            rows: vec![vec![Value::Text("x".repeat(200))]],
+            affected: 0,
+        };
+        let body = build_terminal_body(result, FETCH_ROWS, 1, 2).expect("fits one frame");
+        assert!(body.len() > 127, "body must cross the uint8 width boundary");
+        let ok = ExecOk::decode(&body).expect("decode ExecOk");
+        assert_eq!(
+            ok.stats.bytes as usize,
+            body.len(),
+            "fixpoint keeps stats.bytes exact across the width boundary"
+        );
     }
 
     /// fetch=none drops the buffered rows but keeps cols + affected; `stats.rows` reflects the
