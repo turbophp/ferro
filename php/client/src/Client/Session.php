@@ -31,7 +31,7 @@ use Ferro\Protocol\Msgpack\PackerInterface;
  * `boot_epoch` is stored OPAQUE (`int|string`) exactly as the packer yields it — never coerced, so
  * the Task-4 reconnect loop can detect an epoch change even for `u64 > PHP_INT_MAX` values.
  */
-final class Session
+final class Session implements SessionInterface
 {
     private readonly Codec $codec;
     private readonly PackerInterface $encodePacker;
@@ -43,6 +43,14 @@ final class Session
     /** @var list<string> cached pool names from HELLO_ACK */
     private array $pools = [];
     private bool $handshakeDone = false;
+
+    /**
+     * The `(service, method)` of the last frame {@see sendRequest} put on the wire (the §19.3
+     * lost-COMMIT carve-out reads this).
+     *
+     * @var array{0:int,1:int}|null
+     */
+    private ?array $lastInFlight = null;
 
     public function __construct(
         private readonly TransportInterface $transport,
@@ -120,6 +128,9 @@ final class Session
     public function sendRequest(int $service, int $method, string $payload): Outcome
     {
         $rid = $this->ids->next();
+        // Record BEFORE the write so that if the write (or the terminal read) dies, the carve-out can
+        // read exactly which (service, method) was in flight — e.g. TX/COMMIT ⇒ Indeterminate (§19.3).
+        $this->lastInFlight = [$service, $method];
         $this->writeFrame(0, $service, $method, $payload, $rid);
 
         [$header, $body] = $this->readFrame();
@@ -207,6 +218,9 @@ final class Session
         }
         return $this->bootEpoch;
     }
+
+    /** @return array{0:int,1:int}|null the `(service, method)` of the last frame sent, or null. */
+    public function lastInFlight(): ?array { return $this->lastInFlight; }
 
     /** @return list<string> the pool names advertised in HELLO_ACK. */
     public function pools(): array { return $this->pools; }

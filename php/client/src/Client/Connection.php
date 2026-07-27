@@ -2,66 +2,99 @@
 declare(strict_types=1);
 namespace Ferro\Client;
 
+use Ferro\Client\Error\ConnectionLostException;
+use Ferro\Client\Error\EpochChangedException;
 use Ferro\Client\Error\ErrorMapper;
+use Ferro\Client\Error\IndeterminateException;
+use Ferro\Client\Error\NonRetryableException;
 use Ferro\Client\Error\ProtocolException;
+use Ferro\Client\Error\RetryableException;
+use Ferro\Client\Error\TransportException;
 use Ferro\Client\Hydration\PlanCache;
 use Ferro\Client\Value\M0ValuePolicy;
 use Ferro\Client\Value\ValuePolicy;
+use Ferro\Protocol\BeginRequest;
+use Ferro\Protocol\BeginResponse;
 use Ferro\Protocol\CodecException;
-use Ferro\Protocol\ExecOk;
-use Ferro\Protocol\ExecRequest;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Msgpack\PackerFactory;
 use Ferro\Protocol\Msgpack\PackerInterface;
 use Ferro\Protocol\Outcome;
-use Ferro\Protocol\SqlValueCodec;
 
 /**
- * The query surface a PHP app actually calls, on top of a {@see Session} (the M0 "pool" is a single
- * connection). `query`/`queryOne`/`scalar`/`rows` are READS and `exec` is the write path.
+ * The query + transaction surface a PHP app actually calls (the M0 "pool" is one session). Reads
+ * (`query`/`queryOne`/`scalar`/`rows`) declare `readonly=true`; `exec` is the write path
+ * (`readonly=false`); `transaction(closure)` is the recovery surface (SPEC §19.1).
  *
- * **§19.3-CRITICAL — reads declare `readonly=true`.** The engine gates the `Indeterminate` split on
- * the client-declared `readonly` flag ALONE (no SQL inference): a statement `sent && !readonly` whose
- * connection dies mid-flight is surfaced `WriteUnconfirmed{Indeterminate}` (which the client NEVER
- * retries). So every read here sends `readonly=true` — a read has no write-fate; a lost read is
- * `ConnectionLost{Retryable}`, safely re-issuable. Only {@see exec} defaults `readonly=false`, and a
- * caller must opt a read-only `exec` into `readonly=true` explicitly.
+ * **§19.3-CRITICAL — the engine gates the Indeterminate split on the client-declared `readonly` flag
+ * ALONE** (no SQL inference): a statement `sent && !readonly` whose connection dies mid-flight is
+ * `WriteUnconfirmed{Indeterminate}`, which the client NEVER retries. So a read has no write-fate — a
+ * lost read is `ConnectionLost{Retryable}`, safely re-issuable — and every read here sends
+ * `readonly=true`; only {@see exec} defaults `readonly=false`.
  *
- * Each call builds an {@see ExecRequest}, sends it through {@see Session::sendRequest}, and on a
- * non-`Ok` {@see Outcome} throws the {@see ErrorMapper}-classified exception; on `Ok` it decodes the
- * {@see ExecOk} body and hydrates rows via the {@see ValuePolicy}. A mid-stream {@see CodecException}
- * (which lives OUTSIDE the {@see \Ferro\Client\Error\FerroException} tree) is wrapped as a
- * {@see ProtocolException} so a codec fault never escapes the client contract.
+ * **Resilience.** When constructed with a {@see ReconnectLoop} + {@see RetryPolicy} (as
+ * {@see \Ferro\Ferro::connect} does), a `Retryable` READ that hits a lost connection transparently
+ * reconnects (epoch-aware) and re-issues, bounded by the policy. A lost WRITE / an `Indeterminate` /
+ * a lost COMMIT is NEVER auto-retried — it propagates. Every retry decision is routed through the
+ * single {@see FateClassifier} chokepoint. Without a loop (bare unit construction) no path reconnects.
  */
 final class Connection
 {
-    /** ExecRequest.fetch modes (PROTOCOL.md §8.1): 0 = rows, 1 = none (affected only), 2 = stream
-     *  (reserved). Not emitted as `FETCH_*` in the generated registry, so mirrored here exactly as
-     *  the S5 EXEC codec / live harness already spell them. */
-    private const FETCH_ROWS = 0;
-    private const FETCH_NONE = 1;
-
-    private readonly ValuePolicy $values;
-    private readonly PlanCache $plans;
+    private readonly ExecCodec $codec;
+    private readonly RetryPolicy $policy;
+    private readonly FateClassifier $fate;
     private readonly PackerInterface $encodePacker;
     private readonly PackerInterface $decodePacker;
 
     public function __construct(
-        private readonly Session $session,
+        private readonly SessionInterface $session,
         private readonly string $pool = 'default',
+        ?ExecCodec $codec = null,
+        private readonly ?ReconnectLoop $reconnect = null,
+        ?RetryPolicy $policy = null,
+        ?FateClassifier $fate = null,
         ?ValuePolicy $values = null,
         ?PlanCache $plans = null,
         ?PackerInterface $encodePacker = null,
         ?PackerInterface $decodePacker = null,
     ) {
-        $this->values = $values ?? new M0ValuePolicy();
-        $this->plans = $plans ?? new PlanCache();
         $this->encodePacker = $encodePacker ?? PackerFactory::forEncode();
         $this->decodePacker = $decodePacker ?? PackerFactory::forDecode();
+        $this->codec = $codec ?? new ExecCodec(
+            $values ?? new M0ValuePolicy(),
+            $plans ?? new PlanCache(),
+            $this->encodePacker,
+            $this->decodePacker,
+        );
+        $this->policy = $policy ?? RetryPolicy::default();
+        $this->fate = $fate ?? new FateClassifier($this->policy->retryReads);
     }
 
-    /** The underlying session (the Task-4 reconnect loop drives it). */
-    public function session(): Session { return $this->session; }
+    /** The live session (the reconnect loop's current one when resilient). */
+    public function session(): SessionInterface
+    {
+        return $this->reconnect?->session() ?? $this->session;
+    }
+
+    /** The currently cached opaque `boot_epoch` (`int|string`). */
+    public function currentEpoch(): int|string
+    {
+        return $this->session()->bootEpoch();
+    }
+
+    /** Whether the most recent transparent reconnect observed a changed epoch (false if none). */
+    public function lastReconnectEpochChanged(): bool
+    {
+        return $this->reconnect?->lastEpochChanged() ?? false;
+    }
+
+    /** How many transparent reconnects have happened (0 without a reconnect loop). */
+    public function reconnectCount(): int
+    {
+        return $this->reconnect?->reconnectCount() ?? 0;
+    }
+
+    // ---- autocommit query API -------------------------------------------------------------------
 
     /**
      * Execute a statement. Defaults to the WRITE fate (`readonly=false`, `fetch=none`) — a caller
@@ -72,13 +105,10 @@ final class Connection
      */
     public function exec(string $sql, array $params = [], bool $readonly = false): int
     {
-        return $this->runExec($sql, $params, $readonly, self::FETCH_NONE)['affected'];
+        return $this->dispatchAutocommit($sql, $params, $readonly, ExecCodec::FETCH_NONE)['affected'];
     }
 
     /**
-     * Run a read and return every row. Assoc `array<string,mixed>` by default; pass a `final
-     * readonly` DTO `class-string` to hydrate instead (snake_case column → camelCase param).
-     *
      * @template T of object
      * @param list<mixed> $params
      * @param class-string<T>|null $dto
@@ -86,21 +116,18 @@ final class Connection
      */
     public function query(string $sql, array $params = [], ?string $dto = null): array
     {
-        $res = $this->runExec($sql, $params, true, self::FETCH_ROWS);
+        $res = $this->dispatchAutocommit($sql, $params, true, ExecCodec::FETCH_ROWS);
         if ($dto === null) {
-            return $this->assocRows($res['cols'], $res['rows']);
+            return $this->codec->assocRows($res);
         }
         $out = [];
         foreach ($res['rows'] as $row) {
-            $out[] = $this->hydrateDto($dto, $res['cols'], $row);
+            $out[] = $this->codec->hydrateDto($dto, $res['cols'], $row);
         }
         return $out;
     }
 
     /**
-     * Run a read and return the FIRST row, or null if the result is empty. Assoc by default; pass a
-     * DTO `class-string` to hydrate the row into it.
-     *
      * @template T of object
      * @param list<mixed> $params
      * @param class-string<T>|null $dto
@@ -108,197 +135,238 @@ final class Connection
      */
     public function queryOne(string $sql, array $params = [], ?string $dto = null): array|object|null
     {
-        $res = $this->runExec($sql, $params, true, self::FETCH_ROWS);
+        $res = $this->dispatchAutocommit($sql, $params, true, ExecCodec::FETCH_ROWS);
         $firstRow = $res['rows'][0] ?? null;
         if ($firstRow === null) {
             return null;
         }
-        if ($dto === null) {
-            return $this->assocRow($res['cols'], $firstRow);
-        }
-        return $this->hydrateDto($dto, $res['cols'], $firstRow);
+        return $dto === null
+            ? $this->codec->assocRow($res['cols'], $firstRow)
+            : $this->codec->hydrateDto($dto, $res['cols'], $firstRow);
     }
 
-    /**
-     * Run a read and return the first column of the first row (a single scalar), or null if the
-     * result is empty.
-     *
-     * @param list<mixed> $params
-     */
+    /** @param list<mixed> $params */
     public function scalar(string $sql, array $params = []): mixed
     {
-        $res = $this->runExec($sql, $params, true, self::FETCH_ROWS);
+        $res = $this->dispatchAutocommit($sql, $params, true, ExecCodec::FETCH_ROWS);
         $firstRow = $res['rows'][0] ?? null;
-        if ($firstRow === null) {
-            return null;
-        }
-        return $firstRow[0] ?? null;
+        return $firstRow === null ? null : ($firstRow[0] ?? null);
     }
 
     /**
-     * Alias of {@see query} without DTO hydration: all rows as assoc arrays.
-     *
      * @param list<mixed> $params
      * @return list<array<string,mixed>>
      */
     public function rows(string $sql, array $params = []): array
     {
-        $res = $this->runExec($sql, $params, true, self::FETCH_ROWS);
-        return $this->assocRows($res['cols'], $res['rows']);
+        return $this->codec->assocRows($this->dispatchAutocommit($sql, $params, true, ExecCodec::FETCH_ROWS));
     }
 
-    /**
-     * Build + send one EXEC and return the decoded, value-policy-applied result. Non-`Ok` outcomes
-     * throw the mapped exception; a mid-stream codec fault is wrapped so it stays inside the
-     * FerroException contract.
-     *
-     * @param list<mixed> $params
-     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int}
-     */
-    private function runExec(string $sql, array $params, bool $readonly, int $fetch): array
-    {
-        $payload = ExecRequest::encode([
-            'pool' => $this->pool,
-            'sql' => $sql,
-            'query_id' => null,
-            'params' => $this->bindParams($params),
-            'timeout_ms' => null,
-            'readonly' => $readonly,
-            'fetch' => $fetch,
-            'tx_id' => null,
-        ], $this->encodePacker);
-
-        try {
-            $outcome = $this->session->sendRequest(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
-            if (!$outcome->isOk()) {
-                // A FerroException (never a CodecException), so it escapes the catch below and
-                // propagates with its three-branch fate intact.
-                throw ErrorMapper::fromOutcome($outcome);
-            }
-            return $this->decodeExecOk($outcome);
-        } catch (CodecException $e) {
-            // CARRY-FORWARD (Task-2 review): CodecException extends \RuntimeException OUTSIDE the
-            // FerroException tree the Task-4 classifier catches on. A garbled/torn terminal body that
-            // read fully but failed to parse is a protocol fault, not a fate signal → ProtocolException.
-            throw new ProtocolException('failed to decode SQL terminal: ' . $e->getMessage(), 0, $e);
-        }
-    }
+    // ---- transaction ----------------------------------------------------------------------------
 
     /**
-     * Decode an `Ok` {@see ExecOk} body into column names + value-policy-decoded rows.
+     * Run `$fn($tx)` inside a transaction (SPEC §19.1 recovery surface): `BEGIN` → the closure runs
+     * against a tx-scoped {@see TxHandle} → normal return `COMMIT`s, a thrown exception `ROLLBACK`s
+     * (best-effort) and rethrows.
      *
-     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int}
+     * **§19.3-CRITICAL — the lost-COMMIT carve-out.** A `COMMIT` with no confirmed response is the
+     * ONE transactional `Indeterminate`: surfaced as {@see IndeterminateException} and the closure is
+     * NEVER re-run (an already-committed tx must not re-apply). The `RetryPolicy` may re-run the whole
+     * closure ONLY when the tx is provably dead — a lost/failed `BEGIN`, or a mid-tx statement whose
+     * connection died (the engine rolled the tx back) — never for a lost `COMMIT`. A changed epoch on
+     * reconnect voids the open `tx_id`; the closure re-runs on the new epoch, or, once the budget is
+     * spent, an {@see EpochChangedException} propagates.
+     *
+     * @template R
+     * @param callable(TxHandle): R $fn
+     * @return R
      */
-    private function decodeExecOk(Outcome $outcome): array
+    public function transaction(callable $fn, ?RetryPolicy $policy = null): mixed
     {
-        $off = 0;
-        $w = $this->decodePacker->unpack($outcome->body(), $off);
-        if (!is_array($w)) {
-            throw new CodecException('ExecOk terminal body is not an array');
-        }
-        $ok = ExecOk::mapFromWire(array_values($w));
+        $policy ??= $this->policy;
+        $attempt = 0;
 
-        $cols = [];
-        foreach (SqlValueCodec::listOf($ok['cols']) as $c) {
-            if (!is_array($c)) {
-                throw new CodecException('ExecOk: bad ColMeta');
-            }
-            $cols[] = SqlValueCodec::toStr($c['name'] ?? '');
-        }
+        while (true) {
+            $session = $this->session();
 
-        $rows = [];
-        foreach (SqlValueCodec::listOf($ok['rows']) as $row) {
-            $cells = [];
-            foreach (SqlValueCodec::listOf($row) as $cell) {
-                if (!is_array($cell)) {
-                    throw new CodecException('ExecOk: bad cell');
-                }
-                $cells[] = $this->values->decode(
-                    SqlValueCodec::toInt($cell['tag'] ?? -1),
-                    $cell['data'] ?? null,
+            // ---- 1. BEGIN ----
+            try {
+                $begin = BeginRequest::encode(
+                    ['pool' => $this->pool, 'isolation' => null, 'readonly' => false],
+                    $this->encodePacker,
                 );
+                $outcome = $session->sendRequest(C::SERVICE_TX, C::METHOD_TX_BEGIN, $begin);
+            } catch (ConnectionLostException | TransportException $e) {
+                // A lost BEGIN never opened the tx (nothing applied) → Retryable, safe to re-run.
+                $fate = $this->fate->classifyLoss(
+                    OpKind::TxBegin,
+                    true,
+                    'BEGIN lost: ' . $e->getMessage(),
+                    $e instanceof ConnectionLostException ? $e->errorPayload() : null,
+                );
+                if ($this->reconnect !== null && $attempt + 1 < $policy->maxAttempts) {
+                    $this->reconnect->reconnect();
+                    ++$attempt;
+                    continue;
+                }
+                throw $fate;
+            } catch (CodecException $e) {
+                throw new ProtocolException('failed to decode BEGIN terminal: ' . $e->getMessage(), 0, $e);
             }
-            $rows[] = $cells;
+            if (!$outcome->isOk()) {
+                $ex = ErrorMapper::fromOutcome($outcome);
+                if ($ex instanceof RetryableException && $attempt + 1 < $policy->maxAttempts) {
+                    ++$attempt;
+                    continue; // BEGIN rejected retryably; nothing opened — re-run on the same session.
+                }
+                throw $ex;
+            }
+            $txId = $this->decodeTxId($outcome);
+            $tx = new TxHandle($session, $this->codec, $this->pool, $txId, $this->encodePacker);
+
+            // ---- 2. run the closure ----
+            try {
+                $result = $fn($tx);
+            } catch (\Throwable $closureError) {
+                // Best-effort rollback; the original error is what matters.
+                try {
+                    $tx->rollback();
+                } catch (\Throwable) {
+                    // The connection may already be gone; swallow — never mask the closure error.
+                }
+
+                $decision = $this->txReRunDecision($closureError);
+                if ($decision !== TxReRun::No && $attempt + 1 < $policy->maxAttempts) {
+                    if ($decision === TxReRun::Reconnect) {
+                        // The session died mid-tx: get a fresh, handshaken one. A changed epoch just
+                        // confirms the tx is void — we re-run the whole closure either way.
+                        $this->reconnect?->reconnect();
+                    }
+                    ++$attempt;
+                    continue;
+                }
+
+                // Out of budget (or non-retryable): if a mid-tx epoch change voided the tx, say so.
+                if ($this->reconnect?->lastEpochChanged() === true
+                    && ($closureError instanceof ConnectionLostException
+                        || $closureError instanceof TransportException)) {
+                    throw new EpochChangedException(
+                        'the engine restarted mid-transaction (boot_epoch changed); the transaction '
+                            . 'is dead and must be restarted (§19.1)',
+                        true,
+                        $closureError,
+                    );
+                }
+                throw $closureError;
+            }
+
+            // ---- 3. COMMIT ----
+            try {
+                $tx->commit();
+                return $result;
+            } catch (ConnectionLostException | TransportException $e) {
+                // §19.3 carve-out: a lost COMMIT is the ONE transactional Indeterminate. The session's
+                // last in-flight frame is TX/COMMIT (the frame we just failed on) — NEVER re-run the
+                // closure. classifyLoss(TxCommit, …) is unconditional Indeterminate regardless.
+                throw $this->fate->classifyLoss(OpKind::TxCommit, false, 'COMMIT lost: ' . $e->getMessage(), null);
+            } catch (IndeterminateException | NonRetryableException $e) {
+                throw $e; // server gave a definite fate — propagate (Indeterminate is never retried).
+            } catch (RetryableException $e) {
+                // Server rejected COMMIT retryably (e.g. deadline/rollback before commit) — the tx did
+                // NOT apply, so re-running the closure is safe when the budget allows.
+                if ($attempt + 1 < $policy->maxAttempts) {
+                    ++$attempt;
+                    continue;
+                }
+                throw $e;
+            } catch (CodecException $e) {
+                throw new ProtocolException('failed to decode COMMIT terminal: ' . $e->getMessage(), 0, $e);
+            }
         }
-
-        return ['cols' => $cols, 'rows' => $rows, 'affected' => SqlValueCodec::toInt($ok['affected'] ?? 0)];
     }
 
-    /**
-     * @param list<string> $cols
-     * @param list<list<mixed>> $rows
-     * @return list<array<string,mixed>>
-     */
-    private function assocRows(array $cols, array $rows): array
-    {
-        $out = [];
-        foreach ($rows as $row) {
-            $out[] = $this->assocRow($cols, $row);
-        }
-        return $out;
-    }
+    // ---- internals ------------------------------------------------------------------------------
 
     /**
-     * @param list<string> $cols
-     * @param list<mixed> $row
-     * @return array<string,mixed>
-     */
-    private function assocRow(array $cols, array $row): array
-    {
-        if (count($cols) !== count($row)) {
-            throw new ProtocolException(sprintf(
-                'ExecOk row arity %d does not match column count %d',
-                count($row),
-                count($cols),
-            ));
-        }
-        /** @var array<string,mixed> $assoc */
-        $assoc = array_combine($cols, $row);
-        return $assoc;
-    }
-
-    /**
-     * @template T of object
-     * @param class-string<T> $class
-     * @param list<string> $cols
-     * @param list<mixed> $row
-     * @return T
-     */
-    private function hydrateDto(string $class, array $cols, array $row): object
-    {
-        $args = $this->plans->planFor($class, $cols)->argsFor($row);
-        return (new \ReflectionClass($class))->newInstanceArgs($args);
-    }
-
-    /**
-     * Bind positional PHP scalars to the canonical `{tag, data}` shape {@see ExecRequest::encode}
-     * consumes. M0 binds strings as TEXT (BYTES binding is post-M0).
+     * Send one autocommit EXEC and decode it, transparently reconnecting + re-issuing a Retryable
+     * READ (bounded by the policy). A lost WRITE / Indeterminate / exhausted read propagates.
      *
      * @param list<mixed> $params
-     * @return list<array{tag:int,data:mixed}>
+     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int}
      */
-    private function bindParams(array $params): array
+    private function dispatchAutocommit(string $sql, array $params, bool $readonly, int $fetch): array
     {
-        $out = [];
-        foreach ($params as $v) {
-            $out[] = self::bindOne($v);
+        $opKind = $readonly ? OpKind::Read : OpKind::Write;
+        $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, null);
+        $attempt = 0;
+
+        while (true) {
+            try {
+                $outcome = $this->session()->sendRequest(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
+            } catch (ConnectionLostException | TransportException $e) {
+                // No response / dead transport → classify per §19.1 (a lost write is Indeterminate).
+                $server = $e instanceof ConnectionLostException ? $e->errorPayload() : null;
+                $fate = $this->fate->classifyLoss($opKind, $readonly, $e->getMessage(), $server);
+                if ($this->reconnect !== null
+                    && $attempt + 1 < $this->policy->maxAttempts
+                    && $this->fate->mayRetryException($fate, $readonly, $opKind)
+                ) {
+                    $this->reconnect->reconnect();
+                    ++$attempt;
+                    continue;
+                }
+                throw $fate;
+            } catch (CodecException $e) {
+                throw new ProtocolException('failed to decode SQL terminal: ' . $e->getMessage(), 0, $e);
+            }
+
+            if ($outcome->isOk()) {
+                return $this->codec->decode($outcome);
+            }
+
+            // Server responded with a definite error.
+            $ex = ErrorMapper::fromOutcome($outcome);
+            if ($this->reconnect !== null
+                && $attempt + 1 < $this->policy->maxAttempts
+                && $this->fate->mayRetryException($ex, $readonly, $opKind)
+            ) {
+                // A server-declared Retryable READ: the session is alive → re-issue, no reconnect.
+                ++$attempt;
+                continue;
+            }
+            throw $ex;
         }
-        return $out;
     }
 
-    /** @return array{tag:int,data:mixed} */
-    private static function bindOne(mixed $v): array
+    /** Whether — and how — a closure failure lets the WHOLE transaction re-run (§19.1). */
+    private function txReRunDecision(\Throwable $closureError): TxReRun
     {
-        return match (true) {
-            $v === null   => ['tag' => C::TAG_NULL, 'data' => null],
-            is_bool($v)   => ['tag' => C::TAG_BOOL, 'data' => $v],
-            is_int($v)    => ['tag' => C::TAG_I64,  'data' => $v],
-            is_float($v)  => ['tag' => C::TAG_F64,  'data' => $v],
-            is_string($v) => ['tag' => C::TAG_TEXT, 'data' => $v],
-            default => throw new ProtocolException(sprintf(
-                'unsupported bind parameter type %s (M0 binds null/bool/int/float/string)',
-                get_debug_type($v),
-            )),
-        };
+        // A mid-tx connection loss killed the tx (the engine rolled it back). Re-running the closure
+        // is safe (nothing committed) — but only if we can get a fresh session.
+        if ($closureError instanceof ConnectionLostException || $closureError instanceof TransportException) {
+            return $this->reconnect !== null ? TxReRun::Reconnect : TxReRun::No;
+        }
+        // A server-declared Retryable inside the tx (deadlock/serialization): the tx aborted, so
+        // re-run the whole closure on the SAME live session — no reconnect needed.
+        if ($closureError instanceof RetryableException) {
+            return TxReRun::SameSession;
+        }
+        // Indeterminate (should not occur mid-tx), NonRetryable, Cancelled, Protocol, or a non-Ferro
+        // application error: never silently re-run — propagate.
+        return TxReRun::No;
+    }
+
+    private function decodeTxId(Outcome $outcome): int
+    {
+        try {
+            $off = 0;
+            $w = $this->decodePacker->unpack($outcome->body(), $off);
+            if (!is_array($w)) {
+                throw new CodecException('BeginResponse body is not an array');
+            }
+            return BeginResponse::mapFromWire(array_values($w))['tx_id'];
+        } catch (CodecException $e) {
+            throw new ProtocolException('failed to decode BEGIN response: ' . $e->getMessage(), 0, $e);
+        }
     }
 }

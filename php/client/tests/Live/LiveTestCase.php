@@ -2,8 +2,11 @@
 declare(strict_types=1);
 namespace Ferro\Tests\Live;
 
+use Ferro\Client\Connection;
+use Ferro\Client\RetryPolicy;
 use Ferro\Client\Session;
 use Ferro\Client\Transport;
+use Ferro\Ferro;
 use Ferro\Protocol\ExecRequest;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Msgpack\PackerFactory;
@@ -38,6 +41,9 @@ abstract class LiveTestCase extends TestCase
 
     protected string $socketPath = '';
     private string $stderrPath = '';
+    /** The located ferrod binary + upstream DSN, kept so {@see restartFerrod} can relaunch. */
+    private string $ferrodBin = '';
+    private string $pgUrl = '';
     /** @var resource|null the ferrod process handle */
     private $proc = null;
 
@@ -64,6 +70,8 @@ abstract class LiveTestCase extends TestCase
 
         if (file_exists($this->socketPath)) { @unlink($this->socketPath); }
 
+        $this->ferrodBin = $bin;
+        $this->pgUrl = $pgUrl;
         $this->launchFerrod($bin, $pgUrl);
         $this->waitUntilReady();
     }
@@ -79,6 +87,31 @@ abstract class LiveTestCase extends TestCase
     protected function connect(): Session
     {
         return new Session(Transport::connectUnix($this->socketPath, 2.0, 5.0));
+    }
+
+    /**
+     * A resilient {@see Connection} (the real {@see Ferro::connect} path) bound to this test's ferrod
+     * over its UDS socket — the epoch-aware reconnect loop + fate classifier are wired in, so the
+     * daemon-restart test exercises the true §19.1 recovery path.
+     */
+    protected function connectConnection(?RetryPolicy $policy = null): Connection
+    {
+        return Ferro::connect($this->socketPath, 'default', 2.0, 5.0, $policy);
+    }
+
+    /**
+     * SIGTERM the running ferrod and relaunch a fresh one on the SAME socket — the §19.1 restart
+     * proof. The new process draws a NEW random `boot_epoch`, so a cached epoch no longer matches
+     * and the reconnect loop must void engine-side state. Blocks until the new instance is ready.
+     */
+    protected function restartFerrod(): void
+    {
+        $this->stopFerrod();
+        if ($this->socketPath !== '' && file_exists($this->socketPath)) {
+            @unlink($this->socketPath); // ferrod stale-unlinks at bind, but be explicit
+        }
+        $this->launchFerrod($this->ferrodBin, $this->pgUrl);
+        $this->waitUntilReady();
     }
 
     /** The repo-relative candidate binary paths, plus `FERRO_FERROD_BIN`. */

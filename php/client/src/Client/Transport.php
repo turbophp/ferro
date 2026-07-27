@@ -86,7 +86,9 @@ final class Transport implements TransportInterface
         $buf = '';
         $remaining = $n;
         while ($remaining > 0) {
-            $chunk = fread($this->sock, $remaining);
+            // Suppress the PHP-level warning (a dead peer raises one): the return value + stream meta
+            // below are the authoritative error signal, surfaced as a typed TransportException.
+            $chunk = @fread($this->sock, $remaining);
             if ($chunk === false || $chunk === '') {
                 $meta = stream_get_meta_data($this->sock);
                 if ($meta['timed_out'] === true) {
@@ -108,7 +110,10 @@ final class Transport implements TransportInterface
         $len = strlen($bytes);
         $written = 0;
         while ($written < $len) {
-            $n = fwrite($this->sock, substr($bytes, $written));
+            // Suppress the PHP-level warning on a broken pipe (a restarted/dead ferrod): the false/0
+            // return + stream meta are handled below and surfaced as a typed TransportException, which
+            // the §19.1 reconnect loop acts on. Without @, every reconnect would emit a stray notice.
+            $n = @fwrite($this->sock, substr($bytes, $written));
             if ($n === false || $n === 0) {
                 $meta = stream_get_meta_data($this->sock);
                 if ($meta['timed_out'] === true) {
