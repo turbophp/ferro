@@ -65,6 +65,20 @@ Brings the stack up, waits for health, asserts `ferro_smoke` has exactly 2 rows,
 prints `testkit smoke OK`, and tears everything down (`down -v`) on exit —
 success or failure. Exit code 0 means the testkit works.
 
+## Watch the wire path end to end
+
+```
+testkit/e2e-demo.sh
+```
+
+Brings the `pg` service up, waits for health, then runs the `ferro-e2e` demo
+(`engine/crates/ferro-e2e`) — a real in-process `ferrod` over a UDS socket pointed
+at this Postgres — printing a narrated EXEC sequence (HELLO, SELECT, DDL +
+parametrized INSERT, row-returning SELECT, a classified syntax error, and a burst
+of concurrent EXECs) with `queue_us`/`exec_us` stats, then tears the `pg` service
+down again. Or run the demo directly once `FERRO_TEST_PG_URL` is set:
+`cargo run -p ferro-e2e`.
+
 ## Stop / tear down
 
 ```
