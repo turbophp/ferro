@@ -11,8 +11,9 @@ use tokio::time::Instant;
 
 use ferro_proto::consts::{branch, errc};
 
-use crate::backend::{Cancel, PoolBackend, QueryResult};
+use crate::backend::{Cancel, PoolBackend, QueryResult, TxStatus};
 use crate::error::PoolError;
+use crate::pin::{TxVerb, leading_tx_verb};
 
 /// The fake's connection handle. Fields are `pub` so tests can inspect/mutate state directly
 /// (arm a ping failure, read `recorded`, flip `closed`, check `tx_open`) without a getter for
@@ -27,6 +28,13 @@ pub struct FakeConn {
     pub recorded: Vec<String>,
     pub tx_open: bool,
     fail_next_ping: bool,
+    /// Models the RFQ status this connection would report (Task 3). Lives PER-`FakeConn` (matching
+    /// real per-`Client` semantics), defaults to `Idle` at checkout, and is updated by
+    /// `simple_query`/`query` inferring from the leading SQL keyword (see `leading_tx_verb`) — NOT
+    /// a shared `FakeBackend` field, which would let one connection's status leak into another's
+    /// and (per the Task 3 verification blocker) let a stale `Idle` clobber a pin another conn just
+    /// set.
+    tx_status: TxStatus,
 }
 
 impl FakeConn {
@@ -34,6 +42,33 @@ impl FakeConn {
     /// is consumed (one-shot) so subsequent pings succeed again.
     pub fn arm_fail_next_ping(&mut self) {
         self.fail_next_ping = true;
+    }
+
+    /// This connection's currently-modeled [`TxStatus`] (mirrors `PoolBackend::tx_status`).
+    pub fn tx_status(&self) -> TxStatus {
+        self.tx_status
+    }
+
+    /// Test hook: force this connection's modeled `TxStatus` directly. The only way to reach
+    /// `Failed` (RFQ `E`) — no SQL keyword expresses "the last statement errored", so a test arms
+    /// it explicitly to drive that case through `PoolBackend::tx_status`.
+    pub fn set_tx_status(&mut self, status: TxStatus) {
+        self.tx_status = status;
+    }
+}
+
+/// Updates `conn.tx_status` by inferring from `sql`'s leading transaction-control keyword (shared
+/// scan with `pin::is_bare_tx_control`, Task 3): a leading `BEGIN`/`START TRANSACTION` models
+/// `InTx`; a leading `COMMIT`/`ROLLBACK`/`END`/`ABORT`/`RELEASE` models `Idle`. Anything else
+/// (an ordinary statement, or a tx-control verb that doesn't open/close a transaction like
+/// `SAVEPOINT`) leaves `tx_status` unchanged — exactly like a real `ReadyForQuery` byte, which
+/// only flips between `I`/`T`/`E` on a statement that actually changes transaction state.
+fn apply_leading_tx_verb(conn: &mut FakeConn, sql: &str) {
+    if let Some(verb) = leading_tx_verb(sql) {
+        conn.tx_status = match verb {
+            TxVerb::Open => TxStatus::InTx,
+            TxVerb::Close => TxStatus::Idle,
+        };
     }
 }
 
@@ -221,6 +256,7 @@ impl PoolBackend for FakeBackend {
             recorded: Vec::new(),
             tx_open: false,
             fail_next_ping: false,
+            tx_status: TxStatus::Idle,
         })
     }
 
@@ -246,6 +282,10 @@ impl PoolBackend for FakeBackend {
         conn.closed
     }
 
+    fn tx_status(&self, conn: &Self::Conn) -> TxStatus {
+        conn.tx_status
+    }
+
     async fn reset(&self, conn: &mut Self::Conn) -> Result<(), PoolError> {
         conn.tx_open = false;
         conn.recorded.push("RESET".to_string());
@@ -254,6 +294,7 @@ impl PoolBackend for FakeBackend {
 
     async fn simple_query(&self, conn: &mut Self::Conn, sql: &str) -> Result<u64, PoolError> {
         conn.recorded.push(sql.to_string());
+        apply_leading_tx_verb(conn, sql);
         // Test-only gate (see `block_simple_query`/`release_simple_query`): if armed, park here so
         // the bounded-recycle test can freeze a checkout-time defensive ROLLBACK and prove the
         // recycle timeout evicts the conn instead of hanging.
@@ -274,6 +315,7 @@ impl PoolBackend for FakeBackend {
         // reaches here, so a test can assert `recorded` to prove `Checkout::query`'s guard fired
         // (or didn't) before delegation.
         conn.recorded.push(sql.to_string());
+        apply_leading_tx_verb(conn, sql);
 
         // Test-only gate (see `block_query`): if armed, park until a `FakeCancelHandle` for this
         // backend fires. A fired cancel returns the `57014`-shaped `Sql` error the pg `error_map`

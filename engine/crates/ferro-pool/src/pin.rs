@@ -116,9 +116,47 @@ pub(crate) fn is_bare_tx_control(sql: &str) -> bool {
     false
 }
 
+/// Whether a leading transaction-control verb OPENS a transaction block (`BEGIN`,
+/// `START TRANSACTION`) or CLOSES one (`COMMIT`/`ROLLBACK`/`END`/`ABORT`/`RELEASE`). Verbs that
+/// manage a transaction without opening/closing it (`SAVEPOINT`, `PREPARE TRANSACTION`) are
+/// deliberately not classified here — see [`leading_tx_verb`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxVerb {
+    Open,
+    Close,
+}
+
+/// Classifies `sql`'s leading keyword(s) (comment/whitespace tolerant, same scan as
+/// [`is_bare_tx_control`]) as [`TxVerb::Open`]/[`TxVerb::Close`], or `None` if the leading verb
+/// doesn't change transaction status (`SAVEPOINT`, `PREPARE TRANSACTION`) or isn't tx-control at
+/// all.
+///
+/// This is the shared scan `FakeBackend` (Task 3) uses to model `TxStatus` per-connection from the
+/// SQL it records — matching the ONE thing `is_bare_tx_control` already agrees is a bare
+/// transaction-control statement, so the fake's inference and the real guard can never disagree
+/// about what "looks like a BEGIN/COMMIT" means. Does not change `is_bare_tx_control`'s own
+/// behavior.
+pub(crate) fn leading_tx_verb(sql: &str) -> Option<TxVerb> {
+    let sql = skip_leading_noise(sql);
+    let words = leading_words(sql, 2);
+    let first = words.first()?;
+    match first.as_str() {
+        "BEGIN" => return Some(TxVerb::Open),
+        "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "RELEASE" => return Some(TxVerb::Close),
+        _ => {}
+    }
+    if let Some(second) = words.get(1)
+        && first == "START"
+        && second == "TRANSACTION"
+    {
+        return Some(TxVerb::Open);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_bare_tx_control;
+    use super::{TxVerb, is_bare_tx_control, leading_tx_verb};
 
     #[test]
     fn detects_single_word_verbs_case_insensitively() {
@@ -164,5 +202,30 @@ mod tests {
         assert!(is_bare_tx_control("/* c */\n  Abort"));
         // An ordinary statement behind a leading comment must still be allowed.
         assert!(!is_bare_tx_control("/* c */ SELECT 1"));
+    }
+
+    #[test]
+    fn leading_tx_verb_classifies_open_and_close() {
+        assert_eq!(leading_tx_verb("BEGIN"), Some(TxVerb::Open));
+        assert_eq!(
+            leading_tx_verb("start transaction"),
+            Some(TxVerb::Open),
+            "START TRANSACTION is the two-word open verb"
+        );
+        assert_eq!(leading_tx_verb("COMMIT"), Some(TxVerb::Close));
+        assert_eq!(leading_tx_verb("ROLLBACK"), Some(TxVerb::Close));
+        assert_eq!(leading_tx_verb("End"), Some(TxVerb::Close));
+        assert_eq!(leading_tx_verb("Abort"), Some(TxVerb::Close));
+        assert_eq!(leading_tx_verb("release"), Some(TxVerb::Close));
+    }
+
+    #[test]
+    fn leading_tx_verb_none_for_non_status_changing_or_ordinary_sql() {
+        // SAVEPOINT/PREPARE TRANSACTION manage a transaction without opening/closing it -- and an
+        // ordinary statement is not tx-control at all -- so neither changes the modeled status.
+        assert_eq!(leading_tx_verb("SAVEPOINT sp1"), None);
+        assert_eq!(leading_tx_verb("Prepare Transaction 'foo'"), None);
+        assert_eq!(leading_tx_verb("SELECT 1"), None);
+        assert_eq!(leading_tx_verb(""), None);
     }
 }

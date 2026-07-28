@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use ferro_pool::backend::{Cancel, PoolBackend};
+use ferro_pool::backend::{Cancel, PoolBackend, TxStatus};
 use ferro_pool::error::PoolError;
 
 /// A pooled Postgres connection.
@@ -116,6 +116,12 @@ impl PoolBackend for PgBackend {
 
     fn is_closed(&self, conn: &Self::Conn) -> bool {
         conn.closed.load(Ordering::SeqCst) || conn.client.is_closed()
+    }
+
+    /// Reads the authoritative RFQ status the driver already tracked off the wire (Task 1's fork
+    /// addition) — no round trip, and no bespoke bookkeeping to keep in sync with reality.
+    fn tx_status(&self, conn: &Self::Conn) -> TxStatus {
+        TxStatus::from_pg_byte(conn.client.transaction_status())
     }
 
     async fn reset(&self, conn: &mut Self::Conn) -> Result<(), PoolError> {

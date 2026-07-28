@@ -18,6 +18,37 @@ pub struct QueryResult {
     pub affected: u64,
 }
 
+/// The real transaction status of a pooled connection, surfaced from Postgres's `ReadyForQuery`
+/// (`Z`) status byte (M1, SPEC §21 open item resolved) — `I`dle, `T`ransaction, `E`rror. This is
+/// the authoritative pin signal the pin engine (Task 4) checks AFTER every statement, replacing
+/// the S4 stub's engine-side-only bookkeeping (`Checkout::begin_tx`/`commit_tx`/`rollback_tx`
+/// setting `pin`/`tx_open` by hand) with the protocol's own word on whether a transaction is
+/// still open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxStatus {
+    /// No transaction in progress (RFQ `I`, or nothing observed yet).
+    Idle,
+    /// A transaction block is open (RFQ `T`).
+    InTx,
+    /// A transaction block is open but has hit an error and is aborted, pending ROLLBACK (RFQ
+    /// `E`).
+    Failed,
+}
+
+impl TxStatus {
+    /// Maps a raw `ReadyForQuery` status byte to a [`TxStatus`]: `b'T'` → [`TxStatus::InTx`],
+    /// `b'E'` → [`TxStatus::Failed`], anything else (including the fresh/idle `b'I'`) →
+    /// [`TxStatus::Idle`] — a deliberately permissive fallback since `I` is by far the common case
+    /// and an unrecognized byte should never be treated as "still in a transaction".
+    pub fn from_pg_byte(byte: u8) -> TxStatus {
+        match byte {
+            b'T' => TxStatus::InTx,
+            b'E' => TxStatus::Failed,
+            _ => TxStatus::Idle,
+        }
+    }
+}
+
 /// A fire-once, out-of-band cancel handle (S6). Grabbed via [`PoolBackend::cancel_handle`] /
 /// `Checkout::cancel_handle` BEFORE an interruptible statement starts, moved into a `select!` arm,
 /// and [`Cancel::cancel`]led on a deadline/abort — WITHOUT borrowing the `Checkout` the live query
@@ -67,6 +98,14 @@ pub trait PoolBackend: Send + Sync + 'static {
     /// Cheap, synchronous "is this obviously dead" check (no round trip) used at checkout time.
     fn is_closed(&self, conn: &Self::Conn) -> bool;
 
+    /// Cheap, synchronous read of `conn`'s current [`TxStatus`] — no round trip. Mirrors the real
+    /// Postgres protocol's `ReadyForQuery` status byte, which every backend response ends with, so
+    /// no query is needed to learn it: the real backend reads a value the driver already tracked
+    /// off the wire (`conn.client.transaction_status()`), and the fake models the same thing
+    /// per-connection so it can't be bypassed by pool-internal bookkeeping. This is the pin
+    /// engine's authority (Task 4), replacing the S4 stub's engine-side-only pin tracking.
+    fn tx_status(&self, conn: &Self::Conn) -> TxStatus;
+
     /// Hygiene reset (e.g. `DISCARD ALL`) — run at checkout for a tainted/tx-served conn before
     /// it is handed to a new caller (v2/B1).
     async fn reset(&self, conn: &mut Self::Conn) -> Result<(), PoolError>;
@@ -88,4 +127,23 @@ pub trait PoolBackend: Send + Sync + 'static {
         sql: &str,
         params: &[Value],
     ) -> Result<QueryResult, PoolError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TxStatus;
+
+    #[test]
+    fn from_pg_byte_maps_known_bytes() {
+        assert_eq!(TxStatus::from_pg_byte(b'I'), TxStatus::Idle);
+        assert_eq!(TxStatus::from_pg_byte(b'T'), TxStatus::InTx);
+        assert_eq!(TxStatus::from_pg_byte(b'E'), TxStatus::Failed);
+    }
+
+    #[test]
+    fn from_pg_byte_falls_back_to_idle_for_unknown_bytes() {
+        assert_eq!(TxStatus::from_pg_byte(b'?'), TxStatus::Idle);
+        assert_eq!(TxStatus::from_pg_byte(0), TxStatus::Idle);
+        assert_eq!(TxStatus::from_pg_byte(b'z'), TxStatus::Idle);
+    }
 }
