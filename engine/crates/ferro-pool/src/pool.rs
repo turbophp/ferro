@@ -278,9 +278,11 @@ impl<B: PoolBackend> Checkout<B> {
         self.tx_open
     }
 
-    /// Whether this connection needs a hygiene reset before reuse (an aborted tx `E`, or any error
-    /// while a tx was open). Set unconditionally by `apply_tx_status(Failed)` and by the
-    /// `is_err() && tx_open` stale-atomic guard; only ever cleared by the checkout-time recycle.
+    /// Whether this connection needs a hygiene reset before reuse (an aborted tx `E`, or ANY error
+    /// on an instrumented statement). Set by `apply_tx_status(Failed)` and — as the Rule-A
+    /// fail-safe — UNCONDITIONALLY on any `Err` arm (alongside `tx_open`), since the Err-arm RFQ
+    /// atomic is untrustworthy and a batch can open a tx before erroring. Only ever cleared by the
+    /// checkout-time recycle.
     pub fn tainted(&self) -> bool {
         self.tainted
     }
@@ -310,7 +312,21 @@ impl<B: PoolBackend> Checkout<B> {
         }
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
-        if r.is_err() && self.tx_open {
+        if r.is_err() {
+            // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
+            // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
+            // trailing `ReadyForQuery` is decoded — AND a statement can OPEN a tx before erroring:
+            // `exec` forwards a multi-statement batch to `batch_execute`, and `is_bare_tx_control`
+            // only checks the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
+            // opens a tx mid-batch from autocommit, then errors — leaving an OPEN, ABORTED tx while
+            // the atomic still reads stale-`Idle`. So neither `apply_tx_status` nor a pre-captured
+            // `tx_open` can be trusted here. Force BOTH bits UNCONDITIONALLY so the checkout-time
+            // recycle runs `ROLLBACK` *then* `DISCARD ALL` (that order is required — DISCARD ALL
+            // cannot run inside a tx block) and a possibly-poisoned conn is NEVER handed to the next
+            // tenant (charter rule 6). Over-forcing on a genuinely-clean autocommit error (PG
+            // auto-rolls-back to Idle) costs only one harmless extra ROLLBACK+reset at the next
+            // checkout — the safe direction (charter rule 5: correctness over throughput).
+            self.tx_open = true;
             self.tainted = true;
         }
         r.map(|_| ())
@@ -343,7 +359,21 @@ impl<B: PoolBackend> Checkout<B> {
             .map(|_| ());
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
-        if r.is_err() && self.tx_open {
+        if r.is_err() {
+            // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
+            // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
+            // trailing `ReadyForQuery` is decoded — AND a statement can OPEN a tx before erroring:
+            // `exec` forwards a multi-statement batch to `batch_execute`, and `is_bare_tx_control`
+            // only checks the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
+            // opens a tx mid-batch from autocommit, then errors — leaving an OPEN, ABORTED tx while
+            // the atomic still reads stale-`Idle`. So neither `apply_tx_status` nor a pre-captured
+            // `tx_open` can be trusted here. Force BOTH bits UNCONDITIONALLY so the checkout-time
+            // recycle runs `ROLLBACK` *then* `DISCARD ALL` (that order is required — DISCARD ALL
+            // cannot run inside a tx block) and a possibly-poisoned conn is NEVER handed to the next
+            // tenant (charter rule 6). Over-forcing on a genuinely-clean autocommit error (PG
+            // auto-rolls-back to Idle) costs only one harmless extra ROLLBACK+reset at the next
+            // checkout — the safe direction (charter rule 5: correctness over throughput).
+            self.tx_open = true;
             self.tainted = true;
         }
         r
@@ -374,7 +404,21 @@ impl<B: PoolBackend> Checkout<B> {
         }
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
-        if r.is_err() && self.tx_open {
+        if r.is_err() {
+            // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
+            // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
+            // trailing `ReadyForQuery` is decoded — AND a statement can OPEN a tx before erroring:
+            // `exec` forwards a multi-statement batch to `batch_execute`, and `is_bare_tx_control`
+            // only checks the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
+            // opens a tx mid-batch from autocommit, then errors — leaving an OPEN, ABORTED tx while
+            // the atomic still reads stale-`Idle`. So neither `apply_tx_status` nor a pre-captured
+            // `tx_open` can be trusted here. Force BOTH bits UNCONDITIONALLY so the checkout-time
+            // recycle runs `ROLLBACK` *then* `DISCARD ALL` (that order is required — DISCARD ALL
+            // cannot run inside a tx block) and a possibly-poisoned conn is NEVER handed to the next
+            // tenant (charter rule 6). Over-forcing on a genuinely-clean autocommit error (PG
+            // auto-rolls-back to Idle) costs only one harmless extra ROLLBACK+reset at the next
+            // checkout — the safe direction (charter rule 5: correctness over throughput).
+            self.tx_open = true;
             self.tainted = true;
         }
         r.map(|_| ())
@@ -398,7 +442,21 @@ impl<B: PoolBackend> Checkout<B> {
         }
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
-        if r.is_err() && self.tx_open {
+        if r.is_err() {
+            // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
+            // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
+            // trailing `ReadyForQuery` is decoded — AND a statement can OPEN a tx before erroring:
+            // `exec` forwards a multi-statement batch to `batch_execute`, and `is_bare_tx_control`
+            // only checks the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
+            // opens a tx mid-batch from autocommit, then errors — leaving an OPEN, ABORTED tx while
+            // the atomic still reads stale-`Idle`. So neither `apply_tx_status` nor a pre-captured
+            // `tx_open` can be trusted here. Force BOTH bits UNCONDITIONALLY so the checkout-time
+            // recycle runs `ROLLBACK` *then* `DISCARD ALL` (that order is required — DISCARD ALL
+            // cannot run inside a tx block) and a possibly-poisoned conn is NEVER handed to the next
+            // tenant (charter rule 6). Over-forcing on a genuinely-clean autocommit error (PG
+            // auto-rolls-back to Idle) costs only one harmless extra ROLLBACK+reset at the next
+            // checkout — the safe direction (charter rule 5: correctness over throughput).
+            self.tx_open = true;
             self.tainted = true;
         }
         r.map(|_| ())
@@ -434,7 +492,21 @@ impl<B: PoolBackend> Checkout<B> {
         let r = pool.backend.simple_query(self.conn_mut(), sql).await;
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
-        if r.is_err() && self.tx_open {
+        if r.is_err() {
+            // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
+            // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
+            // trailing `ReadyForQuery` is decoded — AND a statement can OPEN a tx before erroring:
+            // `exec` forwards a multi-statement batch to `batch_execute`, and `is_bare_tx_control`
+            // only checks the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
+            // opens a tx mid-batch from autocommit, then errors — leaving an OPEN, ABORTED tx while
+            // the atomic still reads stale-`Idle`. So neither `apply_tx_status` nor a pre-captured
+            // `tx_open` can be trusted here. Force BOTH bits UNCONDITIONALLY so the checkout-time
+            // recycle runs `ROLLBACK` *then* `DISCARD ALL` (that order is required — DISCARD ALL
+            // cannot run inside a tx block) and a possibly-poisoned conn is NEVER handed to the next
+            // tenant (charter rule 6). Over-forcing on a genuinely-clean autocommit error (PG
+            // auto-rolls-back to Idle) costs only one harmless extra ROLLBACK+reset at the next
+            // checkout — the safe direction (charter rule 5: correctness over throughput).
+            self.tx_open = true;
             self.tainted = true;
         }
         r
@@ -462,7 +534,21 @@ impl<B: PoolBackend> Checkout<B> {
         let r = pool.backend.query(self.conn_mut(), sql, params).await;
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
-        if r.is_err() && self.tx_open {
+        if r.is_err() {
+            // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
+            // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
+            // trailing `ReadyForQuery` is decoded — AND a statement can OPEN a tx before erroring:
+            // `exec` forwards a multi-statement batch to `batch_execute`, and `is_bare_tx_control`
+            // only checks the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
+            // opens a tx mid-batch from autocommit, then errors — leaving an OPEN, ABORTED tx while
+            // the atomic still reads stale-`Idle`. So neither `apply_tx_status` nor a pre-captured
+            // `tx_open` can be trusted here. Force BOTH bits UNCONDITIONALLY so the checkout-time
+            // recycle runs `ROLLBACK` *then* `DISCARD ALL` (that order is required — DISCARD ALL
+            // cannot run inside a tx block) and a possibly-poisoned conn is NEVER handed to the next
+            // tenant (charter rule 6). Over-forcing on a genuinely-clean autocommit error (PG
+            // auto-rolls-back to Idle) costs only one harmless extra ROLLBACK+reset at the next
+            // checkout — the safe direction (charter rule 5: correctness over throughput).
+            self.tx_open = true;
             self.tainted = true;
         }
         r

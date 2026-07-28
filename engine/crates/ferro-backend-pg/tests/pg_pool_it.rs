@@ -581,11 +581,12 @@ async fn pg_rfq_failed_stmt_holds_pin_until_rollback() {
         "the real pool-opened TxId is NEVER clobbered by the failure (E)"
     );
     assert_eq!(co.last_pin_cause(), Some(PinCause::Tx));
-    assert_eq!(
-        pool.backend().tx_status(co.conn()),
-        TxStatus::Failed,
-        "the real RFQ byte reads E (aborted tx block) after the failed statement"
-    );
+    // NOTE: we do NOT assert the raw `tx_status()` byte here. This is an Err arm, where the RFQ
+    // atomic is stale-untrustworthy (Err surfaces at `ErrorResponse` before the trailing
+    // `ReadyForQuery` is decoded — fragile under response fragmentation on non-loopback networks).
+    // The real safety property — the pin is HELD armed-for-cleanup — is the `tx_open()`/`tainted()`
+    // pair asserted just above, which the unconditional Err-arm fail-safe guarantees regardless of
+    // any atomic staleness. The Ok-arm byte read after ROLLBACK below stays (post-drain, trustworthy).
 
     // The pin is held until an EXPLICIT rollback (the engine never auto-rolls-back a user tx).
     co.rollback_tx().await.expect("rollback the aborted tx");
@@ -624,5 +625,62 @@ async fn pg_rfq_autocommit_never_pins() {
         pool.backend().tx_status(co.conn()),
         TxStatus::Idle,
         "the RFQ byte reads I after an autocommit statement"
+    );
+}
+
+/// LIVE end-to-end proof of the Err-arm cross-tenant-leak fix: `exec` forwards a multi-statement
+/// batch to `batch_execute`, and `is_bare_tx_control` only checks the LEADING keyword — so
+/// `SELECT 1; BEGIN; SELECT 1/0` PASSES the guard, opens a tx mid-batch from autocommit, then errors
+/// (`22012`), leaving an OPEN, ABORTED tx on the pooled conn. The unconditional Err-arm fail-safe
+/// must arm the checkout-time cleanup (`tx_open && tainted`) so the NEXT tenant gets a CLEAN conn —
+/// never an inherited `25P02`.
+///
+/// This is an end-to-end GREEN proof; it does NOT reliably go RED against the pre-fix conditional
+/// guard on LOOPBACK. On localhost the connection task decodes the trailing `ReadyForQuery(E)`
+/// before the pool reads the atomic, so the pre-fix `apply_tx_status(Failed)` already sets
+/// `tx_open=true` and the old conditional guard accidentally fires. The leak needs the Err-arm
+/// atomic to be stale-`Idle` (`ErrorResponse`-then-`RFQ` fragmented across reads on a real network)
+/// — that condition is reproduced DETERMINISTICALLY in the fake unit test
+/// `rfq_pin::err_arm_forces_cleanup_even_when_status_reads_idle`, which is the RED→GREEN guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_rfq_err_arm_batch_leak_is_cleaned_before_reuse() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    // max_size=1 so the NEXT checkout is GUARANTEED to reuse the same (possibly-poisoned) conn.
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    {
+        let mut co = pool.checkout().await.expect("checkout");
+        // A batch whose LEADING keyword (SELECT) passes the guard, but which opens a tx mid-batch
+        // then errors — the exact cross-tenant-leak shape.
+        let err = co
+            .exec("SELECT 1; BEGIN; SELECT 1/0")
+            .await
+            .expect_err("the mid-batch division-by-zero must error");
+        // The Err-arm fail-safe armed the cleanup, REGARDLESS of the stale Err-arm RFQ byte.
+        assert!(
+            co.tx_open(),
+            "the Err-arm fail-safe must arm the defensive ROLLBACK (possibly-open tx), got err {err:?}"
+        );
+        assert!(
+            co.tainted(),
+            "the Err-arm fail-safe must arm the DISCARD ALL reset"
+        );
+        // `co` drops here -> returns to the idle stack with tx_open && tainted set.
+    }
+
+    // The NEXT checkout recycles the conn (ROLLBACK then DISCARD ALL) BEFORE handing it out, so it
+    // is CLEAN: a fresh autocommit SELECT succeeds and the RFQ reads Idle — no inherited aborted tx.
+    let mut co2 = pool.checkout().await.expect("checkout again");
+    let one = query_i32(&mut co2, "SELECT 1").await;
+    assert_eq!(
+        one, 1,
+        "the next tenant must inherit a CLEAN conn, not an aborted tx (25P02)"
+    );
+    assert_eq!(
+        pool.backend().tx_status(co2.conn()),
+        TxStatus::Idle,
+        "the recycled conn is Idle — the mid-batch tx was rolled back before reuse"
     );
 }

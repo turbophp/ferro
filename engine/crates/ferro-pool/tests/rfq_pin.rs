@@ -210,6 +210,60 @@ async fn failed_then_rollback_clears_tx_open_but_taint_survives() {
     );
 }
 
+/// REGRESSION (Err-arm cross-tenant-leak fix): an `Err` from `exec` while the conn's `tx_status`
+/// reports `Idle` (the stale-`Idle`-on-error condition — e.g. a multi-statement batch that opened a
+/// tx mid-batch from autocommit, whose trailing `ReadyForQuery` has not decoded yet) MUST still arm
+/// the checkout-time cleanup. The pool forces BOTH `tx_open` and `tainted` on ANY error, since on
+/// the Err arm neither the RFQ atomic NOR a pre-captured `tx_open` can be trusted. Without the fix
+/// the conn returns `tx_open==false && tainted==false`, the recycle is skipped, and the next tenant
+/// inherits a possibly-open/aborted tx (charter rule 6). Proven independent of the fake modelling
+/// the batch: the fake just errors with the status left at `Idle`.
+#[tokio::test]
+async fn err_arm_forces_cleanup_even_when_status_reads_idle() {
+    let config = PoolConfig {
+        max_size: 1,
+        ..Default::default()
+    };
+    let pool = Pool::new(FakeBackend::new(), config);
+    let mut co = pool.checkout().await.expect("checkout");
+    // Fresh autocommit conn: not in a tx, not tainted, status Idle.
+    assert!(!co.tx_open());
+    assert!(!co.tainted());
+
+    // Arm a simple_query failure that leaves tx_status == Idle (the stale-Idle-on-error case).
+    co.conn_mut().arm_fail_next_simple_query();
+    let r = co.exec("SELECT 1").await;
+    assert!(
+        matches!(r, Err(PoolError::Backend(_))),
+        "the armed failure must surface as an Err, got {r:?}"
+    );
+
+    // The fail-safe forces BOTH bits so the checkout-time recycle will run ROLLBACK *then* reset.
+    assert!(
+        co.tx_open(),
+        "ANY Err must force tx_open so the recycle ROLLBACKs a possibly-open tx (stale-Idle guard)"
+    );
+    assert!(
+        co.tainted(),
+        "ANY Err must force tainted so the recycle DISCARD ALLs a possibly-poisoned conn"
+    );
+
+    // Drop + re-checkout (same conn, max_size=1): the recycle ran ROLLBACK then reset, IN THAT
+    // ORDER (DISCARD ALL cannot run inside a tx block).
+    drop(co);
+    let next = pool.checkout().await.expect("checkout again");
+    assert_eq!(
+        next.conn().recorded,
+        vec![
+            "SELECT 1".to_string(),
+            "ROLLBACK".to_string(),
+            "RESET".to_string()
+        ],
+        "the forced bits must drive a ROLLBACK-then-reset recycle before reuse, recorded = {:?}",
+        next.conn().recorded
+    );
+}
+
 /// An autocommit `exec`/`query` on a fresh conn (fake stays `Idle`) NEVER pins and NEVER taints.
 #[tokio::test]
 async fn autocommit_statement_never_pins() {

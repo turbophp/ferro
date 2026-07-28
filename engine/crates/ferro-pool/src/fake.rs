@@ -28,6 +28,13 @@ pub struct FakeConn {
     pub recorded: Vec<String>,
     pub tx_open: bool,
     fail_next_ping: bool,
+    /// One-shot: when set, the NEXT `simple_query()` on this conn returns `PoolError::Backend`
+    /// (a statement-level error) WITHOUT flipping `tx_status`. Models the Task-4 Err-arm
+    /// stale-`Idle` case — a statement that errors while the RFQ atomic still reads `Idle` (e.g. a
+    /// multi-statement batch that opened a tx mid-batch, where the trailing `ReadyForQuery` has not
+    /// been decoded yet) — so the pool's unconditional Err-arm fail-safe can be exercised
+    /// deterministically without the fake having to model batch parsing.
+    fail_next_simple_query: bool,
     /// Models the RFQ status this connection would report (Task 3). Lives PER-`FakeConn` (matching
     /// real per-`Client` semantics), defaults to `Idle` at checkout, and is updated by
     /// `simple_query`/`query` inferring from the leading SQL keyword (see `leading_tx_verb`) — NOT
@@ -49,6 +56,14 @@ impl FakeConn {
     /// is consumed (one-shot) so subsequent pings succeed again.
     pub fn arm_fail_next_ping(&mut self) {
         self.fail_next_ping = true;
+    }
+
+    /// Arms the *next* `simple_query()` call on this connection to fail with
+    /// `PoolError::Backend` WITHOUT changing `tx_status` (one-shot). Used by the Task-4 Err-arm
+    /// regression test to reproduce the stale-`Idle`-on-error condition the pool's unconditional
+    /// fail-safe defends against.
+    pub fn arm_fail_next_simple_query(&mut self) {
+        self.fail_next_simple_query = true;
     }
 
     /// This connection's currently-modeled [`TxStatus`] (mirrors `PoolBackend::tx_status`).
@@ -265,6 +280,7 @@ impl PoolBackend for FakeBackend {
             recorded: Vec::new(),
             tx_open: false,
             fail_next_ping: false,
+            fail_next_simple_query: false,
             tx_status: TxStatus::Idle,
         })
     }
@@ -304,6 +320,14 @@ impl PoolBackend for FakeBackend {
     async fn simple_query(&self, conn: &mut Self::Conn, sql: &str) -> Result<u64, PoolError> {
         conn.recorded.push(sql.to_string());
         apply_leading_tx_verb(conn, sql);
+        // One-shot armed failure (see `arm_fail_next_simple_query`): return a statement-level error
+        // WITHOUT flipping `tx_status`, modelling the Err-arm stale-`Idle` case. Consumed here.
+        if conn.fail_next_simple_query {
+            conn.fail_next_simple_query = false;
+            return Err(PoolError::Backend(
+                "fake: armed simple_query failure".to_string(),
+            ));
+        }
         // Test-only gate (see `block_simple_query`/`release_simple_query`): if armed, park here so
         // the bounded-recycle test can freeze a checkout-time defensive ROLLBACK and prove the
         // recycle timeout evicts the conn instead of hanging.
