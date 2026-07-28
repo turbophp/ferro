@@ -13,7 +13,7 @@ use tokio::time::Instant;
 
 use ferro_proto::value::Value;
 
-use crate::backend::{PoolBackend, QueryResult};
+use crate::backend::{PoolBackend, QueryResult, TxStatus};
 use crate::config::PoolConfig;
 use crate::error::PoolError;
 use crate::pin::{self, PinCause, PinState, TxId};
@@ -209,9 +209,11 @@ pub struct Checkout<B: PoolBackend> {
     queue_us: u64,
     tx_open: bool,
     tainted: bool,
-    /// S4 Task 4 pin stub: set by `begin_tx`, cleared by `commit_tx`/`rollback_tx`. Always starts
-    /// `Unpinned` — a fresh `Checkout` (even one that recycled an idle conn with a stale `tx_open`
-    /// flag) never inherits pin state from a previous holder.
+    /// Pin identity: set by `begin_tx_with` (the real `TxId`), cleared by `commit_tx`/`rollback_tx`.
+    /// Always starts `Unpinned` — a fresh `Checkout` (even one that recycled an idle conn with a
+    /// stale `tx_open` flag) never inherits pin state from a previous holder. The M1-S1 RFQ
+    /// authority (`apply_tx_status`) moves the reuse-safety bits (`tx_open`/`tainted`) but NEVER
+    /// this identity field: it must not clobber a real `TxId`, nor fabricate one for an RFQ-only tx.
     pin: PinState,
     /// The most recent pin cause observed on this `Checkout` (for the pin-cause DoD assertion).
     /// Only ever `Some(PinCause::Tx)` in S4.
@@ -269,6 +271,20 @@ impl<B: PoolBackend> Checkout<B> {
         self.tainted = tainted;
     }
 
+    /// Whether this connection currently has an OPEN transaction, per the authoritative RFQ status
+    /// (`apply_tx_status`) — the reuse-safety bit that makes the next checkout run a defensive
+    /// `ROLLBACK`. Exposed so the RFQ-pin tests can assert the reuse-safety bits directly.
+    pub fn tx_open(&self) -> bool {
+        self.tx_open
+    }
+
+    /// Whether this connection needs a hygiene reset before reuse (an aborted tx `E`, or any error
+    /// while a tx was open). Set unconditionally by `apply_tx_status(Failed)` and by the
+    /// `is_err() && tx_open` stale-atomic guard; only ever cleared by the checkout-time recycle.
+    pub fn tainted(&self) -> bool {
+        self.tainted
+    }
+
     /// The pin hook: opens a transaction on the underlying connection with an ENGINE-COMPOSED
     /// `begin_sql` (e.g. `BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY`) and pins this `Checkout`
     /// to `tx_id` (S6). Drives the RAW, unguarded `PoolBackend::simple_query` (never
@@ -280,12 +296,24 @@ impl<B: PoolBackend> Checkout<B> {
     /// (which is just `begin_tx_with(id, "BEGIN")`).
     pub async fn begin_tx_with(&mut self, tx_id: TxId, begin_sql: &str) -> Result<(), PoolError> {
         let pool = Arc::clone(&self.pool);
-        let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
-        pool.backend.simple_query(conn, begin_sql).await?;
-        self.pin = PinState::PinnedTx(tx_id);
-        self.last_pin_cause = Some(PinCause::Tx);
-        self.tx_open = true;
-        Ok(())
+        // RFQ authority (SPEC §7.1): read tx_status on BOTH arms; it is trustworthy only on the Ok
+        // arm (post-drain), so we never `?` before the read and the guard below fails safe on Err.
+        let r = pool.backend.simple_query(self.conn_mut(), begin_sql).await;
+        // Defense-in-depth (kept from the M0 stub): on a successful BEGIN, record the real `TxId` +
+        // cause + `tx_open` BY HAND *before* the RFQ read, so `apply_tx_status(InTx)` then CONFIRMS
+        // `tx_open` without clobbering the real `TxId` (RFQ is additive authority here, not a
+        // replacement of the manual pin).
+        if r.is_ok() {
+            self.pin = PinState::PinnedTx(tx_id);
+            self.last_pin_cause = Some(PinCause::Tx);
+            self.tx_open = true;
+        }
+        let st = pool.backend.tx_status(self.conn());
+        self.apply_tx_status(st);
+        if r.is_err() && self.tx_open {
+            self.tainted = true;
+        }
+        r.map(|_| ())
     }
 
     /// Plain BEGIN pin hook — `begin_tx_with(tx_id, "BEGIN")`. For S4 this is called directly by
@@ -306,8 +334,19 @@ impl<B: PoolBackend> Checkout<B> {
     /// flow through it.
     pub async fn tx_control(&mut self, sql: &str) -> Result<(), PoolError> {
         let pool = Arc::clone(&self.pool);
-        let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
-        pool.backend.simple_query(conn, sql).await.map(|_| ())
+        // RFQ authority on the Ok arm only (a savepoint op keeps the tx `T`, so tx_open stays set);
+        // on Err the atomic may be stale, so the guard below taints any error while a tx is open.
+        let r = pool
+            .backend
+            .simple_query(self.conn_mut(), sql)
+            .await
+            .map(|_| ());
+        let st = pool.backend.tx_status(self.conn());
+        self.apply_tx_status(st);
+        if r.is_err() && self.tx_open {
+            self.tainted = true;
+        }
+        r
     }
 
     /// An out-of-band handle to cancel this connection's in-flight server statement (S6), WITHOUT
@@ -325,11 +364,20 @@ impl<B: PoolBackend> Checkout<B> {
     /// rationale as `begin_tx`.
     pub async fn commit_tx(&mut self) -> Result<(), PoolError> {
         let pool = Arc::clone(&self.pool);
-        let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
-        pool.backend.simple_query(conn, "COMMIT").await?;
-        self.pin = PinState::Unpinned;
-        self.tx_open = false;
-        Ok(())
+        // RFQ authority on the Ok arm only; on Err the atomic may be stale (guard below).
+        let r = pool.backend.simple_query(self.conn_mut(), "COMMIT").await;
+        // Defense-in-depth (kept): on a successful COMMIT, unpin + clear `tx_open` by hand; the RFQ
+        // read below (`apply_tx_status(Idle)`) then CONFIRMS the conn is out of the tx.
+        if r.is_ok() {
+            self.pin = PinState::Unpinned;
+            self.tx_open = false;
+        }
+        let st = pool.backend.tx_status(self.conn());
+        self.apply_tx_status(st);
+        if r.is_err() && self.tx_open {
+            self.tainted = true;
+        }
+        r.map(|_| ())
     }
 
     /// ROLLBACKs the pinned transaction and unpins this `Checkout`. Raw `simple_query`, same
@@ -338,11 +386,22 @@ impl<B: PoolBackend> Checkout<B> {
     /// rollback.
     pub async fn rollback_tx(&mut self) -> Result<(), PoolError> {
         let pool = Arc::clone(&self.pool);
-        let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
-        pool.backend.simple_query(conn, "ROLLBACK").await?;
-        self.pin = PinState::Unpinned;
-        self.tx_open = false;
-        Ok(())
+        // RFQ authority on the Ok arm only; on Err the atomic may be stale (guard below).
+        let r = pool.backend.simple_query(self.conn_mut(), "ROLLBACK").await;
+        // Defense-in-depth (kept): on a successful ROLLBACK, unpin + clear `tx_open` by hand; the RFQ
+        // read below CONFIRMS the conn is `Idle` again. Any pre-existing `tainted` deliberately
+        // survives (a clean `Idle` does not clear it) — the next checkout eats one DISCARD-ALL
+        // reset; safe/conservative.
+        if r.is_ok() {
+            self.pin = PinState::Unpinned;
+            self.tx_open = false;
+        }
+        let st = pool.backend.tx_status(self.conn());
+        self.apply_tx_status(st);
+        if r.is_err() && self.tx_open {
+            self.tainted = true;
+        }
+        r.map(|_| ())
     }
 
     /// Current pin state (`Unpinned` or `PinnedTx(tx_id)`).
@@ -369,8 +428,16 @@ impl<B: PoolBackend> Checkout<B> {
             )));
         }
         let pool = Arc::clone(&self.pool);
-        let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
-        pool.backend.simple_query(conn, sql).await
+        // RFQ authority (SPEC §7.1): tx_status is trustworthy only on the Ok arm (post-drain); on
+        // Err the atomic may hold a STALE byte, so we read it but let the `is_err() && tx_open`
+        // guard below fail safe by tainting any error that occurs while a tx is open.
+        let r = pool.backend.simple_query(self.conn_mut(), sql).await;
+        let st = pool.backend.tx_status(self.conn());
+        self.apply_tx_status(st);
+        if r.is_err() && self.tx_open {
+            self.tainted = true;
+        }
+        r
     }
 
     /// The guarded, user-facing **row-returning** statement entry (S5, BLOCKER-2). Mirrors
@@ -388,8 +455,51 @@ impl<B: PoolBackend> Checkout<B> {
             )));
         }
         let pool = Arc::clone(&self.pool);
-        let conn = self.conn.as_mut().expect("Checkout conn taken before Drop");
-        pool.backend.query(conn, sql, params).await
+        // RFQ authority (SPEC §7.1): tx_status is trustworthy only on the Ok arm — `query::run`
+        // fully drains the RowStream before returning, so on success the atomic holds this
+        // statement's terminating RFQ; on Err (`ErrorResponse` before the trailing RFQ is consumed)
+        // it may be STALE, so the guard below taints any error while a tx is open.
+        let r = pool.backend.query(self.conn_mut(), sql, params).await;
+        let st = pool.backend.tx_status(self.conn());
+        self.apply_tx_status(st);
+        if r.is_err() && self.tx_open {
+            self.tainted = true;
+        }
+        r
+    }
+
+    /// Applies the AUTHORITATIVE RFQ [`TxStatus`] (read after a statement's response is fully
+    /// drained) to this `Checkout`'s pin state — the M1-S1 pin engine, replacing the M0 stub's
+    /// engine-side-only bookkeeping (SPEC §7.1: protocol signals are the authority, the lexer is
+    /// assist). Two separable concerns:
+    ///
+    /// * **Reuse-safety bits (`tx_open`/`tainted`) — set UNCONDITIONALLY from I/T/E.** These protect
+    ///   the NEXT tenant, so RFQ is their sole authority: `tx_open` is assigned directly from the
+    ///   status ([`pin::tx_status_bits`]), and `Failed`/`E` FORCEs `tainted = true` (an aborted tx
+    ///   must be `ROLLBACK`'d before reuse). A clean `Idle`/`I` sets `tx_open = false` but LEAVES
+    ///   `tainted` as-is — it does NOT clear a prior taint; the checkout-time recycle (the
+    ///   `tx_open || tainted` branch in `checkout`) is what clears it.
+    ///
+    /// * **Identity bits (`pin`/`last_pin_cause`) — NEVER clobber a real `TxId`.** `last_pin_cause`
+    ///   is set to [`PinCause::Tx`] whenever RFQ reports a tx (`InTx`/`Failed`) — in S1 a
+    ///   transaction is the only pin cause. `self.pin` is deliberately LEFT UNTOUCHED here: if the
+    ///   pool opened this tx via `begin_tx_with`, `pin` is already `PinnedTx(real_id)` and must not
+    ///   be overwritten; for an RFQ-ONLY-detected `T`/`E` on a conn the pool did NOT open a tx on (a
+    ///   leaked/guard-bypassed tx with no pool-assigned `TxId`), `pin` stays `Unpinned` — there is
+    ///   NO `PinnedTx`-without-`TxId` variant to fabricate, and the reuse danger is fully carried by
+    ///   `tx_open`/`tainted`, which force the checkout-time ROLLBACK/reset. (The `TxId` is only an
+    ///   identity for the S6 actor, which always allocates it through `begin_tx_with`.)
+    fn apply_tx_status(&mut self, st: TxStatus) {
+        let (tx_open, force_taint) = pin::tx_status_bits(st);
+        self.tx_open = tx_open;
+        if force_taint {
+            self.tainted = true;
+        }
+        if matches!(st, TxStatus::InTx | TxStatus::Failed) {
+            self.last_pin_cause = Some(PinCause::Tx);
+        }
+        // NOTE: `self.pin` is intentionally NOT written here — never clobber a real `TxId`, never
+        // fabricate a sentinel. See the doc comment above.
     }
 }
 

@@ -1,15 +1,18 @@
-//! Stubbed pin state machine (S4 Task 4, decision M-2).
+//! Pin state machine (S4 Task 4 stub → M1-S1 Task 4 RFQ authority, SPEC §7.1 / §21 open item).
 //!
-//! M0 pins on the TX-service lifecycle, NOT on the `ReadyForQuery` status byte — stock
-//! `tokio-postgres` exposes no I/T/E byte, so a real pin engine driven off that signal is an M1
-//! item (SPEC §21 open item). For S4 the pin hook is driven explicitly by `Checkout::begin_tx` /
-//! `commit_tx` / `rollback_tx`, which the TX service (S6) will call in turn. `PinCause` only has
-//! `Tx` in S4; other causes (e.g. session-level `SET`, advisory locks) are M1.
+//! M0 pinned on the TX-service lifecycle only. M1-S1 makes PostgreSQL's `ReadyForQuery` status byte
+//! (I/T/E), surfaced as [`crate::backend::TxStatus`], the AUTHORITY: after every statement the pool
+//! reads `tx_status` and `Checkout::apply_tx_status` updates the pin state from the real I/T/E (pin
+//! on `T`/`E`, unpin on `I`). The explicit `begin_tx`/`commit_tx`/`rollback_tx` sets and the
+//! `is_bare_tx_control` guard remain as DEFENSE-IN-DEPTH, not the authority. `PinCause` still only
+//! has `Tx` in S1 (an RFQ-detected transaction); the assist-lexer causes land in S2.
 //!
 //! A pinned connection is never handed to a second checkout: `Checkout` already holds its
 //! connection exclusively (removed from the pool's idle stack for the lifetime of the guard), so
 //! that invariant falls out of the existing checkout/Drop mechanics rather than needing separate
 //! enforcement here.
+
+use crate::backend::TxStatus;
 
 /// Identifies a transaction for pinning purposes. Opaque to the pool — the TX service (S6) is the
 /// one that allocates these; S4 only stores and reports the value it's given.
@@ -179,9 +182,42 @@ pub(crate) fn leading_tx_verb(sql: &str) -> Option<TxVerb> {
     None
 }
 
+/// Maps an authoritative RFQ [`TxStatus`] to the two REUSE-SAFETY bits it dictates on a checked-out
+/// connection — `(tx_open, force_taint)` — the bits that protect the NEXT tenant.
+/// [`crate::pool::Checkout::apply_tx_status`] assigns `tx_open` from the first element
+/// UNCONDITIONALLY (RFQ is the sole authority on whether a tx is open) and ORs the second into
+/// `tainted` (so `Failed`/`E` can only ADD taint — it never clears one, and a clean `Idle`/`I`
+/// never clears a prior taint here either; only the checkout-time recycle clears it).
+///
+/// The IDENTITY bits (`pin`/`last_pin_cause`) are deliberately NOT modelled here: "never clobber a
+/// real `TxId`" needs `Checkout`'s own `self.pin`, so that logic lives in `apply_tx_status`, not in
+/// this pure mapping.
+///
+/// - `Idle`   → `(false, false)` — no tx open; adds no taint (does NOT clear a prior one).
+/// - `InTx`   → `(true, false)`  — a clean, open tx.
+/// - `Failed` → `(true, true)`   — an open BUT aborted tx (RFQ `E`): must be `ROLLBACK`'d before reuse.
+pub(crate) fn tx_status_bits(st: TxStatus) -> (bool, bool) {
+    match st {
+        TxStatus::Idle => (false, false),
+        TxStatus::InTx => (true, false),
+        TxStatus::Failed => (true, true),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TxVerb, is_bare_tx_control, leading_tx_verb};
+    use super::{TxVerb, is_bare_tx_control, leading_tx_verb, tx_status_bits};
+    use crate::backend::TxStatus;
+
+    #[test]
+    fn tx_status_bits_maps_reuse_safety_bits() {
+        // Idle: not open, forces no taint (must not clear a prior one).
+        assert_eq!(tx_status_bits(TxStatus::Idle), (false, false));
+        // InTx: open, clean.
+        assert_eq!(tx_status_bits(TxStatus::InTx), (true, false));
+        // Failed (E): open AND aborted -> must taint before reuse.
+        assert_eq!(tx_status_bits(TxStatus::Failed), (true, true));
+    }
 
     #[test]
     fn detects_single_word_verbs_case_insensitively() {

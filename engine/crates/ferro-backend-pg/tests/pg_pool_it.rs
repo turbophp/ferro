@@ -11,6 +11,7 @@
 use std::time::Duration;
 
 use ferro_backend_pg::{PgBackend, Value};
+use ferro_pool::backend::{PoolBackend, TxStatus};
 use ferro_pool::config::PoolConfig;
 use ferro_pool::error::{Branch, PoolError};
 use ferro_pool::pin::{PinCause, PinState, TxId};
@@ -54,6 +55,25 @@ async fn query_i32(co: &mut Checkout<PgBackend>, sql: &str) -> i32 {
 
 async fn backend_pid(co: &mut Checkout<PgBackend>) -> i32 {
     query_i32(co, "SELECT pg_backend_pid()").await
+}
+
+/// Runs `sql` through the GUARDED, row-returning `Checkout::query` (so the M1-S1 RFQ pin AUTHORITY
+/// fires after the statement) and returns the first cell as an `i64` (cast the projection to `int8`
+/// so it hydrates to `Value::I64`). Used to prove pinning while the RFQ read runs post-statement.
+async fn query_first_i64(co: &mut Checkout<PgBackend>, sql: &str) -> i64 {
+    let result = co
+        .query(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("Checkout::query {sql:?} failed: {e:?}"));
+    match result
+        .rows
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().next())
+    {
+        Some(Value::I64(v)) => v,
+        other => panic!("expected an i64 cell from {sql:?}, got {other:?}"),
+    }
 }
 
 /// Runs `sql` through the GUARDED, row-returning `Checkout::query` (the real S6 tx-scoped exec
@@ -458,5 +478,151 @@ async fn pg_cancel_handle_cancels_in_flight_query() {
     assert_eq!(
         one, 1,
         "the pinned conn must be usable again after cancel + rollback_tx"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// M1-S1 Task 4 LIVE ACCEPTANCE: the RFQ status byte (I/T/E) off the real wire IS the pin authority.
+// -------------------------------------------------------------------------------------------------
+
+/// S1 acceptance (a) + (d): `begin_tx_with("BEGIN")` → two in-tx statements → `commit_tx`, all on
+/// the SAME `pg_backend_pid` (pinned by the real RFQ `T`), pin-cause `Tx`, and after COMMIT the RFQ
+/// is `I` → `!tx_open`. The two statements ride the GUARDED `Checkout::query`, so the RFQ authority
+/// runs after each and must KEEP `tx_open` set.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_rfq_tx_lifecycle_same_pid_and_unpins_on_commit() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    // max_size >= 2 so pinning is proven by there being somewhere else to go (not just scarcity).
+    let pool = Pool::new(PgBackend::new(url), config(2));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    co.begin_tx_with(TxId(1), "BEGIN").await.expect("begin");
+    assert!(
+        co.tx_open(),
+        "real RFQ T after BEGIN => tx_open (the authority)"
+    );
+    assert!(!co.tainted(), "a clean BEGIN taints nothing");
+    assert_eq!(co.pin_state(), PinState::PinnedTx(TxId(1)));
+    assert_eq!(co.last_pin_cause(), Some(PinCause::Tx), "pin-cause DoD (d)");
+    assert_eq!(
+        pool.backend().tx_status(co.conn()),
+        TxStatus::InTx,
+        "the RFQ byte reads T inside the tx"
+    );
+
+    // Two in-tx statements via the guarded query() path — RFQ authority runs after each; both must
+    // land on the SAME pinned backend pid, and tx_open must stay set.
+    let pid1 = query_first_i64(&mut co, "SELECT pg_backend_pid()::int8").await;
+    assert!(
+        co.tx_open(),
+        "still pinned after the first in-tx statement (RFQ T)"
+    );
+    let pid2 = query_first_i64(&mut co, "SELECT pg_backend_pid()::int8").await;
+    assert_eq!(
+        pid1, pid2,
+        "both in-tx statements ran on the SAME pinned backend (pid {pid1} vs {pid2})"
+    );
+    assert!(
+        co.tx_open() && !co.tainted(),
+        "a clean, still-open tx after two statements"
+    );
+    assert_eq!(
+        co.pin_state(),
+        PinState::PinnedTx(TxId(1)),
+        "the real TxId is preserved across the in-tx statements"
+    );
+
+    co.commit_tx().await.expect("commit");
+    assert!(!co.tx_open(), "real RFQ I after COMMIT => !tx_open");
+    assert!(!co.tainted(), "a clean commit leaves no taint");
+    assert_eq!(co.pin_state(), PinState::Unpinned, "commit unpins");
+    assert_eq!(
+        pool.backend().tx_status(co.conn()),
+        TxStatus::Idle,
+        "the RFQ byte reads I after COMMIT"
+    );
+}
+
+/// S1 acceptance (b): a FAILED statement mid-tx (`SELECT 1/0`, SQLSTATE 22012) aborts the tx block
+/// → the real RFQ flips to `E`; the pin is HELD (`tx_open && tainted`, the real `TxId` never
+/// clobbered) until an explicit `rollback_tx`, after which the RFQ is `I` again. The
+/// `is_err() && tx_open` guard makes `tainted` hold regardless of any Err-arm atomic staleness.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_rfq_failed_stmt_holds_pin_until_rollback() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    co.begin_tx(TxId(2)).await.expect("begin");
+    assert!(co.tx_open());
+    assert_eq!(pool.backend().tx_status(co.conn()), TxStatus::InTx);
+
+    // A failing statement mid-tx aborts the block. The guarded query() reads the RFQ after; on the
+    // Err arm the guard forces the taint even if the atomic were momentarily stale.
+    let _err = co
+        .query("SELECT 1 / 0", &[])
+        .await
+        .expect_err("SELECT 1/0 must error (division_by_zero)");
+    assert!(
+        co.tx_open(),
+        "a failed in-tx statement keeps the tx OPEN (aborted block)"
+    );
+    assert!(
+        co.tainted(),
+        "a failed in-tx statement TAINTS — the conn needs a ROLLBACK before reuse"
+    );
+    assert_eq!(
+        co.pin_state(),
+        PinState::PinnedTx(TxId(2)),
+        "the real pool-opened TxId is NEVER clobbered by the failure (E)"
+    );
+    assert_eq!(co.last_pin_cause(), Some(PinCause::Tx));
+    assert_eq!(
+        pool.backend().tx_status(co.conn()),
+        TxStatus::Failed,
+        "the real RFQ byte reads E (aborted tx block) after the failed statement"
+    );
+
+    // The pin is held until an EXPLICIT rollback (the engine never auto-rolls-back a user tx).
+    co.rollback_tx().await.expect("rollback the aborted tx");
+    assert!(!co.tx_open(), "real RFQ I after ROLLBACK => !tx_open");
+    assert_eq!(co.pin_state(), PinState::Unpinned, "rollback unpins");
+    assert_eq!(
+        pool.backend().tx_status(co.conn()),
+        TxStatus::Idle,
+        "the RFQ byte reads I after ROLLBACK"
+    );
+}
+
+/// S1 acceptance (c): an AUTOCOMMIT `Checkout::query("SELECT 1")` (no BEGIN) NEVER pins — the real
+/// RFQ stays `I` → `!tx_open`, `Unpinned`, no `Tx` pin-cause.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_rfq_autocommit_never_pins() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    co.query("SELECT 1", &[]).await.expect("autocommit query");
+    assert!(
+        !co.tx_open(),
+        "an autocommit query NEVER opens a tx (RFQ stays I)"
+    );
+    assert!(!co.tainted());
+    assert_eq!(co.pin_state(), PinState::Unpinned);
+    assert_eq!(
+        co.last_pin_cause(),
+        None,
+        "no tx observed => no Tx pin-cause"
+    );
+    assert_eq!(
+        pool.backend().tx_status(co.conn()),
+        TxStatus::Idle,
+        "the RFQ byte reads I after an autocommit statement"
     );
 }
