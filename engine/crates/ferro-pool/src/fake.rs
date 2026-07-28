@@ -34,6 +34,13 @@ pub struct FakeConn {
     /// a shared `FakeBackend` field, which would let one connection's status leak into another's
     /// and (per the Task 3 verification blocker) let a stale `Idle` clobber a pin another conn just
     /// set.
+    ///
+    /// The inference is a faithful-to-real-Postgres model, not just "matches the bare tx-control
+    /// guard's keyword list": a savepoint operation (`SAVEPOINT`/`RELEASE`/`ROLLBACK TO
+    /// <savepoint>`) does NOT end the surrounding transaction on real Postgres, so `apply_leading_
+    /// tx_verb` PRESERVES `tx_status` across those (and across any exotic tx-control form it
+    /// doesn't specifically classify, e.g. `PREPARE TRANSACTION`) rather than dropping it to
+    /// `Idle`. See `pin::leading_tx_verb`'s doc comment for the exact Open/Close/preserve mapping.
     tx_status: TxStatus,
 }
 
@@ -58,11 +65,13 @@ impl FakeConn {
 }
 
 /// Updates `conn.tx_status` by inferring from `sql`'s leading transaction-control keyword (shared
-/// scan with `pin::is_bare_tx_control`, Task 3): a leading `BEGIN`/`START TRANSACTION` models
-/// `InTx`; a leading `COMMIT`/`ROLLBACK`/`END`/`ABORT`/`RELEASE` models `Idle`. Anything else
-/// (an ordinary statement, or a tx-control verb that doesn't open/close a transaction like
-/// `SAVEPOINT`) leaves `tx_status` unchanged — exactly like a real `ReadyForQuery` byte, which
-/// only flips between `I`/`T`/`E` on a statement that actually changes transaction state.
+/// scan with `pin::is_bare_tx_control`, Task 3). See `pin::leading_tx_verb`'s doc comment for the
+/// exact mapping; in short: `BEGIN`/`START TRANSACTION` models `InTx`; a BARE `COMMIT`/`END`/
+/// `ABORT`, or a `ROLLBACK` NOT followed by `TO`, models `Idle`. Everything else — an ordinary
+/// statement, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO <savepoint>` (savepoint ops that do NOT end a
+/// real Postgres transaction), or an exotic tx-control form this scan doesn't specifically
+/// classify — PRESERVES `tx_status` unchanged, exactly like a real `ReadyForQuery` byte only
+/// flipping on a statement that actually changes transaction state.
 fn apply_leading_tx_verb(conn: &mut FakeConn, sql: &str) {
     if let Some(verb) = leading_tx_verb(sql) {
         conn.tx_status = match verb {

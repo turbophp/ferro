@@ -117,9 +117,9 @@ pub(crate) fn is_bare_tx_control(sql: &str) -> bool {
 }
 
 /// Whether a leading transaction-control verb OPENS a transaction block (`BEGIN`,
-/// `START TRANSACTION`) or CLOSES one (`COMMIT`/`ROLLBACK`/`END`/`ABORT`/`RELEASE`). Verbs that
-/// manage a transaction without opening/closing it (`SAVEPOINT`, `PREPARE TRANSACTION`) are
-/// deliberately not classified here — see [`leading_tx_verb`].
+/// `START TRANSACTION`) or CLOSES one (a bare `COMMIT`/`END`/`ABORT`, or a `ROLLBACK` NOT followed
+/// by `TO`). Everything else tx-control-shaped is deliberately NOT classified here — see
+/// [`leading_tx_verb`]'s doc comment for the full "preserve" list and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TxVerb {
     Open,
@@ -128,21 +128,46 @@ pub(crate) enum TxVerb {
 
 /// Classifies `sql`'s leading keyword(s) (comment/whitespace tolerant, same scan as
 /// [`is_bare_tx_control`]) as [`TxVerb::Open`]/[`TxVerb::Close`], or `None` if the leading verb
-/// doesn't change transaction status (`SAVEPOINT`, `PREPARE TRANSACTION`) or isn't tx-control at
-/// all.
+/// must leave transaction status UNCHANGED — i.e. "preserve", not "idle by default".
 ///
 /// This is the shared scan `FakeBackend` (Task 3) uses to model `TxStatus` per-connection from the
-/// SQL it records — matching the ONE thing `is_bare_tx_control` already agrees is a bare
-/// transaction-control statement, so the fake's inference and the real guard can never disagree
-/// about what "looks like a BEGIN/COMMIT" means. Does not change `is_bare_tx_control`'s own
-/// behavior.
+/// SQL it records, so the fake's modeled `I`/`T`/`E` stays faithful to what real Postgres's RFQ
+/// byte would report for the same statement — NOT merely "matches `is_bare_tx_control`'s bare
+/// tx-control list". In particular a SAVEPOINT operation does NOT end the surrounding
+/// transaction on real Postgres (RFQ stays `T`), so:
+///
+/// - `BEGIN` / `START TRANSACTION` → [`TxVerb::Open`] (RFQ `I`→`T`).
+/// - A BARE `COMMIT` / `END` / `ABORT`, or a `ROLLBACK` NOT immediately followed by `TO` (i.e.
+///   `ROLLBACK` alone, `ROLLBACK;`, `ROLLBACK WORK`/`TRANSACTION`, ...) → [`TxVerb::Close`] (RFQ
+///   →`I`).
+/// - `SAVEPOINT <name>`, `RELEASE [SAVEPOINT] <name>`, and `ROLLBACK TO [SAVEPOINT] <name>` →
+///   `None` (PRESERVE) — these manage a savepoint WITHIN an already-open transaction; real
+///   Postgres's RFQ byte does not flip on any of them, so the model must not flip either.
+/// - Any exotic/rare tx-control form this scan doesn't specifically classify (e.g.
+///   `PREPARE TRANSACTION`) → `None` (PRESERVE-by-default, not "assume closed"). A test that needs
+///   one of these to model a specific status drives `FakeConn::set_tx_status` explicitly instead.
+/// - An ordinary, non-tx-control statement → `None` (PRESERVE, unchanged from before).
+///
+/// Does NOT change [`is_bare_tx_control`]'s own behavior — that guard's job (rejecting
+/// `SAVEPOINT`/`RELEASE`/`ROLLBACK` at `Checkout::exec`/`query`) is a separate concern from this
+/// status model, and its bare-tx-control list intentionally stays exactly as it was.
 pub(crate) fn leading_tx_verb(sql: &str) -> Option<TxVerb> {
     let sql = skip_leading_noise(sql);
     let words = leading_words(sql, 2);
     let first = words.first()?;
     match first.as_str() {
         "BEGIN" => return Some(TxVerb::Open),
-        "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "RELEASE" => return Some(TxVerb::Close),
+        "COMMIT" | "END" | "ABORT" => return Some(TxVerb::Close),
+        "ROLLBACK" => {
+            // `ROLLBACK TO <savepoint>` stays inside the transaction (RFQ stays `T`) -- only a
+            // bare ROLLBACK (no `TO`, e.g. alone, `ROLLBACK;`, `ROLLBACK WORK`) ends it.
+            return match words.get(1).map(String::as_str) {
+                Some("TO") => None,
+                _ => Some(TxVerb::Close),
+            };
+        }
+        // Savepoint ops manage a transaction without opening/closing it -- preserve status.
+        "SAVEPOINT" | "RELEASE" => return None,
         _ => {}
     }
     if let Some(second) = words.get(1)
@@ -213,18 +238,35 @@ mod tests {
             "START TRANSACTION is the two-word open verb"
         );
         assert_eq!(leading_tx_verb("COMMIT"), Some(TxVerb::Close));
-        assert_eq!(leading_tx_verb("ROLLBACK"), Some(TxVerb::Close));
         assert_eq!(leading_tx_verb("End"), Some(TxVerb::Close));
         assert_eq!(leading_tx_verb("Abort"), Some(TxVerb::Close));
-        assert_eq!(leading_tx_verb("release"), Some(TxVerb::Close));
     }
 
     #[test]
-    fn leading_tx_verb_none_for_non_status_changing_or_ordinary_sql() {
-        // SAVEPOINT/PREPARE TRANSACTION manage a transaction without opening/closing it -- and an
-        // ordinary statement is not tx-control at all -- so neither changes the modeled status.
+    fn leading_tx_verb_bare_rollback_closes_but_rollback_to_preserves() {
+        // A bare ROLLBACK (alone, with a trailing `;`, or followed by WORK/TRANSACTION -- anything
+        // that isn't `TO`) ends the transaction, matching real Postgres RFQ `T`/`E` -> `I`.
+        assert_eq!(leading_tx_verb("ROLLBACK"), Some(TxVerb::Close));
+        assert_eq!(leading_tx_verb("rollback;"), Some(TxVerb::Close));
+        assert_eq!(leading_tx_verb("ROLLBACK WORK"), Some(TxVerb::Close));
+        // ROLLBACK TO <savepoint> stays inside the transaction on real Postgres (RFQ stays `T`) --
+        // the model must preserve, not close (verification finding on Task 3's review).
+        assert_eq!(leading_tx_verb("ROLLBACK TO sp1"), None);
+        assert_eq!(leading_tx_verb("rollback to savepoint sp1"), None);
+    }
+
+    #[test]
+    fn leading_tx_verb_none_for_savepoint_ops_exotic_forms_and_ordinary_sql() {
+        // SAVEPOINT/RELEASE manage a transaction WITHOUT opening/closing it -- real Postgres's RFQ
+        // byte does not flip on either, so the model must preserve, not close (verification
+        // finding on Task 3's review: these previously (wrongly) mapped to Close/Idle).
         assert_eq!(leading_tx_verb("SAVEPOINT sp1"), None);
+        assert_eq!(leading_tx_verb("release sp1"), None);
+        assert_eq!(leading_tx_verb("RELEASE SAVEPOINT sp1"), None);
+        // Exotic tx-control this scan doesn't specifically classify -- preserve-by-default, not
+        // "assume closed".
         assert_eq!(leading_tx_verb("Prepare Transaction 'foo'"), None);
+        // An ordinary statement is not tx-control at all -- unchanged status either way.
         assert_eq!(leading_tx_verb("SELECT 1"), None);
         assert_eq!(leading_tx_verb(""), None);
     }

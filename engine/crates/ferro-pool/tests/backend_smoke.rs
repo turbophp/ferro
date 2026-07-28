@@ -102,6 +102,81 @@ async fn fake_conn_reports_idle_after_commit_or_rollback() {
     assert_eq!(backend.tx_status(&rolled_back), TxStatus::Idle);
 }
 
+// Fidelity fix (Task 3 review, Important finding): a savepoint operation does NOT end a real
+// Postgres transaction (RFQ stays `T`), so the fake must PRESERVE `InTx` across
+// SAVEPOINT/RELEASE/ROLLBACK TO -- not drop to `Idle` -- or a Task-4 fake-driven
+// BEGIN -> SAVEPOINT -> RELEASE pin test would go RED against a live-PG-passing scenario.
+
+#[tokio::test]
+async fn fake_conn_preserves_in_tx_across_savepoint_release_rollback_to_then_commit_closes() {
+    let backend = FakeBackend::new();
+    let mut conn = backend.connect().await.expect("connect should succeed");
+
+    backend
+        .simple_query(&mut conn, "BEGIN")
+        .await
+        .expect("simple_query(BEGIN) should succeed");
+    assert_eq!(backend.tx_status(&conn), TxStatus::InTx);
+
+    backend
+        .simple_query(&mut conn, "SAVEPOINT sp1")
+        .await
+        .expect("simple_query(SAVEPOINT) should succeed");
+    assert_eq!(
+        backend.tx_status(&conn),
+        TxStatus::InTx,
+        "SAVEPOINT must not end the transaction"
+    );
+
+    backend
+        .simple_query(&mut conn, "RELEASE sp1")
+        .await
+        .expect("simple_query(RELEASE) should succeed");
+    assert_eq!(
+        backend.tx_status(&conn),
+        TxStatus::InTx,
+        "RELEASE must not end the transaction"
+    );
+
+    backend
+        .simple_query(&mut conn, "ROLLBACK TO sp1")
+        .await
+        .expect("simple_query(ROLLBACK TO) should succeed");
+    assert_eq!(
+        backend.tx_status(&conn),
+        TxStatus::InTx,
+        "ROLLBACK TO <savepoint> must not end the transaction"
+    );
+
+    backend
+        .simple_query(&mut conn, "COMMIT")
+        .await
+        .expect("simple_query(COMMIT) should succeed");
+    assert_eq!(backend.tx_status(&conn), TxStatus::Idle);
+}
+
+#[tokio::test]
+async fn fake_conn_bare_rollback_after_begin_closes_the_transaction() {
+    let backend = FakeBackend::new();
+    let mut conn = backend.connect().await.expect("connect should succeed");
+
+    backend
+        .simple_query(&mut conn, "BEGIN")
+        .await
+        .expect("simple_query(BEGIN) should succeed");
+    assert_eq!(backend.tx_status(&conn), TxStatus::InTx);
+
+    backend
+        .simple_query(&mut conn, "ROLLBACK")
+        .await
+        .expect("simple_query(ROLLBACK) should succeed");
+    assert_eq!(
+        backend.tx_status(&conn),
+        TxStatus::Idle,
+        "a bare ROLLBACK (no savepoint target) must end the transaction"
+    );
+}
+
 #[tokio::test]
 async fn fake_conn_begin_via_query_also_reports_in_tx() {
     // The guarded `Checkout::query` path never reaches here with a bare BEGIN (the pin guard
