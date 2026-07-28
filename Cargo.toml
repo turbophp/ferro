@@ -28,6 +28,7 @@ lto = "thin"
 # M1-S1 (task 1): a vendored fork of tokio-postgres 0.7.18 that exposes the ReadyForQuery
 # transaction-status byte (I/T/E) via `Client::transaction_status()` — stock tokio-postgres parses
 # and discards it. NOT a workspace member (see deny.toml for the cargo-deny rationale); drop this
-# patch when the upstream PR (tracked in UPSTREAM_PR.md, filed in a later M1-S1 task) merges.
+# patch when the upstream PR (drafted in UPSTREAM_PR.md, pending maintainer sign-off / human
+# authorization before it is actually filed) merges.
 [patch.crates-io]
 tokio-postgres = { path = "vendor/tokio-postgres" }

@@ -246,6 +246,12 @@ pub async fn run<B: PoolBackend>(
                 // `&mut co` the query future then holds.
                 let cancel = co.cancel_handle();
                 let exec_start = std::time::Instant::now();
+                // M1-S1: `co.query` (`ferro-pool`'s `Checkout::query`) reads the real RFQ status byte
+                // after this statement drains and calls `apply_tx_status` — so `tx_open`/`tainted` are
+                // now set from the AUTHORITATIVE protocol signal (SPEC §7.1), not engine-side inference.
+                // A statement that flips the connection to `E` (e.g. a constraint violation) is caught
+                // here regardless of what this actor does next; `teardown`'s own `set_tainted(true)`
+                // (below) becomes belt-and-braces on top of that authority, not the sole mechanism.
                 let query_fut = co.query(&sql, &params);
                 tokio::pin!(query_fut);
 
@@ -329,6 +335,14 @@ async fn teardown<B: PoolBackend>(
         TxEnd::Abort | TxEnd::Deadline => {
             // A clean rollback within the bound leaves the conn reusable; a timeout OR an error
             // taints it (tx still open on the wire) so the next checkout's recycle handles it.
+            //
+            // M1-S1: `co.rollback_tx()` itself now reads the real RFQ status and applies
+            // `apply_tx_status`, so on its `Err` arm it ALREADY forces `tx_open`/`tainted`
+            // unconditionally (the Rule-A fail-safe in `ferro-pool`) — this `set_tainted(true)` below
+            // is belt-and-braces (defense-in-depth) for that case, not the mechanism catching it.
+            // It stays load-bearing for the OTHER case: a `teardown_timeout` firing drops the
+            // in-flight `rollback_tx()` future mid-await, before it can observe/apply anything, so
+            // this is the ONLY thing that taints the conn when the teardown ROLLBACK itself wedges.
             let rolled_back = matches!(
                 tokio::time::timeout(teardown_timeout, co.rollback_tx()).await,
                 Ok(Ok(()))

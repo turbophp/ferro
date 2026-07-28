@@ -513,6 +513,83 @@ async fn tx_readonly_rejects_write() {
 }
 
 // -------------------------------------------------------------------------------------------------
+// M1-S1 Task 5: a tx-scoped EXEC that errors (a genuine constraint violation, 23505) inside the S6
+// actor's `TxCommand::Exec` path drives the real RFQ status to `E` (Failed) — now the AUTHORITATIVE
+// signal (via `Checkout::query`'s `apply_tx_status`), not engine-side inference. The actor's own
+// ROLLBACK teardown (driven by the client's TX/ROLLBACK, same as `tx_readonly_rejects_write` above)
+// then returns a CLEAN, reusable conn: a SUBSEQUENT checkout (a fresh autocommit statement on this
+// pool) gets an Idle conn — no inherited aborted-tx 25P02.
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_exec_constraint_violation_then_rollback_leaves_clean_conn() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = common::exec_server(url);
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    autocommit_write(&mut client, 10, "DROP TABLE IF EXISTS ferro_s6_uniq").await;
+    autocommit_write(
+        &mut client,
+        11,
+        "CREATE TABLE ferro_s6_uniq (id bigint PRIMARY KEY)",
+    )
+    .await;
+    autocommit_write(&mut client, 12, "INSERT INTO ferro_s6_uniq (id) VALUES (1)").await;
+
+    let tx_id = begin(&mut client, 13, "default", None, false).await;
+
+    // A duplicate-key INSERT inside the tx errors (23505 unique_violation) — via the actor's own
+    // `TxCommand::Exec` -> `co.query` path (actor.rs), the exact path Task 4 instrumented. PG aborts
+    // the tx block on this error, flipping the real RFQ byte to `E`.
+    let ep = match exec_in_tx(
+        &mut client,
+        14,
+        tx_id,
+        "INSERT INTO ferro_s6_uniq (id) VALUES (1)",
+        vec![],
+        1,
+        false,
+    )
+    .await
+    {
+        Outcome::Error(ep) => ep,
+        other => panic!("a duplicate-key INSERT must be rejected, got {other:?}"),
+    };
+    assert_eq!(
+        ep.sqlstate.as_deref(),
+        Some("23505"),
+        "the raw unique-violation SQLSTATE is preserved on the wire"
+    );
+    assert_ne!(
+        ep.branch,
+        branch::INDETERMINATE,
+        "a rolled-back in-tx statement persisted nothing — never Indeterminate"
+    );
+    assert_session_alive(&mut client, 130).await;
+
+    // The actor's ROLLBACK/teardown (belt-and-braces `set_tainted(true)` aside — the RFQ read is now
+    // the authority, per Task 4) ends the aborted tx block and releases a CLEAN conn to the pool.
+    assert!(
+        matches!(rollback(&mut client, 15, tx_id).await, Outcome::Ok(_)),
+        "ROLLBACK cleanly ends the aborted (E) tx"
+    );
+
+    // A SUBSEQUENT checkout of the pool (a fresh autocommit statement) gets an Idle, usable conn: the
+    // SELECT succeeds outright rather than surfacing an inherited "current transaction is aborted"
+    // (25P02) — exec_ok panics on anything but Outcome::Ok, so success here IS that proof.
+    let ok = exec_ok(&mut client, 16, &req("SELECT 1")).await;
+    assert_eq!(
+        ok.rows,
+        vec![vec![Value::I64(1)]],
+        "a fresh autocommit SELECT succeeds on the recycled conn — no inherited aborted-tx state"
+    );
+    assert_session_alive(&mut client, 131).await;
+}
+
+// -------------------------------------------------------------------------------------------------
 // Pinning: two in-tx pg_backend_pid() reads return the SAME backend pid (one pinned conn); after
 // COMMIT a fresh autocommit pid MAY differ (the conn was released back to the pool).
 // -------------------------------------------------------------------------------------------------
