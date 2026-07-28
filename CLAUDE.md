@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state (read first)
 
-**This repository is pre-implementation.** Only two files exist: `ferro-spec-v0.2.md` (the spec) and this charter. None of the directories the spec describes (`/engine`, `/php`, `/proto`, `/bench`, `/testkit`) exist yet — so nearly every task starts by *creating* structure, not editing it.
+**M0 is complete and merged** (SPEC §22.1): the full engine vertical — `/proto` registry, wire codec, `ferrod` session layer, the hand-rolled PG pool, SQL EXEC + TX services, the PHP sync client, and the D12 bench — works end-to-end against real Postgres, with the D12 p99 measurement recorded in `bench/results/`.
 
-The first thing to build is **M0, task 1** (SPEC §17.1): the `/proto` registry (`methods.toml`, `errors.toml`, `types.toml`) and its constant generators. Everything else keys off that. Do not skip ahead in the M0 task order.
+**M1 is in progress.** M1-S1 (the real PG protocol-signal pin engine — `Client::transaction_status()` off a vendored `tokio-postgres` fork, replacing the M0 TX-lifecycle stub) is complete: the pool reads the RFQ `I`/`T`/`E` byte after every statement and pins/taints from it, with an unconditional Err-arm fail-safe for the cases where that byte can't be trusted. See `docs/superpowers/specs/2026-07-28-ferro-m1-execution-design.md` for the full M1 slice plan and rationale. Next up: **M1-S2**, the assist lexer (`ferro-classify`).
 
 ## What Ferro is
 

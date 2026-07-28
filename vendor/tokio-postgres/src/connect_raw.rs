@@ -104,6 +104,14 @@ where
     // the `Connection` driver on every `ReadyForQuery`) and the `Client` handle (read
     // synchronously via `transaction_status()`). Starts `I` (idle) — matches Postgres's own
     // pre-transaction state, and this connection hasn't seen an RFQ yet.
+    // CAVEAT: this is a single slot, so correctness depends on "exactly one statement in flight
+    // per `Client`" — Ferro's pool holds a `Checkout`'s connection exclusively and drains each
+    // statement to completion before the next one starts, so the happens-before between "the
+    // codec wrote this RFQ" and "the caller reads it after their await resolved" is carried by the
+    // mpsc response channel, not by the atomic's ordering. If a caller ever PIPELINED multiple
+    // statements on one `Client`, this single slot would report whichever statement's RFQ arrived
+    // last, not necessarily the one the caller is asking about — that would need a per-statement
+    // (per-stream) status instead of one shared atomic.
     let tx_status = Arc::new(AtomicU8::new(b'I'));
 
     let mut stream = StartupStream {

@@ -239,6 +239,14 @@ impl Client {
     /// transaction block), or `b'E'` (in a failed transaction block). This is the protocol-signal
     /// pin engine's authority (SPEC §7.1/§7.2), replacing the M0 client-side tx-lifecycle stub.
     /// Synchronous and cheap: reads a `Relaxed` atomic, no round trip.
+    /// CAVEAT: `Relaxed` is only correct under "exactly one statement in flight per `Client`" —
+    /// Ferro's pool holds a `Checkout`'s connection exclusively per checkout and fully drains each
+    /// statement before returning, so callers never race this read against a still-in-flight
+    /// statement; the happens-before is carried by the mpsc response channel between the codec and
+    /// the caller's await, not by this atomic's ordering. If a caller ever PIPELINED multiple
+    /// statements on one `Client`, this single-slot atomic would report whichever statement's RFQ
+    /// the codec wrote most recently — not necessarily the one the caller means — and the design
+    /// would need a per-statement (per-stream) status instead of one shared slot.
     pub fn transaction_status(&self) -> u8 {
         self.inner
             .tx_status

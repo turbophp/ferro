@@ -247,6 +247,20 @@ impl<B: PoolBackend> Checkout<B> {
     }
 
     /// Mutably borrows the underlying connection.
+    ///
+    /// CONTRACT: this is a raw-client side door that BYPASSES the M1-S1 RFQ pin authority
+    /// entirely — executing a statement directly against the borrowed `B::Conn` (e.g. calling
+    /// `tokio_postgres::Client::batch_execute`/`query` on `PgConn::client` instead of going
+    /// through `Checkout::exec`/`query`/`begin_tx_with`/`tx_control`/`commit_tx`/`rollback_tx`)
+    /// means NO `tx_status()` read runs afterward and NONE of the Err-arm fail-safe forcing
+    /// (`tx_open`/`tainted`) applies. A statement run this way can silently leave the connection
+    /// mid-transaction or aborted with this `Checkout` never finding out, so the next tenant that
+    /// checks out this same pooled connection can inherit an open/aborted tx (a cross-tenant leak
+    /// — charter rule 6). This accessor is for NON-STATEMENT inspection only (e.g. reading
+    /// `pg_backend_pid()`-style state in tests) — any statement execution MUST go through one of
+    /// the instrumented `Checkout` methods above, never through `conn_mut()` directly. See
+    /// `ferrod/src/services/sql.rs`'s "NEVER conn_mut()/the raw client here" comment for the
+    /// production-path enforcement of this rule.
     pub fn conn_mut(&mut self) -> &mut B::Conn {
         self.conn.as_mut().expect("Checkout conn taken before Drop")
     }

@@ -71,7 +71,14 @@ Rust-native poolers would want the same thing), not something Ferro-specific.
 >
 > - `PostgresCodec` (`codec.rs`) gains an `Arc<AtomicU8>` (`tx_status`) written with `Ordering::
 >   Relaxed` on every decoded `ReadyForQuery` frame (the status byte is the last byte of that frame,
->   already fully buffered by the existing length check).
+>   already fully buffered by the existing length check). CAVEAT: `Relaxed` is correct only under
+>   "exactly one statement in flight per `Client`" — the happens-before between the codec's write
+>   and a caller's later `transaction_status()` read is carried by the mpsc response channel (the
+>   caller's own statement future resolving), not by the atomic's ordering. A pipelined client (more
+>   than one statement in flight on the same `Client` at once) would need a per-statement/per-stream
+>   status instead of this one shared slot — documented on `transaction_status()` itself so
+>   downstream poolers relying on it (Ferro's `ferro-pool` included) don't build on that assumption
+>   by accident.
 > - `connect_raw` (`connect_raw.rs`) constructs that atomic once and shares one clone with the
 >   `PostgresCodec` (written by the spawned `Connection`'s decoder) and one with `InnerClient`
 >   (read by the new accessor) — same construction site as the parameter map below.

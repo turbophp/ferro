@@ -494,7 +494,11 @@ async fn pg_rfq_tx_lifecycle_same_pid_and_unpins_on_commit() {
     let Some(url) = test_url() else {
         return;
     };
-    // max_size >= 2 so pinning is proven by there being somewhere else to go (not just scarcity).
+    // max_size >= 2 so a second backend connection is available; pid1 == pid2 below is tautological
+    // at THIS (single-held-Checkout) level, not proof of multiplexed pinning — that genuine proof
+    // (one tx pins one backend pid across requests going through the real session/multiplexing
+    // layer) lives in `ferrod::tests::tx_it::tx_pins_one_backend_pid`. This test's real job is the
+    // RFQ-authority checks below (tx_open/PinnedTx/cause==Tx/the raw I/T/E bytes).
     let pool = Pool::new(PgBackend::new(url), config(2));
     let mut co = pool.checkout().await.expect("checkout");
 

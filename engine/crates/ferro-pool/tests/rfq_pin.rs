@@ -16,7 +16,7 @@ use ferro_pool::config::PoolConfig;
 use ferro_pool::error::PoolError;
 use ferro_pool::fake::FakeBackend;
 use ferro_pool::pin::{PinCause, PinState, TxId};
-use ferro_pool::pool::Pool;
+use ferro_pool::pool::{Checkout, Pool};
 
 /// begin_tx_with(InTx) PRESERVES the real `PinnedTx(id)` + `tx_open` + cause; a following commit
 /// (fake infers `Idle` from `COMMIT`) clears `tx_open` — the conn is reusable.
@@ -262,6 +262,118 @@ async fn err_arm_forces_cleanup_even_when_status_reads_idle() {
         "the forced bits must drive a ROLLBACK-then-reset recycle before reuse, recorded = {:?}",
         next.conn().recorded
     );
+}
+
+/// Shared pre-condition for the four per-method Err-arm tests below: a freshly checked-out
+/// connection starts unpinned and untainted (autocommit, RFQ `Idle`).
+fn assert_fresh(co: &Checkout<FakeBackend>) {
+    assert!(
+        !co.tx_open(),
+        "a fresh checkout must start with tx_open == false"
+    );
+    assert!(
+        !co.tainted(),
+        "a fresh checkout must start with tainted == false"
+    );
+}
+
+/// Shared post-condition for the four per-method Err-arm tests below: after an `Err` from the
+/// method under test, BOTH reuse-safety bits must be forced regardless of what the (possibly
+/// stale) RFQ status read back. Mirrors `err_arm_forces_cleanup_even_when_status_reads_idle`'s
+/// assertions, factored out so the four near-identical method bodies don't repeat them.
+fn assert_forced(co: &Checkout<FakeBackend>) {
+    assert!(
+        co.tx_open(),
+        "ANY Err from this method must force tx_open so the recycle ROLLBACKs a possibly-open tx"
+    );
+    assert!(
+        co.tainted(),
+        "ANY Err from this method must force tainted so the recycle DISCARD ALLs a possibly-poisoned conn"
+    );
+}
+
+/// REGRESSION (per-method Err-arm, `begin_tx_with`): `begin_tx_with` shares the byte-identical
+/// Err-arm fail-safe (`if r.is_err() { self.tx_open = true; self.tainted = true; }`) with
+/// `exec`/`query`/`tx_control`/`commit_tx`/`rollback_tx`, but until now only `exec`/`query` had a
+/// direct test of it. `begin_tx_with` drives `PoolBackend::simple_query` under the hood exactly
+/// like the others (verified by reading `pool.rs`), so the same `arm_fail_next_simple_query` hook
+/// exercises it: the armed failure fires on the `BEGIN` statement itself, which the fake also
+/// classifies as an Open verb (so `tx_open` would end up `true` via `apply_tx_status` alone) — the
+/// bit this test isolates is `tainted`, which ONLY the force sets here. Removing the force from
+/// `begin_tx_with` flips the `tainted` assertion to fail (see the fix report for the RED run).
+#[tokio::test]
+async fn err_arm_forces_cleanup_on_begin_tx_with() {
+    let pool = Pool::new(FakeBackend::new(), PoolConfig::default());
+    let mut co = pool.checkout().await.expect("checkout");
+    assert_fresh(&co);
+
+    co.conn_mut().arm_fail_next_simple_query();
+    let r = co.begin_tx_with(TxId(1), "BEGIN").await;
+    assert!(
+        matches!(r, Err(PoolError::Backend(_))),
+        "the armed failure must surface as an Err, got {r:?}"
+    );
+    assert_forced(&co);
+}
+
+/// REGRESSION (per-method Err-arm, `tx_control`): same fail-safe as above, exercised through the
+/// engine-only savepoint passthrough. `SAVEPOINT sp1` is a PRESERVE verb in the fake's model (a
+/// real Postgres RFQ byte doesn't flip on a savepoint op either), so on a fresh (`Idle`) conn the
+/// status read back after the armed failure is STILL `Idle` — i.e. `apply_tx_status` alone would
+/// leave BOTH `tx_open` and `tainted` `false`. This is the cleanest of the four cases: removing the
+/// force flips BOTH assertions in `assert_forced` to fail (full RED; see the fix report).
+#[tokio::test]
+async fn err_arm_forces_cleanup_on_tx_control() {
+    let pool = Pool::new(FakeBackend::new(), PoolConfig::default());
+    let mut co = pool.checkout().await.expect("checkout");
+    assert_fresh(&co);
+
+    co.conn_mut().arm_fail_next_simple_query();
+    let r = co.tx_control("SAVEPOINT sp1").await;
+    assert!(
+        matches!(r, Err(PoolError::Backend(_))),
+        "the armed failure must surface as an Err, got {r:?}"
+    );
+    assert_forced(&co);
+}
+
+/// REGRESSION (per-method Err-arm, `commit_tx`): same fail-safe, exercised through `commit_tx`'s
+/// hard-coded `"COMMIT"` statement. `COMMIT` is a Close verb in the fake's model, so the status
+/// read back after the armed failure is `Idle` regardless of what preceded it — again both bits
+/// would be `false` from `apply_tx_status` alone. Removing the force flips BOTH assertions (full
+/// RED; see the fix report).
+#[tokio::test]
+async fn err_arm_forces_cleanup_on_commit_tx() {
+    let pool = Pool::new(FakeBackend::new(), PoolConfig::default());
+    let mut co = pool.checkout().await.expect("checkout");
+    assert_fresh(&co);
+
+    co.conn_mut().arm_fail_next_simple_query();
+    let r = co.commit_tx().await;
+    assert!(
+        matches!(r, Err(PoolError::Backend(_))),
+        "the armed failure must surface as an Err, got {r:?}"
+    );
+    assert_forced(&co);
+}
+
+/// REGRESSION (per-method Err-arm, `rollback_tx`): same fail-safe, exercised through
+/// `rollback_tx`'s hard-coded `"ROLLBACK"` statement (a bare ROLLBACK, so a Close verb — same
+/// stale-`Idle`-after-error shape as `commit_tx` above). Removing the force flips BOTH assertions
+/// (full RED; see the fix report).
+#[tokio::test]
+async fn err_arm_forces_cleanup_on_rollback_tx() {
+    let pool = Pool::new(FakeBackend::new(), PoolConfig::default());
+    let mut co = pool.checkout().await.expect("checkout");
+    assert_fresh(&co);
+
+    co.conn_mut().arm_fail_next_simple_query();
+    let r = co.rollback_tx().await;
+    assert!(
+        matches!(r, Err(PoolError::Backend(_))),
+        "the armed failure must surface as an Err, got {r:?}"
+    );
+    assert_forced(&co);
 }
 
 /// An autocommit `exec`/`query` on a fresh conn (fake stays `Idle`) NEVER pins and NEVER taints.

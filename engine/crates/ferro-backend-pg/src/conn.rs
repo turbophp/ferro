@@ -21,6 +21,14 @@ use ferro_pool::error::PoolError;
 /// `SELECT pg_backend_pid()`) — so the raw `tokio_postgres::Client` is reachable via
 /// `Checkout::conn()`/`conn_mut()`.
 ///
+/// CONTRACT (see `Checkout::conn_mut()`'s doc for the full rationale): calling any statement
+/// method directly on `client` (e.g. `client.batch_execute(..)`/`client.query(..)`) BYPASSES the
+/// RFQ pin authority — `PgBackend::tx_status()` is never re-read afterward and the Err-arm
+/// fail-safe (`tx_open`/`tainted` forcing) never runs — so it can leak an open/aborted
+/// transaction to the next tenant of this pooled connection. `client` is reachable here for
+/// NON-STATEMENT inspection ONLY (e.g. a test reading `pg_backend_pid()`); any real statement
+/// execution MUST go through the instrumented `Checkout` methods instead.
+///
 /// Deliberately does NOT duplicate `created_at`/`tx_open` bookkeeping: `ferro-pool`'s
 /// `Checkout`/`IdleConn` already track both at the pool layer (see `ferro_pool::pool`), driven by
 /// `Instant::now()` at connect time and by `Checkout::set_tx_open`/the pin hook, independent of
