@@ -13,6 +13,7 @@ use postgres_protocol::message::frontend;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
@@ -49,6 +50,12 @@ enum State {
 pub struct Connection<S, T> {
     stream: Framed<MaybeTlsStream<S, T>, PostgresCodec>,
     parameters: HashMap<String, String>,
+    /// FERRO M1-S1 fork (see `/UPSTREAM_PR.md`, drop when upstream merges): the same map shared
+    /// with the `Client` handle's `InnerClient`, so `Client::parameter()` can read the latest
+    /// `GUC_REPORT` `ParameterStatus` value synchronously, with no round trip. Kept in lockstep
+    /// with `parameters` above (written alongside it in the `ParameterStatus` arm below) rather
+    /// than replacing it, so the existing `Connection::parameter()` accessor is untouched.
+    shared_parameters: Arc<Mutex<HashMap<String, String>>>,
     receiver: mpsc::UnboundedReceiver<Request>,
     pending_request: Option<RequestMessages>,
     pending_responses: VecDeque<BackendMessage>,
@@ -66,10 +73,12 @@ where
         pending_responses: VecDeque<BackendMessage>,
         parameters: HashMap<String, String>,
         receiver: mpsc::UnboundedReceiver<Request>,
+        shared_parameters: Arc<Mutex<HashMap<String, String>>>,
     ) -> Connection<S, T> {
         Connection {
             stream,
             parameters,
+            shared_parameters,
             receiver,
             pending_request: None,
             pending_responses,
@@ -122,10 +131,17 @@ where
                     return Ok(Some(AsyncMessage::Notification(notification)));
                 }
                 BackendMessage::Async(Message::ParameterStatus(body)) => {
-                    self.parameters.insert(
-                        body.name().map_err(Error::parse)?.to_string(),
-                        body.value().map_err(Error::parse)?.to_string(),
-                    );
+                    let name = body.name().map_err(Error::parse)?.to_string();
+                    let value = body.value().map_err(Error::parse)?.to_string();
+                    // FERRO M1-S1 fork (see `/UPSTREAM_PR.md`, drop when upstream merges): mirror
+                    // into the shared map (`Client::parameter()`'s source) alongside the existing
+                    // local `parameters` write above/below — assist-only (SPEC §7.1), consumed by
+                    // a later M1-S1 slice.
+                    self.shared_parameters
+                        .lock()
+                        .unwrap()
+                        .insert(name.clone(), value.clone());
+                    self.parameters.insert(name, value);
                     continue;
                 }
                 BackendMessage::Async(_) => unreachable!(),

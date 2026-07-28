@@ -33,6 +33,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU8;
 use std::task::{Context, Poll, ready};
 #[cfg(feature = "runtime")]
@@ -97,6 +98,13 @@ pub struct InnerClient {
     /// — shared so `Client::transaction_status()` can read the authoritative RFQ status byte
     /// (`I`/`T`/`E`) synchronously, with no round trip.
     tx_status: Arc<AtomicU8>,
+
+    /// FERRO M1-S1 fork (see `/UPSTREAM_PR.md`, drop when upstream merges): the same map the
+    /// spawned `Connection` driver writes on every `GUC_REPORT` `ParameterStatus` message —
+    /// shared so `Client::parameter()` can read the latest value synchronously. ASSIST-ONLY
+    /// (SPEC §7.1): never a pin-state authority, unlike `tx_status` above; consumed by a later
+    /// M1-S1 slice (the assist lexer).
+    parameters: Arc<StdMutex<HashMap<String, String>>>,
 }
 
 impl InnerClient {
@@ -203,6 +211,7 @@ impl Client {
         process_id: i32,
         secret_key: i32,
         tx_status: Arc<AtomicU8>,
+        parameters: Arc<StdMutex<HashMap<String, String>>>,
     ) -> Client {
         Client {
             inner: Arc::new(InnerClient {
@@ -210,6 +219,7 @@ impl Client {
                 cached_typeinfo: Default::default(),
                 buffer: Default::default(),
                 tx_status,
+                parameters,
             }),
             #[cfg(feature = "runtime")]
             socket_config: None,
@@ -233,6 +243,17 @@ impl Client {
         self.inner
             .tx_status
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// FERRO M1-S1 fork (see `/UPSTREAM_PR.md`, drop when upstream merges): the latest value of
+    /// a `GUC_REPORT` `ParameterStatus` for `name` (e.g. `"server_version"`, `"TimeZone"`), if
+    /// the server has reported one — `None` if it hasn't (either the parameter isn't
+    /// `GUC_REPORT`, e.g. `search_path`, or the server hasn't sent it (yet)). ASSIST-ONLY (SPEC
+    /// §7.1): unlike `transaction_status()`, this is never pin-state authority by itself — the
+    /// consumer is the assist lexer (a later M1-S1 slice). Locks a plain `std::sync::Mutex`; this
+    /// read path is not hot.
+    pub fn parameter(&self, name: &str) -> Option<String> {
+        self.inner.parameters.lock().unwrap().get(name).cloned()
     }
 
     #[cfg(feature = "runtime")]

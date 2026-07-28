@@ -17,8 +17,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
@@ -126,6 +126,15 @@ where
     authenticate(&mut stream, config, &user).await?;
     let (process_id, secret_key, parameters) = read_info(&mut stream).await?;
 
+    // FERRO M1-S1 fork (see `/UPSTREAM_PR.md`, drop when upstream merges): ASSIST-ONLY (SPEC
+    // §7.1 — protocol signals are the authority, this is the assist lexer's input, consumed by a
+    // later M1-S1 slice, never a pin-state authority itself) mirror of the latest `GUC_REPORT`
+    // `ParameterStatus` values, seeded from the startup parameters just read above. One clone is
+    // written by the `Connection` driver on every subsequent `ParameterStatus` message; the other
+    // is read synchronously by `Client::parameter()`. A plain `std::sync::Mutex` — this read path
+    // is not hot, so no need for `arc_swap`.
+    let shared_parameters = Arc::new(Mutex::new(parameters.clone()));
+
     let (sender, receiver) = mpsc::unbounded();
     let client = Client::new(
         sender,
@@ -134,8 +143,15 @@ where
         process_id,
         secret_key,
         tx_status,
+        Arc::clone(&shared_parameters),
     );
-    let connection = Connection::new(stream.inner, stream.delayed, parameters, receiver);
+    let connection = Connection::new(
+        stream.inner,
+        stream.delayed,
+        parameters,
+        receiver,
+        shared_parameters,
+    );
 
     Ok((client, connection))
 }
