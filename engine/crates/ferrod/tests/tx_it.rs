@@ -513,12 +513,21 @@ async fn tx_readonly_rejects_write() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// M1-S1 Task 5: a tx-scoped EXEC that errors (a genuine constraint violation, 23505) inside the S6
-// actor's `TxCommand::Exec` path drives the real RFQ status to `E` (Failed) — now the AUTHORITATIVE
-// signal (via `Checkout::query`'s `apply_tx_status`), not engine-side inference. The actor's own
-// ROLLBACK teardown (driven by the client's TX/ROLLBACK, same as `tx_readonly_rejects_write` above)
-// then returns a CLEAN, reusable conn: a SUBSEQUENT checkout (a fresh autocommit statement on this
-// pool) gets an Idle conn — no inherited aborted-tx 25P02.
+// M1-S1 Task 5 REGRESSION test: a tx-scoped EXEC that errors (a genuine constraint violation,
+// 23505) inside the S6 actor's `TxCommand::Exec` path aborts the tx block server-side (the real RFQ
+// flips to `E`); the actor's own ROLLBACK teardown (driven by the client's TX/ROLLBACK, same as
+// `tx_readonly_rejects_write` above) then returns a CLEAN, reusable conn: a SUBSEQUENT checkout (a
+// fresh autocommit statement on this pool) gets an Idle conn — no inherited aborted-tx 25P02.
+//
+// NOTE: this proves the actor-driven error→rollback→clean-conn BEHAVIOR, not RFQ authority per se —
+// on this Err arm the guarantee comes from `Checkout`'s Rule-A unconditional Err-arm fail-safe
+// (`tx_open`/`tainted` forced on ANY `r.is_err()`) plus `rollback_tx`'s Ok-arm manual bookkeeping,
+// not from the RFQ byte (which is stale-untrustworthy on an Err arm — SPEC §7.1). This test would
+// pass identically under the old M0 stub; it is a valid regression test for the actor's
+// error/rollback/reuse contract, not a discriminating proof that RFQ is now the authority. That
+// discriminating proof (autocommit never pins; a failed statement holds the pin until an explicit
+// ROLLBACK, driven by the real RFQ byte) lives in Task 4's `ferro-backend-pg/tests/pg_pool_it.rs`
+// (`pg_rfq_autocommit_never_pins`, `pg_rfq_failed_stmt_holds_pin_until_rollback`).
 // -------------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -542,8 +551,9 @@ async fn tx_exec_constraint_violation_then_rollback_leaves_clean_conn() {
     let tx_id = begin(&mut client, 13, "default", None, false).await;
 
     // A duplicate-key INSERT inside the tx errors (23505 unique_violation) — via the actor's own
-    // `TxCommand::Exec` -> `co.query` path (actor.rs), the exact path Task 4 instrumented. PG aborts
-    // the tx block on this error, flipping the real RFQ byte to `E`.
+    // `TxCommand::Exec` -> `co.query` path (actor.rs). PG aborts the tx block on this error (the
+    // real RFQ byte flips to `E`); the conn is armed for cleanup by `Checkout`'s Rule-A unconditional
+    // Err-arm fail-safe (keyed on `r.is_err()`, not on the RFQ byte itself — see the note above).
     let ep = match exec_in_tx(
         &mut client,
         14,
@@ -570,8 +580,9 @@ async fn tx_exec_constraint_violation_then_rollback_leaves_clean_conn() {
     );
     assert_session_alive(&mut client, 130).await;
 
-    // The actor's ROLLBACK/teardown (belt-and-braces `set_tainted(true)` aside — the RFQ read is now
-    // the authority, per Task 4) ends the aborted tx block and releases a CLEAN conn to the pool.
+    // The actor's ROLLBACK/teardown ends the aborted tx block and releases a CLEAN conn to the pool
+    // (the actor's own belt-and-braces `set_tainted(true)` in `teardown` is not exercised on this
+    // path — that runs only on the Abort/Deadline teardown arms, not an explicit client ROLLBACK).
     assert!(
         matches!(rollback(&mut client, 15, tx_id).await, Outcome::Ok(_)),
         "ROLLBACK cleanly ends the aborted (E) tx"

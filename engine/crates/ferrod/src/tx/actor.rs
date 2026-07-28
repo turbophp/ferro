@@ -247,11 +247,16 @@ pub async fn run<B: PoolBackend>(
                 let cancel = co.cancel_handle();
                 let exec_start = std::time::Instant::now();
                 // M1-S1: `co.query` (`ferro-pool`'s `Checkout::query`) reads the real RFQ status byte
-                // after this statement drains and calls `apply_tx_status` — so `tx_open`/`tainted` are
-                // now set from the AUTHORITATIVE protocol signal (SPEC §7.1), not engine-side inference.
-                // A statement that flips the connection to `E` (e.g. a constraint violation) is caught
-                // here regardless of what this actor does next; `teardown`'s own `set_tainted(true)`
-                // (below) becomes belt-and-braces on top of that authority, not the sole mechanism.
+                // after this statement drains and calls `apply_tx_status`, so a clean success/failure
+                // is ALSO confirmed by the real protocol signal here, not just inferred. But the actual
+                // safety GUARANTEE on this Err arm — that a statement erroring mid-tx (e.g. a
+                // constraint violation, flipping the real tx to `E`) leaves `tx_open`/`tainted` armed
+                // for cleanup — comes from `Checkout`'s Rule-A unconditional Err-arm fail-safe (forces
+                // both bits on ANY `r.is_err()`, regardless of what the RFQ byte reads), not from the
+                // RFQ read itself: the atomic is stale-untrustworthy on the Err arm (SPEC §7.1;
+                // `ferro-backend-pg/tests/pg_pool_it.rs`'s `pg_rfq_failed_stmt_holds_pin_until_rollback`
+                // states the same caveat). `teardown`'s own `set_tainted(true)` (below) stays
+                // belt-and-braces on top of that fail-safe, not the sole mechanism.
                 let query_fut = co.query(&sql, &params);
                 tokio::pin!(query_fut);
 

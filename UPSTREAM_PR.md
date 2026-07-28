@@ -85,7 +85,7 @@ Rust-native poolers would want the same thing), not something Ferro-specific.
 >
 > ### Diff surface
 >
-> Six touch points across three files, none behavior-changing for existing callers (purely additive
+> Six touch points across four files, none behavior-changing for existing callers (purely additive
 > fields + accessors):
 >
 > - `src/codec.rs` — `PostgresCodec` gains the `tx_status: Arc<AtomicU8>` field; `decode` writes it
