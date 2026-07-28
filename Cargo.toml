@@ -4,6 +4,12 @@ members = ["engine/crates/*", "bench"]
 # NOTE: `bench` (decision B-1) was added to `members` in slice S8 when the crate was created
 # (the D12 boundary-latency benchmark / M0 exit gate). Listing a non-existent path here fails
 # workspace resolution, so it stayed out until the crate existed.
+exclude = ["vendor/tokio-postgres"]
+# `exclude` (M1-S1 task 1) has NO effect on `[patch.crates-io]` resolution below — it only lets
+# `vendor/tokio-postgres` be operated on as its own standalone package (e.g. `cd
+# vendor/tokio-postgres && cargo test --lib` for the fork's codec unit tests) without cargo
+# complaining that it "believes it's in a workspace" it isn't a declared member of. It deliberately
+# is NOT a member: see the `[patch.crates-io]` comment below.
 
 [workspace.package]
 edition = "2024"
@@ -18,3 +24,10 @@ all = { level = "deny", priority = -1 }
 
 [profile.release]
 lto = "thin"
+
+# M1-S1 (task 1): a vendored fork of tokio-postgres 0.7.18 that exposes the ReadyForQuery
+# transaction-status byte (I/T/E) via `Client::transaction_status()` — stock tokio-postgres parses
+# and discards it. NOT a workspace member (see deny.toml for the cargo-deny rationale); drop this
+# patch when the upstream PR (tracked in UPSTREAM_PR.md, filed in a later M1-S1 task) merges.
+[patch.crates-io]
+tokio-postgres = { path = "vendor/tokio-postgres" }

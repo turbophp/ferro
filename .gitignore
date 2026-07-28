@@ -7,8 +7,9 @@ Cargo.lock.orig
 **/fuzz/corpus
 **/fuzz/artifacts
 
-# PHP
-**/vendor
+# PHP (narrowed to php/** so the repo-root `vendor/` — the M1 tokio-postgres fork — is NOT
+# ignored; see M1-S1 task 1)
+php/**/vendor
 **/.phpunit.cache
 **/.phpunit.result.cache
 **/composer.lock.orig

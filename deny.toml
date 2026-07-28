@@ -1,4 +1,9 @@
 # deny.toml — enforces SPEC §21 D9 (the pool is hand-rolled) and basic supply-chain hygiene.
+#
+# M1-D2 (M1-S1 task 1): `tokio-postgres` is patched to a vendored fork at `vendor/tokio-postgres`
+# (root Cargo.toml `[patch.crates-io]`) that adds `Client::transaction_status()` (RFQ-byte access).
+# This is a path patch, not a `[sources]` allowance, so it needs no functional change here — see
+# `/UPSTREAM_PR.md` for the upstream PR link; drop the fork (and this note) once it merges.
 [bans]
 multiple-versions = "allow"
 deny = [
