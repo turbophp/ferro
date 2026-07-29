@@ -17,7 +17,7 @@ use ferro_backend_pg::PgBackend;
 use ferro_pool::config::PoolConfig;
 use ferro_pool::pool::Pool;
 
-use crate::config::Config;
+use crate::config::{Config, PoolSpec};
 
 /// Daemon per-pool defaults (M0). Deliberately modest, not tuned: correctness over throughput
 /// until the D12 bench (charter rule 5). The reaper IS enabled (`Some`) so a backend killed out
@@ -41,7 +41,7 @@ impl PoolRegistry {
     pub fn build(config: &Config) -> Arc<Self> {
         let mut by_name = HashMap::with_capacity(config.pools.len());
         for spec in &config.pools {
-            let pool = Pool::new(PgBackend::new(spec.dsn.clone()), daemon_pool_config());
+            let pool = Pool::new(PgBackend::new(spec.dsn.clone()), daemon_pool_config(spec));
             tracing::info!(pool = %spec.name, "ferrod: built connection pool");
             by_name.insert(spec.name.clone(), pool);
         }
@@ -71,16 +71,18 @@ impl PoolRegistry {
     }
 }
 
-fn daemon_pool_config() -> PoolConfig {
+/// Build a pool's `PoolConfig` from its `PoolSpec`: fixed daemon defaults (size/timeout/lifetime/
+/// reap) plus the per-pool pin-engine escape hatch (`pin_functions`/`pin_on_unknown`, M1-S2 Task 4)
+/// carried verbatim from the spec parsed out of `FERRO_POOL_<NAME>_PIN_FUNCTIONS`/
+/// `FERRO_POOL_<NAME>_PIN_ON_UNKNOWN` (see `config::parse_pool_pin_config`).
+fn daemon_pool_config(spec: &PoolSpec) -> PoolConfig {
     PoolConfig {
         max_size: DEFAULT_POOL_MAX_SIZE,
         checkout_timeout: DEFAULT_POOL_CHECKOUT_TIMEOUT,
         max_lifetime: DEFAULT_POOL_MAX_LIFETIME,
         reap_interval: Some(DEFAULT_POOL_REAP_INTERVAL),
-        // `pin_functions`/`pin_on_unknown` per-pool plumbing from `ferrod` config lands in M1-S2
-        // Task 4; until then every daemon pool runs the assist lexer's conservative defaults
-        // (`pin_on_unknown: true`, no extra escape-hatch names).
-        ..PoolConfig::default()
+        pin_functions: spec.pin_functions.clone(),
+        pin_on_unknown: spec.pin_on_unknown,
     }
 }
 

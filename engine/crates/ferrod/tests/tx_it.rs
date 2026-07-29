@@ -51,6 +51,8 @@ fn exec_server_with_deadlines(url: String, idle_in_tx: Duration, max_tx: Duratio
         pools: vec![PoolSpec {
             name: "default".to_string(),
             dsn: url,
+            pin_functions: Vec::new(),
+            pin_on_unknown: true,
         }],
         idle_in_tx,
         max_tx,

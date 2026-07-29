@@ -55,6 +55,14 @@ const DEFAULT_TX_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct PoolSpec {
     pub name: String,
     pub dsn: String,
+    /// The assist lexer's (`ferro-classify`, M1-S2) per-pool escape hatch: function names that
+    /// always taint + pin-cause `PinFunction`, threaded verbatim into `PoolConfig::pin_functions`.
+    /// From `FERRO_POOL_<NAME>_PIN_FUNCTIONS` (comma-separated), default empty.
+    pub pin_functions: Vec<String>,
+    /// Whether an unrecognized/unclassifiable statement taints the connection, threaded verbatim
+    /// into `PoolConfig::pin_on_unknown`. From `FERRO_POOL_<NAME>_PIN_ON_UNKNOWN`, default `true`
+    /// (SPEC §7.1 — prefer a false taint to a missed one, charter rule 5).
+    pub pin_on_unknown: bool,
 }
 
 impl std::fmt::Debug for PoolSpec {
@@ -62,6 +70,8 @@ impl std::fmt::Debug for PoolSpec {
         f.debug_struct("PoolSpec")
             .field("name", &self.name)
             .field("dsn", &"<redacted>")
+            .field("pin_functions", &self.pin_functions)
+            .field("pin_on_unknown", &self.pin_on_unknown)
             .finish()
     }
 }
@@ -139,7 +149,7 @@ impl Config {
         }
 
         if let Ok(names) = std::env::var("FERRO_POOLS") {
-            cfg.pools = parse_pools(&names);
+            cfg.pools = parse_pools(&names, &|k| std::env::var(k).ok());
         }
 
         cfg
@@ -188,21 +198,33 @@ fn parse_allow_uids(list: &str) -> Vec<u32> {
 }
 
 /// Parse `FERRO_POOLS` (comma-separated pool names) into `PoolSpec`s, reading each pool's DSN from
-/// `FERRO_POOL_<NAME>_DSN` (NAME per [`env_name`]). A named pool whose DSN env var is unset or
-/// empty is `tracing::warn!`-ed and SKIPPED — never defaulted to a bogus DSN (a silent
-/// self-connection surprise). The DSN value itself is never logged (§12).
-fn parse_pools(names: &str) -> Vec<PoolSpec> {
+/// `FERRO_POOL_<NAME>_DSN` (NAME per [`env_name`]) and its pin-engine escape hatch from
+/// `FERRO_POOL_<NAME>_PIN_FUNCTIONS`/`FERRO_POOL_<NAME>_PIN_ON_UNKNOWN` (via
+/// [`parse_pool_pin_config`]). A named pool whose DSN env var is unset or empty is
+/// `tracing::warn!`-ed and SKIPPED — never defaulted to a bogus DSN (a silent self-connection
+/// surprise). The DSN value itself is never logged (§12).
+///
+/// `lookup` abstracts the env read so this is unit-testable without process-env mutation
+/// (`std::env::set_var`/`remove_var` are `unsafe fn` under this crate's edition-2024
+/// `unsafe_code = "forbid"`): the real caller passes `&|k| std::env::var(k).ok()`; tests pass a
+/// `HashMap`-backed closure.
+fn parse_pools(names: &str, lookup: &impl Fn(&str) -> Option<String>) -> Vec<PoolSpec> {
     names
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter_map(|name| {
             let env_key = format!("FERRO_POOL_{}_DSN", env_name(name));
-            match std::env::var(&env_key) {
-                Ok(dsn) if !dsn.is_empty() => Some(PoolSpec {
-                    name: name.to_string(),
-                    dsn,
-                }),
+            match lookup(&env_key) {
+                Some(dsn) if !dsn.is_empty() => {
+                    let (pin_functions, pin_on_unknown) = parse_pool_pin_config(name, lookup);
+                    Some(PoolSpec {
+                        name: name.to_string(),
+                        dsn,
+                        pin_functions,
+                        pin_on_unknown,
+                    })
+                }
                 _ => {
                     tracing::warn!(
                         pool = name,
@@ -214,6 +236,38 @@ fn parse_pools(names: &str) -> Vec<PoolSpec> {
             }
         })
         .collect()
+}
+
+/// Parse a single pool's pin-engine escape hatch from `FERRO_POOL_<NAME>_PIN_FUNCTIONS`
+/// (comma-separated function names, trimmed, empty entries dropped) and
+/// `FERRO_POOL_<NAME>_PIN_ON_UNKNOWN` (falsy tokens `"0"`/`"false"`/`"no"`/`"off"`,
+/// case-insensitive, trimmed; anything else — including unset — is truthy). NAME is normalized via
+/// [`env_name`], the same convention as `FERRO_POOL_<NAME>_DSN`. Defaults (unset): `([], true)` —
+/// SPEC §7.1's conservative default (charter rule 5: prefer a false taint to a missed one).
+///
+/// Pure function over an injected `lookup` — no `std::env` access here — so it is unit-testable
+/// with a plain map, without the process-env mutation that `#[forbid(unsafe_code)]` blocks.
+fn parse_pool_pin_config(
+    name: &str,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> (Vec<String>, bool) {
+    let fns = lookup(&format!("FERRO_POOL_{}_PIN_FUNCTIONS", env_name(name)))
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let pin_on_unknown = lookup(&format!("FERRO_POOL_{}_PIN_ON_UNKNOWN", env_name(name)))
+        .map(|s| {
+            !matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true); // default true (SPEC §7.1)
+    (fns, pin_on_unknown)
 }
 
 /// The env-var-safe form of a pool name: ASCII-uppercased, every non-alphanumeric byte mapped to
@@ -239,6 +293,8 @@ mod tests {
         let s = PoolSpec {
             name: "default".to_string(),
             dsn: "postgres://user:hunter2@db.internal/app".to_string(),
+            pin_functions: Vec::new(),
+            pin_on_unknown: true,
         };
         let dbg = format!("{s:?}");
         assert!(dbg.contains("default"), "the pool name is shown");
@@ -273,5 +329,111 @@ mod tests {
     #[test]
     fn parse_allow_uids_empty_string_yields_empty() {
         assert_eq!(parse_allow_uids(""), Vec::<u32>::new());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `parse_pool_pin_config` (M1-S2 Task 4): map-backed injected lookup, NO process-env
+    // mutation anywhere — `std::env::set_var`/`remove_var` are `unsafe fn` under this crate's
+    // edition-2024 `unsafe_code = "forbid"` and would not compile in a test.
+    // -----------------------------------------------------------------------------------------
+
+    /// Build a lookup closure backed by a `HashMap`, mirroring how the real `from_env` path
+    /// passes `&|k| std::env::var(k).ok()` — here the "env" is just an in-memory map.
+    fn map_lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
+    #[test]
+    fn parse_pool_pin_config_reads_and_trims_pin_functions() {
+        let lookup = map_lookup(&[("FERRO_POOL_MAIN_PIN_FUNCTIONS", "app_lock, other_fn")]);
+        let (fns, pin_on_unknown) = parse_pool_pin_config("main", &lookup);
+        assert_eq!(fns, vec!["app_lock".to_string(), "other_fn".to_string()]);
+        assert!(pin_on_unknown, "PIN_ON_UNKNOWN unset must default to true");
+    }
+
+    #[test]
+    fn parse_pool_pin_config_drops_whitespace_and_empty_entries() {
+        let lookup = map_lookup(&[("FERRO_POOL_MAIN_PIN_FUNCTIONS", "a,,b, ")]);
+        let (fns, _) = parse_pool_pin_config("main", &lookup);
+        assert_eq!(fns, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parse_pool_pin_config_pin_on_unknown_falsy_tokens() {
+        for token in ["0", "false", "False", "FALSE", "no", "No", "off", "OFF"] {
+            let lookup = map_lookup(&[("FERRO_POOL_MAIN_PIN_ON_UNKNOWN", token)]);
+            let (_, pin_on_unknown) = parse_pool_pin_config("main", &lookup);
+            assert!(!pin_on_unknown, "token {token:?} must parse as false");
+        }
+    }
+
+    #[test]
+    fn parse_pool_pin_config_pin_on_unknown_truthy_tokens_and_unset() {
+        let lookup = map_lookup(&[]);
+        let (_, pin_on_unknown) = parse_pool_pin_config("main", &lookup);
+        assert!(pin_on_unknown, "unset must default to true");
+
+        for token in ["1", "true", "TRUE", "yes", "anything-else"] {
+            let lookup = map_lookup(&[("FERRO_POOL_MAIN_PIN_ON_UNKNOWN", token)]);
+            let (_, pin_on_unknown) = parse_pool_pin_config("main", &lookup);
+            assert!(pin_on_unknown, "token {token:?} must parse as true");
+        }
+    }
+
+    #[test]
+    fn parse_pool_pin_config_empty_map_yields_defaults() {
+        let lookup = map_lookup(&[]);
+        let (fns, pin_on_unknown) = parse_pool_pin_config("main", &lookup);
+        assert!(fns.is_empty());
+        assert!(pin_on_unknown);
+    }
+
+    #[test]
+    fn parse_pool_pin_config_uses_env_name_normalization() {
+        // Same normalization convention as the `FERRO_POOL_<NAME>_DSN` key: hyphens become `_`,
+        // letters are uppercased (see `env_name_uppercases_and_sanitizes` above).
+        let lookup = map_lookup(&[("FERRO_POOL_READ_REPLICA_PIN_FUNCTIONS", "app_lock")]);
+        let (fns, _) = parse_pool_pin_config("read-replica", &lookup);
+        assert_eq!(fns, vec!["app_lock".to_string()]);
+
+        // A lookup keyed on the UN-normalized name must miss.
+        let lookup_wrong_key = map_lookup(&[("FERRO_POOL_read-replica_PIN_FUNCTIONS", "app_lock")]);
+        let (fns_wrong, _) = parse_pool_pin_config("read-replica", &lookup_wrong_key);
+        assert!(fns_wrong.is_empty());
+    }
+
+    #[test]
+    fn parse_pools_threads_pin_config_through_injected_lookup() {
+        let lookup = map_lookup(&[
+            ("FERRO_POOL_MAIN_DSN", "postgres://user@db/app"),
+            ("FERRO_POOL_MAIN_PIN_FUNCTIONS", "app_lock"),
+            ("FERRO_POOL_MAIN_PIN_ON_UNKNOWN", "false"),
+            ("FERRO_POOL_OTHER_DSN", "postgres://user@db/other"),
+        ]);
+        let pools = parse_pools("main,other", &lookup);
+        assert_eq!(pools.len(), 2);
+
+        let main = pools.iter().find(|p| p.name == "main").unwrap();
+        assert_eq!(main.pin_functions, vec!["app_lock".to_string()]);
+        assert!(!main.pin_on_unknown);
+
+        // "other" has a DSN but no pin overrides: must fall back to the conservative defaults.
+        let other = pools.iter().find(|p| p.name == "other").unwrap();
+        assert!(other.pin_functions.is_empty());
+        assert!(other.pin_on_unknown);
+    }
+
+    #[test]
+    fn parse_pools_skips_pool_with_no_dsn_regardless_of_pin_config() {
+        let lookup = map_lookup(&[("FERRO_POOL_MAIN_PIN_FUNCTIONS", "app_lock")]);
+        let pools = parse_pools("main", &lookup);
+        assert!(
+            pools.is_empty(),
+            "a pool with no DSN must still be skipped, even if pin config is present"
+        );
     }
 }

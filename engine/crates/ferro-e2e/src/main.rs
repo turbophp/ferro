@@ -53,6 +53,8 @@ async fn main() -> Result<(), BoxErr> {
         pools: vec![PoolSpec {
             name: "default".to_string(),
             dsn: url,
+            pin_functions: Vec::new(),
+            pin_on_unknown: true,
         }],
         ..Config::default()
     };
