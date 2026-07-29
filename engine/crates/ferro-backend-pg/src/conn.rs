@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use ferro_pool::backend::{Cancel, Dialect, PoolBackend, TxStatus};
+use ferro_pool::backend::{Cancel, Dialect, PoolBackend, ResetProfile, TxStatus};
 use ferro_pool::error::PoolError;
 
 /// A pooled Postgres connection.
@@ -47,6 +47,18 @@ pub struct PgConn {
 pub struct PgBackend {
     url: String,
 }
+
+/// The exact `Targeted` reset batch (M1-S3, SPEC §7.2 + the plan's verification-fix addenda) — a
+/// named constant (rather than an inline literal) so a unit test can assert the exact string
+/// verbatim without depending on Rust's string-literal line-continuation whitespace-stripping
+/// behavior being read correctly by eye. This is Postgres's own `DISCARD ALL` MINUS the two
+/// prepare-destroying statements (`DEALLOCATE ALL`, `DISCARD PLANS`) — do NOT add them back; that
+/// would defeat the entire point of the `Targeted` profile (preserving the engine's future
+/// namespaced prepared statements across a checkout recycle).
+const TARGETED_RESET_SQL: &str = "CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES;";
+
+/// The `Full` reset batch — Postgres's own `DISCARD ALL`, unmodified.
+const FULL_RESET_SQL: &str = "DISCARD ALL";
 
 impl PgBackend {
     pub fn new(url: impl Into<String>) -> Self {
@@ -138,11 +150,29 @@ impl PoolBackend for PgBackend {
         TxStatus::from_pg_byte(conn.client.transaction_status())
     }
 
-    async fn reset(&self, conn: &mut Self::Conn) -> Result<(), PoolError> {
-        conn.client.batch_execute("DISCARD ALL").await.map_err(|e| {
-            tracing::warn!(error = %e, "ferro-backend-pg: reset (DISCARD ALL) failed");
+    /// M1-S3 (SPEC §7.2): `Full` runs Postgres's own `DISCARD ALL` (used for a `tainted` conn);
+    /// `Targeted` runs a narrower batch — exactly `DISCARD ALL` minus the two prepare-destroying
+    /// statements (`DEALLOCATE ALL`, `DISCARD PLANS`) — for a non-tainted recycled conn, so the
+    /// engine's future namespaced prepared statements survive while every other §7.4 blind-spot
+    /// leak class (holdable cursors, role/session-authorization, GUCs, LISTEN channels, advisory
+    /// locks, temp tables/sequences) still gets closed. One `batch_execute` per profile (simple
+    /// protocol, one round trip, one trailing `ReadyForQuery`).
+    async fn reset(&self, conn: &mut Self::Conn, profile: ResetProfile) -> Result<(), PoolError> {
+        let sql = match profile {
+            ResetProfile::Full => FULL_RESET_SQL,
+            ResetProfile::Targeted => TARGETED_RESET_SQL,
+        };
+        conn.client.batch_execute(sql).await.map_err(|e| {
+            tracing::warn!(error = %e, profile = ?profile, "ferro-backend-pg: reset failed");
             PoolError::ConnectionLost
         })
+    }
+
+    /// A non-tainted recycled PG conn always gets the `Targeted` profile (the §7.4 blind-spot
+    /// backstop) — PG has no cheaper "provably clean" signal the way a future MySQL session-state
+    /// tracker might.
+    fn clean_reset_profile(&self) -> Option<ResetProfile> {
+        Some(ResetProfile::Targeted)
     }
 
     async fn simple_query(&self, conn: &mut Self::Conn, sql: &str) -> Result<u64, PoolError> {
@@ -202,5 +232,33 @@ mod tests {
     fn dialect_is_postgres() {
         let backend = PgBackend::new("postgres://unused/unused");
         assert_eq!(backend.dialect(), Dialect::Postgres);
+    }
+
+    /// M1-S3 TDD: a non-tainted recycled PG conn's hygiene profile is `Targeted`.
+    #[test]
+    fn clean_reset_profile_is_targeted() {
+        let backend = PgBackend::new("postgres://unused/unused");
+        assert_eq!(backend.clean_reset_profile(), Some(ResetProfile::Targeted));
+    }
+
+    /// The exact targeted batch string, verbatim (task brief + SPEC §7.2 + the plan's
+    /// verification-fix addenda): `DISCARD ALL` minus the two prepare-destroying statements, plus
+    /// `CLOSE ALL` (holdable-cursor leak fix) and `SET SESSION AUTHORIZATION DEFAULT`
+    /// (role/session-authorization coverage).
+    #[test]
+    fn targeted_reset_sql_is_exact() {
+        // Deliberately a single-line literal (no `\`-newline continuation) so this assertion can't
+        // share — and thus can't be silently confirming the correctness of — the same Rust
+        // line-continuation whitespace-stripping the production constant's definition relies on.
+        let expected = "CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES;";
+        assert_eq!(TARGETED_RESET_SQL, expected);
+        // Never regains the prepare-destroying statements `Targeted` exists to omit.
+        assert!(!TARGETED_RESET_SQL.contains("DEALLOCATE ALL"));
+        assert!(!TARGETED_RESET_SQL.contains("DISCARD PLANS"));
+    }
+
+    #[test]
+    fn full_reset_sql_is_discard_all() {
+        assert_eq!(FULL_RESET_SQL, "DISCARD ALL");
     }
 }

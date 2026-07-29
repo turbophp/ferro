@@ -55,6 +55,24 @@ impl TxStatus {
     }
 }
 
+/// Checkout-time hygiene profile (M1-S3, SPEC §7.2). Which one applies to a recycled connection is
+/// driven by the pin engine's `tainted` bit, NOT by "was this conn ever in a tx" (a cleanly
+/// committed transaction never taints — see `Checkout::commit_tx`) — the predicate and rationale
+/// live at the call site in `pool.rs`'s recycle block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetProfile {
+    /// Full reset (e.g. Postgres `DISCARD ALL`) for a `tainted` conn — a session mutation was
+    /// observed, or the conn's fate after an error/aborted tx can't be trusted. Destroys prepared
+    /// statements along with everything else; that's acceptable here because the conn is already
+    /// suspect.
+    Full,
+    /// A narrower reset applied to a non-tainted recycled conn (the §7.4 assist-lexer blind-spot
+    /// backstop): releases session state a safe-listed statement's function/`DO` body could have
+    /// mutated invisibly to the lexer (advisory locks, temp objects, LISTEN channels, GUCs, holdable
+    /// cursors, role) while preserving the engine's future namespaced prepared statements.
+    Targeted,
+}
+
 /// A fire-once, out-of-band cancel handle (S6). Grabbed via [`PoolBackend::cancel_handle`] /
 /// `Checkout::cancel_handle` BEFORE an interruptible statement starts, moved into a `select!` arm,
 /// and [`Cancel::cancel`]led on a deadline/abort — WITHOUT borrowing the `Checkout` the live query
@@ -118,9 +136,21 @@ pub trait PoolBackend: Send + Sync + 'static {
     /// engine's authority (Task 4), replacing the S4 stub's engine-side-only pin tracking.
     fn tx_status(&self, conn: &Self::Conn) -> TxStatus;
 
-    /// Hygiene reset (e.g. `DISCARD ALL`) — run at checkout for a tainted/tx-served conn before
-    /// it is handed to a new caller (v2/B1).
-    async fn reset(&self, conn: &mut Self::Conn) -> Result<(), PoolError>;
+    /// Hygiene reset, run at checkout before a recycled conn is handed to a new caller (v2/B1;
+    /// profile-parameterized in M1-S3, SPEC §7.2). `profile` selects HOW MUCH state to release:
+    /// [`ResetProfile::Full`] (e.g. Postgres `DISCARD ALL`) for a tainted conn, or
+    /// [`ResetProfile::Targeted`] (e.g. a batch that releases advisory locks/temp/listens/GUCs/
+    /// cursors while preserving prepared statements) for a non-tainted recycled conn. The caller
+    /// (the pool's recycle block) decides which profile applies; this method just executes it.
+    async fn reset(&self, conn: &mut Self::Conn, profile: ResetProfile) -> Result<(), PoolError>;
+
+    /// The [`ResetProfile`] to apply to a recycled conn that is NOT `tainted` (M1-S3, SPEC §7.2).
+    /// `Some(profile)` runs that profile as the §7.4 blind-spot backstop (a safe-listed statement's
+    /// function/`DO` body can mutate session state invisibly to the assist lexer, leaving the conn
+    /// `!tainted` yet dirty); `None` means "skip hygiene for a clean conn" — reserved for a future
+    /// backend (e.g. an S6 MySQL session-state tracker) that can prove a recycled conn needs
+    /// nothing at all. `PgBackend` always returns `Some(ResetProfile::Targeted)`.
+    fn clean_reset_profile(&self) -> Option<ResetProfile>;
 
     /// Raw simple query — UNGUARDED. Used only by the pin hook (BEGIN/COMMIT/ROLLBACK, Task 4)
     /// and internal reset. The user-facing guarded entry point (`Checkout::exec`) lands in Task

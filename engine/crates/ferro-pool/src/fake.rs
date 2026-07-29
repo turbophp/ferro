@@ -11,7 +11,7 @@ use tokio::time::Instant;
 
 use ferro_proto::consts::{branch, errc};
 
-use crate::backend::{Cancel, Dialect, PoolBackend, QueryResult, TxStatus};
+use crate::backend::{Cancel, Dialect, PoolBackend, QueryResult, ResetProfile, TxStatus};
 use crate::error::PoolError;
 use crate::pin::{TxVerb, leading_tx_verb};
 
@@ -132,7 +132,13 @@ impl Cancel for FakeCancelHandle {
 /// A `FakeBackend` connects instantly and never touches the network. `next_id` is atomic so
 /// `connect()` only needs `&self` (matching the trait), matching how a real pool shares one
 /// backend across many concurrent checkouts.
-#[derive(Debug, Default)]
+///
+/// NOTE (M1-S3 verification MINOR): this struct deliberately does NOT `#[derive(Default)]`. A
+/// derived `Default` would zero every field structurally — including `clean_reset_profile` to
+/// `None` — which would silently diverge from `new()`'s `Some(ResetProfile::Targeted)` (the
+/// PG-like default policy every existing test relies on). `Default` is hand-implemented below to
+/// delegate to `new()` so the two constructors can never drift apart again.
+#[derive(Debug)]
 pub struct FakeBackend {
     next_id: AtomicU64,
     /// Scripted connect failures: each `connect()` call while this is > 0 fails with
@@ -170,6 +176,11 @@ pub struct FakeBackend {
     /// test that needs a different dialect (e.g. to prove `Checkout` picks the right classify
     /// rule set) calls `set_dialect`.
     dialect: Mutex<Dialect>,
+    /// The [`ResetProfile`] `clean_reset_profile()` reports for a NON-tainted recycled conn
+    /// (M1-S3). Defaults to `Some(ResetProfile::Targeted)` — mirroring `PgBackend`'s policy — so
+    /// pool tests exercise the targeted-hygiene path by default; a test that needs the MySQL-style
+    /// skip case calls `set_clean_reset_profile(None)`.
+    clean_reset_profile: Mutex<Option<ResetProfile>>,
 }
 
 impl FakeBackend {
@@ -184,6 +195,7 @@ impl FakeBackend {
             query_gate: Mutex::new(None),
             queries_waiting: AtomicU64::new(0),
             dialect: Mutex::new(Dialect::default()),
+            clean_reset_profile: Mutex::new(Some(ResetProfile::Targeted)),
         }
     }
 
@@ -262,6 +274,22 @@ impl FakeBackend {
     pub fn set_dialect(&self, dialect: Dialect) {
         *self.dialect.lock().unwrap() = dialect;
     }
+
+    /// Test hook: force the [`ResetProfile`] `clean_reset_profile()` reports for a NON-tainted
+    /// recycled conn (M1-S3). Pass `None` to drive the MySQL-tracker-style "skip hygiene for a
+    /// clean conn" case; pass `Some(profile)` to drive a specific profile (defaults to
+    /// `Some(ResetProfile::Targeted)`, matching `PgBackend`).
+    pub fn set_clean_reset_profile(&self, profile: Option<ResetProfile>) {
+        *self.clean_reset_profile.lock().unwrap() = profile;
+    }
+}
+
+impl Default for FakeBackend {
+    /// Hand-implemented (NOT derived — see the struct's doc comment) so `FakeBackend::default()`
+    /// can never silently diverge from `FakeBackend::new()`.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait]
@@ -331,10 +359,14 @@ impl PoolBackend for FakeBackend {
         conn.tx_status
     }
 
-    async fn reset(&self, conn: &mut Self::Conn) -> Result<(), PoolError> {
+    async fn reset(&self, conn: &mut Self::Conn, profile: ResetProfile) -> Result<(), PoolError> {
         conn.tx_open = false;
-        conn.recorded.push("RESET".to_string());
+        conn.recorded.push(format!("RESET:{profile:?}"));
         Ok(())
+    }
+
+    fn clean_reset_profile(&self) -> Option<ResetProfile> {
+        *self.clean_reset_profile.lock().unwrap()
     }
 
     async fn simple_query(&self, conn: &mut Self::Conn, sql: &str) -> Result<u64, PoolError> {
@@ -389,5 +421,68 @@ impl PoolBackend for FakeBackend {
             }
         }
         Ok(self.canned_query.lock().unwrap().clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M1-S3 TDD: `reset(conn, Full)` records `"RESET:Full"`.
+    #[tokio::test]
+    async fn reset_full_records_reset_full() {
+        let backend = FakeBackend::new();
+        let mut conn = backend.connect().await.expect("connect");
+        backend
+            .reset(&mut conn, ResetProfile::Full)
+            .await
+            .expect("reset");
+        assert_eq!(conn.recorded, vec!["RESET:Full".to_string()]);
+        assert!(!conn.tx_open, "reset clears tx_open regardless of profile");
+    }
+
+    /// M1-S3 TDD: `reset(conn, Targeted)` records `"RESET:Targeted"`.
+    #[tokio::test]
+    async fn reset_targeted_records_reset_targeted() {
+        let backend = FakeBackend::new();
+        let mut conn = backend.connect().await.expect("connect");
+        backend
+            .reset(&mut conn, ResetProfile::Targeted)
+            .await
+            .expect("reset");
+        assert_eq!(conn.recorded, vec!["RESET:Targeted".to_string()]);
+        assert!(!conn.tx_open, "reset clears tx_open regardless of profile");
+    }
+
+    /// M1-S3 TDD: `new()` defaults `clean_reset_profile()` to `Some(Targeted)` (mirrors `PgBackend`).
+    #[test]
+    fn new_defaults_clean_reset_profile_to_targeted() {
+        let backend = FakeBackend::new();
+        assert_eq!(backend.clean_reset_profile(), Some(ResetProfile::Targeted));
+    }
+
+    /// M1-S3 TDD (the Default/new divergence fix): `FakeBackend::default()` and `FakeBackend::new()`
+    /// MUST agree on `clean_reset_profile()`. Before the fix (`#[derive(Default)]` structurally
+    /// zeroing every field), `default()` would silently report `None` here while `new()` reported
+    /// `Some(Targeted)` — this test is the proof the hand-impl'd `Default` closes that gap.
+    #[test]
+    fn default_and_new_agree_on_clean_reset_profile() {
+        assert_eq!(
+            FakeBackend::default().clean_reset_profile(),
+            FakeBackend::new().clean_reset_profile()
+        );
+        assert_eq!(
+            FakeBackend::default().clean_reset_profile(),
+            Some(ResetProfile::Targeted)
+        );
+    }
+
+    /// M1-S3 TDD: a `FakeBackend` with `clean_reset_profile` explicitly set to `None` (the
+    /// MySQL-tracker-style skip case) reports `None`.
+    #[test]
+    fn set_clean_reset_profile_none_is_respected() {
+        let backend = FakeBackend::new();
+        backend.set_clean_reset_profile(None);
+        assert_eq!(backend.clean_reset_profile(), None);
     }
 }

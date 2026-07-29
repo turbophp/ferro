@@ -204,7 +204,7 @@ async fn failed_then_rollback_clears_tx_open_but_taint_survives() {
     let next = pool.checkout().await.expect("checkout again");
     assert_eq!(
         next.conn().recorded.last().map(String::as_str),
-        Some("RESET"),
+        Some("RESET:Full"),
         "the surviving taint makes the next checkout run exactly one reset, recorded = {:?}",
         next.conn().recorded
     );
@@ -257,7 +257,7 @@ async fn err_arm_forces_cleanup_even_when_status_reads_idle() {
         vec![
             "SELECT 1".to_string(),
             "ROLLBACK".to_string(),
-            "RESET".to_string()
+            "RESET:Full".to_string()
         ],
         "the forced bits must drive a ROLLBACK-then-reset recycle before reuse, recorded = {:?}",
         next.conn().recorded

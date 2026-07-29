@@ -13,7 +13,7 @@ use tokio::time::Instant;
 
 use ferro_proto::value::Value;
 
-use crate::backend::{PoolBackend, QueryResult, TxStatus};
+use crate::backend::{PoolBackend, QueryResult, ResetProfile, TxStatus};
 use crate::config::PoolConfig;
 use crate::error::PoolError;
 use crate::pin::{self, PinCause, PinState, TxId};
@@ -144,7 +144,16 @@ impl<B: PoolBackend> Pool<B> {
                         idle_conn.tx_open = false;
                     }
                     if idle_conn.tainted {
-                        self.inner.backend.reset(&mut idle_conn.conn).await?;
+                        // TASK-1 PLACEHOLDER (M1-S3): this call site is exercised ONLY when
+                        // `idle_conn.tainted` (see the guarding `if` above), so `Full` is exactly
+                        // right for every path reachable today — it is NOT a stand-in masking a
+                        // wrong answer. Task 2 wires the actual conditional decision (tainted ->
+                        // Full, non-tainted recycled -> `clean_reset_profile()`), which will also
+                        // widen this block's guard so a non-tainted conn reaches `reset` too.
+                        self.inner
+                            .backend
+                            .reset(&mut idle_conn.conn, ResetProfile::Full)
+                            .await?;
                         idle_conn.tainted = false;
                     }
                     Ok::<(), PoolError>(())

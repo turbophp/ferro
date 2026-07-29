@@ -687,7 +687,7 @@ mod tests {
             .await
             .expect("permit released despite the wedged teardown ROLLBACK");
         assert!(
-            co2.conn().recorded.contains(&"RESET".to_string()),
+            co2.conn().recorded.contains(&"RESET:Full".to_string()),
             "a timed-out teardown taints the conn → the recycle resets it: {:?}",
             co2.conn().recorded
         );
