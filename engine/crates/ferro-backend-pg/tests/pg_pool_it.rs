@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use ferro_backend_pg::{PgBackend, Value};
-use ferro_pool::backend::{PoolBackend, TxStatus};
+use ferro_pool::backend::{PoolBackend, ResetProfile, TxStatus};
 use ferro_pool::config::PoolConfig;
 use ferro_pool::error::{Branch, PoolError};
 use ferro_pool::pin::{PinCause, PinState, TxId};
@@ -938,5 +938,405 @@ async fn pg_classify_temp_table_taints_and_dropped_by_recycle() {
     assert!(
         gone,
         "DISCARD ALL at recycle must have dropped the temp table (to_regclass should be NULL)"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// M1-S3 Task 3 LIVE: the conditional-hygiene acceptance bar. Tasks 1-2 (already merged) taught the
+// pool's checkout-time recycle a `ResetProfile`: `tainted` -> `Full` (`DISCARD ALL`); NOT tainted but
+// recycled (PG's `clean_reset_profile()`) -> `Targeted` (`CLOSE ALL; SET SESSION AUTHORIZATION
+// DEFAULT; RESET ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD
+// SEQUENCES;`). Every test below is `max_size=1` + a same-`pg_backend_pid` assertion across the two
+// checkouts (the same false-green guard the M1-S2 block above uses): without it, a fresh connection
+// (which also starts at PG's defaults) would make the "leak closed" assertions pass even if the
+// targeted reset never ran.
+// -------------------------------------------------------------------------------------------------
+
+/// (a) HEADLINE — the §7.4 assist-lexer blind-spot backstop, and S3's entire value proposition.
+/// `set_config('search_path', ..., false)` mutates SESSION state (persists past the current
+/// statement/transaction, exactly like a bare `SET`) but does so THROUGH A FUNCTION CALL inside an
+/// otherwise-safe-listed leading `SELECT` -- `ferro-classify`'s rule 7 (the only pre-safe-list content
+/// check) only looks for the `pg_advisory_lock` family, not `set_config`, so this statement falls
+/// through to rule 8 (`SELECT` is safe) and returns `None`: the connection is NEVER tainted. Before
+/// M1-S3, the pool's recycle guard was `if idle_conn.tx_open || idle_conn.tainted` (see git blame on
+/// `pool.rs`'s pre-S3 revision) -- a `!tainted` conn skipped hygiene ENTIRELY, so this exact mutation
+/// leaked to the very next tenant of this pooled connection. S3 widens the guard to also run the
+/// backend's `clean_reset_profile()` (PG: `Targeted`) on a non-tainted recycled conn, whose `RESET
+/// ALL` resets every GUC (including one set via `set_config(..., false)`) back to its configured
+/// default. This is a genuine RED-before/GREEN-after test: `git stash` the S3 `pool.rs` recycle-guard
+/// change (reverting to the pre-S3 `tx_open || tainted` guard) and rerun this test -- checkout 2 below
+/// would observe `search_path` STILL `ferro_s3_leak`, and the `assert_ne!` would fail. (Verified by
+/// re-reading the exact pre-S3 diff rather than actually reverting -- see the report.)
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_s3_set_config_search_path_blind_spot_closed_by_targeted_reset() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        co.query(
+            "SELECT set_config('search_path', 'ferro_s3_leak', false)",
+            &[],
+        )
+        .await
+        .expect("set_config via a safe-listed leading SELECT");
+
+        assert!(
+            !co.tainted(),
+            "set_config(...) inside a leading SELECT is the S2 lexer's documented blind spot -- it \
+             must NOT taint (that is exactly what makes this the §7.4 backstop case, not an ordinary \
+             tainted-path reset)"
+        );
+        assert_eq!(co.pin_state(), PinState::Unpinned);
+
+        backend_pid(&mut co).await
+        // `co` drops here -> idle with tainted=false. The recycle at the START of the NEXT
+        // checkout now ALSO runs (S3): tainted=false but `clean_reset_profile() == Some(Targeted)`.
+    };
+
+    let mut co2 = pool
+        .checkout()
+        .await
+        .expect("checkout again (the targeted reset should have run on this non-tainted conn)");
+    let pid2 = backend_pid(&mut co2).await;
+    assert_eq!(
+        pid1, pid2,
+        "max_size=1 must reuse the SAME backend pid -- otherwise a fresh conn (also starting at \
+         the default search_path) would make the assertion below a false green"
+    );
+
+    let search_path = query_first_text(&mut co2, "SHOW search_path").await;
+    assert_ne!(
+        search_path, "ferro_s3_leak",
+        "the targeted profile's RESET ALL must have reset search_path away from the blind-spot \
+         set_config mutation; got {search_path:?} -- a `!tainted` conn that skipped hygiene (the \
+         pre-S3 behavior) would still read back ferro_s3_leak here"
+    );
+}
+
+/// (b) the advisory-lock blind spot: `pg_advisory_lock` called from INSIDE a `DO $$ ... $$` body.
+/// `ferro-classify`'s scanner deliberately masks dollar-quoted regions (`ci_false_inside_dollar_quote`
+/// in `ferro-classify/src/scan.rs` is the unit proof), and `DO` is itself a safe-listed leading
+/// keyword (rules.rs's documented §7.4 limitation) -- so the lexer never sees the lock acquisition and
+/// the connection is NOT tainted. The release proof MUST come from an INDEPENDENT connection: session
+/// advisory locks are RE-ENTRANT within the same session, so re-checking `pg_try_advisory_lock` on the
+/// SAME pooled connection would trivially return true regardless of whether the reset ran at all --
+/// only a genuinely different PG backend session acquiring the SAME lock id proves this session's
+/// hold was actually released by the targeted profile's `pg_advisory_unlock_all()`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_s3_advisory_lock_in_do_body_blind_spot_released_by_targeted_reset() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url.clone()), config(1));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        co.exec("DO $$ BEGIN PERFORM pg_advisory_lock(4242); END $$")
+            .await
+            .expect("DO block acquiring an advisory lock in-body");
+
+        assert!(
+            !co.tainted(),
+            "pg_advisory_lock called from inside a DO body is masked from the lexer (dollar-quote \
+             region) -- this must NOT taint, which is exactly why the targeted profile (not the \
+             already-proven tainted->Full path) is what has to release it"
+        );
+        assert_eq!(co.pin_state(), PinState::Unpinned);
+
+        backend_pid(&mut co).await
+    };
+
+    let mut co2 = pool
+        .checkout()
+        .await
+        .expect("checkout again (targeted reset should have released the advisory lock)");
+    let pid2 = backend_pid(&mut co2).await;
+    assert_eq!(
+        pid1, pid2,
+        "max_size=1 must reuse the SAME backend pid -- the independent-connection release proof \
+         below only means something if this is the SAME session that acquired the lock"
+    );
+    drop(co2);
+
+    // INDEPENDENT second connection: a separate tokio_postgres client, NOT the pooled one.
+    let (indep, indep_conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("connect independent probe");
+    tokio::spawn(async move {
+        let _ = indep_conn.await;
+    });
+
+    let acquired: bool = indep
+        .query_one("SELECT pg_try_advisory_lock(4242)", &[])
+        .await
+        .expect("pg_try_advisory_lock from the independent session")
+        .get(0);
+    assert!(
+        acquired,
+        "an INDEPENDENT session must be able to acquire lock id 4242 -- proving the targeted \
+         profile's pg_advisory_unlock_all() released the pooled connection's hold, not merely that \
+         the SAME session re-acquired it re-entrantly (which would false-green even with no reset)"
+    );
+
+    // Idempotent cleanup: release from the SAME (independent) session that just acquired it, so a
+    // rerun of this test against the persistent testkit DB starts from a clean slate.
+    let released: bool = indep
+        .query_one("SELECT pg_advisory_unlock(4242)", &[])
+        .await
+        .expect("pg_advisory_unlock from the independent session")
+        .get(0);
+    assert!(
+        released,
+        "cleanup: the independent session must release lock id 4242 it just acquired"
+    );
+}
+
+/// (c) temp table + LISTEN, cleared by the TARGETED profile specifically (not merely the
+/// already-proven tainted->Full path). Created via the raw `conn_mut()` side door -- which
+/// deliberately bypasses `Checkout::exec`/`query` entirely, so `apply_classify` never runs and this
+/// checkout stays genuinely `!tainted()` -- isolating the assertion to the targeted profile's OWN
+/// `DISCARD TEMP` / `UNLISTEN *` coverage, independent of the M1-S2 tainted-path tests already in
+/// this file (`pg_classify_listen_taints_...` / `pg_classify_temp_table_taints_...`), which exercise
+/// the SAME leak classes but via the `tainted -> Full` route.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_s3_temp_and_listen_cleared_by_targeted_reset_on_non_tainted_conn() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        co.conn_mut()
+            .client
+            .batch_execute("CREATE TEMP TABLE ferro_s3_tmp (x int); LISTEN ferro_s3_chan;")
+            .await
+            .expect("create temp table + LISTEN via the raw conn_mut() side door");
+
+        assert!(
+            !co.tainted(),
+            "the raw side door bypasses apply_classify entirely -- this checkout must stay \
+             !tainted so the recycle below takes the TARGETED path, not the already-proven Full path"
+        );
+
+        backend_pid(&mut co).await
+    };
+
+    let mut co2 = pool
+        .checkout()
+        .await
+        .expect("checkout again (targeted reset should have cleared temp + listen)");
+    let pid2 = backend_pid(&mut co2).await;
+    assert_eq!(
+        pid1, pid2,
+        "max_size=1 must reuse the SAME backend pid -- otherwise a fresh conn (which also never \
+         saw the temp table/listen) would make the assertions below a false green"
+    );
+
+    let temp_gone = query_first_bool(&mut co2, "SELECT to_regclass('ferro_s3_tmp') IS NULL").await;
+    assert!(
+        temp_gone,
+        "the targeted profile's DISCARD TEMP must have dropped the temp table"
+    );
+
+    let listening = query_first_i64(&mut co2, "SELECT count(*) FROM pg_listening_channels()").await;
+    assert_eq!(
+        listening, 0,
+        "the targeted profile's UNLISTEN * must have unsubscribed the channel, got count={listening}"
+    );
+}
+
+/// (d) the verification-BLOCKER fix, live: a `WITH HOLD` cursor is session-scoped -- it survives its
+/// own transaction's `COMMIT` and stays open for the rest of the session until explicitly `CLOSE`d.
+/// `DECLARE` is NOT in `ferro-classify`'s `SAFE_LEADING_KEYWORDS`, so under the DEFAULT
+/// `pin_on_unknown=true` it would taint as `Unknown` -- which would route this conn through `Full`
+/// (`DISCARD ALL`, which itself starts with `CLOSE ALL`) and never actually exercise the TARGETED
+/// profile's own `CLOSE ALL`. So this test builds the pool with `pin_on_unknown=false` (per the task
+/// brief: "set the PoolConfig field directly"), under which an unrecognized statement like `DECLARE`
+/// classifies `None` (not tainted) -- routing this conn through Targeted specifically. Without
+/// `CLOSE ALL` in the targeted batch, this holdable cursor would survive the reset and the NEXT
+/// tenant on this pooled connection could `FETCH` it -- a cross-tenant data leak (the exact gap the
+/// plan's adversarial review caught and fixed by adding `CLOSE ALL` to the targeted profile).
+///
+/// Uses the sanctioned `begin_tx`/`exec`/`commit_tx` lifecycle (NOT a raw multi-statement
+/// `"BEGIN; DECLARE ...; COMMIT;"` batch through `Checkout::exec`): `is_bare_tx_control` inspects
+/// ONLY the leading keyword, and a batch literally starting with the word `BEGIN` is bare
+/// tx-control by that check, so `exec` would reject it up front with `PoolError::Unsupported` before
+/// anything ran. `begin_tx`/`commit_tx` reach the raw, unguarded `simple_query` for exactly this
+/// reason (see `Checkout::begin_tx_with`'s doc comment) and are the pool's own sanctioned way to
+/// open/close a transaction around an in-between statement -- the live effect (an open tx, a
+/// `WITH HOLD` DECLARE inside it, a clean COMMIT) is identical to the brief's literal SQL.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_s3_with_hold_cursor_closed_by_targeted_close_all() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let mut cfg = config(1);
+    cfg.pin_on_unknown = false;
+    let pool = Pool::new(PgBackend::new(url), cfg);
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        co.begin_tx(TxId(1001)).await.expect("begin tx");
+        co.exec("DECLARE ferro_s3_cur CURSOR WITH HOLD FOR SELECT 1")
+            .await
+            .expect("DECLARE a WITH HOLD cursor inside the tx");
+        co.commit_tx()
+            .await
+            .expect("commit (the WITH HOLD cursor survives)");
+
+        assert!(
+            !co.tainted(),
+            "with pin_on_unknown=false, an unrecognized DECLARE must NOT taint -- this is what \
+             routes the conn through Targeted (not Full) below, actually exercising CLOSE ALL"
+        );
+        assert_eq!(co.pin_state(), PinState::Unpinned, "commit_tx unpins");
+
+        backend_pid(&mut co).await
+    };
+
+    let mut co2 = pool
+        .checkout()
+        .await
+        .expect("checkout again (targeted CLOSE ALL should have closed the held cursor)");
+    let pid2 = backend_pid(&mut co2).await;
+    assert_eq!(
+        pid1, pid2,
+        "max_size=1 must reuse the SAME backend pid -- otherwise a fresh conn (which never \
+         declared the cursor) would make the assertion below a false green"
+    );
+
+    let cursor_count = query_first_i64(
+        &mut co2,
+        "SELECT count(*) FROM pg_cursors WHERE name = 'ferro_s3_cur'",
+    )
+    .await;
+    assert_eq!(
+        cursor_count, 0,
+        "the targeted profile's CLOSE ALL must have closed the WITH HOLD cursor -- without it, the \
+         NEXT tenant on this pooled connection could FETCH a previous tenant's held cursor \
+         (a cross-tenant data leak)"
+    );
+}
+
+/// (e) GENUINE prepares-survive-vs-destroyed contrast -- the entire rationale for the conditional
+/// model. Drives `PoolBackend::reset` DIRECTLY (via the sanctioned `conn_mut()` raw-client side door
+/// + `pool.backend()`), bypassing the pool's own recycle decision entirely: this test is about the
+/// RESET PRIMITIVE's own effect on a named prepared statement, which the other live tests in this
+/// file don't otherwise exercise (they only ever observe SESSION STATE, never a prepared statement's
+/// survival). A named `PREPARE` survives a `Targeted` reset (EXECUTE still succeeds -- Targeted
+/// omits `DEALLOCATE ALL`/`DISCARD PLANS`) but NOT a `Full` reset (`DISCARD ALL` destroys it).
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_s3_targeted_reset_preserves_prepares_full_reset_destroys_them() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    co.conn_mut()
+        .client
+        .batch_execute("PREPARE ferro_s3_ps AS SELECT 1")
+        .await
+        .expect("PREPARE ferro_s3_ps");
+
+    pool.backend()
+        .reset(co.conn_mut(), ResetProfile::Targeted)
+        .await
+        .expect("Targeted reset must succeed");
+
+    co.conn_mut()
+        .client
+        .batch_execute("EXECUTE ferro_s3_ps")
+        .await
+        .expect(
+            "EXECUTE must SUCCEED after a Targeted reset -- Targeted deliberately omits \
+             DEALLOCATE ALL/DISCARD PLANS, so a named prepared statement survives it (the whole \
+             reason Targeted exists instead of always running Full)",
+        );
+
+    // Contrast: re-PREPARE the SAME name (DEALLOCATE first, since Targeted just proved it survives
+    // and a second PREPARE of an existing name errors), then Full -- must NOT survive.
+    co.conn_mut()
+        .client
+        .batch_execute("DEALLOCATE ferro_s3_ps; PREPARE ferro_s3_ps AS SELECT 1")
+        .await
+        .expect("re-PREPARE ferro_s3_ps for the Full contrast");
+
+    pool.backend()
+        .reset(co.conn_mut(), ResetProfile::Full)
+        .await
+        .expect("Full reset must succeed");
+
+    let err = co
+        .conn_mut()
+        .client
+        .batch_execute("EXECUTE ferro_s3_ps")
+        .await
+        .expect_err(
+            "EXECUTE must FAIL after a Full reset -- DISCARD ALL deallocates every prepared \
+             statement, proving the Targeted-vs-Full distinction actually matters",
+        );
+    // `tokio_postgres::Error`'s own `Display` is just a fixed `"db error"` label (the real server
+    // message lives on the wrapped `DbError`, reached via `as_db_error()`), so assert on THAT
+    // message rather than `err.to_string()`.
+    let msg = err
+        .as_db_error()
+        .map(|e| e.message().to_lowercase())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("ferro_s3_ps") || msg.contains("prepared statement"),
+        "expected a 'prepared statement ferro_s3_ps does not exist' style error, got: {err:?}"
+    );
+}
+
+/// (f) tainted still gets Full (confirms Full isn't accidentally replaced by Targeted for a
+/// genuinely tainted conn): a non-local `SET` taints via `PinCause::Set` -- the SAME lexer signal
+/// the existing M1-S2 `pg_classify_set_search_path_taints_and_hygiene_resets_on_recycle` test above
+/// exercises -- and the recycle must still choose `Full` (`DISCARD ALL`), clearing the mutation.
+/// Uses a distinct search_path value (`ferro_s3_full`) and its own pool so it is independently
+/// idempotent against the persistent testkit DB.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_s3_tainted_conn_still_gets_full_reset() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        co.exec("SET search_path TO ferro_s3_full")
+            .await
+            .expect("SET search_path");
+
+        assert!(
+            co.tainted(),
+            "a non-local SET must taint (PinCause::Set) -- this conn must take the Full path, not \
+             Targeted"
+        );
+        assert_eq!(co.last_pin_cause(), Some(PinCause::Set));
+
+        backend_pid(&mut co).await
+    };
+
+    let mut co2 = pool
+        .checkout()
+        .await
+        .expect("checkout again (Full reset should have run)");
+    let pid2 = backend_pid(&mut co2).await;
+    assert_eq!(
+        pid1, pid2,
+        "max_size=1 must reuse the SAME backend pid -- otherwise a fresh conn (also starting at \
+         the default search_path) would make the assertion below a false green"
+    );
+
+    let search_path = query_first_text(&mut co2, "SELECT current_setting('search_path')").await;
+    assert_ne!(
+        search_path, "ferro_s3_full",
+        "DISCARD ALL (the Full profile, for a tainted conn) must have reset search_path; got \
+         {search_path:?}"
     );
 }
