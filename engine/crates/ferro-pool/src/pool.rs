@@ -216,7 +216,9 @@ pub struct Checkout<B: PoolBackend> {
     /// this identity field: it must not clobber a real `TxId`, nor fabricate one for an RFQ-only tx.
     pin: PinState,
     /// The most recent pin cause observed on this `Checkout` (for the pin-cause DoD assertion).
-    /// Only ever `Some(PinCause::Tx)` in S4.
+    /// `Some(PinCause::Tx)` from the RFQ tx-authority path (`apply_tx_status`, M1-S1); any of the
+    /// other seven assist causes (`Listen`/`AdvisoryLock`/`Prepare`/`Temp`/`Set`/`PinFunction`/
+    /// `Unknown`) from the classifier (`apply_classify`, M1-S2).
     last_pin_cause: Option<PinCause>,
 }
 
@@ -481,8 +483,10 @@ impl<B: PoolBackend> Checkout<B> {
         self.pin
     }
 
-    /// The most recent pin cause observed on this `Checkout` (the pin-cause DoD assertion). Only
-    /// ever `Some(PinCause::Tx)` in S4.
+    /// The most recent pin cause observed on this `Checkout` (the pin-cause DoD assertion).
+    /// `Some(PinCause::Tx)` comes from the RFQ tx-authority path (`apply_tx_status`, M1-S1);
+    /// the assist lexer (`apply_classify`, M1-S2) can additionally set any of `Listen`,
+    /// `AdvisoryLock`, `Prepare`, `Temp`, `Set`, `PinFunction`, or `Unknown`.
     pub fn last_pin_cause(&self) -> Option<PinCause> {
         self.last_pin_cause
     }

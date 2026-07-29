@@ -39,6 +39,19 @@ const SAFE_LEADING_KEYWORDS: &[&str] = &[
     "MOVE",
     "CLOSE",
     "COPY",
+    // `CALL`/`DO` are safe-listed at the LEADING-KEYWORD level only: a session mutation (e.g.
+    // `pg_advisory_lock`, `SET`/`set_config`) hidden INSIDE a `DO $$ ... $$` or procedure body is
+    // NOT detected here. The scanner correctly masks dollar-quoted bodies (by design -- it must
+    // not misparse `$$` contents as top-level SQL), so `contains_identifier_ci`/`pin_functions`
+    // cannot see inside them, and the statement's own leading keyword (`DO`/`CALL`) never reaches
+    // the function-reference or `SET` checks either. RFQ (M1-S1) does not help: PG does not emit a
+    // separate RFQ per statement *inside* the procedure body, so an in-procedure session mutation
+    // is invisible to both signals. This is the SPEC §7.4 documented transaction-mode limitation
+    // (in-procedure/DO-body session mutation is unsupported except via session mode); the backstop
+    // is S3 targeted hygiene + session mode, NOT `pin_functions` (which only matches top-level
+    // statement text, not inside a masked dollar-quoted body). S3 follow-up: reconsider dropping
+    // `DO`/`CALL` from this safe list so `pin_on_unknown` conservatively taints them and narrows
+    // this window (at the cost of tainting every `DO`/`CALL`, including harmless ones).
     "CALL",
     "DO",
     "TRUNCATE",
