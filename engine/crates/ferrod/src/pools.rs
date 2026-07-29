@@ -77,6 +77,10 @@ fn daemon_pool_config() -> PoolConfig {
         checkout_timeout: DEFAULT_POOL_CHECKOUT_TIMEOUT,
         max_lifetime: DEFAULT_POOL_MAX_LIFETIME,
         reap_interval: Some(DEFAULT_POOL_REAP_INTERVAL),
+        // `pin_functions`/`pin_on_unknown` per-pool plumbing from `ferrod` config lands in M1-S2
+        // Task 4; until then every daemon pool runs the assist lexer's conservative defaults
+        // (`pin_on_unknown: true`, no extra escape-hatch names).
+        ..PoolConfig::default()
     }
 }
 

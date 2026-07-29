@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+ferro-classify = { path = "../ferro-classify" }
 ferro-proto = { path = "../ferro-proto" }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 async-trait = "0.1"

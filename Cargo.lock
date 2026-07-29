@@ -218,6 +218,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "fastrand",
+ "ferro-classify",
  "ferro-proto",
  "thiserror",
  "tokio",

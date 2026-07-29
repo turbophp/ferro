@@ -450,6 +450,7 @@ mod tests {
             checkout_timeout: Duration::from_secs(5),
             max_lifetime: Duration::from_secs(3600),
             reap_interval: None, // deterministic: no background reaper
+            ..PoolConfig::default()
         }
     }
 

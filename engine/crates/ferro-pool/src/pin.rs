@@ -4,8 +4,11 @@
 //! (I/T/E), surfaced as [`crate::backend::TxStatus`], the AUTHORITY: after every statement the pool
 //! reads `tx_status` and `Checkout::apply_tx_status` updates the pin state from the real I/T/E (pin
 //! on `T`/`E`, unpin on `I`). The explicit `begin_tx`/`commit_tx`/`rollback_tx` sets and the
-//! `is_bare_tx_control` guard remain as DEFENSE-IN-DEPTH, not the authority. `PinCause` still only
-//! has `Tx` in S1 (an RFQ-detected transaction); the assist-lexer causes land in S2.
+//! `is_bare_tx_control` guard remain as DEFENSE-IN-DEPTH, not the authority. M1-S2 (this module)
+//! adds the ASSIST-lexer's 7 `PinCause` variants (`ferro-classify`'s `PinTrigger`, via
+//! `From<PinTrigger>`) alongside the original RFQ-only `Tx` — the RFQ byte remains the sole
+//! transaction-pin AUTHORITY; the lexer only ever ADDS a taint + cause label for protocol-invisible
+//! session-state mutations (wiring into `Checkout` lands in Task 3, not here).
 //!
 //! A pinned connection is never handed to a second checkout: `Checkout` already holds its
 //! connection exclusively (removed from the pool's idle stack for the lifetime of the guard), so
@@ -26,11 +29,46 @@ pub enum PinState {
     PinnedTx(TxId),
 }
 
-/// Why a connection is (or was most recently) pinned. Only `Tx` is emitted in S4 — other causes
-/// land with the real M1 pin engine.
+/// Why a connection is (or was most recently) tainted/pinned. `Tx` is the RFQ-authoritative cause
+/// (S1: an open/aborted transaction, set by `Checkout::apply_tx_status`). The other 7 variants are
+/// M1-S2's assist-lexer causes (`ferro_classify::PinTrigger`, via [`From`] below) — set by
+/// `Checkout::apply_classify` (Task 3) when a statement mutates protocol-invisible session state
+/// even though the RFQ byte itself stays `Idle`. `last_pin_cause` is "most recently observed cause",
+/// not an exclusive state: setting an assist cause never clears/overrides `Tx`'s `tainted`/`tx_open`
+/// bits (SPEC §7.1 — the lexer is assist-only, never the authority).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinCause {
+    /// An RFQ-detected open or aborted transaction (`T`/`E`) — the transaction-pin AUTHORITY.
     Tx,
+    /// `LISTEN`/`UNLISTEN` — subscribes/unsubscribes the session to a notification channel.
+    Listen,
+    /// A session-scoped advisory lock function (`pg_advisory_lock` family, not `_xact`-scoped).
+    AdvisoryLock,
+    /// Raw client-side `PREPARE`/`EXECUTE`/`DEALLOCATE` of a named prepared statement.
+    Prepare,
+    /// Temp-object DDL (`CREATE TEMP/TEMPORARY ...`) or `SELECT ... INTO TEMP ...`.
+    Temp,
+    /// A non-local `SET` (persists past the current transaction/statement).
+    Set,
+    /// The statement referenced one of the pool's configured `pin_functions` escape-hatch names.
+    PinFunction,
+    /// Unrecognized/unclassifiable statement, tainted only when `pin_on_unknown` is set.
+    Unknown,
+}
+
+impl From<ferro_classify::PinTrigger> for PinCause {
+    /// Same-named 1:1 mapping from the assist lexer's trigger to the pool's pin-cause label.
+    fn from(trigger: ferro_classify::PinTrigger) -> Self {
+        match trigger {
+            ferro_classify::PinTrigger::Listen => PinCause::Listen,
+            ferro_classify::PinTrigger::AdvisoryLock => PinCause::AdvisoryLock,
+            ferro_classify::PinTrigger::Prepare => PinCause::Prepare,
+            ferro_classify::PinTrigger::Temp => PinCause::Temp,
+            ferro_classify::PinTrigger::Set => PinCause::Set,
+            ferro_classify::PinTrigger::PinFunction => PinCause::PinFunction,
+            ferro_classify::PinTrigger::Unknown => PinCause::Unknown,
+        }
+    }
 }
 
 /// Single-word statements that open/close/manage a transaction on their own.
@@ -206,8 +244,28 @@ pub(crate) fn tx_status_bits(st: TxStatus) -> (bool, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TxVerb, is_bare_tx_control, leading_tx_verb, tx_status_bits};
+    use super::{PinCause, TxVerb, is_bare_tx_control, leading_tx_verb, tx_status_bits};
     use crate::backend::TxStatus;
+    use ferro_classify::PinTrigger;
+
+    // ---- PinCause::from(PinTrigger) — M1-S2 Task 2 --------------------------------------------
+
+    #[test]
+    fn pin_cause_from_pin_trigger_maps_all_seven_same_named() {
+        assert_eq!(PinCause::from(PinTrigger::Listen), PinCause::Listen);
+        assert_eq!(
+            PinCause::from(PinTrigger::AdvisoryLock),
+            PinCause::AdvisoryLock
+        );
+        assert_eq!(PinCause::from(PinTrigger::Prepare), PinCause::Prepare);
+        assert_eq!(PinCause::from(PinTrigger::Temp), PinCause::Temp);
+        assert_eq!(PinCause::from(PinTrigger::Set), PinCause::Set);
+        assert_eq!(
+            PinCause::from(PinTrigger::PinFunction),
+            PinCause::PinFunction
+        );
+        assert_eq!(PinCause::from(PinTrigger::Unknown), PinCause::Unknown);
+    }
 
     #[test]
     fn tx_status_bits_maps_reuse_safety_bits() {

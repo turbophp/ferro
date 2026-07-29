@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use ferro_pool::backend::{Cancel, PoolBackend, TxStatus};
+use ferro_pool::backend::{Cancel, Dialect, PoolBackend, TxStatus};
 use ferro_pool::error::PoolError;
 
 /// A pooled Postgres connection.
@@ -126,6 +126,12 @@ impl PoolBackend for PgBackend {
         conn.closed.load(Ordering::SeqCst) || conn.client.is_closed()
     }
 
+    /// `PgBackend` only ever speaks Postgres (M1-S2 Task 2) — MySQL/SQLite backends land in a
+    /// future slice as their own `PoolBackend` impls.
+    fn dialect(&self) -> Dialect {
+        Dialect::Postgres
+    }
+
     /// Reads the authoritative RFQ status the driver already tracked off the wire (Task 1's fork
     /// addition) — no round trip, and no bespoke bookkeeping to keep in sync with reality.
     fn tx_status(&self, conn: &Self::Conn) -> TxStatus {
@@ -183,5 +189,18 @@ pub(crate) fn is_session_fatal(e: &tokio_postgres::Error) -> bool {
             db_err.parsed_severity(),
             Some(tokio_postgres::error::Severity::Fatal | tokio_postgres::error::Severity::Panic)
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `PgBackend::dialect()` is a pure, synchronous constant — no live Postgres needed to assert
+    /// it (M1-S2 Task 2 TDD).
+    #[test]
+    fn dialect_is_postgres() {
+        let backend = PgBackend::new("postgres://unused/unused");
+        assert_eq!(backend.dialect(), Dialect::Postgres);
     }
 }

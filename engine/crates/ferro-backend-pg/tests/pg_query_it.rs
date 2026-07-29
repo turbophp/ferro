@@ -32,6 +32,7 @@ fn config(max_size: usize) -> PoolConfig {
         checkout_timeout: Duration::from_secs(5),
         max_lifetime: Duration::from_secs(30 * 60),
         reap_interval: None,
+        ..PoolConfig::default()
     }
 }
 

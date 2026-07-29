@@ -11,7 +11,7 @@ use tokio::time::Instant;
 
 use ferro_proto::consts::{branch, errc};
 
-use crate::backend::{Cancel, PoolBackend, QueryResult, TxStatus};
+use crate::backend::{Cancel, Dialect, PoolBackend, QueryResult, TxStatus};
 use crate::error::PoolError;
 use crate::pin::{TxVerb, leading_tx_verb};
 
@@ -163,6 +163,13 @@ pub struct FakeBackend {
     /// Number of `query()` calls currently parked on `query_gate`. A test polls this until `> 0` to
     /// prove the statement is actually in flight before relying on a timer to fire.
     queries_waiting: AtomicU64,
+    /// The [`Dialect`] `dialect()` reports (M1-S2 Task 2). Defaults to `Dialect::Postgres` (via
+    /// `Dialect: Default`, which is exactly what proves `#[derive(Default)]` on `FakeBackend`
+    /// still compiles/is correct after this field lands) so every existing `FakeBackend::new()`/
+    /// `FakeBackend::default()` call site keeps behaving as a Postgres backend without change. A
+    /// test that needs a different dialect (e.g. to prove `Checkout` picks the right classify
+    /// rule set) calls `set_dialect`.
+    dialect: Mutex<Dialect>,
 }
 
 impl FakeBackend {
@@ -176,6 +183,7 @@ impl FakeBackend {
             simple_query_gate: Mutex::new(None),
             query_gate: Mutex::new(None),
             queries_waiting: AtomicU64::new(0),
+            dialect: Mutex::new(Dialect::default()),
         }
     }
 
@@ -246,6 +254,14 @@ impl FakeBackend {
     pub fn queries_waiting(&self) -> u64 {
         self.queries_waiting.load(Ordering::SeqCst)
     }
+
+    /// Test hook: force the [`Dialect`] this backend reports from `dialect()`. `&self` (not
+    /// `&mut self`), matching every other test-armed knob on this backend (e.g.
+    /// `set_query_result`), since tests typically hold the `FakeBackend` shared (e.g. behind the
+    /// `Arc` a `Pool` wraps it in).
+    pub fn set_dialect(&self, dialect: Dialect) {
+        *self.dialect.lock().unwrap() = dialect;
+    }
 }
 
 #[async_trait]
@@ -305,6 +321,10 @@ impl PoolBackend for FakeBackend {
 
     fn is_closed(&self, conn: &Self::Conn) -> bool {
         conn.closed
+    }
+
+    fn dialect(&self) -> Dialect {
+        *self.dialect.lock().unwrap()
     }
 
     fn tx_status(&self, conn: &Self::Conn) -> TxStatus {

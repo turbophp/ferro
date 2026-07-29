@@ -3,6 +3,12 @@ use async_trait::async_trait;
 use ferro_proto::messages::sql::ColMeta;
 use ferro_proto::value::Value;
 
+/// The upstream SQL dialect a [`PoolBackend`] talks to (M1-S2, `ferro-classify`'s assist lexer
+/// needs it to pick the right keyword rule set — SPEC §7.1). Re-exported here so downstream
+/// backend crates (`ferro-backend-pg`, `FakeBackend`) can write `ferro_pool::backend::Dialect`
+/// without taking their own direct dependency on the `ferro-classify` leaf crate.
+pub use ferro_classify::Dialect;
+
 /// The buffered result of a row-returning statement (S5, BLOCKER-2). `cols` is populated even for
 /// a zero-row result (built from the prepared statement's columns), `rows` is the fully-buffered
 /// result set (D-S5-1: M0 buffers rather than streams), and `affected` comes from the command tag
@@ -97,6 +103,12 @@ pub trait PoolBackend: Send + Sync + 'static {
 
     /// Cheap, synchronous "is this obviously dead" check (no round trip) used at checkout time.
     fn is_closed(&self, conn: &Self::Conn) -> bool;
+
+    /// The upstream SQL [`Dialect`] this backend speaks — a per-backend constant, not per-`conn`
+    /// (a `PoolBackend` impl only ever talks one dialect), so no round trip and no `conn` argument.
+    /// Read by `Checkout`'s assist lexer (`ferro_classify::classify`, M1-S2 Task 3) to pick the
+    /// right keyword rule set for the statement it is about to run.
+    fn dialect(&self) -> Dialect;
 
     /// Cheap, synchronous read of `conn`'s current [`TxStatus`] — no round trip. Mirrors the real
     /// Postgres protocol's `ReadyForQuery` status byte, which every backend response ends with, so
