@@ -376,7 +376,7 @@ pub(crate) fn contains_identifier_ci(sql: &str, ident: &str) -> bool {
     let hay = hay.as_bytes();
     let needle = needle.as_bytes();
     let n = needle.len();
-    if n == 0 || n > hay.len() {
+    if n > hay.len() {
         return false;
     }
     hay.windows(n).enumerate().any(|(start, w)| {
@@ -516,8 +516,39 @@ mod tests {
 
     #[test]
     fn ci_false_e_string_backslash_escape_does_not_close() {
+        // Positive direction of the `is_e_string_prefix` boundary: a standalone `E'...'` IS an
+        // E-string, so `\'` does NOT close it -- "pg_advisory_lock" stays swallowed inside the
+        // string (FALSE). If E-string recognition were removed (e_string always false), the
+        // backslash would have no special meaning, the string would close right after `\`, and
+        // "pg_advisory_lock" would spill into CODE (this assertion would flip to TRUE).
         assert!(!contains_identifier_ci(
             r"SELECT E'a\' pg_advisory_lock'",
+            "pg_advisory_lock"
+        ));
+    }
+
+    // ---- is_e_string_prefix rejection boundary: an identifier ENDING in e/E immediately before a
+    // quote is NOT a standalone E-prefix, so `\'` must NOT be treated as an escape there -- this is
+    // the leak-relevant direction (a wrongly-accepted E-prefix would swallow a trailing trigger
+    // into the "hidden" string region instead of leaving it in CODE). Each input below would FAIL
+    // (flip to `false`) if `is_e_string_prefix` incorrectly returned `true` for it.
+
+    #[test]
+    fn ci_true_identifier_ending_in_e_does_not_enable_backslash_escape() {
+        // "TABLE" ends in `E`, directly adjacent to the quote -- but `L` (not an identifier
+        // boundary) precedes that `E`, so it is NOT a standalone E-prefix. The backslash has no
+        // special meaning, the string closes right after it, and the trailing trigger is CODE.
+        assert!(contains_identifier_ci(
+            r"TABLE'a\' pg_advisory_lock(1)'",
+            "pg_advisory_lock"
+        ));
+    }
+
+    #[test]
+    fn ci_true_lowercase_identifier_ending_in_e_does_not_enable_backslash_escape() {
+        // Same boundary, lowercase and a longer/underscored identifier ("some_table" ends in `e`).
+        assert!(contains_identifier_ci(
+            r"some_table'a\' pg_advisory_lock(1)'",
             "pg_advisory_lock"
         ));
     }
@@ -655,6 +686,40 @@ mod tests {
             split_top_level_statements(" SELECT 1 ; ; SELECT 2 ; "),
             vec!["SELECT 1", "SELECT 2"]
         );
+    }
+
+    // ---- design decision: `;` inside a `"..."` quoted identifier is NOT a split point ---------
+    //
+    // Locks in the judgment call documented in the module doc and confirmed correct by review: a
+    // literal `;` that is part of a quoted identifier's NAME (not a real statement terminator) does
+    // not split the statement, even though quoted-identifier content otherwise counts as CODE.
+
+    #[test]
+    fn split_semicolon_inside_quoted_identifier_is_not_a_split() {
+        assert_eq!(
+            split_top_level_statements(r#"CREATE TABLE "a;b" (x int)"#),
+            vec![r#"CREATE TABLE "a;b" (x int)"#]
+        );
+    }
+
+    #[test]
+    fn split_real_semicolon_after_quoted_identifier_still_splits() {
+        assert_eq!(
+            split_top_level_statements(r#"CREATE TABLE "a;b"(x int); LISTEN c"#),
+            vec![r#"CREATE TABLE "a;b"(x int)"#, "LISTEN c"]
+        );
+    }
+
+    #[test]
+    fn ci_true_trigger_inside_quoted_identifier_with_embedded_semicolon() {
+        // Ties the two directions together: the `;` inside the quoted name does not split the
+        // statement (previous test), AND the quoted-identifier content is still CODE, so a trigger
+        // substring embedded in it is still found -- consistent with "quoted idents are code, not
+        // hidden" (the opposite bug -- hiding quoted-ident content -- is the actual leak surface).
+        assert!(contains_identifier_ci(
+            r#"CREATE TABLE "a;pg_advisory_lock" (x int)"#,
+            "pg_advisory_lock"
+        ));
     }
 
     // ---- panic-safety: every helper, on a hostile corpus, must never panic --------------------
