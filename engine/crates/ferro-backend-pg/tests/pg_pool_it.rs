@@ -1295,10 +1295,12 @@ async fn pg_s3_targeted_reset_preserves_prepares_full_reset_destroys_them() {
     );
 }
 
-/// (f) tainted still gets Full (confirms Full isn't accidentally replaced by Targeted for a
-/// genuinely tainted conn): a non-local `SET` taints via `PinCause::Set` -- the SAME lexer signal
-/// the existing M1-S2 `pg_classify_set_search_path_taints_and_hygiene_resets_on_recycle` test above
-/// exercises -- and the recycle must still choose `Full` (`DISCARD ALL`), clearing the mutation.
+/// (f) a tainted conn is still fully cleaned for the next tenant: a non-local `SET` taints via
+/// `PinCause::Set` -- the SAME lexer signal the existing M1-S2
+/// `pg_classify_set_search_path_taints_and_hygiene_resets_on_recycle` test above exercises -- and
+/// the recycle clears the mutation. Note this only proves a reset ran (both the Full and Targeted
+/// profiles reset `search_path`); the deterministic Full-vs-Targeted selection for a tainted conn
+/// is proven by the fake unit test in `ferro-pool`.
 /// Uses a distinct search_path value (`ferro_s3_full`) and its own pool so it is independently
 /// idempotent against the persistent testkit DB.
 #[tokio::test(flavor = "multi_thread")]
