@@ -228,6 +228,37 @@ mod tests {
         assert_eq!(pg("CREATE TABLE t(x int)"), None);
     }
 
+    // ---- C1 fix: `CREATE OR REPLACE [GLOBAL|LOCAL] TEMP[ORARY] ...` ---------------------------
+    //
+    // PG grammar: `CREATE [OR REPLACE] [GLOBAL|LOCAL] {TEMP|TEMPORARY} [RECURSIVE] VIEW ...` --
+    // `OR REPLACE` legally precedes `TEMP`/`TEMPORARY`. A temp view/etc. created this way lives
+    // for the session exactly like a plain `CREATE TEMP VIEW`, so it MUST also trigger `Temp` --
+    // missing it is a real cross-tenant leak (a temp object surviving into the next tenant's
+    // checkout of the same pooled connection).
+
+    #[test]
+    fn create_or_replace_temp_view_triggers() {
+        assert_eq!(
+            pg("CREATE OR REPLACE TEMP VIEW v AS SELECT 1"),
+            Some(PinTrigger::Temp)
+        );
+    }
+
+    #[test]
+    fn create_or_replace_temporary_view_triggers() {
+        assert_eq!(
+            pg("CREATE OR REPLACE TEMPORARY VIEW v AS SELECT 1"),
+            Some(PinTrigger::Temp)
+        );
+    }
+
+    #[test]
+    fn create_or_replace_permanent_view_is_safe() {
+        // Control: `OR REPLACE` alone, with no TEMP/TEMPORARY, creates a PERMANENT view -- must
+        // NOT trigger.
+        assert_eq!(pg("CREATE OR REPLACE VIEW v AS SELECT 1"), None);
+    }
+
     // ---- session advisory locks (NOT _xact, NOT unlock*) -------------------------------------
 
     #[test]

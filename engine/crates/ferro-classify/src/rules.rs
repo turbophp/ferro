@@ -81,9 +81,11 @@ const ADVISORY_SESSION_FUNCTIONS: &[&str] = &[
 ///    `TRANSACTION` (transaction-scoped, safe -- this fully decides the statement's fate, it does
 ///    not fall through to the generic safe-list/unknown rules below, since a bare `SET` is not
 ///    itself present in [`SAFE_LEADING_KEYWORDS`]).
-/// 5. leading `CREATE` with `TEMP`/`TEMPORARY` before the object kind (skipping an optional
-///    `GLOBAL`/`LOCAL` modifier) -> [`PinTrigger::Temp`] for ANY temp object kind. A non-temp
-///    `CREATE` falls through to the safe-list (rule 8).
+/// 5. leading `CREATE` with `TEMP`/`TEMPORARY` before the object kind (skipping an optional `OR
+///    REPLACE` and/or `GLOBAL`/`LOCAL` modifier, in that order -- PG's grammar is `CREATE [OR
+///    REPLACE] [GLOBAL|LOCAL] {TEMP|TEMPORARY} ...`) -> [`PinTrigger::Temp`] for ANY temp object
+///    kind. A non-temp `CREATE` (incl. plain `CREATE OR REPLACE VIEW ...`) falls through to the
+///    safe-list (rule 8).
 /// 6. `SELECT`/`WITH` containing `INTO TEMP`/`INTO TEMPORARY` -> [`PinTrigger::Temp`].
 /// 7. a session-scoped advisory-lock function call -> [`PinTrigger::AdvisoryLock`]. This runs
 ///    BEFORE the leading-keyword safe-list (rule 8) is checked: a `SELECT` is otherwise safe, but
@@ -244,30 +246,56 @@ fn is_safe_leading_keyword(leading: Option<&str>) -> bool {
 }
 
 /// True iff `stmt` (whose leading keyword is already confirmed `CREATE`) creates a TEMP/TEMPORARY
-/// object of any kind: `CREATE [GLOBAL|LOCAL] TEMP[ORARY] <anything>` (`TABLE`, `VIEW`,
-/// `SEQUENCE`, `MATERIALIZED VIEW`, ...). Only looks as far as the token right after an optional
-/// `GLOBAL`/`LOCAL` modifier -- it does not need to recognize the object-kind keyword itself,
-/// since PG's grammar always places `TEMP`/`TEMPORARY` immediately before it (or immediately after
-/// `GLOBAL`/`LOCAL`).
+/// object of any kind: PG's grammar is `CREATE [OR REPLACE] [GLOBAL|LOCAL] {TEMP|TEMPORARY}
+/// [RECURSIVE] <object-kind> ...` (`TABLE`, `VIEW`, `SEQUENCE`, `MATERIALIZED VIEW`, ...) -- `OR
+/// REPLACE` legally precedes the `GLOBAL|LOCAL`/`TEMP|TEMPORARY` modifiers (e.g. `CREATE OR
+/// REPLACE TEMP VIEW ...`), so both an optional `OR REPLACE` (two tokens) and an optional
+/// `GLOBAL`/`LOCAL` (one token) must be skipped, IN THAT ORDER, before checking for
+/// `TEMP`/`TEMPORARY`. Does not need to recognize the object-kind keyword itself (or `RECURSIVE`,
+/// which comes AFTER `TEMP`/`TEMPORARY` and is therefore never in the way).
 ///
-/// Built only from `scan`'s `pub(crate)` helpers (`next_token_after_keyword`, `strip_leading_noise`
-/// via [`skip_leading_keyword`]) -- both are boundary-checked/total, so this stays panic-safe on
-/// any input without re-deriving the scanner's region-tracking logic.
+/// Built only from `scan`'s `pub(crate)` helpers via [`tokens_after_leading_keyword`] (itself built
+/// only from `next_token_after_keyword`/`strip_leading_noise`, both boundary-checked/total) -- so
+/// this stays panic-safe on any input without re-deriving the scanner's region-tracking logic.
 fn create_is_temp(stmt: &str) -> bool {
-    match scan::next_token_after_keyword(stmt).as_deref() {
-        Some("TEMP") | Some("TEMPORARY") => true,
-        Some("GLOBAL") | Some("LOCAL") => {
-            // Re-anchor on the GLOBAL/LOCAL token just found: `skip_leading_keyword` advances past
-            // `CREATE`, so the resulting slice's OWN leading keyword is GLOBAL/LOCAL, letting
-            // `next_token_after_keyword` give us the (boundary-checked) token after THAT.
-            let after_create = skip_leading_keyword(stmt);
-            matches!(
-                scan::next_token_after_keyword(after_create).as_deref(),
-                Some("TEMP") | Some("TEMPORARY")
-            )
-        }
-        _ => false,
+    // Up to 4 tokens covers the longest legal prefix before TEMP/TEMPORARY: OR, REPLACE,
+    // {GLOBAL|LOCAL}, {TEMP|TEMPORARY}.
+    let tokens = tokens_after_leading_keyword(stmt, 4);
+    let mut idx = 0usize;
+
+    let tok = |i: usize| tokens.get(i).map(String::as_str);
+
+    if tok(idx) == Some("OR") && tok(idx + 1) == Some("REPLACE") {
+        idx += 2;
     }
+    if matches!(tok(idx), Some("GLOBAL") | Some("LOCAL")) {
+        idx += 1;
+    }
+    matches!(tok(idx), Some("TEMP") | Some("TEMPORARY"))
+}
+
+/// Returns up to `max` tokens following `stmt`'s OWN leading keyword (e.g. for `stmt` beginning
+/// `CREATE OR REPLACE TEMP ...`, this returns `["OR", "REPLACE", "TEMP", ...]`), by repeatedly
+/// re-anchoring: `next_token_after_keyword(rest)` gives the (boundary-checked) token right after
+/// `rest`'s leading keyword, then [`skip_leading_keyword`] advances `rest` past that same leading
+/// keyword so the token just found becomes the NEW leading keyword for the next iteration. Stops
+/// early (returning fewer than `max` tokens) once `next_token_after_keyword` returns `None` (no
+/// more complete tokens). Total/panic-safe: `rest` strictly shrinks each iteration (a `Some(_)`
+/// token implies a non-empty leading-keyword run to skip past), and both underlying calls are
+/// already boundary-checked.
+fn tokens_after_leading_keyword(stmt: &str, max: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(max);
+    let mut rest = stmt;
+    for _ in 0..max {
+        match scan::next_token_after_keyword(rest) {
+            Some(tok) => {
+                out.push(tok);
+                rest = skip_leading_keyword(rest);
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 /// True iff `stmt` (whose leading keyword is already confirmed `SELECT`/`WITH`) contains an
