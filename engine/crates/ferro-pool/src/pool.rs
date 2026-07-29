@@ -523,6 +523,10 @@ impl<B: PoolBackend> Checkout<B> {
             self.tx_open = true;
             self.tainted = true;
         }
+        // Assist signal (SPEC §7.1): runs on BOTH the Ok and Err arms — a session-mutating
+        // statement that errored is still labeled + tainted (idempotent alongside the Err-arm
+        // force above). Never touches `tx_open`/`pin`; RFQ (above) stays the tx authority.
+        self.apply_classify(sql);
         r
     }
 
@@ -565,6 +569,10 @@ impl<B: PoolBackend> Checkout<B> {
             self.tx_open = true;
             self.tainted = true;
         }
+        // Assist signal (SPEC §7.1): runs on BOTH the Ok and Err arms — a session-mutating
+        // statement that errored is still labeled + tainted (idempotent alongside the Err-arm
+        // force above). Never touches `tx_open`/`pin`; RFQ (above) stays the tx authority.
+        self.apply_classify(sql);
         r
     }
 
@@ -600,6 +608,23 @@ impl<B: PoolBackend> Checkout<B> {
         }
         // NOTE: `self.pin` is intentionally NOT written here — never clobber a real `TxId`, never
         // fabricate a sentinel. See the doc comment above.
+    }
+
+    /// The M1-S2 assist signal (SPEC §7.1): RFQ (`apply_tx_status`) is the tx AUTHORITY; the lexer
+    /// only ADDS session-state taint + a cause label for protocol-invisible mutations. It NEVER
+    /// clears a taint and NEVER touches `self.pin`/`self.tx_open` (those are the RFQ's/tx's).
+    /// `classify()` is total (never panics) and multi-statement-aware, so `exec`'s batch path is
+    /// covered.
+    fn apply_classify(&mut self, sql: &str) {
+        if let Some(trigger) = ferro_classify::classify(
+            sql,
+            self.pool.backend.dialect(),
+            &self.pool.config.pin_functions,
+            self.pool.config.pin_on_unknown,
+        ) {
+            self.tainted = true;
+            self.last_pin_cause = Some(PinCause::from(trigger));
+        }
     }
 }
 

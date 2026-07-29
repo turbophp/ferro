@@ -97,6 +97,25 @@ async fn query_first_text(co: &mut Checkout<PgBackend>, sql: &str) -> String {
     }
 }
 
+/// Runs `sql` through the GUARDED, row-returning `Checkout::query` and returns the first cell as a
+/// `bool` (panicking if it is not a bool cell). Used for `IS NULL`-style yes/no probes (M1-S2 Task
+/// 3's temp-table hygiene proof).
+async fn query_first_bool(co: &mut Checkout<PgBackend>, sql: &str) -> bool {
+    let result = co
+        .query(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("Checkout::query {sql:?} failed: {e:?}"));
+    match result
+        .rows
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().next())
+    {
+        Some(Value::Bool(b)) => b,
+        other => panic!("expected a bool cell from {sql:?}, got {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_checkout_select1_release() {
     let Some(url) = test_url() else {
@@ -687,5 +706,237 @@ async fn pg_rfq_err_arm_batch_leak_is_cleaned_before_reuse() {
         pool.backend().tx_status(co2.conn()),
         TxStatus::Idle,
         "the recycled conn is Idle — the mid-batch tx was rolled back before reuse"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// M1-S2 Task 3 LIVE: the assist lexer (`ferro-classify`) taints protocol-invisible session
+// mutations, closing the S1-deferred SET search_path/LISTEN/temp/advisory leaks. Every test below
+// builds a `max_size=1` pool so the SAME backend connection is guaranteed to come back at the next
+// checkout, and asserts `pg_backend_pid()` is IDENTICAL across both checkouts before trusting the
+// hygiene assertion that follows — without that pid assertion a fresh/different connection (which
+// also starts at PG's defaults) would make the test a false green even if the taint/reset never ran.
+// -------------------------------------------------------------------------------------------------
+
+/// (a)+(b): a non-local `SET` is PROTOCOL-INVISIBLE to the RFQ byte (it stays `Idle`/`Unpinned`) —
+/// only the assist lexer catches it as `PinCause::Set`. This closes the S1-deferred `SET
+/// search_path` leak: without `apply_classify` wiring the connection would never be `tainted`, the
+/// checkout-time recycle would skip `DISCARD ALL`, and the NEXT tenant on this pooled connection
+/// would inherit `ferro_test_s2` on its `search_path`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_classify_set_search_path_taints_and_hygiene_resets_on_recycle() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        co.exec("SET search_path TO ferro_test_s2")
+            .await
+            .expect("SET search_path");
+
+        // (a) the assist signal fires while the RFQ authority stays exactly as an ordinary
+        // autocommit statement would leave it.
+        assert!(!co.tx_open(), "a SET never opens an RFQ transaction");
+        assert_eq!(co.pin_state(), PinState::Unpinned);
+        assert!(co.tainted(), "a non-local SET must taint (assist signal)");
+        assert_eq!(co.last_pin_cause(), Some(PinCause::Set), "pin-cause DoD");
+
+        backend_pid(&mut co).await
+        // `co` drops here -> returns to idle with tainted=true; the recycle (DISCARD ALL) runs at
+        // the START of the NEXT checkout, not here (v2/B1 recycle-on-next-checkout model).
+    };
+
+    // (b) hygiene end-to-end: the SAME connection (asserted below) comes back recycled.
+    let mut co2 = pool
+        .checkout()
+        .await
+        .expect("checkout again (recycle should have run DISCARD ALL)");
+    let pid2 = backend_pid(&mut co2).await;
+    assert_eq!(
+        pid1, pid2,
+        "max_size=1 must reuse the SAME backend pid -- otherwise a fresh conn (also starting at \
+         the default search_path) would make the assertion below a false green"
+    );
+
+    let search_path = query_first_text(&mut co2, "SELECT current_setting('search_path')").await;
+    assert_ne!(
+        search_path, "ferro_test_s2",
+        "DISCARD ALL at recycle must have reset search_path away from what the tainted \
+         connection set it to; got {search_path:?}"
+    );
+}
+
+/// (c): a session-scoped advisory lock function taints `PinCause::AdvisoryLock`. The release proof
+/// is checked from an INDEPENDENT second connection (a fresh raw `tokio_postgres` client, NOT the
+/// pooled one) asserting `pg_try_advisory_lock(1)` returns `true` — a same-session re-acquire on
+/// the pooled connection would trivially succeed too (session advisory locks are re-entrant within
+/// the SAME session), so that would be a false green; only a genuinely DIFFERENT PG backend session
+/// successfully acquiring the same lock id proves the pooled session's hold was actually released
+/// by `DISCARD ALL` at recycle.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_classify_advisory_lock_taints_and_released_by_recycle() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url.clone()), config(1));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        // `pg_advisory_lock` returns `void` (PG OID 2278), outside the M0 row-hydration scalar set
+        // (`rowmap::oid_to_tag`), so this goes through `exec()` (which discards any result via
+        // `simple_query`/`batch_execute`) rather than the row-returning `query()` -- `apply_classify`
+        // runs identically in both, so the assist-signal behavior under test is unaffected.
+        co.exec("SELECT pg_advisory_lock(1)")
+            .await
+            .expect("pg_advisory_lock");
+
+        assert!(
+            !co.tx_open(),
+            "a session advisory lock never opens an RFQ transaction"
+        );
+        assert_eq!(co.pin_state(), PinState::Unpinned);
+        assert!(
+            co.tainted(),
+            "a session advisory lock must taint (assist signal)"
+        );
+        assert_eq!(
+            co.last_pin_cause(),
+            Some(PinCause::AdvisoryLock),
+            "pin-cause DoD"
+        );
+
+        backend_pid(&mut co).await
+    };
+
+    // Force the recycle (DISCARD ALL) to run by checking out again on the SAME (max_size=1) conn.
+    let mut co2 = pool
+        .checkout()
+        .await
+        .expect("checkout again (recycle should have run DISCARD ALL)");
+    let pid2 = backend_pid(&mut co2).await;
+    assert_eq!(
+        pid1, pid2,
+        "max_size=1 must reuse the SAME backend pid -- the release proof below only means \
+         something if this is the SAME session that held the lock"
+    );
+    drop(co2);
+
+    // INDEPENDENT second connection: a separate tokio_postgres client, not the pooled one.
+    let (indep, indep_conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("connect independent probe");
+    tokio::spawn(async move {
+        let _ = indep_conn.await;
+    });
+
+    let acquired: bool = indep
+        .query_one("SELECT pg_try_advisory_lock(1)", &[])
+        .await
+        .expect("pg_try_advisory_lock from the independent session")
+        .get(0);
+    assert!(
+        acquired,
+        "an INDEPENDENT session must be able to acquire lock id 1 -- proving DISCARD ALL released \
+         the pooled connection's hold, not merely that the SAME session re-acquired it re-entrantly"
+    );
+
+    // Idempotent cleanup: release the lock from the SAME (independent) session that just acquired
+    // it, so a rerun of this test against the persistent testkit DB starts from a clean slate.
+    let released: bool = indep
+        .query_one("SELECT pg_advisory_unlock(1)", &[])
+        .await
+        .expect("pg_advisory_unlock from the independent session")
+        .get(0);
+    assert!(
+        released,
+        "cleanup: the independent session must release lock id 1 it just acquired"
+    );
+}
+
+/// (d): `LISTEN` taints `PinCause::Listen`; after recycle the NEXT same-pid checkout is NOT
+/// subscribed to the channel (`DISCARD ALL` runs `UNLISTEN *` among its resets).
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_classify_listen_taints_and_unsubscribed_by_recycle() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        co.query("LISTEN ferro_test_chan", &[])
+            .await
+            .expect("LISTEN");
+
+        assert!(!co.tx_open(), "LISTEN never opens an RFQ transaction");
+        assert_eq!(co.pin_state(), PinState::Unpinned);
+        assert!(co.tainted(), "LISTEN must taint (assist signal)");
+        assert_eq!(co.last_pin_cause(), Some(PinCause::Listen), "pin-cause DoD");
+
+        backend_pid(&mut co).await
+    };
+
+    let mut co2 = pool
+        .checkout()
+        .await
+        .expect("checkout again (recycle should have run DISCARD ALL)");
+    let pid2 = backend_pid(&mut co2).await;
+    assert_eq!(
+        pid1, pid2,
+        "max_size=1 must reuse the SAME backend pid -- otherwise a fresh conn (also never \
+         subscribed) would make the assertion below a false green"
+    );
+
+    let subscribed =
+        query_first_i64(&mut co2, "SELECT count(*) FROM pg_listening_channels()").await;
+    assert_eq!(
+        subscribed, 0,
+        "DISCARD ALL at recycle must have UNLISTENed the channel, got count={subscribed}"
+    );
+}
+
+/// (e): `CREATE TEMP TABLE` taints `PinCause::Temp`; after recycle the NEXT same-pid checkout does
+/// NOT see the temp table (`DISCARD ALL` drops all temp objects).
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_classify_temp_table_taints_and_dropped_by_recycle() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        co.exec("CREATE TEMP TABLE IF NOT EXISTS ferro_test_tmp (x int)")
+            .await
+            .expect("CREATE TEMP TABLE");
+
+        assert!(
+            !co.tx_open(),
+            "CREATE TEMP TABLE never opens an RFQ transaction"
+        );
+        assert_eq!(co.pin_state(), PinState::Unpinned);
+        assert!(co.tainted(), "CREATE TEMP TABLE must taint (assist signal)");
+        assert_eq!(co.last_pin_cause(), Some(PinCause::Temp), "pin-cause DoD");
+
+        backend_pid(&mut co).await
+    };
+
+    let mut co2 = pool
+        .checkout()
+        .await
+        .expect("checkout again (recycle should have run DISCARD ALL)");
+    let pid2 = backend_pid(&mut co2).await;
+    assert_eq!(
+        pid1, pid2,
+        "max_size=1 must reuse the SAME backend pid -- otherwise a fresh conn (which also never \
+         saw the temp table) would make the assertion below a false green"
+    );
+
+    let gone = query_first_bool(&mut co2, "SELECT to_regclass('ferro_test_tmp') IS NULL").await;
+    assert!(
+        gone,
+        "DISCARD ALL at recycle must have dropped the temp table (to_regclass should be NULL)"
     );
 }
