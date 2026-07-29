@@ -963,10 +963,12 @@ async fn pg_classify_temp_table_taints_and_dropped_by_recycle() {
 /// leaked to the very next tenant of this pooled connection. S3 widens the guard to also run the
 /// backend's `clean_reset_profile()` (PG: `Targeted`) on a non-tainted recycled conn, whose `RESET
 /// ALL` resets every GUC (including one set via `set_config(..., false)`) back to its configured
-/// default. This is a genuine RED-before/GREEN-after test: `git stash` the S3 `pool.rs` recycle-guard
-/// change (reverting to the pre-S3 `tx_open || tainted` guard) and rerun this test -- checkout 2 below
-/// would observe `search_path` STILL `ferro_s3_leak`, and the `assert_ne!` would fail. (Verified by
-/// re-reading the exact pre-S3 diff rather than actually reverting -- see the report.)
+/// default. This is a genuine RED-before/GREEN-after test: temporarily reverting the S3 `pool.rs`
+/// recycle-guard change (back to the pre-S3 `tx_open || tainted` guard) and rerunning this test makes
+/// checkout 2 below observe `search_path` STILL `ferro_s3_leak`, failing the `assert_ne!` with
+/// `left: "ferro_s3_leak"`. (Empirically confirmed: the recycle guard was temporarily reverted, this
+/// test was rerun and observed exactly that failure, then the guard was restored -- not merely
+/// inferred by re-reading the diff.)
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_s3_set_config_search_path_blind_spot_closed_by_targeted_reset() {
     let Some(url) = test_url() else {
