@@ -52,7 +52,11 @@ async fn begin_pins_intx_then_commit_idles_and_leaves_reusable() {
     assert!(!co.tainted(), "a clean commit leaves no taint");
     assert_eq!(co.pin_state(), PinState::Unpinned, "commit unpins");
 
-    // Drop + re-checkout: no defensive ROLLBACK/RESET runs on the cleanly-committed conn.
+    // Drop + re-checkout: no defensive ROLLBACK runs on the cleanly-committed conn, but M1-S3's
+    // conditional hygiene (§7.2) DOES run the backend's clean-profile reset on this now-recycled,
+    // non-tainted conn — the §7.4 assist-lexer blind-spot backstop (a `set_config`/in-`DO`-body
+    // session mutation the lexer can't see would otherwise leak to the next tenant). The fake's
+    // `clean_reset_profile()` defaults to `Some(Targeted)`, mirroring `PgBackend`.
     drop(co);
     let next = pool.checkout().await.expect("checkout again");
     assert_eq!(
@@ -60,9 +64,11 @@ async fn begin_pins_intx_then_commit_idles_and_leaves_reusable() {
         vec![
             "BEGIN".to_string(),
             "SELECT 1".to_string(),
-            "COMMIT".to_string()
+            "COMMIT".to_string(),
+            "RESET:Targeted".to_string()
         ],
-        "a cleanly-committed conn is reusable with no defensive ROLLBACK/RESET appended"
+        "a cleanly-committed conn is reusable with no defensive ROLLBACK, but still gets the \
+         targeted reset as the non-tainted recycle profile"
     );
 }
 

@@ -134,7 +134,16 @@ impl<B: PoolBackend> Pool<B> {
             // `checkout_timeout` at the top of `checkout()` wraps ONLY the permit acquire, not this
             // pop/rollback/reset loop, so without this bound a single wedged conn could stall every
             // subsequent checkout. Reuses `checkout_timeout` as the per-conn cleanup bound.
-            if idle_conn.tx_open || idle_conn.tainted {
+            //
+            // M1-S3 (SPEC §7.2): a NON-tainted recycled conn now ALSO needs cleanup (the backend's
+            // `clean_reset_profile()` targeted reset — the §7.4 assist-lexer blind-spot backstop),
+            // so the guard widens to `tx_open || tainted || clean_reset_profile().is_some()`. A
+            // backend that reports `None` (a future MySQL known-clean tracker) still SKIPS the
+            // timeout wrapper entirely when there is genuinely nothing to do.
+            if idle_conn.tx_open
+                || idle_conn.tainted
+                || self.inner.backend.clean_reset_profile().is_some()
+            {
                 let cleanup = async {
                     if idle_conn.tx_open {
                         self.inner
@@ -143,17 +152,17 @@ impl<B: PoolBackend> Pool<B> {
                             .await?;
                         idle_conn.tx_open = false;
                     }
-                    if idle_conn.tainted {
-                        // TASK-1 PLACEHOLDER (M1-S3): this call site is exercised ONLY when
-                        // `idle_conn.tainted` (see the guarding `if` above), so `Full` is exactly
-                        // right for every path reachable today — it is NOT a stand-in masking a
-                        // wrong answer. Task 2 wires the actual conditional decision (tainted ->
-                        // Full, non-tainted recycled -> `clean_reset_profile()`), which will also
-                        // widen this block's guard so a non-tainted conn reaches `reset` too.
-                        self.inner
-                            .backend
-                            .reset(&mut idle_conn.conn, ResetProfile::Full)
-                            .await?;
+                    // §7.2 conditional profile: a tainted conn (detected session mutation / error /
+                    // aborted tx) gets the FULL reset; a non-tainted recycled conn gets the
+                    // backend's clean profile (PG: Targeted — the §7.4 blind-spot backstop; MySQL
+                    // later: None when the tracker says clean).
+                    let profile = if idle_conn.tainted {
+                        Some(ResetProfile::Full)
+                    } else {
+                        self.inner.backend.clean_reset_profile()
+                    };
+                    if let Some(p) = profile {
+                        self.inner.backend.reset(&mut idle_conn.conn, p).await?;
                         idle_conn.tainted = false;
                     }
                     Ok::<(), PoolError>(())

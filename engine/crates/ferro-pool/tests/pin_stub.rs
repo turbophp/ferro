@@ -28,13 +28,21 @@ async fn pin_stub_tx_cause() {
     );
 
     // A cleanly committed tx clears the tx_open flag: dropping and checking out again must NOT
-    // trigger a defensive rollback (no trailing "ROLLBACK" recorded).
+    // trigger a defensive ROLLBACK (no trailing "ROLLBACK" recorded) — but M1-S3's conditional
+    // hygiene DOES run the backend's clean-profile reset on this now-recycled, non-tainted conn
+    // (the fake defaults `clean_reset_profile()` to `Some(Targeted)`, mirroring `PgBackend`'s §7.4
+    // blind-spot backstop), so a trailing "RESET:Targeted" is expected and correct here.
     drop(c);
     let next = pool.checkout().await.expect("checkout should succeed");
     assert_eq!(
         next.conn().recorded,
-        vec!["BEGIN".to_string(), "COMMIT".to_string()],
-        "no defensive rollback should run once the tx was cleanly committed"
+        vec![
+            "BEGIN".to_string(),
+            "COMMIT".to_string(),
+            "RESET:Targeted".to_string()
+        ],
+        "no defensive ROLLBACK should run once the tx was cleanly committed, but the non-tainted \
+         recycled conn still gets the targeted profile reset (§7.2 conditional hygiene)"
     );
 }
 
@@ -108,10 +116,19 @@ async fn defensive_rollback_on_next_checkout() {
         conn_id,
         "max_size=1 guarantees the same conn is reused"
     );
+    // The dropped conn was OPEN (`tx_open`) but never tainted (a bare BEGIN taints nothing), so the
+    // recycle runs the defensive ROLLBACK FIRST, then — M1-S3's conditional hygiene — the backend's
+    // clean-profile reset on this now non-tainted recycled conn (the fake's default
+    // `clean_reset_profile() == Some(Targeted)`, the §7.4 blind-spot backstop). Assert the full
+    // ROLLBACK-then-RESET:Targeted sequence, not just `.last()`.
     assert_eq!(
-        b.conn().recorded.last().map(String::as_str),
-        Some("ROLLBACK"),
-        "the next checkout should have run a defensive ROLLBACK, recorded = {:?}",
+        b.conn().recorded,
+        vec![
+            "BEGIN".to_string(),
+            "ROLLBACK".to_string(),
+            "RESET:Targeted".to_string()
+        ],
+        "the next checkout should run ROLLBACK then the targeted reset, in that order, recorded = {:?}",
         b.conn().recorded
     );
     assert_eq!(
@@ -168,5 +185,134 @@ async fn exec_rejects_bare_tx_control() {
         vec!["SELECT 1".to_string()],
         "only the ordinary statement should have reached the backend; rejected calls must never \
          reach simple_query"
+    );
+}
+
+// --- M1-S3 Task 2: the conditional checkout-recycle decision (§7.2) -----------------------------
+//
+// `Pool::checkout`'s recycle block now picks a hygiene profile off `idle_conn.tainted`: a tainted
+// conn (session mutation observed, or an error/aborted-tx fail-safe) gets `ResetProfile::Full`; a
+// non-tainted recycled conn gets the backend's `clean_reset_profile()` (the fake defaults to
+// `Some(ResetProfile::Targeted)`, mirroring `PgBackend`'s §7.4 blind-spot backstop). These tests
+// drive that decision deterministically via the `FakeBackend`.
+
+#[tokio::test]
+async fn tainted_conn_gets_full_reset_on_next_checkout() {
+    let backend = FakeBackend::new();
+    let config = PoolConfig {
+        max_size: 1,
+        ..Default::default()
+    };
+    let pool = Pool::new(backend, config);
+
+    let mut c = pool.checkout().await.expect("checkout should succeed");
+    // A non-local SET taints via the M1-S2 assist lexer (autocommit — no tx involved, so tx_open
+    // stays false and only `tainted` is set).
+    c.exec("SET search_path TO app")
+        .await
+        .expect("SET should succeed");
+    assert!(c.tainted(), "a non-local SET must taint");
+    assert!(!c.tx_open(), "an autocommit SET never opens a tx");
+
+    drop(c);
+    let next = pool.checkout().await.expect("checkout again");
+    assert_eq!(
+        next.conn().recorded,
+        vec![
+            "SET search_path TO app".to_string(),
+            "RESET:Full".to_string()
+        ],
+        "a tainted conn must get the FULL reset on the next checkout, recorded = {:?}",
+        next.conn().recorded
+    );
+}
+
+#[tokio::test]
+async fn non_tainted_recycled_conn_gets_targeted_reset_on_next_checkout() {
+    let backend = FakeBackend::new();
+    let config = PoolConfig {
+        max_size: 1,
+        ..Default::default()
+    };
+    let pool = Pool::new(backend, config);
+
+    let mut c = pool.checkout().await.expect("checkout should succeed");
+    c.exec("SELECT 1").await.expect("plain SELECT");
+    assert!(!c.tainted(), "a plain SELECT never taints");
+    assert!(!c.tx_open());
+
+    drop(c);
+    let next = pool.checkout().await.expect("checkout again");
+    assert_eq!(
+        next.conn().recorded,
+        vec!["SELECT 1".to_string(), "RESET:Targeted".to_string()],
+        "a non-tainted recycled conn must get the TARGETED reset (fake's clean_reset_profile == \
+         Some(Targeted), mirroring PgBackend's §7.4 blind-spot backstop), recorded = {:?}",
+        next.conn().recorded
+    );
+}
+
+#[tokio::test]
+async fn tx_open_and_tainted_rollback_precedes_full_reset() {
+    // Ordering must be preserved regardless of WHICH profile applies: the defensive ROLLBACK (for
+    // an open tx) always runs before the reset, since a reset (e.g. real PG's DISCARD ALL) cannot
+    // run inside a transaction block.
+    let backend = FakeBackend::new();
+    let config = PoolConfig {
+        max_size: 1,
+        ..Default::default()
+    };
+    let pool = Pool::new(backend, config);
+
+    let mut c = pool.checkout().await.expect("checkout should succeed");
+    c.begin_tx(TxId(1)).await.expect("begin_tx should succeed");
+    // Taint it via a session-mutating statement inside the open tx.
+    c.exec("SET search_path TO app")
+        .await
+        .expect("SET inside open tx");
+    assert!(c.tx_open(), "the tx is still open (SET is a PRESERVE verb)");
+    assert!(c.tainted(), "the SET must taint");
+
+    // Dropped without COMMIT/ROLLBACK: tx_open AND tainted both survive onto the idle conn.
+    drop(c);
+    let next = pool.checkout().await.expect("checkout again");
+    assert_eq!(
+        next.conn().recorded,
+        vec![
+            "BEGIN".to_string(),
+            "SET search_path TO app".to_string(),
+            "ROLLBACK".to_string(),
+            "RESET:Full".to_string()
+        ],
+        "ROLLBACK must precede the (Full) reset, recorded = {:?}",
+        next.conn().recorded
+    );
+}
+
+#[tokio::test]
+async fn clean_reset_profile_none_skips_hygiene_entirely_for_a_non_tainted_conn() {
+    // The MySQL-known-clean analog (S6, future work): a backend that reports `None` from
+    // `clean_reset_profile()` means "this non-tainted conn needs nothing at all" — the recycle
+    // must skip the timeout-wrapped cleanup entirely rather than running a no-op reset.
+    let backend = FakeBackend::new();
+    backend.set_clean_reset_profile(None);
+    let config = PoolConfig {
+        max_size: 1,
+        ..Default::default()
+    };
+    let pool = Pool::new(backend, config);
+
+    let mut c = pool.checkout().await.expect("checkout should succeed");
+    c.exec("SELECT 1").await.expect("plain SELECT");
+    assert!(!c.tainted());
+    assert!(!c.tx_open());
+
+    drop(c);
+    let next = pool.checkout().await.expect("checkout again");
+    assert_eq!(
+        next.conn().recorded,
+        vec!["SELECT 1".to_string()],
+        "a None clean_reset_profile must skip hygiene entirely for a non-tainted conn, recorded = {:?}",
+        next.conn().recorded
     );
 }
