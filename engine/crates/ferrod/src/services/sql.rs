@@ -20,12 +20,13 @@
 //!     the supervisor sends the ONE terminal `END` on the existing S3 control path — exactly-one-END
 //!     is untouched (no second terminal, no DATA frames).
 //!
-//! Error mapping ([`pool_error_to_payload`]) layers the §19.3 `Indeterminate` classification on TOP
+//! Error mapping ([`fate::classify_fate`]) layers the §19.3 `Indeterminate` classification on TOP
 //! of the pool's coarse taxonomy, WITHOUT any read/write inference (charter rule 6): it branches on
-//! the client-declared `readonly` flag ALONE. A known-fate `PoolError::Sql` (a server rejection OR
-//! a client-side bind pre-validation) passes through VERBATIM — the `readonly` override never
-//! applies to it. The engine NEVER retries a user statement (charter rule 3); the wire branch only
-//! informs the client's own policy.
+//! the client-declared `readonly` flag, the honest `sent` (was the statement transmitted?) flag,
+//! and the per-call-site `in_tx` (is this an in-transaction user STATEMENT?) flag — see
+//! [`fate::OpContext`]. A known-fate `PoolError::Sql` (a server rejection OR a client-side bind
+//! pre-validation) passes through VERBATIM — the override never applies to it. The engine NEVER
+//! retries a user statement (charter rule 3); the wire branch only informs the client's own policy.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,13 +37,13 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use ferro_pool::backend::QueryResult;
-use ferro_pool::error::PoolError;
 use ferro_proto::consts::{MAX_FRAME_PAYLOAD, errc, method_sql, method_tx, service};
 use ferro_proto::messages::ErrorPayload;
 use ferro_proto::messages::sql::{ExecOk, ExecRequest, Stats};
 use ferro_proto::messages::tx::{BeginRequest, BeginResponse, SavepointRequest, TxControl};
 
 use crate::pools::PoolRegistry;
+use crate::services::fate::{self, OpContext};
 use crate::session::codec::InFrame;
 use crate::session::responder::Responder;
 use crate::session::{HandlerFactory, HandlerFn, SessionId};
@@ -240,9 +241,21 @@ async fn handle_exec(
                         Ok(body) => responder.end_ok(Bytes::from(body)),
                         Err(ep) => responder.end_error(ep),
                     },
-                    // The statement WAS transmitted on the pinned conn → §19.3 still applies
-                    // (readonly gates Indeterminate), exactly as on the autocommit path (sent=true).
-                    Err(e) => responder.end_error(pool_error_to_payload(e, req.readonly, true)),
+                    // The statement WAS transmitted on the pinned conn (sent=true). This is an
+                    // in-transaction user STATEMENT (in_tx=true), NOT a control boundary: a
+                    // link-loss here means the WHOLE TRANSACTION is dead (known outcome — it will
+                    // never commit) → Retryable, never Indeterminate for the statement itself. Do
+                    // NOT pass in_tx=false here (that would wrongly report an in-tx write loss as
+                    // Indeterminate, same as the autocommit path — but there is no separate write
+                    // to be unconfirmed about: the tx as a whole cannot be salvaged either way).
+                    Err(e) => responder.end_error(fate::classify_fate(
+                        e,
+                        OpContext {
+                            readonly: req.readonly,
+                            sent: true,
+                            in_tx: true,
+                        },
+                    )),
                 },
                 // A deadline cancelled the statement mid-flight → the ONE TxDeadline terminal. The
                 // statement is never re-run (charter rule 3).
@@ -269,7 +282,15 @@ async fn handle_exec(
                 Err(e) => {
                     // A checkout failure means NO connection was established, so the user statement
                     // was NEVER transmitted → known "did-not-apply", never Indeterminate (sent=false).
-                    responder.end_error(pool_error_to_payload(e, req.readonly, false));
+                    // This is the autocommit path: in_tx=false.
+                    responder.end_error(fate::classify_fate(
+                        e,
+                        OpContext {
+                            readonly: req.readonly,
+                            sent: false,
+                            in_tx: false,
+                        },
+                    ));
                     return;
                 }
             };
@@ -290,7 +311,15 @@ async fn handle_exec(
                 Err(e) => {
                     // The statement WAS transmitted (checkout succeeded, `co.query` ran), so a
                     // connection loss here has a genuinely UNKNOWN fate → §19.3 eligible (sent=true).
-                    responder.end_error(pool_error_to_payload(e, req.readonly, true));
+                    // This is the autocommit path: in_tx=false.
+                    responder.end_error(fate::classify_fate(
+                        e,
+                        OpContext {
+                            readonly: req.readonly,
+                            sent: true,
+                            in_tx: false,
+                        },
+                    ));
                     return;
                 }
             };
@@ -342,7 +371,15 @@ async fn handle_begin(
         Ok(co) => co,
         Err(e) => {
             // No conn established: BEGIN never ran, no user statement sent → known-fate (sent=false).
-            responder.end_error(pool_error_to_payload(e, req.readonly, false));
+            // BEGIN precedes any open transaction: in_tx=false.
+            responder.end_error(fate::classify_fate(
+                e,
+                OpContext {
+                    readonly: req.readonly,
+                    sent: false,
+                    in_tx: false,
+                },
+            ));
             return;
         }
     };
@@ -353,7 +390,15 @@ async fn handle_begin(
     {
         // BEGIN (engine tx-control) failed: nothing registered, `co` drops → conn released, one END.
         // BEGIN is not a user write and no user statement was sent → known-fate (sent=false).
-        responder.end_error(pool_error_to_payload(e, req.readonly, false));
+        // BEGIN itself is a control op, never an in-tx statement: in_tx=false.
+        responder.end_error(fate::classify_fate(
+            e,
+            OpContext {
+                readonly: req.readonly,
+                sent: false,
+                in_tx: false,
+            },
+        ));
         return;
     }
 
@@ -508,12 +553,27 @@ fn resolve_active(
 }
 
 /// Declare a tx-control reply's terminal: `Ok` → an empty `Outcome::Ok` ack; a backend `Err` →
-/// mapped via `pool_error_to_payload` (the COMMIT-loss `WriteUnconfirmed` §19.3 case rides in on
+/// mapped via `fate::classify_fate` (the COMMIT-loss `WriteUnconfirmed` §19.3 case rides in on
 /// `readonly=false`); an `UnknownSavepoint` → `Protocol` (client misuse, never touched the backend).
+///
+/// EVERY control op routed through here — COMMIT, ROLLBACK, SAVEPOINT, RELEASE, ROLLBACK_TO — is a
+/// tx CONTROL boundary, never an in-transaction user STATEMENT, so `in_tx` is always `false`. This
+/// is load-bearing for COMMIT specifically: a lost COMMIT (`readonly=false, sent=true`) MUST stay
+/// `Indeterminate` (double-apply risk — did it commit or not?). Passing `in_tx=true` here would
+/// wrongly downgrade that to `Retryable` (the "in-tx statement, whole tx is dead" rule is for a
+/// *statement* whose transaction can no longer commit either way — it does not apply to the COMMIT
+/// itself, whose entire fate IS whether it committed).
 fn declare_ctl(responder: Responder, reply: CtlReply, readonly: bool) {
     match reply {
         CtlReply::Ok => responder.end_ok(Bytes::new()),
-        CtlReply::Err(e) => responder.end_error(pool_error_to_payload(e, readonly, true)),
+        CtlReply::Err(e) => responder.end_error(fate::classify_fate(
+            e,
+            OpContext {
+                readonly,
+                sent: true,
+                in_tx: false,
+            },
+        )),
         CtlReply::UnknownSavepoint => {
             responder.end_error(protocol("no such savepoint in this transaction"))
         }
@@ -597,100 +657,6 @@ fn build_terminal_body(
     Ok(body)
 }
 
-/// Map a `PoolError` to a wire `ErrorPayload`. NEVER retries (charter rule 3); the branch only
-/// informs the client's own policy.
-///
-/// The §19.3 `Indeterminate` split is layered on the client-declared `readonly` flag ALONE (no SQL
-/// read/write inference — charter rule 6). A known-fate `PoolError::Sql` (server rejection OR a
-/// client-side bind pre-validation, both fate-known) passes through VERBATIM — the override never
-/// touches it.
-///
-/// `sent` gates the Indeterminate branch: a `ConnectionLost` is only Indeterminate if the statement
-/// was actually TRANSMITTED (`sent=true`, a mid-`co.query()` loss whose fate is unknown). A
-/// checkout-time connect failure (`sent=false` — DB down/restarting, the §19 bounce) means the SQL
-/// was never sent, so its fate is a KNOWN "did-not-apply" → `ConnectionLost{Retryable}`, never a
-/// false `WriteUnconfirmed`. Reporting fate-unknown for a provably-not-applied write would corrupt
-/// the §19.3 guarantee just as much as a spurious auto-retry would.
-fn pool_error_to_payload(err: PoolError, readonly: bool, sent: bool) -> ErrorPayload {
-    match err {
-        // Known-fate: pass the proto classification through verbatim. Never Indeterminate.
-        PoolError::Sql {
-            code,
-            branch,
-            sqlstate,
-            message,
-        } => ErrorPayload {
-            code,
-            branch,
-            sqlstate,
-            errno: None,
-            message,
-            detail: None,
-            retry_after_ms: None,
-        },
-        // A connection loss. Indeterminate ONLY if the statement was transmitted AND non-readonly:
-        //  - !sent (checkout failed, never transmitted) → known did-not-apply → Retryable.
-        //  - sent & readonly=false → a possibly-applied write, fate UNKNOWN → §19.3 Indeterminate.
-        //  - sent & readonly=true  → a read that observed no result → Retryable (client policy).
-        PoolError::ConnectionLost => {
-            if sent && !readonly {
-                payload(
-                    errc::WRITE_UNCONFIRMED,
-                    errc::WRITE_UNCONFIRMED_BRANCH,
-                    "connection lost during an in-flight non-readonly statement; the write may or \
-                     may not have applied (§19.3 indeterminate — the engine never retries; retry \
-                     is client policy)",
-                )
-            } else {
-                payload(
-                    errc::CONNECTION_LOST,
-                    errc::CONNECTION_LOST_BRANCH,
-                    "connection lost with a known-fate outcome (statement not transmitted, or a \
-                     readonly read) — retryable; the engine never retries",
-                )
-            }
-        }
-        PoolError::Timeout => payload(
-            errc::POOL_TIMEOUT,
-            errc::POOL_TIMEOUT_BRANCH,
-            "timed out waiting for a pooled connection",
-        ),
-        PoolError::Unsupported(m) => ErrorPayload {
-            code: errc::UNSUPPORTED,
-            branch: errc::UNSUPPORTED_BRANCH,
-            sqlstate: None,
-            errno: None,
-            message: m,
-            detail: None,
-            retry_after_ms: None,
-        },
-        // No dedicated wire code for Closed/Backend yet — a generic NonRetryable Protocol, matching
-        // `PoolError::errc()`'s own fallback.
-        PoolError::Closed => payload(errc::PROTOCOL, errc::PROTOCOL_BRANCH, "pool is closed"),
-        PoolError::Backend(m) => ErrorPayload {
-            code: errc::PROTOCOL,
-            branch: errc::PROTOCOL_BRANCH,
-            sqlstate: None,
-            errno: None,
-            message: m,
-            detail: None,
-            retry_after_ms: None,
-        },
-    }
-}
-
-fn payload(code: u16, branch: u8, message: &str) -> ErrorPayload {
-    ErrorPayload {
-        code,
-        branch,
-        sqlstate: None,
-        errno: None,
-        message: message.to_string(),
-        detail: None,
-        retry_after_ms: None,
-    }
-}
-
 fn unsupported(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: errc::UNSUPPORTED,
@@ -733,6 +699,7 @@ fn tx_deadline(message: impl Into<String>) -> ErrorPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferro_pool::error::PoolError;
     use ferro_proto::consts::{branch, tag};
     use ferro_proto::messages::Outcome;
     use ferro_proto::messages::sql::ColMeta;
@@ -748,78 +715,6 @@ mod tests {
             Outcome::Ok(body.clone()).encode().len(),
             OUTCOME_OK_OVERHEAD + body.len()
         );
-    }
-
-    /// The DETERMINISTIC proof of §19.3, across BOTH the `sent` and `readonly` axes. Indeterminate
-    /// requires `sent && !readonly`; nothing else (and no SQL read/write inference):
-    ///
-    /// - a TRANSMITTED (`sent=true`) non-readonly loss → `WriteUnconfirmed{Indeterminate}` (fate unknown);
-    /// - a transmitted readonly loss → `ConnectionLost{Retryable}`;
-    /// - a NOT-transmitted loss (`sent=false` — a checkout-time connect failure, the §19 DB-bounce)
-    ///   → `ConnectionLost{Retryable}` EVEN on a write, because the statement provably never ran.
-    #[test]
-    fn connection_lost_indeterminate_only_when_sent_and_write() {
-        // sent + write → the ONE Indeterminate case.
-        let sent_write = pool_error_to_payload(PoolError::ConnectionLost, false, true);
-        assert_eq!(sent_write.code, errc::WRITE_UNCONFIRMED);
-        assert_eq!(sent_write.branch, branch::INDETERMINATE);
-
-        // sent + readonly → Retryable.
-        let sent_read = pool_error_to_payload(PoolError::ConnectionLost, true, true);
-        assert_eq!(sent_read.code, errc::CONNECTION_LOST);
-        assert_eq!(sent_read.branch, branch::RETRYABLE);
-
-        // NOT sent (checkout failure) + write → Retryable, NOT Indeterminate (the T3-review fix:
-        // a write that provably never left the client is known-fate, not fate-unknown).
-        let unsent_write = pool_error_to_payload(PoolError::ConnectionLost, false, false);
-        assert_eq!(
-            unsent_write.code,
-            errc::CONNECTION_LOST,
-            "a checkout-time (never-transmitted) loss must be known-fate Retryable, not Indeterminate"
-        );
-        assert_eq!(unsent_write.branch, branch::RETRYABLE);
-        assert_ne!(unsent_write.code, errc::WRITE_UNCONFIRMED);
-        assert_ne!(unsent_write.branch, branch::INDETERMINATE);
-
-        // NOT sent + readonly → Retryable.
-        let unsent_read = pool_error_to_payload(PoolError::ConnectionLost, true, false);
-        assert_eq!(unsent_read.code, errc::CONNECTION_LOST);
-        assert_eq!(unsent_read.branch, branch::RETRYABLE);
-    }
-
-    /// A known-fate `PoolError::Sql` passes through VERBATIM regardless of `readonly` — the
-    /// Indeterminate override must NEVER touch it. This is what keeps a bind pre-validation error
-    /// (COMMIT 1: `Sql{Unsupported}`) from being reclassified Indeterminate on a write.
-    #[test]
-    fn sql_error_passes_through_verbatim_ignoring_readonly() {
-        let sql = PoolError::Sql {
-            code: errc::SYNTAX,
-            branch: branch::NON_RETRYABLE,
-            sqlstate: Some("42601".to_string()),
-            message: "syntax error".to_string(),
-        };
-        // Verbatim regardless of readonly AND sent — a known-fate Sql is never Indeterminate.
-        for readonly in [true, false] {
-            for sent in [true, false] {
-                let ep = pool_error_to_payload(sql.clone(), readonly, sent);
-                assert_eq!(ep.code, errc::SYNTAX);
-                assert_eq!(ep.branch, branch::NON_RETRYABLE);
-                assert_eq!(ep.sqlstate.as_deref(), Some("42601"));
-            }
-        }
-
-        // The exact COMMIT-1 bind-error shape (Sql{Unsupported}) on a WRITE (readonly=false), even
-        // if it were reported at the sent=true site, stays Unsupported — NOT WriteUnconfirmed.
-        let bind = PoolError::Sql {
-            code: errc::UNSUPPORTED,
-            branch: errc::UNSUPPORTED_BRANCH,
-            sqlstate: None,
-            message: "parameter 0 type mismatch".to_string(),
-        };
-        let ep = pool_error_to_payload(bind, false, true);
-        assert_eq!(ep.code, errc::UNSUPPORTED);
-        assert_ne!(ep.code, errc::WRITE_UNCONFIRMED);
-        assert_ne!(ep.branch, branch::INDETERMINATE);
     }
 
     /// An over-one-frame result is a clean per-request `Unsupported` — NEVER a body the frame codec
@@ -976,7 +871,12 @@ mod tests {
         assert_eq!(ep.branch, branch::RETRYABLE);
     }
 
-    /// `declare_ctl` reply → terminal mapping, including the COMMIT-loss §19.3 case.
+    /// `declare_ctl` reply → terminal mapping, including the COMMIT-loss §19.3 case. Exercises the
+    /// REAL `declare_ctl` call site (now routed through `fate::classify_fate` with `in_tx: false`,
+    /// per the M1-S4 refactor) — a lost COMMIT MUST stay `Indeterminate` here even though the tx is
+    /// technically open when COMMIT is sent; `declare_ctl` is a control boundary, not an in-tx
+    /// statement, so passing `in_tx: false` is what keeps this from being wrongly downgraded to
+    /// `Retryable`.
     #[test]
     fn declare_ctl_maps_replies_including_commit_loss_indeterminate() {
         // Ok → an empty Outcome::Ok ack.

@@ -110,8 +110,10 @@ pub enum TxCommand {
 pub enum ExecReply {
     /// The statement ran to completion (successfully, or with a known/unknown-fate error). The
     /// handler maps this exactly like the S5 autocommit path — `build_terminal_body` on `Ok`, or
-    /// `pool_error_to_payload(.., readonly, sent=true)` on `Err` (§19.3 still holds for a tx-scoped
-    /// conn-loss). `exec_us` times only the DB call.
+    /// `fate::classify_fate(.., OpContext{ readonly, sent: true, in_tx: true })` on `Err`: `in_tx`
+    /// is `true` here (unlike the autocommit/control call sites) because a link-loss on an in-tx
+    /// STATEMENT means the whole transaction is dead, so it is `Retryable`, never `Indeterminate`.
+    /// `exec_us` times only the DB call.
     Completed {
         result: Result<QueryResult, PoolError>,
         exec_us: u64,
@@ -130,8 +132,8 @@ pub enum CtlReply {
     /// The control statement applied. The handler declares an empty `Outcome::Ok`.
     Ok,
     /// The backend rejected/failed the control statement. The handler maps it via
-    /// `pool_error_to_payload` (COMMIT loss → §19.3 `WriteUnconfirmed`; the others are not
-    /// lost-writes → mapped known-fate).
+    /// `fate::classify_fate` with `in_tx: false` (a control boundary, never an in-tx statement) —
+    /// COMMIT loss → §19.3 `WriteUnconfirmed`; the others are not lost-writes → mapped known-fate.
     Err(PoolError),
     /// A RELEASE/ROLLBACK_TO named (or, with `None`, an empty stack implied) a savepoint that does
     /// not exist. The handler declares `Protocol` (a client-side misuse, never touched the backend).

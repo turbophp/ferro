@@ -2,4 +2,5 @@
 //! each `Route::Request` frame to. M0 implements SQL `EXEC` ([`sql`]); TX (BEGIN/COMMIT over the
 //! pin, S6) and STREAM (post-M0) land later.
 
+pub mod fate;
 pub mod sql;
