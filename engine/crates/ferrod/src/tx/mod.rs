@@ -76,9 +76,26 @@ pub enum TxCommand {
     /// forwarding HANDLER's concern (result shaping + the §19.3 fate classification, exactly as on
     /// the S5 autocommit path), so they stay handler-local and are NOT carried here — the actor
     /// needs only the statement and returns the raw result for the handler to map.
+    ///
+    /// **M1-S4 (Task 3):** `timeout_ms` and `cancel` enforce the same `ExecRequest.timeout_ms` +
+    /// per-request CANCEL contract the S4 autocommit path enforces, but for a tx-scoped statement:
+    /// the actor's `select!` races the query against BOTH, and on either firing rolls the whole
+    /// transaction back + tombstones it (§19.3 — the safe uniform in-tx action on a client
+    /// cancel/timeout is roll back, the client restarts), the SAME exit its own absolute `max_tx`
+    /// deadline already uses.
+    ///
+    /// `cancel` is the per-REQUEST [`CancellationToken`] (the forwarding handler's own, from
+    /// `session::registry`) — DISTINCT from [`TxHandle::abort`] (the session-level teardown signal
+    /// `TxRegistry::abort_session` fires on session death/drain). Reusing `abort` here would be
+    /// WRONG: firing it routes through `ExecStep::Abort`, which DROPS the reply with no fate at all
+    /// (the forwarding handler then declares its own `Protocol`/`NonRetryable` guess) — the correct
+    /// fate for a client CANCEL of an in-flight tx statement is a REPLIED `TxDeadline{Retryable}`,
+    /// exactly like a deadline, not a silently dropped reply.
     Exec {
         sql: String,
         params: Vec<Value>,
+        timeout_ms: Option<u32>,
+        cancel: CancellationToken,
         reply: oneshot::Sender<ExecReply>,
     },
     /// Establish a savepoint. `name` is an optional client alias; the engine composes the ACTUAL

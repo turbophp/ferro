@@ -29,6 +29,8 @@ use ferro_pool::error::PoolError;
 use ferro_pool::pool::Checkout;
 use ferro_proto::messages::tx::Isolation;
 
+use crate::services::fate;
+
 use super::{CtlReply, ExecReply, TxCommand, TxRegistry};
 
 /// Compose the engine's `BEGIN` statement from the request's `isolation` (a `u8` off the wire) and
@@ -240,11 +242,21 @@ pub async fn run<B: PoolBackend>(
                     }
                 }
             },
-            TxCommand::Exec { sql, params, reply } => {
+            TxCommand::Exec {
+                sql,
+                params,
+                timeout_ms,
+                cancel,
+                reply,
+            } => {
                 // Capture the out-of-band cancel BEFORE borrowing `co` for the query — it returns an
                 // owned handle, so the shared borrow ends immediately and does not conflict with the
-                // `&mut co` the query future then holds.
-                let cancel = co.cancel_handle();
+                // `&mut co` the query future then holds. Named `cancel_handle` (NOT `cancel`) to
+                // stay DISTINCT from the per-request `cancel: CancellationToken` this command now
+                // carries (M1-S4 Task 3) — the two are different things: this is the out-of-band
+                // primitive that actually interrupts the SERVER statement; `cancel` below is the
+                // per-request SIGNAL that we should do so.
+                let cancel_handle = co.cancel_handle();
                 let exec_start = std::time::Instant::now();
                 // M1-S1: `co.query` (`ferro-pool`'s `Checkout::query`) reads the real RFQ status byte
                 // after this statement drains and calls `apply_tx_status`, so a clean success/failure
@@ -270,23 +282,56 @@ pub async fn run<B: PoolBackend>(
                     }
                     () = &mut max_deadline => ExecStep::Deadline,
                     () = abort.cancelled() => ExecStep::Abort,
+                    // M1-S4 Task 3: the per-STATEMENT `ExecRequest.timeout_ms` deadline and the
+                    // per-REQUEST CANCEL token. Both resolve to the SAME `ExecStep::Deadline` the
+                    // actor's own absolute `max_tx` timer uses below — a client cancel/timeout
+                    // in-tx gets the identical cancel -> drain -> ROLLBACK -> tombstone ->
+                    // `TxDeadline{Retryable}` treatment (§19.3: the safe uniform in-tx action is
+                    // roll back; the client restarts), never the `Abort` (drop-reply, no fate)
+                    // path — that stays reserved for the session-level `abort` above.
+                    () = sleep_opt(timeout_ms) => ExecStep::Deadline,
+                    () = cancel.cancelled() => ExecStep::Deadline,
                 };
 
                 match step {
                     ExecStep::Completed(result, exec_us) => {
+                        // An app-set `statement_timeout` (or any other bare 57014) can resolve
+                        // through the query's OWN completion rather than any select arm above —
+                        // PG has already aborted the tx block on this error exactly like a
+                        // mid-statement deadline would (the next statement would see 25P02), so it
+                        // MUST take the SAME rollback+tombstone+TxDeadline exit, not be forwarded
+                        // as a statement error the client might mistake for retry-in-place-able.
+                        // No cancel_handle fire / drain needed: the query already resolved on its
+                        // own. A NON-cancel statement error (e.g. 23505) is NOT touched here and
+                        // falls through to the ordinary `Completed` reply below, unchanged from
+                        // pre-M1-S4 behavior (no auto-rollback).
+                        if let Err(e) = &result
+                            && fate::is_57014(e)
+                        {
+                            let _ = reply.send(ExecReply::Deadline);
+                            break 'actor TxEnd::Deadline;
+                        }
                         let _ = reply.send(ExecReply::Completed { result, exec_us });
                     }
                     ExecStep::Deadline => {
                         // (1) fire the out-of-band cancel; (2) DRAIN the pinned future to its
                         // now-erroring completion (do NOT drop it) so the conn is back at
                         // ReadyForQuery; (3) reply the ONE TxDeadline terminal; teardown rolls back.
-                        cancel.cancel().await;
+                        //
+                        // This same exit now also serves the per-statement `timeout_ms` and
+                        // per-request `cancel` arms above: whichever of the three fired, the query
+                        // has definitely been dispatched (biased query-first), so draining before
+                        // replying is correct for all of them, including the raced-`Ok` case (the
+                        // cancel/timeout LOST the race to completion) — §19.3 says the client asked
+                        // to stop, so the safe uniform in-tx action is still roll back regardless of
+                        // whether the drained value is `Ok` or `Err`.
+                        cancel_handle.cancel().await;
                         let _ = query_fut.await;
                         let _ = reply.send(ExecReply::Deadline);
                         break 'actor TxEnd::Deadline;
                     }
                     ExecStep::Abort => {
-                        cancel.cancel().await;
+                        cancel_handle.cancel().await;
                         let _ = query_fut.await;
                         // Drop the reply sender: the forwarding handler's recv returns `Err` and it
                         // declares its one prompt terminal — the request still ends in exactly one END.
@@ -315,6 +360,18 @@ fn ctl_reply(r: Result<(), PoolError>) -> CtlReply {
     match r {
         Ok(()) => CtlReply::Ok,
         Err(e) => CtlReply::Err(e),
+    }
+}
+
+/// `Some(ms)` → a real `tokio::time::sleep` deadline for one statement; `None` → a future that
+/// NEVER resolves (NOT a 0ms timer), so the `TxCommand::Exec` select's per-statement timeout arm is
+/// effectively absent when the caller passed no `timeout_ms` — mirrors `services::sql`'s identical
+/// `sleep_opt` (M1-S4 Task 2) exactly, so a `timeout_ms: None` tx-scoped statement behaves exactly
+/// as it did before M1-S4 Task 3.
+async fn sleep_opt(ms: Option<u32>) {
+    match ms {
+        Some(ms) => tokio::time::sleep(Duration::from_millis(u64::from(ms))).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -521,6 +578,8 @@ mod tests {
             .send(TxCommand::Exec {
                 sql: "SELECT pg_sleep(9)".into(),
                 params: vec![],
+                timeout_ms: None,
+                cancel: CancellationToken::new(),
                 reply: reply_tx,
             })
             .await
@@ -558,6 +617,275 @@ mod tests {
             recorded.contains(&"ROLLBACK".to_string()),
             "the tx was rolled back on the deadline: {recorded:?}"
         );
+    }
+
+    // ---- M1-S4 Task 3: per-statement timeout_ms + per-request CANCEL on the tx-scoped path -----
+
+    /// A per-statement `ExecRequest.timeout_ms` (NOT the actor's own absolute `max_tx`) elapses
+    /// mid-statement: the NEW `sleep_opt(timeout_ms)` select arm fires, taking the exact same
+    /// cancel→drain→ROLLBACK→tombstone→`TxDeadline` exit `max_deadline` already used. `max_tx`/
+    /// `idle` are both deliberately LONG here, so only Task 3's new arm can be what fires.
+    #[tokio::test(start_paused = true)]
+    async fn per_statement_timeout_ms_cancels_rolls_back_and_tombstones() {
+        let backend = FakeBackend::new();
+        backend.block_query(); // freeze the tx-scoped statement mid-flight
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+
+        let (tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "SELECT pg_sleep(9)".into(),
+                params: vec![],
+                timeout_ms: Some(50),
+                cancel: CancellationToken::new(), // never fired — the per-statement TIMER must fire
+                reply: reply_tx,
+            })
+            .await
+            .expect("send exec");
+
+        let reply = reply_rx
+            .await
+            .expect("the actor replies, never drops silently");
+        assert!(
+            matches!(reply, ExecReply::Deadline),
+            "a per-statement timeout_ms yields exactly one TxDeadline terminal, got {reply:?}"
+        );
+
+        done_rx.wait_for(|t| *t).await.expect("actor tears down");
+        assert_eq!(
+            registry.lookup(tx_id, owner).unwrap_err(),
+            TxLookupErr::Tombstoned
+        );
+
+        let co2 = pool
+            .checkout()
+            .await
+            .expect("permit released, conn returned");
+        let recorded = co2.conn().recorded.clone();
+        assert_eq!(
+            recorded.iter().filter(|s| s.contains("pg_sleep")).count(),
+            1,
+            "statement transmitted exactly once, never re-run: {recorded:?}"
+        );
+        assert!(
+            recorded.contains(&"ROLLBACK".to_string()),
+            "the tx was rolled back on the per-statement timeout: {recorded:?}"
+        );
+    }
+
+    /// A per-REQUEST CANCEL (the `TxCommand::Exec::cancel` token, NOT the actor's `abort` and NOT a
+    /// timer) races an in-flight tx-scoped statement: fired only once the statement is PROVABLY in
+    /// flight (parked on the query gate), proving the cancel ARM itself — not a lucky pre-dispatch
+    /// race — is what unblocks it. Same rollback+tombstone+TxDeadline exit as a deadline.
+    #[tokio::test]
+    async fn per_request_cancel_races_in_flight_stmt_rolls_back_and_tombstones() {
+        let backend = FakeBackend::new();
+        backend.block_query();
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+
+        let (tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        let cancel = CancellationToken::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "SELECT pg_sleep(9)".into(),
+                params: vec![],
+                timeout_ms: None,
+                cancel: cancel.clone(),
+                reply: reply_tx,
+            })
+            .await
+            .expect("send exec");
+
+        // Wait until the statement is actually in flight (parked on the query gate) before firing
+        // the per-request CANCEL — a cancel that fires before dispatch is a different (pre-dispatch)
+        // case; this proves the in-flight cancel arm specifically.
+        while pool.backend().queries_waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        cancel.cancel();
+
+        let reply = reply_rx
+            .await
+            .expect("the actor replies, never drops silently");
+        assert!(
+            matches!(reply, ExecReply::Deadline),
+            "a per-request CANCEL of an in-flight tx statement yields TxDeadline, got {reply:?}"
+        );
+
+        done_rx.wait_for(|t| *t).await.expect("actor tears down");
+        assert_eq!(
+            registry.lookup(tx_id, owner).unwrap_err(),
+            TxLookupErr::Tombstoned
+        );
+
+        let co2 = pool.checkout().await.expect("conn released");
+        assert!(
+            co2.conn().recorded.contains(&"ROLLBACK".to_string()),
+            "the tx was rolled back on the per-request cancel: {:?}",
+            co2.conn().recorded
+        );
+    }
+
+    /// A BARE `57014` (an app-set `statement_timeout`) resolves through the statement's OWN
+    /// completion (`ExecStep::Completed`) — no deadline/cancel select arm ever fires (no gate is
+    /// armed; `arm_next_query_err` returns the error immediately). It must STILL take the same
+    /// rollback+tombstone+TxDeadline exit as a genuine mid-statement deadline (§19.3: PG has
+    /// already aborted the tx block on this error — a next statement would see 25P02 — so it must
+    /// not be forwarded as a bare statement error the client might retry in place).
+    #[tokio::test]
+    async fn bare_57014_via_completed_rolls_back_and_tombstones() {
+        let backend = FakeBackend::new();
+        backend.arm_next_query_err(PoolError::Sql {
+            code: 0,
+            branch: 0,
+            sqlstate: Some("57014".to_string()),
+            message: "canceling statement due to statement timeout".to_string(),
+        });
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+
+        let (tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "UPDATE t SET n = n + 1".into(),
+                params: vec![],
+                timeout_ms: None,
+                cancel: CancellationToken::new(),
+                reply: reply_tx,
+            })
+            .await
+            .expect("send exec");
+
+        let reply = reply_rx
+            .await
+            .expect("the actor replies, never drops silently");
+        assert!(
+            matches!(reply, ExecReply::Deadline),
+            "a bare 57014 resolving via ExecStep::Completed must STILL yield TxDeadline \
+             (rolled back), never a bare Completed error, got {reply:?}"
+        );
+
+        done_rx.wait_for(|t| *t).await.expect("actor tears down");
+        assert_eq!(
+            registry.lookup(tx_id, owner).unwrap_err(),
+            TxLookupErr::Tombstoned
+        );
+
+        let co2 = pool.checkout().await.expect("conn released");
+        assert!(
+            co2.conn().recorded.contains(&"ROLLBACK".to_string()),
+            "a bare 57014 must still roll the tx back: {:?}",
+            co2.conn().recorded
+        );
+    }
+
+    /// S6 REGRESSION GUARD: a NON-cancel statement error (23505, a genuine constraint violation)
+    /// resolving via `ExecStep::Completed` must NOT be treated like a 57014 — it is reported to the
+    /// client as an ordinary `ExecReply::Completed { result: Err(..), .. }` WITHOUT any auto-
+    /// rollback, exactly as before M1-S4 Task 3: the actor keeps running (no `break`), the tx stays
+    /// Active, and a subsequent client-driven COMMIT on the SAME tx_id still works.
+    #[tokio::test]
+    async fn non_cancel_statement_error_reported_without_auto_rollback() {
+        let backend = FakeBackend::new();
+        backend.arm_next_query_err(PoolError::Sql {
+            code: 0,
+            branch: 0,
+            sqlstate: Some("23505".to_string()),
+            message: "duplicate key value violates unique constraint".to_string(),
+        });
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+
+        let (_tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "INSERT INTO t (id) VALUES (1)".into(),
+                params: vec![],
+                timeout_ms: None,
+                cancel: CancellationToken::new(),
+                reply: reply_tx,
+            })
+            .await
+            .expect("send exec");
+
+        match reply_rx.await.expect("the actor replies") {
+            ExecReply::Completed { result, .. } => {
+                let e = result.expect_err("a constraint violation must surface as an Err");
+                assert!(
+                    matches!(&e, PoolError::Sql { sqlstate, .. } if sqlstate.as_deref() == Some("23505")),
+                    "expected the 23505 error to pass through verbatim, got {e:?}"
+                );
+            }
+            other => panic!(
+                "a NON-cancel statement error must reply Completed, never Deadline: {other:?}"
+            ),
+        }
+
+        // No auto-rollback: the tx is still Active (not tombstoned) and a client-driven COMMIT on
+        // the SAME tx_id still works — proving the actor never broke out of its loop on this error.
+        let (commit_tx, commit_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Commit { reply: commit_tx })
+            .await
+            .expect("send commit");
+        assert!(
+            matches!(commit_rx.await.expect("commit replies"), CtlReply::Ok),
+            "the tx survived the 23505 and a subsequent COMMIT still succeeds"
+        );
+        done_rx
+            .wait_for(|t| *t)
+            .await
+            .expect("actor ends after commit");
+
+        let co2 = pool.checkout().await.expect("conn released after commit");
+        assert!(
+            !co2.conn().recorded.contains(&"ROLLBACK".to_string()),
+            "a non-cancel statement error must NOT auto-rollback: {:?}",
+            co2.conn().recorded
+        );
+        assert!(co2.conn().recorded.contains(&"COMMIT".to_string()));
     }
 
     #[tokio::test(start_paused = true)]
@@ -715,6 +1043,8 @@ mod tests {
             .send(TxCommand::Exec {
                 sql: "SELECT 1".into(),
                 params: vec![],
+                timeout_ms: None,
+                cancel: CancellationToken::new(),
                 reply: reply_tx,
             })
             .await

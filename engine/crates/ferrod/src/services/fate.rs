@@ -191,7 +191,13 @@ pub fn classify_fate(err: PoolError, ctx: OpContext) -> ErrorPayload {
 /// `57014` to `(errc::CANCELLED, errc::CANCELLED_BRANCH)`, so detect either the raw sqlstate OR the
 /// already-classified code — both identify the same server-side event, and a caller may construct
 /// either shape (e.g. a synthetic test, or a future backend that skips the sqlstate string).
-fn is_57014(err: &PoolError) -> bool {
+///
+/// `pub(crate)`: reused by `tx::actor` (M1-S4 Task 3) to detect a BARE 57014 that resolved through
+/// a tx-scoped statement's own `ExecStep::Completed` (an app-set `statement_timeout`, not the
+/// actor's deadline/cancel select arms) — that case must route through the SAME
+/// rollback+tombstone+`TxDeadline` exit the deadline/cancel arms use, so the actor needs the same
+/// detection this module's override already performs, not a second hand-rolled copy of it.
+pub(crate) fn is_57014(err: &PoolError) -> bool {
     matches!(
         err,
         PoolError::Sql { sqlstate, code, .. }

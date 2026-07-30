@@ -243,9 +243,15 @@ async fn handle_exec(
                 }
             };
             let (reply_tx, reply_rx) = oneshot::channel();
+            // M1-S4: thread `req.timeout_ms` + this request's own per-request `cancel` token into
+            // the actor — DISTINCT from the tx's session-level `abort` (see `TxCommand::Exec`'s
+            // doc comment). `cancel` is moved: this `Some(tx_id)` arm and the autocommit `None` arm
+            // below are mutually exclusive, so nothing else in this call needs it afterward.
             let cmd = TxCommand::Exec {
                 sql: sql.to_string(),
                 params: req.params.clone(),
+                timeout_ms: req.timeout_ms,
+                cancel,
                 reply: reply_tx,
             };
             if handle.cmd_tx.send(cmd).await.is_err() {

@@ -181,6 +181,13 @@ pub struct FakeBackend {
     /// pool tests exercise the targeted-hygiene path by default; a test that needs the MySQL-style
     /// skip case calls `set_clean_reset_profile(None)`.
     clean_reset_profile: Mutex<Option<ResetProfile>>,
+    /// One-shot armed error for the NEXT `query()` call (M1-S4 Task 3), consumed on read and
+    /// returned IMMEDIATELY — bypassing `query_gate` entirely. Models a statement that resolves
+    /// through its OWN completion with a server-side error (e.g. an app-set `statement_timeout`
+    /// firing on its own, or an ordinary constraint violation) — as opposed to `block_query` +
+    /// `FakeCancelHandle`, which model the out-of-band-cancel path. Armed via
+    /// `arm_next_query_err`.
+    canned_query_err: Mutex<Option<PoolError>>,
 }
 
 impl FakeBackend {
@@ -196,6 +203,7 @@ impl FakeBackend {
             queries_waiting: AtomicU64::new(0),
             dialect: Mutex::new(Dialect::default()),
             clean_reset_profile: Mutex::new(Some(ResetProfile::Targeted)),
+            canned_query_err: Mutex::new(None),
         }
     }
 
@@ -204,6 +212,15 @@ impl FakeBackend {
     /// reached, and that a normal statement returns exactly these canned rows.
     pub fn set_query_result(&self, result: QueryResult) {
         *self.canned_query.lock().unwrap() = result;
+    }
+
+    /// Arms the NEXT `query()` call to return `err` immediately (one-shot), bypassing
+    /// `query_gate`/`block_query` entirely (M1-S4 Task 3). Use this — not `block_query` — to model
+    /// a statement that resolves through its OWN completion with a server-side error and no
+    /// deadline/cancel arm ever firing (e.g. an app-set `statement_timeout`, or an ordinary
+    /// constraint violation).
+    pub fn arm_next_query_err(&self, err: PoolError) {
+        *self.canned_query_err.lock().unwrap() = Some(err);
     }
 
     /// Arms the next `n` `connect()` calls to fail with `PoolError::ConnectionLost`.
@@ -401,6 +418,13 @@ impl PoolBackend for FakeBackend {
         // (or didn't) before delegation.
         conn.recorded.push(sql.to_string());
         apply_leading_tx_verb(conn, sql);
+
+        // One-shot armed error (see `arm_next_query_err`): return immediately, bypassing
+        // `query_gate` entirely — models a statement resolving through its OWN completion with a
+        // server-side error, distinct from the out-of-band-cancel path `block_query` models.
+        if let Some(err) = self.canned_query_err.lock().unwrap().take() {
+            return Err(err);
+        }
 
         // Test-only gate (see `block_query`): if armed, park until a `FakeCancelHandle` for this
         // backend fires. A fired cancel returns the `57014`-shaped `Sql` error the pg `error_map`
