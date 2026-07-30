@@ -15,11 +15,11 @@
 //! path, so a request id is freed for reuse exactly once, right when its lifecycle is truly over.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
-use super::flow::Credit;
+use super::flow::{Credit, CreditCell};
 
 /// Why `Registry::insert` rejected a request id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,12 +33,14 @@ pub enum InsertErr {
 }
 
 /// One in-flight request's registry-held state: its advisory cancellation token and its
-/// flow-control credit window. Neither is touched by the registry itself beyond storage/lookup —
-/// `cancel` and `replenish` below are the only mutators, both driven by routed core frames
-/// (`CANCEL`, `WINDOW_UPDATE`) in `session::mod`'s reader loop.
+/// flow-control credit window (an `Arc<CreditCell>` so the producer holds a clone and a routed
+/// `WINDOW_UPDATE`'s `replenish` here wakes a producer parked on `debit_or_wait`). Neither is
+/// touched by the registry itself beyond storage/lookup — `cancel` and `replenish` below are the
+/// only mutators, both driven by routed core frames (`CANCEL`, `WINDOW_UPDATE`) in `session::mod`'s
+/// reader loop.
 struct InFlight {
     cancel: CancellationToken,
-    credit: Credit,
+    credit: Arc<CreditCell>,
 }
 
 /// The in-flight registry for one session. Holds only request-bearing (SQL/TX/STREAM) request
@@ -58,13 +60,18 @@ impl Registry {
         }
     }
 
-    /// Insert `id` — seeding a fresh `CancellationToken` and `credit` window — if it is neither
-    /// already in-flight nor at capacity. On success, returns a clone of the new token for the
-    /// caller to hand to the spawned handler (the registry keeps its own clone, so `cancel` below
-    /// can reach it purely by `id` without the handler's cooperation). On `Err`, the caller must
-    /// send a per-request diagnostic WITHOUT spawning anything and WITHOUT touching the registry
-    /// further for this frame.
-    pub fn insert(&self, id: u32, credit: Credit) -> Result<CancellationToken, InsertErr> {
+    /// Insert `id` — seeding a fresh `CancellationToken` and wrapping the passed `credit` window in
+    /// a fresh `CreditCell` — if it is neither already in-flight nor at capacity. On success,
+    /// returns a clone of the new token AND an `Arc<CreditCell>` clone for the caller to hand to the
+    /// spawned handler/producer (the registry keeps its own clones, so `cancel` and `replenish`
+    /// below can reach them purely by `id` without the handler's cooperation). On `Err`, the caller
+    /// must send a per-request diagnostic WITHOUT spawning anything and WITHOUT touching the
+    /// registry further for this frame.
+    pub fn insert(
+        &self,
+        id: u32,
+        credit: Credit,
+    ) -> Result<(CancellationToken, Arc<CreditCell>), InsertErr> {
         let mut map = self.inner.lock().unwrap();
         if map.contains_key(&id) {
             return Err(InsertErr::Reused);
@@ -73,14 +80,15 @@ impl Registry {
             return Err(InsertErr::Full);
         }
         let cancel = CancellationToken::new();
+        let cell = Arc::new(CreditCell::new(credit));
         map.insert(
             id,
             InFlight {
                 cancel: cancel.clone(),
-                credit,
+                credit: Arc::clone(&cell),
             },
         );
-        Ok(cancel)
+        Ok((cancel, cell))
     }
 
     /// Free `id` for reuse. Called by the supervisor exactly once, immediately after it sends
@@ -113,10 +121,13 @@ impl Registry {
         }
     }
 
-    /// Apply a routed `WINDOW_UPDATE {frames, bytes}` to `id`'s stored credit. An unknown `id` is
-    /// silently a no-op (the target may never have existed, or may have already completed).
+    /// Apply a routed `WINDOW_UPDATE {frames, bytes}` to `id`'s stored credit cell — which mutates
+    /// the window AND notifies, so a producer parked on `debit_or_wait` wakes and rechecks. An
+    /// unknown `id` is silently a no-op (the target may never have existed, or may have already
+    /// completed). Only a shared borrow of the map is needed: `CreditCell::replenish` takes `&self`
+    /// (the window's own `std::sync::Mutex` guards the mutation).
     pub fn replenish(&self, id: u32, frames: u32, bytes: u32) {
-        if let Some(inflight) = self.inner.lock().unwrap().get_mut(&id) {
+        if let Some(inflight) = self.inner.lock().unwrap().get(&id) {
             inflight.credit.replenish(frames, bytes);
         }
     }
@@ -126,7 +137,11 @@ impl Registry {
     /// (that lands in S5); a plain, non-test-gated accessor since "what is this request's current
     /// window" is a reasonable thing for future introspection/metrics to want too.
     pub fn credit_snapshot(&self, id: u32) -> Option<Credit> {
-        self.inner.lock().unwrap().get(&id).map(|f| f.credit)
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|f| f.credit.snapshot())
     }
 
     /// The number of currently in-flight request ids.
@@ -152,9 +167,17 @@ mod tests {
     fn insert_rejects_reuse_and_enforces_capacity() {
         let registry = Registry::new(2);
         assert!(registry.insert(1, test_credit()).is_ok());
-        assert_eq!(registry.insert(1, test_credit()), Err(InsertErr::Reused));
+        // Map away the `(CancellationToken, Arc<CreditCell>)` Ok payload (not `PartialEq`) so the
+        // rejection reason is what's asserted.
+        assert_eq!(
+            registry.insert(1, test_credit()).map(|_| ()),
+            Err(InsertErr::Reused)
+        );
         assert!(registry.insert(2, test_credit()).is_ok());
-        assert_eq!(registry.insert(3, test_credit()), Err(InsertErr::Full));
+        assert_eq!(
+            registry.insert(3, test_credit()).map(|_| ()),
+            Err(InsertErr::Full)
+        );
         assert_eq!(registry.len(), 2);
 
         registry.remove(1);
@@ -165,7 +188,7 @@ mod tests {
     #[test]
     fn cancel_is_idempotent_and_unknown_id_is_noop() {
         let registry = Registry::new(4);
-        let cancel = registry.insert(1, test_credit()).unwrap();
+        let (cancel, _cell) = registry.insert(1, test_credit()).unwrap();
         assert!(!cancel.is_cancelled());
 
         registry.cancel(1);
@@ -185,8 +208,8 @@ mod tests {
         // Safe on an empty registry: no panic, nothing to cancel.
         registry.cancel_all();
 
-        let a = registry.insert(1, test_credit()).unwrap();
-        let b = registry.insert(2, test_credit()).unwrap();
+        let (a, _a_cell) = registry.insert(1, test_credit()).unwrap();
+        let (b, _b_cell) = registry.insert(2, test_credit()).unwrap();
         assert!(!a.is_cancelled());
         assert!(!b.is_cancelled());
 

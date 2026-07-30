@@ -535,8 +535,11 @@ async fn handle_request_frame(
 
     let credit = Credit::new(config.credit_frames, config.credit_bytes);
 
-    let cancel = match registry.insert(id, credit) {
-        Ok(cancel) => cancel,
+    // `_credit_cell` is the producer's handle onto this request's flow-control window; it is wired
+    // into the Responder in Task 4a. Bound (not dropped) here so the registry's clone is not the
+    // sole owner — the registry always keeps its own clone regardless.
+    let (cancel, _credit_cell) = match registry.insert(id, credit) {
+        Ok(pair) => pair,
         Err(err) => {
             let message = match err {
                 InsertErr::Reused => "reused in-flight request id",
