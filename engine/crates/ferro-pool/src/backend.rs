@@ -91,12 +91,48 @@ pub trait Cancel: Send + 'static {
     async fn cancel(self);
 }
 
+/// A pull-based, INCREMENTAL row source (S5 Task 3, the constant-memory streaming path). Produced
+/// by [`PoolBackend::query_stream`] and driven ONE row at a time by `Checkout`'s `RowStreamHandle`
+/// (and, above it, the `fetch:stream` producer's credit window in Task 4) — the opposite of
+/// [`PoolBackend::query`], which buffers the WHOLE result into a `QueryResult` up front.
+///
+/// The contract mirrors an async iterator: `next()` yields `Some(Ok(row))` per row, `Some(Err(_))`
+/// on a mid-stream failure (SQLSTATE-preserving, via the backend's `error_map`), then `None` once
+/// exhausted. `rows_affected()` is only meaningful AFTER `next()` has returned `None` — the command
+/// tag (`RowStream::rows_affected()`) arrives in the `CommandComplete` message that immediately
+/// precedes the terminating `ReadyForQuery`, so reading it before exhaustion returns `0`.
+///
+/// `#[async_trait]` (mirroring [`PoolBackend`]) so `next()`'s future is boxed `+ Send`; the `Send`
+/// supertrait makes every implementor `Send` so the whole stream can cross the `fetch:stream`
+/// producer's `tokio::spawn` boundary. Kept trait-generic (no pg type here) so `ferro-pool` stays
+/// backend-agnostic — the pg impl wraps a box-pinned `tokio_postgres::RowStream`, the fake replays
+/// a scripted `Vec`.
+#[async_trait]
+pub trait BackendRows: Send {
+    /// Pull the NEXT row, lazily: a backend MUST NOT have produced this row until `next()` is
+    /// polled (constant memory — this is the whole point of the streaming path). `Some(Ok(row))`
+    /// per row; `Some(Err(_))` on a mid-stream error (after which the stream is done — a subsequent
+    /// `next()` returns `None`); `None` once the result set is exhausted.
+    async fn next(&mut self) -> Option<Result<Vec<Value>, PoolError>>;
+
+    /// The command-tag affected-row count, valid ONLY after `next()` has returned `None` (see the
+    /// trait docs); `0` before the stream is exhausted, never a fabricated value.
+    fn rows_affected(&self) -> u64;
+}
+
 /// A pooled backend: connection factory + per-connection operations. `#[async_trait]` (not bare
 /// async-fn-in-trait) so the futures are `Send` for the background reaper's `tokio::spawn` (Task
 /// 3) — this is mandated by plan v2/B2, not a per-toolchain style choice.
 #[async_trait]
 pub trait PoolBackend: Send + Sync + 'static {
     type Conn: Send + 'static;
+
+    /// The [`BackendRows`] implementation this backend's [`PoolBackend::query_stream`] produces
+    /// (S5 Task 3). An associated type (not a `dyn` object) so `ferro-pool` stays backend-agnostic
+    /// with no boxing forced and no pg type in the trait; `+ Send` so the concrete stream (pg's
+    /// box-pinned `tokio_postgres::RowStream`, the fake's scripted `Vec`) can cross the
+    /// `fetch:stream` producer's `tokio::spawn` boundary.
+    type RowStream: BackendRows + Send;
 
     /// An out-of-band handle that cancels the connection's in-flight server statement (S6). It is
     /// `Send + 'static` (via the [`Cancel`] supertrait bound) so it can be grabbed BEFORE a query
@@ -169,6 +205,25 @@ pub trait PoolBackend: Send + Sync + 'static {
         sql: &str,
         params: &[Value],
     ) -> Result<QueryResult, PoolError>;
+
+    /// Row-returning, parameterized statement — INCREMENTAL (S5 Task 3, the constant-memory path).
+    /// Runs `sql` (already `?`→`$n` normalized by the backend) with bound `params`, returns the
+    /// `cols` (from the prepared statement — correct even for a zero-row result) plus a pull-based
+    /// [`Self::RowStream`] that produces rows ONE AT A TIME, NOT a buffered `Vec` like
+    /// [`PoolBackend::query`]. This is the producer half of the `fetch:stream` reply path (Task 4).
+    ///
+    /// UNGUARDED at the trait level, exactly like [`PoolBackend::query`]: the guard against bare
+    /// tx-control lives in `Checkout::query_stream` (which calls `pin::is_bare_tx_control` FIRST),
+    /// so a partially-drained/abandoned stream can never leave the next tenant an untracked open
+    /// transaction (cross-tenant leak, charter rule 6). The pin/taint bookkeeping — the S1 RFQ
+    /// post-drain read + Err-arm force-taint and the S2 assist classify — runs in the handle's
+    /// `finish()` (or, on abandonment, the handle's `Drop` safety net), NOT here.
+    async fn query_stream(
+        &self,
+        conn: &mut Self::Conn,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(Vec<ColMeta>, Self::RowStream), PoolError>;
 }
 
 #[cfg(test)]

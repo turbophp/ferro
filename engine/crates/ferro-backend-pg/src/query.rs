@@ -37,11 +37,16 @@
 //! All server-side errors go through `error_map::map` (`as_db_error()`-first). Nothing here
 //! re-runs the statement (charter rule 3).
 
-use ferro_pool::backend::QueryResult;
+use std::pin::Pin;
+
+use async_trait::async_trait;
+use ferro_pool::backend::{BackendRows, QueryResult};
 use ferro_pool::error::PoolError;
 use ferro_proto::consts::errc;
+use ferro_proto::messages::sql::ColMeta;
 use futures_util::{TryStreamExt, pin_mut};
 use tokio_postgres::Client;
+use tokio_postgres::types::Oid;
 
 use crate::Value;
 use crate::{bind, error_map, placeholder, rowmap};
@@ -128,5 +133,137 @@ fn bind_error(message: String) -> PoolError {
         branch: errc::UNSUPPORTED_BRANCH,
         sqlstate: None,
         message,
+    }
+}
+
+/// Runs `sql` (with `?` placeholders) + `params` against `client` and returns the prepared
+/// statement's `cols` plus a LAZY [`PgRowStream`] — the incremental, constant-memory counterpart to
+/// [`run`] (S5 Task 3, the `fetch:stream` producer path).
+///
+/// Steps 1-4 are IDENTICAL to [`run`] (see this module's flow docs): `?`→`$n` normalize; `prepare`
+/// for OID-strict `cols` + PG-inferred `$n` param types (an out-of-M0 column type is a loud
+/// `Unsupported` raised BEFORE the query runs, conn stays clean); and the §19.3 bind pre-validation
+/// that keeps a client-side bind fault KNOWN-FATE (`Sql{Unsupported}`) rather than the fate-unknown
+/// `ConnectionLost` a post-send transport failure produces (which would mint a false
+/// `WriteUnconfirmed{Indeterminate}`). The difference is step 5: the `RowStream` is BOX-PINNED
+/// (`tokio_postgres::RowStream` is `!Unpin`) and handed back to be drained one row at a time by the
+/// caller, NOT collected into a `Vec`.
+///
+/// This DELIBERATELY duplicates `run`'s prepare/pre-validate preamble rather than refactoring a
+/// shared helper into it — the buffered `run` is a proven, correctness-critical path (S5 Task 2)
+/// and this task's charter is to add the streaming path WITHOUT touching it.
+pub async fn stream(
+    client: &Client,
+    sql: &str,
+    params: &[Value],
+) -> Result<(Vec<ColMeta>, PgRowStream), PoolError> {
+    let normalized = placeholder::normalize(sql);
+
+    let stmt = client
+        .prepare(&normalized)
+        .await
+        .map_err(|e| error_map::map(&e))?;
+
+    // cols + per-column OIDs, driven off the prepared statement — correct even for a zero-row
+    // result, and an out-of-M0 column type errors here (Unsupported) before the query runs.
+    let mut cols = Vec::with_capacity(stmt.columns().len());
+    let mut oids = Vec::with_capacity(stmt.columns().len());
+    for col in stmt.columns() {
+        let tag = rowmap::oid_to_tag(col.type_().oid())?;
+        cols.push(ColMeta {
+            name: col.name().to_string(),
+            tag,
+        });
+        oids.push(col.type_().oid());
+    }
+
+    // (4) §19.3 bind pre-validation — IDENTICAL to `run`'s step 4: reject a client-side bind fault
+    // as known-fate BEFORE sending, so it is never mistaken for the fate-unknown ConnectionLost.
+    let expected = stmt.params();
+    if params.len() != expected.len() {
+        return Err(bind_error(format!(
+            "parameter count mismatch: got {}, statement expects {}",
+            params.len(),
+            expected.len()
+        )));
+    }
+    for (i, (v, ty)) in params.iter().zip(expected).enumerate() {
+        if !bind::accepts(v, ty) {
+            return Err(bind_error(format!(
+                "parameter {i} type mismatch: canonical {} cannot bind to PG type {} \
+                 (M0 maps I64->int8 / F64->float8 directly; a narrower column needs a client cast)",
+                bind::value_kind(v),
+                ty.name()
+            )));
+        }
+    }
+
+    let boxed = bind::to_boxed_params(params);
+    let row_stream = client
+        .query_raw(&stmt, boxed)
+        .await
+        .map_err(|e| error_map::map(&e))?;
+
+    Ok((
+        cols,
+        PgRowStream {
+            // `RowStream` is `!Unpin` (it `pin_project!`s an internal `Responses`), so it MUST be
+            // box-pinned to be stored and polled across `next()` calls. It is channel-backed and
+            // driven by the spawned connection task — it does NOT borrow `client`/`stmt`, and it
+            // keeps its OWN `Statement` clone internally, so nothing here needs to outlive it.
+            stream: Box::pin(row_stream),
+            oids,
+            done: false,
+        },
+    ))
+}
+
+/// The incremental [`BackendRows`] for Postgres (S5 Task 3). Owns a BOX-PINNED
+/// `tokio_postgres::RowStream` and maps each row's cells to canonical `Value`s OID-strictly (via
+/// `rowmap::extract_value`, exactly as [`run`] does), LAZILY — one row per `next()` poll. A
+/// mid-stream server error maps through `error_map::map` (SQLSTATE-preserving); a client-side
+/// decode mismatch surfaces as `Backend` — both mark the stream `done` (a real backend cannot
+/// continue a statement past its error). `rows_affected` reads the command tag, valid only AFTER
+/// `next()` has returned `None` (the post-drain rule: the `CommandComplete` count arrives in the
+/// message just before the terminating `ReadyForQuery`).
+pub struct PgRowStream {
+    stream: Pin<Box<tokio_postgres::RowStream>>,
+    oids: Vec<Oid>,
+    done: bool,
+}
+
+#[async_trait]
+impl BackendRows for PgRowStream {
+    async fn next(&mut self) -> Option<Result<Vec<Value>, PoolError>> {
+        if self.done {
+            return None;
+        }
+        match self.stream.as_mut().try_next().await {
+            Ok(Some(row)) => {
+                let mut out = Vec::with_capacity(self.oids.len());
+                for (idx, &oid) in self.oids.iter().enumerate() {
+                    match rowmap::extract_value(&row, idx, oid) {
+                        Ok(v) => out.push(v),
+                        Err(e) => {
+                            self.done = true;
+                            return Some(Err(e));
+                        }
+                    }
+                }
+                Some(Ok(out))
+            }
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(error_map::map(&e)))
+            }
+        }
+    }
+
+    fn rows_affected(&self) -> u64 {
+        self.stream.rows_affected().unwrap_or(0)
     }
 }

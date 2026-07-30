@@ -89,6 +89,7 @@ impl Cancel for PgCancel {
 impl PoolBackend for PgBackend {
     type Conn = PgConn;
     type CancelHandle = PgCancel;
+    type RowStream = crate::query::PgRowStream;
 
     /// The out-of-band cancel handle (S6): `tokio_postgres::Client::cancel_token` captures this
     /// connection's backend key data into a `Send + 'static` `CancelToken`. Cancelling it runs
@@ -208,6 +209,19 @@ impl PoolBackend for PgBackend {
         params: &[crate::Value],
     ) -> Result<ferro_pool::backend::QueryResult, PoolError> {
         crate::query::run(&conn.client, sql, params).await
+    }
+
+    /// The incremental, constant-memory row-returning path (S5 Task 3): prepare + `query_raw`, then
+    /// return the prepared `cols` and a box-pinned [`crate::query::PgRowStream`] the caller drains
+    /// one row at a time. See `crate::query::stream` for the prepare/bind-pre-validation flow (§19.3
+    /// safety, identical to the buffered `query`).
+    async fn query_stream(
+        &self,
+        conn: &mut Self::Conn,
+        sql: &str,
+        params: &[crate::Value],
+    ) -> Result<(Vec<ferro_proto::messages::sql::ColMeta>, Self::RowStream), PoolError> {
+        crate::query::stream(&conn.client, sql, params).await
     }
 }
 

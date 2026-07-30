@@ -10,8 +10,12 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use ferro_proto::consts::{branch, errc};
+use ferro_proto::messages::sql::ColMeta;
+use ferro_proto::value::Value;
 
-use crate::backend::{Cancel, Dialect, PoolBackend, QueryResult, ResetProfile, TxStatus};
+use crate::backend::{
+    BackendRows, Cancel, Dialect, PoolBackend, QueryResult, ResetProfile, TxStatus,
+};
 use crate::error::PoolError;
 use crate::pin::{TxVerb, leading_tx_verb};
 
@@ -129,6 +133,69 @@ impl Cancel for FakeCancelHandle {
     }
 }
 
+/// A scripted incremental row stream for [`FakeBackend::query_stream`] (S5 Task 3). Armed via
+/// [`FakeBackend::set_stream_script`]; `query_stream` clones it (so it survives multiple checkouts)
+/// and replays `rows` ONE AT A TIME. Reports `cols` up front, `affected` post-exhaustion, and — if
+/// `error_at` is `Some(k)` — yields a mid-stream `Err` after emitting exactly `k` rows (`Some(0)` =
+/// error before any row), so the taint-on-mid-stream-error path is deterministic without live PG.
+#[derive(Debug, Clone, Default)]
+pub struct StreamScript {
+    pub cols: Vec<ColMeta>,
+    pub rows: Vec<Vec<Value>>,
+    pub affected: u64,
+    pub error_at: Option<usize>,
+}
+
+/// The fake's incremental [`BackendRows`] (S5 Task 3): replays a scripted `Vec` LAZILY — one row
+/// per `next()` poll — so a test can prove the streaming path pulls rows on demand (constant
+/// memory) rather than buffering them up front. Every `next()` poll bumps the backend's shared
+/// `stream_pulls` counter (via [`FakeBackend::stream_pulls`]) so laziness is directly observable:
+/// `0` right after `query_stream`, `1` after the first `next()`, and so on. `rows_affected()` is
+/// the scripted command-tag count, meaningful only after `next()` has returned `None`.
+#[derive(Debug)]
+pub struct FakeRowStream {
+    rows: std::vec::IntoIter<Vec<Value>>,
+    affected: u64,
+    error_at: Option<usize>,
+    emitted: usize,
+    done: bool,
+    pulls: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl BackendRows for FakeRowStream {
+    async fn next(&mut self) -> Option<Result<Vec<Value>, PoolError>> {
+        // Bump the laziness probe on EVERY poll (including the terminal `None`) — a test asserts
+        // this stayed `0` between `query_stream` and the first `next()`.
+        self.pulls.fetch_add(1, Ordering::SeqCst);
+        if self.done {
+            return None;
+        }
+        if self.error_at == Some(self.emitted) {
+            // Mid-stream error: the stream is done afterward (a real backend can't continue past a
+            // statement error), mirroring the pg impl marking itself `done` on `Err`.
+            self.done = true;
+            return Some(Err(PoolError::Backend(
+                "fake: armed mid-stream row error".to_string(),
+            )));
+        }
+        match self.rows.next() {
+            Some(row) => {
+                self.emitted += 1;
+                Some(Ok(row))
+            }
+            None => {
+                self.done = true;
+                None
+            }
+        }
+    }
+
+    fn rows_affected(&self) -> u64 {
+        self.affected
+    }
+}
+
 /// A `FakeBackend` connects instantly and never touches the network. `next_id` is atomic so
 /// `connect()` only needs `&self` (matching the trait), matching how a real pool shares one
 /// backend across many concurrent checkouts.
@@ -188,6 +255,14 @@ pub struct FakeBackend {
     /// `FakeCancelHandle`, which model the out-of-band-cancel path. Armed via
     /// `arm_next_query_err`.
     canned_query_err: Mutex<Option<PoolError>>,
+    /// Script the incremental `query_stream()` replays (S5 Task 3). Cloned per `query_stream` call
+    /// so it survives multiple checkouts; defaults to an empty stream. Armed via
+    /// `set_stream_script`.
+    stream_script: Mutex<StreamScript>,
+    /// Shared count of `FakeRowStream::next()` polls across every stream this backend produced —
+    /// the laziness probe. A test reads it via `stream_pulls()` to assert rows are pulled on
+    /// `next()`, not buffered up front by `query_stream`.
+    stream_pulls: Arc<AtomicU64>,
 }
 
 impl FakeBackend {
@@ -204,7 +279,23 @@ impl FakeBackend {
             dialect: Mutex::new(Dialect::default()),
             clean_reset_profile: Mutex::new(Some(ResetProfile::Targeted)),
             canned_query_err: Mutex::new(None),
+            stream_script: Mutex::new(StreamScript::default()),
+            stream_pulls: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Arms the [`StreamScript`] every subsequent `query_stream()` replays (S5 Task 3). Lets a test
+    /// drive the incremental `Checkout::query_stream` path — assert laziness, a mid-stream error,
+    /// and the affected count — without a live Postgres.
+    pub fn set_stream_script(&self, script: StreamScript) {
+        *self.stream_script.lock().unwrap() = script;
+    }
+
+    /// Total number of `FakeRowStream::next()` polls across every stream this backend produced —
+    /// the laziness probe (see [`FakeRowStream`]). `0` between `query_stream` and the first
+    /// `next()` is the proof rows are produced on demand, not buffered up front.
+    pub fn stream_pulls(&self) -> u64 {
+        self.stream_pulls.load(Ordering::SeqCst)
     }
 
     /// Arms the `QueryResult` that every subsequent `query()` returns (S5). Lets a test drive the
@@ -313,6 +404,7 @@ impl Default for FakeBackend {
 impl PoolBackend for FakeBackend {
     type Conn = FakeConn;
     type CancelHandle = FakeCancelHandle;
+    type RowStream = FakeRowStream;
 
     fn cancel_handle(&self, _conn: &Self::Conn) -> Self::CancelHandle {
         // Capture a clone of the armed query gate (if any) so a later `cancel()` can release a
@@ -445,6 +537,34 @@ impl PoolBackend for FakeBackend {
             }
         }
         Ok(self.canned_query.lock().unwrap().clone())
+    }
+
+    async fn query_stream(
+        &self,
+        conn: &mut Self::Conn,
+        sql: &str,
+        _params: &[Value],
+    ) -> Result<(Vec<ColMeta>, Self::RowStream), PoolError> {
+        // Record the SQL that actually reached the backend so the guard-rejection test can assert
+        // `recorded` stays EMPTY when `Checkout::query_stream` rejects a bare tx-control statement
+        // BEFORE delegating here (the cross-tenant-leak guard).
+        conn.recorded.push(sql.to_string());
+        apply_leading_tx_verb(conn, sql);
+
+        // Clone the script (reusable across checkouts) and hand back a LAZY stream: no rows are
+        // produced here — the `stream_pulls` counter stays untouched until `next()` is polled.
+        let script = self.stream_script.lock().unwrap().clone();
+        Ok((
+            script.cols,
+            FakeRowStream {
+                rows: script.rows.into_iter(),
+                affected: script.affected,
+                error_at: script.error_at,
+                emitted: 0,
+                done: false,
+                pulls: Arc::clone(&self.stream_pulls),
+            },
+        ))
     }
 }
 
