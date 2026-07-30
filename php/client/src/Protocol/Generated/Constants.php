@@ -33,6 +33,8 @@ final class Constants
     public const METHOD_CORE_PONG = 4;
     public const METHOD_CORE_WINDOW_UPDATE = 6;
     public const METHOD_SQL_EXEC = 1;
+    public const METHOD_STREAM_DATA = 2;
+    public const METHOD_STREAM_HEAD = 1;
     public const METHOD_TX_BEGIN = 1;
     public const METHOD_TX_COMMIT = 2;
     public const METHOD_TX_RELEASE = 5;
@@ -108,5 +110,5 @@ final class Constants
     public const ERR_WRITE_UNCONFIRMED = 8193;
     public const ERR_WRITE_UNCONFIRMED_BRANCH = 2;
 
-    public const TYPE_REGISTRY_HASH = '67b32e3e616e27f5';
+    public const TYPE_REGISTRY_HASH = '6c1880070c299862';
 }

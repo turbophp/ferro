@@ -41,6 +41,15 @@ SAVEPOINT   = 4
 RELEASE     = 5
 ROLLBACK_TO = 6
 
+# STREAM service (§6/§7.2 window credit, M1-S5). The windowed DATA-channel producer for
+# `fetch:stream` EXEC: HEAD carries the result's column metadata once, DATA carries a batch of rows;
+# each DATA frame sets the `STREAM` flag (`flags::STREAM = 0x01`), and the terminal `END` is the
+# unchanged `Outcome::Ok({affected, stats})` (no rows — they already went out as DATA). (Service
+# `STREAM = 4` above.)
+[methods.stream]
+HEAD = 1
+DATA = 2
+
 # Terminal outcome-envelope status discriminant (decision W-4). In /proto so both codecs
 # generate it rather than hand-writing 0/1/2 (charter rule 2).
 [outcome]

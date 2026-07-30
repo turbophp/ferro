@@ -42,7 +42,9 @@ fn message_payloads_are_canonical_and_byte_stable() {
     // proves the on-disk bytes ARE the canonical encoder output (encode==bytes at the message
     // level), and that decode->encode is a fixpoint. This is the Rust half of the cross-language
     // byte lock; the PHP half asserts PurePacker re-encodes to these same bytes (Task 9).
-    use ferro_proto::consts::{flags, method_core as mc, method_sql, method_tx, service};
+    use ferro_proto::consts::{
+        flags, method_core as mc, method_sql, method_stream, method_tx, service,
+    };
     use ferro_proto::messages::*;
     for entry in fs::read_dir(vectors_dir()).unwrap() {
         let p = entry.unwrap().path();
@@ -116,6 +118,16 @@ fn message_payloads_are_canonical_and_byte_stable() {
                     );
                 }
                 outcome.encode()
+            }
+            // A STREAM HEAD frame (no END flag, no Outcome envelope — see /proto/PROTOCOL.md §10):
+            // a plain StreamHead message payload, exactly like an ExecRequest vector.
+            (s, m) if s == service::STREAM && m == method_stream::HEAD => {
+                StreamHead::decode(payload).unwrap().encode()
+            }
+            // A STREAM DATA frame (STREAM flag set, no END flag, no Outcome envelope): a plain
+            // StreamData message payload.
+            (s, m) if s == service::STREAM && m == method_stream::DATA => {
+                StreamData::decode(payload).unwrap().encode()
             }
             // error_protocol vectors: an Outcome terminal payload (END flag).
             _ => Outcome::decode(payload).unwrap().encode(),

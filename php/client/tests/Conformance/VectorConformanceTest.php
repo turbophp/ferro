@@ -12,6 +12,8 @@ use Ferro\Protocol\Message;
 use Ferro\Protocol\Msgpack\{PurePacker, ExtPacker};
 use Ferro\Protocol\Outcome;
 use Ferro\Protocol\SavepointRequest;
+use Ferro\Protocol\StreamData;
+use Ferro\Protocol\StreamHead;
 use Ferro\Protocol\TxControl;
 use PHPUnit\Framework\TestCase;
 
@@ -153,6 +155,54 @@ final class VectorConformanceTest extends TestCase
         $this->assertEquals($message, $decoded, "PHP ExecOk decode==value for {$name}");
         $this->assertSame(bin2hex($payload), bin2hex(self::wrapOk($p, ExecOk::encode($decoded, $p))),
             "ExecOk decode->encode fixpoint for {$name}");
+    }
+
+    /** @return iterable<string, array{0:array<string,mixed>}> the STREAM HEAD/DATA vectors (M1-S5 Task 1). */
+    public static function streamVectors(): iterable
+    {
+        foreach (self::vectors() as $name => [$v]) {
+            if (str_starts_with((string) ($v['name'] ?? ''), 'stream_head_')
+                || str_starts_with((string) ($v['name'] ?? ''), 'stream_data_')
+            ) {
+                yield $name => [$v];
+            }
+        }
+    }
+
+    /**
+     * THE STREAM cross-language byte lock (bespoke Value-splicing codec, mirrors the SQL EXEC lock
+     * above). Neither `HEAD` nor `DATA` is wrapped in the `Outcome` envelope — they are plain
+     * message payloads, exactly like an `ExecRequest` vector (see /proto/PROTOCOL.md §10). For
+     * every stream_* vector, PHP must (a) re-encode the "message" JSON to the EXACT Rust-produced
+     * payload bytes, (b) decode those bytes back to the message value with full consumption, and
+     * (c) round-trip decode->encode to the same bytes.
+     * @param array<string,mixed> $v
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('streamVectors')]
+    public function testStreamVectorByteMatchesBothDirections(array $v): void
+    {
+        $name = (string) $v['name'];
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $message = is_array($v['message']) ? $v['message'] : [];
+        $p = new PurePacker();
+        $isHead = str_starts_with($name, 'stream_head_');
+
+        // (a) encode direction
+        $encoded = $isHead ? StreamHead::encode($message, $p) : StreamData::encode($message, $p);
+        $this->assertSame(bin2hex($payload), bin2hex($encoded),
+            "PHP " . ($isHead ? 'StreamHead' : 'StreamData') . " encode must byte-match {$name}");
+
+        // (b) decode direction + full consumption
+        $off = 0;
+        $wire = $p->unpack($payload, $off);
+        $this->assertSame(strlen($payload), $off, "consumed all payload bytes for {$name}");
+        $this->assertIsArray($wire);
+        $decoded = $isHead ? StreamHead::mapFromWire($wire) : StreamData::mapFromWire($wire);
+        $this->assertEquals($message, $decoded, "PHP " . ($isHead ? 'StreamHead' : 'StreamData') . " decode==value for {$name}");
+
+        // (c) fixpoint
+        $reencoded = $isHead ? StreamHead::encode($decoded, $p) : StreamData::encode($decoded, $p);
+        $this->assertSame(bin2hex($payload), bin2hex($reencoded), "{$name} decode->encode fixpoint");
     }
 
     /** @return iterable<string, array{0:array<string,mixed>}> the request-bearing TX vectors (Task S7). */

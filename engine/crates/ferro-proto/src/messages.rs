@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// in a submodule with a bespoke positional codec. Declared after `to_vec`/`from_slice` and the
 /// `msg!` macro so the Value-free `ColMeta`/`Stats` there can reuse the same rmp-serde helpers.
 pub mod sql;
-pub use sql::{ColMeta, ExecOk, ExecRequest, Stats};
+pub use sql::{ColMeta, ExecOk, ExecRequest, Stats, StreamData, StreamHead};
 
 /// rmp-serde in default (compact) mode encodes a struct as a fixarray of its fields in
 /// declaration order — exactly the positional layout PROTOCOL.md pins.

@@ -240,7 +240,7 @@ A positional fixarray of 8 fields in declaration order (payload of a non-`END` `
 | 4 | `params` | `array<Value>` | positional bind params, each a `[tag, payload]` `Value` (§3) |
 | 5 | `timeout_ms` | `u32 \| nil` | per-statement deadline hint |
 | 6 | `readonly` | `bool` | client-declared; drives the write-loss → `Indeterminate` split (no engine inference) |
-| 7 | `fetch` | `u8` | `0` = rows, `1` = none (affected only), `2` = stream (reserved; `Unsupported` in M0) |
+| 7 | `fetch` | `u8` | `0` = rows, `1` = none (affected only), `2` = stream (§10's windowed `HEAD`/`DATA`/`END` producer, M1-S5) — a valid, wire-accepted value as of M1-S5 Task 1 (the codec never restricted it); the ferrod EXEC handler's `Unsupported` rejection of `2` is unchanged by that task and lifts in a later S5 task |
 | 8 | `tx_id` | `u64 \| nil` | S6: `nil` = autocommit; a value routes this EXEC to the actor pinning that tx's conn (§9). Bounded < 2^63 (native int, §2); the opt-u64 nil/value peek rule (below) applies |
 
 ### 8.2 `ExecOk` — terminal `Outcome::Ok` body — server → client
@@ -349,3 +349,51 @@ The method id selects the savepoint operation; the body is a positional fixarray
 `tx_begin_request` (`SERIALIZABLE`, not readonly), `tx_begin_response` (the terminal
 `Outcome::Ok(BeginResponse)` envelope, locking the one-field-msg-composes-with-`Outcome::Ok` path),
 `tx_commit` (a bare `TxControl`), and `tx_savepoint` (a named `SavepointRequest`).
+
+## 10. STREAM service messages (`HEAD`/`DATA`)
+
+The STREAM service (`SERVICE_STREAM = 4`, M1-S5) is the windowed DATA-channel producer for a
+`fetch:stream` `EXEC` (§8.1 field 7 = `2`): instead of buffering the whole result into the single
+terminal frame (the `fetch:rows` path, §8.2), the engine emits one `HEAD` frame (the column
+metadata) followed by N `DATA` frames (row batches), then the SAME terminal `END` frame every EXEC
+uses — an `Outcome::Ok(ExecOk)` body whose `cols`/`rows` are empty (the rows already went out as
+`DATA`; only `affected`/`stats` are populated, exactly like the `fetch:none` shape, §8.2). `HEAD`
+and `DATA` share `EXEC`'s `request_id` (§5.2) and are **not** terminal frames, so neither carries
+the `END` flag and neither is wrapped in the `Outcome` envelope (§6, reserved for the one true
+terminal) — each is a plain positional message payload, exactly like an `ExecRequest` frame. `DATA`
+frames (and only `DATA` frames) carry the `STREAM` flag (`flags::STREAM = 0x01`) to mark them as
+DATA-channel frames under the per-request credit window (§5.2's `WINDOW_UPDATE`/§7.2). The methods
+are registry `methods.stream` (`/proto/registry.lock.json`): `HEAD = 1`, `DATA = 2`.
+
+Like `EXEC`, both messages carry `TypedValue`s (`DATA.rows`) or the `Value`-free `ColMeta`
+(`HEAD.cols`), so they live in `ferro-proto`'s `messages::sql` alongside `ExecOk` and use the SAME
+**bespoke positional codec** (`ferro-proto`'s hand-rolled `encode`/`decode`, not `msg!`/rmp-serde) —
+never a second source of truth for how a column or a row cell is framed.
+
+**Task-1 scope note:** this section defines the `/proto`-layer wire shapes only. The producer that
+actually emits `HEAD`/`DATA` frames from a real query, and the ferrod EXEC handler's lift of its
+current `fetch:stream` → `Unsupported` rejection, are later M1-S5 tasks.
+
+### 10.1 `HEAD` (service `STREAM`, method `HEAD` = 1) — server → client
+
+A positional fixarray of 1 field, sent once, before any `DATA` frame for the same `request_id`:
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `cols` | `array<ColMeta>` | one `ColMeta` per result column — the exact shape `ExecOk.cols` uses (§8.2), so the client hydrator is shared between the buffered and streamed paths |
+
+### 10.2 `DATA` (service `STREAM`, method `DATA` = 2) — server → client
+
+A positional fixarray of 1 field, carried in a frame with the `STREAM` flag set:
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `rows` | `array<array<Value>>` | outer = rows in this batch, inner = that row's cells (each a `Value`, §3) — the SAME `[tag, payload]` scalar codec `ExecOk.rows` uses |
+
+### 10.3 STREAM vector index
+
+`stream_head_cols` (a `HEAD` frame with 3 cols, incl. a `TEXT` and a `BYTES`-tagged col — locks the
+`ColMeta` shape shared with `ExecOk.cols`) and `stream_data_rows` (a `DATA` frame — `STREAM` flag
+set — with 3 rows incl. an all-`Null` row, the divergent-range negative int `I64(-200)` = `d1 ff
+38`, and a `BYTES` cell whose first byte is the `0xc0` nil marker — the same cross-language arbiter
+shape as `sql_exec_response_typedvalue`, §8.3).

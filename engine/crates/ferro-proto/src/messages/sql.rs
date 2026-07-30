@@ -39,7 +39,11 @@ pub struct ExecRequest {
     pub params: Vec<Value>,
     pub timeout_ms: Option<u32>,
     pub readonly: bool,
-    /// 0 = rows, 1 = none (affected only), 2 = stream (reserved; rejected `Unsupported` in M0).
+    /// 0 = rows (buffered into the terminal), 1 = none (affected only), 2 = stream (§7.2's
+    /// windowed HEAD/DATA/END producer, M1-S5). Value `2` is a valid, wire-accepted `fetch` value
+    /// as of M1-S5 Task 1 (the codec never restricted it — only the ferrod EXEC handler did); that
+    /// handler's `Unsupported` rejection of it is untouched by this task and lifts in a later S5
+    /// task. See [`StreamHead`]/[`StreamData`] for the DATA-channel message shapes it now names.
     pub fetch: u8,
     /// Optional transaction id (S6): `Some` routes this EXEC to the actor pinning that tx's conn,
     /// `None` is the autocommit path. Bounded < 2^63, so an opt-u64 native int (NOT the u32 opt
@@ -257,6 +261,108 @@ impl ExecOk {
             last_insert_id,
             stats,
         })
+    }
+}
+
+/// `HEAD` (service `STREAM`, method `HEAD` = 1) — server → client, the streaming-fetch counterpart
+/// of `ExecOk.cols`: sent once, before any `DATA` frame, carrying the result's column metadata. A
+/// positional fixarray of 1 field: `cols` splices `ColMeta::encode()` cells exactly as `ExecOk`
+/// does, so the client hydrator is shared between the buffered and streamed paths. `Value`-free
+/// itself (`ColMeta` is `Value`-free — see `ColMeta`'s own doc), but kept as a hand-rolled codec
+/// alongside `ExecOk`/`StreamData` rather than `msg!`, for symmetry with its DATA-channel sibling
+/// and so a future field never accidentally needs a codec split. `/proto/PROTOCOL.md` §10.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamHead {
+    pub cols: Vec<ColMeta>,
+}
+
+impl StreamHead {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        enc::write_array_len(&mut out, 1).unwrap();
+        enc::write_array_len(&mut out, self.cols.len() as u32).unwrap();
+        for c in &self.cols {
+            out.extend_from_slice(&c.encode());
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<StreamHead, CodecError> {
+        let mut rd: &[u8] = b;
+        let top = dec::read_array_len(&mut rd)
+            .map_err(|e| CodecError::Malformed(format!("StreamHead array: {e:?}")))?;
+        if top != 1 {
+            return Err(CodecError::Malformed(format!("StreamHead len {top} != 1")));
+        }
+        let ncols = dec::read_array_len(&mut rd)
+            .map_err(|e| CodecError::Malformed(format!("cols array: {e:?}")))?
+            as usize;
+        bound_len(ncols, rd.len())?; // MAJOR-v2a
+        let mut cols = Vec::with_capacity(ncols);
+        for _ in 0..ncols {
+            cols.push(ColMeta::decode_at(&mut rd)?); // NEVER ColMeta::decode (trailing bytes follow)
+        }
+        if !rd.is_empty() {
+            return Err(CodecError::TrailingBytes(rd.len()));
+        }
+        Ok(StreamHead { cols })
+    }
+}
+
+/// `DATA` (service `STREAM`, method `DATA` = 2) — server → client, a batch of result rows on the
+/// streaming-fetch DATA channel. Carried in a frame with the `STREAM` flag (`flags::STREAM =
+/// 0x01`) set. A positional fixarray of 1 field: `rows` splices `Value::encode()` cells per cell
+/// exactly as `ExecOk.rows` does — the same `[tag, payload]` scalar codec, so a row decoded off
+/// `StreamData` is byte-identical in shape to one decoded off the buffered `ExecOk` path. Carries
+/// `Value`s, so — like `ExecOk` — it CANNOT ride the `msg!`/rmp-serde path (`Value` derives only
+/// `Debug/Clone/PartialEq`) and uses this hand-rolled positional codec instead.
+/// `/proto/PROTOCOL.md` §10.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamData {
+    pub rows: Vec<Vec<Value>>,
+}
+
+impl StreamData {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        enc::write_array_len(&mut out, 1).unwrap();
+        enc::write_array_len(&mut out, self.rows.len() as u32).unwrap();
+        for row in &self.rows {
+            enc::write_array_len(&mut out, row.len() as u32).unwrap();
+            for v in row {
+                v.encode(&mut out);
+            }
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<StreamData, CodecError> {
+        let mut rd: &[u8] = b;
+        let top = dec::read_array_len(&mut rd)
+            .map_err(|e| CodecError::Malformed(format!("StreamData array: {e:?}")))?;
+        if top != 1 {
+            return Err(CodecError::Malformed(format!("StreamData len {top} != 1")));
+        }
+        let nrows = dec::read_array_len(&mut rd)
+            .map_err(|e| CodecError::Malformed(format!("rows array: {e:?}")))?
+            as usize;
+        bound_len(nrows, rd.len())?; // MAJOR-v2a
+        let mut rows = Vec::with_capacity(nrows);
+        for _ in 0..nrows {
+            let ncell = dec::read_array_len(&mut rd)
+                .map_err(|e| CodecError::Malformed(format!("row array: {e:?}")))?
+                as usize;
+            bound_len(ncell, rd.len())?; // MAJOR-v2a: bound each inner row too
+            let mut row = Vec::with_capacity(ncell);
+            for _ in 0..ncell {
+                row.push(Value::decode(&mut rd)?);
+            }
+            rows.push(row);
+        }
+        if !rd.is_empty() {
+            return Err(CodecError::TrailingBytes(rd.len()));
+        }
+        Ok(StreamData { rows })
     }
 }
 

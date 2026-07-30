@@ -1,0 +1,26 @@
+{
+  "frame_hex": "f7010000040001001e00000018000000919392a269640292a5656d61696c0692a661766174617207",
+  "header": {
+    "flags": 0,
+    "method": 1,
+    "request_id": 30,
+    "service": 4
+  },
+  "message": {
+    "cols": [
+      {
+        "name": "id",
+        "tag": 2
+      },
+      {
+        "name": "email",
+        "tag": 6
+      },
+      {
+        "name": "avatar",
+        "tag": 7
+      }
+    ]
+  },
+  "name": "stream_head_cols"
+}

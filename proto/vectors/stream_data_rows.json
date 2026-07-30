@@ -1,0 +1,63 @@
+{
+  "frame_hex": "f7010100040002001e000000430000009193939202019206ad61406578616d706c652e636f6d9207c402c001939202029200c09200c0939202d1ff389206ad63406578616d706c652e636f6d9207c403010203",
+  "header": {
+    "flags": 1,
+    "method": 2,
+    "request_id": 30,
+    "service": 4
+  },
+  "message": {
+    "rows": [
+      [
+        {
+          "data": 1,
+          "tag": 2
+        },
+        {
+          "data": "a@example.com",
+          "tag": 6
+        },
+        {
+          "data": [
+            192,
+            1
+          ],
+          "tag": 7
+        }
+      ],
+      [
+        {
+          "data": 2,
+          "tag": 2
+        },
+        {
+          "data": null,
+          "tag": 0
+        },
+        {
+          "data": null,
+          "tag": 0
+        }
+      ],
+      [
+        {
+          "data": -200,
+          "tag": 2
+        },
+        {
+          "data": "c@example.com",
+          "tag": 6
+        },
+        {
+          "data": [
+            1,
+            2,
+            3
+          ],
+          "tag": 7
+        }
+      ]
+    ]
+  },
+  "name": "stream_data_rows"
+}

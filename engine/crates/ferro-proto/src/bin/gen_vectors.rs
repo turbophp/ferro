@@ -1,6 +1,8 @@
 //! Emit deterministic golden vectors: for each case, build the full frame (header+payload),
 //! and write {name, header, message(json), frame_hex}. Also emit malformed negative .bin seeds.
-use ferro_proto::consts::{self, flags, method_core, method_sql, method_tx, service};
+use ferro_proto::consts::{
+    self, flags, method_core, method_sql, method_stream, method_tx, service,
+};
 use ferro_proto::header::Header;
 use ferro_proto::messages::*;
 use ferro_proto::value::Value;
@@ -110,6 +112,53 @@ fn exec_ok_json(ok: &ExecOk) -> serde_json::Value {
             "bytes": ok.stats.bytes,
         },
     })
+}
+
+/// A `Vec<ColMeta>` as the JSON `[{name, tag}, ...]` shape shared with `exec_ok_json`'s `cols`.
+fn cols_json(cols: &[ColMeta]) -> serde_json::Value {
+    serde_json::Value::Array(
+        cols.iter()
+            .map(|c| serde_json::json!({ "name": c.name, "tag": c.tag }))
+            .collect(),
+    )
+}
+fn stream_head_json(head: &StreamHead) -> serde_json::Value {
+    serde_json::json!({ "cols": cols_json(&head.cols) })
+}
+fn stream_data_json(data: &StreamData) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = data.rows.iter().map(|r| values_json(r)).collect();
+    serde_json::json!({ "rows": rows })
+}
+
+/// A `STREAM`/`HEAD` vector: a plain (non-`END`) message payload, exactly like an `ExecRequest`
+/// vector — `HEAD` is not wrapped in the `Outcome` envelope (that's reserved for the terminal
+/// `END` frame; §6). No `STREAM` flag on `HEAD` itself (only `DATA` frames carry it, per
+/// `/proto/PROTOCOL.md` §10).
+fn write_stream_head(name: &str, req: u32, head: &StreamHead) {
+    write_case(
+        name,
+        0,
+        service::STREAM,
+        method_stream::HEAD,
+        req,
+        head.encode(),
+        stream_head_json(head),
+    );
+}
+
+/// A `STREAM`/`DATA` vector: a plain (non-`END`) message payload carrying the `STREAM` flag
+/// (`flags::STREAM = 0x01`) that marks it as a DATA-channel frame under the per-request credit
+/// window (§5.2/§7.2).
+fn write_stream_data(name: &str, req: u32, data: &StreamData) {
+    write_case(
+        name,
+        flags::STREAM,
+        service::STREAM,
+        method_stream::DATA,
+        req,
+        data.encode(),
+        stream_data_json(data),
+    );
 }
 
 fn main() {
@@ -430,6 +479,49 @@ fn main() {
         },
     };
     write_sql_response("sql_exec_response_typedvalue", 18, &resp_typedvalue);
+
+    // --- STREAM service vectors (M1-S5 Task 1; /proto/PROTOCOL.md §10). HEAD carries the column
+    // metadata (reusing the exact ColMeta shape ExecOk.cols uses); DATA carries a batch of rows
+    // (reusing the exact Value [tag,payload] scalar codec ExecOk.rows uses). Neither is wrapped in
+    // the Outcome envelope — that's reserved for the terminal END frame, which stays an unchanged
+    // ExecOk-shaped Outcome::Ok(affected+stats, no rows) and is not re-vectored here. ---
+    let stream_head_cols = StreamHead {
+        cols: vec![
+            ColMeta {
+                name: "id".into(),
+                tag: consts::tag::I64,
+            },
+            ColMeta {
+                name: "email".into(),
+                tag: consts::tag::TEXT,
+            },
+            ColMeta {
+                name: "avatar".into(),
+                tag: consts::tag::BYTES,
+            },
+        ],
+    };
+    write_stream_head("stream_head_cols", 30, &stream_head_cols);
+
+    // A DATA batch matching stream_head_cols' 3-col arity: a Null row, the divergent-range negative
+    // int (I64(-200) => `d1 ff 38`), and a BYTES cell whose first byte is the 0xc0 nil marker —
+    // mirrors sql_exec_response_typedvalue's row shape, riding the SAME Value::encode as ExecOk.rows.
+    let stream_data_rows = StreamData {
+        rows: vec![
+            vec![
+                Value::I64(1),
+                Value::Text("a@example.com".into()),
+                Value::Bytes(vec![0xc0, 0x01]),
+            ],
+            vec![Value::I64(2), Value::Null, Value::Null],
+            vec![
+                Value::I64(-200),
+                Value::Text("c@example.com".into()),
+                Value::Bytes(vec![1, 2, 3]),
+            ],
+        ],
+    };
+    write_stream_data("stream_data_rows", 30, &stream_data_rows);
 
     // --- TX service vectors (S6; /proto/PROTOCOL.md §9). Requests are the positional message
     // payload (flags 0). tx_begin_response is the terminal Outcome::Ok(BeginResponse) envelope

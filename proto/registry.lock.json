@@ -30,6 +30,10 @@
     "sql": {
       "EXEC": 1
     },
+    "stream": {
+      "DATA": 2,
+      "HEAD": 1
+    },
     "tx": {
       "BEGIN": 1,
       "COMMIT": 2,

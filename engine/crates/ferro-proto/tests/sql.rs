@@ -1,7 +1,7 @@
 //! Bespoke SQL codec: ExecRequest / ExecOk round-trips, divergent-range Value cells, trailing-byte
 //! rejection, oversized-array_len refusal (the MAJOR-v2a bound_len fix), Option<Value> peek, and
 //! array16. See /proto/PROTOCOL.md §8.
-use ferro_proto::messages::{ColMeta, ExecOk, ExecRequest, Outcome, Stats};
+use ferro_proto::messages::{ColMeta, ExecOk, ExecRequest, Outcome, Stats, StreamData, StreamHead};
 use ferro_proto::value::Value;
 
 fn sample_stats() -> Stats {
@@ -283,6 +283,160 @@ fn outcome_ok_composes_with_exec_ok_body() {
         Outcome::Ok(body) => assert_eq!(ExecOk::decode(&body).unwrap(), ok),
         other => panic!("expected Outcome::Ok, got {other:?}"),
     }
+}
+
+// --- STREAM service (HEAD/DATA, M1-S5 Task 1): the hand-rolled StreamHead/StreamData codec.
+// Mirrors the ExecOk round-trip/array16/trailing-bytes/oversized-len coverage above, since both
+// carry the same ColMeta/Value cells as ExecOk's cols/rows (see /proto/PROTOCOL.md §10). ---
+
+#[test]
+fn stream_head_roundtrip_cols() {
+    let head = StreamHead {
+        cols: vec![
+            ColMeta {
+                name: "id".into(),
+                tag: 2,
+            },
+            ColMeta {
+                name: "name".into(),
+                tag: 6,
+            },
+        ],
+    };
+    assert_eq!(StreamHead::decode(&head.encode()).unwrap(), head);
+}
+
+#[test]
+fn stream_head_roundtrip_empty_cols() {
+    let head = StreamHead { cols: vec![] };
+    let bytes = head.encode();
+    assert_eq!(
+        bytes,
+        [0x91, 0x90],
+        "fixarray(1) wrapping an empty cols fixarray(0)"
+    );
+    assert_eq!(StreamHead::decode(&bytes).unwrap(), head);
+}
+
+#[test]
+fn stream_head_wide_uses_array16_marker() {
+    // 16 cols forces the array16 marker (0xdc) for the cols length, exactly as ExecOk.cols does.
+    let cols: Vec<ColMeta> = (0..16)
+        .map(|i| ColMeta {
+            name: format!("c{i}"),
+            tag: 2,
+        })
+        .collect();
+    let head = StreamHead { cols };
+    let bytes = head.encode();
+    assert_eq!(bytes[0], 0x91, "top-level fixarray(1)");
+    assert_eq!(
+        bytes[1], 0xdc,
+        "cols length must be array16 (>=16 elements)"
+    );
+    assert!(
+        contains_subslice(&bytes, &[0xdc, 0x00, 0x10]),
+        "array16 marker + len 16"
+    );
+    assert_eq!(StreamHead::decode(&bytes).unwrap(), head);
+}
+
+#[test]
+fn stream_head_trailing_bytes_rejected() {
+    let head = StreamHead {
+        cols: vec![ColMeta {
+            name: "id".into(),
+            tag: 2,
+        }],
+    };
+    let mut b = head.encode();
+    b.push(0xff);
+    match StreamHead::decode(&b) {
+        Err(ferro_proto::CodecError::TrailingBytes(1)) => {}
+        other => panic!("expected TrailingBytes(1), got {other:?}"),
+    }
+}
+
+#[test]
+fn stream_head_oversized_cols_len_refused() {
+    // fixarray(1), cols array32(u32::MAX) — MAJOR-v2a bound_len must refuse before Vec::with_capacity.
+    let b = [0x91u8, 0xdd, 0xff, 0xff, 0xff, 0xff];
+    assert!(StreamHead::decode(&b).is_err());
+}
+
+#[test]
+fn stream_data_roundtrip_rows_incl_null_and_typed_value() {
+    let data = StreamData {
+        rows: vec![
+            vec![Value::I64(200), Value::Text("a".into())],
+            vec![Value::Null, Value::Bool(true)],
+        ],
+    };
+    assert_eq!(StreamData::decode(&data.encode()).unwrap(), data);
+}
+
+#[test]
+fn stream_data_roundtrip_empty_rows() {
+    let data = StreamData { rows: vec![] };
+    let bytes = data.encode();
+    assert_eq!(
+        bytes,
+        [0x91, 0x90],
+        "fixarray(1) wrapping an empty rows fixarray(0)"
+    );
+    assert_eq!(StreamData::decode(&bytes).unwrap(), data);
+}
+
+#[test]
+fn stream_data_carries_divergent_range_ints_and_full_scalar_set() {
+    // Same cross-language arbiter shape as ExecOk's resp_typedvalue vector: the full M0 scalar set
+    // incl. the divergent-range ints (I64(200) => `cc c8`, I64(-200) => `d1 ff 38`) and a BYTES
+    // whose first byte is the 0xc0 nil marker, all riding the SAME Value::encode as ExecOk.rows.
+    let data = StreamData {
+        rows: vec![vec![
+            Value::Null,
+            Value::Bool(true),
+            Value::I64(200),
+            Value::I64(-200),
+            Value::F64(1.5),
+            Value::Text("x".into()),
+            Value::Bytes(vec![0xc0, 0x01]),
+        ]],
+    };
+    let bytes = data.encode();
+    assert!(contains_subslice(&bytes, &[0xcc, 0xc8]), "I64(200) uint8");
+    assert!(
+        contains_subslice(&bytes, &[0xd1, 0xff, 0x38]),
+        "I64(-200) int16"
+    );
+    assert_eq!(StreamData::decode(&bytes).unwrap(), data);
+}
+
+#[test]
+fn stream_data_trailing_bytes_rejected() {
+    let data = StreamData {
+        rows: vec![vec![Value::I64(1)]],
+    };
+    let mut b = data.encode();
+    b.push(0xff);
+    match StreamData::decode(&b) {
+        Err(ferro_proto::CodecError::TrailingBytes(1)) => {}
+        other => panic!("expected TrailingBytes(1), got {other:?}"),
+    }
+}
+
+#[test]
+fn stream_data_oversized_rows_len_refused() {
+    // fixarray(1), rows array32(u32::MAX)
+    let b = [0x91u8, 0xdd, 0xff, 0xff, 0xff, 0xff];
+    assert!(StreamData::decode(&b).is_err());
+}
+
+#[test]
+fn stream_data_oversized_inner_row_len_refused() {
+    // fixarray(1), rows [ array32(u32::MAX) ]
+    let b = [0x91u8, 0x91, 0xdd, 0xff, 0xff, 0xff, 0xff];
+    assert!(StreamData::decode(&b).is_err());
 }
 
 /// F64 specials byte-identity (T1-review #3 — the S1 F64 gap, first travels in a Value here).

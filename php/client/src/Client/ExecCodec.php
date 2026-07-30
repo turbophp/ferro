@@ -25,9 +25,15 @@ use Ferro\Protocol\SqlValueCodec;
  */
 final class ExecCodec
 {
-    /** ExecRequest.fetch modes (PROTOCOL.md §8.1): 0 = rows, 1 = none (affected only), 2 = stream. */
+    /**
+     * ExecRequest.fetch modes (PROTOCOL.md §8.1): 0 = rows, 1 = none (affected only), 2 = stream
+     * (the §7.2 windowed HEAD/DATA/END producer, M1-S5). `FETCH_STREAM` is a valid, wire-accepted
+     * `fetch` value as of M1-S5 Task 1 (the codec never restricted it); the engine's `Unsupported`
+     * rejection of it is unrelated client-side surface and lifts in a later S5 task.
+     */
     public const FETCH_ROWS = 0;
     public const FETCH_NONE = 1;
+    public const FETCH_STREAM = 2;
 
     public function __construct(
         private readonly ValuePolicy $values,
