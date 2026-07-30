@@ -267,8 +267,17 @@ final class Connection
             } catch (ConnectionLostException | TransportException $e) {
                 // §19.3 carve-out: a lost COMMIT is the ONE transactional Indeterminate. The session's
                 // last in-flight frame is TX/COMMIT (the frame we just failed on) — NEVER re-run the
-                // closure. classifyLoss(TxCommit, …) is unconditional Indeterminate regardless.
-                throw $this->fate->classifyLoss(OpKind::TxCommit, false, 'COMMIT lost: ' . $e->getMessage(), null);
+                // closure. classifyLoss(TxCommit, …) is unconditional Indeterminate regardless. The
+                // `cause()` on that exception is CAUSE_ENGINE_RESTART iff a reconnect (any earlier one
+                // in this connection's life) has already observed a changed `boot_epoch`, else the
+                // honest generic CAUSE_LINK_LOST — a client-side inference only, never a wire signal.
+                throw $this->fate->classifyLoss(
+                    OpKind::TxCommit,
+                    false,
+                    'COMMIT lost: ' . $e->getMessage(),
+                    null,
+                    $this->reconnect?->lastEpochChanged() ?? false,
+                );
             } catch (IndeterminateException | NonRetryableException $e) {
                 throw $e; // server gave a definite fate — propagate (Indeterminate is never retried).
             } catch (RetryableException $e) {
@@ -305,8 +314,17 @@ final class Connection
                 $outcome = $this->session()->sendRequest(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
             } catch (ConnectionLostException | TransportException $e) {
                 // No response / dead transport → classify per §19.1 (a lost write is Indeterminate).
+                // The `cause()` this yields (when Indeterminate) is CAUSE_ENGINE_RESTART iff a
+                // reconnect has already observed a changed `boot_epoch`, else CAUSE_LINK_LOST — a
+                // client-side inference only (the wire carries no `cause`).
                 $server = $e instanceof ConnectionLostException ? $e->errorPayload() : null;
-                $fate = $this->fate->classifyLoss($opKind, $readonly, $e->getMessage(), $server);
+                $fate = $this->fate->classifyLoss(
+                    $opKind,
+                    $readonly,
+                    $e->getMessage(),
+                    $server,
+                    $this->reconnect?->lastEpochChanged() ?? false,
+                );
                 if ($this->reconnect !== null
                     && $attempt + 1 < $this->policy->maxAttempts
                     && $this->fate->mayRetryException($fate, $readonly, $opKind)

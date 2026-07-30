@@ -88,8 +88,41 @@ final class ConnectionResilienceTest extends TestCase
             $this->fail('expected an IndeterminateException for a lost write');
         } catch (IndeterminateException $e) {
             $this->assertSame(C::ERR_WRITE_UNCONFIRMED, $e->errorCode());
+            // No reconnect has happened on this connection yet — the honest generic label, not a
+            // fabricated "timeout" (M1-S4 T5: cause() is a client-side inference, not a wire field).
+            $this->assertSame(IndeterminateException::CAUSE_LINK_LOST, $e->cause());
         }
         $this->assertSame(0, $conn->reconnectCount(), 'a lost write must never reconnect+retry (§19.3)');
+    }
+
+    /**
+     * A lost autocommit WRITE with no response, on a connection that has ALREADY seen the daemon
+     * restart (an earlier read's reconnect observed a changed `boot_epoch`), is labeled
+     * `cause() == engine_restart` — the client's best honest inference, still NEVER retried.
+     */
+    public function testLostWriteAfterKnownEpochChangeCauseIsEngineRestart(): void
+    {
+        $s1 = new FakeSession(1);
+        $s1->push(new ConnectionLostException('daemon went away')); // read lost
+        $s2 = new FakeSession(2); // restarted daemon → changed epoch
+        $s2->push(FakeSession::scalarRow(1))                        // read retried, succeeds
+           ->push(new ConnectionLostException('link dropped mid-write')); // a later write is lost, no response
+
+        $conn = $this->connection([$s1, $s2], new RetryPolicy(maxAttempts: 3));
+
+        // First: a lost read transparently reconnects, observing the changed epoch.
+        $this->assertSame(1, $conn->scalar('SELECT 1'));
+        $this->assertTrue($conn->lastReconnectEpochChanged());
+
+        // Then: a lost WRITE with no response, on the same (now-known-restarted) connection.
+        try {
+            $conn->exec('UPDATE accounts SET balance = balance + 1 WHERE id = ?', [42]);
+            $this->fail('expected an IndeterminateException for a lost write');
+        } catch (IndeterminateException $e) {
+            $this->assertSame(C::ERR_WRITE_UNCONFIRMED, $e->errorCode());
+            $this->assertSame(IndeterminateException::CAUSE_ENGINE_RESTART, $e->cause());
+        }
+        $this->assertSame(1, $conn->reconnectCount(), 'the lost write itself must never reconnect+retry (§19.3)');
     }
 
     /** Read retry is bounded: a persistently-down daemon exhausts the budget and then propagates. */

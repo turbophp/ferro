@@ -145,4 +145,49 @@ final class FateClassifierTest extends TestCase
         $this->assertFalse($this->reads->mayRetryException($ind, true, OpKind::Read));
         $this->assertFalse($this->reads->mayRetryException($nonRetry, true, OpKind::Read));
     }
+
+    // ---- IndeterminateException::cause() — client-side inference, NEVER a wire field (M1-S4 T5) ---
+    //
+    // The wire carries only `code=WRITE_UNCONFIRMED, branch=Indeterminate`; `cause()` is scoped to
+    // exactly what `classifyLoss`'s call site can honestly tell apart. Do NOT read a "timeout"
+    // specificity into any of these — the wire cannot carry it.
+
+    /** A no-response lost autocommit WRITE, no known epoch change -> the honest generic link_lost. */
+    public function testClassifyLossWriteNoEpochChangeCauseIsLinkLostAndNeverRetried(): void
+    {
+        $ex = $this->reads->classifyLoss(OpKind::Write, false, 'link dropped mid-write');
+        $this->assertInstanceOf(IndeterminateException::class, $ex);
+        $this->assertSame(IndeterminateException::CAUSE_LINK_LOST, $ex->cause());
+        $this->assertFalse($this->reads->mayRetryException($ex, false, OpKind::Write, idempotent: true));
+    }
+
+    /** The SAME no-response write loss, but the reconnect loop already knows the epoch changed. */
+    public function testClassifyLossWriteEpochChangedCauseIsEngineRestartAndNeverRetried(): void
+    {
+        $ex = $this->reads->classifyLoss(OpKind::Write, false, 'link dropped mid-write', epochChanged: true);
+        $this->assertInstanceOf(IndeterminateException::class, $ex);
+        $this->assertSame(IndeterminateException::CAUSE_ENGINE_RESTART, $ex->cause());
+        $this->assertFalse($this->reads->mayRetryException($ex, false, OpKind::Write, idempotent: true));
+    }
+
+    /** The lost-COMMIT carve-out gets the identical link_lost / engine_restart split. */
+    public function testClassifyLossCommitCauseTracksEpochChanged(): void
+    {
+        $linkLost = $this->reads->classifyLoss(OpKind::TxCommit, false, 'link dropped during COMMIT');
+        $this->assertInstanceOf(IndeterminateException::class, $linkLost);
+        $this->assertSame(IndeterminateException::CAUSE_LINK_LOST, $linkLost->cause());
+
+        $restart = $this->reads->classifyLoss(OpKind::TxCommit, false, 'link dropped during COMMIT', epochChanged: true);
+        $this->assertInstanceOf(IndeterminateException::class, $restart);
+        $this->assertSame(IndeterminateException::CAUSE_ENGINE_RESTART, $restart->cause());
+    }
+
+    /** A trusted server-reported Indeterminate hint is always engine_reported — epochChanged never overrides it. */
+    public function testClassifyLossTrustedServerIndeterminateCauseIsEngineReported(): void
+    {
+        $serverInd = new ErrorPayload(C::ERR_WRITE_UNCONFIRMED, C::BRANCH_INDETERMINATE, null, null, 'x', null, null);
+        $ex = $this->reads->classifyLoss(OpKind::Read, true, 'x', $serverInd, epochChanged: true);
+        $this->assertInstanceOf(IndeterminateException::class, $ex);
+        $this->assertSame(IndeterminateException::CAUSE_ENGINE_REPORTED, $ex->cause());
+    }
 }

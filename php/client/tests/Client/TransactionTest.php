@@ -169,12 +169,44 @@ final class TransactionTest extends TestCase
         } catch (IndeterminateException $e) {
             $this->assertSame(C::ERR_WRITE_UNCONFIRMED, $e->errorCode());
             $this->assertSame(C::BRANCH_INDETERMINATE, $e->branch());
+            // No reconnect has happened yet on this connection — the honest generic label (M1-S4 T5:
+            // cause() is a client-side inference, never a wire field, and never a fabricated "timeout").
+            $this->assertSame(IndeterminateException::CAUSE_LINK_LOST, $e->cause());
         }
 
         $this->assertSame(1, $calls, 'a lost COMMIT must NEVER re-run the closure');
         $this->assertSame(0, $conn->reconnectCount(), 'a lost COMMIT must not reconnect+retry');
         // The session confirms the last in-flight frame was TX/COMMIT — the carve-out's signal.
         $this->assertSame([C::SERVICE_TX, C::METHOD_TX_COMMIT], $s->lastInFlight());
+    }
+
+    /**
+     * The OTHER Indeterminate path (contrast with the lost-link COMMIT above): the engine actually
+     * REPLIES to COMMIT with `Outcome::Error{WRITE_UNCONFIRMED, Indeterminate}` (no dropped link).
+     * `cause()` is `engine_reported` (M1-S4 T5) — never `link_lost`/`engine_restart`, which are
+     * reserved for the no-response inference — and the closure still never re-runs.
+     */
+    public function testEngineReportedIndeterminateCommitCauseIsEngineReported(): void
+    {
+        $ep = new ErrorPayload(C::ERR_WRITE_UNCONFIRMED, C::BRANCH_INDETERMINATE, null, null, 'commit outcome unconfirmed', null, null);
+        $s = new FakeSession();
+        $s->push(FakeSession::beginOk(11))->push(FakeSession::errorOutcome($ep)); // COMMIT reply, not a lost link
+
+        $conn = $this->connection([$s, new FakeSession(2)], new RetryPolicy(maxAttempts: 5));
+        $calls = 0;
+
+        try {
+            $conn->transaction(function (TxHandle $tx) use (&$calls): string {
+                $calls++;
+                return 'done';
+            });
+            $this->fail('expected an IndeterminateException for the engine-reported COMMIT');
+        } catch (IndeterminateException $e) {
+            $this->assertSame(IndeterminateException::CAUSE_ENGINE_REPORTED, $e->cause());
+        }
+
+        $this->assertSame(1, $calls, 'an engine-reported Indeterminate COMMIT must NEVER re-run the closure');
+        $this->assertSame(0, $conn->reconnectCount());
     }
 
     // ---- RetryPolicy honored within its attempt bound -------------------------------------------

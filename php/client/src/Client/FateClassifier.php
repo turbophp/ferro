@@ -85,13 +85,26 @@ final class FateClassifier
      * lost-COMMIT carve-out is checked FIRST and is unconditional. When the engine actually sent a
      * session-fatal `Outcome::Error` (`$server`), its branch is trusted for the non-COMMIT cases (the
      * engine already applied the dispatched-vs-not classification).
+     *
+     * `$epochChanged` is the client-side {@see IndeterminateException::cause} inference for the TWO
+     * no-response branches below (lost COMMIT / lost autocommit write): pass whether the
+     * {@see \Ferro\Client\ReconnectLoop} has (so far) observed a CHANGED `boot_epoch` — `true` labels
+     * the built exception {@see IndeterminateException::CAUSE_ENGINE_RESTART}, `false` (the default —
+     * no reconnect has happened yet, or none observed a change) labels it
+     * {@see IndeterminateException::CAUSE_LINK_LOST}. This is honest best-effort inference, NOT a wire
+     * signal — the wire carries no `cause` at all (§9.2/§19.3; M1-S4 verification MAJOR).
      */
     public function classifyLoss(
         OpKind $opKind,
         bool $readonly,
         string $reason,
         ?ErrorPayload $server = null,
+        bool $epochChanged = false,
     ): FerroException {
+        $noResponseCause = $epochChanged
+            ? IndeterminateException::CAUSE_ENGINE_RESTART
+            : IndeterminateException::CAUSE_LINK_LOST;
+
         // §19.3 carve-out: a COMMIT with no confirmed response is the ONE transactional Indeterminate.
         if ($opKind === OpKind::TxCommit) {
             return new IndeterminateException(self::payload(
@@ -99,14 +112,17 @@ final class FateClassifier
                 C::BRANCH_INDETERMINATE,
                 'COMMIT sent with no confirmed response — the transaction may or may not have applied '
                     . '(§19.3 Indeterminate; the client never re-runs it): ' . $reason,
-            ));
+            ), $noResponseCause);
         }
 
         // The engine spoke a definite fate before the link died — trust it (branch already classified).
+        // This IS an engine-reported fate (just relayed via a session-fatal terminal rather than a
+        // matched-id reply), so an Indeterminate here is CAUSE_ENGINE_REPORTED, never the no-response
+        // inference above.
         if ($server !== null) {
             return match ($server->branch) {
                 C::BRANCH_RETRYABLE     => new RetryableException($server),
-                C::BRANCH_INDETERMINATE => new IndeterminateException($server),
+                C::BRANCH_INDETERMINATE => new IndeterminateException($server, IndeterminateException::CAUSE_ENGINE_REPORTED),
                 default                 => new NonRetryableException($server),
             };
         }
@@ -117,7 +133,7 @@ final class FateClassifier
                 C::ERR_WRITE_UNCONFIRMED,
                 C::BRANCH_INDETERMINATE,
                 'autocommit write lost mid-flight — fate unknown (§19.3 Indeterminate): ' . $reason,
-            ));
+            ), $noResponseCause);
         }
 
         // Reads, BEGIN, mid-tx statements, ROLLBACK, savepoints: provably did not commit → Retryable.

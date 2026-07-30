@@ -34,12 +34,17 @@ final class ErrorMapper
         return self::fromErrorPayload($outcome->errorPayload());
     }
 
-    /** Classify a decoded {@see ErrorPayload} on its wire `branch` byte. */
+    /**
+     * Classify a decoded {@see ErrorPayload} on its wire `branch` byte. An `Indeterminate` built here
+     * is always {@see IndeterminateException::CAUSE_ENGINE_REPORTED} — this IS a decoded engine reply
+     * (e.g. the S4 cancelled/timed-out autocommit-write `WriteUnconfirmed`), never a no-response
+     * inference (that's {@see \Ferro\Client\FateClassifier::classifyLoss}'s job).
+     */
     public static function fromErrorPayload(ErrorPayload $ep): FerroException
     {
         return match ($ep->branch) {
             C::BRANCH_RETRYABLE     => new RetryableException($ep),
-            C::BRANCH_INDETERMINATE => new IndeterminateException($ep),
+            C::BRANCH_INDETERMINATE => new IndeterminateException($ep, IndeterminateException::CAUSE_ENGINE_REPORTED),
             C::BRANCH_NON_RETRYABLE => new NonRetryableException($ep),
             // Unknown/garbled branch: the SAFE fate is non-retryable. Defaulting to Retryable would
             // breach §19.3 (silent replay of a possibly-applied statement). Payload carried verbatim.

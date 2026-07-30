@@ -8,6 +8,8 @@ use Ferro\Client\Error\IndeterminateException;
 use Ferro\Client\Error\NonRetryableException;
 use Ferro\Client\Error\ProtocolException;
 use Ferro\Client\Error\RetryableException;
+use Ferro\Client\FateClassifier;
+use Ferro\Client\OpKind;
 use Ferro\Protocol\ErrorPayload;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Outcome;
@@ -78,5 +80,28 @@ final class ErrorMapperTest extends TestCase
     {
         $e = ErrorMapper::fromOutcome(Outcome::ok("\xc0"));
         $this->assertInstanceOf(ProtocolException::class, $e);
+    }
+
+    /**
+     * M1-S4 T5: an engine-replied `Outcome::Error{code: WRITE_UNCONFIRMED, branch: Indeterminate}`
+     * (the cancelled/timed-out autocommit-write case, S4 T2) decodes to
+     * {@see IndeterminateException::CAUSE_ENGINE_REPORTED} — the wire cannot distinguish it from any
+     * OTHER engine-reported WriteUnconfirmed, so this honest generic label is used, NEVER `"timeout"`.
+     * It is NEVER auto-retried by {@see FateClassifier}, even with `retry_reads=true` or a (M3-only,
+     * not consulted here) idempotent hint.
+     */
+    public function testEngineReportedWriteUnconfirmedIsIndeterminateCauseAndNeverAutoRetried(): void
+    {
+        $outcome = Outcome::error(self::payload(C::BRANCH_INDETERMINATE, code: C::ERR_WRITE_UNCONFIRMED));
+        $ex = ErrorMapper::fromOutcome($outcome);
+
+        $this->assertInstanceOf(IndeterminateException::class, $ex);
+        $this->assertSame(IndeterminateException::CAUSE_ENGINE_REPORTED, $ex->cause());
+
+        $fate = new FateClassifier(retryReads: true);
+        $this->assertFalse($fate->mayRetryException($ex, false, OpKind::Write, idempotent: true));
+        // Even mis-declared as a retryable-eligible read shape, an Indeterminate is never retried —
+        // the never-retry check on branch happens before readonly/idempotent are ever consulted.
+        $this->assertFalse($fate->mayRetryException($ex, true, OpKind::Read, idempotent: true));
     }
 }
