@@ -462,10 +462,23 @@ impl Session {
         // terminal frame.
         //
         // ORDER IS LOAD-BEARING (S6 seam): `cancel_all()` only fires each request's
-        // `CancellationToken`, which a tx-scoped handler blocked on a `oneshot` recv does NOT
-        // observe — so `abort_session` runs BETWEEN it and the drain: aborting the actors drops
-        // their reply senders, the in-flight handler's recv returns `Err`, it declares its one
-        // terminal, and the supervisor delivers the `END` inside the drain window.
+        // `CancellationToken`, which the FORWARDING HANDLER of a tx-scoped request — blocked on a
+        // `oneshot` recv from its tx actor — does NOT itself observe — so `abort_session` runs
+        // BETWEEN it and the drain: aborting the actors drops their reply senders, the in-flight
+        // handler's recv returns `Err`, it declares its one terminal, and the supervisor delivers
+        // the `END` inside the drain window.
+        //
+        // M1-S4 NOTE (SPEC §22.2): the tx actor's OWN in-flight-statement select (`tx/actor.rs`)
+        // now ALSO carries a per-request `cancel: CancellationToken` — of structural necessity the
+        // SAME token this `cancel_all()` fires (it is the one token a client's own
+        // `CANCEL{request_id}` must reach). So on session death, firing `cancel_all()` HERE, before
+        // `abort_session` below, can make the actor's `cancel` arm win the teardown race instead of
+        // `abort`: the transaction still rolls back and the conn is still released either way, but
+        // the actor tombstones + REPLIES `TxDeadline{Retryable}` (a real, declared terminal) rather
+        // than dropping the reply for the handler to synthesize its own `Protocol`. This is a
+        // recorded, traced-safe deviation (§22.2), not a bug: exactly one teardown, exactly one
+        // terminal, no leaked permit, and a losing client sees a safe-or-better fate (the tx is
+        // already rolled back, so there is no double-apply risk either way).
         registry.cancel_all();
         tx_registry.abort_session(session_id).await;
         drain_supervisors(&mut supervisors, config.drain_deadline).await;

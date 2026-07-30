@@ -748,6 +748,109 @@ mod tests {
         );
     }
 
+    /// SPEC §22.2 COLLISION REGRESSION (reviewer-flagged): `session/mod.rs` fires
+    /// `registry.cancel_all()` (the session::registry, cancelling every in-flight request's
+    /// per-request `CancellationToken`) STRICTLY BEFORE `tx_registry.abort_session()` (which fires
+    /// `abort`) on EVERY session end — and the per-request `cancel` this command now carries is,
+    /// of structural necessity, THE SAME token `cancel_all()` fires (it must be, so a client's own
+    /// `CANCEL{request_id}` still reaches the actor). So the literal T3 plan constraint ("session
+    /// death routes through `abort` only") does not quite hold: the `cancel` arm can — and, given
+    /// `cancel_all()` runs first and typically completes its own work well before `abort_session`
+    /// is even called, ordinarily WILL — win the teardown race instead of `abort`. This test drives
+    /// exactly that: fires the per-request `cancel` on an in-flight statement, lets the actor fully
+    /// react to it (the realistic ordering — `cancel_all()`'s effect resolves before
+    /// `abort_session()` ever runs), THEN races `registry.abort_session()` in behind it — exactly
+    /// as `session/mod.rs` unconditionally does on every session end, whether or not an owned actor
+    /// already tore down. Asserts the whole interleaving is safe: exactly one terminal for the
+    /// original request (structurally guaranteed by the `oneshot` reply channel), the actor tears
+    /// down without hanging or panicking, `abort_session` on the now-already-gone tx returns
+    /// PROMPTLY (never blocks on a dead actor), the conn is rolled back EXACTLY once (never twice)
+    /// and released, and the final registry state is consistent (no leaked/resurrected Active
+    /// entry). The OPPOSITE ordering — `abort` winning outright — is already covered by
+    /// `session_death_mid_statement_drops_reply_exactly_once` above (which now also carries a
+    /// dormant, never-fired `cancel` field); forcing genuine microsecond-level simultaneity between
+    /// the two signals isn't observable/controllable from outside the actor's task without adding
+    /// test-only instrumentation, so this is the closest deterministic approximation of the real
+    /// race `session/mod.rs` can produce.
+    #[tokio::test]
+    async fn cancel_then_abort_racing_same_inflight_stmt_tear_down_exactly_once() {
+        let backend = FakeBackend::new();
+        backend.block_query();
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+
+        let (tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        let cancel = CancellationToken::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "SELECT pg_sleep(9)".into(),
+                params: vec![],
+                timeout_ms: None,
+                cancel: cancel.clone(),
+                reply: reply_tx,
+            })
+            .await
+            .expect("send exec");
+
+        while pool.backend().queries_waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        // Signal #1 — mirrors `session/mod.rs`'s `registry.cancel_all()`: fire the per-request
+        // `cancel` token and let the actor run all the way to its one reply + teardown.
+        cancel.cancel();
+        let reply = reply_rx
+            .await
+            .expect("the actor replies to the per-request cancel, never drops silently here");
+        assert!(
+            matches!(reply, ExecReply::Deadline),
+            "the cancel arm must yield exactly one TxDeadline terminal, got {reply:?}"
+        );
+        done_rx
+            .wait_for(|t| *t)
+            .await
+            .expect("the actor tears down cleanly after the cancel arm, never hangs/panics");
+
+        // Signal #2 — mirrors `session/mod.rs`'s SUBSEQUENT, UNCONDITIONAL `abort_session()` call:
+        // it always runs on every session end, regardless of whether an owned actor already tore
+        // down. Must return PROMPTLY (bounded well under its own 5s abort_deadline) and must not
+        // resurrect, double-tombstone, hang on, or otherwise corrupt the now-gone entry.
+        tokio::time::timeout(Duration::from_secs(1), registry.abort_session(owner))
+            .await
+            .expect("abort_session on an already-torn-down tx must return promptly, never hang");
+
+        // The registry is left consistent: purged by `abort_session`'s own final cleanup — never
+        // still Active (no leaked/resurrected live entry after both signals fired).
+        assert_eq!(
+            registry.lookup(tx_id, owner).unwrap_err(),
+            TxLookupErr::NotFoundOrForbidden,
+            "abort_session's final purge removes the tombstone the cancel-arm teardown left"
+        );
+
+        // The conn was rolled back EXACTLY once (not twice, despite two racing teardown signals)
+        // and released — a fresh checkout on the size-1 pool succeeds (no leaked permit).
+        let co2 = pool
+            .checkout()
+            .await
+            .expect("permit released, conn returned, despite the racing second teardown signal");
+        let recorded = co2.conn().recorded.clone();
+        assert_eq!(
+            recorded.iter().filter(|s| *s == "ROLLBACK").count(),
+            1,
+            "the tx is rolled back EXACTLY once despite two teardown signals racing it: {recorded:?}"
+        );
+    }
+
     /// A BARE `57014` (an app-set `statement_timeout`) resolves through the statement's OWN
     /// completion (`ExecStep::Completed`) — no deadline/cancel select arm ever fires (no gate is
     /// armed; `arm_next_query_err` returns the error immediately). It must STILL take the same
