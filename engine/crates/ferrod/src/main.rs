@@ -25,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env();
+    config.validate()?;
     let listener = bind_uds(&config)?;
     tracing::info!(socket = %config.socket_path.display(), "ferrod listening");
 

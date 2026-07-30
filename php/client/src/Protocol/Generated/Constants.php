@@ -12,7 +12,7 @@ final class Constants
     public const MAGIC = 247;
     public const MAX_FRAME_PAYLOAD = 16777216;
     public const DEFAULT_CREDIT_FRAMES = 64;
-    public const DEFAULT_CREDIT_BYTES = 4194304;
+    public const DEFAULT_CREDIT_BYTES = 16777216;
 
     public const FLAG_CANCEL = 4;
     public const FLAG_COMPRESSED = 16;
@@ -110,5 +110,5 @@ final class Constants
     public const ERR_WRITE_UNCONFIRMED = 8193;
     public const ERR_WRITE_UNCONFIRMED_BRANCH = 2;
 
-    public const TYPE_REGISTRY_HASH = '6c1880070c299862';
+    public const TYPE_REGISTRY_HASH = 'fc0807a28c0d0ab4';
 }

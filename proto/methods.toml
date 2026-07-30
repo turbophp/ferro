@@ -2,7 +2,7 @@ protocol_version    = 1
 magic               = 0xF7
 max_frame_payload   = 16777216   # 16 MiB hard codec ceiling (W-5)
 default_credit_frames = 64
-default_credit_bytes  = 4194304  # 4 MiB per-request credit window (W-5)
+default_credit_bytes  = 16777216  # 16 MiB -- deliberately == MAX_FRAME_PAYLOAD so any single valid DATA frame always fits the per-request credit window (M1-S5 large-row rule, user-confirmed Option B)
 
 [flags]
 STREAM     = 0x01

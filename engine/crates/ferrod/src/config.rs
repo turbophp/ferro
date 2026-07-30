@@ -1,6 +1,15 @@
 //! Daemon configuration: env-loaded with defaults (charter rule: no hand-rolled protocol
-//! constants — `credit_frames`/`credit_bytes` default from `ferro_proto::consts`;
-//! `session_cap_bytes` is its OWN literal, a distinct concept from `MAX_FRAME_PAYLOAD`).
+//! constants — `credit_frames`/`credit_bytes` default from `ferro_proto::consts`).
+//!
+//! `credit_bytes` is DELIBERATELY COUPLED to `ferro_proto::consts::MAX_FRAME_PAYLOAD` (M1-S5,
+//! user-confirmed Option B for the large-row hazard — SPEC §5.2/§22): a single indivisible row
+//! can be as large as `MAX_FRAME_PAYLOAD`, and the client will not replenish a request's credit
+//! window before it has SEEN that frame, so the initial per-request byte window must always be
+//! able to fit one such frame — otherwise a large row can never be sent and the request hangs
+//! forever. `session_cap_bytes` is a separate, own-literal concept (the *aggregate* per-session
+//! cap vs. the *per-frame* codec ceiling) but is validated (`Config::validate`) to also be
+//! `>= MAX_FRAME_PAYLOAD`, for the same reason: a per-request window cannot exceed the session
+//! cap it draws from.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -9,8 +18,11 @@ use std::time::Duration;
 const DEFAULT_SOCKET_PATH: &str = "/run/ferro/dev.sock";
 
 /// Default per-session aggregate credit cap in bytes. A distinct concept from
-/// `ferro_proto::consts::MAX_FRAME_PAYLOAD` (the codec's per-frame ceiling) — do NOT couple
-/// the two.
+/// `ferro_proto::consts::MAX_FRAME_PAYLOAD` (the codec's per-frame ceiling: this is the
+/// session-wide running total, that is the per-frame limit) — its default is its OWN literal,
+/// not derived from `MAX_FRAME_PAYLOAD` the way `credit_bytes` now is. It happens to equal 16 MiB
+/// here, which already satisfies `Config::validate`'s `>= MAX_FRAME_PAYLOAD` floor (see the module
+/// doc above for why that floor exists).
 const DEFAULT_SESSION_CAP_BYTES: usize = 16 * 1024 * 1024;
 
 /// Default cap on concurrently in-flight requests per session.
@@ -74,6 +86,37 @@ impl std::fmt::Debug for PoolSpec {
             .field("pin_on_unknown", &self.pin_on_unknown)
             .finish()
     }
+}
+
+/// A `Config` invariant violated at load time. Caught by [`Config::validate`], which the daemon's
+/// `main` calls right after `Config::from_env()` (fail fast at startup, not at first request).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ConfigError {
+    /// `credit_bytes` (the per-request DATA credit window, see the module doc's M1-S5 coupling
+    /// note) is below `ferro_proto::consts::MAX_FRAME_PAYLOAD`: a single valid frame at the
+    /// ceiling could never fit the initial window, and the client will not replenish credit before
+    /// it has seen that frame — a permanent hang, reintroducing the large-row hazard this default
+    /// was coupled to close.
+    #[error(
+        "credit_bytes ({credit_bytes}) must be >= MAX_FRAME_PAYLOAD ({max_frame_payload}): a \
+         single valid DATA frame at the frame ceiling must always fit the initial per-request \
+         credit window, or a large row can never be sent (permanent hang)"
+    )]
+    CreditBytesBelowMaxFramePayload {
+        credit_bytes: u32,
+        max_frame_payload: u32,
+    },
+    /// `session_cap_bytes` (the aggregate per-session credit cap) is below `MAX_FRAME_PAYLOAD`.
+    /// Since a per-request window cannot exceed the session cap it draws from, this would make it
+    /// impossible to grant a spec-conformant (`>= MAX_FRAME_PAYLOAD`) `credit_bytes` window at all.
+    #[error(
+        "session_cap_bytes ({session_cap_bytes}) must be >= MAX_FRAME_PAYLOAD \
+         ({max_frame_payload})"
+    )]
+    SessionCapBelowMaxFramePayload {
+        session_cap_bytes: usize,
+        max_frame_payload: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +212,28 @@ impl Config {
         } else {
             self.peer_allow_uids.contains(&uid)
         }
+    }
+
+    /// Fail-fast validation of the large-row invariant (M1-S5, see the module doc): both
+    /// `credit_bytes` and `session_cap_bytes` must be `>= ferro_proto::consts::MAX_FRAME_PAYLOAD`,
+    /// or a single maximally-sized DATA frame could never fit its credit window — a permanent
+    /// hang, not merely a slow path. Called once at startup, right after `Config::from_env()`; not
+    /// re-checked per-request (a `Config` is immutable for the life of the process).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let max_frame_payload = ferro_proto::consts::MAX_FRAME_PAYLOAD;
+        if self.credit_bytes < max_frame_payload {
+            return Err(ConfigError::CreditBytesBelowMaxFramePayload {
+                credit_bytes: self.credit_bytes,
+                max_frame_payload,
+            });
+        }
+        if self.session_cap_bytes < max_frame_payload as usize {
+            return Err(ConfigError::SessionCapBelowMaxFramePayload {
+                session_cap_bytes: self.session_cap_bytes,
+                max_frame_payload: max_frame_payload as usize,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -287,6 +352,70 @@ fn env_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------------------------
+    // M1-S5 Task 1b: `credit_bytes` coupled to `MAX_FRAME_PAYLOAD` (large-row rule, user
+    // Option B) + `Config::validate` enforcing the floor on both `credit_bytes` and
+    // `session_cap_bytes`.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn default_config_credit_bytes_equals_max_frame_payload() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.credit_bytes,
+            ferro_proto::consts::MAX_FRAME_PAYLOAD,
+            "credit_bytes must default to MAX_FRAME_PAYLOAD so a single maximally-sized DATA \
+             frame always fits the initial per-request credit window"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_the_default_config() {
+        assert_eq!(Config::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_credit_bytes_below_max_frame_payload() {
+        let mut cfg = Config::default();
+        cfg.credit_bytes = ferro_proto::consts::MAX_FRAME_PAYLOAD - 1;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::CreditBytesBelowMaxFramePayload {
+                credit_bytes: ferro_proto::consts::MAX_FRAME_PAYLOAD - 1,
+                max_frame_payload: ferro_proto::consts::MAX_FRAME_PAYLOAD,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_session_cap_bytes_below_max_frame_payload() {
+        let mut cfg = Config::default();
+        cfg.session_cap_bytes = ferro_proto::consts::MAX_FRAME_PAYLOAD as usize - 1;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::SessionCapBelowMaxFramePayload {
+                session_cap_bytes: ferro_proto::consts::MAX_FRAME_PAYLOAD as usize - 1,
+                max_frame_payload: ferro_proto::consts::MAX_FRAME_PAYLOAD as usize,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_checks_credit_bytes_before_session_cap_bytes() {
+        // Both fields violated: the credit_bytes check must win (documented order), not silently
+        // report only the session_cap_bytes violation.
+        let mut cfg = Config::default();
+        cfg.credit_bytes = 0;
+        cfg.session_cap_bytes = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::CreditBytesBelowMaxFramePayload {
+                credit_bytes: 0,
+                max_frame_payload: ferro_proto::consts::MAX_FRAME_PAYLOAD,
+            })
+        );
+    }
 
     #[test]
     fn pool_spec_debug_redacts_dsn() {
