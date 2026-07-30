@@ -53,6 +53,7 @@ use ferro_proto::value::Value;
 const CTR_TABLE: &str = "ferro_s4_ctr";
 const DLK_TABLE: &str = "ferro_s4_dlk";
 const SER_TABLE: &str = "ferro_s4_ser";
+const WSKEW_TABLE: &str = "ferro_s4_wskew";
 
 // -------------------------------------------------------------------------------------------------
 // Shared chaos-harness helpers (raw side connection, in-flight proof, the counter, TX plumbing).
@@ -715,34 +716,35 @@ async fn deadlock_40p01_is_retryable_live() {
     wait_for_two_lock_waiters(&raw, &marker).await;
 
     // Postgres's own deadlock detector picks exactly one victim (whichever side's OWN periodic
-    // check discovers the cycle first, self-aborting) and errors it with 40P01; the other side
-    // normally stays genuinely blocked (still holding its own original lock) until the victim's
-    // transaction is explicitly rolled back, and then completes normally.
+    // check discovers the cycle first, self-aborting) and errors ITS blocked statement with 40P01
+    // ("deadlock detected") -- `error_map` classifies that as `Deadlock{Retryable}`. The OTHER side
+    // (the survivor) then completes NORMALLY (`Ok`) -- confirmed LIVE (a dedicated timing probe,
+    // run repeatedly against this exact harness) to resolve essentially IMMEDIATELY after the
+    // victim's error (sub-millisecond), well BEFORE this test ever issues an explicit ROLLBACK on
+    // either tx below.
     //
-    // RARE, CONFIRMED-LIVE edge case (server logs correlated while developing this test): the
-    // blocked (non-victim) side's own pooled connection can independently receive an "unexpected
-    // EOF on client connection with an open transaction" from Postgres's perspective WHILE still
-    // waiting on the lock -- a separate, rare hiccup unrelated to the deadlock resolution itself.
-    // When that happens, that side's own in-flight statement surfaces as a KNOWN-FATE connection
-    // loss on an in-tx statement (`ConnectionLost{Retryable}`, per §19.3's `in_tx: true` rule --
-    // never `Indeterminate`), and BECAUSE that side's transaction (and its locks, including the
-    // one the victim was waiting on) is gone, the victim's OWN statement can then also unblock and
-    // complete `Ok` instead of ever needing to be the one that hits the deadlock check. Either way,
-    // the two terminals are NOT assumed to arrive in a fixed order (they are two independent tasks
+    // (M4a correction: an earlier version of this comment claimed the survivor "stays blocked until
+    // the victim's transaction is explicitly rolled back" -- that mental model was never itself
+    // verified live and, taken literally, would make this test hang, since the explicit rollback
+    // below runs only AFTER both terminals are collected. The "RARE, CONFIRMED-LIVE edge case" this
+    // used to carry -- an independent connection loss on the non-victim side, tolerated as an
+    // alternative to `Deadlock` in the assertion below -- was reasoned from that same inaccurate
+    // "long open-ended block" model; with the real (sub-millisecond) resolution window there is no
+    // remaining basis for it, so the tolerance is removed: verified live, repeatedly, to still pass.)
+    //
+    // The two terminals are NOT assumed to arrive in a fixed order (they are two independent tasks
     // racing to complete and both write to the same multiplexed output stream) -- collect BOTH,
-    // matching by rid, and assert the required invariant regardless of which specific interleaving
-    // Postgres/the OS produced: EXACTLY one of the two must be the `Deadlock{Retryable}` proof this
-    // test exists for, or (the rare case) neither needs to be IF a genuine connection loss already
-    // resolved the cycle -- but even then every non-Ok outcome MUST stay Retryable, and NEITHER may
-    // ever be Indeterminate (the core §19.3 property under test, independent of this timing wrinkle).
+    // matching by rid, and assert the required invariant regardless of which side Postgres picked
+    // as the victim: EXACTLY one `Deadlock{Retryable}` and one `Ok`, NEVER `Indeterminate`.
     let mut terminals = collect_terminals(&mut client, vec![rid_a, rid_b]).await;
     let outcome_a = terminals.remove(&rid_a).expect("rid_a terminal");
     let outcome_b = terminals.remove(&rid_b).expect("rid_b terminal");
 
     let mut saw_deadlock = false;
+    let mut saw_ok = false;
     for (label, outcome) in [("cross_a", &outcome_a), ("cross_b", &outcome_b)] {
         match outcome {
-            Outcome::Ok(_) => {}
+            Outcome::Ok(_) => saw_ok = true,
             Outcome::Error(ep) => {
                 assert_ne!(
                     ep.branch,
@@ -750,20 +752,16 @@ async fn deadlock_40p01_is_retryable_live() {
                     "{label}: an in-tx statement's fate must never be Indeterminate (§19.3), got {ep:?}"
                 );
                 assert_eq!(
+                    ep.code,
+                    errc::DEADLOCK,
+                    "{label}: the only error tolerated here is the deadlock victim's, got {ep:?}"
+                );
+                assert_eq!(
                     ep.branch,
                     branch::RETRYABLE,
-                    "{label}: every non-Ok outcome here must be Retryable, got {ep:?}"
+                    "{label}: a deadlock must be Retryable, got {ep:?}"
                 );
-                if ep.code == errc::DEADLOCK {
-                    saw_deadlock = true;
-                } else {
-                    assert_eq!(
-                        ep.code,
-                        errc::CONNECTION_LOST,
-                        "{label}: the only non-deadlock error tolerated here is a known-fate \
-                         connection loss on the in-tx statement, got {ep:?}"
-                    );
-                }
+                saw_deadlock = true;
             }
             Outcome::Cancelled => panic!("{label}: Outcome::Cancelled is retired (M1-S4 T3)"),
         }
@@ -772,9 +770,15 @@ async fn deadlock_40p01_is_retryable_live() {
         saw_deadlock,
         "neither cross-update ever surfaced Deadlock/Retryable: cross_a={outcome_a:?} cross_b={outcome_b:?}"
     );
+    assert!(
+        saw_ok,
+        "the survivor's cross-update must complete Ok: cross_a={outcome_a:?} cross_b={outcome_b:?}"
+    );
 
-    // Best-effort cleanup: whichever tx is still alive gets rolled back (a tx already torn down by
-    // a connection loss just yields a benign `Protocol` "unknown tx_id", ignored here).
+    // Best-effort cleanup: both txs are still alive at this point (the victim's plain statement
+    // error does not auto-rollback its actor -- see `non_cancel_statement_error_reported_without_
+    // auto_rollback` -- and the survivor never errored at all), so both ROLLBACKs below run for
+    // real; `let _ =` only guards against an unrelated failure making cleanup itself fail the test.
     let _ = rollback(&mut client, 71, tx_a).await;
     let _ = rollback(&mut client, 72, tx_b).await;
 
@@ -886,4 +890,158 @@ async fn serialization_40001_is_retryable_live() {
     let _ = rollback(&mut client, 88, tx_b).await;
 
     assert_session_alive(&mut client, 89).await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// 8. Serialization failure (40001) caught AT COMMIT (a classic write-skew anomaly), through the TX
+//    service's COMMIT path -> Retryable, live through ferrod.
+//
+// This is the M4b regression test: `Checkout::commit_tx` (`ferro-pool/src/pool.rs`) routes through
+// `PoolBackend::simple_query`, and PRE-FIX `PgBackend::simple_query` (`ferro-backend-pg/src/
+// conn.rs`) discarded the SQLSTATE on any non-session-fatal error (`PoolError::Backend(msg)`),
+// collapsing a genuine 40001/40P01 AT COMMIT into `Protocol{NonRetryable}` -- exactly the gap
+// `serialization_40001_is_retryable_live` (test 7, above) flagged but structurally could not cover,
+// because that test's own anomaly is caught mid-STATEMENT (`Checkout::query`'s SQLSTATE-preserving
+// `error_map::map` path), never at COMMIT. Fixed by routing `simple_query`'s non-fatal error through
+// `error_map::map` too (M4b) -- this test is RED against the pre-fix `PoolError::Backend` behavior
+// (it observes `Protocol`/`NonRetryable`) and GREEN once `simple_query` preserves the SQLSTATE.
+//
+// The classic "doctors on call" write-skew anomaly (Cahill et al / the PostgreSQL SSI docs): two
+// rows both start "true"; two SERIALIZABLE txs each read BOTH rows (establishing a read dependency
+// on both), then each flips ONE row to "false" (a different row per tx, so the writes never
+// conflict/block each other) after confirming "the other one is still true". Both UPDATEs succeed
+// (no row-lock contention -- confirmed live while writing this test), because neither transaction
+// has committed yet, so Postgres cannot yet know whether the cycle is genuinely dangerous. The
+// rw-dependency cycle (tx_a reads b's row / tx_b writes it; tx_b reads a's row / tx_a writes it) is
+// only detected once the transactions start committing: the FIRST commit succeeds cleanly, and the
+// SECOND is the one Postgres aborts with 40001 ("Reason code: Canceled on identification as a
+// pivot, during commit attempt" -- confirmed live), never during either UPDATE statement. This is
+// SSI deferring the pivot check to COMMIT, the dominant real-world SERIALIZABLE-conflict shape the
+// S4 gate ("a serialization/deadlock -> Retryable", unqualified) is about.
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_time_serialization_write_skew_is_retryable_live() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = exec_server(url);
+    let mut client = server.connect().await;
+    client.hello(1).await;
+
+    let run = unique_key("wskew");
+    let key_a = format!("{run}_a");
+    let key_b = format!("{run}_b");
+
+    ensure_table(
+        &mut client,
+        90,
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {WSKEW_TABLE} (key text primary key, on_call boolean not null)"
+        ),
+    )
+    .await;
+
+    // Seed both rows "on call" (true) -- the invariant both txs will each (wrongly, concurrently)
+    // believe is safe to break on their own row alone.
+    for (rid, key) in [(91, &key_a), (92, &key_b)] {
+        let mut w = req(&format!(
+            "INSERT INTO {WSKEW_TABLE} (key, on_call) VALUES (?, true)"
+        ));
+        w.readonly = false;
+        w.fetch = 1;
+        w.params = vec![Value::Text(key.clone())];
+        match exec(&mut client, rid, &w).await {
+            Outcome::Ok(_) => {}
+            other => panic!("seed wskew row {key:?} failed: {other:?}"),
+        }
+    }
+
+    let iso = Some(u8::from(Isolation::Serializable));
+    let tx_a = begin(&mut client, 93, "default", iso, false).await;
+    let tx_b = begin(&mut client, 94, "default", iso, false).await;
+
+    // Both txs read BOTH rows first (establishing the rw-dependency on both sides) -- sequential
+    // awaits are fine here (unlike the deadlock test): SERIALIZABLE reads take SIREAD predicate
+    // locks, which never block a concurrent reader/writer, so there is no lock-contention race to
+    // prove -- only the eventual COMMIT-time check matters.
+    for (rid, tx) in [(95, tx_a), (96, tx_b)] {
+        let mut r = req(&format!(
+            "SELECT count(*) FROM {WSKEW_TABLE} WHERE key IN (?, ?) AND on_call = true"
+        ));
+        r.tx_id = Some(tx);
+        r.params = vec![Value::Text(key_a.clone()), Value::Text(key_b.clone())];
+        match exec(&mut client, rid, &r).await {
+            Outcome::Ok(_) => {}
+            other => panic!("write-skew read failed: {other:?}"),
+        }
+    }
+
+    // Each tx flips its OWN row to false -- a different row per tx, so neither UPDATE blocks or
+    // conflicts with the other; both succeed (confirmed live: no error surfaces here).
+    let mut upd_a = req(&format!(
+        "UPDATE {WSKEW_TABLE} SET on_call = false WHERE key = ?"
+    ));
+    upd_a.tx_id = Some(tx_a);
+    upd_a.readonly = false;
+    upd_a.fetch = 1;
+    upd_a.params = vec![Value::Text(key_a.clone())];
+    match exec(&mut client, 97, &upd_a).await {
+        Outcome::Ok(_) => {}
+        other => panic!("tx_a's update failed: {other:?}"),
+    }
+
+    let mut upd_b = req(&format!(
+        "UPDATE {WSKEW_TABLE} SET on_call = false WHERE key = ?"
+    ));
+    upd_b.tx_id = Some(tx_b);
+    upd_b.readonly = false;
+    upd_b.fetch = 1;
+    upd_b.params = vec![Value::Text(key_b.clone())];
+    match exec(&mut client, 98, &upd_b).await {
+        Outcome::Ok(_) => {}
+        other => panic!("tx_b's update failed: {other:?}"),
+    }
+
+    // tx_a commits first -- clean, no anomaly detected yet.
+    match commit(&mut client, 99, tx_a).await {
+        Outcome::Ok(_) => {}
+        other => panic!("tx_a's commit (first committer) should succeed, got {other:?}"),
+    }
+
+    // tx_b's COMMIT is where Postgres's SSI detector identifies the pivot and aborts with 40001 --
+    // THE commit-time case this test exists to prove. This is the SQLSTATE-preserving assertion:
+    // pre-fix, `Checkout::commit_tx` -> `PgBackend::simple_query`'s `PoolError::Backend(msg)` would
+    // have discarded the SQLSTATE and this would classify `Protocol`/`NonRetryable` instead.
+    let ep = match commit(&mut client, 100, tx_b).await {
+        Outcome::Error(ep) => ep,
+        other => {
+            panic!("tx_b's commit must be rejected with a serialization failure, got {other:?}")
+        }
+    };
+    assert_eq!(
+        ep.code,
+        errc::SERIALIZATION_FAILURE,
+        "a commit-time SSI write-skew abort must classify as SerializationFailure, got {ep:?}"
+    );
+    assert_eq!(
+        ep.branch,
+        branch::RETRYABLE,
+        "a commit-time serialization failure must be Retryable, got {ep:?}"
+    );
+    assert_ne!(
+        ep.branch,
+        branch::NON_RETRYABLE,
+        "must NOT be misclassified NonRetryable (the pre-fix M4b bug), got {ep:?}"
+    );
+
+    // The TX actor tears the tx down unconditionally on ANY Commit reply (Ok or Err) -- tx_b's
+    // tx_id is already gone (conn returned to the pool via RAII), no explicit rollback needed.
+    let mut cleanup = req(&format!("DELETE FROM {WSKEW_TABLE} WHERE key IN (?, ?)"));
+    cleanup.readonly = false;
+    cleanup.fetch = 1;
+    cleanup.params = vec![Value::Text(key_a), Value::Text(key_b)];
+    let _ = exec(&mut client, 101, &cleanup).await;
+
+    assert_session_alive(&mut client, 102).await;
 }

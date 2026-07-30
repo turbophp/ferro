@@ -175,6 +175,20 @@ impl PoolBackend for PgBackend {
         Some(ResetProfile::Targeted)
     }
 
+    /// M1-S4 fix (M4b, whole-branch final review): routed through the SAME `is_session_fatal`-first
+    /// `error_map::map` the row-returning `query` path already uses, rather than a hand-rolled
+    /// `if is_session_fatal { ConnectionLost } else { Backend(str) }`. The old `Backend(str)` arm
+    /// DISCARDED the SQLSTATE — and `Checkout::commit_tx`/`rollback_tx`/`tx_control` (`pool.rs`) all
+    /// route through this method, so a `40001`(serialization)/`40P01`(deadlock) conflict surfacing
+    /// AT COMMIT (the dominant SERIALIZABLE case — SSI defers the pivot check to COMMIT) used to
+    /// mis-classify `Protocol{NonRetryable}` instead of `Retryable{SerializationFailure/Deadlock}`.
+    /// `error_map::map` is `is_session_fatal`-first, so this changes NOTHING about the fatal branch
+    /// (still `ConnectionLost` → §19.3 `WriteUnconfirmed{Indeterminate}` for a lost COMMIT, byte-for-
+    /// byte identical to before — see `declare_ctl_maps_replies_including_commit_loss_indeterminate`
+    /// in `ferrod`'s `sql.rs`), only the non-fatal arm: a genuine SQLSTATE now survives as
+    /// `PoolError::Sql{code, branch, sqlstate, message}` and passes through `classify_fate` verbatim
+    /// (see `serialization_40001... `/`commit_time_serialization_write_skew_is_retryable_live` in
+    /// `ferrod`'s `chaos_fate_it.rs`), exactly like `Checkout::query` already does.
     async fn simple_query(&self, conn: &mut Self::Conn, sql: &str) -> Result<u64, PoolError> {
         conn.client.batch_execute(sql).await.map(|_| 0u64).map_err(|e| {
             if is_session_fatal(&e) {
@@ -182,10 +196,8 @@ impl PoolBackend for PgBackend {
                     error = %e,
                     "ferro-backend-pg: simple_query hit a session-ending failure (connection considered lost)"
                 );
-                PoolError::ConnectionLost
-            } else {
-                PoolError::Backend(e.to_string())
             }
+            crate::error_map::map(&e)
         })
     }
 

@@ -320,15 +320,23 @@ async fn pg_max_lifetime_recycles_live() {
     );
 }
 
-/// IMPORTANT 2 (S4 review): the FATAL-severity-vs-DbError classification in `conn.rs`'s
-/// `simple_query` had zero coverage of the `Backend`/`NonRetryable` arm -- only the
-/// `ConnectionLost`/`Retryable` arm (a killed backend, `pg_killed_backend_evicted_no_retry` above)
-/// was exercised live. A genuine SQL error (severity ERROR, not FATAL/PANIC) must classify as
-/// `PoolError::Backend` + `Branch::NonRetryable`, never be misclassified as the retryable
-/// `ConnectionLost` -- and the connection itself must stay alive and reusable afterward, since
-/// nothing about the session actually ended.
+/// IMPORTANT 2 (S4 review), UPDATED (M1-S4 M4b whole-branch final review): the FATAL-severity-vs-
+/// DbError classification in `conn.rs`'s `simple_query` had zero coverage of the non-fatal arm --
+/// only the `ConnectionLost`/`Retryable` arm (a killed backend, `pg_killed_backend_evicted_no_retry`
+/// above) was exercised live. A genuine SQL error (severity ERROR, not FATAL/PANIC) must classify as
+/// a NonRetryable statement-level error, never be misclassified as the retryable `ConnectionLost` --
+/// and the connection itself must stay alive and reusable afterward, since nothing about the session
+/// actually ended.
+///
+/// M4b changed `simple_query`'s non-fatal arm from the coarse `PoolError::Backend(String)` (SQLSTATE
+/// discarded) to the SQLSTATE-preserving `PoolError::Sql{code, branch, sqlstate, message}` --
+/// `Checkout::query`'s path (`error_map::map`) already produced this shape; `simple_query` now
+/// matches it exactly, which is what makes a commit-time `40001`/`40P01` classify correctly (see
+/// `ferrod`'s `chaos_fate_it.rs`'s `commit_time_serialization_write_skew_is_retryable_live`). This
+/// test's core property -- NonRetryable, never the retryable `ConnectionLost`, connection survives --
+/// is unchanged; only the exact `PoolError` variant + the now-preserved SQLSTATE are asserted.
 #[tokio::test(flavor = "multi_thread")]
-async fn pg_syntax_error_classifies_as_backend_nonretryable() {
+async fn pg_syntax_error_classifies_as_sql_nonretryable() {
     let Some(url) = test_url() else {
         return;
     };
@@ -340,10 +348,16 @@ async fn pg_syntax_error_classifies_as_backend_nonretryable() {
         .exec("SELECT * FROM nonexistent_table_xyz")
         .await
         .expect_err("querying a nonexistent table must fail");
-    assert!(
-        matches!(err, PoolError::Backend(_)),
-        "a genuine SQL error (undefined table) must classify as PoolError::Backend, got {err:?}"
-    );
+    match &err {
+        PoolError::Sql { sqlstate, .. } => assert_eq!(
+            sqlstate.as_deref(),
+            Some("42P01"),
+            "undefined table must preserve its SQLSTATE, got {err:?}"
+        ),
+        other => panic!(
+            "a genuine SQL error (undefined table) must classify as PoolError::Sql, got {other:?}"
+        ),
+    }
     assert_eq!(
         err.taxonomy_branch(),
         Branch::NonRetryable,
@@ -357,10 +371,14 @@ async fn pg_syntax_error_classifies_as_backend_nonretryable() {
         .exec("SEL ECT 1")
         .await
         .expect_err("a syntax error must fail");
-    assert!(
-        matches!(err2, PoolError::Backend(_)),
-        "a syntax error must also classify as PoolError::Backend, got {err2:?}"
-    );
+    match &err2 {
+        PoolError::Sql { sqlstate, .. } => assert_eq!(
+            sqlstate.as_deref(),
+            Some("42601"),
+            "a syntax error must preserve its SQLSTATE, got {err2:?}"
+        ),
+        other => panic!("a syntax error must also classify as PoolError::Sql, got {other:?}"),
+    }
     assert_eq!(err2.taxonomy_branch(), Branch::NonRetryable);
 
     // The connection itself must still be alive and usable afterward: proof the errors above were
