@@ -251,6 +251,7 @@ dependencies = [
  "nix",
  "thiserror",
  "tokio",
+ "tokio-postgres",
  "tokio-util",
  "tracing",
  "tracing-subscriber",

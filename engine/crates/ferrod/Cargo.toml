@@ -27,3 +27,9 @@ nix = { version = "0.29", features = ["socket", "user"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util", "time", "test-util"] }
+# The chaos live suite (M1-S4 Task 4, `tests/chaos_fate_it.rs`) needs a RAW side connection to
+# Postgres — independent of ferrod's own pool — to `pg_terminate_backend(pid)` a targeted backend
+# and to poll `pg_stat_activity` for proof a statement is genuinely in flight before firing a
+# kill/CANCEL. Resolves to the SAME vendored fork `ferro-backend-pg` uses (workspace
+# `[patch.crates-io]`), so no second copy of the driver is compiled in.
+tokio-postgres = "0.7"
