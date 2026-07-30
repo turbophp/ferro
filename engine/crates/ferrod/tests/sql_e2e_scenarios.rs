@@ -4,8 +4,9 @@
 //! fate matrix), this suite proves the SAME real client→UDS→ferrod→pool→Docker-PG→client path holds
 //! under realistic *multi-request* conditions: concurrent multiplexed EXECs on one session, a
 //! per-request error that must NOT poison the session, a PING answered while a slow EXEC is still
-//! in flight (reader stays responsive), a CANCEL against an in-flight EXEC (the documented M0
-//! no-op), and a boot-epoch change observed across a daemon "restart".
+//! in flight (reader stays responsive), a CANCEL against an in-flight EXEC (M1-S4: enforced —
+//! `Cancelled{NonRetryable}` for a read), and a boot-epoch change observed across a daemon
+//! "restart".
 //!
 //! It reuses the ONE shared harness in `common/mod.rs` (`TestServer`/`TestClient`, plus the lifted
 //! `pg_url`/`exec_server`/`req`/`exec_ok`/`exec_err`/`assert_session_alive`) — a genuine round trip
@@ -28,7 +29,7 @@ mod common;
 use std::time::Instant;
 
 use common::{TestServer, assert_session_alive, exec_err, exec_ok, exec_server, pg_url, req};
-use ferro_proto::consts::{errc, flags, method_core, method_sql, service};
+use ferro_proto::consts::{branch, errc, flags, method_core, method_sql, service};
 use ferro_proto::messages::Outcome;
 use ferro_proto::messages::sql::ExecOk;
 use ferro_proto::value::Value;
@@ -39,6 +40,14 @@ use ferrod::epoch::BootEpoch;
 /// `Unsupported` — so `SELECT pg_sleep(0.2), 1` would break the PING/CANCEL scenarios. Selecting a
 /// constant `FROM pg_sleep(..)` keeps the delay while shipping a supported column (verified live).
 const SLOW_ROW_SQL: &str = "SELECT 1 FROM pg_sleep(0.2)";
+
+/// A LONGER-sleeping sibling of [`SLOW_ROW_SQL`], used ONLY by `cancel_in_flight_exec` — that test
+/// needs a real margin BEYOND however long `checkout()` (a first-time `connect()` to Postgres)
+/// takes, which was empirically measured at ~150 ms in this dev environment (WSL2's Docker
+/// port-forwarding path). `SLOW_ROW_SQL`'s 200 ms is too tight a budget for that; every OTHER
+/// scenario in this file keeps using `SLOW_ROW_SQL` (their timing math, e.g.
+/// `concurrent_multiplexed_execs`'s serialized-floor check, depends on the 200 ms figure).
+const CANCELLABLE_SLEEP_SQL: &str = "SELECT 1 FROM pg_sleep(1.5)";
 
 // -------------------------------------------------------------------------------------------------
 // concurrent_multiplexed_execs — one session multiplexes N in-flight EXECs (each handler owns its
@@ -221,10 +230,12 @@ async fn ping_during_in_flight_exec() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// cancel_in_flight_exec — the TRUE M0 behavior: the EXEC handler binds its cancel token as `_cancel`
-// (sql.rs) and NEVER reads it, so a CANCEL is a NO-OP — it neither aborts the query nor yields
-// `Outcome::Cancelled`; `co.query` runs to completion and the terminal is `Outcome::Ok`. A
-// cancel-aware handler is post-M0.
+// cancel_in_flight_exec — M1-S4: the autocommit EXEC path now ENFORCES the per-request `CANCEL`
+// flag via a biased `tokio::select!` (`sql.rs`'s `run_autocommit_exec`): the query is polled first
+// (so `sent` is honest), then a routed CANCEL fires the out-of-band cancel and drains the query to
+// its erroring (`57014`) completion. This request is a READ (`req()`'s default `readonly: true`),
+// so §19.3 routes it to `Cancelled{NonRetryable}` — never `Indeterminate` (there is no
+// `Cancelled/Retryable` wire pairing) and never the old M0 `Outcome::Ok` no-op.
 // -------------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -239,15 +250,27 @@ async fn cancel_in_flight_exec() {
     // Interleave explicitly (NOT the atomic `exec()` helper): fire the slow EXEC, then CANCEL its id
     // WHILE it is in flight, then read the single terminal. The reader processes the two frames in
     // FIFO order, so the request is registered before the CANCEL reaches `registry.cancel(rid)`.
+    //
+    // The delay before the CANCEL is load-bearing, NOT cosmetic: Postgres CLEARS a pending cancel
+    // signal that arrives before the backend has actually started reading/executing the targeted
+    // command (the well-known "a cancel sent between statements has no effect" behavior —
+    // `QueryCancelPending` is reset at the top of the backend's next-command loop). This request's
+    // EXEC is the FIRST on a brand-new pool, so the handler's `checkout()` pays a real `connect()` —
+    // empirically ~150 ms in this dev environment (WSL2's Docker port-forwarding path) — entirely
+    // BEFORE the query is ever dispatched; a CANCEL sent any earlier races that connect+dispatch and
+    // is silently discarded by Postgres rather than interrupting the (not-yet-started) statement.
+    // 600 ms is a 4x margin over that measured cost, and `CANCELLABLE_SLEEP_SQL`'s 1.5 s leaves ~900
+    // ms of remaining budget for the cancel to land — comfortably inside `RECV_TIMEOUT` (2 s).
     let rid = 210;
     client
         .send_request(
             rid,
             service::SQL,
             method_sql::EXEC,
-            req(SLOW_ROW_SQL).encode(),
+            req(CANCELLABLE_SLEEP_SQL).encode(),
         )
         .await;
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     client.cancel(rid).await;
 
     let terminal = client.recv().await;
@@ -255,27 +278,33 @@ async fn cancel_in_flight_exec() {
     assert_eq!(
         terminal.header.flags & flags::END,
         flags::END,
-        "the (un-cancelled) EXEC terminal still carries exactly one END"
+        "the cancelled EXEC terminal still carries exactly one END"
     );
     assert_eq!(terminal.header.service, service::SQL);
     assert_eq!(terminal.header.method, method_sql::EXEC);
 
     match Outcome::decode(&terminal.payload).expect("decode Outcome") {
-        Outcome::Ok(body) => {
-            let ok = ExecOk::decode(&body).expect("decode ExecOk");
+        Outcome::Error(ep) => {
             assert_eq!(
-                ok.rows,
-                vec![vec![Value::I64(1)]],
-                "M0 CANCEL is a no-op: the slow query ran to completion and returned its row"
+                ep.code,
+                errc::CANCELLED,
+                "a cancelled READ is Cancelled, never Indeterminate/a bare Retryable"
+            );
+            assert_eq!(
+                ep.branch,
+                branch::NON_RETRYABLE,
+                "there is no Cancelled/Retryable wire pairing — a read cancel rides NonRetryable"
             );
         }
-        Outcome::Cancelled => {
-            panic!("M0 CANCEL does not abort EXEC — the handler binds `_cancel` and never reads it")
-        }
-        other => panic!("expected Outcome::Ok (CANCEL is a no-op in M0), got {other:?}"),
+        Outcome::Ok(_) => panic!(
+            "CANCEL is enforced as of M1-S4: the query must have been interrupted, not run to \
+             completion (if this flakes, the cancel lost a legitimate race — investigate timing, \
+             don't just widen the assertion to accept Ok)"
+        ),
+        other => panic!("expected Outcome::Error{{Cancelled}}, got {other:?}"),
     }
 
-    // Session survives AND exactly one END was produced for `rid` (no stray Cancelled/second frame).
+    // Session survives AND exactly one END was produced for `rid` (no stray Ok/second frame).
     assert_session_alive(&mut client, 5).await;
 }
 

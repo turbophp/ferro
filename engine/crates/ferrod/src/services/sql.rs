@@ -13,6 +13,18 @@
 //!     inherits (a cross-tenant leak — charter rule 6). The `Checkout` guard is DROPPED here (RAII
 //!     → the conn returns to the pool) BEFORE any framing/sending, so a slow client can never hold
 //!     a pooled connection and `exec_us` reflects only the query (never client send time).
+//!
+//!     **M1-S4:** the autocommit path enforces `ExecRequest.timeout_ms` and the per-request
+//!     `CANCEL` flag ([`run_autocommit_exec`]) via a `biased` `tokio::select!` that polls the query
+//!     FIRST (mirroring the S6 tx actor's proven pattern, `tx/actor.rs` ~247-273) — so `sent` is
+//!     honest whenever a later arm wins — and DRAINS (never drops) the query future on a
+//!     timeout/cancel, via the out-of-band [`ferro_pool::backend::Cancel`] handle fired over a side
+//!     connection. The drained value is a genuine `Result`: an `Ok` (the cancel/timeout LOST the
+//!     race) is reported as the real success terminal, never fabricated as an error; an `Err` is
+//!     mapped through `fate::classify_fate`. `responder.end_cancelled()`/`Outcome::Cancelled` are
+//!     NOT used here — a fated cancel/timeout always rides a branch-carrying `Outcome::Error`
+//!     (`Cancelled{NonRetryable}` for a read, `WriteUnconfirmed{Indeterminate}` for a dispatched
+//!     write) — see [`declare_autocommit_exec`].
 //!  5. shape by `fetch` (`rows` → include rows; `none` → drop rows, keep `cols`+`affected`), encode
 //!     the terminal body, and SIZE-CHECK the FULLY-ENCODED `Outcome::Ok` payload (not the raw body
 //!     — see [`OUTCOME_OK_OVERHEAD`]).
@@ -36,11 +48,14 @@ use futures::FutureExt;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use ferro_pool::backend::QueryResult;
+use ferro_pool::backend::{Cancel, PoolBackend, QueryResult};
+use ferro_pool::error::PoolError;
+use ferro_pool::pool::Checkout;
 use ferro_proto::consts::{MAX_FRAME_PAYLOAD, errc, method_sql, method_tx, service};
 use ferro_proto::messages::ErrorPayload;
 use ferro_proto::messages::sql::{ExecOk, ExecRequest, Stats};
 use ferro_proto::messages::tx::{BeginRequest, BeginResponse, SavepointRequest, TxControl};
+use ferro_proto::value::Value;
 
 use crate::pools::PoolRegistry;
 use crate::services::fate::{self, OpContext};
@@ -89,7 +104,7 @@ pub fn make_handler(
     Arc::new(move |session_id| -> HandlerFn {
         let registry = registry.clone();
         let tx_registry = tx_registry.clone();
-        Arc::new(move |frame, responder, _cancel| {
+        Arc::new(move |frame, responder, cancel| {
             let registry = registry.clone();
             let tx_registry = tx_registry.clone();
             async move {
@@ -102,6 +117,7 @@ pub fn make_handler(
                     idle_in_tx,
                     max_tx,
                     teardown_timeout,
+                    cancel,
                 )
                 .await;
             }
@@ -120,10 +136,11 @@ async fn handle(
     idle_in_tx: Duration,
     max_tx: Duration,
     teardown_timeout: Duration,
+    cancel: CancellationToken,
 ) {
     match (frame.header.service, frame.header.method) {
         (service::SQL, method_sql::EXEC) => {
-            handle_exec(frame, responder, registry, tx_registry, session_id).await
+            handle_exec(frame, responder, registry, tx_registry, session_id, cancel).await
         }
         (service::TX, method_tx::BEGIN) => {
             handle_begin(
@@ -173,6 +190,7 @@ async fn handle_exec(
     registry: &PoolRegistry,
     tx_registry: &TxRegistry,
     session_id: SessionId,
+    cancel: CancellationToken,
 ) {
     // (1) decode the per-request payload.
     let req = match ExecRequest::decode(&frame.payload) {
@@ -269,7 +287,7 @@ async fn handle_exec(
             }
         }
 
-        // ---- autocommit EXEC: the S5 path, byte-for-byte unchanged ----
+        // ---- autocommit EXEC: the S5 path, now with M1-S4's timeout_ms + CANCEL enforcement ----
         None => {
             let Some(pool) = registry.get(&req.pool) else {
                 responder.end_error(unsupported(format!("unknown pool {:?}", req.pool)));
@@ -296,40 +314,136 @@ async fn handle_exec(
             };
             let queue_us = co.stats().queue_us;
 
-            // (4) run the GUARDED row-returning entry. exec_us times ONLY the DB query — the conn is
-            // released (below) before framing, so a slow client cannot inflate it (D-S5-1). NEVER
-            // conn_mut()/the raw client here (that bypasses the tx-control guard → cross-tenant leak).
-            let exec_start = Instant::now();
-            let result = co.query(sql, &req.params).await;
-            let exec_us = exec_start.elapsed().as_micros() as u64;
+            // (4) run the GUARDED, INTERRUPTIBLE row-returning entry: enforces `timeout_ms` + the
+            // per-request CANCEL via a biased select that polls the query FIRST, so `sent` is
+            // honest for whatever `Err` comes back (see `run_autocommit_exec`'s doc). exec_us times
+            // ONLY the DB call — the conn is released (below) before framing, so a slow client
+            // cannot inflate it (D-S5-1). NEVER conn_mut()/the raw client here (that bypasses the
+            // tx-control guard → cross-tenant leak).
+            let (result, exec_us) =
+                run_autocommit_exec(&mut co, sql, &req.params, req.timeout_ms, &cancel).await;
 
-            // Release the pooled connection BEFORE framing/sending (RAII): held only for the query.
+            // Release the pooled connection BEFORE framing/sending (RAII): held only for the
+            // query. A cancelled/timed-out statement returns Err(57014) here, which
+            // `Checkout::query`'s S1 unconditional Err-arm fail-safe ALREADY taints regardless of
+            // the RFQ byte — so `co` is never handed back dirty; the next checkout's S3 recycle
+            // DISCARD-ALLs it before the next tenant.
             drop(co);
 
-            let result = match result {
-                Ok(r) => r,
-                Err(e) => {
-                    // The statement WAS transmitted (checkout succeeded, `co.query` ran), so a
-                    // connection loss here has a genuinely UNKNOWN fate → §19.3 eligible (sent=true).
-                    // This is the autocommit path: in_tx=false.
-                    responder.end_error(fate::classify_fate(
-                        e,
-                        OpContext {
-                            readonly: req.readonly,
-                            sent: true,
-                            in_tx: false,
-                        },
-                    ));
-                    return;
-                }
-            };
-
-            // (5)+(6) shape, size-check the ENCODED terminal payload, declare the single terminal.
-            match build_terminal_body(result, req.fetch, queue_us, exec_us) {
-                Ok(body) => responder.end_ok(Bytes::from(body)),
-                Err(ep) => responder.end_error(ep),
-            }
+            // (5)+(6) Ok → the real success terminal, even if a cancel/timeout raced it and lost
+            // (§5.2/§19.3 — never fabricate an error for a statement that actually completed); Err
+            // → `fate::classify_fate` with the HONEST `sent: true` (a later-winning timeout/cancel
+            // arm only ever fires after the query was already polled at least once — see
+            // `run_autocommit_exec`). This is the autocommit path: in_tx=false.
+            declare_autocommit_exec(
+                responder,
+                result,
+                req.fetch,
+                queue_us,
+                exec_us,
+                req.readonly,
+            );
         }
+    }
+}
+
+/// Run one autocommit statement against `co`, honoring `timeout_ms` and the per-request `cancel`
+/// token via a `biased` `tokio::select!` that polls the query future FIRST — mirroring the S6 tx
+/// actor's proven pattern (`tx/actor.rs`'s `TxCommand::Exec` inner select!, ~247-273) exactly,
+/// just without the actor's rollback/tombstone teardown (there is no transaction here).
+///
+/// **Why `sent` is honest.** Because the query is polled first every round, a timeout/cancel arm
+/// can only ever WIN a round in which the query was ALSO polled (and was not yet ready) — so by
+/// the time either arm wins, the statement has already been dispatched to the backend at least
+/// once. This is what licenses the caller to report `sent: true` for whatever `Err` this function
+/// returns, without hardcoding it blind (a `sent: true` that were NOT honestly earned would let an
+/// unsent write be misreported as `Indeterminate` instead of the correct `Retryable`).
+///
+/// **Drain, don't drop.** On a timeout/cancel win, the out-of-band [`Cancel`] handle — captured
+/// BEFORE the query borrow, exactly like the actor, since a live `tokio-postgres` query future
+/// holds `&mut Client` and the cancel MUST fire over a SEPARATE connection — fires, then the query
+/// future is AWAITED to its completion (never dropped: a dropped mid-flight statement's fate would
+/// be unknowable, and could leave the connection mid-protocol). The drained value is a genuine
+/// `Result`, not a synthesized one:
+/// - `Ok(qr)` — the cancel/timeout LOST the race: the statement actually completed. The caller
+///   MUST treat this as a real success (§5.2/§19.3 — never fabricate a cancel/error for a
+///   statement that finished).
+/// - `Err(e)` — the statement's real outcome. A cancelled/timed-out statement surfaces PG's
+///   `57014`, which `fate::classify_fate`'s override then routes by `readonly`/`in_tx`.
+///
+/// Returns `(drained result, exec_us)`; `exec_us` measures only this call, matching the
+/// pre-existing `build_terminal_body` stats contract.
+async fn run_autocommit_exec<B: PoolBackend>(
+    co: &mut Checkout<B>,
+    sql: &str,
+    params: &[Value],
+    timeout_ms: Option<u32>,
+    cancel: &CancellationToken,
+) -> (Result<QueryResult, PoolError>, u64) {
+    // Capture the out-of-band cancel handle BEFORE the mutable query borrow: it returns an OWNED
+    // handle, so this borrow of `co` ends immediately and does not conflict with the `&mut co` the
+    // query future then holds (mirrors `tx/actor.rs`'s `co.cancel_handle()` at ~247).
+    let cancel_handle = co.cancel_handle();
+    let exec_start = Instant::now();
+    let query_fut = co.query(sql, params);
+    tokio::pin!(query_fut);
+
+    let result = tokio::select! {
+        biased;
+
+        // Polled FIRST every round: a statement that completes is never spuriously reported as
+        // interrupted, even against an already-fired timer/cancel — this is both what makes `sent`
+        // honest (see the doc above) and what makes the Ok-lost-race case possible at all.
+        r = &mut query_fut => r,
+
+        () = sleep_opt(timeout_ms) => {
+            cancel_handle.cancel().await;
+            (&mut query_fut).await
+        }
+        () = cancel.cancelled() => {
+            cancel_handle.cancel().await;
+            (&mut query_fut).await
+        }
+    };
+    (result, exec_start.elapsed().as_micros() as u64)
+}
+
+/// `Some(ms)` → a real `tokio::time::sleep` deadline; `None` → a future that NEVER resolves (NOT a
+/// 0ms timer) so [`run_autocommit_exec`]'s timeout arm is effectively absent when the caller
+/// passed no deadline — a `timeout_ms: None` request must behave exactly as before M1-S4.
+async fn sleep_opt(ms: Option<u32>) {
+    match ms {
+        Some(ms) => tokio::time::sleep(Duration::from_millis(u64::from(ms))).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Declare the autocommit EXEC terminal from a [`run_autocommit_exec`] result: `Ok` frames the
+/// normal success terminal via [`build_terminal_body`] — a statement that actually completed is
+/// ALWAYS reported as success, even if a cancel/timeout raced it and lost; `Err` maps through
+/// [`fate::classify_fate`] with `sent: true` (honest — see `run_autocommit_exec`'s doc) and
+/// `in_tx: false` (this is the autocommit path, never an in-transaction statement).
+fn declare_autocommit_exec(
+    responder: Responder,
+    result: Result<QueryResult, PoolError>,
+    fetch: u8,
+    queue_us: u64,
+    exec_us: u64,
+    readonly: bool,
+) {
+    match result {
+        Ok(r) => match build_terminal_body(r, fetch, queue_us, exec_us) {
+            Ok(body) => responder.end_ok(Bytes::from(body)),
+            Err(ep) => responder.end_error(ep),
+        },
+        Err(e) => responder.end_error(fate::classify_fate(
+            e,
+            OpContext {
+                readonly,
+                sent: true,
+                in_tx: false,
+            },
+        )),
     }
 }
 
@@ -699,11 +813,12 @@ fn tx_deadline(message: impl Into<String>) -> ErrorPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferro_pool::error::PoolError;
+    use ferro_pool::config::PoolConfig;
+    use ferro_pool::fake::FakeBackend;
+    use ferro_pool::pool::Pool;
     use ferro_proto::consts::{branch, tag};
     use ferro_proto::messages::Outcome;
     use ferro_proto::messages::sql::ColMeta;
-    use ferro_proto::value::Value;
 
     /// Locks `OUTCOME_OK_OVERHEAD` against `Outcome::Ok`'s ACTUAL envelope, so the size-cap can
     /// never silently drift out of sync with the codec (which would re-open the BLOCKER-v2 teardown).
@@ -917,5 +1032,218 @@ mod tests {
             }
             other => panic!("expected ConnectionLost, got {other:?}"),
         }
+    }
+
+    // ---- M1-S4 Task 2: run_autocommit_exec / declare_autocommit_exec ---------------------------
+    //
+    // Deterministic `FakeBackend`-driven proofs of the biased-select/drain-to-Result mechanics
+    // that back the autocommit EXEC path's `timeout_ms` + per-request CANCEL enforcement —
+    // mirroring exactly how `tx/actor.rs`'s own deadline/abort tests drive the same primitives
+    // (`FakeBackend::block_query` + `FakeCancelHandle`), just without a transaction. Each test also
+    // routes its `run_autocommit_exec` result through the REAL `declare_autocommit_exec` (not a
+    // copy), so the wire-shaped `Terminal`/`ErrorPayload` asserted here is what the handler would
+    // actually declare, not a stand-in.
+
+    fn autocommit_test_pool_config() -> PoolConfig {
+        PoolConfig {
+            max_size: 1, // one conn: a fresh checkout after a taint proves the recycle ran
+            checkout_timeout: Duration::from_secs(5),
+            max_lifetime: Duration::from_secs(3600),
+            reap_interval: None, // deterministic: no background reaper
+            ..PoolConfig::default()
+        }
+    }
+
+    /// A `timeout_ms`-elapsed autocommit WRITE → the drained `Err` is a 57014-shaped cancel, and
+    /// declaring it (readonly=false, i.e. a write) yields `WriteUnconfirmed{Indeterminate}` — never
+    /// `Cancelled{NonRetryable}`, never a bare `Retryable` (§19.3: a dispatched write's
+    /// non-execution is UNCONFIRMED, not known).
+    #[tokio::test(start_paused = true)]
+    async fn autocommit_write_timeout_drains_to_indeterminate() {
+        let backend = FakeBackend::new();
+        backend.block_query(); // freeze the statement mid-flight
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+        let mut co = pool.checkout().await.expect("checkout");
+
+        let cancel = CancellationToken::new(); // never fired — the TIMER must fire instead
+        let (result, _exec_us) =
+            run_autocommit_exec(&mut co, "UPDATE t SET n = n + 1", &[], Some(20), &cancel).await;
+
+        let e = result.expect_err("a timed-out statement must drain to an Err, never Ok");
+        assert!(
+            matches!(&e, PoolError::Sql { sqlstate, .. } if sqlstate.as_deref() == Some("57014")),
+            "expected a 57014-shaped cancel, got {e:?}"
+        );
+
+        // `sent: true` is honest here (the biased select polled the query before the timer could
+        // win) — declaring a WRITE (readonly=false) must yield Indeterminate.
+        let (r, cell) = Responder::new_pair();
+        declare_autocommit_exec(r, Err(e), FETCH_ROWS, 0, 0, /* readonly */ false);
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Error(ep)) => {
+                assert_eq!(ep.code, errc::WRITE_UNCONFIRMED);
+                assert_eq!(ep.branch, branch::INDETERMINATE);
+            }
+            other => panic!("expected WriteUnconfirmed/Indeterminate, got {other:?}"),
+        }
+    }
+
+    /// The SAME `timeout_ms`-elapsed cancel, but declared as a READ (readonly=true) →
+    /// `Cancelled{NonRetryable}` — never `Indeterminate` (§19.3: a read's non-execution is a KNOWN,
+    /// safe-to-retry fate, but the wire has no `Cancelled/Retryable` pairing, so it rides
+    /// NonRetryable and the client's own read-retry policy decides).
+    #[tokio::test(start_paused = true)]
+    async fn autocommit_read_timeout_drains_to_cancelled_nonretryable() {
+        let backend = FakeBackend::new();
+        backend.block_query();
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+        let mut co = pool.checkout().await.expect("checkout");
+
+        let cancel = CancellationToken::new();
+        let (result, _exec_us) =
+            run_autocommit_exec(&mut co, "SELECT pg_sleep(9)", &[], Some(20), &cancel).await;
+        let e = result.expect_err("a timed-out statement must drain to an Err");
+
+        let (r, cell) = Responder::new_pair();
+        declare_autocommit_exec(r, Err(e), FETCH_ROWS, 0, 0, /* readonly */ true);
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Error(ep)) => {
+                assert_eq!(ep.code, errc::CANCELLED);
+                assert_eq!(ep.branch, branch::NON_RETRYABLE);
+            }
+            other => panic!("expected Cancelled/NonRetryable, got {other:?}"),
+        }
+    }
+
+    /// A per-request CANCEL (the token, NOT the timer) racing an in-flight autocommit WRITE →
+    /// the same drain-to-Err path, declared Indeterminate. Fires the cancel only once the
+    /// statement is OBSERVED in flight (`queries_waiting() > 0`), proving the CANCEL arm itself —
+    /// not a lucky pre-poll race — is what unblocks it.
+    #[tokio::test]
+    async fn autocommit_write_cancel_token_races_in_flight_drains_to_indeterminate() {
+        let backend = FakeBackend::new();
+        backend.block_query();
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+        let mut co = pool.checkout().await.expect("checkout");
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let waiter = async {
+            while pool.backend().queries_waiting() == 0 {
+                tokio::task::yield_now().await;
+            }
+            cancel_clone.cancel();
+        };
+
+        let (exec_result, ()) = tokio::join!(
+            run_autocommit_exec(&mut co, "UPDATE t SET n = n + 1", &[], None, &cancel),
+            waiter,
+        );
+        let e = exec_result
+            .0
+            .expect_err("a cancelled statement must drain to an Err");
+        assert!(
+            matches!(&e, PoolError::Sql { sqlstate, .. } if sqlstate.as_deref() == Some("57014")),
+            "expected a 57014-shaped cancel, got {e:?}"
+        );
+
+        let (r, cell) = Responder::new_pair();
+        declare_autocommit_exec(r, Err(e), FETCH_ROWS, 0, 0, /* readonly */ false);
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Error(ep)) => {
+                assert_eq!(ep.code, errc::WRITE_UNCONFIRMED);
+                assert_eq!(ep.branch, branch::INDETERMINATE);
+            }
+            other => panic!("expected WriteUnconfirmed/Indeterminate, got {other:?}"),
+        }
+    }
+
+    /// Cancel-LOSES-the-race: no gate is armed (the statement completes on its very first poll),
+    /// and BOTH the timer (`timeout_ms: Some(0)`) and the per-request cancel token are ALREADY
+    /// primed to fire before the call even starts — yet the query still wins (it is polled FIRST,
+    /// every round) and the REAL result comes back as `Ok`, never a fabricated cancel/error.
+    #[tokio::test]
+    async fn autocommit_exec_lost_race_returns_real_ok_never_fabricated_error() {
+        let backend = FakeBackend::new();
+        backend.set_query_result(QueryResult {
+            cols: vec![ColMeta {
+                name: "n".to_string(),
+                tag: tag::I64,
+            }],
+            rows: vec![vec![Value::I64(42)]],
+            affected: 1,
+        });
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+        let mut co = pool.checkout().await.expect("checkout");
+
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // already cancelled BEFORE the statement even starts
+        let (result, _exec_us) =
+            run_autocommit_exec(&mut co, "UPDATE t SET n = n + 1", &[], Some(0), &cancel).await;
+
+        let qr = result.expect("the query completed first (biased) — must be Ok, not Err");
+        assert_eq!(qr.rows, vec![vec![Value::I64(42)]]);
+
+        // Declaring it must be the REAL success terminal, never a fabricated Cancelled/error.
+        let (r, cell) = Responder::new_pair();
+        declare_autocommit_exec(r, Ok(qr), FETCH_ROWS, 0, 0, false);
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Ok(body)) => {
+                let ok = ExecOk::decode(&body).expect("decode ExecOk");
+                assert_eq!(ok.rows, vec![vec![Value::I64(42)]]);
+            }
+            other => panic!("expected the real Ok result, got {other:?}"),
+        }
+    }
+
+    /// `timeout_ms == None` → no timer arm at all (a `pending()` future, NOT a 0ms sleep):
+    /// regression guard against a bug that would make a `None` deadline resolve immediately. A
+    /// frozen statement with no timer and no cancel simply STAYS pending.
+    #[tokio::test]
+    async fn autocommit_exec_timeout_none_never_fires_a_phantom_timer() {
+        let backend = FakeBackend::new();
+        backend.block_query();
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+        let mut co = pool.checkout().await.expect("checkout");
+
+        let cancel = CancellationToken::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(50),
+            run_autocommit_exec(&mut co, "SELECT 1", &[], None, &cancel),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "timeout_ms=None must never resolve on its own; a 0ms-timer bug would return here"
+        );
+    }
+
+    /// The post-cancel connection is TAINTED (the S1 `Checkout::query` Err-arm fail-safe forces
+    /// `tainted` unconditionally) and therefore RECYCLED (a full `DISCARD ALL`-shaped reset) at the
+    /// next checkout — no conn is ever handed to the next tenant still holding a cancelled/aborted
+    /// statement's state.
+    #[tokio::test(start_paused = true)]
+    async fn autocommit_post_cancel_conn_is_tainted_and_recycled() {
+        let backend = FakeBackend::new();
+        backend.block_query();
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+        let mut co = pool.checkout().await.expect("checkout");
+
+        let cancel = CancellationToken::new();
+        let (result, _exec_us) =
+            run_autocommit_exec(&mut co, "UPDATE t SET n = n + 1", &[], Some(20), &cancel).await;
+        assert!(result.is_err(), "the timeout fired a cancel");
+        drop(co); // RAII release, same as `handle_exec`
+
+        // A fresh checkout on the size-1 pool recycles the tainted conn with a FULL reset.
+        let co2 = pool
+            .checkout()
+            .await
+            .expect("permit released despite the cancel");
+        assert!(
+            co2.conn().recorded.contains(&"RESET:Full".to_string()),
+            "a cancelled statement taints the conn -> Full reset at the next checkout: {:?}",
+            co2.conn().recorded
+        );
     }
 }
