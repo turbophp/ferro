@@ -39,9 +39,14 @@ payload_len)` / the matching `unpack` format (all fields little-endian; `C`=u8, 
 **Hard ceiling:** `MAX_FRAME_PAYLOAD = 16777216` (16 MiB, `consts::MAX_FRAME_PAYLOAD`). A frame
 declaring a larger `payload_len` MUST be rejected with a `Protocol` error **before any allocation
 sized by the declared length** — the header is fully readable with zero payload-sized allocation,
-so a decoder can reject an oversize claim cheaply. This is distinct from the `4 MiB`
-`DEFAULT_CREDIT_BYTES` flow-control window (§5.2 of the spec), which bounds buffered stream
-output, not a single frame's ceiling.
+so a decoder can reject an oversize claim cheaply. This is conceptually distinct from the
+`DEFAULT_CREDIT_BYTES` flow-control window (§5.2 of the spec, also `16777216` / 16 MiB as of
+M1-S5): `MAX_FRAME_PAYLOAD` is a hard per-frame reject ceiling enforced by the codec, while
+`DEFAULT_CREDIT_BYTES` is a replenishable per-request budget that bounds buffered stream output,
+not a single frame's size. The two are numerically equal by deliberate design (a single valid
+frame at the ceiling must always fit the initial credit window, or a maximally-sized row could
+never be sent — see SPEC §22.2's M1-S5 deviation note) but remain distinct knobs: one is a codec
+invariant, the other an operator-tunable default.
 
 ## 2. Canonical MessagePack profile
 

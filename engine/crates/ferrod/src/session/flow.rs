@@ -1,9 +1,12 @@
 //! Per-request flow-control credit: SPEC §5.2's "server→client streams are credit-based **per
-//! request**: default window 64 frames / 4 MiB, replenished via `WINDOW_UPDATE {request_id,
-//! frames, bytes}`." S3 wires only the primitive plus `WINDOW_UPDATE` routing (`session::registry`
-//! stores one `Credit` per in-flight request, `session::mod`'s reader loop applies incoming
-//! `WINDOW_UPDATE` frames to it); no stream producer *debits* it yet (`try_debit` exists ahead of
-//! that consumer, which lands with DATA frames in S5).
+//! request** ... replenished via `WINDOW_UPDATE {request_id, frames, bytes}`." The default window
+//! size is deliberately NOT repeated here as a literal — see `Config::credit_frames`/`credit_bytes`
+//! and `ferro_proto::consts::DEFAULT_CREDIT_{FRAMES,BYTES}` below for the current defaults, and
+//! SPEC §22.2's M1-S5 note for why the byte figure is coupled to `MAX_FRAME_PAYLOAD` and thus not
+//! a stable number to quote in a doc comment. S3 wires only the primitive plus `WINDOW_UPDATE`
+//! routing (`session::registry` stores one `Credit` per in-flight request, `session::mod`'s reader
+//! loop applies incoming `WINDOW_UPDATE` frames to it); no stream producer *debits* it yet
+//! (`try_debit` exists ahead of that consumer, which lands with DATA frames in S5).
 //!
 //! Deliberately NOT the per-session aggregate cap (`Config::session_cap_bytes`) — that is a
 //! distinct, session-wide concept layered on top in Task 6; this module is the per-request window
