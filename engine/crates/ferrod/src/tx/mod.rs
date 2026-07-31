@@ -41,6 +41,7 @@ use ferro_pool::error::PoolError;
 use ferro_proto::value::Value;
 
 use crate::session::SessionId;
+use crate::session::responder::Responder;
 
 /// Process-global source of `tx_id`s. Monotonic and never reused, starting at 1 (0 is reserved as a
 /// "no tx" sentinel on the wire). Contractually **bounded < 2^63** (SPEC §7 — a `tx_id` is a native
@@ -97,6 +98,29 @@ pub enum TxCommand {
         timeout_ms: Option<u32>,
         cancel: CancellationToken,
         reply: oneshot::Sender<ExecReply>,
+    },
+    /// A tx-scoped `fetch:stream` user statement (M1-S5 Task 5). Unlike [`TxCommand::Exec`] (which
+    /// returns the whole result via an [`ExecReply`] the handler then frames), a streamed exec MOVES
+    /// the request's [`Responder`] INTO the actor: the actor owns the pinned `co`, and the shared
+    /// `services::sql::run_tx_streamed` producer emits HEAD/DATA off it and declares the ONE terminal
+    /// through that moved `Responder` — the forwarding handler cannot, because `query_stream` borrows
+    /// the actor's `&mut co`. The `done` ack tells the handler the producer has finished (so it may
+    /// RETURN and let the supervisor deliver the already-declared terminal AFTER the last DATA, B4).
+    ///
+    /// `timeout_ms`/`cancel` carry the SAME S4 contract as [`TxCommand::Exec`]; the actor combines
+    /// them with its own `abort` + `max_tx` into the single cancel/deadline the producer takes. A
+    /// mid-stream cancel/timeout/max-deadline → the producer classifies `TxDeadline{Retryable}`
+    /// (`in_tx: true`) and the actor rolls back + tombstones (the §19.3 uniform in-tx action); a
+    /// session `abort` mid-stream takes the no-fate `TxEnd::Abort` teardown, exactly as the buffered
+    /// path's `ExecStep::{Deadline,Abort}` split does. `readonly` feeds the producer's fate context.
+    ExecStreamed {
+        sql: String,
+        params: Vec<Value>,
+        timeout_ms: Option<u32>,
+        readonly: bool,
+        cancel: CancellationToken,
+        responder: Responder,
+        done: oneshot::Sender<()>,
     },
     /// Establish a savepoint. `name` is an optional client alias; the engine composes the ACTUAL
     /// savepoint name (`sp_N`) it runs on the wire (never a client string — no injection surface).

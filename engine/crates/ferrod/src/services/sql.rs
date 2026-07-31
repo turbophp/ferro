@@ -72,7 +72,7 @@ use crate::tx::{
 const TX_CMD_CHANNEL_CAP: usize = 16;
 
 /// `ExecRequest.fetch` modes. 0 = rows, 1 = none (affected only), 2 = stream (M1-S5: the windowed
-/// DATA-channel producer, autocommit path in Task 4b; a tx-scoped stream is Task 5). Kept as named
+/// DATA-channel producer — autocommit path in Task 4b, tx-scoped path in Task 5). Kept as named
 /// constants (not magic numbers) at the handler boundary.
 const FETCH_ROWS: u8 = 0;
 const FETCH_NONE: u8 = 1;
@@ -210,8 +210,8 @@ async fn handle_exec(
         return;
     }
     match req.fetch {
-        // FETCH_STREAM is now honored on the autocommit path (below); a tx-scoped stream is still
-        // rejected in the `Some(tx_id)` arm (Task 5).
+        // FETCH_STREAM is honored on BOTH paths: the autocommit producer (below) and, since Task 5,
+        // the tx-scoped producer forwarded to the owning actor (the `Some(tx_id)` arm).
         FETCH_ROWS | FETCH_NONE | FETCH_STREAM => {}
         other => {
             responder.end_error(unsupported(format!("unknown fetch mode {other}")));
@@ -231,16 +231,6 @@ async fn handle_exec(
     match req.tx_id {
         // ---- tx-scoped EXEC: forward to the owning actor (the conn is already pinned) ----
         Some(tx_id) => {
-            // A tx-scoped streamed fetch runs the shared producer against the actor's pinned conn —
-            // that wiring is Task 5. Until then it is a clean per-request Unsupported (the buffered
-            // tx path below is untouched).
-            if req.fetch == FETCH_STREAM {
-                responder.end_error(unsupported(
-                    "tx-scoped fetch=stream is not yet supported (streaming inside a transaction is \
-                     Task 5); use an autocommit stream or a buffered fetch",
-                ));
-                return;
-            }
             // `req.pool` is ignored here — the transaction is already pinned to its pool's conn.
             let handle = match resolve_active(tx_registry, tx_id, session_id) {
                 Ok(h) => h,
@@ -249,6 +239,47 @@ async fn handle_exec(
                     return;
                 }
             };
+
+            // A tx-scoped streamed fetch (M1-S5 Task 5): the actor owns the pinned conn and
+            // `query_stream` borrows its `&mut co`, so the FORWARDING HANDLER cannot stream — it hands
+            // the `Responder` INTO the actor, which runs the shared producer, emits HEAD/DATA, and
+            // declares the ONE terminal. The handler awaits a done-ack, then RETURNS so the supervisor
+            // delivers that terminal strictly AFTER the last DATA (B4). The buffered path below is
+            // untouched.
+            if req.fetch == FETCH_STREAM {
+                let (done_tx, done_rx) = oneshot::channel::<()>();
+                let cmd = TxCommand::ExecStreamed {
+                    sql: sql.to_string(),
+                    params: req.params.clone(),
+                    timeout_ms: req.timeout_ms,
+                    readonly: req.readonly,
+                    cancel,
+                    responder,
+                    done: done_tx,
+                };
+                match handle.cmd_tx.send(cmd).await {
+                    // The actor now owns the `Responder` and will declare the terminal. Await its ack,
+                    // then return. An `Err` (the actor dropped the ack, e.g. a panic) leaves the
+                    // terminal to the supervisor's synthetic-terminal safety net — the `Responder` is
+                    // gone, so there is nothing to declare here; just return (still exactly-one-END).
+                    Ok(()) => {
+                        let _ = done_rx.await;
+                    }
+                    // The actor is already gone: RECOVER the `Responder` from the un-sent command and
+                    // declare the prompt terminal ourselves (we still hold it — exactly-one-END).
+                    Err(mpsc::error::SendError(cmd)) => {
+                        if let TxCommand::ExecStreamed { responder, .. } = cmd {
+                            responder.end_error(actor_gone_terminal(
+                                tx_registry,
+                                tx_id,
+                                session_id,
+                            ));
+                        }
+                    }
+                }
+                return;
+            }
+
             let (reply_tx, reply_rx) = oneshot::channel();
             // M1-S4: thread `req.timeout_ms` + this request's own per-request `cancel` token into
             // the actor — DISTINCT from the tx's session-level `abort` (see `TxCommand::Exec`'s
@@ -503,6 +534,24 @@ impl StreamBatch {
     };
 }
 
+/// How a `fetch:stream` producer ([`run_streamed_exec`]) ended, for a caller that must decide
+/// follow-up teardown — the tx actor (via [`run_tx_streamed`]). The autocommit caller ignores it
+/// (there is no transaction to keep or tear down). EITHER way, `run_streamed_exec` has ALREADY
+/// declared the request's ONE terminal via the consumed `Responder` — this only tells a tx caller
+/// whether the transaction survives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamEnded {
+    /// The statement reached its OWN conclusion: the stream drained cleanly (an `Ok` terminal) or hit
+    /// a natural, NON-cancel mid-stream error the client may still handle itself (an `Error`
+    /// terminal). A tx-scoped caller keeps the transaction OPEN — mirroring the buffered path, which
+    /// does NOT auto-roll-back a 23505 (`non_cancel_statement_error_reported_without_auto_rollback`).
+    Intact,
+    /// The statement was INTERRUPTED (cancel / deadline / backpressure-unwind / lost link) OR
+    /// surfaced a `57014` — so the §19.3 uniform in-tx action applies: a tx-scoped caller must ROLL
+    /// BACK (and, per the deadline-vs-abort split, tombstone). The ONE fated terminal is declared.
+    Broken,
+}
+
 /// One iteration of [`run_streamed_exec`]'s outer `biased` select over cancel / deadline / the pull.
 enum StreamStep {
     /// The pull resolved: `Some(Ok(row))` per row, `Some(Err(_))` mid-stream error, `None` drained.
@@ -620,6 +669,93 @@ async fn run_autocommit_streamed<B: PoolBackend>(
     drop(co);
 }
 
+/// The tx-scoped `fetch:stream` producer (M1-S5 Task 5): the tx-actor analog of
+/// [`run_autocommit_streamed`], run against the actor's ALREADY-pinned `co` (never a fresh checkout —
+/// the conn is pinned to the tx for its whole life). Captures the out-of-band cancel handles BEFORE
+/// the stream borrow, races the `query_stream` OPEN via [`open_streamed_raced`], then hands off to the
+/// SHARED [`run_streamed_exec`] with `in_tx: true` — so a mid-stream cancel/timeout classifies
+/// `TxDeadline{Retryable}` (§19.3) and the credit/cap/ordering/fate logic is NOT duplicated. The ONE
+/// terminal is declared INSIDE (via the moved `responder`); the returned [`StreamEnded`] tells the
+/// actor whether to keep the tx open (`Intact`) or roll it back + tombstone (`Broken`).
+///
+/// Unlike the autocommit path, `co` is NOT dropped here — it stays pinned to the tx; the actor's own
+/// teardown releases it. `cancel`/`deadline` are the actor's ALREADY-COMBINED signals (request cancel
+/// OR session abort; `min(timeout_ms, max_tx)`), so this function stays identical in shape to the
+/// autocommit producer — it just cannot own/return the checkout.
+///
+/// On an aborted open the conn is TAINTED (the actor's teardown ROLLBACK then resets/evicts it). A
+/// NATURAL non-`57014` open error (a syntax/bind fault) leaves the tx OPEN — `query_stream`'s Err arm
+/// already finalized+tainted it, and the client may `ROLLBACK` itself, mirroring the buffered
+/// non-cancel statement-error path — so it is NOT forced to `Broken`.
+pub(crate) async fn run_tx_streamed<B: PoolBackend>(
+    co: &mut Checkout<B>,
+    sql: &str,
+    params: &[Value],
+    responder: Responder,
+    cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+    readonly: bool,
+) -> StreamEnded {
+    // Two out-of-band cancel handles captured BEFORE the stream borrows `co` (each owned, firing the
+    // SAME connection's cancel): one for the OPEN race, one for the pull→send loop. Identical
+    // capture-before-borrow discipline to `run_autocommit_streamed`/`tx/actor.rs`.
+    let cancel_handle_open = co.cancel_handle();
+    let cancel_handle_loop = co.cancel_handle();
+    // `sent: true` from the OPEN onward (see `run_streamed_exec`'s doc); `in_tx: true` so the fate of
+    // any cancel/timeout/loss is the in-tx `TxDeadline{Retryable}`/known-tx-dead classification.
+    let ctx = OpContext {
+        readonly,
+        sent: true,
+        in_tx: true,
+    };
+
+    // The open-race + loop live in a block confining every co-BORROWING value (the raced handle), so
+    // `co` is free again after it for the `set_tainted` below (mirrors `run_autocommit_streamed`).
+    let open_start = tokio::time::Instant::now();
+    let (ended, needs_taint) = {
+        let outcome =
+            open_streamed_raced(co, sql, params, cancel, deadline, cancel_handle_open).await;
+        let open_us = open_start.elapsed().as_micros() as u64;
+        match outcome {
+            Ok(handle) => {
+                let ended = run_streamed_exec(
+                    handle,
+                    responder,
+                    cancel,
+                    deadline,
+                    cancel_handle_loop,
+                    ctx,
+                    open_us,
+                    StreamBatch::DEFAULT,
+                )
+                .await;
+                (ended, false)
+            }
+            Err(e) => {
+                // Distinguish an ABORTED open / app-`57014` (the tx is dead → `Broken` + taint) from a
+                // natural NON-cancel open error (syntax/bind — the tx block is app-aborted but the
+                // client may `ROLLBACK` itself → `Intact`, exactly like the buffered non-57014
+                // statement error). The ONE terminal is `classify_fate(e)` either way.
+                let broken = fate::is_57014(&e);
+                responder.end_error(fate::classify_fate(e, ctx));
+                if broken {
+                    // Taint UNCONDITIONALLY: idempotent if `query_stream`'s Err arm already tainted a
+                    // natural 57014, load-bearing if a raced/aborted open DROPPED the future before
+                    // its finalize ran (the aborted-open path — the taint is the recycle trigger, the
+                    // equivalent-safety substitute for draining, exactly as the autocommit path does).
+                    (StreamEnded::Broken, true)
+                } else {
+                    (StreamEnded::Intact, false)
+                }
+            }
+        }
+    };
+    if needs_taint {
+        co.set_tainted(true);
+    }
+    ended
+}
+
 /// Race the incremental `query_stream` OPEN (prepare + `query_raw` dispatch — real backend
 /// round-trips) against `cancel`/`deadline`, so `timeout_ms` + a routed CANCEL are ENFORCED across
 /// the open the same way `run_autocommit_exec` enforces them across the buffered query. Pull-first
@@ -640,8 +776,8 @@ async fn run_autocommit_streamed<B: PoolBackend>(
 /// recycle at the next checkout). tokio-postgres's connection task drains the dropped request's
 /// server response, so the connection does not desync; the taint guarantees no cross-tenant leak.
 ///
-/// Reused by Task 5 (the tx-actor open needs the SAME guard) — same shape, with the actor supplying
-/// its own `Checkout`, `cancel`/`deadline`, and an in-tx `OpContext`.
+/// Reused by [`run_tx_streamed`] (Task 5 — the tx-actor open needs the SAME guard): same shape, with
+/// the actor supplying its own pinned `Checkout`, combined `cancel`/`deadline`, and an in-tx `OpContext`.
 async fn open_streamed_raced<'a, B: PoolBackend>(
     co: &'a mut Checkout<B>,
     sql: &str,
@@ -665,7 +801,8 @@ async fn open_streamed_raced<'a, B: PoolBackend>(
     }
 }
 
-/// The SHARED pull→send loop (Task 5 will call it from the tx actor too): emit HEAD once, then pull
+/// The SHARED pull→send loop (called by BOTH the autocommit producer and, via [`run_tx_streamed`],
+/// the tx actor): emit HEAD once, then pull
 /// rows incrementally and flush them as DATA frames under the credit window, then exactly ONE
 /// terminal — declared by this function via the consumed `responder`. Exactly-one-END and the §19.3
 /// fate rules hold on EVERY exit.
@@ -701,7 +838,7 @@ async fn run_streamed_exec<B: PoolBackend>(
     ctx: OpContext,
     open_us: u64,
     batch: StreamBatch,
-) {
+) -> StreamEnded {
     let mut exec_us = open_us;
     // Total HEAD + DATA payload bytes actually enqueued — reported as `stats.bytes` (item 4: the
     // buffered path reports its full result-body size, so the streamed path reports the full shipped
@@ -726,7 +863,7 @@ async fn run_streamed_exec<B: PoolBackend>(
                 send_err_to_pool_error(e),
             )
             .await;
-            return;
+            return StreamEnded::Broken;
         }
     }
 
@@ -762,15 +899,28 @@ async fn run_streamed_exec<B: PoolBackend>(
                     stream_cancel_error(),
                 )
                 .await;
-                return;
+                return StreamEnded::Broken;
             }
             StreamStep::Row(Some(Err(e))) => {
                 // The statement SELF-terminated (that is why `next()` yielded `Err`) → do NOT fire
                 // the out-of-band cancel (item 2): opening a side connection to `CancelRequest` an
                 // already-errored/idle backend is pure waste. `run_autocommit_exec` likewise only
                 // cancels on its interruption arms, never on a natural query error.
+                //
+                // A 57014 surfacing HERE (an app-set `statement_timeout` firing mid-stream) is the
+                // in-tx `Broken` case — it must roll back + tombstone exactly like the buffered
+                // `ExecStep::Completed` bare-57014 path; any OTHER natural error (23505, a computed
+                // 22012, …) leaves the tx block app-aborted but recoverable by the client, so the tx
+                // stays OPEN (`Intact`) — matching the buffered non-cancel statement-error path. The
+                // ONE terminal is `classify_fate(e)` either way (correct for both: 57014→TxDeadline,
+                // 23505→the Sql passthrough).
+                let broken = fate::is_57014(&e);
                 abort_stream(handle, responder, cancel_handle, ctx, false, e).await;
-                return;
+                return if broken {
+                    StreamEnded::Broken
+                } else {
+                    StreamEnded::Intact
+                };
             }
             StreamStep::Row(Some(Ok(row))) => {
                 batch_bytes += estimate_row_bytes(&row);
@@ -791,7 +941,7 @@ async fn run_streamed_exec<B: PoolBackend>(
                                 send_err_to_pool_error(e),
                             )
                             .await;
-                            return;
+                            return StreamEnded::Broken;
                         }
                     }
                 }
@@ -814,11 +964,11 @@ async fn run_streamed_exec<B: PoolBackend>(
                                 send_err_to_pool_error(e),
                             )
                             .await;
-                            return;
+                            return StreamEnded::Broken;
                         }
                     }
                 }
-                match handle.finish().await {
+                return match handle.finish().await {
                     Ok(end) => {
                         let body = build_stream_terminal_body(
                             end.affected,
@@ -828,12 +978,16 @@ async fn run_streamed_exec<B: PoolBackend>(
                             sent_bytes,
                         );
                         responder.end_ok(Bytes::from(body));
+                        StreamEnded::Intact
                     }
                     // `finish()` currently always returns Ok (a late drain error force-taints but
                     // returns Ok); handle a future Err defensively — a read never goes Indeterminate.
-                    Err(e) => responder.end_error(fate::classify_fate(e, ctx)),
-                }
-                return;
+                    // A late drain error means the conn is in trouble → a tx caller must roll back.
+                    Err(e) => {
+                        responder.end_error(fate::classify_fate(e, ctx));
+                        StreamEnded::Broken
+                    }
+                };
             }
         }
     }

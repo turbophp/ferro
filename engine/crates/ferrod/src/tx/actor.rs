@@ -30,6 +30,7 @@ use ferro_pool::pool::Checkout;
 use ferro_proto::messages::tx::Isolation;
 
 use crate::services::fate;
+use crate::services::sql::StreamEnded;
 
 use super::{CtlReply, ExecReply, TxCommand, TxRegistry};
 
@@ -340,6 +341,76 @@ pub async fn run<B: PoolBackend>(
                     }
                 }
             }
+            TxCommand::ExecStreamed {
+                sql,
+                params,
+                timeout_ms,
+                readonly,
+                cancel,
+                responder,
+                done,
+            } => {
+                // Combine the FOUR stop sources a tx-scoped stream must honor into the ONE cancel +
+                // ONE deadline the shared producer takes:
+                //  * cancel = a CHILD of the session `abort` (so it fires on session teardown) that a
+                //    small linker task ALSO fires when THIS request's own `cancel` fires;
+                //  * deadline = min(now + timeout_ms, the actor's ABSOLUTE max_tx deadline) — so a
+                //    per-statement timeout AND the tx max-lifetime both bound the stream (open,
+                //    mid-pull, and mid-backpressure alike). There is ALWAYS a deadline in a tx (the
+                //    max_tx bound), unlike the autocommit path.
+                let child = abort.child_token();
+                let linker = {
+                    let child = child.clone();
+                    let req_cancel = cancel.clone();
+                    tokio::spawn(async move {
+                        req_cancel.cancelled().await;
+                        child.cancel();
+                    })
+                };
+                let max_instant = max_deadline.deadline();
+                let deadline = Some(match timeout_ms {
+                    Some(ms) => std::cmp::min(
+                        tokio::time::Instant::now() + Duration::from_millis(u64::from(ms)),
+                        max_instant,
+                    ),
+                    None => max_instant,
+                });
+
+                // Stream off the pinned `co` via the SHARED producer (`in_tx: true`). It declares the
+                // ONE terminal itself (through the moved `responder`); we only learn whether the tx
+                // survives.
+                let ended = crate::services::sql::run_tx_streamed(
+                    &mut co, &sql, &params, responder, &child, deadline, readonly,
+                )
+                .await;
+
+                // The request-cancel linker is no longer needed — stop it (no leak if it never fired).
+                linker.abort();
+                // Let the forwarding handler RETURN; the supervisor then delivers the already-declared
+                // terminal, strictly AFTER the last DATA the producer enqueued (B4).
+                let _ = done.send(());
+
+                match ended {
+                    // The statement reached its own conclusion (clean drain, or a non-cancel error the
+                    // client may still `ROLLBACK`): keep the tx OPEN, exactly like the buffered 23505
+                    // path. Fall through to reset the idle deadline and process the next command.
+                    StreamEnded::Intact => {}
+                    // §19.3 uniform in-tx action: the tx is dead. Preserve the S4 abort-vs-deadline
+                    // DISTINCTION — a session `abort` deregisters (no fate: `TxEnd::Abort`), a request
+                    // cancel / per-statement timeout / max-deadline TOMBSTONEs (`TxEnd::Deadline` →
+                    // `TxDeadline{Retryable}`). The terminal is already TxDeadline (the producer's
+                    // in-tx classify_fate), so the abort case yields a TxDeadline terminal + a
+                    // deregister teardown; both are single-terminal, single-teardown (the session is
+                    // dying either way — `abort_session`'s final purge cleans a deregistered OR
+                    // tombstoned entry identically).
+                    StreamEnded::Broken => {
+                        if abort.is_cancelled() {
+                            break 'actor TxEnd::Abort;
+                        }
+                        break 'actor TxEnd::Deadline;
+                    }
+                }
+            }
         }
 
         // A non-terminal command was processed: reset the idle deadline (it measures the idle gap
@@ -426,13 +497,44 @@ async fn teardown<B: PoolBackend>(
 mod tests {
     use super::*;
     use crate::session::SessionId;
+    use crate::session::codec::ControlMsg;
+    use crate::session::flow::{Credit, CreditCell, SessionCap};
+    use crate::session::responder::{Responder, Terminal};
     use crate::tx::{TxHandle, TxLookupErr, next_tx_id};
 
     use ferro_pool::config::PoolConfig;
-    use ferro_pool::fake::FakeBackend;
+    use ferro_pool::fake::{FakeBackend, StreamScript};
     use ferro_pool::pin::{PinCause, PinState, TxId};
     use ferro_pool::pool::Pool;
+    use ferro_proto::consts::{branch, errc, method_stream, service, tag};
+    use ferro_proto::messages::StreamData;
+    use ferro_proto::messages::sql::{ColMeta, ExecOk};
+    use ferro_proto::value::Value;
+    use std::sync::Arc;
     use tokio::sync::oneshot;
+
+    /// The wire `request_id` the streamed-tx tests stamp on their HEAD/DATA frames.
+    const STREAM_REQ_ID: u32 = 91;
+
+    /// Build a stream-capable [`Responder`] wired to a drainable control channel, mirroring what the
+    /// session layer hands a `fetch:stream` handler. Returns the responder, its terminal cell, and
+    /// the receiver end of the control channel (all HEAD/DATA frames land there). The local
+    /// `control_tx` is dropped so the channel CLOSES once the actor consumes the responder — a test's
+    /// `control_rx.recv()` drain then terminates instead of hanging.
+    fn streaming_responder(
+        credit_frames: u32,
+    ) -> (
+        Responder,
+        Arc<std::sync::Mutex<Option<Terminal>>>,
+        mpsc::Receiver<ControlMsg>,
+    ) {
+        let (control_tx, control_rx) = mpsc::channel::<ControlMsg>(64);
+        let credit_cell = Arc::new(CreditCell::new(Credit::new(credit_frames, u32::MAX)));
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+        let (responder, cell) =
+            Responder::new_streaming(STREAM_REQ_ID, credit_cell, session_cap, control_tx);
+        (responder, cell, control_rx)
+    }
 
     // ---- pure helpers -----------------------------------------------------------------------
 
@@ -1317,5 +1419,461 @@ mod tests {
             "a client savepoint name NEVER reaches the backend SQL: {rec:?}"
         );
         assert!(rec.contains(&"COMMIT".to_string()));
+    }
+
+    // ---- M1-S5 Task 5: tx-scoped fetch:stream from the pinned conn -----------------------------
+
+    fn stream_script(rows: Vec<Vec<Value>>, affected: u64) -> StreamScript {
+        StreamScript {
+            cols: vec![ColMeta {
+                name: "n".into(),
+                tag: tag::I64,
+            }],
+            rows,
+            affected,
+            error_at: None,
+        }
+    }
+
+    /// A tx-scoped `fetch:stream` streams HEAD + DATA off the pinned conn, declares exactly ONE `Ok`
+    /// terminal (carrying the streamed `affected`/row count), and — the stream being INTACT — leaves
+    /// the transaction OPEN so a following COMMIT still succeeds. Proves the whole Task-5 wiring plus
+    /// the `StreamEnded::Intact` "keep the tx open" branch.
+    #[tokio::test]
+    async fn tx_scoped_stream_streams_head_data_then_ok_and_stays_open_to_commit() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(stream_script(
+            vec![
+                vec![Value::I64(1)],
+                vec![Value::I64(2)],
+                vec![Value::I64(3)],
+            ],
+            3,
+        ));
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let (tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        // Generous credit so nothing parks: the whole stream flows to a clean end.
+        let (responder, cell, mut control_rx) = streaming_responder(1000);
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        cmd_tx
+            .send(TxCommand::ExecStreamed {
+                sql: "SELECT n".into(),
+                params: vec![],
+                timeout_ms: None,
+                readonly: true,
+                cancel: CancellationToken::new(),
+                responder,
+                done: ack_tx,
+            })
+            .await
+            .expect("send exec-streamed");
+        ack_rx.await.expect("the actor acks the streamed exec");
+
+        // Drain the emitted frames (the responder is now dropped -> the channel closes -> drain ends).
+        let mut heads = 0;
+        let mut datas = 0;
+        let mut rows_seen: Vec<Vec<Value>> = Vec::new();
+        while let Some(msg) = control_rx.recv().await {
+            match (msg.frame.header.service, msg.frame.header.method) {
+                (service::STREAM, method_stream::HEAD) => heads += 1,
+                (service::STREAM, method_stream::DATA) => {
+                    datas += 1;
+                    let sd = StreamData::decode(&msg.frame.payload).expect("decode DATA");
+                    rows_seen.extend(sd.rows);
+                }
+                other => panic!("unexpected stream frame {other:?}"),
+            }
+        }
+        assert_eq!(heads, 1, "exactly one HEAD");
+        assert!(datas >= 1, "at least one DATA frame carried the rows");
+        assert_eq!(
+            rows_seen,
+            vec![
+                vec![Value::I64(1)],
+                vec![Value::I64(2)],
+                vec![Value::I64(3)]
+            ],
+            "the rows stream in order off the pinned conn"
+        );
+
+        // Exactly ONE terminal: an Ok carrying the streamed affected/row count (no rows/cols — those
+        // went out as DATA/HEAD).
+        match cell.lock().unwrap().take().expect("exactly one terminal") {
+            Terminal::Ok(body) => {
+                let ok = ExecOk::decode(&body).expect("decode ExecOk");
+                assert_eq!(ok.affected, 3);
+                assert_eq!(ok.stats.rows, 3);
+                assert!(ok.rows.is_empty(), "the stream terminal carries no rows");
+                assert!(ok.cols.is_empty(), "the stream terminal carries no cols");
+            }
+            other => panic!("expected exactly one Ok terminal, got {other:?}"),
+        }
+
+        // INTACT: the tx is still open — a COMMIT still works (never auto-torn-down).
+        let (commit_tx, commit_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Commit { reply: commit_tx })
+            .await
+            .expect("send commit");
+        assert!(
+            matches!(commit_rx.await.expect("commit replies"), CtlReply::Ok),
+            "the tx survived the stream and COMMIT succeeds"
+        );
+        done_rx
+            .wait_for(|t| *t)
+            .await
+            .expect("actor ends on commit");
+        assert_eq!(
+            registry.lookup(tx_id, owner).unwrap_err(),
+            TxLookupErr::NotFoundOrForbidden,
+            "a committed tx is deregistered, never tombstoned"
+        );
+
+        let co2 = pool.checkout().await.expect("conn released after commit");
+        let rec = co2.conn().recorded.clone();
+        assert!(
+            rec.contains(&"SELECT n".to_string()),
+            "the streamed SQL ran: {rec:?}"
+        );
+        assert!(
+            rec.contains(&"COMMIT".to_string()),
+            "the tx committed: {rec:?}"
+        );
+        assert!(
+            !rec.contains(&"ROLLBACK".to_string()),
+            "an intact stream never rolls the tx back: {rec:?}"
+        );
+    }
+
+    /// A per-request CANCEL mid-stream inside a tx → the shared producer classifies
+    /// `TxDeadline{Retryable}` (`in_tx: true`), the actor ROLLS BACK + TOMBSTONEs, and the request
+    /// ends in exactly ONE terminal after whatever DATA already went out. A subsequent touch of the
+    /// tx_id by its owner sees the tombstone.
+    #[tokio::test]
+    async fn tx_scoped_stream_cancel_mid_stream_rolls_back_tombstones_one_retryable_terminal() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(stream_script(vec![vec![Value::I64(1)]], 1));
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let (tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        // 1-frame credit window: HEAD consumes it, so the first DATA send PARKS on the empty window —
+        // the mid-stream point a CANCEL must unwind (never a live PG needed).
+        let (responder, cell, mut control_rx) = streaming_responder(1);
+        let cancel = CancellationToken::new();
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        cmd_tx
+            .send(TxCommand::ExecStreamed {
+                sql: "SELECT n".into(),
+                params: vec![],
+                timeout_ms: None,
+                readonly: true,
+                cancel: cancel.clone(),
+                responder,
+                done: ack_tx,
+            })
+            .await
+            .expect("send exec-streamed");
+
+        // HEAD goes out and consumes the window; the first DATA then parks. Cancel unwinds it.
+        let head = control_rx.recv().await.expect("HEAD frame");
+        assert_eq!(head.frame.header.method, method_stream::HEAD);
+        cancel.cancel();
+        ack_rx
+            .await
+            .expect("the actor acks after the cancel unwind");
+
+        // Exactly ONE terminal: TxDeadline{Retryable} (the in-tx cancel fate).
+        match cell.lock().unwrap().take().expect("exactly one terminal") {
+            Terminal::Error(ep) => {
+                assert_eq!(ep.code, errc::TX_DEADLINE);
+                assert_eq!(ep.branch, branch::RETRYABLE);
+            }
+            other => panic!("expected exactly one TxDeadline terminal, got {other:?}"),
+        }
+
+        // Rolled back + tombstoned: the owner sees Tombstoned, the conn recorded a ROLLBACK, and the
+        // out-of-band cancel was fired (an interruption abort).
+        done_rx.wait_for(|t| *t).await.expect("actor tears down");
+        assert_eq!(
+            registry.lookup(tx_id, owner).unwrap_err(),
+            TxLookupErr::Tombstoned
+        );
+        assert!(
+            pool.backend().cancel_calls() >= 1,
+            "a mid-stream cancel fires the out-of-band backend cancel"
+        );
+        let co2 = pool.checkout().await.expect("conn released");
+        assert!(
+            co2.conn().recorded.contains(&"ROLLBACK".to_string()),
+            "the tx was rolled back on the mid-stream cancel: {:?}",
+            co2.conn().recorded
+        );
+    }
+
+    /// A per-statement `timeout_ms` elapsing mid-stream inside a tx → the SAME
+    /// rollback+tombstone+`TxDeadline` exit as an explicit cancel (the §19.3 uniform in-tx action).
+    /// Proven under the paused clock: the deadline auto-fires while the first DATA is parked on the
+    /// exhausted credit window.
+    #[tokio::test(start_paused = true)]
+    async fn tx_scoped_stream_timeout_mid_stream_rolls_back_tombstones_one_retryable_terminal() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(stream_script(vec![vec![Value::I64(1)]], 1));
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        // Generous max_tx: only the per-statement `timeout_ms` (below) can fire.
+        let (tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        // 1-frame window: HEAD consumes it; the first DATA parks and the `timeout_ms` fires there.
+        let (responder, cell, mut control_rx) = streaming_responder(1);
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        cmd_tx
+            .send(TxCommand::ExecStreamed {
+                sql: "SELECT n".into(),
+                params: vec![],
+                timeout_ms: Some(50),
+                readonly: true,
+                cancel: CancellationToken::new(), // never fired — the per-statement TIMER must fire
+                responder,
+                done: ack_tx,
+            })
+            .await
+            .expect("send exec-streamed");
+        ack_rx
+            .await
+            .expect("the deadline aborts the parked stream, then acks");
+
+        // Exactly one HEAD went out; no DATA (it was aborted while parked).
+        let mut heads = 0;
+        let mut datas = 0;
+        while let Some(msg) = control_rx.recv().await {
+            match (msg.frame.header.service, msg.frame.header.method) {
+                (service::STREAM, method_stream::HEAD) => heads += 1,
+                (service::STREAM, method_stream::DATA) => datas += 1,
+                other => panic!("unexpected stream frame {other:?}"),
+            }
+        }
+        assert_eq!(heads, 1);
+        assert_eq!(datas, 0, "the parked DATA was aborted, never enqueued");
+
+        match cell.lock().unwrap().take().expect("exactly one terminal") {
+            Terminal::Error(ep) => {
+                assert_eq!(ep.code, errc::TX_DEADLINE);
+                assert_eq!(ep.branch, branch::RETRYABLE);
+            }
+            other => panic!("expected one TxDeadline terminal, got {other:?}"),
+        }
+
+        done_rx.wait_for(|t| *t).await.expect("actor tears down");
+        assert_eq!(
+            registry.lookup(tx_id, owner).unwrap_err(),
+            TxLookupErr::Tombstoned
+        );
+        let co2 = pool.checkout().await.expect("conn released");
+        assert!(
+            co2.conn().recorded.contains(&"ROLLBACK".to_string()),
+            "the tx was rolled back on the mid-stream timeout: {:?}",
+            co2.conn().recorded
+        );
+    }
+
+    /// A NATURAL (non-cancel) mid-stream error inside a tx → exactly ONE terminal carrying the error's
+    /// CLASSIFIED fate (NOT `TxDeadline`), and the transaction STAYS OPEN — the client may `ROLLBACK`
+    /// it itself, mirroring the buffered 23505 path (`non_cancel_statement_error_reported_without_auto_rollback`).
+    /// This is the `StreamEnded::Intact`-on-natural-error branch; the out-of-band cancel is NOT fired.
+    #[tokio::test]
+    async fn tx_scoped_stream_natural_mid_stream_error_keeps_tx_open() {
+        let backend = FakeBackend::new();
+        // error_at: Some(1) → emit 1 row, then a natural (non-cancel) mid-stream Err on the next pull.
+        backend.set_stream_script(StreamScript {
+            cols: vec![ColMeta {
+                name: "n".into(),
+                tag: tag::I64,
+            }],
+            rows: vec![vec![Value::I64(1)], vec![Value::I64(2)]],
+            affected: 0,
+            error_at: Some(1),
+        });
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let (tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        let (responder, cell, mut control_rx) = streaming_responder(1000);
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        cmd_tx
+            .send(TxCommand::ExecStreamed {
+                sql: "SELECT n".into(),
+                params: vec![],
+                timeout_ms: None,
+                readonly: true,
+                cancel: CancellationToken::new(),
+                responder,
+                done: ack_tx,
+            })
+            .await
+            .expect("send exec-streamed");
+        ack_rx
+            .await
+            .expect("the actor acks after the natural error");
+
+        // Drain whatever went out (HEAD, and possibly the batched row) — the point is the terminal.
+        while control_rx.recv().await.is_some() {}
+
+        // ONE terminal: the natural error's classified fate (the fake's Backend error → Protocol),
+        // NEVER TxDeadline (a natural error is not a cancel/deadline).
+        match cell.lock().unwrap().take().expect("exactly one terminal") {
+            Terminal::Error(ep) => {
+                assert_eq!(
+                    ep.code,
+                    errc::PROTOCOL,
+                    "a natural mid-stream error reports its classified fate, not TxDeadline"
+                );
+                assert_ne!(ep.code, errc::TX_DEADLINE);
+            }
+            other => panic!("expected exactly one Error terminal, got {other:?}"),
+        }
+
+        // INTACT: the tx is NOT tombstoned (still Active), and the out-of-band cancel was NOT fired
+        // (the statement self-terminated). A client-driven ROLLBACK on the SAME tx_id still works.
+        assert!(
+            registry.lookup(tx_id, owner).is_ok(),
+            "the tx stays OPEN after a natural mid-stream error (no engine auto-rollback)"
+        );
+        assert_eq!(
+            pool.backend().cancel_calls(),
+            0,
+            "a natural mid-stream error must NOT fire the out-of-band cancel"
+        );
+        let (rb_tx, rb_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Rollback { reply: rb_tx })
+            .await
+            .expect("send rollback");
+        assert!(matches!(
+            rb_rx.await.expect("rollback replies"),
+            CtlReply::Ok
+        ));
+        done_rx
+            .wait_for(|t| *t)
+            .await
+            .expect("actor ends on the client rollback");
+    }
+
+    /// The OPEN itself aborted inside a tx (a blocked `query_stream` + a fired cancel): exactly ONE
+    /// `TxDeadline` terminal, no HEAD/DATA (the open never returned a handle), the conn FORCE-TAINTED
+    /// (its recycle at the next checkout resets it), rolled back, and the tx tombstoned.
+    #[tokio::test]
+    async fn tx_scoped_stream_open_abort_taints_rolls_back_and_tombstones() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(stream_script(vec![vec![Value::I64(1)]], 1));
+        backend.block_stream_open(); // freeze the OPEN (prepare + query_raw)
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let (tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        let (responder, cell, mut control_rx) = streaming_responder(1000);
+        let cancel = CancellationToken::new();
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        cmd_tx
+            .send(TxCommand::ExecStreamed {
+                sql: "SELECT n".into(),
+                params: vec![],
+                timeout_ms: None,
+                readonly: true,
+                cancel: cancel.clone(),
+                responder,
+                done: ack_tx,
+            })
+            .await
+            .expect("send exec-streamed");
+
+        // Wait until the OPEN is provably parked, then fire the request cancel.
+        for _ in 0..1000 {
+            if pool.backend().stream_opens_waiting() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            pool.backend().stream_opens_waiting(),
+            1,
+            "the open must be parked before the cancel"
+        );
+        cancel.cancel();
+        ack_rx
+            .await
+            .expect("the cancel aborts the blocked open, then acks");
+
+        // No HEAD/DATA (the open never returned a handle); exactly ONE TxDeadline terminal.
+        assert!(
+            control_rx.recv().await.is_none(),
+            "a cancelled open emits no HEAD/DATA"
+        );
+        match cell.lock().unwrap().take().expect("exactly one terminal") {
+            Terminal::Error(ep) => {
+                assert_eq!(ep.code, errc::TX_DEADLINE);
+                assert_eq!(ep.branch, branch::RETRYABLE);
+            }
+            other => panic!("expected one TxDeadline terminal, got {other:?}"),
+        }
+
+        done_rx.wait_for(|t| *t).await.expect("actor tears down");
+        assert_eq!(
+            registry.lookup(tx_id, owner).unwrap_err(),
+            TxLookupErr::Tombstoned
+        );
+        assert!(
+            pool.backend().cancel_calls() >= 1,
+            "the aborted open fires the out-of-band backend cancel"
+        );
+        // The aborted open FORCE-TAINTED the conn → the recycle at the next checkout resets it.
+        let co2 = pool.checkout().await.expect("conn released");
+        assert!(
+            co2.conn().recorded.contains(&"RESET:Full".to_string()),
+            "an aborted open taints the conn → Full reset at the next checkout: {:?}",
+            co2.conn().recorded
+        );
     }
 }

@@ -65,6 +65,7 @@ pub enum StreamSendError {
 /// The streaming sink resources a `Responder` carries so a `fetch:stream` handler can emit
 /// HEAD/DATA frames. Bundled so `new_pair` (inert) and `new_streaming` (real) differ only in what
 /// they put here. A non-streamed handler never touches any of it.
+#[derive(Debug)]
 struct StreamSink {
     /// The wire `request_id` stamped on every HEAD/DATA frame (correlates them with the eventual
     /// terminal, which the supervisor sends on the same id).
@@ -80,6 +81,7 @@ struct StreamSink {
 }
 
 /// A handler's one-shot terminal declaration AND (M1-S5) its streaming sink.
+#[derive(Debug)]
 pub struct Responder {
     cell: Arc<Mutex<Option<Terminal>>>,
     sink: StreamSink,
