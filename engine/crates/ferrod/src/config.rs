@@ -377,8 +377,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_credit_bytes_below_max_frame_payload() {
-        let mut cfg = Config::default();
-        cfg.credit_bytes = ferro_proto::consts::MAX_FRAME_PAYLOAD - 1;
+        let cfg = Config {
+            credit_bytes: ferro_proto::consts::MAX_FRAME_PAYLOAD - 1,
+            ..Config::default()
+        };
         assert_eq!(
             cfg.validate(),
             Err(ConfigError::CreditBytesBelowMaxFramePayload {
@@ -390,8 +392,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_session_cap_bytes_below_max_frame_payload() {
-        let mut cfg = Config::default();
-        cfg.session_cap_bytes = ferro_proto::consts::MAX_FRAME_PAYLOAD as usize - 1;
+        let cfg = Config {
+            session_cap_bytes: ferro_proto::consts::MAX_FRAME_PAYLOAD as usize - 1,
+            ..Config::default()
+        };
         assert_eq!(
             cfg.validate(),
             Err(ConfigError::SessionCapBelowMaxFramePayload {
@@ -405,9 +409,11 @@ mod tests {
     fn validate_checks_credit_bytes_before_session_cap_bytes() {
         // Both fields violated: the credit_bytes check must win (documented order), not silently
         // report only the session_cap_bytes violation.
-        let mut cfg = Config::default();
-        cfg.credit_bytes = 0;
-        cfg.session_cap_bytes = 0;
+        let cfg = Config {
+            credit_bytes: 0,
+            session_cap_bytes: 0,
+            ..Config::default()
+        };
         assert_eq!(
             cfg.validate(),
             Err(ConfigError::CreditBytesBelowMaxFramePayload {

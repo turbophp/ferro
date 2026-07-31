@@ -323,6 +323,15 @@ async fn second_stream_on_same_session() {
 
 // -------------------------------------------------------------------------------------------------
 // Test 3 — abandonment recovery: CANCEL mid-stream, drain to the terminal, then a fresh request.
+//
+// This test must prove CANCEL-is-honored ITSELF (not merely rely on the deterministic FakeBackend
+// unit tests elsewhere): after routing the CANCEL we drain WITHOUT sending any further
+// WINDOW_UPDATE, so a producer that actually stops on cancel is starved of credit and must abort
+// quickly, while an implementation that silently ignored the CANCEL would have no way to ever
+// deliver the remaining ~47000 rows of the 50000-row result (no more credit is ever granted) and
+// would instead hang until `client.recv()`'s own 2 s timeout panics the test. The row count
+// collected before the terminal is asserted to be far short of the full result, so a false-green
+// "drained everything anyway" outcome is impossible even if some other bug reshaped the terminal.
 // -------------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -343,7 +352,8 @@ async fn abandonment_recovery_after_cancel() {
             .await;
 
         // Read HEAD + a few DATA frames (replenishing so it keeps producing) — a genuinely
-        // mid-stream point, nowhere near the 50000th row.
+        // mid-stream point, nowhere near the 50000th row. Collect rows so the post-terminal
+        // assertion can prove truncation against the FULL 50000-row result.
         let f_head = client.recv().await;
         let hplen = f_head.header.payload_len;
         assert!(
@@ -352,12 +362,14 @@ async fn abandonment_recovery_after_cancel() {
         );
         client.window_update(rid, 1, hplen).await;
 
+        let mut rows: Vec<i64> = Vec::new();
         let mut data_before_cancel = 0u32;
         while data_before_cancel < 3 {
             let frame = client.recv().await;
             let plen = frame.header.payload_len;
             match classify(&frame, rid) {
-                SFrame::Data(_) => {
+                SFrame::Data(d) => {
+                    push_rows(d, &mut rows);
                     data_before_cancel += 1;
                     client.window_update(rid, 1, plen).await;
                 }
@@ -367,23 +379,46 @@ async fn abandonment_recovery_after_cancel() {
         }
 
         // ABANDON: route a CANCEL to this request, then DRAIN whatever is already in flight to the
-        // ONE terminal. Keep replenishing during the drain so a producer momentarily parked on
-        // credit still reaches its abort path — the drain is bounded (at most the remaining result),
-        // and the request declares exactly one terminal.
+        // ONE terminal — but send NO further WINDOW_UPDATEs. A producer parked on
+        // `CreditCell::debit_or_wait` is cancel-aware (B3): if CANCEL is honored it aborts almost
+        // immediately without needing more credit (the terminal itself is credit-free). If CANCEL
+        // were silently ignored, withholding all further credit means the remaining ~47000 rows
+        // could never be sent, and this drain loop would stall until `recv()`'s timeout panics —
+        // a hard failure, not a false-green `Ok`.
         client.cancel(rid).await;
+        let mut data_during_drain = 0u32;
         let terminal = loop {
             let frame = client.recv().await;
-            let plen = frame.header.payload_len;
             match classify(&frame, rid) {
-                SFrame::Data(_) => client.window_update(rid, 1, plen).await,
+                SFrame::Data(d) => {
+                    push_rows(d, &mut rows);
+                    data_during_drain += 1;
+                }
                 SFrame::Head(_) => panic!("a second HEAD frame after cancel"),
                 SFrame::End(o) => break o,
             }
         };
 
+        // TRUNCATION PROOF: the CANCEL must have cut the stream far short of the full 50000-row
+        // result. At most a handful of DATA frames (the 3 primed pre-cancel + at most one more
+        // in-flight batch the producer had already pulled/queued before observing the cancel) can
+        // possibly have been delivered without any further WINDOW_UPDATE — nowhere near the
+        // ~49-frame/50000-row full result. This is the assertion that makes THIS test self-proving
+        // (not just reliant on the FakeBackend unit tests elsewhere).
+        assert!(
+            rows.len() < BIG_ROWS / 5,
+            "CANCEL must truncate the stream far short of the full {BIG_ROWS} rows when no further \
+             credit is granted; got {} rows before the terminal ({} pre-cancel + {} during the \
+             no-replenish drain) — the CANCEL does not appear to be gating the producer",
+            rows.len(),
+            data_before_cancel,
+            data_during_drain
+        );
+
         // The abandoned read terminates with the ONE END frame. Normally it is `Error(CANCELLED)`
         // (57014 — a read is NEVER `Indeterminate`); on a benign race the stream may have drained
-        // just before the cancel routed, giving an `Ok`. Either way: exactly one terminal.
+        // just before the cancel routed, giving an `Ok` — but the row-count assertion above already
+        // rules out a full, unabridged drain reaching that arm. Either way: exactly one terminal.
         match &terminal {
             Outcome::Error(ep) => assert_eq!(
                 ep.code,
@@ -404,8 +439,13 @@ async fn abandonment_recovery_after_cancel() {
         );
         assert_session_alive(&mut client, 999).await;
         eprintln!(
-            "[abandon] data_before_cancel={} terminal={:?}",
-            data_before_cancel, terminal
+            "[abandon] rows_before_terminal={} (data_before_cancel={} data_during_drain={}) \
+             full_result={} terminal={:?}",
+            rows.len(),
+            data_before_cancel,
+            data_during_drain,
+            BIG_ROWS,
+            terminal
         );
     })
     .await
