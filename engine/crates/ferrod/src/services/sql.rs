@@ -50,7 +50,7 @@ use tokio_util::sync::CancellationToken;
 
 use ferro_pool::backend::{Cancel, PoolBackend, QueryResult};
 use ferro_pool::error::PoolError;
-use ferro_pool::pool::Checkout;
+use ferro_pool::pool::{Checkout, Pool, RowStreamHandle};
 use ferro_proto::consts::{MAX_FRAME_PAYLOAD, errc, method_sql, method_tx, service};
 use ferro_proto::messages::ErrorPayload;
 use ferro_proto::messages::sql::{ExecOk, ExecRequest, Stats};
@@ -60,7 +60,7 @@ use ferro_proto::value::Value;
 use crate::pools::PoolRegistry;
 use crate::services::fate::{self, OpContext};
 use crate::session::codec::InFrame;
-use crate::session::responder::Responder;
+use crate::session::responder::{Responder, StreamSendError};
 use crate::session::{HandlerFactory, HandlerFn, SessionId};
 use crate::tx::{
     CtlReply, ExecReply, TxCommand, TxHandle, TxLookupErr, TxRegistry, actor, next_tx_id,
@@ -71,8 +71,9 @@ use crate::tx::{
 /// otherwise applies backpressure on the (spawned, per-request) forwarding handler tasks.
 const TX_CMD_CHANNEL_CAP: usize = 16;
 
-/// `ExecRequest.fetch` modes. 0 = rows, 1 = none (affected only), 2 = stream (reserved — `Unsupported`
-/// in M0 per D-S5-1). Kept as named constants (not magic numbers) at the handler boundary.
+/// `ExecRequest.fetch` modes. 0 = rows, 1 = none (affected only), 2 = stream (M1-S5: the windowed
+/// DATA-channel producer, autocommit path in Task 4b; a tx-scoped stream is Task 5). Kept as named
+/// constants (not magic numbers) at the handler boundary.
 const FETCH_ROWS: u8 = 0;
 const FETCH_NONE: u8 = 1;
 const FETCH_STREAM: u8 = 2;
@@ -209,13 +210,9 @@ async fn handle_exec(
         return;
     }
     match req.fetch {
-        FETCH_ROWS | FETCH_NONE => {}
-        FETCH_STREAM => {
-            responder.end_error(unsupported(
-                "fetch=stream is post-M0 (D-S5-1: M0 buffers the result into one terminal frame)",
-            ));
-            return;
-        }
+        // FETCH_STREAM is now honored on the autocommit path (below); a tx-scoped stream is still
+        // rejected in the `Some(tx_id)` arm (Task 5).
+        FETCH_ROWS | FETCH_NONE | FETCH_STREAM => {}
         other => {
             responder.end_error(unsupported(format!("unknown fetch mode {other}")));
             return;
@@ -234,6 +231,16 @@ async fn handle_exec(
     match req.tx_id {
         // ---- tx-scoped EXEC: forward to the owning actor (the conn is already pinned) ----
         Some(tx_id) => {
+            // A tx-scoped streamed fetch runs the shared producer against the actor's pinned conn —
+            // that wiring is Task 5. Until then it is a clean per-request Unsupported (the buffered
+            // tx path below is untouched).
+            if req.fetch == FETCH_STREAM {
+                responder.end_error(unsupported(
+                    "tx-scoped fetch=stream is not yet supported (streaming inside a transaction is \
+                     Task 5); use an autocommit stream or a buffered fetch",
+                ));
+                return;
+            }
             // `req.pool` is ignored here — the transaction is already pinned to its pool's conn.
             let handle = match resolve_active(tx_registry, tx_id, session_id) {
                 Ok(h) => h,
@@ -299,6 +306,24 @@ async fn handle_exec(
                 responder.end_error(unsupported(format!("unknown pool {:?}", req.pool)));
                 return;
             };
+
+            // M1-S5 Task 4b: a streamed fetch runs the incremental HEAD + DATA×N producer under the
+            // credit window instead of buffering the whole result into the terminal (D-S5-1). The
+            // buffered FETCH_ROWS/FETCH_NONE path below is untouched.
+            if req.fetch == FETCH_STREAM {
+                run_autocommit_streamed(
+                    responder,
+                    pool,
+                    sql,
+                    &req.params,
+                    req.timeout_ms,
+                    req.readonly,
+                    &cancel,
+                    StreamBatch::DEFAULT,
+                )
+                .await;
+                return;
+            }
 
             // (3) checkout → queue_us (the pool-wait, including any recycle cleanup on the popped conn).
             let mut co = match pool.checkout().await {
@@ -450,6 +475,372 @@ fn declare_autocommit_exec(
                 in_tx: false,
             },
         )),
+    }
+}
+
+// ============================ M1-S5 Task 4b: the streaming producer ============================
+
+/// Batch flush policy for [`run_streamed_exec`]: accumulate pulled rows and flush the batch as ONE
+/// `STREAM/DATA` frame when EITHER `max_rows` rows OR `max_bytes` (estimated) payload bytes have
+/// accumulated — whichever trips first — keeping each DATA frame comfortably under
+/// `MAX_FRAME_PAYLOAD` while amortizing per-frame overhead. `max_bytes` is a SOFT target measured by
+/// a cheap per-row estimate ([`estimate_row_bytes`]); the HARD per-frame ceiling is still enforced
+/// by `Responder::send_data`'s `Oversized` check. Passing the budget in (rather than a hidden const)
+/// is what makes the DATA-frame count observable — a test forces a known count with `max_rows: 1`.
+#[derive(Debug, Clone, Copy)]
+struct StreamBatch {
+    max_rows: usize,
+    max_bytes: usize,
+}
+
+impl StreamBatch {
+    /// Production default: ~a thousand rows or ~256 KiB per DATA frame — well under the 16 MiB
+    /// `MAX_FRAME_PAYLOAD`, so the credit window and session cap flow smoothly and no single batch
+    /// of typical rows risks the codec ceiling.
+    const DEFAULT: StreamBatch = StreamBatch {
+        max_rows: 1024,
+        max_bytes: 256 * 1024,
+    };
+}
+
+/// One iteration of [`run_streamed_exec`]'s outer `biased` select over cancel / deadline / the pull.
+enum StreamStep {
+    /// The pull resolved: `Some(Ok(row))` per row, `Some(Err(_))` mid-stream error, `None` drained.
+    Row(Option<Result<Vec<Value>, PoolError>>),
+    /// The request's `cancel` token fired mid-stream (a routed CANCEL or session teardown).
+    Cancelled,
+    /// The request's `timeout_ms` deadline passed mid-stream.
+    Deadline,
+}
+
+/// The autocommit `fetch:stream` producer entry: checkout, capture the out-of-band cancel handle
+/// BEFORE the stream borrow (mirroring [`run_autocommit_exec`]/the tx actor — a live query future
+/// holds `&mut Client`, so the cancel MUST fire over a side connection), open the incremental
+/// [`Checkout::query_stream`], then hand off to the shared [`run_streamed_exec`] loop. `co` is held
+/// for the WHOLE stream (the `RowStreamHandle` borrows it) and drops only AFTER `finish()` inside
+/// the loop — the reverse of the buffered path, where the conn is released before framing.
+#[allow(clippy::too_many_arguments)]
+async fn run_autocommit_streamed<B: PoolBackend>(
+    responder: Responder,
+    pool: &Pool<B>,
+    sql: &str,
+    params: &[Value],
+    timeout_ms: Option<u32>,
+    readonly: bool,
+    cancel: &CancellationToken,
+    batch: StreamBatch,
+) {
+    // A checkout failure means NO connection was established → the statement was NEVER transmitted
+    // (sent=false), a known did-not-apply; autocommit (in_tx=false). Same fate as the buffered path.
+    let mut co = match pool.checkout().await {
+        Ok(co) => co,
+        Err(e) => {
+            responder.end_error(fate::classify_fate(
+                e,
+                OpContext {
+                    readonly,
+                    sent: false,
+                    in_tx: false,
+                },
+            ));
+            return;
+        }
+    };
+
+    // Capture the out-of-band cancel handle BEFORE the stream borrows `co`: it returns an OWNED
+    // handle, so this shared borrow ends at once and does not conflict with the `&mut co` the
+    // `RowStreamHandle` then holds (identical to `run_autocommit_exec`/`tx/actor.rs`).
+    let cancel_handle = co.cancel_handle();
+    // A single fixed deadline shared by the outer select AND every send_head/send_data flow-control
+    // wait, so `timeout_ms` bounds the WHOLE stream (mid-pull and mid-backpressure alike).
+    let deadline =
+        timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(u64::from(ms)));
+
+    // M7: exec_us times ONLY backend-pull awaits — the `query_stream` OPEN is the first such await.
+    let open_start = tokio::time::Instant::now();
+    let handle = match co.query_stream(sql, params).await {
+        Ok(h) => h,
+        Err(e) => {
+            // Open-time failure. `sent: true` — `Checkout::query_stream` calls `client.query_raw`
+            // (the Bind+Execute SEND) before it can return `Err` from that step, so a
+            // `ConnectionLost` here is a post-send transport loss whose fate is UNKNOWN → a WRITE is
+            // `Indeterminate`, matching the BUFFERED path (`run_autocommit_exec`'s error is declared
+            // `sent: true` too). A known-fate `Sql` (a prepare syntax error, an out-of-M0 column, a
+            // bind pre-validation fault) passes through VERBATIM regardless of `sent`, so this
+            // conservative choice only ever tightens the transport-loss cell — the safe direction
+            // (charter rule 5). Autocommit (in_tx=false).
+            responder.end_error(fate::classify_fate(
+                e,
+                OpContext {
+                    readonly,
+                    sent: true,
+                    in_tx: false,
+                },
+            ));
+            return;
+        }
+    };
+    let open_us = open_start.elapsed().as_micros() as u64;
+
+    run_streamed_exec(
+        handle,
+        responder,
+        cancel,
+        deadline,
+        cancel_handle,
+        OpContext {
+            readonly,
+            // `sent: true` for the WHOLE loop: `query_stream` returning Ok means `query_raw` already
+            // dispatched the statement to the backend (rows then pull lazily off a channel), so from
+            // here on the statement is in flight — identical to the buffered path's unconditional
+            // `sent: true` for any post-dispatch error. See the safety note below.
+            sent: true,
+            in_tx: false,
+        },
+        open_us,
+        batch,
+    )
+    .await;
+
+    // `co` drops HERE (RAII), only after `run_streamed_exec`'s `handle.finish()` released the
+    // `&mut co` borrow — the conn returns to the pool correctly pinned/tainted (Task 3).
+    drop(co);
+}
+
+/// The SHARED pull→send loop (Task 5 will call it from the tx actor too): emit HEAD once, then pull
+/// rows incrementally and flush them as DATA frames under the credit window, then exactly ONE
+/// terminal — declared by this function via the consumed `responder`. Exactly-one-END and the §19.3
+/// fate rules hold on EVERY exit.
+///
+/// **M7 (exec_us excludes backpressure).** `exec_us` starts at `open_us` (the caller-timed
+/// `query_stream` open) and is incremented ONLY around each `handle.next()` pull — NEVER around
+/// `send_head`/`send_data`, which include the credit/cap/channel waits. The strictly-sequential
+/// pull-then-send loop makes this exact: no pull overlaps a send.
+///
+/// **Cancel/abort sequence.** On any abort — the outer `biased` select observing `cancel`/`deadline`
+/// (even mid-pull), a `handle.next()` `Err`, or a `send_head`/`send_data` `StreamSendError` — the
+/// loop STOPS producing and routes to [`abort_stream`]: fire the out-of-band `cancel_handle` (drain
+/// the running query at the server), `handle.finish()` (drain to RFQ + hygiene), then ONE terminal
+/// from `classify_fate` of the ABORT reason under `ctx`. A streamed READ never becomes
+/// `Indeterminate` (classify_fate routes it by `readonly`).
+///
+/// **`ctx.sent` is `true` for the whole loop** and NEVER re-derived from "how many DATA frames went
+/// out". Reaching this function at all means `query_stream` returned Ok, i.e. `query_raw` already
+/// dispatched the statement (see `run_autocommit_streamed`); rows then pull lazily off a channel,
+/// but the statement is already executing server-side. So a cancel/timeout/loss at ANY point in the
+/// loop — even before the first DATA frame — is a dispatched-statement event, and a streamed WRITE's
+/// fate is UNKNOWN → `Indeterminate` (§19.3, the "defining safety property"). Gating `sent` on
+/// DATA-delivered would mint an UNSAFE `Retryable` for a write cancelled after dispatch but before
+/// its first row (a double-apply hazard). This mirrors the buffered path, which declares `sent: true`
+/// for any post-dispatch error unconditionally.
+#[allow(clippy::too_many_arguments)]
+async fn run_streamed_exec<B: PoolBackend>(
+    mut handle: RowStreamHandle<'_, B>,
+    responder: Responder,
+    cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+    cancel_handle: B::CancelHandle,
+    ctx: OpContext,
+    open_us: u64,
+    batch: StreamBatch,
+) {
+    let mut exec_us = open_us;
+
+    // (1) HEAD: the column metadata, once, before any DATA. Grab `cols` before `finish()` consumes
+    // the handle. A StreamSendError here (a cancelled/deadlined flow-control wait, an oversized cols
+    // frame, or a lost link) → the abort path (the statement is already dispatched — see the doc).
+    let cols = handle.cols().to_vec();
+    if let Err(e) = responder.send_head(&cols, cancel, deadline).await {
+        abort_stream(
+            handle,
+            responder,
+            cancel_handle,
+            ctx,
+            send_err_to_pool_error(e),
+        )
+        .await;
+        return;
+    }
+
+    // (2) pull → batch → send_data loop.
+    let mut batch_rows: Vec<Vec<Value>> = Vec::new();
+    let mut batch_bytes: usize = 0;
+    let mut streamed_rows: u64 = 0;
+
+    loop {
+        // Pull under a `biased` select over cancel / deadline / the pull, so a cancel/timeout is
+        // observed even while awaiting a slow row. exec_us times ONLY the pull (M7).
+        let pull_start = tokio::time::Instant::now();
+        let step = tokio::select! {
+            biased;
+            () = cancel.cancelled() => StreamStep::Cancelled,
+            () = sleep_until_opt(deadline) => StreamStep::Deadline,
+            row = handle.next() => StreamStep::Row(row),
+        };
+        exec_us += pull_start.elapsed().as_micros() as u64;
+
+        match step {
+            StreamStep::Cancelled | StreamStep::Deadline => {
+                abort_stream(handle, responder, cancel_handle, ctx, stream_cancel_error()).await;
+                return;
+            }
+            StreamStep::Row(Some(Err(e))) => {
+                abort_stream(handle, responder, cancel_handle, ctx, e).await;
+                return;
+            }
+            StreamStep::Row(Some(Ok(row))) => {
+                batch_bytes += estimate_row_bytes(&row);
+                batch_rows.push(row);
+                streamed_rows += 1;
+                if batch_rows.len() >= batch.max_rows || batch_bytes >= batch.max_bytes {
+                    let to_send = std::mem::take(&mut batch_rows);
+                    batch_bytes = 0;
+                    if let Err(e) = responder.send_data(to_send, cancel, deadline).await {
+                        abort_stream(
+                            handle,
+                            responder,
+                            cancel_handle,
+                            ctx,
+                            send_err_to_pool_error(e),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            StreamStep::Row(None) => {
+                // The stream drained: flush any final partial batch, then finish → the ONE Ok
+                // terminal. The handler future resolves only after this returns, so the supervisor's
+                // terminal is ordered strictly AFTER the last DATA (B4).
+                if !batch_rows.is_empty() {
+                    let to_send = std::mem::take(&mut batch_rows);
+                    if let Err(e) = responder.send_data(to_send, cancel, deadline).await {
+                        abort_stream(
+                            handle,
+                            responder,
+                            cancel_handle,
+                            ctx,
+                            send_err_to_pool_error(e),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                match handle.finish().await {
+                    Ok(end) => {
+                        let body = build_stream_terminal_body(
+                            end.affected,
+                            streamed_rows,
+                            end.stats.queue_us,
+                            exec_us,
+                        );
+                        responder.end_ok(Bytes::from(body));
+                    }
+                    // `finish()` currently always returns Ok (a late drain error force-taints but
+                    // returns Ok); handle a future Err defensively — a read never goes Indeterminate.
+                    Err(e) => responder.end_error(fate::classify_fate(e, ctx)),
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// The single abort exit for [`run_streamed_exec`]: STOP producing, fire the out-of-band backend
+/// cancel (drain a still-running query at the server, exactly like [`run_autocommit_exec`]/the tx
+/// actor's Deadline arm — necessary when the abort is a cancel/timeout/backpressure-unwind, harmless
+/// when the stream already errored on its own), `finish()` the handle (drain to RFQ + run hygiene;
+/// `finish` force-taints a late drain error but returns Ok — we classify from `err`, the ABORT
+/// reason, not from finish's return), then declare the ONE terminal via `classify_fate` under `ctx`
+/// (`sent: true` — the statement is dispatched; see [`run_streamed_exec`]'s doc). A streamed READ
+/// never becomes `Indeterminate` (classify_fate routes it by `readonly`).
+async fn abort_stream<B: PoolBackend>(
+    handle: RowStreamHandle<'_, B>,
+    responder: Responder,
+    cancel_handle: B::CancelHandle,
+    ctx: OpContext,
+    err: PoolError,
+) {
+    cancel_handle.cancel().await;
+    let _ = handle.finish().await;
+    responder.end_error(fate::classify_fate(err, ctx));
+}
+
+/// The terminal `Outcome::Ok` body for a finished `fetch:stream`: the rows already went out as DATA
+/// frames and the cols as the HEAD frame, so the terminal carries ONLY `affected` + `stats` (no
+/// cols, no rows). `stats.rows` is the TOTAL streamed row count (the client also counts them off the
+/// DATA channel). No one-frame size-check is needed — with no rows and no cols the body is tiny.
+fn build_stream_terminal_body(
+    affected: u64,
+    streamed_rows: u64,
+    queue_us: u64,
+    exec_us: u64,
+) -> Vec<u8> {
+    let mut exec_ok = ExecOk {
+        cols: Vec::new(),
+        rows: Vec::new(),
+        affected,
+        last_insert_id: None,
+        stats: Stats {
+            queue_us,
+            exec_us,
+            rows: streamed_rows,
+            bytes: 0,
+        },
+    };
+    encode_exec_ok_fixpoint(&mut exec_ok)
+}
+
+/// A cheap per-row byte estimate used ONLY to bound batch size (see [`StreamBatch`]); the exact
+/// per-frame ceiling is enforced by `Responder::send_data`'s `Oversized` check, so this need only be
+/// roughly proportional to the encoded size, never exact.
+fn estimate_row_bytes(row: &[Value]) -> usize {
+    row.iter()
+        .map(|v| match v {
+            Value::Null | Value::Bool(_) => 1,
+            Value::I64(_) | Value::F64(_) => 9,
+            Value::Text(s) => s.len() + 5,
+            Value::Bytes(b) => b.len() + 5,
+        })
+        .sum::<usize>()
+        + 2
+}
+
+/// A 57014-shaped cancel `PoolError` for a stream aborted by cancel / deadline / a backpressure
+/// unwind. `fate::classify_fate`'s `is_57014` override then routes it by `readonly`/`sent`/`in_tx`
+/// exactly as it routes the buffered path's drained cancel: a streamed autocommit READ →
+/// `Cancelled{NonRetryable}`, a dispatched streamed autocommit WRITE → `WriteUnconfirmed{Indeterminate}`,
+/// a tx-scoped stream (Task 5) → `TxDeadline{Retryable}`.
+fn stream_cancel_error() -> PoolError {
+    PoolError::Sql {
+        code: errc::CANCELLED,
+        branch: errc::CANCELLED_BRANCH,
+        sqlstate: Some("57014".to_string()),
+        message: "streamed statement cancelled or timed out".to_string(),
+    }
+}
+
+/// Map a `StreamSendError` (a failed `send_head`/`send_data`) to the `PoolError` the abort path
+/// classifies from: a flow-control OR final-channel-send abort is a cancel/timeout (57014); an
+/// oversized single row is the §5.2 large-row ceiling; a closed control channel is a lost link.
+fn send_err_to_pool_error(e: StreamSendError) -> PoolError {
+    match e {
+        StreamSendError::Aborted(_) => stream_cancel_error(),
+        StreamSendError::Oversized => PoolError::Unsupported(
+            "a streamed row exceeds one frame (MAX_FRAME_PAYLOAD); large-row streaming is post-M1"
+                .to_string(),
+        ),
+        StreamSendError::LinkLost => PoolError::ConnectionLost,
+    }
+}
+
+/// Await `deadline` if there is one, else never resolve — the `Instant`-based sibling of
+/// [`sleep_opt`], for [`run_streamed_exec`]'s outer select (a single fixed `Instant` deadline is
+/// shared with every `send_head`/`send_data` wait, so the whole stream honors one `timeout_ms`).
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -717,6 +1108,25 @@ fn actor_gone_terminal(
     }
 }
 
+/// Encode an `ExecOk` with an EXACT `stats.bytes` by iterating to a FIXED POINT: `stats.bytes` IS
+/// the encoded body length, but the body carries `stats.bytes`, so setting it can widen that field
+/// and grow the body. Body length is monotonic non-decreasing in the `bytes` value (a larger value
+/// is the same-or-wider msgpack uint), and each step sets `bytes` to the current length, so the
+/// sequence increases and converges in a couple of steps (bounded defensively). Shared by the
+/// buffered [`build_terminal_body`] and the streamed [`build_stream_terminal_body`].
+fn encode_exec_ok_fixpoint(exec_ok: &mut ExecOk) -> Vec<u8> {
+    let mut body = exec_ok.encode();
+    for _ in 0..8 {
+        let len = body.len() as u64;
+        if exec_ok.stats.bytes == len {
+            break;
+        }
+        exec_ok.stats.bytes = len;
+        body = exec_ok.encode();
+    }
+    body
+}
+
 /// Shape `result` by `fetch`, encode the `ExecOk` terminal body, and size-check the fully-encoded
 /// `Outcome::Ok` payload. Returns the encoded body on success, or an `Unsupported` `ErrorPayload`
 /// if the result would exceed one frame. Split out (no pool/DB) so the size-cap and shaping are
@@ -751,21 +1161,7 @@ fn build_terminal_body(
         },
     };
 
-    // `stats.bytes` IS the encoded terminal body length, but the body carries `stats.bytes`, so
-    // setting it can widen that field and grow the body. Iterate to a FIXED POINT so the reported
-    // count is EXACT: body length is monotonic non-decreasing in the `bytes` value (a larger value
-    // is the same-or-wider msgpack uint), and each step sets `bytes` to the current length, so the
-    // sequence increases and converges in a couple of steps. (Bounded defensively; the size-check
-    // below always uses the FINAL body regardless, so the one-frame bound is exact either way.)
-    let mut body = exec_ok.encode();
-    for _ in 0..8 {
-        let len = body.len() as u64;
-        if exec_ok.stats.bytes == len {
-            break;
-        }
-        exec_ok.stats.bytes = len;
-        body = exec_ok.encode();
-    }
+    let body = encode_exec_ok_fixpoint(&mut exec_ok);
 
     // Size-check the FULLY-ENCODED Outcome::Ok payload (body + the 2-byte envelope), NOT the raw
     // body (BLOCKER-v2). A per-request Unsupported is the clean alternative to a session teardown.
@@ -1251,5 +1647,691 @@ mod tests {
             "a cancelled statement taints the conn -> Full reset at the next checkout: {:?}",
             co2.conn().recorded
         );
+    }
+
+    // ---- M1-S5 Task 4b: the streaming producer (run_autocommit_streamed / run_streamed_exec) -----
+    //
+    // Deterministic `FakeBackend`-driven proofs of the pull->send loop under credit: HEAD + DATA*N
+    // then exactly ONE terminal END (B4), backpressure pause/resume + cancel/timeout unwind (B3),
+    // the session cap release (M6), and exec_us-excludes-backpressure (M7). Each drives the REAL
+    // `run_autocommit_streamed` (checkout + query_stream + the shared `run_streamed_exec` loop) with
+    // a `max_rows: 1` batch so the DATA-frame count is exactly the scripted row count.
+
+    use crate::session::codec::ControlMsg;
+    use crate::session::flow::{Credit, CreditCell, SessionCap};
+    use crate::session::registry::Registry;
+    use crate::session::supervisor;
+    use ferro_pool::fake::StreamScript;
+    use ferro_proto::consts::{flags, method_stream};
+    use ferro_proto::messages::{StreamData, StreamHead};
+    use tokio::time::timeout;
+
+    const STREAM_REQ_ID: u32 = 77;
+
+    fn stream_col(name: &str) -> ColMeta {
+        ColMeta {
+            name: name.to_string(),
+            tag: tag::I64,
+        }
+    }
+
+    fn i64_row(n: i64) -> Vec<Value> {
+        vec![Value::I64(n)]
+    }
+
+    /// One row per DATA frame — so a scripted N-row result emits exactly N DATA frames (the
+    /// DATA-frame count is observable; see `StreamBatch`'s doc).
+    fn one_row_batch() -> StreamBatch {
+        StreamBatch {
+            max_rows: 1,
+            max_bytes: usize::MAX,
+        }
+    }
+
+    fn script(rows: Vec<Vec<Value>>, affected: u64, error_at: Option<usize>) -> StreamScript {
+        StreamScript {
+            cols: vec![stream_col("n")],
+            rows,
+            affected,
+            error_at,
+        }
+    }
+
+    /// Run one autocommit stream INLINE (not spawned — so a `&Pool` borrow is fine), drain every
+    /// emitted frame into `(service, method, flags)` descriptors (dropping each `ControlMsg`, which
+    /// releases its cap guard — modelling the writer), and return those plus the declared terminal.
+    async fn drive_stream(
+        pool: &Pool<FakeBackend>,
+        session_cap: &Arc<SessionCap>,
+        sql: &str,
+        readonly: bool,
+        batch: StreamBatch,
+    ) -> (Vec<(u16, u16, u16)>, Terminal) {
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(64);
+        let credit_cell = Arc::new(CreditCell::new(Credit::new(1000, u32::MAX)));
+        let (responder, cell) = Responder::new_streaming(
+            STREAM_REQ_ID,
+            credit_cell,
+            Arc::clone(session_cap),
+            control_tx.clone(),
+        );
+        let cancel = CancellationToken::new();
+        // Channel cap 64 >> the frame count, so the inline producer never blocks on the send.
+        run_autocommit_streamed(responder, pool, sql, &[], None, readonly, &cancel, batch).await;
+        drop(control_tx);
+
+        let mut frames = Vec::new();
+        while let Some(msg) = control_rx.recv().await {
+            frames.push((
+                msg.frame.header.service,
+                msg.frame.header.method,
+                msg.frame.header.flags,
+            ));
+            // `msg` drops here -> its cap guard (if any) releases.
+        }
+        let terminal = cell
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the producer declared exactly one terminal");
+        (frames, terminal)
+    }
+
+    fn count_data(frames: &[(u16, u16, u16)]) -> usize {
+        frames
+            .iter()
+            .filter(|(s, m, _)| *s == service::STREAM && *m == method_stream::DATA)
+            .count()
+    }
+
+    /// B4: a streamed EXEC producing 3 DATA frames → the wire sees HEAD, DATA×3, then exactly ONE
+    /// terminal END, in that order (the terminal is LAST — it can never overtake a DATA frame).
+    #[tokio::test]
+    async fn streamed_exec_head_data_x3_then_exactly_one_end_b4() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(script(vec![i64_row(1), i64_row(2), i64_row(3)], 3, None));
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(16);
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+        let registry = Arc::new(Registry::new(4));
+        let (cancel, credit_cell) = registry
+            .insert(STREAM_REQ_ID, Credit::new(10, 10_000_000))
+            .unwrap();
+        let permit = control_tx.clone().reserve_owned().await.unwrap();
+        let (responder, cell) = Responder::new_streaming(
+            STREAM_REQ_ID,
+            credit_cell,
+            Arc::clone(&session_cap),
+            control_tx.clone(),
+        );
+
+        // The supervisor sends the terminal ONLY after the handler task joins — on the SAME ordered
+        // channel as the DATA frames, so FIFO puts it strictly last (B4).
+        let task = tokio::spawn(async move {
+            run_autocommit_streamed(
+                responder,
+                &pool,
+                "SELECT n",
+                &[],
+                None,
+                true,
+                &cancel,
+                one_row_batch(),
+            )
+            .await;
+        });
+        supervisor::supervise(
+            STREAM_REQ_ID,
+            service::SQL,
+            method_sql::EXEC,
+            permit,
+            cell,
+            task,
+            Arc::clone(&registry),
+        )
+        .await;
+
+        // HEAD first.
+        let head = control_rx.recv().await.expect("HEAD frame");
+        assert_eq!(head.frame.header.service, service::STREAM);
+        assert_eq!(head.frame.header.method, method_stream::HEAD);
+        assert!(head.cap.is_some(), "HEAD carries its cap guard");
+        let sh = StreamHead::decode(&head.frame.payload).expect("decode HEAD");
+        assert_eq!(sh.cols.len(), 1);
+
+        // Then exactly 3 DATA frames, one scripted row each.
+        for i in 1..=3i64 {
+            let d = control_rx.recv().await.expect("a DATA frame");
+            assert_eq!(d.frame.header.service, service::STREAM);
+            assert_eq!(d.frame.header.method, method_stream::DATA);
+            assert_eq!(d.frame.header.flags, flags::STREAM);
+            let sd = StreamData::decode(&d.frame.payload).expect("decode DATA");
+            assert_eq!(
+                sd.rows,
+                vec![i64_row(i)],
+                "DATA frames stream rows in order"
+            );
+        }
+
+        // Then exactly ONE terminal END — last, after all DATA.
+        let end = control_rx.recv().await.expect("the terminal END");
+        assert_eq!(end.frame.header.flags, flags::END);
+        assert_eq!(end.frame.header.service, service::SQL);
+        assert!(end.cap.is_none(), "the terminal carries no cap guard");
+        match Outcome::decode(&end.frame.payload).expect("decode Outcome") {
+            Outcome::Ok(body) => {
+                let ok = ExecOk::decode(&body).expect("decode ExecOk");
+                assert_eq!(ok.affected, 3);
+                assert!(ok.rows.is_empty(), "the stream terminal carries no rows");
+                assert!(
+                    ok.cols.is_empty(),
+                    "the stream terminal carries no cols (they went out in HEAD)"
+                );
+                assert_eq!(ok.stats.rows, 3, "stats.rows is the streamed count");
+            }
+            other => panic!("expected Outcome::Ok, got {other:?}"),
+        }
+        assert!(
+            control_rx.try_recv().is_err(),
+            "exactly one END — nothing follows the terminal"
+        );
+        assert_eq!(
+            registry.len(),
+            0,
+            "the supervisor removed the registry entry"
+        );
+    }
+
+    /// B3 backpressure pause+resume: a 1-frame credit window → HEAD (MINOR-12: HEAD debits a frame)
+    /// consumes it, the first DATA then BLOCKS; a `WINDOW_UPDATE` replenishes → it resumes and
+    /// finishes. Bounded by `tokio::time::timeout` so a lost-wakeup hang fails instead of stalling.
+    #[tokio::test]
+    async fn streamed_exec_backpressure_pause_then_resume_b3() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(script(vec![i64_row(1)], 1, None));
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(16);
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+        // 1-frame window: HEAD consumes it; the first DATA then parks on the empty window.
+        let credit_cell = Arc::new(CreditCell::new(Credit::new(1, 10_000_000)));
+        let (responder, cell) = Responder::new_streaming(
+            STREAM_REQ_ID,
+            Arc::clone(&credit_cell),
+            Arc::clone(&session_cap),
+            control_tx.clone(),
+        );
+        let cancel = CancellationToken::new();
+
+        let task = tokio::spawn(async move {
+            run_autocommit_streamed(
+                responder,
+                &pool,
+                "SELECT n",
+                &[],
+                None,
+                true,
+                &cancel,
+                one_row_batch(),
+            )
+            .await;
+        });
+
+        // HEAD goes out and consumes the 1 frame; the first DATA then parks.
+        let head = timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("HEAD within the bound")
+            .expect("HEAD");
+        assert_eq!(head.frame.header.method, method_stream::HEAD);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the producer must BLOCK on the exhausted window after HEAD"
+        );
+        assert!(
+            control_rx.try_recv().is_err(),
+            "no DATA yet — the credit window is empty"
+        );
+
+        // A WINDOW_UPDATE replenishes → the parked DATA send resumes and the stream finishes.
+        credit_cell.replenish(5, 10_000_000);
+        let data = timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("DATA after replenish — never a lost-wakeup hang")
+            .expect("DATA");
+        assert_eq!(data.frame.header.method, method_stream::DATA);
+        timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the producer finishes after replenish, never hangs")
+            .expect("task join");
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Ok(body)) => {
+                assert_eq!(ExecOk::decode(&body).expect("ExecOk").affected, 1);
+            }
+            other => panic!("expected an Ok terminal after resume, got {other:?}"),
+        }
+    }
+
+    /// B3 cancel mid-backpressure (the v1 lost-wakeup blocker): a 1-frame window NEVER replenished +
+    /// a client CANCEL → the parked producer unwinds, `finish()` runs, exactly ONE `Cancelled`
+    /// terminal is declared, and the conn is released (a fresh checkout succeeds) — NO hang, NO
+    /// leaked checkout.
+    #[tokio::test]
+    async fn streamed_exec_cancel_mid_backpressure_one_terminal_no_leak_b3() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(script(vec![i64_row(1), i64_row(2)], 2, None));
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(16);
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+        // 1-frame window, never replenished: only the CANCEL can unwind the parked first DATA.
+        let credit_cell = Arc::new(CreditCell::new(Credit::new(1, 10_000_000)));
+        let (responder, cell) = Responder::new_streaming(
+            STREAM_REQ_ID,
+            Arc::clone(&credit_cell),
+            Arc::clone(&session_cap),
+            control_tx.clone(),
+        );
+        let cancel = CancellationToken::new();
+        let cancel_fire = cancel.clone();
+
+        // Clone the `Pool` (a cheap `Arc` handle — sharing conns, not forking a pool) so the test can
+        // still checkout after the producer task takes its own handle.
+        let pool_task = pool.clone();
+        let task = tokio::spawn(async move {
+            run_autocommit_streamed(
+                responder,
+                &pool_task,
+                "SELECT n",
+                &[],
+                None,
+                true,
+                &cancel,
+                one_row_batch(),
+            )
+            .await;
+        });
+
+        let head = timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("HEAD")
+            .expect("HEAD");
+        assert_eq!(head.frame.header.method, method_stream::HEAD);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the producer is parked on the never-replenished window"
+        );
+
+        // The CANCEL unwinds the parked producer (a wait ONLY a WINDOW_UPDATE could otherwise wake).
+        cancel_fire.cancel();
+        timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancel must unwind the parked producer, never hang")
+            .expect("task join");
+
+        // Exactly ONE terminal: an autocommit READ cancel → Cancelled{NonRetryable} (never
+        // Indeterminate for a read).
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Error(ep)) => {
+                assert_eq!(ep.code, errc::CANCELLED);
+                assert_eq!(ep.branch, branch::NON_RETRYABLE);
+            }
+            other => panic!("expected exactly one Cancelled terminal, got {other:?}"),
+        }
+        // No leaked checkout: `co` dropped inside the producer → a fresh checkout on the size-1 pool
+        // succeeds (the permit was released) — no hang.
+        let _co2 = timeout(Duration::from_secs(5), pool.checkout())
+            .await
+            .expect("no leaked checkout, no hang")
+            .expect("conn released");
+    }
+
+    /// Timeout mid-stream (the S4 timeout gate on the streamed path): a `timeout_ms` that elapses
+    /// while the producer is parked mid-stream → stop + ONE fated terminal AFTER the DATA already
+    /// sent. A dispatched streamed WRITE (readonly=false, sent=true) → `WriteUnconfirmed{Indeterminate}`.
+    #[tokio::test(start_paused = true)]
+    async fn streamed_exec_timeout_mid_stream_one_fated_terminal_after_data() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(script(vec![i64_row(1), i64_row(2)], 2, None));
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(16);
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+        // 2-frame window: HEAD + the first DATA go out (sent=true); the second DATA parks on the
+        // empty window and the `timeout_ms` deadline (never replenished) fires while it is parked.
+        let credit_cell = Arc::new(CreditCell::new(Credit::new(2, 10_000_000)));
+        let (responder, cell) = Responder::new_streaming(
+            STREAM_REQ_ID,
+            Arc::clone(&credit_cell),
+            Arc::clone(&session_cap),
+            control_tx.clone(),
+        );
+        let cancel = CancellationToken::new();
+
+        let task = tokio::spawn(async move {
+            run_autocommit_streamed(
+                responder,
+                &pool,
+                "INSERT INTO t SELECT n RETURNING n",
+                &[],
+                Some(50), // timeout_ms
+                false,    // a WRITE
+                &cancel,
+                one_row_batch(),
+            )
+            .await;
+        });
+
+        // HEAD + DATA1 go out before the deadline.
+        let head = timeout(Duration::from_secs(30), control_rx.recv())
+            .await
+            .expect("HEAD")
+            .expect("HEAD");
+        assert_eq!(head.frame.header.method, method_stream::HEAD);
+        let data1 = timeout(Duration::from_secs(30), control_rx.recv())
+            .await
+            .expect("DATA1")
+            .expect("DATA1");
+        assert_eq!(data1.frame.header.method, method_stream::DATA);
+
+        // The paused clock auto-advances to the 50ms deadline while the 2nd DATA is parked → abort.
+        timeout(Duration::from_secs(30), task)
+            .await
+            .expect("the deadline aborts the parked stream, no hang")
+            .expect("task join");
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Error(ep)) => {
+                assert_eq!(
+                    ep.code,
+                    errc::WRITE_UNCONFIRMED,
+                    "a dispatched streamed write timeout is Indeterminate"
+                );
+                assert_eq!(ep.branch, branch::INDETERMINATE);
+            }
+            other => panic!("expected one WriteUnconfirmed terminal after the DATA, got {other:?}"),
+        }
+        assert!(
+            control_rx.try_recv().is_err(),
+            "the 2nd DATA was aborted while parked — it never went out"
+        );
+    }
+
+    /// M7: exec_us excludes backpressure. A stream stalled on an empty credit window for a long
+    /// (virtual) time must report `exec_us` ≈ the DB pull time (≈0 for the fake), NOT the wall-clock
+    /// including the stall. Proven under the paused clock: the 60s stall is advanced while the
+    /// producer is parked on a send (never inside a timed pull).
+    #[tokio::test(start_paused = true)]
+    async fn streamed_exec_exec_us_excludes_backpressure_stall_m7() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(script(vec![i64_row(1), i64_row(2)], 2, None));
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(16);
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+        // 2-frame window: HEAD + DATA1 go out; DATA2 parks (no deadline this time).
+        let credit_cell = Arc::new(CreditCell::new(Credit::new(2, 10_000_000)));
+        let (responder, cell) = Responder::new_streaming(
+            STREAM_REQ_ID,
+            Arc::clone(&credit_cell),
+            Arc::clone(&session_cap),
+            control_tx.clone(),
+        );
+        let cancel = CancellationToken::new();
+
+        let task = tokio::spawn(async move {
+            run_autocommit_streamed(
+                responder,
+                &pool,
+                "SELECT n",
+                &[],
+                None,
+                true,
+                &cancel,
+                one_row_batch(),
+            )
+            .await;
+        });
+
+        // Drain HEAD + DATA1; the producer then parks on DATA2's empty window.
+        timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("HEAD")
+            .expect("HEAD");
+        timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("DATA1")
+            .expect("DATA1");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "the producer is parked on the window");
+
+        // Advance the VIRTUAL clock 60s while parked on backpressure — time a whole-loop timer would
+        // wrongly count into exec_us. Then replenish so the stream finishes.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        credit_cell.replenish(5, 10_000_000);
+        timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("DATA2 after replenish")
+            .expect("DATA2");
+        timeout(Duration::from_secs(5), task)
+            .await
+            .expect("finishes")
+            .expect("join");
+
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Ok(body)) => {
+                let ok = ExecOk::decode(&body).expect("ExecOk");
+                assert_eq!(ok.affected, 2);
+                assert!(
+                    ok.stats.exec_us < 1_000_000,
+                    "exec_us ({}) must exclude the 60s backpressure stall (M7): it times pulls only",
+                    ok.stats.exec_us
+                );
+            }
+            other => panic!("expected an Ok terminal, got {other:?}"),
+        }
+    }
+
+    /// M6: the session cap returns to baseline after the terminal (not monotonic), and a 2nd stream
+    /// on the SAME session works (no wedge). Also covers the HEAD-only (zero-row) stream → used == 0.
+    #[tokio::test]
+    async fn streamed_exec_session_cap_releases_and_second_stream_works_m6() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(script(vec![i64_row(1), i64_row(2), i64_row(3)], 3, None));
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+
+        // Stream #1: a multi-frame result. `drive_stream` drops every emitted ControlMsg (modelling
+        // the writer), so all DATA cap guards release.
+        let (frames1, term1) =
+            drive_stream(&pool, &session_cap, "SELECT n", true, one_row_batch()).await;
+        assert_eq!(count_data(&frames1), 3, "3 rows → 3 DATA frames");
+        assert!(matches!(term1, Terminal::Ok(_)));
+        assert_eq!(
+            session_cap.used(),
+            0,
+            "M6: the session cap returns to baseline after all DATA guards drop"
+        );
+
+        // Stream #2 on the SAME session cap + the SAME size-1 pool (recycled conn): a zero-row stream
+        // emits HEAD but no DATA, and must ALSO release the cap to 0 (no wedge).
+        pool.backend().set_stream_script(script(vec![], 0, None));
+        let (frames2, term2) =
+            drive_stream(&pool, &session_cap, "SELECT n", true, one_row_batch()).await;
+        assert_eq!(count_data(&frames2), 0, "a zero-row stream emits no DATA");
+        assert_eq!(
+            frames2
+                .iter()
+                .filter(|(s, m, _)| *s == service::STREAM && *m == method_stream::HEAD)
+                .count(),
+            1,
+            "a zero-row stream still emits its HEAD"
+        );
+        assert!(
+            matches!(term2, Terminal::Ok(_)),
+            "a 2nd stream on the same session works (no wedge)"
+        );
+        assert_eq!(
+            session_cap.used(),
+            0,
+            "a HEAD-only stream also releases the cap to baseline"
+        );
+    }
+
+    /// A mid-stream `next()` error → exactly ONE `Outcome::Error` terminal with the classified fate,
+    /// AFTER whatever DATA already went out. (The fake's mid-stream error is a `PoolError::Backend`
+    /// → `classify_fate` → Protocol; a real server error would be a `Sql` passed through verbatim.)
+    #[tokio::test]
+    async fn streamed_exec_mid_stream_error_one_terminal_after_data() {
+        let backend = FakeBackend::new();
+        // error_at: Some(1) → emit exactly 1 row, then error on the next pull.
+        backend.set_stream_script(script(vec![i64_row(1), i64_row(2)], 0, Some(1)));
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+
+        let (frames, terminal) =
+            drive_stream(&pool, &session_cap, "SELECT n", true, one_row_batch()).await;
+
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(s, m, _)| *s == service::STREAM && *m == method_stream::HEAD)
+                .count(),
+            1,
+            "HEAD went out before the error"
+        );
+        assert_eq!(
+            count_data(&frames),
+            1,
+            "exactly one DATA (row 1) went out before the mid-stream error"
+        );
+        match terminal {
+            Terminal::Error(ep) => assert_eq!(
+                ep.code,
+                errc::PROTOCOL,
+                "the fake's mid-stream Backend error classifies to Protocol"
+            ),
+            other => panic!("expected exactly one Error terminal, got {other:?}"),
+        }
+        assert_eq!(
+            session_cap.used(),
+            0,
+            "the cap is released even on a mid-stream error"
+        );
+    }
+
+    /// A checkout failure on the streamed path → the same never-sent fate as the buffered path
+    /// (sent=false → a write is known-fate Retryable, never Indeterminate), and no HEAD/DATA/rows.
+    #[tokio::test]
+    async fn streamed_exec_checkout_failure_is_known_fate_no_frames() {
+        let backend = FakeBackend::new();
+        backend.arm_fail_connect(1); // the pool's only connect attempt fails
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+
+        // A WRITE (readonly=false): a checkout failure is a provable did-not-apply → Retryable,
+        // NOT Indeterminate (nothing was transmitted).
+        let (frames, terminal) = drive_stream(
+            &pool,
+            &session_cap,
+            "INSERT INTO t VALUES (1)",
+            false,
+            one_row_batch(),
+        )
+        .await;
+        assert!(frames.is_empty(), "a checkout failure emits no HEAD/DATA");
+        match terminal {
+            Terminal::Error(ep) => {
+                assert_eq!(ep.code, errc::CONNECTION_LOST);
+                assert_eq!(ep.branch, branch::RETRYABLE);
+                assert_ne!(ep.branch, branch::INDETERMINATE);
+            }
+            other => panic!("expected a known-fate ConnectionLost terminal, got {other:?}"),
+        }
+    }
+
+    /// SAFETY (the §19.3 "defining safety property"): a streamed WRITE cancelled AFTER dispatch but
+    /// BEFORE its first DATA frame is `WriteUnconfirmed{Indeterminate}` — NOT `Retryable`. `sent` is
+    /// `true` for the whole loop because `query_stream` returning Ok means `query_raw` already
+    /// dispatched the statement (rows pull lazily off a channel afterward); gating `sent` on
+    /// DATA-delivered would mint an UNSAFE `Retryable` here and invite a double-apply. The 1-frame
+    /// window is consumed by HEAD, so the CANCEL fires while the first DATA is parked — provably
+    /// before ANY DATA went out.
+    #[tokio::test]
+    async fn streamed_write_cancel_before_first_data_is_indeterminate_not_retryable() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(script(vec![i64_row(1)], 1, None));
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(16);
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+        // 1-frame window: HEAD consumes it; the first DATA parks before it can go out.
+        let credit_cell = Arc::new(CreditCell::new(Credit::new(1, 10_000_000)));
+        let (responder, cell) = Responder::new_streaming(
+            STREAM_REQ_ID,
+            Arc::clone(&credit_cell),
+            Arc::clone(&session_cap),
+            control_tx.clone(),
+        );
+        let cancel = CancellationToken::new();
+        let cancel_fire = cancel.clone();
+
+        let task = tokio::spawn(async move {
+            run_autocommit_streamed(
+                responder,
+                &pool,
+                "INSERT INTO t SELECT 1 RETURNING id",
+                &[],
+                None,
+                false, // a WRITE
+                &cancel,
+                one_row_batch(),
+            )
+            .await;
+        });
+
+        // HEAD goes out (consuming the 1 frame); the first DATA then parks — no DATA has gone out.
+        let head = timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("HEAD")
+            .expect("HEAD");
+        assert_eq!(head.frame.header.method, method_stream::HEAD);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            control_rx.try_recv().is_err(),
+            "no DATA has gone out yet — the cancel below is provably before the first DATA"
+        );
+
+        cancel_fire.cancel();
+        timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancel unwinds, no hang")
+            .expect("task join");
+
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Error(ep)) => {
+                assert_eq!(
+                    ep.code,
+                    errc::WRITE_UNCONFIRMED,
+                    "a dispatched streamed write cancelled before its first row is Indeterminate"
+                );
+                assert_eq!(ep.branch, branch::INDETERMINATE);
+                assert_ne!(
+                    ep.branch,
+                    branch::RETRYABLE,
+                    "NEVER Retryable — that would invite a double-apply of a possibly-applied write"
+                );
+            }
+            other => panic!("expected WriteUnconfirmed/Indeterminate, got {other:?}"),
+        }
     }
 }

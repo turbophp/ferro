@@ -262,9 +262,12 @@ async fn unsupported_query_id_pool_stream() {
         errc::UNSUPPORTED
     );
 
-    // fetch = stream (reserved in M0).
+    // A TX-SCOPED fetch=stream (streaming inside a transaction) is still Unsupported (Task 5). The
+    // AUTOCOMMIT fetch=stream path is now the live HEAD/DATA producer (M1-S5 Task 4b) — covered by
+    // the deterministic FakeBackend unit tests in `services::sql` — so it is no longer an error here.
     let mut stream = req("SELECT 1");
     stream.fetch = 2;
+    stream.tx_id = Some(1);
     assert_eq!(
         exec_err(&mut client, 52, &stream).await.code,
         errc::UNSUPPORTED

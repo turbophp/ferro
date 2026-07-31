@@ -248,14 +248,33 @@ impl Responder {
             },
             payload: Bytes::from(payload),
         };
-        self.sink
-            .control_tx
-            .send(ControlMsg {
-                frame,
-                cap: Some(cap),
-            })
-            .await
-            .map_err(|_| StreamSendError::LinkLost)
+        let msg = ControlMsg {
+            frame,
+            cap: Some(cap),
+        };
+        // The FINAL channel send is cancel/deadline-aware too (carried Task-4a review fix). Steps 2-3
+        // already returned, so without this a slow-but-connected client filling the channel's slack
+        // could park the producer HERE past its cancel/deadline. Race the send against the same
+        // `cancel`/`deadline`; on an abort arm the `send(msg)` future is dropped, dropping `msg` —
+        // which releases the `CapReserve` guard it carries (no leak, exactly one release) — and the
+        // frame is never enqueued. `biased` so cancel/deadline win a tie over a just-freed slot.
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(StreamSendError::Aborted(WaitAborted::Cancelled)),
+            () = sleep_until_opt(deadline) => Err(StreamSendError::Aborted(WaitAborted::Deadline)),
+            res = self.sink.control_tx.send(msg) => res.map_err(|_| StreamSendError::LinkLost),
+        }
+    }
+}
+
+/// Await `deadline` if there is one, else never resolve — so the final-send race in
+/// [`Responder::send_stream_frame`] has a deadline arm even when the request set no `timeout_ms`.
+/// Mirrors `flow`'s identical private helper (kept local rather than reaching into another module's
+/// private item).
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -445,6 +464,83 @@ mod tests {
             0,
             "an aborted send reserves nothing net"
         );
+    }
+
+    // --- carried Task-4a review fix: the FINAL channel send is cancel/deadline-aware too ---
+    // A `send_data` parked on a FULL control channel (debit + reserve already passed) with a fired
+    // `cancel` must return `Aborted` PROMPTLY (never park past the request's cancel/deadline while a
+    // slow-but-connected client fills the channel slack), and the dropped guard-carrying `ControlMsg`
+    // must release the cap reservation — no leak.
+    #[tokio::test]
+    async fn send_data_final_channel_send_aborts_on_cancel_and_releases_cap() {
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+        // Capacity 1, pre-filled: the producer's own send then blocks on a FULL channel.
+        let (tx, mut rx) = mpsc::channel::<ControlMsg>(1);
+        tx.send(ControlMsg::bare(dummy_stream_frame()))
+            .await
+            .expect("prefill the one channel slot");
+        // Generous credit + cap: the block MUST be on the channel send, not on debit/reserve.
+        let credit = cell(10, u32::MAX);
+        let (responder, _cell) =
+            Responder::new_streaming(REQ_ID, Arc::clone(&credit), Arc::clone(&session_cap), tx);
+        let responder = Arc::new(responder);
+        let cancel = CancellationToken::new();
+
+        let rows = small_rows();
+        let expected_len = StreamData { rows: rows.clone() }.encode().len() as u64;
+
+        let waiter = {
+            let responder = Arc::clone(&responder);
+            let cancel = cancel.clone();
+            tokio::spawn(async move { responder.send_data(rows, &cancel, None).await })
+        };
+        // Let it debit+reserve and park on the full channel's send.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "send_data must park on the full channel (debit + reserve already passed)"
+        );
+        assert_eq!(
+            session_cap.used(),
+            expected_len,
+            "the frame's cap is reserved while it is parked on the channel send"
+        );
+
+        // Fire cancel -> the final-send race unwinds promptly; the dropped ControlMsg releases the cap.
+        cancel.cancel();
+        let res = timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("cancel must unwind a full-channel send promptly, never hang")
+            .expect("task join");
+        assert_eq!(res, Err(StreamSendError::Aborted(WaitAborted::Cancelled)));
+        assert_eq!(
+            session_cap.used(),
+            0,
+            "the aborted send's cap reservation is released on the dropped ControlMsg (no leak)"
+        );
+
+        // Only the prefilled bare message was ever enqueued — the cancelled frame never went in.
+        let first = rx.recv().await.expect("the prefilled message");
+        assert!(first.cap.is_none(), "the prefilled message carries no cap");
+        assert!(
+            rx.try_recv().is_err(),
+            "the cancelled frame was never enqueued"
+        );
+    }
+
+    fn dummy_stream_frame() -> OutFrame {
+        OutFrame {
+            header: Header {
+                flags: 0,
+                service: service::STREAM,
+                method: method_stream::DATA,
+                request_id: REQ_ID,
+                payload_len: 0,
+            },
+            payload: Bytes::new(),
+        }
     }
 
     // --- a stray stream send on an inert `new_pair` Responder fails fast, never hangs ---
