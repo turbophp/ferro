@@ -14,6 +14,8 @@ use Ferro\Protocol\Message;
 use Ferro\Protocol\Outcome;
 use Ferro\Protocol\Msgpack\PackerFactory;
 use Ferro\Protocol\Msgpack\PackerInterface;
+use Ferro\Protocol\StreamData;
+use Ferro\Protocol\StreamHead;
 
 /**
  * The synchronous, single-in-flight session over a {@see TransportInterface}: HELLO/HELLO_ACK, one
@@ -31,7 +33,7 @@ use Ferro\Protocol\Msgpack\PackerInterface;
  * `boot_epoch` is stored OPAQUE (`int|string`) exactly as the packer yields it — never coerced, so
  * the Task-4 reconnect loop can detect an epoch change even for `u64 > PHP_INT_MAX` values.
  */
-final class Session implements SessionInterface
+final class Session implements SessionInterface, StreamingSessionInterface
 {
     private readonly Codec $codec;
     private readonly PackerInterface $encodePacker;
@@ -51,6 +53,15 @@ final class Session implements SessionInterface
      * @var array{0:int,1:int}|null
      */
     private ?array $lastInFlight = null;
+
+    /**
+     * Set between a successful {@see openStream} and the streamed read reaching its terminal (or
+     * being {@see abandonStream}-ed). While set, {@see sendRequest} / {@see openStream} refuse —
+     * the single-in-flight session cannot interleave a buffered request with an open stream's
+     * un-read DATA/END frames without desyncing the wire (M1-S5 Task 6).
+     */
+    private bool $streamOpen = false;
+    private ?int $streamRequestId = null;
 
     public function __construct(
         private readonly TransportInterface $transport,
@@ -127,6 +138,7 @@ final class Session implements SessionInterface
      */
     public function sendRequest(int $service, int $method, string $payload): Outcome
     {
+        $this->assertNoOpenStream();
         $rid = $this->ids->next();
         // Record BEFORE the write so that if the write (or the terminal read) dies, the carve-out can
         // read exactly which (service, method) was in flight — e.g. TX/COMMIT ⇒ Indeterminate (§19.3).
@@ -138,17 +150,7 @@ final class Session implements SessionInterface
 
         if ($header->requestId === 0) {
             // Session-context terminal. Decode its Outcome::Error (if any) so the fate is preserved.
-            $ep = null;
-            if ($isEnd) {
-                $outcome = Outcome::decode($body, $this->decodePacker);
-                if ($outcome->isError()) { $ep = $outcome->errorPayload(); }
-            }
-            throw new ConnectionLostException(
-                $ep !== null
-                    ? sprintf('session-fatal terminal: %s (code=%d)', $ep->message, $ep->code)
-                    : 'session-fatal terminal on request_id=0',
-                $ep,
-            );
+            throw $this->sessionFatal($body, $isEnd);
         }
 
         if (!$isEnd) {
@@ -227,6 +229,119 @@ final class Session implements SessionInterface
 
     public function handshakeComplete(): bool { return $this->handshakeDone; }
 
+    // ---- streamed read (M1-S5 Task 6, {@see StreamingSessionInterface}) --------------------------
+
+    /** @return array{type:'head', requestId:int, cols:list<array{name:string,tag:int}>}|array{type:'end', requestId:int, outcome:Outcome} */
+    public function openStream(int $service, int $method, string $payload): array
+    {
+        $this->assertNoOpenStream();
+        $rid = $this->ids->next();
+        $this->lastInFlight = [$service, $method];
+        $this->writeFrame(0, $service, $method, $payload, $rid);
+
+        [$header, $body] = $this->readFrame();
+        $isEnd = ($header->flags & C::FLAG_END) !== 0;
+
+        if ($header->requestId === 0) {
+            throw $this->sessionFatal($body, $isEnd);
+        }
+
+        if ($isEnd) {
+            // A known fate decided before any HEAD/DATA went out (e.g. a checkout failure) — no
+            // stream was ever really opened, so there is nothing to guard or drain.
+            if ($header->requestId !== $rid) {
+                throw new ProtocolException(sprintf(
+                    'stream-open terminal request_id %d does not echo the sent id %d',
+                    $header->requestId,
+                    $rid,
+                ));
+            }
+            return ['type' => 'end', 'requestId' => $rid, 'outcome' => Outcome::decode($body, $this->decodePacker)];
+        }
+
+        if ($header->service !== C::SERVICE_STREAM || $header->method !== C::METHOD_STREAM_HEAD
+            || $header->requestId !== $rid) {
+            throw new ProtocolException(sprintf(
+                'expected STREAM/HEAD for request %d, got service=%d method=%d flags=%d request_id=%d',
+                $rid,
+                $header->service,
+                $header->method,
+                $header->flags,
+                $header->requestId,
+            ));
+        }
+
+        $this->streamOpen = true;
+        $this->streamRequestId = $rid;
+
+        return ['type' => 'head', 'requestId' => $rid, 'cols' => $this->decodeStreamHead($body)];
+    }
+
+    /**
+     * @return array{type:'data', rows:list<list<array{tag:int,data:mixed}>>, bytes:int}
+     *       | array{type:'end', outcome:Outcome}
+     */
+    public function readStreamFrame(int $requestId): array
+    {
+        [$header, $body] = $this->readFrame();
+        $isEnd = ($header->flags & C::FLAG_END) !== 0;
+
+        if ($header->requestId === 0) {
+            $this->streamOpen = false;
+            $this->streamRequestId = null;
+            throw $this->sessionFatal($body, $isEnd);
+        }
+
+        if ($isEnd) {
+            if ($header->requestId !== $requestId) {
+                throw new ProtocolException(sprintf(
+                    'stream terminal request_id %d does not echo the open stream id %d',
+                    $header->requestId,
+                    $requestId,
+                ));
+            }
+            $this->streamOpen = false;
+            $this->streamRequestId = null;
+            return ['type' => 'end', 'outcome' => Outcome::decode($body, $this->decodePacker)];
+        }
+
+        if ($header->service !== C::SERVICE_STREAM || $header->method !== C::METHOD_STREAM_DATA
+            || $header->requestId !== $requestId) {
+            throw new ProtocolException(sprintf(
+                'expected STREAM/DATA for request %d, got service=%d method=%d flags=%d request_id=%d',
+                $requestId,
+                $header->service,
+                $header->method,
+                $header->flags,
+                $header->requestId,
+            ));
+        }
+
+        return ['type' => 'data', 'rows' => $this->decodeStreamData($body), 'bytes' => strlen($body)];
+    }
+
+    public function sendWindowUpdate(int $requestId, int $frames, int $bytes): void
+    {
+        $payload = Message::encode('window_update', ['frames' => $frames, 'bytes' => $bytes], $this->encodePacker);
+        $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_WINDOW_UPDATE, $payload, $requestId);
+    }
+
+    public function sendCancel(int $requestId): void
+    {
+        $this->writeFrame(C::FLAG_CANCEL, C::SERVICE_CORE, 0, '', $requestId);
+    }
+
+    public function abandonStream(int $requestId): void
+    {
+        if (!$this->streamOpen || $this->streamRequestId !== $requestId) {
+            return; // already closed (normal completion) or not this stream — nothing to drain.
+        }
+        $this->sendCancel($requestId);
+        while ($this->streamOpen) {
+            $this->readStreamFrame($requestId); // discards DATA batches; clears the guard on 'end'.
+        }
+    }
+
     private function writeFrame(int $flags, int $service, int $method, string $payload, int $requestId = 0): void
     {
         $header = new Header($flags, $service, $method, $requestId, strlen($payload));
@@ -240,5 +355,55 @@ final class Session implements SessionInterface
         $header = Header::decode($head);
         $payload = $header->payloadLen > 0 ? $this->transport->readExact($header->payloadLen) : '';
         return [$header, $payload];
+    }
+
+    /** @throws ProtocolException if a stream is currently open on this session. */
+    private function assertNoOpenStream(): void
+    {
+        if ($this->streamOpen) {
+            throw new ProtocolException(sprintf(
+                'a stream (request_id=%d) is open on this session; drive it to its terminal or call '
+                    . 'abandonStream() before sending another request',
+                $this->streamRequestId ?? -1,
+            ));
+        }
+    }
+
+    /** Build the {@see ConnectionLostException} for a `request_id=0` session-fatal terminal body. */
+    private function sessionFatal(string $body, bool $isEnd): ConnectionLostException
+    {
+        $ep = null;
+        if ($isEnd) {
+            $outcome = Outcome::decode($body, $this->decodePacker);
+            if ($outcome->isError()) { $ep = $outcome->errorPayload(); }
+        }
+        return new ConnectionLostException(
+            $ep !== null
+                ? sprintf('session-fatal terminal: %s (code=%d)', $ep->message, $ep->code)
+                : 'session-fatal terminal on request_id=0',
+            $ep,
+        );
+    }
+
+    /** @return list<array{name:string,tag:int}> */
+    private function decodeStreamHead(string $body): array
+    {
+        $off = 0;
+        $w = $this->decodePacker->unpack($body, $off);
+        if (!is_array($w)) {
+            throw new ProtocolException('StreamHead body is not an array');
+        }
+        return StreamHead::mapFromWire(array_values($w))['cols'];
+    }
+
+    /** @return list<list<array{tag:int,data:mixed}>> */
+    private function decodeStreamData(string $body): array
+    {
+        $off = 0;
+        $w = $this->decodePacker->unpack($body, $off);
+        if (!is_array($w)) {
+            throw new ProtocolException('StreamData body is not an array');
+        }
+        return StreamData::mapFromWire(array_values($w))['rows'];
     }
 }

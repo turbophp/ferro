@@ -24,7 +24,7 @@ final class StreamHead
     /**
      * Map an already-unpacked 1-element wire array back to the "message" JSON shape.
      * @param array<int,mixed> $w
-     * @return array<string,mixed>
+     * @return array{cols:list<array{name:string,tag:int}>}
      */
     public static function mapFromWire(array $w): array
     {

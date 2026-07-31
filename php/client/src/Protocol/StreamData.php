@@ -24,7 +24,7 @@ final class StreamData
     /**
      * Map an already-unpacked 1-element wire array back to the "message" JSON shape.
      * @param array<int,mixed> $w
-     * @return array<string,mixed>
+     * @return array{rows:list<list<array{tag:int,data:mixed}>>}
      */
     public static function mapFromWire(array $w): array
     {

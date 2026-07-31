@@ -89,17 +89,7 @@ final class ExecCodec
 
             $rows = [];
             foreach (SqlValueCodec::listOf($ok['rows']) as $row) {
-                $cells = [];
-                foreach (SqlValueCodec::listOf($row) as $cell) {
-                    if (!is_array($cell)) {
-                        throw new CodecException('ExecOk: bad cell');
-                    }
-                    $cells[] = $this->values->decode(
-                        SqlValueCodec::toInt($cell['tag'] ?? -1),
-                        $cell['data'] ?? null,
-                    );
-                }
-                $rows[] = $cells;
+                $rows[] = $this->decodeRow(SqlValueCodec::listOf($row));
             }
 
             return ['cols' => $cols, 'rows' => $rows, 'affected' => SqlValueCodec::toInt($ok['affected'] ?? 0)];
@@ -107,6 +97,30 @@ final class ExecCodec
             // A terminal that read fully but failed to parse is a protocol fault, not a fate signal.
             throw new ProtocolException('failed to decode SQL terminal: ' . $e->getMessage(), 0, $e);
         }
+    }
+
+    /**
+     * Value-policy-decode one raw wire row (a list of `{tag, data}` cells — the exact shape both
+     * `ExecOk.rows` and the streaming `StreamData.rows` use, see {@see \Ferro\Protocol\SqlValueCodec::fromWire}).
+     * Shared by the buffered {@see decode} and the streaming path ({@see \Ferro\Client\Connection::stream}) so
+     * a cell is decoded identically regardless of which wire channel it arrived on.
+     *
+     * @param list<mixed> $rawCells
+     * @return list<mixed>
+     */
+    public function decodeRow(array $rawCells): array
+    {
+        $cells = [];
+        foreach ($rawCells as $cell) {
+            if (!is_array($cell)) {
+                throw new ProtocolException('bad TypedValue cell (not an array)');
+            }
+            $cells[] = $this->values->decode(
+                SqlValueCodec::toInt($cell['tag'] ?? -1),
+                $cell['data'] ?? null,
+            );
+        }
+        return $cells;
     }
 
     /**

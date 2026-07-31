@@ -162,6 +162,96 @@ final class Connection
         return $this->codec->assocRows($this->dispatchAutocommit($sql, $params, true, ExecCodec::FETCH_ROWS));
     }
 
+    /**
+     * Lazily stream a read-only query's rows over the engine's windowed HEAD/DATA/END producer
+     * (`fetch:FETCH_STREAM`, SPEC §7.2, M1-S5) — the Doctrine/Eloquent `iterate*()`-never-buffers
+     * contract: each row is hydrated and yielded as its DATA batch arrives, never the whole result
+     * set at once. Sends a replenishing `WINDOW_UPDATE` after every consumed DATA frame so the
+     * server's per-request credit window stays healthy.
+     *
+     * **Abandonment safety.** If the caller stops iterating before the terminal `END` — a
+     * `foreach (...) { break; }`, or simply letting the returned Generator get garbage-collected —
+     * the Generator's `finally` sends an outbound `CANCEL` and drains the remaining DATA/END frames
+     * to the ONE terminal. Without this, the un-read frames would sit on the session's socket and
+     * the NEXT request would read them as its own reply (a wire desync) — the reason this method
+     * needs its own streamed read path rather than reusing {@see query}'s buffered one.
+     *
+     * A mid-stream error terminal throws the mapped {@see \Ferro\Client\Error\FerroException} (via
+     * {@see \Ferro\Client\Error\ErrorMapper}) AFTER the rows that arrived before it — they are
+     * already handed to the caller and are never rewound.
+     *
+     * Requires the active session to implement {@see StreamingSessionInterface} (the concrete
+     * {@see Session}); throws {@see ProtocolException} otherwise rather than mis-reading frames.
+     *
+     * @template T of object
+     * @param list<mixed> $params
+     * @param class-string<T>|null $dto
+     * @return ($dto is null ? iterable<array<string,mixed>> : iterable<T>)
+     */
+    public function stream(string $sql, array $params = [], ?string $dto = null): iterable
+    {
+        $session = $this->session();
+        if (!$session instanceof StreamingSessionInterface) {
+            throw new ProtocolException(
+                'stream() requires a session implementing StreamingSessionInterface (the concrete Session)',
+            );
+        }
+        $payload = $this->codec->encode($this->pool, $sql, $params, true, ExecCodec::FETCH_STREAM, null);
+
+        $opened = $session->openStream(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
+        if ($opened['type'] === 'end') {
+            // A known fate decided before any HEAD/DATA went out (e.g. a checkout failure) — no
+            // stream was ever really opened, so there's nothing to cancel/drain.
+            $this->throwIfError($opened['outcome']);
+            return;
+        }
+        $rid = $opened['requestId'];
+        $colNames = array_map(static fn (array $c): string => $c['name'], $opened['cols']);
+
+        $reachedTerminal = false;
+        // Set on a failure of a WIRE operation itself (a read/write against `$session`) so the
+        // `finally` below never attempts a second wire operation (the cancel+drain) on a
+        // connection we already know is broken — that would either mask the real failure with a
+        // confusing secondary one, or (worse) silently replace it (a `finally` that throws
+        // discards whatever exception was already propagating). A hydration failure (bad DTO
+        // arity, etc.) does NOT set this — the wire is fine, so draining the still-unread
+        // DATA/END frames is exactly the right cleanup for the NEXT request's sake.
+        $wireFailed = false;
+        try {
+            while (true) {
+                try {
+                    $frame = $session->readStreamFrame($rid);
+                } catch (\Throwable $e) {
+                    $wireFailed = true;
+                    throw $e;
+                }
+                if ($frame['type'] === 'end') {
+                    $reachedTerminal = true;
+                    $this->throwIfError($frame['outcome']);
+                    return;
+                }
+
+                foreach ($frame['rows'] as $rawRow) {
+                    $row = $this->codec->decodeRow($rawRow);
+                    yield $dto === null
+                        ? $this->codec->assocRow($colNames, $row)
+                        : $this->codec->hydrateDto($dto, $colNames, $row);
+                }
+
+                try {
+                    $session->sendWindowUpdate($rid, 1, $frame['bytes']);
+                } catch (\Throwable $e) {
+                    $wireFailed = true;
+                    throw $e;
+                }
+            }
+        } finally {
+            if (!$reachedTerminal && !$wireFailed) {
+                $session->abandonStream($rid);
+            }
+        }
+    }
+
     // ---- transaction ----------------------------------------------------------------------------
 
     /**
@@ -295,6 +385,14 @@ final class Connection
     }
 
     // ---- internals ------------------------------------------------------------------------------
+
+    /** Throw the mapped taxonomy exception for a non-`Ok` stream terminal {@see Outcome}; a no-op on `Ok`. */
+    private function throwIfError(Outcome $outcome): void
+    {
+        if (!$outcome->isOk()) {
+            throw ErrorMapper::fromOutcome($outcome);
+        }
+    }
 
     /**
      * Send one autocommit EXEC and decode it, transparently reconnecting + re-issuing a Retryable
