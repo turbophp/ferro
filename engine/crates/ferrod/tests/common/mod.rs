@@ -169,6 +169,43 @@ impl TestServer {
         TestServer { socket_path }
     }
 
+    /// Like `spawn_with_factory`, but threads a caller-supplied `Config` into EVERY session (its
+    /// `socket_path` is always overwritten with a fresh temp path). `spawn_with_factory` hardcodes
+    /// `Config::default()` for the session, which fixes the credit window at the default
+    /// `credit_frames` — so a streaming-backpressure test (M1-S5 Task 7) that needs a SMALL window
+    /// (`credit_frames: 2`) uses this variant instead, and `stream_server` builds on it.
+    pub fn spawn_with_factory_and_config(
+        epoch: BootEpoch,
+        config: Config,
+        tx_registry: Arc<TxRegistry>,
+        factory: HandlerFactory,
+    ) -> Self {
+        let socket_path = tmp_socket_path();
+        let config = Config {
+            socket_path: socket_path.clone(),
+            ..config
+        };
+        let listener = ferrod::listener::bind_uds(&config).expect("bind_uds in test harness");
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _addr) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(Session::run_with_handler(
+                    stream,
+                    config.clone(),
+                    epoch,
+                    tx_registry.clone(),
+                    factory.clone(),
+                ));
+            }
+        });
+
+        TestServer { socket_path }
+    }
+
     /// Connect a new client to this server.
     pub async fn connect(&self) -> TestClient {
         connect(&self.socket_path).await
@@ -507,6 +544,36 @@ pub fn exec_server(url: String) -> TestServer {
         config.tx_teardown_timeout,
     );
     TestServer::spawn_with_factory(BootEpoch(1), tx_registry, factory)
+}
+
+/// Like [`exec_server`], but with a caller-chosen SMALL per-request credit window
+/// (`credit_frames`) so a large `fetch:stream` result MUST park on backpressure and resume only
+/// when the client sends a `WINDOW_UPDATE` (M1-S5 Task 7's live gate). `credit_bytes` is left at the
+/// default (== `MAX_FRAME_PAYLOAD`, 16 MiB — `Config::validate` rejects anything smaller), so the
+/// backpressure comes purely from the FRAMES dimension. The SAME `config` seeds both the session's
+/// credit window (via `spawn_with_factory_and_config`) and the EXEC handler's pool, so the small
+/// window is actually in force end to end (`spawn_with_factory` would silently reset it to default).
+pub fn stream_server(url: String, credit_frames: u32) -> TestServer {
+    let config = Config {
+        credit_frames,
+        pools: vec![PoolSpec {
+            name: "default".to_string(),
+            dsn: url,
+            pin_functions: Vec::new(),
+            pin_on_unknown: true,
+        }],
+        ..Config::default()
+    };
+    let registry = PoolRegistry::build(&config);
+    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let factory = sql::make_handler(
+        registry,
+        tx_registry.clone(),
+        config.idle_in_tx,
+        config.max_tx,
+        config.tx_teardown_timeout,
+    );
+    TestServer::spawn_with_factory_and_config(BootEpoch(1), config, tx_registry, factory)
 }
 
 /// A base read-only `EXEC "sql"` against the "default" pool, fetch=rows, no params.
