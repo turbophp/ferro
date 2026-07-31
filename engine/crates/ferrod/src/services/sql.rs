@@ -1445,7 +1445,7 @@ fn unsupported(message: impl Into<String>) -> ErrorPayload {
     }
 }
 
-fn protocol(message: impl Into<String>) -> ErrorPayload {
+pub(crate) fn protocol(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: errc::PROTOCOL,
         branch: errc::PROTOCOL_BRANCH,
@@ -1460,7 +1460,7 @@ fn protocol(message: impl Into<String>) -> ErrorPayload {
 /// A `TxDeadline{Retryable}` terminal (0x1003, §7): the tx was cancelled + rolled back by a deadline
 /// (idle or max) or the owner is retrying a timed-out tx. Retryable is CLIENT policy — the engine
 /// never re-runs the statement (charter rule 3).
-fn tx_deadline(message: impl Into<String>) -> ErrorPayload {
+pub(crate) fn tx_deadline(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: errc::TX_DEADLINE,
         branch: errc::TX_DEADLINE_BRANCH,
