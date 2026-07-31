@@ -5,12 +5,17 @@
 //! **One tokio task per accepted connection ("the session task").** It owns:
 //! - a **reader loop** over the read half of `Framed<UnixStream, FrameCodec>`;
 //! - a long-lived **writer task**, spawned once per connection (`writer::run`), fed by a
-//!   **control channel** (`mpsc::Sender<OutFrame>` / `Receiver<OutFrame>`) sized to
+//!   **control channel** (`mpsc::Sender<ControlMsg>` / `Receiver<ControlMsg>`) sized to
 //!   `max_inflight + slack` so it is effectively never full. Every `HELLO_ACK`, `PONG`, every
-//!   terminal `END`, and every session-fatal error frame flows through this one channel. A
-//!   second, credit-limited **data channel** for streamed result frames arrives in S5;
-//!   `writer::run`'s `tokio::select!` loop is written so that second receiver can be added as
-//!   another arm without restructuring it.
+//!   terminal `END`, every session-fatal error frame — AND (from M1-S5) every streamed HEAD/DATA
+//!   frame — flows through this ONE ordered channel. That single-conduit choice is what makes a
+//!   streamed request's terminal never overtake its DATA (invariant B4): DATA is enqueued during
+//!   the handler run, the terminal only after (via the supervisor's reserved permit), so FIFO on
+//!   the one channel puts the terminal last. A `ControlMsg` is an `OutFrame` plus an optional
+//!   `CapReserve` guard (M6) the writer drops after the write; non-streamed sends carry `None`.
+//!   The earlier design sketched a SECOND, credit-limited data channel with control prioritized
+//!   over data — that priority-split is DEFERRED (charter rule 5, SPEC §22); `writer::run`'s
+//!   `tokio::select!` loop shape is kept so it can be reintroduced later without a rewrite.
 //! - an **in-flight registry** (`session::registry::Registry`, a
 //!   `std::sync::Mutex<HashMap<u32, InFlight>>` under the hood, `InFlight` holding a
 //!   `CancellationToken` + a `flow::Credit` — this module's Task 5 addition) keyed by
@@ -29,8 +34,10 @@
 //! 2. Reserves a control-channel permit (`control_tx.clone().reserve_owned().await`) — this
 //!    guarantees a delivery slot for the eventual terminal regardless of whatever else is queued
 //!    on the control channel, BEFORE the handler ever runs.
-//! 3. Builds a `Responder`/`cell` pair (`responder::Responder::new_pair`), spawns the handler
-//!    task (`tokio::spawn(handler(frame, responder))`), and spawns a **supervisor task**
+//! 3. Builds a stream-capable `Responder`/`cell` pair (`responder::Responder::new_streaming`,
+//!    carrying this request's credit window, the per-session cap, a `control_tx` clone, and the
+//!    request id so a `fetch:stream` handler can `send_head`/`send_data` — M1-S5), spawns the
+//!    handler task (`tokio::spawn(handler(frame, responder))`), and spawns a **supervisor task**
 //!    (`supervisor::supervise`) that awaits the handler's `JoinHandle` independently of the
 //!    reader loop — so the reader loop is never blocked by an in-flight handler and keeps
 //!    answering other traffic (PING, further requests, more diagnostics) concurrently.
@@ -161,9 +168,9 @@ use crate::dispatch::{self, CoreMethod, Route};
 use crate::epoch::BootEpoch;
 use crate::tx::TxRegistry;
 use classify::Classification;
-use codec::{FrameCodec, InFrame, OutFrame};
+use codec::{ControlMsg, FrameCodec, InFrame, OutFrame};
 use error::SessionError;
-use flow::Credit;
+use flow::{Credit, SessionCap};
 use registry::{InsertErr, Registry};
 use responder::Responder;
 
@@ -176,8 +183,9 @@ const CONTROL_CHANNEL_SLACK: usize = 8;
 /// A pluggable handler for request-bearing frames (`service` SQL/TX/STREAM): given the decoded
 /// `InFrame`, a `Responder` it owns, and a `CancellationToken` it may observe (set by a routed
 /// `CANCEL` targeting this request's id — advisory; the handler decides whether/when to honor it
-/// by calling `responder.end_cancelled()`), the handler declares exactly one terminal outcome (it
-/// may also stream DATA frames in S5, via a channel not yet wired). `Session::run` uses
+/// by calling `responder.end_cancelled()`), the handler declares exactly one terminal outcome (a
+/// streamed `fetch` handler may also emit HEAD/DATA frames first, via `Responder::send_head`/
+/// `send_data`, which enqueue on the same ordered control channel — M1-S5). `Session::run` uses
 /// `default_handler` (which ignores the token — an `Unsupported` stub has nothing to cancel);
 /// tests and (from Task 6 on) the real dispatch table provide their own.
 pub type HandlerFn =
@@ -245,8 +253,14 @@ impl Session {
         let (sink, mut reader) = framed.split();
 
         let (control_tx, control_rx) =
-            mpsc::channel::<OutFrame>(config.max_inflight + CONTROL_CHANNEL_SLACK);
+            mpsc::channel::<ControlMsg>(config.max_inflight + CONTROL_CHANNEL_SLACK);
         let writer_handle = tokio::spawn(writer::run(sink, control_rx));
+
+        // One per-session aggregate byte cap, shared (as an `Arc`) with every streamed request's
+        // `Responder` (M6). Its first construction lands here — `SessionCap`/`reserve_or_wait`/
+        // `CapReserve` were built in Task 2 with no instantiation site until now. Non-streamed
+        // requests carry the same handle but never reserve against it.
+        let session_cap = Arc::new(SessionCap::new(config.session_cap_bytes as u64));
 
         // 1. The mandatory first frame must arrive within `config.handshake_timeout` and decode as
         // core/HELLO. Whatever the read's outcome, route it through the SAME `classify` split the
@@ -286,7 +300,7 @@ impl Session {
                 // rid=0 session-fatal `END` the reader loop sends for any later frame — not a
                 // silent close.
                 let fatal = SessionError::Fatal(ep).into_out_frame();
-                let _ = control_tx.send(fatal).await;
+                let _ = control_tx.send(ControlMsg::bare(fatal)).await;
                 drop(control_tx);
                 let _ = writer_handle.await;
                 return;
@@ -296,7 +310,7 @@ impl Session {
                 // There is no valid HELLO in hand and thus no session to keep alive past this
                 // point — send the diagnostic on the frame's own id, then close.
                 let diagnostic = SessionError::PerRequest { rid, err }.into_out_frame();
-                let _ = control_tx.send(diagnostic).await;
+                let _ = control_tx.send(ControlMsg::bare(diagnostic)).await;
                 drop(control_tx);
                 let _ = writer_handle.await;
                 return;
@@ -307,7 +321,7 @@ impl Session {
         if !handshake::is_hello(&first) {
             let fatal =
                 SessionError::protocol_fatal("first frame was not core/HELLO").into_out_frame();
-            let _ = control_tx.send(fatal).await;
+            let _ = control_tx.send(ControlMsg::bare(fatal)).await;
             drop(control_tx);
             let _ = writer_handle.await;
             return;
@@ -316,7 +330,9 @@ impl Session {
         let _hello = match handshake::validate_hello(&first) {
             Ok(hello) => hello,
             Err(err) => {
-                let _ = control_tx.send(err.into_out_frame()).await;
+                let _ = control_tx
+                    .send(ControlMsg::bare(err.into_out_frame()))
+                    .await;
                 drop(control_tx);
                 let _ = writer_handle.await;
                 return;
@@ -328,7 +344,7 @@ impl Session {
             epoch,
             config.pools.iter().map(|p| p.name.clone()).collect(),
         );
-        if control_tx.send(ack).await.is_err() {
+        if control_tx.send(ControlMsg::bare(ack)).await.is_err() {
             // Writer already gone; nothing left to do.
             drop(control_tx);
             let _ = writer_handle.await;
@@ -378,12 +394,12 @@ impl Session {
                 Classification::Closed => break,
                 Classification::Fatal(ep) => {
                     let fatal = SessionError::Fatal(ep).into_out_frame();
-                    let _ = control_tx.send(fatal).await;
+                    let _ = control_tx.send(ControlMsg::bare(fatal)).await;
                     break;
                 }
                 Classification::PerRequestErr { rid, err } => {
                     let diagnostic = SessionError::PerRequest { rid, err }.into_out_frame();
-                    if control_tx.send(diagnostic).await.is_err() {
+                    if control_tx.send(ControlMsg::bare(diagnostic)).await.is_err() {
                         break;
                     }
                     continue;
@@ -403,7 +419,7 @@ impl Session {
                 Route::CoreControl(CoreMethod::Ping) => {
                     if let Ok(ping) = Ping::decode(&frame.payload) {
                         let pong = pong_frame(frame.header.request_id, ping.token);
-                        if control_tx.send(pong).await.is_err() {
+                        if control_tx.send(ControlMsg::bare(pong)).await.is_err() {
                             break;
                         }
                     }
@@ -425,6 +441,7 @@ impl Session {
                         frame,
                         &registry,
                         &control_tx,
+                        &session_cap,
                         &handler,
                         &config,
                         &mut supervisors,
@@ -443,7 +460,11 @@ impl Session {
                         err: unsupported_error_payload(),
                     }
                     .into_out_frame();
-                    if control_tx.send(unsupported).await.is_err() {
+                    if control_tx
+                        .send(ControlMsg::bare(unsupported))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -516,7 +537,8 @@ async fn drain_supervisors(supervisors: &mut JoinSet<()>, deadline: Duration) {
 async fn handle_request_frame(
     frame: InFrame,
     registry: &Arc<Registry>,
-    control_tx: &mpsc::Sender<OutFrame>,
+    control_tx: &mpsc::Sender<ControlMsg>,
+    session_cap: &Arc<SessionCap>,
     handler: &HandlerFn,
     config: &Config,
     supervisors: &mut JoinSet<()>,
@@ -530,15 +552,15 @@ async fn handle_request_frame(
     if id == 0 {
         let diagnostic =
             diagnostic_error_frame(&frame, "request_id 0 is reserved for session context");
-        return control_tx.send(diagnostic).await.is_ok();
+        return control_tx.send(ControlMsg::bare(diagnostic)).await.is_ok();
     }
 
     let credit = Credit::new(config.credit_frames, config.credit_bytes);
 
-    // `_credit_cell` is the producer's handle onto this request's flow-control window; it is wired
-    // into the Responder in Task 4a. Bound (not dropped) here so the registry's clone is not the
-    // sole owner — the registry always keeps its own clone regardless.
-    let (cancel, _credit_cell) = match registry.insert(id, credit) {
+    // `credit_cell` is the producer's handle onto this request's flow-control window (wired into
+    // the streamed `Responder` below, M1-S5 Task 4a). The registry keeps its own clone regardless,
+    // so a routed `WINDOW_UPDATE` can replenish it purely by id.
+    let (cancel, credit_cell) = match registry.insert(id, credit) {
         Ok(pair) => pair,
         Err(err) => {
             let message = match err {
@@ -546,7 +568,7 @@ async fn handle_request_frame(
                 InsertErr::Full => "max_inflight exceeded",
             };
             let diagnostic = diagnostic_error_frame(&frame, message);
-            return control_tx.send(diagnostic).await.is_ok();
+            return control_tx.send(ControlMsg::bare(diagnostic)).await.is_ok();
         }
     };
 
@@ -560,9 +582,15 @@ async fn handle_request_frame(
         }
     };
 
-    let (responder, cell) = Responder::new_pair();
     let service = frame.header.service;
     let method = frame.header.method;
+
+    // The handler ALWAYS gets a stream-capable `Responder` (M5 — additive, `HandlerFn` unchanged):
+    // it carries this request's credit window, the shared session cap, a `control_tx` clone, and
+    // the request id so a `fetch:stream` handler can `send_head`/`send_data`. A non-streamed
+    // handler simply never calls those and declares its one terminal exactly as before.
+    let (responder, cell) =
+        Responder::new_streaming(id, credit_cell, Arc::clone(session_cap), control_tx.clone());
     let handler = handler.clone();
     let handle = tokio::spawn(async move { handler(frame, responder, cancel).await });
 

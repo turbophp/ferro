@@ -28,7 +28,7 @@ use ferro_proto::consts::{errc, flags};
 use ferro_proto::header::Header;
 use ferro_proto::messages::{ErrorPayload, Outcome};
 
-use super::codec::OutFrame;
+use super::codec::{ControlMsg, OutFrame};
 use super::registry::Registry;
 use super::responder::Terminal;
 
@@ -44,7 +44,7 @@ pub async fn supervise(
     id: u32,
     service: u16,
     method: u16,
-    permit: mpsc::OwnedPermit<OutFrame>,
+    permit: mpsc::OwnedPermit<ControlMsg>,
     cell: Arc<Mutex<Option<Terminal>>>,
     handle: JoinHandle<()>,
     registry: Arc<Registry>,
@@ -77,8 +77,11 @@ pub async fn supervise(
     let frame = build_terminal_frame(service, method, id, outcome);
     // `permit` was reserved at insert time, before the handler ever ran: this send cannot fail
     // for lack of channel capacity. It returns the `Sender` back (tokio's `OwnedPermit::send`
-    // API), which we have no further use for.
-    let _sender = permit.send(frame);
+    // API), which we have no further use for. The terminal carries no cap reservation (`cap:
+    // None`) — it rides the SAME ordered conduit as any streamed DATA frame this request enqueued
+    // during its run, and because those DATA sends happened before this post-`handle.await` send,
+    // FIFO on the one channel puts the terminal strictly last (invariant B4).
+    let _sender = permit.send(ControlMsg::bare(frame));
 
     registry.remove(id);
 }

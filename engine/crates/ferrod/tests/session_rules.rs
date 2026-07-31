@@ -27,7 +27,7 @@ use ferro_proto::messages::{Outcome, Pong};
 use ferrod::config::Config;
 use ferrod::epoch::BootEpoch;
 use ferrod::session::HandlerFn;
-use ferrod::session::codec::{InFrame, OutFrame};
+use ferrod::session::codec::{ControlMsg, InFrame, OutFrame};
 use ferrod::session::flow::Credit;
 use ferrod::session::registry::{InsertErr, Registry};
 use ferrod::session::responder::Responder;
@@ -77,7 +77,7 @@ fn registry_reuse_and_full() {
 
 #[tokio::test]
 async fn supervisor_sends_declared_ok_exactly_once() {
-    let (control_tx, mut control_rx) = mpsc::channel::<OutFrame>(8);
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(8);
     let registry = Arc::new(Registry::new(4));
     registry.insert(7, test_credit()).unwrap();
 
@@ -98,7 +98,10 @@ async fn supervisor_sends_declared_ok_exactly_once() {
     )
     .await;
 
-    let frame = control_rx.try_recv().expect("exactly one terminal frame");
+    let frame = control_rx
+        .try_recv()
+        .expect("exactly one terminal frame")
+        .frame;
     assert_eq!(frame.header.request_id, 7);
     assert_eq!(frame.header.flags, flags::END);
     // The terminal frame must carry the ORIGINAL request's service/method, not a hard-coded
@@ -122,7 +125,7 @@ async fn supervisor_sends_declared_ok_exactly_once() {
 
 #[tokio::test]
 async fn supervisor_synthesizes_on_panic_with_distinct_code() {
-    let (control_tx, mut control_rx) = mpsc::channel::<OutFrame>(8);
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(8);
     let registry = Arc::new(Registry::new(4));
     registry.insert(11, test_credit()).unwrap();
 
@@ -147,7 +150,8 @@ async fn supervisor_synthesizes_on_panic_with_distinct_code() {
 
     let frame = control_rx
         .try_recv()
-        .expect("exactly one synthesized terminal");
+        .expect("exactly one synthesized terminal")
+        .frame;
     assert_eq!(frame.header.flags, flags::END);
     match Outcome::decode(&frame.payload).expect("decode Outcome") {
         Outcome::Error(ep) => {
@@ -167,7 +171,7 @@ async fn declare_then_panic_yields_single_synth_terminal() {
     // inspects the cell — so the declared `Ok` is discarded in favor of the synthetic error.
     // This pins that semantic explicitly: a future refactor that tried to "recover" the
     // declared outcome on panic would be a behavior change, and this test would catch it.
-    let (control_tx, mut control_rx) = mpsc::channel::<OutFrame>(8);
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(8);
     let registry = Arc::new(Registry::new(4));
     registry.insert(31, test_credit()).unwrap();
 
@@ -191,7 +195,8 @@ async fn declare_then_panic_yields_single_synth_terminal() {
 
     let frame = control_rx
         .try_recv()
-        .expect("exactly one synthesized terminal");
+        .expect("exactly one synthesized terminal")
+        .frame;
     assert_eq!(frame.header.flags, flags::END);
     match Outcome::decode(&frame.payload).expect("decode Outcome") {
         Outcome::Error(ep) => {
@@ -215,7 +220,7 @@ async fn declare_then_panic_yields_single_synth_terminal() {
 
 #[tokio::test]
 async fn supervisor_synthesizes_on_no_terminal() {
-    let (control_tx, mut control_rx) = mpsc::channel::<OutFrame>(8);
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(8);
     let registry = Arc::new(Registry::new(4));
     registry.insert(21, test_credit()).unwrap();
 
@@ -239,7 +244,8 @@ async fn supervisor_synthesizes_on_no_terminal() {
 
     let frame = control_rx
         .try_recv()
-        .expect("exactly one synthesized terminal");
+        .expect("exactly one synthesized terminal")
+        .frame;
     assert_eq!(frame.header.flags, flags::END);
     match Outcome::decode(&frame.payload).expect("decode Outcome") {
         Outcome::Error(ep) => {
