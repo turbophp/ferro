@@ -547,64 +547,122 @@ async fn run_autocommit_streamed<B: PoolBackend>(
         }
     };
 
-    // Capture the out-of-band cancel handle BEFORE the stream borrows `co`: it returns an OWNED
-    // handle, so this shared borrow ends at once and does not conflict with the `&mut co` the
-    // `RowStreamHandle` then holds (identical to `run_autocommit_exec`/`tx/actor.rs`).
-    let cancel_handle = co.cancel_handle();
-    // A single fixed deadline shared by the outer select AND every send_head/send_data flow-control
-    // wait, so `timeout_ms` bounds the WHOLE stream (mid-pull and mid-backpressure alike).
+    // Two out-of-band cancel handles, captured BEFORE the stream borrows `co` (each returns an OWNED
+    // handle firing the SAME connection's cancel, so two is harmless): one for the OPEN race
+    // (`open_streamed_raced`), one for the pull→send loop (`run_streamed_exec`). A single owned handle
+    // can't serve both — it's fire-once by value — and the open and the loop are distinct interruption
+    // points. Identical capture-before-borrow discipline to `run_autocommit_exec`/`tx/actor.rs`.
+    let cancel_handle_open = co.cancel_handle();
+    let cancel_handle_loop = co.cancel_handle();
+    // A single fixed deadline shared by the OPEN race, the outer loop select, AND every
+    // send_head/send_data flow-control wait, so `timeout_ms` bounds the WHOLE request (open, mid-pull,
+    // and mid-backpressure alike).
     let deadline =
         timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(u64::from(ms)));
+    let ctx = OpContext {
+        readonly,
+        // `sent: true` from the OPEN onward: `query_stream` returning Ok means `query_raw` already
+        // dispatched the statement (rows then pull lazily off a channel), so the statement is in
+        // flight — identical to the buffered path's unconditional `sent: true` for any post-dispatch
+        // error. See `run_streamed_exec`'s doc for the §19.3 safety argument.
+        sent: true,
+        in_tx: false,
+    };
 
-    // M7: exec_us times ONLY backend-pull awaits — the `query_stream` OPEN is the first such await.
+    // M7: exec_us times ONLY backend-pull awaits — the `query_stream` OPEN (prepare + query_raw
+    // dispatch, a real round-trip) is the first such await. `timeout_ms` + CANCEL are ENFORCED across
+    // it via `open_streamed_raced` (see its doc for why draining is not type-expressible here).
+    //
+    // The open-race + loop live in an INNER BLOCK returning a plain `bool` (taint?), so every
+    // co-BORROWING value (the raced `Result<RowStreamHandle<'_>, _>` and the handle) is confined to
+    // the block; `co` is free again after it, which lets the taint below take `&mut co`. (A top-level
+    // `let outcome = ...` would keep `co` borrowed through the taint — E0499/E0505.)
     let open_start = tokio::time::Instant::now();
-    let handle = match co.query_stream(sql, params).await {
-        Ok(h) => h,
-        Err(e) => {
-            // Open-time failure. `sent: true` — `Checkout::query_stream` calls `client.query_raw`
-            // (the Bind+Execute SEND) before it can return `Err` from that step, so a
-            // `ConnectionLost` here is a post-send transport loss whose fate is UNKNOWN → a WRITE is
-            // `Indeterminate`, matching the BUFFERED path (`run_autocommit_exec`'s error is declared
-            // `sent: true` too). A known-fate `Sql` (a prepare syntax error, an out-of-M0 column, a
-            // bind pre-validation fault) passes through VERBATIM regardless of `sent`, so this
-            // conservative choice only ever tightens the transport-loss cell — the safe direction
-            // (charter rule 5). Autocommit (in_tx=false).
-            responder.end_error(fate::classify_fate(
-                e,
-                OpContext {
-                    readonly,
-                    sent: true,
-                    in_tx: false,
-                },
-            ));
-            return;
+    let needs_taint = {
+        let outcome =
+            open_streamed_raced(&mut co, sql, params, cancel, deadline, cancel_handle_open).await;
+        let open_us = open_start.elapsed().as_micros() as u64;
+        match outcome {
+            Ok(handle) => {
+                run_streamed_exec(
+                    handle,
+                    responder,
+                    cancel,
+                    deadline,
+                    cancel_handle_loop,
+                    ctx,
+                    open_us,
+                    batch,
+                )
+                .await;
+                false
+            }
+            Err(e) => {
+                // Either the open failed on its own (`query_stream` `Err` — already finalized+tainted
+                // internally by Task 3) OR it was aborted by cancel/deadline (the future was dropped,
+                // so Task 3's finalize did NOT run). Declare the one fated terminal here; TAINT below.
+                responder.end_error(fate::classify_fate(e, ctx));
+                true
+            }
         }
     };
-    let open_us = open_start.elapsed().as_micros() as u64;
 
-    run_streamed_exec(
-        handle,
-        responder,
-        cancel,
-        deadline,
-        cancel_handle,
-        OpContext {
-            readonly,
-            // `sent: true` for the WHOLE loop: `query_stream` returning Ok means `query_raw` already
-            // dispatched the statement to the backend (rows then pull lazily off a channel), so from
-            // here on the statement is in flight — identical to the buffered path's unconditional
-            // `sent: true` for any post-dispatch error. See the safety note below.
-            sent: true,
-            in_tx: false,
-        },
-        open_us,
-        batch,
-    )
-    .await;
+    if needs_taint {
+        // Taint UNCONDITIONALLY on any open Err: idempotent on the already-tainted natural-failure
+        // conn, and the load-bearing recycle trigger on an aborted-open conn (the next checkout's
+        // bounded DISCARD ALL resyncs it — the equivalent-safety substitute for draining, which
+        // cannot type-check here; see `open_streamed_raced`'s doc).
+        co.set_tainted(true);
+    }
 
-    // `co` drops HERE (RAII), only after `run_streamed_exec`'s `handle.finish()` released the
-    // `&mut co` borrow — the conn returns to the pool correctly pinned/tainted (Task 3).
+    // `co` drops HERE (RAII), only after the loop's `handle.finish()` released the `&mut co` borrow
+    // (or the taint above) — the conn returns to the pool correctly pinned/tainted (Task 3).
     drop(co);
+}
+
+/// Race the incremental `query_stream` OPEN (prepare + `query_raw` dispatch — real backend
+/// round-trips) against `cancel`/`deadline`, so `timeout_ms` + a routed CANCEL are ENFORCED across
+/// the open the same way `run_autocommit_exec` enforces them across the buffered query. Pull-first
+/// (the open arm is polled FIRST, `biased`), so a just-completed open never loses to a
+/// simultaneously-ready cancel/deadline (§5.2 — never fabricate an abort for a statement that
+/// finished). On abort it fires the out-of-band `cancel_handle` (stop the dispatched server work)
+/// and returns `Err(57014)`; the CALLER then taints `co` (the aborted open's future is dropped, not
+/// drained — see below — so nothing else taints it) and declares the one fated terminal.
+///
+/// **Why drop-not-drain (deviation from the review's literal ask, with compiler evidence).** The
+/// buffered `run_autocommit_exec` drains its query future because its output (`QueryResult`) is
+/// OWNED. Here the open's output — `RowStreamHandle<'a>` — BORROWS `co`, so a pinned open future
+/// (needed to `(&mut fut).await`-drain on abort) cannot coexist with using the extracted handle:
+/// `rustc` rejects it with **E0505** ("cannot move out of `co` … borrowed … when `open_fut` is
+/// dropped and runs the destructor"). Draining-then-extracting is simply not type-expressible when
+/// the handle borrows the checkout. So the open is raced BY VALUE (dropped on abort); the equivalent
+/// safety comes from firing the cancel + the caller's `co.set_tainted(true)` (a bounded DISCARD-ALL
+/// recycle at the next checkout). tokio-postgres's connection task drains the dropped request's
+/// server response, so the connection does not desync; the taint guarantees no cross-tenant leak.
+///
+/// Reused by Task 5 (the tx-actor open needs the SAME guard) — same shape, with the actor supplying
+/// its own `Checkout`, `cancel`/`deadline`, and an in-tx `OpContext`.
+async fn open_streamed_raced<'a, B: PoolBackend>(
+    co: &'a mut Checkout<B>,
+    sql: &str,
+    params: &[Value],
+    cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+    cancel_handle: B::CancelHandle,
+) -> Result<RowStreamHandle<'a, B>, PoolError> {
+    tokio::select! {
+        biased;
+        // Polled FIRST: a completed open wins a tie over a ready cancel/deadline (§5.2).
+        r = co.query_stream(sql, params) => r,
+        () = sleep_until_opt(deadline) => {
+            cancel_handle.cancel().await;
+            Err(stream_cancel_error())
+        }
+        () = cancel.cancelled() => {
+            cancel_handle.cancel().await;
+            Err(stream_cancel_error())
+        }
+    }
 }
 
 /// The SHARED pull→send loop (Task 5 will call it from the tx actor too): emit HEAD once, then pull
@@ -645,21 +703,31 @@ async fn run_streamed_exec<B: PoolBackend>(
     batch: StreamBatch,
 ) {
     let mut exec_us = open_us;
+    // Total HEAD + DATA payload bytes actually enqueued — reported as `stats.bytes` (item 4: the
+    // buffered path reports its full result-body size, so the streamed path reports the full shipped
+    // HEAD+DATA size, not the tiny rows-less terminal envelope). `send_head`/`send_data` return the
+    // payload length they enqueued so this is exact without re-encoding.
+    let mut sent_bytes: u64 = 0;
 
     // (1) HEAD: the column metadata, once, before any DATA. Grab `cols` before `finish()` consumes
     // the handle. A StreamSendError here (a cancelled/deadlined flow-control wait, an oversized cols
-    // frame, or a lost link) → the abort path (the statement is already dispatched — see the doc).
+    // frame, or a lost link) → the abort path with `fire_cancel: true` (the statement is already
+    // dispatched — the out-of-band cancel stops the server producing rows we will never read).
     let cols = handle.cols().to_vec();
-    if let Err(e) = responder.send_head(&cols, cancel, deadline).await {
-        abort_stream(
-            handle,
-            responder,
-            cancel_handle,
-            ctx,
-            send_err_to_pool_error(e),
-        )
-        .await;
-        return;
+    match responder.send_head(&cols, cancel, deadline).await {
+        Ok(n) => sent_bytes += n as u64,
+        Err(e) => {
+            abort_stream(
+                handle,
+                responder,
+                cancel_handle,
+                ctx,
+                true,
+                send_err_to_pool_error(e),
+            )
+            .await;
+            return;
+        }
     }
 
     // (2) pull → batch → send_data loop.
@@ -668,24 +736,40 @@ async fn run_streamed_exec<B: PoolBackend>(
     let mut streamed_rows: u64 = 0;
 
     loop {
-        // Pull under a `biased` select over cancel / deadline / the pull, so a cancel/timeout is
-        // observed even while awaiting a slow row. exec_us times ONLY the pull (M7).
+        // Pull FIRST in the `biased` select (item 3, §5.2 — like `run_autocommit_exec` polls the
+        // query first): a slow pull is Pending so cancel/deadline still get polled (fully
+        // interruptible), but on a TIE — the stream draining to `None` in the same poll a
+        // cancel/deadline becomes ready — the completed stream wins and ends in `end_ok`, never a
+        // fabricated error terminal for a query that finished. exec_us times ONLY the pull (M7).
         let pull_start = tokio::time::Instant::now();
         let step = tokio::select! {
             biased;
+            row = handle.next() => StreamStep::Row(row),
             () = cancel.cancelled() => StreamStep::Cancelled,
             () = sleep_until_opt(deadline) => StreamStep::Deadline,
-            row = handle.next() => StreamStep::Row(row),
         };
         exec_us += pull_start.elapsed().as_micros() as u64;
 
         match step {
             StreamStep::Cancelled | StreamStep::Deadline => {
-                abort_stream(handle, responder, cancel_handle, ctx, stream_cancel_error()).await;
+                // The server is still producing rows we will never read → FIRE the out-of-band cancel.
+                abort_stream(
+                    handle,
+                    responder,
+                    cancel_handle,
+                    ctx,
+                    true,
+                    stream_cancel_error(),
+                )
+                .await;
                 return;
             }
             StreamStep::Row(Some(Err(e))) => {
-                abort_stream(handle, responder, cancel_handle, ctx, e).await;
+                // The statement SELF-terminated (that is why `next()` yielded `Err`) → do NOT fire
+                // the out-of-band cancel (item 2): opening a side connection to `CancelRequest` an
+                // already-errored/idle backend is pure waste. `run_autocommit_exec` likewise only
+                // cancels on its interruption arms, never on a natural query error.
+                abort_stream(handle, responder, cancel_handle, ctx, false, e).await;
                 return;
             }
             StreamStep::Row(Some(Ok(row))) => {
@@ -695,16 +779,20 @@ async fn run_streamed_exec<B: PoolBackend>(
                 if batch_rows.len() >= batch.max_rows || batch_bytes >= batch.max_bytes {
                     let to_send = std::mem::take(&mut batch_rows);
                     batch_bytes = 0;
-                    if let Err(e) = responder.send_data(to_send, cancel, deadline).await {
-                        abort_stream(
-                            handle,
-                            responder,
-                            cancel_handle,
-                            ctx,
-                            send_err_to_pool_error(e),
-                        )
-                        .await;
-                        return;
+                    match responder.send_data(to_send, cancel, deadline).await {
+                        Ok(n) => sent_bytes += n as u64,
+                        Err(e) => {
+                            abort_stream(
+                                handle,
+                                responder,
+                                cancel_handle,
+                                ctx,
+                                true,
+                                send_err_to_pool_error(e),
+                            )
+                            .await;
+                            return;
+                        }
                     }
                 }
             }
@@ -714,16 +802,20 @@ async fn run_streamed_exec<B: PoolBackend>(
                 // terminal is ordered strictly AFTER the last DATA (B4).
                 if !batch_rows.is_empty() {
                     let to_send = std::mem::take(&mut batch_rows);
-                    if let Err(e) = responder.send_data(to_send, cancel, deadline).await {
-                        abort_stream(
-                            handle,
-                            responder,
-                            cancel_handle,
-                            ctx,
-                            send_err_to_pool_error(e),
-                        )
-                        .await;
-                        return;
+                    match responder.send_data(to_send, cancel, deadline).await {
+                        Ok(n) => sent_bytes += n as u64,
+                        Err(e) => {
+                            abort_stream(
+                                handle,
+                                responder,
+                                cancel_handle,
+                                ctx,
+                                true,
+                                send_err_to_pool_error(e),
+                            )
+                            .await;
+                            return;
+                        }
                     }
                 }
                 match handle.finish().await {
@@ -733,6 +825,7 @@ async fn run_streamed_exec<B: PoolBackend>(
                             streamed_rows,
                             end.stats.queue_us,
                             exec_us,
+                            sent_bytes,
                         );
                         responder.end_ok(Bytes::from(body));
                     }
@@ -746,37 +839,49 @@ async fn run_streamed_exec<B: PoolBackend>(
     }
 }
 
-/// The single abort exit for [`run_streamed_exec`]: STOP producing, fire the out-of-band backend
-/// cancel (drain a still-running query at the server, exactly like [`run_autocommit_exec`]/the tx
-/// actor's Deadline arm — necessary when the abort is a cancel/timeout/backpressure-unwind, harmless
-/// when the stream already errored on its own), `finish()` the handle (drain to RFQ + run hygiene;
-/// `finish` force-taints a late drain error but returns Ok — we classify from `err`, the ABORT
-/// reason, not from finish's return), then declare the ONE terminal via `classify_fate` under `ctx`
-/// (`sent: true` — the statement is dispatched; see [`run_streamed_exec`]'s doc). A streamed READ
-/// never becomes `Indeterminate` (classify_fate routes it by `readonly`).
+/// The single abort exit for [`run_streamed_exec`]: STOP producing, OPTIONALLY fire the out-of-band
+/// backend cancel, `finish()` the handle (drain to RFQ + run hygiene; `finish` force-taints a late
+/// drain error but returns Ok — we classify from `err`, the ABORT reason, not from finish's return),
+/// then declare the ONE terminal via `classify_fate` under `ctx` (`sent: true` — the statement is
+/// dispatched; see [`run_streamed_exec`]'s doc). A streamed READ never becomes `Indeterminate`
+/// (classify_fate routes it by `readonly`).
+///
+/// `fire_cancel` (item 2): `true` for an interruption abort (cancel/deadline/backpressure-unwind —
+/// the server is still producing rows we will never read, so the out-of-band `CancelRequest` stops
+/// it); `false` for a natural mid-stream `next()` `Err` — the statement already self-terminated (that
+/// is why it erred), so opening a side connection to cancel an already-errored/idle backend is pure
+/// waste. Mirrors `run_autocommit_exec`, which cancels only on its interruption arms.
 async fn abort_stream<B: PoolBackend>(
     handle: RowStreamHandle<'_, B>,
     responder: Responder,
     cancel_handle: B::CancelHandle,
     ctx: OpContext,
+    fire_cancel: bool,
     err: PoolError,
 ) {
-    cancel_handle.cancel().await;
+    if fire_cancel {
+        cancel_handle.cancel().await;
+    }
     let _ = handle.finish().await;
     responder.end_error(fate::classify_fate(err, ctx));
 }
 
 /// The terminal `Outcome::Ok` body for a finished `fetch:stream`: the rows already went out as DATA
 /// frames and the cols as the HEAD frame, so the terminal carries ONLY `affected` + `stats` (no
-/// cols, no rows). `stats.rows` is the TOTAL streamed row count (the client also counts them off the
-/// DATA channel). No one-frame size-check is needed — with no rows and no cols the body is tiny.
+/// cols, no rows). `stats.rows` is the TOTAL streamed row count and `stats.bytes` is the TOTAL
+/// HEAD+DATA payload bytes shipped (item 4 — consistent with the buffered path reporting its full
+/// result-body size, NOT the tiny rows-less terminal envelope). Both are accumulated by the producer
+/// loop, so — unlike the buffered `build_terminal_body` — no `stats.bytes` fixed-point is needed
+/// (the value is not self-referential: it counts the DATA-channel frames, not this terminal frame).
+/// No one-frame size-check is needed either — with no rows and no cols the terminal body is tiny.
 fn build_stream_terminal_body(
     affected: u64,
     streamed_rows: u64,
     queue_us: u64,
     exec_us: u64,
+    stream_bytes: u64,
 ) -> Vec<u8> {
-    let mut exec_ok = ExecOk {
+    ExecOk {
         cols: Vec::new(),
         rows: Vec::new(),
         affected,
@@ -785,10 +890,10 @@ fn build_stream_terminal_body(
             queue_us,
             exec_us,
             rows: streamed_rows,
-            bytes: 0,
+            bytes: stream_bytes,
         },
-    };
-    encode_exec_ok_fixpoint(&mut exec_ok)
+    }
+    .encode()
 }
 
 /// A cheap per-row byte estimate used ONLY to bound batch size (see [`StreamBatch`]); the exact
@@ -1167,7 +1272,8 @@ fn build_terminal_body(
     // body (BLOCKER-v2). A per-request Unsupported is the clean alternative to a session teardown.
     if body.len() + OUTCOME_OK_OVERHEAD > MAX_FRAME_PAYLOAD as usize {
         return Err(unsupported(
-            "result exceeds one frame; streaming is post-M0 (D-S5-1)",
+            "buffered result exceeds one frame; re-issue with fetch=stream to receive it \
+             incrementally over the DATA channel",
         ));
     }
     Ok(body)
@@ -1799,6 +1905,8 @@ mod tests {
         assert!(head.cap.is_some(), "HEAD carries its cap guard");
         let sh = StreamHead::decode(&head.frame.payload).expect("decode HEAD");
         assert_eq!(sh.cols.len(), 1);
+        // Item 4: accumulate the HEAD + DATA payload bytes to check `stats.bytes` on the terminal.
+        let mut shipped_bytes = head.frame.payload.len() as u64;
 
         // Then exactly 3 DATA frames, one scripted row each.
         for i in 1..=3i64 {
@@ -1812,6 +1920,7 @@ mod tests {
                 vec![i64_row(i)],
                 "DATA frames stream rows in order"
             );
+            shipped_bytes += d.frame.payload.len() as u64;
         }
 
         // Then exactly ONE terminal END — last, after all DATA.
@@ -1829,6 +1938,11 @@ mod tests {
                     "the stream terminal carries no cols (they went out in HEAD)"
                 );
                 assert_eq!(ok.stats.rows, 3, "stats.rows is the streamed count");
+                assert_eq!(
+                    ok.stats.bytes, shipped_bytes,
+                    "item 4: stats.bytes is the TOTAL HEAD+DATA payload shipped, not the terminal size"
+                );
+                assert!(ok.stats.bytes > 0);
             }
             other => panic!("expected Outcome::Ok, got {other:?}"),
         }
@@ -2220,6 +2334,14 @@ mod tests {
             ),
             other => panic!("expected exactly one Error terminal, got {other:?}"),
         }
+        // Item 2: a NATURAL mid-stream error must NOT fire the out-of-band cancel — the statement
+        // already self-terminated (that is why next() erred), so a side-connection CancelRequest
+        // against an already-errored/idle backend would be pure waste.
+        assert_eq!(
+            pool.backend().cancel_calls(),
+            0,
+            "a natural mid-stream error must NOT fire the out-of-band cancel (item 2)"
+        );
         assert_eq!(
             session_cap.used(),
             0,
@@ -2332,6 +2454,177 @@ mod tests {
                 );
             }
             other => panic!("expected WriteUnconfirmed/Indeterminate, got {other:?}"),
+        }
+    }
+
+    // ---- review round 2: items 1 (open race), 2 (cancel policy), 3 (pull-first tie) ------------
+
+    /// Item 1 (MUST-FIX): `timeout_ms`/CANCEL are ENFORCED across the `query_stream` OPEN itself
+    /// (prepare + query_raw — real backend round-trips, which a lock-blocked prepare could hang on
+    /// past the deadline). A blocked open + a fired CANCEL → exactly ONE fated terminal, bounded (no
+    /// hang), and the conn tainted (the aborted-open recycle path). No HEAD/DATA — the open never
+    /// completed.
+    #[tokio::test]
+    async fn streamed_exec_open_blocked_cancel_one_terminal_no_hang() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(script(vec![i64_row(1)], 1, None));
+        backend.block_stream_open(); // freeze the OPEN (prepare+query_raw)
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(16);
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+        let credit_cell = Arc::new(CreditCell::new(Credit::new(10, 10_000_000)));
+        let (responder, cell) = Responder::new_streaming(
+            STREAM_REQ_ID,
+            Arc::clone(&credit_cell),
+            Arc::clone(&session_cap),
+            control_tx.clone(),
+        );
+        let cancel = CancellationToken::new();
+        let cancel_fire = cancel.clone();
+        // A READ so the fated terminal is the clean Cancelled/NonRetryable (a WRITE would be
+        // Indeterminate — also correct, but Cancelled is the sharper assertion for an open abort).
+        let pool_task = pool.clone();
+        let task = tokio::spawn(async move {
+            run_autocommit_streamed(
+                responder,
+                &pool_task,
+                "SELECT n",
+                &[],
+                None,
+                true,
+                &cancel,
+                one_row_batch(),
+            )
+            .await;
+        });
+
+        // Wait until the OPEN is provably in flight (parked on the open gate) before firing CANCEL —
+        // so this proves the OPEN-race arm, not a pre-dispatch shortcut.
+        for _ in 0..1000 {
+            if pool.backend().stream_opens_waiting() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            pool.backend().stream_opens_waiting(),
+            1,
+            "the open must be parked (timeout/cancel were unenforced across it before this fix)"
+        );
+
+        cancel_fire.cancel();
+        timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the CANCEL must abort the blocked open promptly, never hang")
+            .expect("task join");
+
+        // Exactly ONE fated terminal; no HEAD/DATA (the open never returned a handle).
+        assert!(
+            control_rx.try_recv().is_err(),
+            "a cancelled open emits no HEAD/DATA"
+        );
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Error(ep)) => {
+                assert_eq!(ep.code, errc::CANCELLED);
+                assert_eq!(ep.branch, branch::NON_RETRYABLE);
+            }
+            other => panic!("expected one Cancelled terminal, got {other:?}"),
+        }
+        // The out-of-band cancel WAS fired (an interruption abort), and the conn is released.
+        assert!(
+            pool.backend().cancel_calls() >= 1,
+            "an interruption abort fires the out-of-band cancel"
+        );
+        pool.backend().release_stream_pulls(); // no-op here; keep the gate tidy
+        let co2 = timeout(Duration::from_secs(5), pool.checkout())
+            .await
+            .expect("no leaked checkout after a cancelled open")
+            .expect("conn released");
+        assert!(
+            co2.conn().recorded.contains(&"RESET:Full".to_string()),
+            "an aborted open taints the conn → Full reset at the next checkout: {:?}",
+            co2.conn().recorded
+        );
+    }
+
+    /// Item 3 (§5.2 consistency): the loop's biased select polls the PULL FIRST, so a stream draining
+    /// to `None` in the same poll a CANCEL becomes ready ends in `end_ok` — never a fabricated error
+    /// terminal for a query that FINISHED. The per-pull gate pauses the (empty) stream's first pull;
+    /// releasing it and firing cancel back-to-back (no await between → the producer is not polled in
+    /// the gap) makes both arms ready at the next poll, and pull-first must win.
+    #[tokio::test]
+    async fn streamed_exec_final_none_races_cancel_ends_ok_pull_first() {
+        let backend = FakeBackend::new();
+        backend.set_stream_script(script(vec![], 0, None)); // EMPTY: the first pull is None
+        backend.block_stream_pulls(); // pause at the first (None) pull
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlMsg>(16);
+        let session_cap = Arc::new(SessionCap::new(1_000_000));
+        let credit_cell = Arc::new(CreditCell::new(Credit::new(10, 10_000_000)));
+        let (responder, cell) = Responder::new_streaming(
+            STREAM_REQ_ID,
+            Arc::clone(&credit_cell),
+            Arc::clone(&session_cap),
+            control_tx.clone(),
+        );
+        let cancel = CancellationToken::new();
+        let cancel_fire = cancel.clone();
+        let pool_task = pool.clone();
+        let task = tokio::spawn(async move {
+            run_autocommit_streamed(
+                responder,
+                &pool_task,
+                "SELECT n",
+                &[],
+                None,
+                true,
+                &cancel,
+                one_row_batch(),
+            )
+            .await;
+        });
+
+        // HEAD goes out (cancel not yet fired), then the first pull parks on the gate.
+        let head = timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("HEAD")
+            .expect("HEAD");
+        assert_eq!(head.frame.header.method, method_stream::HEAD);
+        for _ in 0..1000 {
+            if pool.backend().stream_pulls_waiting() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            pool.backend().stream_pulls_waiting(),
+            1,
+            "the producer must be parked on the final (None) pull"
+        );
+
+        // Release the pull AND fire cancel back-to-back with NO await between: single-threaded, so
+        // the producer is not polled in the gap, and at its next poll BOTH the pull (→ None) and the
+        // cancel are ready. Pull-first must resolve to None → end_ok.
+        pool.backend().release_stream_pulls();
+        cancel_fire.cancel();
+
+        timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the drained stream must finish, never hang")
+            .expect("task join");
+
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Ok(body)) => {
+                let ok = ExecOk::decode(&body).expect("ExecOk");
+                assert_eq!(ok.affected, 0);
+                assert_eq!(ok.stats.rows, 0);
+            }
+            other => panic!(
+                "a stream that DRAINED (final None) must end in end_ok even when a cancel is also \
+                 ready — pull-first (§5.2), got {other:?}"
+            ),
         }
     }
 }

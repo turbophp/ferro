@@ -162,13 +162,14 @@ impl Responder {
     /// Stream the result's column metadata as one `STREAM/HEAD` frame — sent once, before any
     /// `DATA`. Runs the FULL flow-control gauntlet exactly like `send_data` (MINOR-12 — HEAD is not
     /// special-cased: it debits credit and reserves cap too), so a client's credit window governs
-    /// HEAD delivery as uniformly as it governs rows.
+    /// HEAD delivery as uniformly as it governs rows. Returns the enqueued payload byte length so the
+    /// producer can accumulate `stats.bytes` exactly (Task 4b item 4).
     pub async fn send_head(
         &self,
         cols: &[ColMeta],
         cancel: &CancellationToken,
         deadline: Option<tokio::time::Instant>,
-    ) -> Result<(), StreamSendError> {
+    ) -> Result<usize, StreamSendError> {
         let payload = StreamHead {
             cols: cols.to_vec(),
         }
@@ -178,13 +179,14 @@ impl Responder {
     }
 
     /// Stream a batch of result rows as one `STREAM/DATA` frame (flag `STREAM` set). Debits the
-    /// per-request credit window and reserves against the per-session cap before enqueueing.
+    /// per-request credit window and reserves against the per-session cap before enqueueing. Returns
+    /// the enqueued payload byte length (Task 4b item 4 — see `send_head`).
     pub async fn send_data(
         &self,
         rows: Vec<Vec<Value>>,
         cancel: &CancellationToken,
         deadline: Option<tokio::time::Instant>,
-    ) -> Result<(), StreamSendError> {
+    ) -> Result<usize, StreamSendError> {
         let payload = StreamData { rows }.encode();
         self.send_stream_frame(
             method_stream::DATA,
@@ -204,6 +206,9 @@ impl Responder {
     /// 4. build the frame and enqueue it with the guard riding IN the `ControlMsg`, so a cancelled
     ///    or link-lost enqueue drops the message and releases the reservation (no leak, exactly one
     ///    release, on the writer's post-write drop).
+    ///
+    /// Returns the enqueued payload byte length (`len`) on success — the producer sums these into
+    /// `stats.bytes` (Task 4b item 4).
     async fn send_stream_frame(
         &self,
         method: u16,
@@ -211,7 +216,7 @@ impl Responder {
         payload: Vec<u8>,
         cancel: &CancellationToken,
         deadline: Option<tokio::time::Instant>,
-    ) -> Result<(), StreamSendError> {
+    ) -> Result<usize, StreamSendError> {
         let len = payload.len();
 
         // 1. Oversized: a single frame's payload cannot exceed the codec ceiling. Mirrors the
@@ -262,7 +267,7 @@ impl Responder {
             biased;
             () = cancel.cancelled() => Err(StreamSendError::Aborted(WaitAborted::Cancelled)),
             () = sleep_until_opt(deadline) => Err(StreamSendError::Aborted(WaitAborted::Deadline)),
-            res = self.sink.control_tx.send(msg) => res.map_err(|_| StreamSendError::LinkLost),
+            res = self.sink.control_tx.send(msg) => res.map(|()| len).map_err(|_| StreamSendError::LinkLost),
         }
     }
 }
@@ -437,7 +442,10 @@ mod tests {
             .await
             .expect("replenish must unblock send_data, never hang")
             .expect("task join");
-        assert_eq!(res, Ok(()), "send_data proceeds once credit is replenished");
+        assert!(
+            res.is_ok(),
+            "send_data proceeds once credit is replenished (returns the enqueued byte len): {res:?}"
+        );
     }
 
     // --- 4. a pre-cancelled request aborts a credit-starved send_data, reserving nothing ---

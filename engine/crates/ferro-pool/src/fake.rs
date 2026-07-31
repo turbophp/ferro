@@ -118,14 +118,20 @@ struct QueryGate {
 /// server-side statement cancel. When no gate is armed it is inert (its `gate` is `None`); either
 /// way it exercises the `Checkout::cancel_handle` -> `B::CancelHandle` surface (grabbed on `&self`,
 /// `Send + 'static`, fired fire-once by value) without a live Postgres.
+///
+/// `cancel_calls` (M1-S5 Task 4b) counts every `cancel()` fired via any handle this backend minted,
+/// so a test can assert whether the streaming producer fired the out-of-band cancel — in particular
+/// that it does NOT on a natural mid-stream error (Task 4b item 2).
 #[derive(Debug, Clone)]
 pub struct FakeCancelHandle {
     gate: Option<Arc<QueryGate>>,
+    cancel_calls: Arc<AtomicU64>,
 }
 
 #[async_trait]
 impl Cancel for FakeCancelHandle {
     async fn cancel(self) {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(gate) = self.gate {
             gate.cancelled.store(true, Ordering::SeqCst);
             gate.notify.notify_waiters();
@@ -160,6 +166,10 @@ pub struct FakeRowStream {
     emitted: usize,
     done: bool,
     pulls: Arc<AtomicU64>,
+    /// M1-S5 Task 4b (item 3): the shared per-pull gate. When armed, each `next()` parks here — the
+    /// pause point that lets a test make the final `None` pull race a fired cancel.
+    pull_gate: Arc<Mutex<Option<Arc<Notify>>>>,
+    pulls_waiting: Arc<AtomicU64>,
 }
 
 #[async_trait]
@@ -168,6 +178,14 @@ impl BackendRows for FakeRowStream {
         // Bump the laziness probe on EVERY poll (including the terminal `None`) — a test asserts
         // this stayed `0` between `query_stream` and the first `next()`.
         self.pulls.fetch_add(1, Ordering::SeqCst);
+        // Per-pull gate (item 3): if armed, park until released. The counter is bumped before the
+        // await so a test can observe the pull is parked before firing the racing cancel.
+        let gate = self.pull_gate.lock().unwrap().clone();
+        if let Some(notify) = gate {
+            self.pulls_waiting.fetch_add(1, Ordering::SeqCst);
+            notify.notified().await;
+            self.pulls_waiting.fetch_sub(1, Ordering::SeqCst);
+        }
         if self.done {
             return None;
         }
@@ -263,6 +281,26 @@ pub struct FakeBackend {
     /// the laziness probe. A test reads it via `stream_pulls()` to assert rows are pulled on
     /// `next()`, not buffered up front by `query_stream`.
     stream_pulls: Arc<AtomicU64>,
+    /// M1-S5 Task 4b: total `FakeCancelHandle::cancel()` calls across every handle this backend
+    /// minted. Lets a test assert the streaming producer's out-of-band cancel policy (fired on an
+    /// interruption abort; NOT fired on a natural mid-stream error — item 2). Shared into each
+    /// `FakeCancelHandle`.
+    cancel_calls: Arc<AtomicU64>,
+    /// M1-S5 Task 4b (item 1): when `Some`, every `query_stream()` OPEN parks on this `Notify` until
+    /// released/dropped — modelling a slow/blocked prepare+query_raw so a test can prove `timeout_ms`
+    /// / CANCEL are enforced ACROSS the open (the open future is dropped by the by-value race).
+    stream_open_gate: Mutex<Option<Arc<Notify>>>,
+    /// Number of `query_stream()` opens currently parked on `stream_open_gate` (a test polls it > 0
+    /// before firing the cancel/deadline).
+    stream_opens_waiting: Arc<AtomicU64>,
+    /// M1-S5 Task 4b (item 3): when `Some`, every `FakeRowStream::next()` pull parks on this `Notify`
+    /// until `release_stream_pulls` clears it — the pause point a test uses to make the final `None`
+    /// pull race a fired cancel (proving the loop's pull-first select ends in `end_ok` on the tie).
+    /// Behind an `Arc<Mutex<..>>` so it can be shared into each `FakeRowStream` AND re-armed/cleared
+    /// from the backend after the stream is created.
+    stream_pull_gate: Arc<Mutex<Option<Arc<Notify>>>>,
+    /// Number of `FakeRowStream::next()` pulls currently parked on `stream_pull_gate`.
+    stream_pulls_waiting: Arc<AtomicU64>,
 }
 
 impl FakeBackend {
@@ -281,7 +319,51 @@ impl FakeBackend {
             canned_query_err: Mutex::new(None),
             stream_script: Mutex::new(StreamScript::default()),
             stream_pulls: Arc::new(AtomicU64::new(0)),
+            cancel_calls: Arc::new(AtomicU64::new(0)),
+            stream_open_gate: Mutex::new(None),
+            stream_opens_waiting: Arc::new(AtomicU64::new(0)),
+            stream_pull_gate: Arc::new(Mutex::new(None)),
+            stream_pulls_waiting: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Total `FakeCancelHandle::cancel()` calls across every handle this backend minted (M1-S5 Task
+    /// 4b). `0` proves the producer did NOT fire the out-of-band cancel (e.g. on a natural mid-stream
+    /// error, item 2); `>= 1` proves it did (an interruption abort).
+    pub fn cancel_calls(&self) -> u64 {
+        self.cancel_calls.load(Ordering::SeqCst)
+    }
+
+    /// Arm the `query_stream()` OPEN gate (M1-S5 Task 4b item 1): every subsequent open parks until
+    /// the future is dropped (the by-value open race drops it on cancel/deadline). Models a
+    /// slow/blocked prepare+query_raw.
+    pub fn block_stream_open(&self) {
+        *self.stream_open_gate.lock().unwrap() = Some(Arc::new(Notify::new()));
+    }
+
+    /// Number of `query_stream()` opens currently parked on the gate armed by `block_stream_open`.
+    pub fn stream_opens_waiting(&self) -> u64 {
+        self.stream_opens_waiting.load(Ordering::SeqCst)
+    }
+
+    /// Arm the per-pull gate (M1-S5 Task 4b item 3): every subsequent `FakeRowStream::next()` pull
+    /// parks until `release_stream_pulls`. Arm it BEFORE the stream is created (it is read per pull).
+    pub fn block_stream_pulls(&self) {
+        *self.stream_pull_gate.lock().unwrap() = Some(Arc::new(Notify::new()));
+    }
+
+    /// Release + clear the per-pull gate: wakes the parked pull and lets all subsequent pulls proceed
+    /// (so `finish()`'s own drain does not re-park). Pair with `block_stream_pulls`.
+    pub fn release_stream_pulls(&self) {
+        if let Some(notify) = self.stream_pull_gate.lock().unwrap().take() {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Number of `FakeRowStream::next()` pulls currently parked on the gate armed by
+    /// `block_stream_pulls`.
+    pub fn stream_pulls_waiting(&self) -> u64 {
+        self.stream_pulls_waiting.load(Ordering::SeqCst)
     }
 
     /// Arms the [`StreamScript`] every subsequent `query_stream()` replays (S5 Task 3). Lets a test
@@ -408,9 +490,11 @@ impl PoolBackend for FakeBackend {
 
     fn cancel_handle(&self, _conn: &Self::Conn) -> Self::CancelHandle {
         // Capture a clone of the armed query gate (if any) so a later `cancel()` can release a
-        // `query()` frozen on it — the fake stand-in for a server-side statement cancel.
+        // `query()` frozen on it — the fake stand-in for a server-side statement cancel. Also carry
+        // the shared `cancel_calls` counter so every fire is observable (Task 4b item 2).
         FakeCancelHandle {
             gate: self.query_gate.lock().unwrap().clone(),
+            cancel_calls: Arc::clone(&self.cancel_calls),
         }
     }
 
@@ -551,6 +635,17 @@ impl PoolBackend for FakeBackend {
         conn.recorded.push(sql.to_string());
         apply_leading_tx_verb(conn, sql);
 
+        // OPEN gate (item 1): if armed, park here — modelling a slow/blocked prepare+query_raw. The
+        // by-value open race in the producer DROPS this future on a cancel/deadline, so this parked
+        // await is simply dropped (never resolves); the counter lets a test observe it is in flight
+        // before firing the interruption.
+        let gate = self.stream_open_gate.lock().unwrap().clone();
+        if let Some(notify) = gate {
+            self.stream_opens_waiting.fetch_add(1, Ordering::SeqCst);
+            notify.notified().await;
+            self.stream_opens_waiting.fetch_sub(1, Ordering::SeqCst);
+        }
+
         // Clone the script (reusable across checkouts) and hand back a LAZY stream: no rows are
         // produced here — the `stream_pulls` counter stays untouched until `next()` is polled.
         let script = self.stream_script.lock().unwrap().clone();
@@ -563,6 +658,8 @@ impl PoolBackend for FakeBackend {
                 emitted: 0,
                 done: false,
                 pulls: Arc::clone(&self.stream_pulls),
+                pull_gate: Arc::clone(&self.stream_pull_gate),
+                pulls_waiting: Arc::clone(&self.stream_pulls_waiting),
             },
         ))
     }
