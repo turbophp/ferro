@@ -67,10 +67,37 @@ pub struct MysqlConn {
 impl MysqlConn {
     /// Record the last statement's session-tracker verdict into the per-lease flag (§7.1). Additive
     /// (`|=`): once tainted, a subsequent benign statement never un-taints within the lease. Called
-    /// by the leaf statement-runners AFTER the result drains (`last_ok_packet` is post-drain).
-    fn record_session_mutation(&mut self) {
+    /// by the leaf statement-runners ([`MysqlBackend::simple_query`], [`crate::query::run`]) AFTER
+    /// the result drains (`last_ok_packet` is post-drain). `pub(crate)` so the row-returning `query`
+    /// path in [`crate::query`] records the SAME taint the leaf `simple_query` does.
+    pub(crate) fn record_session_mutation(&mut self) {
         let mutated = tracker::ok_reports_session_mutation(self.mysql.last_ok_packet());
         self.session_mutated |= mutated;
+    }
+
+    /// Map a leaf statement-runner's `mysql_async::Error` to a `PoolError`, session-fatal-FIRST: on a
+    /// transport/driver (session-ending) failure, flip the synchronous `closed` flag (so the pool
+    /// evicts this conn) and warn, THEN route through `error_map`. Shared by [`MysqlBackend::simple_query`]
+    /// and [`crate::query::run`] so both classify a failure identically (a serialization/deadlock at
+    /// COMMIT survives as `Sql{Retryable}`; a transport failure is the distinct `ConnectionLost`).
+    /// `&self`: `closed` is an `AtomicBool` (interior-mutable), so no `&mut` is needed — which lets
+    /// `query` call this AFTER the driver's `&mut Conn` borrow has ended.
+    pub(crate) fn map_stmt_error(&self, e: &mysql_async::Error) -> PoolError {
+        if error_map::is_session_fatal(e) {
+            self.closed.store(true, Ordering::SeqCst);
+            tracing::warn!(
+                error = %e,
+                "ferro-backend-mysql: statement hit a session-ending failure (connection considered lost)"
+            );
+        }
+        error_map::map(e)
+    }
+
+    /// The last `AUTO_INCREMENT` id generated on this connection (`LAST_INSERT_ID()` off the last OK
+    /// packet), if any. Exposed for S7's DBAL `lastInsertId()` — `QueryResult` (a shared type) does
+    /// not carry it, and a successful [`crate::query::run`] leaves it populated on the conn.
+    pub fn last_insert_id(&self) -> Option<u64> {
+        self.mysql.last_insert_id()
     }
 }
 
@@ -278,29 +305,25 @@ impl PoolBackend for MysqlBackend {
                 conn.record_session_mutation();
                 Ok(conn.mysql.affected_rows())
             }
-            Err(e) => {
-                if error_map::is_session_fatal(&e) {
-                    conn.closed.store(true, Ordering::SeqCst);
-                    tracing::warn!(
-                        error = %e,
-                        "ferro-backend-mysql: simple_query hit a session-ending failure (connection considered lost)"
-                    );
-                }
-                Err(error_map::map(&e))
-            }
+            Err(e) => Err(conn.map_stmt_error(&e)),
         }
     }
 
+    /// The buffered, param-bound, row-returning path (M1-S6 Task 4). Prepares (`COM_STMT_PREPARE`),
+    /// builds `cols` from the prepared statement (an out-of-scope column type is a loud `Unsupported`
+    /// before the query runs), arity-checks + binds, buffers the full result via `exec_iter`, and
+    /// maps each cell through `rowmap`. After a successful drain it records the §7.1 session-mutation
+    /// taint (`record_session_mutation`) — the SAME signal the leaf `simple_query` records. Any
+    /// prepare/exec/transport error is PROPAGATED as `Err` (never swallowed), so `ferro-pool`'s
+    /// backend-agnostic Rule-A (`Checkout::query`'s Err-arm) force-taints the conn. See
+    /// [`crate::query::run`].
     async fn query(
         &self,
-        _conn: &mut Self::Conn,
-        _sql: &str,
-        _params: &[Value],
+        conn: &mut Self::Conn,
+        sql: &str,
+        params: &[Value],
     ) -> Result<QueryResult, PoolError> {
-        // The buffered row-returning path (with param bind + rowmap + the full error_map) lands in
-        // Task 4. It MUST, after draining, call `conn.record_session_mutation()` — the same §7.1
-        // taint the leaf `simple_query` records — so a mutation on the row-returning path also taints.
-        todo!("MySQL row-returning query lands in M1-S6 Task 4")
+        crate::query::run(conn, sql, params).await
     }
 
     async fn query_stream(
