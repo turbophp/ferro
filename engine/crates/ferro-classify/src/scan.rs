@@ -35,6 +35,25 @@
 //! *not* splitting); this is the conservative reading of "prefer a false taint to a missed one"
 //! applied to a case the spec's exact wording didn't anticipate.
 //!
+//! **Dialect-blind, by design (M1-S6 task 6):** this module is SHARED across all three dialects
+//! (`rules::classify_one_{pg,mysql,sqlite}`) and only implements Postgres's own quoting rules —
+//! it is not aware `Dialect` exists at all. Two MySQL/MariaDB differences from PG are therefore
+//! NOT modeled here, and both were reviewed and ACCEPTED because they resolve to the SAFE
+//! direction (an over-pin, never a missed trigger), rather than dialect-parameterizing `scan()`
+//! (which would mean updating every PG call site for no leak-closing benefit):
+//! - MySQL `"..."` is a STRING literal by default (the opposite of PG's quoted-IDENTIFIER
+//!   reading, absent `ANSI_QUOTES` mode), but this scanner still keeps `"..."` content
+//!   VISIBLE/code (the PG rule, see above). A trigger keyword/function name that happens to sit
+//!   inside a MySQL double-quoted string is therefore still seen as CODE — a false-positive pin,
+//!   never a missed one (hiding it, the technically-correct MySQL reading, could only ever REMOVE
+//!   visibility here, not add it).
+//! - Backtick `` `...` `` identifiers (MySQL's actual identifier-quote syntax) are not a
+//!   recognized region at all — a backtick is just an ordinary visible-code byte to this scanner.
+//!   The practical consequence lands in [`leading_keyword`]: a statement whose very first byte is
+//!   a backtick has no ASCII-alphabetic run at that position, so `leading_keyword` returns `None`
+//!   and `rules::classify_one_mysql` falls through to its `pin_on_unknown` rule — again the safe
+//!   direction, never a missed trigger.
+//!
 //! These helpers are `pub(crate)`, consumed by `rules.rs` in task T1b (not yet implemented — until
 //! then, `#[allow(dead_code)]` below suppresses the expected "never used outside `#[cfg(test)]`"
 //! warning for this standalone task).

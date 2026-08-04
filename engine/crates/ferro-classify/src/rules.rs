@@ -6,8 +6,11 @@
 //! the token immediately following, and returns the first matching [`crate::PinTrigger`] rule.
 //! First match wins; the ordering below is deliberate (see the per-function doc comments for why).
 //!
-//! Only `classify_one_pg` is wired to a live backend in M1-S2 (`Dialect::Postgres`, via
-//! `ferro-backend-pg`); `classify_one_sqlite`/`classify_one_mysql` are stubs for a future slice.
+//! `classify_one_pg` is wired to a live backend in M1-S2 (`Dialect::Postgres`, via
+//! `ferro-backend-pg`); `classify_one_mysql` is wired to a live backend in M1-S6 (`Dialect::MySql`,
+//! via `ferro-backend-mysql`) as defense-in-depth ASSIST alongside that slice's session-tracker
+//! AUTHORITY (`PoolBackend::take_session_mutated`); `classify_one_sqlite` remains a stub for a
+//! future slice.
 
 use crate::PinTrigger;
 use crate::scan;
@@ -216,18 +219,69 @@ pub(crate) fn classify_one_sqlite(
     }
 }
 
-/// Stub MySQL rules (not wired to a live backend in M1-S2; the real MySQL session-mutation signal
-/// is the S6 tracker). Leading `SET` triggers unless the next token is exactly `LOCAL` or
-/// `TRANSACTION` -- mirroring the Postgres exact-token exclusion for parity/future-proofing (MySQL
-/// doesn't have `SET LOCAL`, but the guard is harmless). `SET SESSION ...` and `SET @@session...`
-/// are deliberately NOT excluded (they fall into the general leading-SET trigger, since their next
-/// token is `SESSION`/not-a-bare-keyword respectively) -- both persist for the session and must
-/// taint.
+/// Session-scoped MySQL/MariaDB user-level lock functions (the `GET_LOCK`/named-lock family):
+/// acquiring OR releasing one of these changes the session's held-lock set, and a single-statement
+/// lexer has no memory of what else the session might still be holding across other statements --
+/// so, UNLIKE Postgres's advisory-lock check (which excludes `pg_advisory_unlock*`, since PG's
+/// bookkeeping there is per-key and releasing is always safe to leave un-pinned), MySQL's
+/// `RELEASE_LOCK`/`RELEASE_ALL_LOCKS` are included here too: a false "still might be holding
+/// something" taint is the safe direction (SPEC §7.1), and there is no cross-statement state in
+/// this leaf crate to reason about whether releasing THIS lock leaves the session clean.
+const MYSQL_LOCK_FUNCTIONS: &[&str] = &["GET_LOCK", "RELEASE_LOCK", "RELEASE_ALL_LOCKS"];
+
+/// MySQL/MariaDB classification rules (M1-S6 task 6), IN ORDER (first match wins) -- ASSIST only.
+/// Unlike Postgres (where this lexer + the RFQ protocol byte are the only two signals), MySQL has a
+/// THIRD, stronger signal: the S6 session tracker (`PoolBackend::take_session_mutated`, wired via
+/// `Checkout::apply_session_tracker`) reads the server's own OK-packet session-state-change report,
+/// which sees INSIDE stored-program bodies this lexer cannot. That tracker is the session-mutation
+/// AUTHORITY for this dialect; this function is defense-in-depth, same relationship the RFQ byte
+/// has to `classify_one_pg`.
+///
+/// 1. `pin_functions` escape hatch (checked first, same as PG).
+/// 2. raw `PREPARE`/`EXECUTE`/`DEALLOCATE` -> [`PinTrigger::Prepare`].
+/// 3. leading `SET`, UNLESS the next token is exactly `LOCAL` or `TRANSACTION` -- `SET SESSION
+///    ...`/`SET @@session...`/`SET GLOBAL ...` are NOT excluded (their next token is
+///    `SESSION`/not-a-bare-keyword/`GLOBAL`, none of which match the exclusion), so they fall
+///    through to the trigger, as they must (both persist for the session/globally). MySQL has no
+///    `SET LOCAL`; the guard is harmless dead-but-safe parity with PG. `SET TRANSACTION ISOLATION
+///    LEVEL ...` (no SESSION/GLOBAL) only affects the NEXT transaction, so it is excluded like PG's
+///    `SET TRANSACTION`. Fully decides a leading-SET statement's fate (same as `classify_one_pg`'s
+///    rule 4).
+/// 4. `CREATE TEMPORARY TABLE ...` (any temp DDL [`create_is_temp`] recognizes) ->
+///    [`PinTrigger::Temp`]. A non-temp `CREATE` falls through to the rule-8 safe-list.
+/// 5. `LOCK TABLES ...` -> [`PinTrigger::AdvisoryLock`] (reused: MySQL's `LOCK TABLES` implicitly
+///    commits any open transaction and then holds an explicit, session-scoped table lock until
+///    `UNLOCK TABLES`/another `LOCK TABLES`/session end -- the same "session holds a lock that
+///    outlives the statement" shape `AdvisoryLock` already names; there is no dedicated
+///    `PinTrigger` variant for it, and adding one is out of this task's file-scoped brief). Checked
+///    BEFORE the rule-8 safe-list: bare `LOCK` (PG's transaction-scoped `LOCK TABLE`) IS in the
+///    shared [`SAFE_LEADING_KEYWORDS`], and would otherwise resolve `LOCK TABLES ...` to `None`.
+/// 6. the CALL/DO conservative-fallback pin (verification P2/P3 -- the false-safety fix this task
+///    closes): `CALL`/`DO` are in the shared [`SAFE_LEADING_KEYWORDS`] (see that const's doc for
+///    why PG safe-lists them -- a documented SPEC §7.4 limitation), but a stored-procedure/`DO`-
+///    block body can mutate session state (`SET SESSION ...`, `GET_LOCK`, ...) INSIDE it, where
+///    this single-statement lexer cannot see. MySQL-ONLY -- the shared list itself is untouched
+///    (`classify_one_pg` still safe-lists `CALL`/`DO` unchanged): every top-level MySQL `CALL`/`DO`
+///    is treated as tracker-ambiguous and pinned UNCONDITIONALLY here -- this check does NOT gate on
+///    `pin_on_unknown` (a deliberate, modest over-pin: every `CALL`/`DO`, including harmless ones,
+///    pins, so an in-proc session mutation is caught even if the S6 session tracker misses it --
+///    belt-and-braces with the tracker authority, not a substitute for it). Reuses
+///    [`PinTrigger::Unknown`] (no new variant needed) purely as "conservatively pinned, cause not
+///    lexically knowable" -- a DIFFERENT meaning from rule 9's generic "we don't recognize this
+///    statement at all" (which IS gated on `pin_on_unknown`, unlike this rule).
+/// 7. a MySQL session-lock function ([`MYSQL_LOCK_FUNCTIONS`]) referenced anywhere in the statement
+///    -> [`PinTrigger::AdvisoryLock`]. Runs BEFORE the rule-8 safe-list check for the same reason
+///    PG's advisory-lock check does: `SELECT GET_LOCK(...)` has an otherwise-safe `SELECT` leading
+///    keyword.
+/// 8. a known-safe leading keyword (shared [`SAFE_LEADING_KEYWORDS`]) -> `None`.
+/// 9. anything else (unrecognized/empty/unclassifiable) -> `Some(Unknown)` iff `pin_on_unknown`,
+///    else `None` (same conservative default as PG).
 pub(crate) fn classify_one_mysql(
     stmt: &str,
     pin_functions: &[String],
     pin_on_unknown: bool,
 ) -> Option<PinTrigger> {
+    // 1. pin_functions escape hatch.
     if pin_functions
         .iter()
         .any(|f| scan::contains_identifier_ci(stmt, f))
@@ -236,6 +290,16 @@ pub(crate) fn classify_one_mysql(
     }
 
     let leading = scan::leading_keyword(stmt);
+
+    // 2. raw PREPARE/EXECUTE/DEALLOCATE.
+    if matches!(
+        leading.as_deref(),
+        Some("PREPARE") | Some("EXECUTE") | Some("DEALLOCATE")
+    ) {
+        return Some(PinTrigger::Prepare);
+    }
+
+    // 3. SET, excluding SET LOCAL / SET TRANSACTION by exact token (see fn-level doc rule 3).
     if leading.as_deref() == Some("SET") {
         return match scan::next_token_after_keyword(stmt).as_deref() {
             Some("LOCAL") | Some("TRANSACTION") => None,
@@ -243,10 +307,40 @@ pub(crate) fn classify_one_mysql(
         };
     }
 
+    // 4. CREATE TEMPORARY TABLE / other temp DDL.
+    if leading.as_deref() == Some("CREATE") && create_is_temp(stmt) {
+        return Some(PinTrigger::Temp);
+    }
+
+    // 5. LOCK TABLES ... (see fn-level doc rule 5 for the AdvisoryLock reuse rationale).
+    if leading.as_deref() == Some("LOCK")
+        && scan::next_token_after_keyword(stmt).as_deref() == Some("TABLES")
+    {
+        return Some(PinTrigger::AdvisoryLock);
+    }
+
+    // 6. CALL/DO conservative-fallback pin -- MySQL-ONLY, UNCONDITIONAL (does NOT check
+    // `pin_on_unknown`; see fn-level doc rule 6). Must run before rule 8's safe-list check, since
+    // CALL/DO are safe-listed there for PG's sake.
+    if matches!(leading.as_deref(), Some("CALL") | Some("DO")) {
+        return Some(PinTrigger::Unknown);
+    }
+
+    // 7. MySQL session-lock functions, anywhere in the statement.
+    if MYSQL_LOCK_FUNCTIONS
+        .iter()
+        .any(|f| scan::contains_identifier_ci(stmt, f))
+    {
+        return Some(PinTrigger::AdvisoryLock);
+    }
+
+    // 8. known-safe leading keyword.
     if is_safe_leading_keyword(leading.as_deref()) {
         return None;
     }
 
+    // 9. unrecognized/unclassifiable: conservative default per SPEC §7.1 (prefer a false taint to
+    // a missed one) is the caller's `pin_on_unknown` flag.
     if pin_on_unknown {
         Some(PinTrigger::Unknown)
     } else {

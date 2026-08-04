@@ -14,9 +14,11 @@
 mod rules;
 mod scan;
 
-/// The upstream SQL dialect being classified against. Only [`Dialect::Postgres`] is wired to a
-/// live backend in M1-S2; `MySql`/`Sqlite` have stub rules (`rules::classify_one_{mysql,sqlite}`)
-/// for a future slice. Derives `Default` (with `Postgres` as the default) because
+/// The upstream SQL dialect being classified against. [`Dialect::Postgres`] is wired to a live
+/// backend in M1-S2; [`Dialect::MySql`] is wired to a live backend in M1-S6 (as defense-in-depth
+/// ASSIST alongside that slice's session-tracker AUTHORITY — see `rules::classify_one_mysql`);
+/// `Sqlite` still has stub rules (`rules::classify_one_sqlite`) for a future slice. Derives
+/// `Default` (with `Postgres` as the default) because
 /// `ferro-pool`'s `FakeBackend` derives `Default` and gains a `Dialect` field (M1-S2 task 2) —
 /// without this derive, that struct's `#[derive(Default)]` would fail to compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -450,7 +452,7 @@ mod tests {
         assert_eq!(classify("SELECT '", Dialect::Postgres, &[], true), None);
     }
 
-    // ---- MySQL / SQLite stubs (not wired to a live backend in S2; sanity-only) -----------------
+    // ---- SQLite stub (not wired to a live backend; sanity-only) ---------------------------------
 
     #[test]
     fn sqlite_attach_triggers_set() {
@@ -478,16 +480,198 @@ mod tests {
         assert_eq!(classify("SELECT 1", Dialect::Sqlite, &[], true), None);
     }
 
+    // ---- MySQL dialect (M1-S6 task 6, LIVE via `ferro-backend-mysql`) ----------------------------
+    //
+    // ASSIST only: the S6 session tracker (`PoolBackend::take_session_mutated`) is the
+    // session-mutation AUTHORITY for this dialect; `classify_one_mysql` only adds defense-in-depth
+    // taint, same relationship the RFQ byte has to `classify_one_pg`.
+
+    /// Shorthand: classify a single MySQL statement with no `pin_functions` escape hatch and
+    /// `pin_on_unknown = true`, matching the brief's TDD corpus (mirrors the `pg()` helper above).
+    fn my(sql: &str) -> Option<PinTrigger> {
+        classify(sql, Dialect::MySql, &[], true)
+    }
+
     #[test]
     fn mysql_set_session_triggers_set() {
+        assert_eq!(my("SET SESSION x = 1"), Some(PinTrigger::Set));
+    }
+
+    #[test]
+    fn mysql_set_global_triggers_set() {
+        assert_eq!(my("SET GLOBAL x = 1"), Some(PinTrigger::Set));
+    }
+
+    #[test]
+    fn mysql_set_local_is_excluded() {
+        // MySQL has no SET LOCAL, but the exact-token exclusion is harmless dead-but-safe parity
+        // with `classify_one_pg` (see the fn-level doc).
+        assert_eq!(my("SET LOCAL x = 1"), None);
+    }
+
+    #[test]
+    fn mysql_set_transaction_is_excluded() {
+        assert_eq!(my("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"), None);
+    }
+
+    #[test]
+    fn mysql_get_lock_triggers_advisory_lock() {
         assert_eq!(
-            classify("SET SESSION x = 1", Dialect::MySql, &[], true),
-            Some(PinTrigger::Set)
+            my("SELECT GET_LOCK('a', 1)"),
+            Some(PinTrigger::AdvisoryLock)
         );
     }
 
     #[test]
+    fn mysql_release_lock_triggers_advisory_lock() {
+        // Unlike PG (which excludes `pg_advisory_unlock*`), MySQL's RELEASE_LOCK is NOT excluded --
+        // see `MYSQL_LOCK_FUNCTIONS`'s doc comment for why (no cross-statement lock bookkeeping in
+        // this leaf crate, so releasing one named lock doesn't prove the session holds none).
+        assert_eq!(
+            my("SELECT RELEASE_LOCK('a')"),
+            Some(PinTrigger::AdvisoryLock)
+        );
+    }
+
+    #[test]
+    fn mysql_release_all_locks_triggers_advisory_lock() {
+        assert_eq!(
+            my("SELECT RELEASE_ALL_LOCKS()"),
+            Some(PinTrigger::AdvisoryLock)
+        );
+    }
+
+    #[test]
+    fn mysql_create_temporary_table_triggers_temp() {
+        assert_eq!(
+            my("CREATE TEMPORARY TABLE t(id INT)"),
+            Some(PinTrigger::Temp)
+        );
+    }
+
+    #[test]
+    fn mysql_create_table_non_temp_is_safe() {
+        assert_eq!(my("CREATE TABLE t(id INT)"), None);
+    }
+
+    #[test]
+    fn mysql_prepare_triggers_prepare() {
+        assert_eq!(my("PREPARE s FROM 'SELECT 1'"), Some(PinTrigger::Prepare));
+    }
+
+    #[test]
+    fn mysql_execute_triggers_prepare() {
+        assert_eq!(my("EXECUTE s"), Some(PinTrigger::Prepare));
+    }
+
+    #[test]
+    fn mysql_deallocate_prepare_triggers_prepare() {
+        assert_eq!(my("DEALLOCATE PREPARE s"), Some(PinTrigger::Prepare));
+    }
+
+    #[test]
+    fn mysql_lock_tables_triggers_advisory_lock() {
+        // `LOCK TABLES` is checked BEFORE the shared safe-list (which safe-lists bare `LOCK` for
+        // PG's transaction-scoped `LOCK TABLE`) -- see the fn-level doc rule 5 for the
+        // `AdvisoryLock` reuse rationale.
+        assert_eq!(my("LOCK TABLES t WRITE"), Some(PinTrigger::AdvisoryLock));
+    }
+
+    // ---- the CALL/DO conservative-fallback pin (the in-stored-proc leak this task closes) ------
+
+    #[test]
+    fn mysql_call_triggers_the_conservative_fallback() {
+        assert_eq!(my("CALL p_set_session()"), Some(PinTrigger::Unknown));
+    }
+
+    #[test]
+    fn mysql_do_triggers_the_conservative_fallback() {
+        assert_eq!(my("DO SLEEP(0)"), Some(PinTrigger::Unknown));
+    }
+
+    #[test]
+    fn mysql_call_fallback_is_unconditional_not_gated_on_pin_on_unknown() {
+        // Load-bearing distinction from rule 9's generic "unrecognized statement" fallback: the
+        // CALL/DO pin fires even when the pool operator has configured `pin_on_unknown = false`,
+        // because CALL/DO are RECOGNIZED (not unclassifiable) -- the lexer just can't see inside
+        // them. This is what makes it a real belt-and-braces backstop for the S6 tracker rather
+        // than something an operator could accidentally disable.
+        assert_eq!(
+            classify("CALL p_set_session()", Dialect::MySql, &[], false),
+            Some(PinTrigger::Unknown)
+        );
+        assert_eq!(
+            classify("DO SLEEP(0)", Dialect::MySql, &[], false),
+            Some(PinTrigger::Unknown)
+        );
+    }
+
+    #[test]
+    fn pg_call_and_do_remain_safe_listed_unaffected_by_the_mysql_fallback() {
+        // Discipline check: the MySQL-only CALL/DO fallback must NOT leak into PG -- the shared
+        // `SAFE_LEADING_KEYWORDS` list is untouched, so `classify_one_pg` still treats bare
+        // `CALL`/`DO` as safe (the documented SPEC §7.4 limitation, unchanged by this task).
+        assert_eq!(pg("CALL p_set_session()"), None);
+        assert_eq!(pg("DO $$ BEGIN NULL; END $$"), None);
+    }
+
+    // ---- unknown / safe statements ----------------------------------------------------------
+
+    #[test]
+    fn mysql_unknown_statement_triggers_when_pin_on_unknown() {
+        assert_eq!(my("FLUFF nonsense"), Some(PinTrigger::Unknown));
+    }
+
+    #[test]
+    fn mysql_unknown_statement_is_none_when_not_pin_on_unknown() {
+        assert_eq!(classify("FLUFF nonsense", Dialect::MySql, &[], false), None);
+    }
+
+    #[test]
     fn mysql_plain_select_is_safe() {
-        assert_eq!(classify("SELECT 1", Dialect::MySql, &[], true), None);
+        assert_eq!(my("SELECT 1"), None);
+    }
+
+    #[test]
+    fn mysql_plain_insert_is_safe() {
+        assert_eq!(my("INSERT INTO t VALUES (1)"), None);
+    }
+
+    #[test]
+    fn mysql_plain_update_is_safe() {
+        // Load-bearing: `SET` appears in this statement, but NOT as the leading keyword (the
+        // leading keyword is `UPDATE`) -- must not false-positive off `SET` anywhere in the text.
+        assert_eq!(my("UPDATE t SET x = 1"), None);
+    }
+
+    // ---- scan.rs's documented MySQL dialect-blind over-pin (M1-S6 task 6) -----------------------
+    //
+    // The shared scanner (`scan.rs`) is NOT dialect-parameterized: it keeps `"..."` VISIBLE/code
+    // (correct for PG's quoted-identifier convention) and has no notion of backtick-quoted
+    // identifiers at all (MySQL's real identifier quote). Both differences resolve to the SAFE
+    // direction -- an over-pin, never a missed trigger -- and are accepted rather than fixed for
+    // this task (see `scan.rs`'s module doc for the full rationale).
+
+    #[test]
+    fn mysql_double_quoted_string_content_over_pins_safely() {
+        // MySQL `"..."` is really a STRING literal (opposite of PG's quoted-identifier reading),
+        // but the shared scanner still keeps its content visible/code, so a lock-function name
+        // that happens to appear inside one is still caught -- a false positive, never a missed
+        // trigger (SPEC §7.1's preferred direction). Independent of `pin_on_unknown` (rule 7 fires
+        // unconditionally), so this is asserted with it OFF to isolate the effect being tested.
+        assert_eq!(
+            classify(r#"SELECT "get_lock demo""#, Dialect::MySql, &[], false),
+            Some(PinTrigger::AdvisoryLock)
+        );
+    }
+
+    #[test]
+    fn mysql_backtick_led_statement_falls_through_to_pin_on_unknown() {
+        // Backticks are not a recognized region at all here, so a statement whose very first byte
+        // is a backtick has no ASCII-alphabetic leading keyword -- `leading_keyword` returns
+        // `None`, and the statement falls through to the ordinary `pin_on_unknown` rule (safe:
+        // over-pins when the flag is set, same as any other unrecognized statement).
+        assert_eq!(my("`col` = 1"), Some(PinTrigger::Unknown));
+        assert_eq!(classify("`col` = 1", Dialect::MySql, &[], false), None);
     }
 }
