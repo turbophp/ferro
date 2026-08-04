@@ -4,7 +4,7 @@ members = ["engine/crates/*", "bench"]
 # NOTE: `bench` (decision B-1) was added to `members` in slice S8 when the crate was created
 # (the D12 boundary-latency benchmark / M0 exit gate). Listing a non-existent path here fails
 # workspace resolution, so it stayed out until the crate existed.
-exclude = ["vendor/tokio-postgres"]
+exclude = ["vendor/tokio-postgres", "vendor/mysql-async"]
 # `exclude` (M1-S1 task 1) has NO effect on `[patch.crates-io]` resolution below — it only lets
 # `vendor/tokio-postgres` be operated on as its own standalone package (e.g. `cd
 # vendor/tokio-postgres && cargo test --lib` for the fork's codec unit tests) without cargo
@@ -32,3 +32,14 @@ lto = "thin"
 # authorization before it is actually filed) merges.
 [patch.crates-io]
 tokio-postgres = { path = "vendor/tokio-postgres" }
+
+# M1-S6 (task 1): a vendored fork of mysql_async 0.37.0 that negotiates CLIENT_SESSION_TRACK at the
+# handshake (a single capability bit OR'd into `Opts::get_capabilities()`). Stock mysql_async never
+# advertises it and exposes no opts hook to add it, so on a stock connection the MySQL OK-packet
+# session trackers (`OkPacket::session_state_info()`) are ALWAYS empty — the MySQL pin engine's
+# session-mutation authority (the S1 ReadyForQuery analog) would be dead at the handshake. mysql_async
+# depends on `mysql_common` 0.37.1 from crates.io; `ferro-backend-mysql` depends on the same version,
+# so both unify to one `mysql_common` (no `mysql_common` patch needed — the fork touches only
+# mysql_async). NOT a workspace member (see `exclude` above); drop this patch when the upstream PR
+# (drafted in `/UPSTREAM_PR_MYSQL_ASYNC.md`, pending maintainer sign-off / human authorization) merges.
+mysql_async = { path = "vendor/mysql-async" }

@@ -1,0 +1,27 @@
+[package]
+name = "ferro-backend-mysql"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ferro-pool = { path = "../ferro-pool" }
+ferro-proto = { path = "../ferro-proto" }
+# The (patched) mysql_async — see the root Cargo.toml `[patch.crates-io]`. `minimal-rust` selects
+# flate2's pure-Rust backend (no system zlib) + `derive`; no TLS (M1 connects plaintext to a local
+# socket, like the PG backend's `NoTls`). The CLIENT_SESSION_TRACK fork is what makes the trackers
+# below non-empty on the wire.
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
+# Direct dep on the same mysql_common mysql_async pins (0.37.1) so both unify to ONE crate instance —
+# the `OkPacket` / `SessionStateChange` / `StatusFlags` types are then identical across the boundary.
+mysql_common = { version = "0.37", default-features = false }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+async-trait = "0.1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "time"] }

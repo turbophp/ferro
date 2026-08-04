@@ -4,6 +4,11 @@
 # (root Cargo.toml `[patch.crates-io]`) that adds `Client::transaction_status()` (RFQ-byte access).
 # This is a path patch, not a `[sources]` allowance, so it needs no functional change here — see
 # `/UPSTREAM_PR.md` for the upstream PR link; drop the fork (and this note) once it merges.
+#
+# M1-S6 (task 1): likewise `mysql_async` is patched to a vendored fork at `vendor/mysql-async` that
+# negotiates `CLIENT_SESSION_TRACK` (a single capability bit) so `OkPacket::session_state_info()` is
+# non-empty — the MySQL pin engine's session-tracker authority (the S1 ReadyForQuery analog). Also a
+# path patch (no `[sources]` change needed); see `/UPSTREAM_PR_MYSQL_ASYNC.md`; drop once it merges.
 [bans]
 multiple-versions = "allow"
 deny = [
