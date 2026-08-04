@@ -34,3 +34,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros",
 # kill/CANCEL. Resolves to the SAME vendored fork `ferro-backend-pg` uses (workspace
 # `[patch.crates-io]`), so no second copy of the driver is compiled in.
 tokio-postgres = "0.7"
+# The MySQL chaos live suite (M1-S6 Task 8, `tests/mysql_chaos_it.rs`) needs a RAW side connection to
+# MySQL/MariaDB — independent of ferrod's own pool — to `KILL [QUERY] <id>` a targeted backend, hold
+# a row lock (so a chaos write is provably interruptible-with-error, unlike a self-terminating
+# `SLEEP()`), and poll `information_schema.processlist` for proof a statement is genuinely in flight
+# before firing an external kill/CANCEL. Resolves to the SAME vendored fork `ferro-backend-mysql`
+# uses (workspace `[patch.crates-io]`), so no second copy of the driver is compiled in.
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
