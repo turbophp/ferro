@@ -66,24 +66,36 @@ pub enum PoolKind {
     Mysql,
 }
 
+/// The ONLY portion of a DSN that is safe to log (SPEC §12): the scheme token — the substring
+/// strictly BEFORE a real `://` separator. In a URL-form DSN the credentials always follow `://`
+/// (`scheme://user:pass@host`), so the scheme itself can never carry them. When the DSN has no
+/// `://` at all there is no scheme to isolate and the WHOLE string is potentially credential-
+/// bearing, so we return a fixed placeholder rather than any slice of it. This is what closes the
+/// schemeless-DSN leak: `split("://").next()` returns the whole string when the delimiter is
+/// absent, which would emit the credentials — `split_once` returns `None` and we log nothing of it.
+fn loggable_scheme(dsn: &str) -> &str {
+    dsn.split_once("://")
+        .map_or("<no scheme>", |(scheme, _)| scheme)
+}
+
 /// Infer a pool's [`PoolKind`] from its DSN scheme (the substring before `://`, ASCII-lowercased):
 /// `postgres`/`postgresql` → [`PoolKind::Postgres`]; `mysql`/`mariadb` → [`PoolKind::Mysql`]. An
 /// unrecognized or missing scheme is `tracing::warn!`-ed and defaults to [`PoolKind::Postgres`]
 /// (the M0 backend) — a conservative default that keeps a typo'd scheme from silently disabling a
 /// pool. Pure over its `dsn` input (the warn is a side channel), so it is directly unit-testable.
-/// The DSN VALUE is never logged here (§12) — only the scheme token.
+/// The DSN VALUE is never logged here (§12) — only the scheme token via [`loggable_scheme`], which
+/// yields `<no scheme>` (never any slice of the DSN) for a schemeless/typo'd credential-bearing DSN.
 pub fn infer_pool_kind(dsn: &str) -> PoolKind {
     match dsn
-        .split("://")
-        .next()
-        .map(str::to_ascii_lowercase)
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
         .as_deref()
     {
         Some("mysql") | Some("mariadb") => PoolKind::Mysql,
         Some("postgres") | Some("postgresql") => PoolKind::Postgres,
-        other => {
+        _ => {
             tracing::warn!(
-                scheme = other.unwrap_or(""),
+                scheme = loggable_scheme(dsn),
                 "FERRO_POOLS: unrecognized DSN scheme; defaulting pool kind to Postgres"
             );
             PoolKind::Postgres
@@ -518,6 +530,32 @@ mod tests {
         assert_eq!(infer_pool_kind("sqlite://x"), PoolKind::Postgres);
         assert_eq!(infer_pool_kind("not-a-dsn"), PoolKind::Postgres);
         assert_eq!(infer_pool_kind(""), PoolKind::Postgres);
+    }
+
+    /// §12 secret hygiene: the value handed to `tracing::warn!` for an unrecognized/missing scheme
+    /// must NEVER be a slice of a credential-bearing DSN. `loggable_scheme` is that exact value.
+    /// A schemeless/typo'd DSN (no `://`) — the case an operator misconfiguration lands in — must
+    /// resolve to the fixed `<no scheme>` placeholder, not the whole password-bearing string.
+    #[test]
+    fn loggable_scheme_never_leaks_credentials() {
+        // No `://` at all: the whole string is potentially credential-bearing → placeholder only.
+        // These are the exact leak shapes the review flagged (one-slash typo + Go-form MySQL DSN).
+        for dsn in [
+            "mysql:/user:secret@db.internal/app",
+            "admin:s3cret@tcp(10.0.0.5:3306)/prod",
+            "not-a-dsn",
+            "",
+        ] {
+            assert_eq!(loggable_scheme(dsn), "<no scheme>");
+            // Belt-and-suspenders: whatever we log for these must not contain any credential text.
+            let logged = loggable_scheme(dsn);
+            assert!(!logged.contains("secret"), "leaked credential via {dsn:?}");
+            assert!(!logged.contains("s3cret"), "leaked credential via {dsn:?}");
+        }
+        // A real scheme (before `://`) is credential-free by construction and IS safe to log —
+        // even an unrecognized one, and even when the authority after `://` carries a password.
+        assert_eq!(loggable_scheme("mysql://ferro:pw@h/db"), "mysql");
+        assert_eq!(loggable_scheme("redis://user:secret@h:6379"), "redis");
     }
 
     #[test]
