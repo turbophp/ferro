@@ -30,12 +30,14 @@ pub enum PinState {
 }
 
 /// Why a connection is (or was most recently) tainted/pinned. `Tx` is the RFQ-authoritative cause
-/// (S1: an open/aborted transaction, set by `Checkout::apply_tx_status`). The other 7 variants are
-/// M1-S2's assist-lexer causes (`ferro_classify::PinTrigger`, via [`From`] below) — set by
-/// `Checkout::apply_classify` (Task 3) when a statement mutates protocol-invisible session state
-/// even though the RFQ byte itself stays `Idle`. `last_pin_cause` is "most recently observed cause",
-/// not an exclusive state: setting an assist cause never clears/overrides `Tx`'s `tainted`/`tx_open`
-/// bits (SPEC §7.1 — the lexer is assist-only, never the authority).
+/// (S1: an open/aborted transaction, set by `Checkout::apply_tx_status`). The seven variants in the
+/// middle are M1-S2's assist-lexer causes (`ferro_classify::PinTrigger`, via [`From`] below) — set
+/// by `Checkout::apply_classify` when a statement mutates protocol-invisible session state even
+/// though the RFQ byte itself stays `Idle`. [`PinCause::SessionTracker`] is M1-S6's MySQL
+/// OK-packet session-mutation cause (`Checkout::apply_session_tracker`), a distinct
+/// protocol-derived assist signal — see its own doc below. `last_pin_cause` is "most recently
+/// observed cause", not an exclusive state: setting an assist cause never clears/overrides `Tx`'s
+/// `tainted`/`tx_open` bits (SPEC §7.1 — the assist signals are assist-only, never the authority).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinCause {
     /// An RFQ-detected open or aborted transaction (`T`/`E`) — the transaction-pin AUTHORITY.
@@ -54,6 +56,16 @@ pub enum PinCause {
     PinFunction,
     /// Unrecognized/unclassifiable statement, tainted only when `pin_on_unknown` is set.
     Unknown,
+    /// A MySQL/MariaDB **OK-packet session tracker** reported a session-state MUTATION on the last
+    /// statement (M1-S6, `Checkout::apply_session_tracker` via `PoolBackend::take_session_mutated`).
+    /// This is an ASSIST signal like the lexer causes above — it taints for reuse-safety without
+    /// touching the transaction AUTHORITY (`tx_open`/`pin`) — but it is derived from the wire
+    /// PROTOCOL (`OkPacket::session_state_info`), not from lexing the SQL, so it sees session
+    /// mutations INSIDE stored programs (`SET SESSION …` in a proc body) that the assist lexer's
+    /// §7.1 hard gate is blind to. It is deliberately distinct from `Set`: `Set` is the lexer's
+    /// static guess from the SQL text, `SessionTracker` is the server's own OK-packet report.
+    /// Postgres backends never raise it — `take_session_mutated` defaults to `false` there.
+    SessionTracker,
 }
 
 impl From<ferro_classify::PinTrigger> for PinCause {

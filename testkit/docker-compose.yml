@@ -2,6 +2,12 @@
 # Postgres 17 pinned by digest for a reproducible reference backend (SPEC §16).
 # To refresh the digest: docker pull postgres:17 && docker inspect --format '{{index .RepoDigests 0}}' postgres:17
 #
+# MySQL 8 + MariaDB 11 (M1-S6) are ALSO digest-pinned reference backends, both with the OK-packet
+# session trackers ENABLED at startup (the pin engine's session-mutation authority — the S1
+# ReadyForQuery analog). To refresh those digests:
+#   docker pull mysql:8   && docker inspect --format '{{index .RepoDigests 0}}' mysql:8
+#   docker pull mariadb:11 && docker inspect --format '{{index .RepoDigests 0}}' mariadb:11
+#
 # `ferrod` is a sidecar sharing a named UDS socket volume with (future) client containers —
 # the shared-socket-volume deployment model from SPEC §18. It does NOT connect to `pg` yet
 # (no DB wiring until S4); `depends_on: pg` just keeps the two coexisting in one `up`.
@@ -26,6 +32,66 @@ services:
       interval: 1s
       timeout: 3s
       retries: 30
+
+  # MySQL 8.x — digest-pinned (currently 8.4.x). The `command:` flags are the AUTHORITATIVE
+  # session-tracker config (applied at server start, before any connection): a CURATED
+  # `session_track_system_variables` list (NOT `'*'` — the Task-1 spike found `'*'` fires benign
+  # trackers like `statement_id` that would taint every connection), plus the state-change and
+  # transaction-info trackers. `mysql-init.sql` mirrors these (belt-and-braces) and adds the seed
+  # table + the `p_set_session()` §7.1 fixture. Ephemeral (tmpfs) — a test backend, re-inited each up.
+  mysql:
+    image: mysql:8@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
+    command:
+      - "--session_track_state_change=ON"
+      - "--session_track_transaction_info=STATE"
+      - "--session_track_system_variables=autocommit,sql_mode,time_zone,sort_buffer_size,foreign_key_checks,unique_checks"
+    environment:
+      MYSQL_USER: ferro
+      MYSQL_PASSWORD: ferro
+      MYSQL_DATABASE: ferro
+      MYSQL_ROOT_PASSWORD: ferro
+    ports:
+      - "33060:3306"
+    tmpfs:
+      - /var/lib/mysql               # ephemeral, fast — this is a test backend
+    volumes:
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      # Force TCP (`-h 127.0.0.1`) + auth as the ferro user so "healthy" means the REAL networked
+      # server is up AND init finished (the init temp server is socket-only and has no ferro user).
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uferro", "-pferro"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 40s
+
+  # MariaDB 11.x — digest-pinned (currently 11.8.x). Same trackers, same curated var list, same
+  # env + init file as MySQL: the S2 assist lexer's tracker verification against a SECOND dialect
+  # (M1-S6). Note MariaDB 11 ships `mariadb-admin` (no `mysqladmin` symlink), so the healthcheck
+  # uses it.
+  mariadb:
+    image: mariadb:11@sha256:d9f7eb2637296652f24b484afd5d246f759f49f5babcadc6a9e344c9acb75fbf
+    command:
+      - "--session_track_state_change=ON"
+      - "--session_track_transaction_info=STATE"
+      - "--session_track_system_variables=autocommit,sql_mode,time_zone,sort_buffer_size,foreign_key_checks,unique_checks"
+    environment:
+      MYSQL_USER: ferro
+      MYSQL_PASSWORD: ferro
+      MYSQL_DATABASE: ferro
+      MYSQL_ROOT_PASSWORD: ferro
+    ports:
+      - "33061:3306"
+    tmpfs:
+      - /var/lib/mysql               # ephemeral, fast — this is a test backend
+    volumes:
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1", "-uferro", "-pferro"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 40s
 
   ferrod:
     build:

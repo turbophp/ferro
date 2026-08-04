@@ -172,6 +172,28 @@ pub trait PoolBackend: Send + Sync + 'static {
     /// engine's authority (Task 4), replacing the S4 stub's engine-side-only pin tracking.
     fn tx_status(&self, conn: &Self::Conn) -> TxStatus;
 
+    /// Did the backend OBSERVE (and now CONSUME/clear) a session-state MUTATION reported by the last
+    /// statement's own protocol signal? A SECOND, additive pin signal alongside [`tx_status`] (M1-S6,
+    /// SPEC §7.1), read at the same post-statement point and consumed by
+    /// `Checkout::apply_session_tracker`, which taints for reuse-safety and labels the cause
+    /// [`crate::pin::PinCause::SessionTracker`] WITHOUT touching the transaction authority
+    /// (`tx_open`/`pin`).
+    ///
+    /// The MySQL/MariaDB backend overrides this to drain its connection's OK-packet session-tracker
+    /// flag (`OkPacket::session_state_info`) — the signal that sees session mutations INSIDE stored
+    /// programs, which the assist lexer's §7.1 hard gate cannot. Reading it CLEARS it (one mutation
+    /// is reported exactly once), so it is called precisely once per statement.
+    ///
+    /// [`tx_status`]: PoolBackend::tx_status
+    ///
+    /// **Default `false`** — every backend WITHOUT an OK-packet-style session tracker (Postgres, the
+    /// `FakeBackend`, and every other current impl) inherits it and is UNCHANGED: for them
+    /// `apply_session_tracker` is a pure no-op that never taints and never sets a pin cause. Only a
+    /// backend that can actually PROVE a session mutation off the wire overrides it.
+    fn take_session_mutated(&self, _conn: &mut Self::Conn) -> bool {
+        false
+    }
+
     /// Hygiene reset, run at checkout before a recycled conn is handed to a new caller (v2/B1;
     /// profile-parameterized in M1-S3, SPEC §7.2). `profile` selects HOW MUCH state to release:
     /// [`ResetProfile::Full`] (e.g. Postgres `DISCARD ALL`) for a tainted conn, or

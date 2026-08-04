@@ -520,6 +520,33 @@ pub fn pg_url() -> Option<String> {
     }
 }
 
+/// The MySQL DSN under test (M1-S6), or `None` (→ skip) when `FERRO_TEST_MYSQL_URL` is unset —
+/// mirrors [`pg_url`]. Points at the `testkit` `mysql` service (default `33060:3306`), e.g.
+/// `mysql://ferro:ferro@127.0.0.1:33060/ferro`.
+pub fn mysql_url() -> Option<String> {
+    match std::env::var("FERRO_TEST_MYSQL_URL") {
+        Ok(u) => Some(u),
+        Err(_) => {
+            eprintln!("skip: FERRO_TEST_MYSQL_URL unset");
+            None
+        }
+    }
+}
+
+/// The MariaDB DSN under test (M1-S6), or `None` (→ skip) when `FERRO_TEST_MARIADB_URL` is unset —
+/// mirrors [`pg_url`]. Points at the `testkit` `mariadb` service (default `33061:3306`), e.g.
+/// `mysql://ferro:ferro@127.0.0.1:33061/ferro`. The second dialect the S2 assist lexer's tracker
+/// verification runs against.
+pub fn mariadb_url() -> Option<String> {
+    match std::env::var("FERRO_TEST_MARIADB_URL") {
+        Ok(u) => Some(u),
+        Err(_) => {
+            eprintln!("skip: FERRO_TEST_MARIADB_URL unset");
+            None
+        }
+    }
+}
+
 /// A live `ferrod` session server whose EXEC handler owns a real `Pool<PgBackend>` named "default"
 /// pointing at `url`. Uses `TestServer::spawn_with_factory` (no peercred gate) with the real
 /// `sql::make_handler` + a shared `Arc<TxRegistry>` — built exactly as `main` builds it — so this

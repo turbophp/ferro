@@ -347,6 +347,9 @@ impl<B: PoolBackend> Checkout<B> {
         }
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
+        // M1-S6: the SECOND assist signal, read at the same post-statement point. No-op for PG/Fake
+        // (default `take_session_mutated -> false`); taints + labels `SessionTracker` for MySQL.
+        self.apply_session_tracker();
         if r.is_err() {
             // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
             // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
@@ -394,6 +397,9 @@ impl<B: PoolBackend> Checkout<B> {
             .map(|_| ());
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
+        // M1-S6: the SECOND assist signal, read at the same post-statement point. No-op for PG/Fake
+        // (default `take_session_mutated -> false`); taints + labels `SessionTracker` for MySQL.
+        self.apply_session_tracker();
         if r.is_err() {
             // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
             // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
@@ -439,6 +445,9 @@ impl<B: PoolBackend> Checkout<B> {
         }
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
+        // M1-S6: the SECOND assist signal, read at the same post-statement point. No-op for PG/Fake
+        // (default `take_session_mutated -> false`); taints + labels `SessionTracker` for MySQL.
+        self.apply_session_tracker();
         if r.is_err() {
             // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
             // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
@@ -477,6 +486,9 @@ impl<B: PoolBackend> Checkout<B> {
         }
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
+        // M1-S6: the SECOND assist signal, read at the same post-statement point. No-op for PG/Fake
+        // (default `take_session_mutated -> false`); taints + labels `SessionTracker` for MySQL.
+        self.apply_session_tracker();
         if r.is_err() {
             // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
             // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
@@ -529,6 +541,9 @@ impl<B: PoolBackend> Checkout<B> {
         let r = pool.backend.simple_query(self.conn_mut(), sql).await;
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
+        // M1-S6: the SECOND assist signal, read at the same post-statement point. No-op for PG/Fake
+        // (default `take_session_mutated -> false`); taints + labels `SessionTracker` for MySQL.
+        self.apply_session_tracker();
         if r.is_err() {
             // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
             // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
@@ -575,6 +590,9 @@ impl<B: PoolBackend> Checkout<B> {
         let r = pool.backend.query(self.conn_mut(), sql, params).await;
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
+        // M1-S6: the SECOND assist signal, read at the same post-statement point. No-op for PG/Fake
+        // (default `take_session_mutated -> false`); taints + labels `SessionTracker` for MySQL.
+        self.apply_session_tracker();
         if r.is_err() {
             // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
             // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
@@ -694,6 +712,35 @@ impl<B: PoolBackend> Checkout<B> {
         // fabricate a sentinel. See the doc comment above.
     }
 
+    /// The M1-S6 SECOND assist signal (SPEC §7.1): the backend's post-statement PROTOCOL report of a
+    /// session-state mutation — for MySQL/MariaDB, the OK-packet session trackers
+    /// (`PoolBackend::take_session_mutated`). Runs immediately AFTER `apply_tx_status` on every
+    /// instrumented method (the same post-statement point the RFQ/OK-packet is read), and is a pure
+    /// NO-OP for any backend that inherits the default `take_session_mutated -> false` (Postgres, the
+    /// `FakeBackend`): the call compiles and runs but never taints — PG's pin behavior is byte-identical.
+    ///
+    /// Like `apply_classify`, it is ASSIST-not-AUTHORITY: it only ADDS reuse-safety taint plus a cause
+    /// label, and NEVER touches `self.pin`/`self.tx_open` (those belong to the RFQ tx authority). It
+    /// mirrors `apply_classify`'s composition, with ONE deliberate difference: it does NOT overwrite an
+    /// authoritative `Tx` label. `apply_tx_status` (which runs first) sets `last_pin_cause = Tx` when a
+    /// tx is open; leaving that in place keeps the authority visible even when a session mutation
+    /// rode along inside the same in-tx statement. (A later `apply_classify` may still overwrite the
+    /// label with its own lexer cause — "most recently observed"; the tracker's own guard only
+    /// protects the authority's `Tx`.)
+    fn apply_session_tracker(&mut self) {
+        // Clone the Arc so the `&self.pool` borrow does not collide with the `self.conn_mut()`
+        // borrow `take_session_mutated` needs (same pattern as `exec`/`query`).
+        let pool = Arc::clone(&self.pool);
+        if pool.backend.take_session_mutated(self.conn_mut()) {
+            self.tainted = true;
+            // Never clobber the RFQ's authoritative `Tx` label (set by the preceding
+            // `apply_tx_status`); otherwise record `SessionTracker` as the observed cause.
+            if !matches!(self.last_pin_cause, Some(PinCause::Tx)) {
+                self.last_pin_cause = Some(PinCause::SessionTracker);
+            }
+        }
+    }
+
     /// The M1-S2 assist signal (SPEC §7.1): RFQ (`apply_tx_status`) is the tx AUTHORITY; the lexer
     /// only ADDS session-state taint + a cause label for protocol-invisible mutations. It NEVER
     /// clears a taint and NEVER touches `self.pin`/`self.tx_open` (those are the RFQ's/tx's).
@@ -723,6 +770,9 @@ impl<B: PoolBackend> Checkout<B> {
         // errored stream it may be stale, so the Err-arm force below fails safe.
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
+        // M1-S6: the SECOND assist signal, read at the same post-statement point. No-op for PG/Fake
+        // (default `take_session_mutated -> false`); taints + labels `SessionTracker` for MySQL.
+        self.apply_session_tracker();
         if errored {
             // Rule A fail-safe (uniform with the six instrumented methods): on ANY mid-stream error
             // the terminating `ReadyForQuery` may not have been consumed and a statement can open a

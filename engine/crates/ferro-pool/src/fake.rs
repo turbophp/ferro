@@ -39,6 +39,13 @@ pub struct FakeConn {
     /// been decoded yet) — so the pool's unconditional Err-arm fail-safe can be exercised
     /// deterministically without the fake having to model batch parsing.
     fail_next_simple_query: bool,
+    /// One-shot (M1-S6): when set, the NEXT `take_session_mutated()` on this conn returns `true`
+    /// and clears it — modelling a MySQL OK-packet session tracker reporting a session mutation on
+    /// the statement just run. Defaults to `false` so the FakeBackend's pin behavior is UNCHANGED
+    /// for every existing test (this is the additive M1-S6 hook; a test opts in via
+    /// `arm_session_mutated`). Consumed on read so exactly one statement is credited, mirroring the
+    /// real backend draining the OK-packet tracker.
+    session_mutated: bool,
     /// Models the RFQ status this connection would report (Task 3). Lives PER-`FakeConn` (matching
     /// real per-`Client` semantics), defaults to `Idle` at checkout, and is updated by
     /// `simple_query`/`query` inferring from the leading SQL keyword (see `leading_tx_verb`) — NOT
@@ -68,6 +75,14 @@ impl FakeConn {
     /// fail-safe defends against.
     pub fn arm_fail_next_simple_query(&mut self) {
         self.fail_next_simple_query = true;
+    }
+
+    /// Arms the *next* `take_session_mutated()` on this conn to report `true` (one-shot, M1-S6).
+    /// Models a MySQL OK-packet session tracker firing on the statement just run — the second
+    /// (protocol-derived) assist signal `Checkout::apply_session_tracker` consumes. Consumed on
+    /// read so subsequent statements report no mutation, exactly like a drained OK-packet tracker.
+    pub fn arm_session_mutated(&mut self) {
+        self.session_mutated = true;
     }
 
     /// This connection's currently-modeled [`TxStatus`] (mirrors `PoolBackend::tx_status`).
@@ -518,6 +533,7 @@ impl PoolBackend for FakeBackend {
             tx_open: false,
             fail_next_ping: false,
             fail_next_simple_query: false,
+            session_mutated: false,
             tx_status: TxStatus::Idle,
         })
     }
@@ -550,6 +566,14 @@ impl PoolBackend for FakeBackend {
 
     fn tx_status(&self, conn: &Self::Conn) -> TxStatus {
         conn.tx_status
+    }
+
+    /// M1-S6: read-and-CLEAR this conn's one-shot session-mutation flag (armed via
+    /// `FakeConn::arm_session_mutated`), modelling MySQL's OK-packet session tracker. Defaults to
+    /// `false` (unarmed), so every existing test — which never arms it — sees the exact same
+    /// behavior as the trait's default `false`: `apply_session_tracker` never taints for the fake.
+    fn take_session_mutated(&self, conn: &mut Self::Conn) -> bool {
+        std::mem::take(&mut conn.session_mutated)
     }
 
     async fn reset(&self, conn: &mut Self::Conn, profile: ResetProfile) -> Result<(), PoolError> {
