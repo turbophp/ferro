@@ -70,6 +70,17 @@ async fn read_sbs(co: &mut Checkout<MysqlBackend>) -> u64 {
         .expect("sort_buffer_size returned one row")
 }
 
+/// A verification-only raw read of `@@session.sort_buffer_size` off a bare (non-pooled) backend
+/// connection — the same read as [`read_sbs`], but for the raw `MysqlConn` the tracker-authority
+/// proof and the parity `(b1)` open directly via `pool.backend().connect()`.
+async fn read_sbs_raw(raw: &mut ferro_backend_mysql::MysqlConn) -> u64 {
+    raw.mysql
+        .query_first::<u64, _>("SELECT @@session.sort_buffer_size")
+        .await
+        .expect("read @@session.sort_buffer_size (raw)")
+        .expect("sort_buffer_size returned one row (raw)")
+}
+
 /// The physical connection id (the MySQL protocol handshake thread id off the driver — NOT
 /// `CONNECTION_ID()`, whose `BIGINT UNSIGNED` result is the deferred unsigned-64 type, SPEC §9).
 /// `COM_RESET_CONNECTION` preserves this id (it re-initializes session state on the same TCP conn),
@@ -86,6 +97,51 @@ async fn run_hard_gate(url: &str, label: &str) {
     // max_size = 1: the ONLY connection this pool creates MUST be the one reused at the next
     // checkout — that reuse is what lets the read-back observe whether the mutation leaked.
     let pool = Pool::new(MysqlBackend::new(url), config(1));
+
+    // ---- R2 HEADLINE PROPERTY, proven SELF-CONTAINED (the TRACKER, not the CALL backstop) --------
+    // The gate's raison d'être (§7.1): the OK-packet tracker sees a session mutation performed INSIDE
+    // a stored program. The `Checkout::exec("CALL …")` path below proves DETECTION + hygiene, but its
+    // taint can come from the T6 unconditional CALL/DO lexer backstop — which would MASK a dead
+    // tracker (the gate would still pass). So prove the tracker DIRECTLY here, on a RAW backend conn:
+    // `take_session_mutated` at the backend level reflects ONLY the OK-packet tracker (it never runs
+    // `apply_classify`). Pre-set a NON-default value first so the proc's `262144` is a REAL change on
+    // MySQL 8 too (whose default IS 262144 — a no-op SET might be tracker-suppressed; matching
+    // conn_it.rs), DRAIN that pre-set's taint (read-and-clear), THEN CALL and assert the tracker fired.
+    {
+        let mut raw = pool
+            .backend()
+            .connect()
+            .await
+            .expect("raw connect (tracker proof)");
+        let raw_default = read_sbs_raw(&mut raw).await;
+        pool.backend()
+            .simple_query(
+                &mut raw,
+                &format!("SET SESSION sort_buffer_size = {}", raw_default * 2),
+            )
+            .await
+            .expect(
+                "pre-set a non-default sort_buffer_size (so the proc's 262144 is a real change)",
+            );
+        // Drain the pre-set's taint so the assertion below is about the CALL alone, not the SET.
+        let _ = pool.backend().take_session_mutated(&mut raw);
+        pool.backend()
+            .simple_query(&mut raw, "CALL p_set_session()")
+            .await
+            .expect("CALL p_set_session() (raw)");
+        let tracker_fired = pool.backend().take_session_mutated(&mut raw);
+        assert!(
+            tracker_fired,
+            "[{label}] R2: the OK-packet tracker MUST fire for a SET SESSION inside a stored program \
+             (proven independent of the CALL lexer backstop) — a dead tracker fails HERE"
+        );
+        println!(
+            "[{label}] TRACKER PROOF: take_session_mutated after CALL p_set_session() \
+             (pre-set {} → proc set 262144) = {tracker_fired} — the tracker saw inside the stored program",
+            raw_default * 2
+        );
+        drop(raw);
+    }
 
     // ---- co1: run the in-proc mutation, prove DETECTION, install a discriminating probe ----------
     let (co1_id, default_sbs, in_proc_val, probe) = {

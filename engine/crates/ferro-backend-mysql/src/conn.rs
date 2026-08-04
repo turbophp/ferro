@@ -286,8 +286,11 @@ impl PoolBackend for MysqlBackend {
 
     /// A non-tainted recycled MySQL conn currently gets the conservative `Full` profile
     /// (`COM_RESET_CONNECTION`). The tracker-clean `None` skip — provably safe once the OK-packet
-    /// tracker is shown to fire for EVERY §7.1 mutation class inside stored programs — is switched on
-    /// in Task 7 (after the hard gate). Until then `Some(Full)` is the correct conservative backstop.
+    /// tracker is shown to fire for EVERY §7.1 mutation class inside stored programs — is DEFERRED
+    /// (M1-S6 Task 7 verified the tracker + closed the read-back leak, but did NOT enable the skip:
+    /// R2, correctness over the §16 cache target, until in-proc coverage across all reuse-relevant
+    /// session variables is proven — see SPEC §7.2 / §22.2). Until then `Some(Full)` is the correct
+    /// conservative backstop.
     fn clean_reset_profile(&self) -> Option<ResetProfile> {
         Some(ResetProfile::Full)
     }
