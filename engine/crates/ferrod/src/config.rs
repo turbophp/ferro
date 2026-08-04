@@ -56,8 +56,43 @@ const DEFAULT_MAX_TX: Duration = Duration::from_secs(60);
 /// Symmetric with the pool's bounded recycle (`PoolConfig::checkout_timeout`).
 const DEFAULT_TX_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The upstream backend a pool speaks (M1-S6). Inferred from the DSN scheme by [`infer_pool_kind`]
+/// (`postgres`/`postgresql` → [`PoolKind::Postgres`]; `mysql`/`mariadb` → [`PoolKind::Mysql`]) — the
+/// daemon has no separate `kind =` knob, the scheme IS the selector. `PoolRegistry::build` matches
+/// on this to construct the right concrete `Pool<B>` variant (`AnyPool`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolKind {
+    Postgres,
+    Mysql,
+}
+
+/// Infer a pool's [`PoolKind`] from its DSN scheme (the substring before `://`, ASCII-lowercased):
+/// `postgres`/`postgresql` → [`PoolKind::Postgres`]; `mysql`/`mariadb` → [`PoolKind::Mysql`]. An
+/// unrecognized or missing scheme is `tracing::warn!`-ed and defaults to [`PoolKind::Postgres`]
+/// (the M0 backend) — a conservative default that keeps a typo'd scheme from silently disabling a
+/// pool. Pure over its `dsn` input (the warn is a side channel), so it is directly unit-testable.
+/// The DSN VALUE is never logged here (§12) — only the scheme token.
+pub fn infer_pool_kind(dsn: &str) -> PoolKind {
+    match dsn
+        .split("://")
+        .next()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mysql") | Some("mariadb") => PoolKind::Mysql,
+        Some("postgres") | Some("postgresql") => PoolKind::Postgres,
+        other => {
+            tracing::warn!(
+                scheme = other.unwrap_or(""),
+                "FERRO_POOLS: unrecognized DSN scheme; defaulting pool kind to Postgres"
+            );
+            PoolKind::Postgres
+        }
+    }
+}
+
 /// A configured connection pool: the logical `name` a client references in `ExecRequest.pool`,
-/// plus the upstream `dsn`.
+/// the upstream `dsn`, and the `kind` (backend) inferred from that DSN's scheme.
 ///
 /// Per SPEC §12 the DSN is a SERVER-side secret: the client never sees it, and it must never be
 /// logged. The manual `Debug` impl below REDACTS `dsn`, so a `{:?}` on a `Config` (or anywhere a
@@ -67,6 +102,8 @@ const DEFAULT_TX_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct PoolSpec {
     pub name: String,
     pub dsn: String,
+    /// The upstream backend this pool speaks, inferred from the DSN scheme by [`infer_pool_kind`].
+    pub kind: PoolKind,
     /// The assist lexer's (`ferro-classify`, M1-S2) per-pool escape hatch: function names that
     /// always taint + pin-cause `PinFunction`, threaded verbatim into `PoolConfig::pin_functions`.
     /// From `FERRO_POOL_<NAME>_PIN_FUNCTIONS` (comma-separated), default empty.
@@ -82,6 +119,7 @@ impl std::fmt::Debug for PoolSpec {
         f.debug_struct("PoolSpec")
             .field("name", &self.name)
             .field("dsn", &"<redacted>")
+            .field("kind", &self.kind)
             .field("pin_functions", &self.pin_functions)
             .field("pin_on_unknown", &self.pin_on_unknown)
             .finish()
@@ -283,9 +321,11 @@ fn parse_pools(names: &str, lookup: &impl Fn(&str) -> Option<String>) -> Vec<Poo
             match lookup(&env_key) {
                 Some(dsn) if !dsn.is_empty() => {
                     let (pin_functions, pin_on_unknown) = parse_pool_pin_config(name, lookup);
+                    let kind = infer_pool_kind(&dsn);
                     Some(PoolSpec {
                         name: name.to_string(),
                         dsn,
+                        kind,
                         pin_functions,
                         pin_on_unknown,
                     })
@@ -428,6 +468,7 @@ mod tests {
         let s = PoolSpec {
             name: "default".to_string(),
             dsn: "postgres://user:hunter2@db.internal/app".to_string(),
+            kind: PoolKind::Postgres,
             pin_functions: Vec::new(),
             pin_on_unknown: true,
         };
@@ -445,6 +486,51 @@ mod tests {
         assert_eq!(env_name("default"), "DEFAULT");
         assert_eq!(env_name("read-replica"), "READ_REPLICA");
         assert_eq!(env_name("pool.1"), "POOL_1");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // M1-S6 Task 5: `PoolKind` inferred from the DSN scheme (there is no separate `kind =` knob —
+    // the scheme IS the selector). `PoolRegistry::build` matches on this to build the right
+    // concrete `Pool<B>`.
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn infer_pool_kind_from_scheme() {
+        assert_eq!(
+            infer_pool_kind("mysql://ferro:ferro@127.0.0.1:33060/ferro"),
+            PoolKind::Mysql
+        );
+        assert_eq!(
+            infer_pool_kind("mariadb://ferro:ferro@127.0.0.1:33061/ferro"),
+            PoolKind::Mysql
+        );
+        assert_eq!(
+            infer_pool_kind("postgres://ferro:ferro@localhost:5432/ferro"),
+            PoolKind::Postgres
+        );
+        assert_eq!(
+            infer_pool_kind("postgresql://ferro@localhost/ferro"),
+            PoolKind::Postgres
+        );
+        // Scheme is case-insensitive.
+        assert_eq!(infer_pool_kind("MySQL://h/db"), PoolKind::Mysql);
+        // Unknown / missing scheme defaults to Postgres (the M0 backend), never a panic.
+        assert_eq!(infer_pool_kind("sqlite://x"), PoolKind::Postgres);
+        assert_eq!(infer_pool_kind("not-a-dsn"), PoolKind::Postgres);
+        assert_eq!(infer_pool_kind(""), PoolKind::Postgres);
+    }
+
+    #[test]
+    fn parse_pools_infers_kind_from_each_dsn_scheme() {
+        let lookup = map_lookup(&[
+            ("FERRO_POOL_PGPOOL_DSN", "postgres://user@db/app"),
+            ("FERRO_POOL_MYPOOL_DSN", "mysql://user@db/app"),
+        ]);
+        let pools = parse_pools("pgpool,mypool", &lookup);
+        let pg = pools.iter().find(|p| p.name == "pgpool").unwrap();
+        let my = pools.iter().find(|p| p.name == "mypool").unwrap();
+        assert_eq!(pg.kind, PoolKind::Postgres);
+        assert_eq!(my.kind, PoolKind::Mysql);
     }
 
     #[test]

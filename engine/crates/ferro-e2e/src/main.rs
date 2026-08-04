@@ -48,11 +48,13 @@ async fn main() -> Result<(), BoxErr> {
     // Build the in-process daemon. PoolRegistry::build + serve MUST run inside the tokio runtime
     // (Pool::new spawns a background reaper) — they do, we are inside `#[tokio::main]`.
     let socket_path = temp_socket_path();
+    let kind = ferrod::config::infer_pool_kind(&url);
     let config = Config {
         socket_path: socket_path.clone(),
         pools: vec![PoolSpec {
             name: "default".to_string(),
             dsn: url,
+            kind,
             pin_functions: Vec::new(),
             pin_on_unknown: true,
         }],

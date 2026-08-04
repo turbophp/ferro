@@ -47,10 +47,12 @@ use ferrod::tx::TxRegistry;
 /// real `sql::make_handler` + a shared `Arc<TxRegistry>`) so it is a genuine client→ferrod→actor→PG
 /// round trip.
 fn exec_server_with_deadlines(url: String, idle_in_tx: Duration, max_tx: Duration) -> TestServer {
+    let kind = ferrod::config::infer_pool_kind(&url);
     let config = Config {
         pools: vec![PoolSpec {
             name: "default".to_string(),
             dsn: url,
+            kind,
             pin_functions: Vec::new(),
             pin_on_unknown: true,
         }],

@@ -350,6 +350,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "ferro-backend-mysql",
  "ferro-backend-pg",
  "ferro-pool",
  "ferro-proto",

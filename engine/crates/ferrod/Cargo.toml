@@ -14,6 +14,7 @@ workspace = true
 ferro-proto = { path = "../ferro-proto" }
 ferro-pool = { path = "../ferro-pool" }
 ferro-backend-pg = { path = "../ferro-backend-pg" }
+ferro-backend-mysql = { path = "../ferro-backend-mysql" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "signal", "macros", "io-util", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"

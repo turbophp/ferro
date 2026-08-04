@@ -262,15 +262,17 @@ async fn unsupported_query_id_pool_stream() {
         errc::UNSUPPORTED
     );
 
-    // A TX-SCOPED fetch=stream (streaming inside a transaction) is still Unsupported (Task 5). The
-    // AUTOCOMMIT fetch=stream path is now the live HEAD/DATA producer (M1-S5 Task 4b) — covered by
-    // the deterministic FakeBackend unit tests in `services::sql` — so it is no longer an error here.
+    // A tx-scoped EXEC naming an UNKNOWN tx_id (no prior BEGIN) → the unknown/forbidden-tx guard
+    // (`resolve_active` → Protocol), which fires BEFORE any fetch handling. Both the autocommit
+    // fetch=stream producer (M1-S5 Task 4b) AND the tx-scoped one (M1-S5 Task 5) are now live, so
+    // fetch=stream is no longer an error shape here — an unknown tx_id is (Protocol, not
+    // Unsupported). Using fetch=stream keeps the request identical to the pre-M1-S5 case.
     let mut stream = req("SELECT 1");
     stream.fetch = 2;
     stream.tx_id = Some(1);
     assert_eq!(
         exec_err(&mut client, 52, &stream).await.code,
-        errc::UNSUPPORTED
+        errc::PROTOCOL
     );
 
     // All three were per-request errors; the session is unaffected.

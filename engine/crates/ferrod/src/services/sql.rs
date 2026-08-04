@@ -57,7 +57,7 @@ use ferro_proto::messages::sql::{ExecOk, ExecRequest, Stats};
 use ferro_proto::messages::tx::{BeginRequest, BeginResponse, SavepointRequest, TxControl};
 use ferro_proto::value::Value;
 
-use crate::pools::PoolRegistry;
+use crate::pools::{AnyPool, PoolRegistry};
 use crate::services::fate::{self, OpContext};
 use crate::session::codec::InFrame;
 use crate::session::responder::{Responder, StreamSendError};
@@ -331,82 +331,116 @@ async fn handle_exec(
             }
         }
 
-        // ---- autocommit EXEC: the S5 path, now with M1-S4's timeout_ms + CANCEL enforcement ----
+        // ---- autocommit EXEC: the S5 path (M1-S4 timeout_ms + CANCEL), dispatched over the
+        //      heterogeneous pool registry (M1-S6) ----
         None => {
             let Some(pool) = registry.get(&req.pool) else {
                 responder.end_error(unsupported(format!("unknown pool {:?}", req.pool)));
                 return;
             };
 
-            // M1-S5 Task 4b: a streamed fetch runs the incremental HEAD + DATA×N producer under the
-            // credit window instead of buffering the whole result into the terminal (D-S5-1). The
-            // buffered FETCH_ROWS/FETCH_NONE path below is untouched.
-            if req.fetch == FETCH_STREAM {
-                run_autocommit_streamed(
-                    responder,
-                    pool,
-                    sql,
-                    &req.params,
-                    req.timeout_ms,
-                    req.readonly,
-                    &cancel,
-                    StreamBatch::DEFAULT,
-                )
-                .await;
+            // M1-S6: `fetch:stream` is not yet wired for MySQL (the streaming bridge lands in
+            // M1-S7 with `MysqlBackend::query_stream`). Reject it EARLY — before any checkout — with
+            // a clean, documented terminal, so the client sees a precise Unsupported rather than a
+            // mid-stream error surfaced from the backend's `query_stream` `Unsupported`. The buffered
+            // FETCH_ROWS/FETCH_NONE MySQL paths run normally; PG streaming is unchanged.
+            if req.fetch == FETCH_STREAM && matches!(pool, AnyPool::Mysql(_)) {
+                responder.end_error(unsupported(
+                    "fetch=stream is not yet supported on MySQL (lands in M1-S7 with the \
+                     streaming bridge)",
+                ));
                 return;
             }
 
-            // (3) checkout → queue_us (the pool-wait, including any recycle cleanup on the popped conn).
-            let mut co = match pool.checkout().await {
-                Ok(co) => co,
-                Err(e) => {
-                    // A checkout failure means NO connection was established, so the user statement
-                    // was NEVER transmitted → known "did-not-apply", never Indeterminate (sent=false).
-                    // This is the autocommit path: in_tx=false.
-                    responder.end_error(fate::classify_fate(
-                        e,
-                        OpContext {
-                            readonly: req.readonly,
-                            sent: false,
-                            in_tx: false,
-                        },
-                    ));
-                    return;
-                }
-            };
-            let queue_us = co.stats().queue_us;
-
-            // (4) run the GUARDED, INTERRUPTIBLE row-returning entry: enforces `timeout_ms` + the
-            // per-request CANCEL via a biased select that polls the query FIRST, so `sent` is
-            // honest for whatever `Err` comes back (see `run_autocommit_exec`'s doc). exec_us times
-            // ONLY the DB call — the conn is released (below) before framing, so a slow client
-            // cannot inflate it (D-S5-1). NEVER conn_mut()/the raw client here (that bypasses the
-            // tx-control guard → cross-tenant leak).
-            let (result, exec_us) =
-                run_autocommit_exec(&mut co, sql, &req.params, req.timeout_ms, &cancel).await;
-
-            // Release the pooled connection BEFORE framing/sending (RAII): held only for the
-            // query. A cancelled/timed-out statement returns Err(57014) here, which
-            // `Checkout::query`'s S1 unconditional Err-arm fail-safe ALREADY taints regardless of
-            // the RFQ byte — so `co` is never handed back dirty; the next checkout's S3 recycle
-            // DISCARD-ALLs it before the next tenant.
-            drop(co);
-
-            // (5)+(6) Ok → the real success terminal, even if a cancel/timeout raced it and lost
-            // (§5.2/§19.3 — never fabricate an error for a statement that actually completed); Err
-            // → `fate::classify_fate` with the HONEST `sent: true` (a later-winning timeout/cancel
-            // arm only ever fires after the query was already polled at least once — see
-            // `run_autocommit_exec`). This is the autocommit path: in_tx=false.
-            declare_autocommit_exec(
-                responder,
-                result,
-                req.fetch,
-                queue_us,
-                exec_us,
-                req.readonly,
-            );
+            // Dispatch to the SAME generic body for whichever concrete backend the named pool is.
+            // Both arms monomorphize `run_exec_on_pool`; the terminal is declared via the moved
+            // `Responder` (no typed return), so the arms unify. PG's path is byte-for-byte the
+            // pre-M1-S6 inline body.
+            match pool {
+                AnyPool::Pg(p) => run_exec_on_pool(p, responder, &req, sql, cancel).await,
+                AnyPool::Mysql(p) => run_exec_on_pool(p, responder, &req, sql, cancel).await,
+            }
         }
     }
+}
+
+/// The autocommit EXEC body, generic over the backend `B` — extracted verbatim from `handle_exec`'s
+/// `None` (autocommit) arm so the heterogeneous pool registry (M1-S6) dispatches to ONE
+/// implementation per `AnyPool` variant. PG's behavior is byte-for-byte the pre-M1-S6 inline body;
+/// the MySQL monomorphization reuses it verbatim for the buffered `fetch:rows`/`none` paths (its
+/// `fetch:stream` is rejected upstream in `handle_exec`, so the stream branch below is unreachable
+/// for `B = MysqlBackend` — it stays only because the fn is generic and must compile for both).
+async fn run_exec_on_pool<B: PoolBackend>(
+    pool: &Pool<B>,
+    responder: Responder,
+    req: &ExecRequest,
+    sql: &str,
+    cancel: CancellationToken,
+) {
+    // M1-S5 Task 4b: a streamed fetch runs the incremental HEAD + DATA×N producer under the credit
+    // window instead of buffering the whole result into the terminal (D-S5-1). The buffered
+    // FETCH_ROWS/FETCH_NONE path below is untouched. (Reached only for PG — a MySQL stream is
+    // rejected in `handle_exec` before dispatch.)
+    if req.fetch == FETCH_STREAM {
+        run_autocommit_streamed(
+            responder,
+            pool,
+            sql,
+            &req.params,
+            req.timeout_ms,
+            req.readonly,
+            &cancel,
+            StreamBatch::DEFAULT,
+        )
+        .await;
+        return;
+    }
+
+    // (3) checkout → queue_us (the pool-wait, including any recycle cleanup on the popped conn).
+    let mut co = match pool.checkout().await {
+        Ok(co) => co,
+        Err(e) => {
+            // A checkout failure means NO connection was established, so the user statement was
+            // NEVER transmitted → known "did-not-apply", never Indeterminate (sent=false). This is
+            // the autocommit path: in_tx=false.
+            responder.end_error(fate::classify_fate(
+                e,
+                OpContext {
+                    readonly: req.readonly,
+                    sent: false,
+                    in_tx: false,
+                },
+            ));
+            return;
+        }
+    };
+    let queue_us = co.stats().queue_us;
+
+    // (4) run the GUARDED, INTERRUPTIBLE row-returning entry: enforces `timeout_ms` + the
+    // per-request CANCEL via a biased select that polls the query FIRST, so `sent` is honest for
+    // whatever `Err` comes back (see `run_autocommit_exec`'s doc). exec_us times ONLY the DB call —
+    // the conn is released (below) before framing, so a slow client cannot inflate it (D-S5-1).
+    // NEVER conn_mut()/the raw client here (that bypasses the tx-control guard → cross-tenant leak).
+    let (result, exec_us) =
+        run_autocommit_exec(&mut co, sql, &req.params, req.timeout_ms, &cancel).await;
+
+    // Release the pooled connection BEFORE framing/sending (RAII): held only for the query. A
+    // cancelled/timed-out statement returns Err(57014) here, which `Checkout::query`'s S1
+    // unconditional Err-arm fail-safe ALREADY taints regardless of the RFQ byte — so `co` is never
+    // handed back dirty; the next checkout's S3 recycle DISCARD-ALLs it before the next tenant.
+    drop(co);
+
+    // (5)+(6) Ok → the real success terminal, even if a cancel/timeout raced it and lost
+    // (§5.2/§19.3 — never fabricate an error for a statement that actually completed); Err →
+    // `fate::classify_fate` with the HONEST `sent: true`. This is the autocommit path: in_tx=false.
+    declare_autocommit_exec(
+        responder,
+        result,
+        req.fetch,
+        queue_us,
+        exec_us,
+        req.readonly,
+    );
 }
 
 /// Run one autocommit statement against `co`, honoring `timeout_ms` and the per-request `cancel`
@@ -1129,6 +1163,58 @@ async fn handle_begin(
         responder.end_error(unsupported(format!("unknown pool {:?}", req.pool)));
         return;
     };
+
+    // Dispatch to the SAME generic body for whichever concrete backend the named pool is: the tx
+    // actor (`actor::run<B>`) and `TxRegistry` (backend-AGNOSTIC command channels) are already
+    // generic, so each arm spawns the right `Checkout<B>` actor and both monomorphize
+    // `begin_on_pool`. PG's path is byte-for-byte the pre-M1-S6 inline body.
+    match pool {
+        AnyPool::Pg(p) => {
+            begin_on_pool(
+                p,
+                responder,
+                &req,
+                tx_registry,
+                session_id,
+                idle_in_tx,
+                max_tx,
+                teardown_timeout,
+            )
+            .await
+        }
+        AnyPool::Mysql(p) => {
+            begin_on_pool(
+                p,
+                responder,
+                &req,
+                tx_registry,
+                session_id,
+                idle_in_tx,
+                max_tx,
+                teardown_timeout,
+            )
+            .await
+        }
+    }
+}
+
+/// The `service=TX, method=BEGIN` body, generic over the backend `B` — extracted from `handle_begin`
+/// so the heterogeneous pool registry (M1-S6) dispatches per `AnyPool` variant. Composes the engine
+/// BEGIN, checks out + opens the tx on the pinned conn, allocates a `tx_id`, spawns the (already
+/// backend-agnostic) actor MOVING the `Checkout<B>` in, registers its control surface, and replies
+/// the terminal `BeginResponse{tx_id}`. Any failure before the spawn → a mapped error, one END,
+/// nothing registered, the conn released. PG's behavior is byte-for-byte the pre-M1-S6 inline body.
+#[allow(clippy::too_many_arguments)]
+async fn begin_on_pool<B: PoolBackend>(
+    pool: &Pool<B>,
+    responder: Responder,
+    req: &BeginRequest,
+    tx_registry: &TxRegistry,
+    session_id: SessionId,
+    idle_in_tx: Duration,
+    max_tx: Duration,
+    teardown_timeout: Duration,
+) {
     let begin_sql = match actor::compose_begin_sql(req.isolation, req.readonly) {
         Ok(s) => s,
         Err(msg) => {

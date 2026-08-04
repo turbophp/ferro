@@ -552,10 +552,14 @@ pub fn mariadb_url() -> Option<String> {
 /// `sql::make_handler` + a shared `Arc<TxRegistry>` — built exactly as `main` builds it — so this
 /// is a genuine client→ferrod→pool→PG round trip.
 pub fn exec_server(url: String) -> TestServer {
+    // Kind is inferred from the DSN scheme (M1-S6), so `exec_server(mysql_url())` builds a MySQL
+    // pool and `exec_server(pg_url())` a Postgres one — the SAME helper drives both dialects.
+    let kind = ferrod::config::infer_pool_kind(&url);
     let config = Config {
         pools: vec![PoolSpec {
             name: "default".to_string(),
             dsn: url,
+            kind,
             pin_functions: Vec::new(),
             pin_on_unknown: true,
         }],
@@ -581,11 +585,13 @@ pub fn exec_server(url: String) -> TestServer {
 /// credit window (via `spawn_with_factory_and_config`) and the EXEC handler's pool, so the small
 /// window is actually in force end to end (`spawn_with_factory` would silently reset it to default).
 pub fn stream_server(url: String, credit_frames: u32) -> TestServer {
+    let kind = ferrod::config::infer_pool_kind(&url);
     let config = Config {
         credit_frames,
         pools: vec![PoolSpec {
             name: "default".to_string(),
             dsn: url,
+            kind,
             pin_functions: Vec::new(),
             pin_on_unknown: true,
         }],
