@@ -12,6 +12,7 @@ use Ferro\Client\Error\RetryableException;
 use Ferro\Client\Error\TransportException;
 use Ferro\Client\Hydration\PlanCache;
 use Ferro\Client\Value\M0ValuePolicy;
+use Ferro\Client\Value\TypePolicyOptions;
 use Ferro\Client\Value\ValuePolicy;
 use Ferro\Protocol\BeginRequest;
 use Ferro\Protocol\BeginResponse;
@@ -45,7 +46,16 @@ final class Connection
     private readonly FateClassifier $fate;
     private readonly PackerInterface $encodePacker;
     private readonly PackerInterface $decodePacker;
+    private readonly TypePolicyOptions $types;
 
+    /**
+     * `codec:` and the `values:`/`plans:`/`types:` PARTS are mutually exclusive, and so are
+     * `values:` and `types:` — see the constructor body for why (each combination used to, or would,
+     * silently discard an argument).
+     *
+     * @param ?TypePolicyOptions $types the SPEC §9.1 policy knobs this connection decodes with
+     *   (client-side in M1 — see {@see TypePolicyOptions}). Defaults to the safe object forms.
+     */
     public function __construct(
         private readonly SessionInterface $session,
         private readonly string $pool = 'default',
@@ -57,9 +67,36 @@ final class Connection
         ?PlanCache $plans = null,
         ?PackerInterface $encodePacker = null,
         ?PackerInterface $decodePacker = null,
+        ?TypePolicyOptions $types = null,
     ) {
+        // A supplied ExecCodec already carries its own ValuePolicy and PlanCache, so `values:`,
+        // `plans:` and `types:` have nowhere to go — they used to be accepted and DROPPED, which
+        // meant an app that configured a §9.1 policy silently got the default decoding instead.
+        // Reject the combination loudly rather than pick a winner.
+        if ($codec !== null && ($values !== null || $plans !== null || $types !== null)) {
+            throw new \InvalidArgumentException(
+                'Connection: `codec:` is mutually exclusive with `values:`, `plans:` and `types:` — '
+                . 'a supplied ExecCodec already carries its own ValuePolicy and PlanCache, so those '
+                . 'arguments would be SILENTLY DISCARDED. Pass a fully-built `codec:`, or the '
+                . '`values:`/`plans:`/`types:` parts, never both.',
+            );
+        }
+        // Same trap one layer down: a ready-made ValuePolicy already embeds whichever §9.1 options
+        // it was built with, so a `types:` alongside it would be discarded just as quietly.
+        if ($values !== null && $types !== null) {
+            throw new \InvalidArgumentException(
+                'Connection: `values:` is mutually exclusive with `types:` — a supplied ValuePolicy '
+                . 'already embeds its own §9.1 TypePolicyOptions, so `types:` would be SILENTLY '
+                . 'DISCARDED. Pass a ready ValuePolicy (`values:`) or the policy options (`types:`).',
+            );
+        }
+
+        $this->types = $types ?? new TypePolicyOptions();
         $this->encodePacker = $encodePacker ?? PackerFactory::forEncode();
         $this->decodePacker = $decodePacker ?? PackerFactory::forDecode();
+        // The default-policy site. M1-S7 Task 7 swaps `M0ValuePolicy` for the M1 policy built from
+        // `$this->types`; until then a configured `types:` governs only tags M0 already refuses
+        // LOUDLY (DECIMAL/U64/TIMESTAMP/UUID all raise), so it can never mask a silent miscast.
         $this->codec = $codec ?? new ExecCodec(
             $values ?? new M0ValuePolicy(),
             $plans ?? new PlanCache(),
@@ -68,6 +105,12 @@ final class Connection
         );
         $this->policy = $policy ?? RetryPolicy::default();
         $this->fate = $fate ?? new FateClassifier($this->policy->retryReads);
+    }
+
+    /** The SPEC §9.1 type policy this connection decodes with (client-side in M1). */
+    public function typePolicy(): TypePolicyOptions
+    {
+        return $this->types;
     }
 
     /** The live session (the reconnect loop's current one when resilient). */

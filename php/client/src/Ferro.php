@@ -10,6 +10,7 @@ use Ferro\Client\RetryPolicy;
 use Ferro\Client\Session;
 use Ferro\Client\SessionInterface;
 use Ferro\Client\Transport;
+use Ferro\Client\Value\TypePolicyOptions;
 
 /**
  * The M0 entry-point facade: open a transport, run the HELLO handshake, and hand back a
@@ -30,6 +31,9 @@ final class Ferro
      *
      * @param string $socketPath the UDS path (e.g. `/run/ferro/{schema_hash}.sock`).
      * @param string $pool the pool name to bind requests to (must be advertised in HELLO_ACK).
+     * @param ?TypePolicyOptions $types the SPEC §9.1 type policy (`decimal`, `naive_datetime_zone`,
+     *   `u64_overflow`, `uuid`). Client-side in M1 — see {@see TypePolicyOptions} for why the engine
+     *   has no matching knob. Defaults to the safe object forms.
      */
     public static function connect(
         string $socketPath,
@@ -37,17 +41,20 @@ final class Ferro
         float $connectTimeout = 2.0,
         float $ioTimeout = 5.0,
         ?RetryPolicy $policy = null,
+        ?TypePolicyOptions $types = null,
     ): Connection {
         $factory = static function () use ($socketPath, $connectTimeout, $ioTimeout): SessionInterface {
             $session = new Session(Transport::connectUnix($socketPath, $connectTimeout, $ioTimeout));
             $session->hello();
             return $session;
         };
-        return self::assemble($factory, $pool, $policy);
+        return self::assemble($factory, $pool, $policy, $types);
     }
 
     /**
      * Connect over TCP (the `FERRO_ADDR` fallback) instead of a Unix socket.
+     *
+     * @param ?TypePolicyOptions $types see {@see connect}.
      */
     public static function connectTcp(
         string $host,
@@ -56,13 +63,14 @@ final class Ferro
         float $connectTimeout = 2.0,
         float $ioTimeout = 5.0,
         ?RetryPolicy $policy = null,
+        ?TypePolicyOptions $types = null,
     ): Connection {
         $factory = static function () use ($host, $port, $connectTimeout, $ioTimeout): SessionInterface {
             $session = new Session(Transport::connectTcp($host, $port, $connectTimeout, $ioTimeout));
             $session->hello();
             return $session;
         };
-        return self::assemble($factory, $pool, $policy);
+        return self::assemble($factory, $pool, $policy, $types);
     }
 
     /**
@@ -71,8 +79,12 @@ final class Ferro
      *
      * @param \Closure(): SessionInterface $factory
      */
-    private static function assemble(\Closure $factory, string $pool, ?RetryPolicy $policy): Connection
-    {
+    private static function assemble(
+        \Closure $factory,
+        string $pool,
+        ?RetryPolicy $policy,
+        ?TypePolicyOptions $types = null,
+    ): Connection {
         $policy ??= RetryPolicy::default();
         $session = $factory();
         $loop = new ReconnectLoop(
@@ -87,6 +99,7 @@ final class Ferro
             reconnect: $loop,
             policy: $policy,
             fate: new FateClassifier($policy->retryReads),
+            types: $types,
         );
     }
 }
