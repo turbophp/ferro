@@ -41,7 +41,7 @@
 
 use ferro_pool::backend::PoolBackend;
 use ferro_pool::error::PoolError;
-use ferro_proto::consts::tag;
+use ferro_proto::consts::{branch, errc, tag};
 use ferro_proto::value::Value;
 use mysql_async::prelude::Queryable;
 
@@ -1218,8 +1218,12 @@ async fn bind_round_trip_is_byte_identical(url: &str, label: &str) {
     // **A payload MySQL has no representation for is a CLEAN TYPED ERROR — never a panic and never
     // a substituted date.** PG's `infinity` / `-infinity` / `NaN` are legal canonical payloads that
     // a cross-engine application can genuinely hand to a MySQL pool (read from PG, written to
-    // MySQL). The binder refuses to fabricate components for them: they fall back to a byte-string
-    // param and the SERVER rejects them, which is a known-fate SQL error the client can classify.
+    // MySQL). The binder refuses them at the PRE-SEND pre-flight (fix round 1) — it will neither
+    // fabricate components nor pass the text through, since a passthrough is silently COERCED under
+    // a permissive `sql_mode` (see
+    // `non_canonical_payloads_are_rejected_pre_send_under_permissive_sql_mode`, which proves that
+    // half). Here the session still carries the engine's DEFAULT `sql_mode`, so this case asserts
+    // only the outcome both modes now share: a known-fate SQL error, connection clean.
     let mut id = 500;
     for (v, col) in [
         (Value::Date("infinity".into()), "da"),
@@ -1253,6 +1257,247 @@ async fn bind_round_trip_is_byte_identical(url: &str, label: &str) {
         assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
         println!("  [{label}] non-representable {v:?} -> {col}: clean SQL error, conn clean");
     }
+
+    conn.mysql.disconnect().await.ok();
+}
+
+/// **Task 8b fix round 1 — a non-canonical payload is rejected PRE-SEND, and stays rejected under a
+/// PERMISSIVE `sql_mode`.**
+///
+/// The original Task 8b binder passed a non-parseable canonical payload through as a byte-string
+/// param, on the reasoning that the SERVER would then produce its own clean, known-fate error. That
+/// reasoning holds ONLY under `STRICT_TRANS_TABLES`. Measured under `SET SESSION sql_mode = ''` —
+/// which is what a legacy stack routinely runs in, since Doctrine sets no `sql_mode` — the server
+/// does not error at all; it **silently coerces**:
+///
+/// ```text
+/// [mysql]   Date("infinity")      -> ACCEPTED, stored 0000-00-00
+/// [mysql]   Timestamp("infinity") -> ACCEPTED, stored 0000-00-00 00:00:00
+/// [mysql]   Time("839:00:00")     -> ACCEPTED, stored 838:59:59
+/// [mysql]   Decimal("NaN")        -> ACCEPTED, stored 0.0000
+/// [mariadb] Time("839:00:00")     -> ACCEPTED, stored 838:59:59.999999
+/// ```
+///
+/// A cross-engine app reading a PG `date 'infinity'` and writing it to a MySQL pool would therefore
+/// store a wrong value with NO error anywhere — the silent miscast charter rule 6 forbids. The fix
+/// makes the non-canonical branch a bind-time rejection alongside the arity pre-check, so the
+/// outcome no longer depends on a server session variable at all.
+///
+/// Both halves are asserted here: the rejection is a KNOWN-FATE `Sql{Unsupported}` (branch
+/// `NonRetryable`, no SQLSTATE — the server never saw it) with **nothing written** and the
+/// connection immediately reusable; and, in the SAME permissive session, every payload that is a
+/// legal MySQL value still binds — the zero-date sentinels above all, which are exactly what a
+/// permissive `sql_mode` exists to allow (the over-rejection guard).
+async fn non_canonical_payloads_are_rejected_pre_send_under_permissive_sql_mode(
+    url: &str,
+    label: &str,
+) {
+    let backend = MysqlBackend::new(url);
+    let mut conn = backend.connect().await.expect("connect");
+
+    backend
+        .simple_query(
+            &mut conn,
+            "CREATE TEMPORARY TABLE ferro_s7_coerce (
+                 id BIGINT PRIMARY KEY,
+                 d  DECIMAL(30,10),
+                 da DATE,
+                 tm TIME(6),
+                 dt DATETIME(6),
+                 ts TIMESTAMP(6) NULL
+             )",
+        )
+        .await
+        .expect("create temp table");
+
+    // The mode that turns every rejection below into a SILENT coercion. Asserted, not assumed: if
+    // the server had ignored the `SET`, this whole test would be measuring STRICT mode instead and
+    // would pass over the defect it exists to catch.
+    backend
+        .simple_query(&mut conn, "SET SESSION sql_mode = ''")
+        .await
+        .expect("permissive sql_mode");
+    assert_eq!(
+        read_text(&mut conn, "SELECT @@session.sql_mode").await,
+        "",
+        "[{label}] the coercion hazard only exists under a permissive sql_mode — the SET must have \
+         taken effect or this test proves nothing"
+    );
+
+    let mut id = 600;
+    for (v, col) in [
+        // The PG DATE/TIMESTAMP range sentinels: legal canonical payloads MySQL cannot represent.
+        (Value::Date("infinity".into()), "da"),
+        (Value::Date("-infinity".into()), "da"),
+        (Value::Timestamp("infinity".into()), "dt"),
+        (Value::TimestampTz("infinity".into()), "ts"),
+        (Value::TimestampTz("-infinity".into()), "ts"),
+        // One µs past the documented MySQL TIME range, both signs.
+        (Value::Time("839:00:00".into()), "tm"),
+        (Value::Time("-839:00:00".into()), "tm"),
+        // The PG NUMERIC specials.
+        (Value::Decimal("NaN".into()), "d"),
+        (Value::Decimal("Infinity".into()), "d"),
+        (Value::Decimal("-Infinity".into()), "d"),
+    ] {
+        id += 1;
+        let r = backend
+            .query(
+                &mut conn,
+                &format!("INSERT INTO ferro_s7_coerce (id, {col}) VALUES (?, ?)"),
+                &[Value::I64(id), v.clone()],
+            )
+            .await;
+        match r {
+            Err(PoolError::Sql {
+                code,
+                branch: b,
+                ref sqlstate,
+                ..
+            }) => {
+                assert_eq!(
+                    code,
+                    errc::UNSUPPORTED,
+                    "[{label}] {v:?} -> {col}: a non-canonical payload is a bind-time Unsupported"
+                );
+                assert_eq!(
+                    b,
+                    branch::NON_RETRYABLE,
+                    "[{label}] {v:?} -> {col}: the rejection must classify NonRetryable — retrying \
+                     an unrepresentable payload can never succeed"
+                );
+                assert_eq!(
+                    *sqlstate, None,
+                    "[{label}] {v:?} -> {col}: the server never saw the statement, so there is no \
+                     SQLSTATE to report"
+                );
+            }
+            Err(PoolError::ConnectionLost) => panic!(
+                "[{label}] {v:?} -> {col}: a rejected bind must NEVER be ConnectionLost — that \
+                 would mint a false §19.3 Indeterminate for a write that never left the engine"
+            ),
+            Err(other) => panic!(
+                "[{label}] {v:?} -> {col}: expected a known-fate Sql{{Unsupported}}, got {other:?}"
+            ),
+            Ok(_) => {
+                let stored = read_text(
+                    &mut conn,
+                    &format!("SELECT CAST({col} AS CHAR) FROM ferro_s7_coerce WHERE id = {id}"),
+                )
+                .await;
+                panic!(
+                    "[{label}] SILENT COERCION: {v:?} was ACCEPTED into `{col}` and stored as \
+                     {stored:?} under sql_mode='' — a corrupt write with no error anywhere"
+                );
+            }
+        }
+        // Nothing was written: the rejection happened before the statement reached the server, so
+        // there is no row at all — not a row carrying a coerced value.
+        assert_eq!(
+            read_text(
+                &mut conn,
+                &format!("SELECT COUNT(*) FROM ferro_s7_coerce WHERE id = {id}")
+            )
+            .await,
+            "0",
+            "[{label}] {v:?} -> {col}: the rejection is PRE-SEND, so no row may exist"
+        );
+        // ...and the connection is immediately usable (no half-sent statement, no desync).
+        let ok = backend
+            .query(&mut conn, "SELECT 1", &[])
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] conn must survive {v:?}: {e:?}"));
+        assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
+        println!("  [{label}] non-canonical {v:?} -> {col}: pre-send Unsupported, nothing written");
+    }
+    assert_eq!(
+        read_text(&mut conn, "SELECT COUNT(*) FROM ferro_s7_coerce").await,
+        "0",
+        "[{label}] not one of the rejected payloads may have reached the table"
+    );
+
+    // **The over-rejection guard, in the SAME permissive session.** A legal MySQL sentinel is not a
+    // non-canonical payload: the zero date / zero datetime and a zero-in-date are exactly the values
+    // `sql_mode = ''` exists to allow, and they must still bind, verbatim.
+    backend
+        .query(
+            &mut conn,
+            "INSERT INTO ferro_s7_coerce (id, d, da, tm, dt, ts) VALUES (?, ?, ?, ?, ?, ?)",
+            &[
+                Value::I64(700),
+                Value::Decimal("-12345.6700000000".into()),
+                Value::Date("0000-00-00".into()),
+                Value::Time("-838:59:58.000001".into()),
+                Value::Timestamp("0000-00-00 00:00:00".into()),
+                // The one canonical TIMESTAMPTZ payload that is NOT RFC3339.
+                Value::TimestampTz("0000-00-00 00:00:00".into()),
+            ],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] the legal sentinels must still bind: {e:?}"));
+    backend
+        .query(
+            &mut conn,
+            "INSERT INTO ferro_s7_coerce (id, da, tm) VALUES (?, ?, ?)",
+            &[
+                Value::I64(701),
+                // A zero-in-date, legal without NO_ZERO_IN_DATE.
+                Value::Date("2026-00-05".into()),
+                // A >24 h TIME — a duration, not a time of day.
+                Value::Time("26:00:00".into()),
+            ],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] legal >24h/zero-in-date payloads must bind: {e:?}"));
+    // `24:00:00` is likewise a legal TIME (the top of a day, as a duration) and must still bind.
+    backend
+        .query(
+            &mut conn,
+            "INSERT INTO ferro_s7_coerce (id, tm) VALUES (?, ?)",
+            &[Value::I64(702), Value::Time("24:00:00".into())],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] `24:00:00` is a legal TIME and must bind: {e:?}"));
+    let r = backend
+        .query(
+            &mut conn,
+            "SELECT d, da, dt, ts FROM ferro_s7_coerce WHERE id = 700",
+            &[],
+        )
+        .await
+        .expect("read the sentinel row");
+    assert_eq!(
+        r.rows[0],
+        vec![
+            Value::Decimal("-12345.6700000000".into()),
+            Value::Date("0000-00-00".into()),
+            Value::Timestamp("0000-00-00 00:00:00".into()),
+            Value::TimestampTz("0000-00-00 00:00:00".into()),
+        ],
+        "[{label}] the legal zero sentinels round-trip verbatim — the fix must not over-reject them"
+    );
+    let r = backend
+        .query(
+            &mut conn,
+            "SELECT da, tm FROM ferro_s7_coerce WHERE id = 701",
+            &[],
+        )
+        .await
+        .expect("read the zero-in-date row");
+    assert_eq!(r.rows[0][0], Value::Date("2026-00-05".into()));
+    assert_eq!(r.rows[0][1], Value::Time("26:00:00".into()));
+    let r = backend
+        .query(
+            &mut conn,
+            "SELECT tm FROM ferro_s7_coerce WHERE id = 702",
+            &[],
+        )
+        .await
+        .expect("read the 24:00:00 row");
+    assert_eq!(r.rows[0][0], Value::Time("24:00:00".into()));
+    println!(
+        "  [{label}] the legal sentinels + 24:00:00/26:00:00 TIME still bind under sql_mode=''"
+    );
 
     conn.mysql.disconnect().await.ok();
 }
@@ -1326,6 +1571,11 @@ both_engines!(
     bind_round_trip_is_byte_identical,
     mysql_bind_round_trip_is_byte_identical,
     mariadb_bind_round_trip_is_byte_identical
+);
+both_engines!(
+    non_canonical_payloads_are_rejected_pre_send_under_permissive_sql_mode,
+    mysql_non_canonical_payloads_are_rejected_pre_send_under_permissive_sql_mode,
+    mariadb_non_canonical_payloads_are_rejected_pre_send_under_permissive_sql_mode
 );
 
 /// MariaDB-only (the types do not exist on MySQL 8).

@@ -2,16 +2,13 @@
 //!
 //! Unlike Postgres (whose prepared statement carries a server-inferred type per `$n`, so PG's
 //! `bind` can pre-flight each param's `ToSql::accepts`), a MySQL `COM_STMT_PREPARE` exposes NO
-//! inferred parameter types — every `?` is reported as an opaque placeholder. So the ONLY client-side
-//! bind validation possible here is the parameter COUNT. A mismatch is a KNOWN-FATE
-//! [`PoolError::Unsupported`] (the statement provably never executed) — deliberately NOT
-//! `PoolError::ConnectionLost`, whose fate is unknown and would let the SQL service mint a false
-//! `WriteUnconfirmed{Indeterminate}` for a write that never happened (§19.3, the same no-false-
-//! Indeterminate safety PG's `bind`/`query` pre-validation enforces).
-//!
-//! The canonical scalar → `mysql_common::Value` conversion itself is TOTAL — every `Value` variant
-//! has an exact MySQL representation — so it never fails; there is no lossy or fallible arm that
-//! could produce a fate-unknown error.
+//! inferred parameter types — every `?` is reported as an opaque placeholder. So the client-side
+//! bind validation possible here is the parameter COUNT ([`validate_arity`]) plus the CANONICAL
+//! SHAPE of each payload ([`to_params`]). Both are KNOWN-FATE [`bind_error`]s (`Sql{Unsupported}`,
+//! branch `NonRetryable`) raised BEFORE anything is sent, so the statement provably never executed
+//! — deliberately NOT `PoolError::ConnectionLost`, whose fate is unknown and would let the SQL
+//! service mint a false `WriteUnconfirmed{Indeterminate}` for a write that never happened (§19.3,
+//! the same no-false-Indeterminate safety PG's `bind`/`query` pre-validation enforces).
 //!
 //! ## M1-S7: the temporal tags bind as TYPED params, never as text (hazard 41)
 //!
@@ -31,9 +28,24 @@
 //! write silently shifts by the session offset — the exact mirror of the read-side coupling
 //! documented in [`crate::mytext::timestamptz_to_text`].
 //!
-//! The parse helpers stay **infallible**: canonical text the engine itself produced always parses,
-//! and anything else falls back to a byte-string param (so the server produces its own clean error)
-//! rather than introducing a `Result` cascade this module has no pre-flight to report through.
+//! ## A non-canonical payload is REJECTED here, never passed through (Task 8b fix round 1)
+//!
+//! Canonical text the engine itself produced always parses. Anything else — a PG-origin
+//! `date 'infinity'` bound at a MySQL pool, an over-range `TIME`, a PG `NUMERIC` `NaN` — has NO
+//! MySQL representation, and the parse helpers below return `None` for it. That becomes a
+//! [`bind_error`] at [`to_params`].
+//!
+//! It deliberately does **not** fall back to a byte-string param for the server to reject. That was
+//! the original Task 8b design and it is only safe under `STRICT_TRANS_TABLES`. Measured on both
+//! engines under `SET SESSION sql_mode = ''` — the mode a legacy stack routinely runs in, since
+//! Doctrine sets no `sql_mode` — the server does not error, it **silently coerces**:
+//! `Date("infinity")` → `0000-00-00`, `Time("839:00:00")` → `838:59:59`, `Decimal("NaN")` → `0.0000`.
+//! That is the silent miscast charter rule 6 forbids, so the decision cannot be left to a server
+//! session variable: the engine refuses the payload itself, pre-send, with a known fate.
+//!
+//! A legal MySQL SENTINEL is not a non-canonical payload: `"0000-00-00"`, `"0000-00-00 00:00:00"`
+//! and a zero-in-date such as `"2026-00-05"` are values a permissive `sql_mode` legitimately
+//! accepts, and they bind verbatim as the all-zero components (`PROTOCOL.md` §3.2).
 
 use ferro_pool::error::PoolError;
 use ferro_proto::consts::errc;
@@ -57,59 +69,70 @@ pub fn validate_arity(params: &[Value], num_params: usize) -> Result<(), PoolErr
 }
 
 /// Convert canonical params into `mysql_async::Params`. Positional (MySQL's native `?` binding);
-/// an empty slice is `Params::Empty`. The conversion is total (never fails) — see the module docs.
-pub fn to_params(params: &[Value]) -> Params {
+/// an empty slice is `Params::Empty`.
+///
+/// This is the **per-param canonical pre-flight**, the companion to [`validate_arity`]: a payload
+/// with no MySQL representation is a KNOWN-FATE [`bind_error`] raised before anything is sent (see
+/// the module docs — passing it through for the server to reject is a SILENT COERCION under a
+/// permissive `sql_mode`). Both pre-checks run back to back at the one call site,
+/// `query::run`.
+pub fn to_params(params: &[Value]) -> Result<Params, PoolError> {
     if params.is_empty() {
-        return Params::Empty;
+        return Ok(Params::Empty);
     }
-    Params::Positional(params.iter().map(value_to_my).collect())
+    let mut out = Vec::with_capacity(params.len());
+    for (idx, v) in params.iter().enumerate() {
+        out.push(value_to_my(v, idx)?);
+    }
+    Ok(Params::Positional(out))
 }
 
 /// The canonical → driver `Value` mapping. `Bool` binds as the MySQL boolean idiom (`0`/`1` integer);
 /// `Text` and `Bytes` both bind as `Bytes` (MySQL has one byte-string param form — the target
 /// column's type decides the interpretation server-side).
-fn value_to_my(v: &Value) -> MyValue {
-    match v {
+///
+/// `idx` is the zero-based param position, carried only so a rejection can name the offending `?`.
+fn value_to_my(v: &Value, idx: usize) -> Result<MyValue, PoolError> {
+    Ok(match v {
         Value::Null => MyValue::NULL,
         Value::Bool(b) => MyValue::Int(*b as i64),
         Value::I64(n) => MyValue::Int(*n),
         Value::F64(f) => MyValue::Double(*f),
         Value::Text(s) => MyValue::Bytes(s.clone().into_bytes()),
         Value::Bytes(b) => MyValue::Bytes(b.clone()),
-        // ---- M1-S7 canonical tags. The mapping stays TOTAL (the module invariant above): every
-        // variant has a driver representation, so no arm can fail and mint a fate-unknown error.
+        // ---- M1-S7 canonical tags. Every arm below either has an exact MySQL representation or
+        // is REFUSED here — never coerced, never passed through (module docs, fix round 1).
         Value::U64(n) => MyValue::UInt(*n),
-        // DECIMAL/UUID/JSON: the canonical text IS what the server wants as a string param.
-        Value::Decimal(s) | Value::Uuid(s) | Value::Json(s) => {
-            MyValue::Bytes(s.clone().into_bytes())
-        }
+        // UUID/JSON: the canonical text IS what the server wants as a string param.
+        Value::Uuid(s) | Value::Json(s) => MyValue::Bytes(s.clone().into_bytes()),
+        // DECIMAL likewise — but PG's `NaN`/`Infinity`/`-Infinity` are legal canonical payloads with
+        // no MySQL representation, and a permissive `sql_mode` stores them as `0`.
+        Value::Decimal(s) if is_decimal_text(s) => MyValue::Bytes(s.clone().into_bytes()),
+        Value::Decimal(s) => return Err(reject(idx, "DECIMAL", s)),
         // DATE / TIME / TIMESTAMP / TIMESTAMPTZ: TYPED params built from the canonical text (see
         // the module docs, hazard 41). Never a `Z`-suffixed literal — both servers reject it.
-        Value::Date(s) => parse_date(s),
-        Value::Time(s) => parse_time(s),
-        Value::Timestamp(s) => parse_datetime(s),
+        Value::Date(s) => parse_date(s).ok_or_else(|| reject(idx, "DATE", s))?,
+        Value::Time(s) => parse_time(s).ok_or_else(|| reject(idx, "TIME", s))?,
+        Value::Timestamp(s) => parse_datetime(s).ok_or_else(|| reject(idx, "TIMESTAMP", s))?,
         // Correct ONLY under the `time_zone = '+00:00'` session pin — the components are bound
         // bare and the server reads them in the session zone. The two are COUPLED (module docs).
-        Value::TimestampTz(s) => parse_rfc3339_utc(s),
-    }
+        Value::TimestampTz(s) => {
+            parse_rfc3339_utc(s).ok_or_else(|| reject(idx, "TIMESTAMPTZ", s))?
+        }
+    })
 }
 
 /// Canonical `DATE` text (`"YYYY-MM-DD"`, incl. the `"0000-00-00"` zero sentinel) → a typed
-/// date-only param. See [`fallback`] for the non-canonical branch.
-fn parse_date(s: &str) -> MyValue {
-    match split_date(s) {
-        Some((y, mo, d)) => MyValue::Date(y, mo, d, 0, 0, 0, 0),
-        None => fallback(s),
-    }
+/// date-only param. `None` is the non-canonical branch — see [`reject`].
+fn parse_date(s: &str) -> Option<MyValue> {
+    let (y, mo, d) = split_date(s)?;
+    Some(MyValue::Date(y, mo, d, 0, 0, 0, 0))
 }
 
 /// Canonical **naive** `TIMESTAMP` text (`"YYYY-MM-DD HH:MM:SS[.ffffff]"`, incl. the
 /// `"0000-00-00 00:00:00"` zero sentinel) → a typed `MYSQL_TYPE_DATETIME` param.
-fn parse_datetime(s: &str) -> MyValue {
-    match split_naive_datetime(s) {
-        Some(v) => v,
-        None => fallback(s),
-    }
+fn parse_datetime(s: &str) -> Option<MyValue> {
+    split_naive_datetime(s)
 }
 
 /// Canonical `TIMESTAMPTZ` text (`"YYYY-MM-DDTHH:MM:SS[.ffffff]Z"`) → a typed
@@ -119,43 +142,55 @@ fn parse_datetime(s: &str) -> MyValue {
 /// canonical `TIMESTAMPTZ` payload that is NOT RFC3339 — `mytext` renders it as the verbatim
 /// `"0000-00-00 00:00:00"`, deliberately with neither `T` nor `Z` because it is not an instant — so
 /// it is matched exactly, not by loosening the RFC3339 shape.
-fn parse_rfc3339_utc(s: &str) -> MyValue {
+fn parse_rfc3339_utc(s: &str) -> Option<MyValue> {
     if s == ZERO_DATETIME {
-        return MyValue::Date(0, 0, 0, 0, 0, 0, 0);
+        return Some(MyValue::Date(0, 0, 0, 0, 0, 0, 0));
     }
-    let Some(body) = s.strip_suffix('Z') else {
-        return fallback(s);
-    };
+    let body = s.strip_suffix('Z')?;
     // The RFC3339 `T` separator, and ONLY it: a space here would mean a naive payload arrived on
     // the instant tag.
     if body.as_bytes().get(10) != Some(&b'T') {
-        return fallback(s);
+        return None;
     }
-    match split_date_and_time(body, b'T') {
-        Some(v) => v,
-        None => fallback(s),
-    }
+    split_date_and_time(body, b'T')
 }
 
 /// Canonical `TIME` text (`"[-]HH:MM:SS[.ffffff]"`, hours up to 838) → a typed `MYSQL_TYPE_TIME`
 /// param. The driver's component form carries the day overflow in its own field, so the hour count
 /// is split back out: `"26:00:00"` → `Time(false, 1, 2, 0, 0, 0)`, mirroring
 /// [`crate::mytext::time_to_text`], which folds it the other way.
-fn parse_time(s: &str) -> MyValue {
-    match split_time(s) {
-        Some(v) => v,
-        None => fallback(s),
-    }
+fn parse_time(s: &str) -> Option<MyValue> {
+    split_time(s)
 }
 
-/// The impossible branch, made total. A canonical string the engine produced always parses, so this
-/// is reached only by a payload no renderer emits — a PG-origin `infinity` bound at a MySQL pool,
-/// or malformed client text. Passing the bytes through keeps `value_to_my` infallible (the module's
-/// TOTAL invariant: there is no MySQL bind pre-flight to report a `Result` through) and lets the
-/// SERVER produce its own clean, known-fate error instead of the engine fabricating a component
-/// tuple — which would be the silent miscast charter rule 6 forbids.
-fn fallback(s: &str) -> MyValue {
-    MyValue::Bytes(s.as_bytes().to_vec())
+/// A canonical `DECIMAL` payload MySQL can actually store: `[+-]digits[.digits]`, the exact grammar
+/// [`crate::mytext::decimal_to_text`] validates on the way OUT, so the two directions agree by
+/// construction. It deliberately EXCLUDES PG `NUMERIC`'s `NaN` / `Infinity` / `-Infinity`, which are
+/// legal canonical payloads (`PROTOCOL.md` §3.2) that MySQL has no representation for — and which a
+/// permissive `sql_mode` stores as `0` rather than rejecting.
+fn is_decimal_text(s: &str) -> bool {
+    let body = s.strip_prefix(['-', '+']).unwrap_or(s);
+    let (int, frac) = match body.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (body, None),
+    };
+    let digits_ok = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    digits_ok(int) && frac.is_none_or(digits_ok)
+}
+
+/// The non-canonical branch: a payload with NO MySQL representation → a KNOWN-FATE, PRE-SEND
+/// rejection. Reached only by text no canonical renderer emits — a PG-origin `infinity` /
+/// `NaN` bound at a MySQL pool, an over-range `TIME`, or malformed client text.
+///
+/// It is deliberately NOT passed through as a byte string for the server to reject: under a
+/// permissive `sql_mode` the server silently COERCES it instead of erroring (module docs), so the
+/// engine would be shipping a corrupt write. Refusing here also cannot fabricate a component tuple,
+/// the other half of the charter rule 6 miscast ban.
+fn reject(idx: usize, kind: &str, text: &str) -> PoolError {
+    bind_error(format!(
+        "parameter {idx}: {text:?} has no MySQL/MariaDB {kind} representation — refused before \
+         sending (binding it as text would be silently coerced under a permissive sql_mode)"
+    ))
 }
 
 /// `YYYY-MM-DD` → `(year, month, day)`. Strict: exactly ten bytes, ASCII digits only (so a
@@ -309,10 +344,15 @@ mod tests {
         }
     }
 
+    /// `to_params`, unwrapped — every case below is a CANONICAL param set, which must always bind.
+    fn bound(params: &[Value]) -> Params {
+        to_params(params).unwrap_or_else(|e| panic!("canonical params must bind, got {e:?}"))
+    }
+
     #[test]
     fn to_params_maps_every_scalar_positionally() {
         // Empty → Params::Empty (MySQL's no-param form).
-        assert!(matches!(to_params(&[]), Params::Empty));
+        assert!(matches!(bound(&[]), Params::Empty));
 
         let params = [
             Value::Null,
@@ -322,7 +362,7 @@ mod tests {
             Value::Text("hi".to_string()),
             Value::Bytes(vec![0xde, 0xad]),
         ];
-        match to_params(&params) {
+        match bound(&params) {
             Params::Positional(vs) => {
                 assert_eq!(vs.len(), 6, "one driver Value per canonical param");
                 assert!(matches!(vs[0], MyValue::NULL));
@@ -342,12 +382,12 @@ mod tests {
         }
     }
 
-    /// The module's documented invariant, restated for M1-S7: `value_to_my` is TOTAL over every
-    /// canonical `Value` variant — no panic, no fallible arm, and only `Value::Null` produces a
-    /// driver `NULL`. (MySQL has no `accepts`-style pre-flight — see the module docs — so totality
-    /// is what keeps a bind from ever becoming a fate-unknown error.)
+    /// `value_to_my` binds every canonical `Value` variant — no panic, no rejection of a legitimate
+    /// payload, and only `Value::Null` produces a driver `NULL`. (MySQL has no `accepts`-style
+    /// server-side pre-flight — see the module docs — so this canonical-shape check IS the bind
+    /// pre-flight, and it must accept everything a canonical renderer can emit for MySQL.)
     #[test]
-    fn value_to_my_is_total_over_every_canonical_variant() {
+    fn value_to_my_binds_every_canonical_variant() {
         let all = [
             Value::Null,
             Value::Bool(true),
@@ -366,7 +406,7 @@ mod tests {
         ];
         assert_eq!(all.len(), 14, "one instance of every canonical tag");
 
-        match to_params(&all) {
+        match bound(&all) {
             Params::Positional(vs) => {
                 assert_eq!(vs.len(), 14);
                 for (i, (v, my)) in all.iter().zip(vs.iter()).enumerate() {
@@ -416,7 +456,7 @@ mod tests {
             Value::Timestamp("2026-08-05 13:45:07".into()),
             Value::TimestampTz("2026-08-05T13:45:07Z".into()),
         ] {
-            let my = value_to_my(&v);
+            let my = value_to_my(&v, 0).expect("a canonical temporal payload must bind");
             assert!(
                 matches!(my, MyValue::Date(..) | MyValue::Time(..)),
                 "{v:?} must bind as a TYPED temporal param, got {my:?} — a text literal is \
@@ -432,14 +472,26 @@ mod tests {
     fn time_and_datetime_helpers_survive_the_edges() {
         assert_eq!(
             parse_time("-838:59:58.000001"),
-            MyValue::Time(true, 34, 22, 59, 58, 1)
+            Some(MyValue::Time(true, 34, 22, 59, 58, 1))
         );
-        assert_eq!(parse_time("26:00:00"), MyValue::Time(false, 1, 2, 0, 0, 0));
+        assert_eq!(
+            parse_time("26:00:00"),
+            Some(MyValue::Time(false, 1, 2, 0, 0, 0))
+        );
+        // `24:00:00` is the top of a day as a DURATION — legal, and never confused with the
+        // wall-clock hour bound the naive-datetime parser enforces.
+        assert_eq!(
+            parse_time("24:00:00"),
+            Some(MyValue::Time(false, 1, 0, 0, 0, 0))
+        );
         assert_eq!(
             parse_rfc3339_utc("2026-08-05T11:45:07.250000Z"),
-            MyValue::Date(2026, 8, 5, 11, 45, 7, 250_000)
+            Some(MyValue::Date(2026, 8, 5, 11, 45, 7, 250_000))
         );
-        assert_eq!(parse_date("0000-00-00"), MyValue::Date(0, 0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            parse_date("0000-00-00"),
+            Some(MyValue::Date(0, 0, 0, 0, 0, 0, 0))
+        );
     }
 
     /// Whole-second and fractional forms both parse — the canonical text omits the fraction group
@@ -449,33 +501,39 @@ mod tests {
     fn the_fraction_group_is_optional_on_every_temporal_helper() {
         assert_eq!(
             parse_datetime("2026-08-05 11:45:07"),
-            MyValue::Date(2026, 8, 5, 11, 45, 7, 0)
+            Some(MyValue::Date(2026, 8, 5, 11, 45, 7, 0))
         );
         assert_eq!(
             parse_datetime("2026-08-05 11:45:07.000001"),
-            MyValue::Date(2026, 8, 5, 11, 45, 7, 1)
+            Some(MyValue::Date(2026, 8, 5, 11, 45, 7, 1))
         );
         assert_eq!(
             parse_rfc3339_utc("2026-08-05T11:45:07Z"),
-            MyValue::Date(2026, 8, 5, 11, 45, 7, 0)
+            Some(MyValue::Date(2026, 8, 5, 11, 45, 7, 0))
         );
-        assert_eq!(parse_time("00:00:00"), MyValue::Time(false, 0, 0, 0, 0, 0));
+        assert_eq!(
+            parse_time("00:00:00"),
+            Some(MyValue::Time(false, 0, 0, 0, 0, 0))
+        );
         assert_eq!(
             parse_time("00:00:00.900000"),
-            MyValue::Time(false, 0, 0, 0, 0, 900_000)
+            Some(MyValue::Time(false, 0, 0, 0, 0, 900_000))
         );
         // The full documented TIME range, both signs.
         assert_eq!(
             parse_time("838:59:59.999999"),
-            MyValue::Time(false, 34, 22, 59, 59, 999_999)
+            Some(MyValue::Time(false, 34, 22, 59, 59, 999_999))
         );
         assert_eq!(
             parse_time("-838:59:59"),
-            MyValue::Time(true, 34, 22, 59, 59, 0)
+            Some(MyValue::Time(true, 34, 22, 59, 59, 0))
         );
         // `-00:00:00` and `00:00:00` are ONE value: the sign is dropped at zero magnitude, exactly
         // as `mytext::time_to_text` renders it.
-        assert_eq!(parse_time("-00:00:00"), MyValue::Time(false, 0, 0, 0, 0, 0));
+        assert_eq!(
+            parse_time("-00:00:00"),
+            Some(MyValue::Time(false, 0, 0, 0, 0, 0))
+        );
     }
 
     /// The zero sentinels (`PROTOCOL.md` §3.2) bind as the all-zero driver components, which
@@ -483,7 +541,7 @@ mod tests {
     /// are deliberately NOT parsed as a calendar value on the way in either.
     #[test]
     fn zero_sentinels_bind_as_the_all_zero_components() {
-        let zero = MyValue::Date(0, 0, 0, 0, 0, 0, 0);
+        let zero = Some(MyValue::Date(0, 0, 0, 0, 0, 0, 0));
         assert_eq!(parse_date("0000-00-00"), zero);
         assert_eq!(parse_datetime("0000-00-00 00:00:00"), zero);
         // A zero `TIMESTAMP` renders WITHOUT the `T`/`Z` (it is not an instant), so the
@@ -492,20 +550,33 @@ mod tests {
         // A zero-in-date is legal without NO_ZERO_IN_DATE and carries through component-wise.
         assert_eq!(
             parse_date("2026-00-05"),
-            MyValue::Date(2026, 0, 5, 0, 0, 0, 0)
+            Some(MyValue::Date(2026, 0, 5, 0, 0, 0, 0))
         );
+        // A legal SENTINEL is NOT a non-canonical payload: the fix must never reject one, at any
+        // level — these are exactly the values a permissive `sql_mode` exists to allow.
+        for v in [
+            Value::Date("0000-00-00".into()),
+            Value::Timestamp("0000-00-00 00:00:00".into()),
+            Value::TimestampTz("0000-00-00 00:00:00".into()),
+            Value::Date("2026-00-05".into()),
+        ] {
+            assert!(
+                to_params(std::slice::from_ref(&v)).is_ok(),
+                "{v:?} is a LEGAL MySQL sentinel and must still bind"
+            );
+        }
     }
 
-    /// **The impossible branch is provably total.** Every helper falls back to a byte-string param
-    /// rather than panicking or introducing a `Result` this module has no pre-flight to report
-    /// through (`value_to_my` is TOTAL by the documented module invariant). The inputs below are
-    /// the ones a canonical renderer never emits — a PG-origin `infinity` bound at a MySQL pool,
-    /// and outright malformed text — and each stays a driver value the server can reject cleanly.
+    /// **The non-canonical branch is a PRE-SEND REJECTION, never a passthrough and never a panic
+    /// (fix round 1).** The inputs below are the ones a canonical renderer never emits for MySQL —
+    /// a PG-origin `infinity` bound at a MySQL pool, an over-range `TIME`, outright malformed text
+    /// — and each must produce `None` here rather than a byte-string param the server would
+    /// *silently coerce* under `sql_mode = ''` (module docs), or a fabricated component tuple.
     #[test]
-    fn non_canonical_text_falls_back_to_a_byte_string_never_a_panic() {
+    fn non_canonical_text_is_refused_by_every_helper() {
         /// One canonical-text parse helper, so the case table below can name which one each input
         /// is aimed at.
-        type Parser = fn(&str) -> MyValue;
+        type Parser = fn(&str) -> Option<MyValue>;
 
         let cases: &[(&str, Parser)] = &[
             // PG sentinels: legal DATE/TIMESTAMP payloads that MySQL has no representation for.
@@ -540,12 +611,83 @@ mod tests {
             ("-839:00:00", parse_time),
         ];
         for (text, f) in cases {
-            let my = f(text);
             assert_eq!(
-                my,
-                MyValue::Bytes(text.as_bytes().to_vec()),
-                "{text:?} is not canonical: it must fall back to a byte-string param, not a \
-                 fabricated component tuple"
+                f(text),
+                None,
+                "{text:?} is not canonical: it must be REFUSED, not bound as a byte string (which \
+                 a permissive sql_mode silently coerces) and not as a fabricated component tuple"
+            );
+        }
+    }
+
+    /// **The rejection reaches the caller as a KNOWN-FATE, PRE-SEND `Sql{Unsupported}`** — the same
+    /// shape `validate_arity` produces, and deliberately never `ConnectionLost`, which would let the
+    /// SQL service mint a false §19.3 `Indeterminate` for a write that never left the engine.
+    ///
+    /// The `Decimal` cases are the ones no temporal helper covers: PG `NUMERIC`'s `NaN` /
+    /// `Infinity` / `-Infinity` are LEGAL canonical payloads (`PROTOCOL.md` §3.2) with no MySQL
+    /// representation, which a permissive `sql_mode` stores as `0`.
+    #[test]
+    fn a_non_canonical_param_is_a_known_fate_pre_send_bind_error() {
+        for v in [
+            Value::Date("infinity".into()),
+            Value::Date("-infinity".into()),
+            Value::Timestamp("infinity".into()),
+            Value::TimestampTz("-infinity".into()),
+            Value::Time("839:00:00".into()),
+            Value::Time("-839:00:00".into()),
+            Value::Decimal("NaN".into()),
+            Value::Decimal("Infinity".into()),
+            Value::Decimal("-Infinity".into()),
+            Value::Decimal("1e5".into()),
+            Value::Decimal("".into()),
+        ] {
+            // Bound at position 1 so the message's param index is actually exercised.
+            match to_params(&[Value::I64(1), v.clone()]) {
+                Err(PoolError::Sql {
+                    code,
+                    branch: b,
+                    sqlstate,
+                    message,
+                }) => {
+                    assert_eq!(code, errc::UNSUPPORTED, "{v:?}");
+                    assert_eq!(b, errc::UNSUPPORTED_BRANCH, "{v:?} must be NonRetryable");
+                    assert_eq!(
+                        sqlstate, None,
+                        "{v:?}: the server never saw the statement, so there is no SQLSTATE"
+                    );
+                    assert!(
+                        message.starts_with("parameter 1:"),
+                        "{v:?}: the message must name the offending placeholder, got {message:?}"
+                    );
+                }
+                Err(PoolError::ConnectionLost) => panic!(
+                    "REGRESSION: {v:?} must NEVER be ConnectionLost — a pre-send bind rejection \
+                     has a KNOWN fate (§19.3)"
+                ),
+                other => panic!("{v:?}: expected Sql{{Unsupported}}, got {other:?}"),
+            }
+        }
+
+        // The finite DECIMAL grammar — including the display scale and an explicit sign — is
+        // untouched by the check (the over-rejection guard for `is_decimal_text`).
+        for text in [
+            "0",
+            "1.10",
+            "-12345.6700000000",
+            "+1.5",
+            "18446744073709551615",
+            "0.0000000001",
+        ] {
+            assert!(
+                is_decimal_text(text),
+                "{text:?} is a canonical DECIMAL and must still bind"
+            );
+        }
+        for text in ["NaN", "Infinity", "-Infinity", "1e5", "1.", ".5", "-", ""] {
+            assert!(
+                !is_decimal_text(text),
+                "{text:?} has no MySQL DECIMAL representation"
             );
         }
     }

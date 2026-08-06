@@ -7,10 +7,12 @@
 //! 2. Build `Vec<ColMeta>` from the prepared statement's columns via [`rowmap::column_to_tag`] — a
 //!    loud `Unsupported` for any out-of-scope column type, raised BEFORE the query runs (the
 //!    connection stays clean and usable), exactly like PG's cols-build.
-//! 3. **Arity pre-check** ([`bind::validate_arity`]): `params.len()` vs the statement's
-//!    `num_params()`. A mismatch is a KNOWN-FATE `Sql{Unsupported}`, NEVER `ConnectionLost` — the
-//!    statement provably never ran, so it can never mint a false §19.3 `Indeterminate` (MySQL
-//!    prepares expose NO inferred param types, so arity is the only client-side check possible).
+//! 3. **Bind pre-flight**, both halves BEFORE anything is sent: the arity check
+//!    ([`bind::validate_arity`], `params.len()` vs the statement's `num_params()`) and the per-param
+//!    canonical-shape check ([`bind::to_params`]). Either failure is a KNOWN-FATE
+//!    `Sql{Unsupported}`, NEVER `ConnectionLost` — the statement provably never ran, so it can never
+//!    mint a false §19.3 `Indeterminate`. (MySQL prepares expose NO inferred param types, so unlike
+//!    PG there is no server-side type to check the payload against — the canonical grammar is.)
 //! 4. Bind + `exec_iter`, fully draining the single result set (BUFFERED — constant-memory streaming
 //!    is S7). Each cell maps through [`rowmap::extract_value`]. `affected` and `last_insert_id` come
 //!    off the OK packet (via the driver's per-conn cache).
@@ -59,9 +61,12 @@ pub async fn run(
         });
     }
 
-    // (3) arity pre-check — a mismatch is KNOWN-FATE (never ConnectionLost), raised before sending.
+    // (3) bind PRE-FLIGHT, both halves raised before anything is sent, both KNOWN-FATE (never
+    // ConnectionLost): the arity check, then the per-param canonical-shape check. A payload MySQL
+    // cannot represent (a PG `infinity`/`NaN`, an over-range TIME) is refused HERE — passing it
+    // through for the server to reject is a silent coercion under a permissive `sql_mode`.
     bind::validate_arity(params, stmt.num_params() as usize)?;
-    let bound = bind::to_params(params);
+    let bound = bind::to_params(params)?;
 
     // (4) bind + buffered exec. `drain` confines the driver's `&mut Conn` borrow entirely to itself
     // and returns OWNED rows + affected + last_insert_id, so `conn` is free again afterward.
