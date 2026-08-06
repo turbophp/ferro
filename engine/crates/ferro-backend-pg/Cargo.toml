@@ -20,3 +20,13 @@ tracing = "0.1"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "time"] }
 ferro-pool = { path = "../ferro-pool" }
+# M1-S7 Task 4b: `pg_types_it.rs`'s NUMERIC oracle drives a RAW (non-pooled) client so it can run
+# `COPY ... (FORMAT binary)` and hand PG a crafted `numeric` wire payload — using PG's OWN renderer
+# as the oracle for wire shapes PG never emits (notably `dscale` truncation), which is the one half
+# of `pgtext`'s correctness that unit tests alone can only self-referentially confirm.
+# All three are already in the tree at these exact versions (tokio-postgres and futures-util are
+# this crate's own dependencies; bytes 1.12.1 arrives transitively via tokio), so this adds ZERO
+# new crates to the dependency graph.
+tokio-postgres = "0.7"
+futures-util = "0.3"
+bytes = "1"

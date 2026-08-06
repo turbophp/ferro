@@ -2,6 +2,10 @@
 //! Postgres. Every test SKIPS (does not fail) when `FERRO_TEST_PG_URL` is unset — mirrors
 //! `pg_pool_it.rs` so `cargo test --workspace` stays green offline.
 //!
+//! **Type-coverage contract:** this file covers the M0 scalar set plus the pre-flight refusal of a
+//! type outside the supported set. The M1-S7 canonical tags (`DECIMAL`/`DATE`/`TIME`/`TIMESTAMP`/
+//! `TIMESTAMPTZ`/`UUID`/`JSON`) have their own live round-trip suite in `pg_types_it.rs`.
+//!
 //! ```text
 //! docker compose -f testkit/docker-compose.yml up -d
 //! FERRO_TEST_PG_URL=postgres://ferro:ferro@localhost:55432/ferro cargo test -p ferro-backend-pg
@@ -158,10 +162,15 @@ async fn query_syntax_error_classifies_and_conn_survives() {
     assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
 }
 
-/// An out-of-M0 column type (`now()` → timestamptz) is a loud `Unsupported`, raised before the
-/// query runs, and the connection stays clean.
+/// A still-deferred column type (`interval`) is a loud `Unsupported`, raised before the query runs,
+/// and the connection stays clean.
+///
+/// Was `query_out_of_m0_column_is_unsupported` / `SELECT now()` until M1-S7 implemented
+/// `timestamptz` — the assertion is REPOINTED at a genuinely-deferred type, not deleted, because
+/// the property under test (a column type outside the supported set is a pre-flight `Unsupported`,
+/// never a silent miscast) is unchanged; only its witness moved.
 #[tokio::test(flavor = "multi_thread")]
-async fn query_out_of_m0_column_is_unsupported() {
+async fn query_deferred_column_type_is_unsupported() {
     let Some(url) = test_url() else {
         return;
     };
@@ -169,13 +178,21 @@ async fn query_out_of_m0_column_is_unsupported() {
     let mut co = pool.checkout().await.expect("checkout");
 
     let err = co
-        .query("SELECT now()", &[])
+        .query("SELECT '1 day'::interval", &[])
         .await
-        .expect_err("timestamptz is out of the M0 scalar set");
+        .expect_err("interval is deferred past M1-S7");
     assert!(
         matches!(err, PoolError::Unsupported(_)),
-        "an out-of-M0 column type must be Unsupported, got {err:?}"
+        "a deferred column type must be Unsupported, got {err:?}"
     );
+
+    // `timestamptz` — this test's PREVIOUS witness — is now genuinely supported, so the repointing
+    // above is a real coverage move rather than a silently-weakened assertion.
+    let now = co
+        .query("SELECT now()", &[])
+        .await
+        .expect("timestamptz is supported as of M1-S7");
+    assert_eq!(now.cols[0].tag, tag::TIMESTAMPTZ);
 
     // Conn stays clean/usable (we errored during cols-build, before running the query).
     let ok = co.query("SELECT 1", &[]).await.expect("conn still usable");

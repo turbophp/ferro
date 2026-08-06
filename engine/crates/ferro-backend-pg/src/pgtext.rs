@@ -38,6 +38,42 @@
 //! query. Neither half is sufficient alone.
 
 use ferro_pool::error::PoolError;
+use tokio_postgres::types::{FromSql, Type};
+
+/// A raw-payload passthrough `FromSql`: hands back the column's binary bytes untouched, so the
+/// decoders above can render them (result format is BINARY and is not per-statement selectable —
+/// see the module docs).
+///
+/// **DANGER (hazard 16) — this type is deliberately contained.** Its `accepts` is universally
+/// `true`, which **DEFEATS tokio-postgres' own type check**: `try_get::<RawBytes>` will happily
+/// hand back the bytes of *any* column, including a type Ferro does not support and cannot
+/// render. `rowmap::oid_extract_type` is the SOLE type authority; this newtype must never widen
+/// it. Two structural containments keep that true, both locked by
+/// `rowmap`'s `raw_getter_is_only_named_behind_the_oid_gate` test:
+///
+/// 1. it is `pub(crate)`, so it cannot escape this crate at all; and
+/// 2. inside the crate it is named ONLY here and inside `rowmap::extract_value`, where every call
+///    site sits in a match arm `oid_extract_type` has already selected.
+///
+/// Reaching the raw getter without first passing the OID gate would decode an unsupported type as
+/// garbage instead of raising the loud `Unsupported` this module exists to guarantee (charter
+/// rule 6, "no silent miscasts").
+pub(crate) struct RawBytes<'a>(pub &'a [u8]);
+
+impl<'a> FromSql<'a> for RawBytes<'a> {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(RawBytes(raw))
+    }
+
+    /// Universally true BY DESIGN — see the type docs. The OID gate, not this predicate, decides
+    /// what may be read.
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+}
 
 /// `numeric_send` sign words (PG `src/backend/utils/adt/numeric.c`; ±Inf are PG14+, testkit is
 /// `postgres:17`). Anything else in the sign field is a malformed payload.

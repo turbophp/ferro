@@ -5,8 +5,10 @@
 //! 2. `prepare` it — one round trip that yields the column OIDs (so `cols` is correct even for a
 //!    zero-row result) and lets PG infer the `$n` param types.
 //! 3. Build `Vec<ColMeta>` from the prepared statement's columns via `rowmap::oid_to_tag` — a loud
-//!    `Unsupported` for any out-of-M0 column type, raised BEFORE the query runs (the connection
-//!    stays clean and usable).
+//!    `Unsupported` for any column type outside the supported set, raised BEFORE the query runs
+//!    (the connection stays clean and usable). This is the cols-build half of the two-gate pair —
+//!    `rowmap::extract_value` (step 5) is the mid-stream half, and both read the one
+//!    `oid_extract_type` table so `HEAD` can never promise a tag the producer cannot fill.
 //! 4. **Pre-validate the bind (S5 review fix — §19.3 safety).** BEFORE sending anything, check the
 //!    param arity (`params.len() == stmt.params().len()`) and that each param's `ToSql` impl
 //!    `accepts` the statement's inferred parameter type. A failure here is a client-side BIND error
@@ -61,7 +63,7 @@ pub async fn run(client: &Client, sql: &str, params: &[Value]) -> Result<QueryRe
         .map_err(|e| error_map::map(&e))?;
 
     // Build cols from the prepared statement's columns — correct even for a zero-row result, and
-    // detects an out-of-M0 column type before running the query (Unsupported, conn stays clean).
+    // detects an unsupported column type before running the query (Unsupported, conn stays clean).
     let mut cols = Vec::with_capacity(stmt.columns().len());
     for col in stmt.columns() {
         let tag = rowmap::oid_to_tag(col.type_().oid())?;
@@ -141,7 +143,7 @@ fn bind_error(message: String) -> PoolError {
 /// [`run`] (S5 Task 3, the `fetch:stream` producer path).
 ///
 /// Steps 1-4 are IDENTICAL to [`run`] (see this module's flow docs): `?`→`$n` normalize; `prepare`
-/// for OID-strict `cols` + PG-inferred `$n` param types (an out-of-M0 column type is a loud
+/// for OID-strict `cols` + PG-inferred `$n` param types (an unsupported column type is a loud
 /// `Unsupported` raised BEFORE the query runs, conn stays clean); and the §19.3 bind pre-validation
 /// that keeps a client-side bind fault KNOWN-FATE (`Sql{Unsupported}`) rather than the fate-unknown
 /// `ConnectionLost` a post-send transport failure produces (which would mint a false
@@ -165,7 +167,7 @@ pub async fn stream(
         .map_err(|e| error_map::map(&e))?;
 
     // cols + per-column OIDs, driven off the prepared statement — correct even for a zero-row
-    // result, and an out-of-M0 column type errors here (Unsupported) before the query runs.
+    // result, and an unsupported column type errors here (Unsupported) before the query runs.
     let mut cols = Vec::with_capacity(stmt.columns().len());
     let mut oids = Vec::with_capacity(stmt.columns().len());
     for col in stmt.columns() {
