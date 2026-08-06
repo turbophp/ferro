@@ -24,16 +24,17 @@
 //! applied, MySQL already durably committed it server-side, independent of which physical pooled
 //! connection answers the read-back.
 //!
-//! **Provably in-flight, never a fixed-delay guess (the mandatory false-green guard).** A kill/CANCEL
-//! that lands BEFORE the statement is dispatched proves nothing. Every EXTERNAL chaos event (a
+//! **Provably EXECUTING, never a fixed-delay guess (the mandatory false-green guard).** A kill/CANCEL
+//! that lands BEFORE the statement is executing proves nothing. Every EXTERNAL chaos event (a
 //! `KILL`/`KILL QUERY` from the raw side connection, or a client `CANCEL` frame) is preceded by
 //! [`wait_for_active_conn`] polling `information_schema.processlist` — over a RAW side connection,
-//! entirely outside ferrod's own pool — until the targeted statement is observed `COMMAND = 'Query'`
-//! running a statement whose text contains a run-unique marker. If never observed within the bound,
-//! the test SKIPS loudly (never a silent green on an unproven chaos event). The two engine-timer
-//! cases (an `ExecRequest.timeout_ms` shorter than how long the write is blocked) need no such proof:
-//! the timer provably cannot fire before `timeout_ms` has elapsed, by which point the query is
-//! dispatched and still blocked on the lock.
+//! entirely outside ferrod's own pool — until the targeted statement is observed in an EXECUTING
+//! command state (`COMMAND` `Execute`/`Query`, never `Prepare`) with a statement text containing a
+//! run-unique marker. If never observed within the bound, the test SKIPS with a `skip:`-prefixed
+//! line, which the CI live lane treats as a lane FAILURE — never a silent green on an unproven chaos
+//! event. The two engine-timer cases (an `ExecRequest.timeout_ms` shorter than how long the write is
+//! blocked) need no such proof: the timer provably cannot fire before `timeout_ms` has elapsed, by
+//! which point the query is dispatched and still blocked on the lock.
 //!
 //! **Two MySQL-specific chaos-mechanics facts this suite is built around (verified live while
 //! writing it):**
@@ -64,6 +65,7 @@ use common::{
 };
 use ferro_proto::consts::{branch, errc, flags, method_sql, method_tx, service};
 use ferro_proto::messages::Outcome;
+use ferro_proto::messages::sql::ExecRequest;
 use ferro_proto::messages::tx::{BeginRequest, BeginResponse, TxControl};
 use ferro_proto::value::Value;
 use mysql_async::prelude::Queryable;
@@ -71,6 +73,19 @@ use mysql_async::{Conn, Opts};
 
 const CTR_TABLE: &str = "ferro_s6_ctr";
 const DLK_TABLE: &str = "ferro_s6_dlk";
+
+/// How long [`wait_for_active_conn`] waits for the marked statement to be observed EXECUTING before
+/// giving up. Generous on purpose: the statement it waits for is blocked on a row lock this harness
+/// itself holds, so once dispatched the state PERSISTS — only a genuinely stuck dispatch can burn
+/// this bound, and burning it is now a CI lane FAILURE (the `skip:`-prefixed line), not a silent
+/// green. A slow, contended runner must not be able to trip it.
+const IN_FLIGHT_GUARD_BOUND: Duration = Duration::from_secs(15);
+
+/// Liveness bound for case 6's 1205 terminal — the ONE step gated on a server-side timer (see
+/// [`exec_within`]). 10s is ~5x the worst legitimate server-side latency (a 1s
+/// `innodb_lock_wait_timeout` floor plus InnoDB's ~1s lock-wait monitor tick), so a genuinely wedged
+/// request still fails the test loudly instead of a timing artifact doing it.
+const LOCK_WAIT_TERMINAL_BOUND: Duration = Duration::from_secs(10);
 
 // -------------------------------------------------------------------------------------------------
 // Targets: run each scenario against every configured dialect (MySQL 8 + MariaDB 11) that is set.
@@ -123,28 +138,61 @@ async fn raw_connect(url: &str) -> Conn {
         .expect("chaos harness: raw side connection to MySQL/MariaDB")
 }
 
-/// Poll `information_schema.processlist` (over the RAW side connection) every 15ms, up to a 5s bound,
-/// until a backend is observed `COMMAND = 'Query'` running a statement whose text contains `marker`
-/// — i.e. PROVABLY in flight (here: dispatched and blocked on the raw side's row lock), not merely
-/// dispatched-but-not-yet-running, and certainly not "not yet dispatched at all" (the false-green
-/// race). Returns that backend's thread id. Returns `None` (→ the caller SKIPS loudly, never a silent
-/// green) if the bound elapses — better an inconclusive skip than a chaos event that proves nothing.
+/// Poll `information_schema.processlist` (over the RAW side connection) every 15ms, up to
+/// [`IN_FLIGHT_GUARD_BOUND`], until a backend is observed EXECUTING a statement whose text contains
+/// `marker` — i.e. PROVABLY in flight (here: dispatched and blocked on the raw side's row lock), not
+/// merely dispatched-but-not-yet-running, and certainly not "not yet dispatched at all" (the
+/// false-green race). Returns that backend's thread id. Returns `None` (→ the caller SKIPS with a
+/// `skip:` line, which the CI live lane fails on) if the bound elapses — better an inconclusive,
+/// LOUD skip than a chaos event that proves nothing.
+///
+/// **`COMMAND` is load-bearing, not decoration — this filter IS the C14 flake fix.** `INFO` also
+/// carries the statement text during `COM_STMT_PREPARE`: ferrod's row-returning path is
+/// prepare-THEN-execute (two round trips — `Conn::prep` then `exec_iter`, see
+/// `ferro-backend-mysql`'s `query::run`), so a marker match alone can mean "the server is PREPARING
+/// this statement", which is NOT in flight. Observed live: under parallel load 3 of 240 guard
+/// matches were `COMMAND = 'Prepare', STATE = 'Opening tables'`.
+///
+/// Between the prepare's reply and the execute's request the pooled connection is IDLE, and what a
+/// `KILL QUERY` aimed there does is a RACE in the server's own command loop — observed live BOTH
+/// ways on these engines: fired at an idle connection it left a following `SELECT SLEEP(4)` running
+/// its full 4s (lost), and under load it cut a following `SELECT SLEEP(1)` short (carried over).
+/// Either way a CANCEL fired off a `Prepare` match proves nothing about the write's fate; and in the
+/// LOST case it also wedges the test, because the write then blocks on the raw side's row lock
+/// (released only AFTER the terminal is read) until `innodb_lock_wait_timeout` (50s by default), far
+/// past the harness's 2s per-frame bound, so no terminal ever arrives.
+///
+/// So the guard demands an EXECUTING command state: `Execute` (`COM_STMT_EXECUTE`, the binary
+/// protocol ferrod's `query` path uses) or `Query` (`COM_QUERY`, the text protocol the pin hook
+/// uses) — never `Prepare`. That is also the STABLE state here: once the marked statement is
+/// executing it is blocked on a lock this harness itself holds until after the terminal is read, so
+/// it cannot leave `Execute` on its own. The guard therefore waits for a state that PERSISTS instead
+/// of sampling for one that is transient — which is what makes it deterministic rather than a race.
+///
+/// NOTE (why there is no unit-style regression test pinning this filter): the `Prepare` phase cannot
+/// be held open on demand. A prepare opens its tables under a plain `MDL_SHARED`
+/// (`MYSQL_OPEN_FORCE_SHARED_MDL`), so neither a `LOCK TABLES ... WRITE` holder nor a pending
+/// `ALTER TABLE` exclusive request blocks it (both tried live — the ALTER parks, the prepare sails
+/// past), and the phase itself costs ≤10ms even for a 61-table join. The protections against this
+/// filter being dropped again are therefore this comment and the CI live lane, which FAILS on the
+/// `skip:` line the guard emits when it cannot prove execution.
 ///
 /// The `marker` is bound as a PARAMETER (never inlined into the poll SQL), so the poll's own
 /// processlist row can never self-match; `ID <> CONNECTION_ID()` excludes the poller as belt-and-
 /// braces.
 async fn wait_for_active_conn(raw: &mut Conn, marker: &str) -> Option<u64> {
     let pattern = format!("%{marker}%");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + IN_FLIGHT_GUARD_BOUND;
     loop {
-        // Match on the statement text alone: a conn EXECUTING a prepared statement (the binary
-        // protocol ferrod uses) reports `COMMAND = 'Execute'`, NOT `'Query'`, so we must NOT filter
-        // on COMMAND; an IDLE conn has `INFO = NULL` (never matches `LIKE`), so the marker predicate
-        // is a sufficient "in flight" test on its own. `ID <> CONNECTION_ID()` excludes the poller.
+        // An IDLE conn has `INFO = NULL` (never matches `LIKE`), so the marker predicate excludes
+        // idle threads on its own; the `COMMAND` predicate is what additionally excludes the
+        // PREPARING-but-not-yet-executing phase (see the doc above). `ID <> CONNECTION_ID()`
+        // excludes the poller's own thread.
         let id: Option<u64> = raw
             .exec_first(
                 "SELECT ID FROM information_schema.processlist \
-                 WHERE ID <> CONNECTION_ID() AND INFO LIKE ?",
+                 WHERE ID <> CONNECTION_ID() AND INFO LIKE ? \
+                   AND COMMAND IN ('Execute', 'Query')",
                 (pattern.clone(),),
             )
             .await
@@ -268,6 +316,43 @@ async fn recv_terminal(client: &mut TestClient, rid: u32, svc: u16, method: u16)
     );
     assert_eq!(t.header.service, svc);
     assert_eq!(t.header.method, method);
+    Outcome::decode(&t.payload).expect("decode terminal Outcome")
+}
+
+/// `common::exec` (send + read the one terminal, same shape assertions) but with an EXPLICIT
+/// liveness deadline instead of the harness-wide 2s `RECV_TIMEOUT`.
+///
+/// Needed by exactly one step: case 6's 1205 write. Its terminal is gated on a SERVER-side timer the
+/// harness cannot make faster — `innodb_lock_wait_timeout` has a 1s FLOOR, and InnoDB's lock-wait
+/// monitor only ticks about once a second, so a `= 1` statement legitimately errors 1205 anywhere up
+/// to ~2s after it starts waiting. That is already at the default 2s bound with zero margin, and past
+/// it under parallel-suite load: reproduced live at 16/25 full-suite runs under half-core contention,
+/// every failure the same `client recv: timed out after 2s` on that one step.
+///
+/// This widens ONLY the harness's liveness bound. Every §19.3 assertion on the terminal it returns is
+/// unchanged (still exactly one END, still `SerializationFailure`/`Retryable`, still never
+/// `Indeterminate`), and a genuinely wedged request still FAILS the test — just at `dur`, not at 2s.
+async fn exec_within(
+    client: &mut TestClient,
+    rid: u32,
+    request: &ExecRequest,
+    dur: Duration,
+) -> Outcome {
+    client
+        .send_request(rid, service::SQL, method_sql::EXEC, request.encode())
+        .await;
+    let t = client
+        .recv_or_none(dur)
+        .await
+        .unwrap_or_else(|| panic!("no EXEC terminal for rid {rid} within {dur:?}"));
+    assert_eq!(t.header.request_id, rid, "terminal echoes the request id");
+    assert_eq!(
+        t.header.flags & flags::END,
+        flags::END,
+        "exactly one END frame per request (charter rule 4)"
+    );
+    assert_eq!(t.header.service, service::SQL);
+    assert_eq!(t.header.method, method_sql::EXEC);
     Outcome::decode(&t.payload).expect("decode terminal Outcome")
 }
 
@@ -426,11 +511,14 @@ async fn mysql_cancel_frame_autocommit_write_consistent() {
             .send_request(rid, service::SQL, method_sql::EXEC, w.encode())
             .await;
 
-        // Provably in flight (blocked on the raw side's row lock) before firing CANCEL.
+        // Provably EXECUTING (dispatched AND blocked on the raw side's row lock, never merely
+        // being PREPARED) before firing CANCEL: a KILL QUERY that lands while the pooled conn is
+        // between COM_STMT_PREPARE and COM_STMT_EXECUTE is silently lost (case 0 proves it), which
+        // would make this cancel prove nothing and wedge the request on the row lock.
         let Some(_id) = wait_for_active_conn(&mut raw, &marker).await else {
             eprintln!(
-                "[{label}] SKIP case2: the write was never observed in flight within 5s \
-                 (chaos event would be a false-green race)"
+                "skip: [{label}] case2 -- the write was never observed EXECUTING within 5s \
+                 (the CANCEL would be a false-green race); the CI live lane fails on this line"
             );
             raw_release(&mut raw).await;
             continue;
@@ -513,12 +601,15 @@ async fn mysql_connection_kill_mid_write_is_indeterminate() {
             .send_request(rid, service::SQL, method_sql::EXEC, w.encode())
             .await;
 
-        // Provably in flight (blocked on the raw side's row lock): observe the EXACT pool conn's
-        // thread id running our marked statement before killing the whole connection.
+        // Provably EXECUTING (blocked on the raw side's row lock): observe the EXACT pool conn's
+        // thread id running our marked statement before killing the whole connection. (`KILL <id>`
+        // is phase-INsensitive -- it destroys the connection whatever it is doing -- so this case
+        // does not depend on the COMMAND filter the way case 2's KILL QUERY does; it still uses the
+        // one shared guard so both prove the same thing.)
         let Some(id) = wait_for_active_conn(&mut raw, &marker).await else {
             eprintln!(
-                "[{label}] SKIP case3: the write was never observed in flight within 5s \
-                 (chaos event would be a false-green race)"
+                "skip: [{label}] case3 -- the write was never observed EXECUTING within 5s \
+                 (the KILL would be a false-green race); the CI live lane fails on this line"
             );
             raw_release(&mut raw).await;
             continue;
@@ -683,15 +774,16 @@ async fn mysql_deadlock_1213_is_retryable_live() {
             .send_request(rid_ca, service::SQL, method_sql::EXEC, cross_a.encode())
             .await;
 
-        // GUARD: wait until cross_a is provably blocked-waiting before closing the cycle -- so the
+        // GUARD: wait until cross_a is provably EXECUTING (blocked-waiting) before closing the cycle -- so the
         // cross_b send below can never "win" against a cross_a that had not yet reached the server
         // (the false-green race the PG suite's `wait_for_two_lock_waiters` addresses; here one
         // confirmed lock-waiter suffices because the second update deterministically CLOSES the cycle
         // InnoDB then detects immediately).
         let Some(_id) = wait_for_active_conn(&mut raw, &marker).await else {
             eprintln!(
-                "[{label}] SKIP case5: cross_a was never observed lock-waiting within 5s \
-                 (the cross-lock cycle would be a false-green race)"
+                "skip: [{label}] case5 -- cross_a was never observed EXECUTING (lock-waiting) \
+                 within 5s (the cross-lock cycle would be a false-green race); the CI live lane \
+                 fails on this line"
             );
             // Do NOT try to ROLLBACK here: tx_a's actor is blocked serving the stuck cross_a query,
             // so a ROLLBACK command would queue behind it and hang. Dropping `client` at end of this
@@ -825,8 +917,10 @@ async fn mysql_lock_wait_timeout_1205_tx_teardown_retryable() {
 
         let tx_a = begin(&mut client, 90, "default").await;
 
-        // Shrink tx_a's lock-wait timeout to the 1s minimum so the 1205 lands well inside the
-        // harness's 2s per-frame recv bound.
+        // Shrink tx_a's lock-wait timeout to the 1s minimum (the smallest value InnoDB accepts) so
+        // the 1205 lands promptly. NOTE the terminal below is read with `exec_within`, not the
+        // harness-wide 2s bound: 1s is a FLOOR, and InnoDB's lock-wait monitor ticks about once a
+        // second, so 1205 can legitimately surface anywhere up to ~2s later — see `exec_within`.
         let mut s = req("SET SESSION innodb_lock_wait_timeout = 1");
         s.tx_id = Some(tx_a);
         s.readonly = false;
@@ -844,7 +938,7 @@ async fn mysql_lock_wait_timeout_1205_tx_teardown_retryable() {
         w.readonly = false;
         w.params = vec![Value::Text(key.clone())];
 
-        let ep = match exec(&mut client, 92, &w).await {
+        let ep = match exec_within(&mut client, 92, &w, LOCK_WAIT_TERMINAL_BOUND).await {
             Outcome::Error(ep) => ep,
             other => {
                 panic!("[{label}] the lock-wait-timeout write must error (1205), got {other:?}")

@@ -25,13 +25,29 @@
 //! **Provably in-flight, never a fixed-delay guess.** T2's review found a real false-green race: a
 //! CANCEL (or, here, a kill) that lands BEFORE the targeted statement is dispatched is silently
 //! cleared/ineffective by Postgres, so a test that merely sleeps-then-acts can "pass" without ever
-//! proving what it claims. Every external chaos event in this file (`pg_terminate_backend`, the
-//! `CANCEL` frame) is preceded by [`wait_for_active_pid`] polling `pg_stat_activity` — over a RAW
-//! side connection, entirely outside ferrod's own pool — until the targeted statement is observed
-//! `state = 'active'` server-side. The two engine-internal-timer cases (an `ExecRequest.timeout_ms`
-//! shorter than the statement's own `pg_sleep`) need no such proof: the timer provably cannot fire
-//! before `timeout_ms` has elapsed, by which point the query has already been dispatched and is
-//! still sleeping (a >10x margin in both cases here).
+//! proving what it claims. Every external chaos event in this file is preceded by a poll of
+//! `pg_stat_activity` over a RAW side connection, entirely outside ferrod's own pool — but WHICH
+//! poll depends on how phase-sensitive the chaos event is:
+//!
+//! * `pg_terminate_backend` is phase-INSENSITIVE (it destroys the connection whatever the backend is
+//!   doing, so the client's next protocol message fails either way) → [`wait_for_active_pid`]'s
+//!   `state = 'active'` is proof enough.
+//! * a `CANCEL` frame is phase-SENSITIVE: a cancel delivered to a backend that is not running the
+//!   statement does nothing dependable — verified live here, `pg_cancel_backend()` on an IDLE backend
+//!   left a following `pg_sleep(4)` running its full 4s. And `state = 'active'` is ALSO true while
+//!   the backend merely PARSES the statement — `ferro-backend-pg`'s `query::run` is `prepare()` THEN
+//!   `query_raw()`, two round trips, and `exec_parse_message` reports the query text as active — so
+//!   a `state='active'` match can be the Parse round trip, with the backend going idle again right
+//!   after it. Cancelling THERE proves nothing about the write's fate, and when the cancel is lost it
+//!   also WEDGES the test (the write then runs its full `pg_sleep(3)`, past the harness's 2s
+//!   per-frame bound, so no terminal arrives). The cancel test therefore uses the stronger
+//!   [`wait_for_backend_inside_pg_sleep`], which requires the backend to be observed INSIDE the
+//!   statement body. (This is the PG twin of the C14 flake the MySQL suite hit — see
+//!   `mysql_chaos_it.rs`'s `wait_for_active_conn`, whose `COMMAND` filter is the same fix.)
+//!
+//! The two engine-internal-timer cases (an `ExecRequest.timeout_ms` shorter than the statement's own
+//! `pg_sleep`) need no such proof: the timer provably cannot fire before `timeout_ms` has elapsed, by
+//! which point the query has already been dispatched and is still sleeping (a >10x margin here).
 //!
 //! `pg_sleep(..)` is used only in a `WHERE`/`FROM` predicate (`IS NOT NULL`, or bare `FROM
 //! pg_sleep(..)`), NEVER in a projected/`RETURNING` column — `rowmap::oid_to_tag` rejects a
@@ -95,10 +111,15 @@ async fn raw_connect(url: &str) -> tokio_postgres::Client {
 
 /// Poll `pg_stat_activity` (over the RAW side connection) every 15ms, up to a 5s bound, until a
 /// backend is observed `state = 'active'` running a statement whose text contains `marker` — i.e.
-/// PROVABLY in flight, not merely dispatched-but-not-yet-running (or, worse, not yet dispatched at
-/// all — the false-green race T2's review found: a kill/CANCEL landing before dispatch is silently
-/// cleared/ineffective by Postgres). Returns that backend's pid. Panics — a loud test failure, not
-/// a silent skip — if the bound elapses first: better that than a chaos event that proves nothing.
+/// PROVABLY dispatched, not "not yet dispatched at all" (the false-green race T2's review found: a
+/// kill landing before dispatch is silently ineffective). Returns that backend's pid. Panics — a
+/// loud test failure, not a silent skip — if the bound elapses first: better that than a chaos event
+/// that proves nothing.
+///
+/// **Only for phase-INSENSITIVE chaos events (`pg_terminate_backend`).** `state = 'active'` is also
+/// true during the Parse round trip of `ferro-backend-pg`'s prepare-then-execute path, so it does NOT
+/// prove the statement body is running. Terminating the backend does not care (the connection dies
+/// either way), but a CANCEL does — see [`wait_for_backend_inside_pg_sleep`] and the module docs.
 async fn wait_for_active_pid(raw: &tokio_postgres::Client, marker: &str) -> i32 {
     let pattern = format!("%{marker}%");
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -117,6 +138,51 @@ async fn wait_for_active_pid(raw: &tokio_postgres::Client, marker: &str) -> i32 
             panic!(
                 "chaos harness: no backend became active running a statement matching {marker:?} \
                  within 5s -- the chaos event would be a false-green race (dispatch never observed)"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
+/// The STRONGER in-flight proof, for the phase-SENSITIVE chaos event (the `CANCEL` frame): poll
+/// `pg_stat_activity` every 15ms, up to a 5s bound, until a backend running a statement whose text
+/// contains `marker` is observed *inside* `pg_sleep()` — `wait_event_type = 'Timeout'`,
+/// `wait_event = 'PgSleep'`. Returns that backend's pid; panics (loudly, never a silent skip) if the
+/// bound elapses.
+///
+/// **Why `state = 'active'` is NOT enough here.** `ferro-backend-pg`'s `query::run` is `prepare()`
+/// THEN `query_raw()` — two round trips — and `exec_parse_message` reports the query text with
+/// `STATE_RUNNING`, so `state='active'` + a marker match can mean "the backend is PARSING this
+/// statement". The backend then goes IDLE between the Parse reply and the Bind/Execute request, and a
+/// cancel that lands in that gap does nothing dependable — verified live, `pg_cancel_backend()` on an
+/// idle backend then `pg_sleep(4)` on it slept its full 4s. The statement would then run its own
+/// `pg_sleep(3)` to completion, past the harness's 2s per-frame bound, so the cancel would prove
+/// nothing about the write's fate AND the test would wedge.
+///
+/// `wait_event = 'PgSleep'` is proof the statement BODY is executing, and it is the STABLE state for
+/// ~3s afterwards, so the guard waits on a condition that persists rather than sampling for one that
+/// is transient.
+async fn wait_for_backend_inside_pg_sleep(raw: &tokio_postgres::Client, marker: &str) -> i32 {
+    let pattern = format!("%{marker}%");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = raw
+            .query(
+                "SELECT pid FROM pg_stat_activity \
+                  WHERE state = 'active' AND query LIKE $1 \
+                    AND wait_event_type = 'Timeout' AND wait_event = 'PgSleep'",
+                &[&pattern],
+            )
+            .await
+            .expect("chaos harness: pg_stat_activity poll");
+        if let Some(row) = rows.first() {
+            return row.get::<_, i32>(0);
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "chaos harness: no backend was observed INSIDE pg_sleep running a statement \
+                 matching {marker:?} within 5s -- the CANCEL would be a false-green race (a cancel \
+                 delivered before the statement body runs is discarded by Postgres)"
             );
         }
         tokio::time::sleep(Duration::from_millis(15)).await;
@@ -572,9 +638,12 @@ async fn cancel_race_mid_write_consistent_with_counter() {
         .send_request(rid, service::SQL, method_sql::EXEC, w.encode())
         .await;
 
-    // Provably in flight before firing CANCEL -- the exact false-green race T2's review found (a
-    // CANCEL landing before dispatch is silently cleared by Postgres, proving nothing).
-    wait_for_active_pid(&raw, &marker).await;
+    // Provably EXECUTING (inside the statement's own pg_sleep) before firing CANCEL -- the exact
+    // false-green race T2's review found, strengthened: a CANCEL landing before the statement BODY
+    // runs (including during the separate Parse round trip, where `state='active'` alone already
+    // matches) is silently discarded by Postgres, proving nothing -- and would wedge this test,
+    // since the write would then run its pg_sleep(3) out past the harness's 2s per-frame bound.
+    wait_for_backend_inside_pg_sleep(&raw, &marker).await;
     client.cancel(rid).await;
 
     let outcome = recv_terminal(&mut client, rid, service::SQL, method_sql::EXEC).await;
