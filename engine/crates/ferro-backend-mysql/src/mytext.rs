@@ -56,6 +56,12 @@ use mysql_async::Value as MyValue;
 /// The largest magnitude a MySQL/MariaDB `TIME` can hold: `838:59:59.999999`. The server clamps
 /// out-of-range results (`SEC_TO_TIME(999999999)` → `838:59:59` + a warning), so anything beyond
 /// this is a corrupt payload, not a value — and rendering it would emit a plausible-looking lie.
+///
+/// **The trailing `.999999` is REQUIRED, not slack — do not "tighten" this to match MySQL.** The
+/// two engines diverge at the fraction: MySQL rejects `'838:59:59.999999'` under strict mode and
+/// truncates it to `838:59:59.000000` under a permissive `sql_mode`, but **MariaDB stores and
+/// returns it exactly** (measured live on MariaDB 11.8: `CAST('838:59:59.999999' AS TIME(6))` →
+/// `838:59:59.999999`). A bound narrowed to MySQL's clamp would reject a legal MariaDB value.
 const MAX_TIME_US: u64 = ((838 * 3600) + (59 * 60) + 59) * 1_000_000 + 999_999;
 
 const US_PER_SECOND: u64 = 1_000_000;
