@@ -133,12 +133,14 @@ final class TypePolicyExceptionTest extends TestCase
         self::assertSame([C::SERVICE_TX, C::METHOD_TX_ROLLBACK], $s->lastInFlight());
     }
 
-    // ---- the M1 seam is inert TODAY, but safely so ------------------------------------------------
+    // ---- the superseded M0 policy is still a loud refusal ----------------------------------------
 
     /**
-     * Until Task 7 lands the M1 policy, a `types:`-configured Connection still decodes with
-     * {@see M0ValuePolicy} — which raises a LOUD ProtocolException for every tag the four §9.1 knobs
-     * govern. So the seam cannot silently miscast anything in the meantime.
+     * M1-S7 Task 7 made {@see \Ferro\Client\Value\M1ValuePolicy} the Connection default (see
+     * `ConnectionTypePolicyWiringTest`, which asserts a configured `types:` genuinely reaches the
+     * decode path). {@see M0ValuePolicy} survives for the M0 conformance surface, and what is
+     * asserted here is that it never became a silent fallback: every tag the four §9.1 knobs govern
+     * is still a LOUD ProtocolException under it, never a miscast.
      *
      * @return list<array{int}>
      */

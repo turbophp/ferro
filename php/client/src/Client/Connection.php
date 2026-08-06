@@ -11,7 +11,7 @@ use Ferro\Client\Error\ProtocolException;
 use Ferro\Client\Error\RetryableException;
 use Ferro\Client\Error\TransportException;
 use Ferro\Client\Hydration\PlanCache;
-use Ferro\Client\Value\M0ValuePolicy;
+use Ferro\Client\Value\M1ValuePolicy;
 use Ferro\Client\Value\TypePolicyOptions;
 use Ferro\Client\Value\ValuePolicy;
 use Ferro\Protocol\BeginRequest;
@@ -94,11 +94,13 @@ final class Connection
         $this->types = $types ?? new TypePolicyOptions();
         $this->encodePacker = $encodePacker ?? PackerFactory::forEncode();
         $this->decodePacker = $decodePacker ?? PackerFactory::forDecode();
-        // The default-policy site. M1-S7 Task 7 swaps `M0ValuePolicy` for the M1 policy built from
-        // `$this->types`; until then a configured `types:` governs only tags M0 already refuses
-        // LOUDLY (DECIMAL/U64/TIMESTAMP/UUID all raise), so it can never mask a silent miscast.
+        // The default-policy site, and the ONLY place `types:` becomes behaviour: an M1 policy is
+        // BUILT from `$this->types` here (M1-S7 Task 7, superseding M0's scalar-only policy). Revert
+        // this to `new M0ValuePolicy()` and `Ferro::connect(types: ...)` silently becomes an inert
+        // public knob — every DECIMAL/TIMESTAMP/UUID/U64 read throws "not supported in M0" while the
+        // configured policy is never consulted. `ConnectionTypePolicyWiringTest` is the guard.
         $this->codec = $codec ?? new ExecCodec(
-            $values ?? new M0ValuePolicy(),
+            $values ?? new M1ValuePolicy($this->types),
             $plans ?? new PlanCache(),
             $this->encodePacker,
             $this->decodePacker,
@@ -249,6 +251,13 @@ final class Connection
             return;
         }
         $rid = $opened['requestId'];
+        // `$colNames` is deliberately `list<string>` — the `ColMeta` TAG is dropped here ON PURPOSE
+        // (F25/hazard 47). The decode authority is the PER-CELL tag ({@see ExecCodec::decodeRow},
+        // which reads `$cell['tag']`), not the column metadata, and the BUFFERED path drops the tag
+        // too ({@see ExecCodec::decode}), so the two paths must agree on this shape. Widening it to
+        // carry the tag would break `assocRow`, `hydrateDto` and `PlanCache::planFor` for ZERO
+        // behavioural gain — a streamed row and a buffered row of the same data already decode to
+        // equal values (`ConnectionStreamTest::testStreamedAndBufferedRowsDecodeIdentically`).
         $colNames = array_map(static fn (array $c): string => $c['name'], $opened['cols']);
 
         $reachedTerminal = false;

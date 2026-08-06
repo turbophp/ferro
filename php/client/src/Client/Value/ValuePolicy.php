@@ -7,11 +7,15 @@ namespace Ferro\Client\Value;
  * seam (SPEC §9.1). The engine has already resolved every column to a canonical tag; this policy
  * only decides the PHP REPRESENTATION, deterministically, never inferring from column names or SQL.
  *
- * This is the documented EXTENSION POINT for M1: the DECIMAL / TIMESTAMP / TIMESTAMPTZ / UUID / JSON
- * policies (`naive_datetime_zone=utc`, safe-object defaults, etc.) land as ALTERNATE implementations
- * of this same interface, and a {@see \Ferro\Client\Connection} is constructed with whichever policy
- * the app configures. The M0 default is {@see M0ValuePolicy} (scalar tags only; every reserved M1
- * tag is `Unsupported`).
+ * This is the documented EXTENSION POINT, and as of M1-S7 it has three implementations:
+ *
+ *  - {@see M1ValuePolicy} — the DEFAULT ({@see \Ferro\Client\Connection} builds one from its
+ *    `types:` {@see TypePolicyOptions}). All fourteen implemented tags → the SPEC §9 PHP types under
+ *    the four §9.1 knobs.
+ *  - {@see RawStringValuePolicy} — the canonical wire text verbatim for the eight M1-S7 tags; the
+ *    M1-S8 Doctrine DBAL hand-off, where the type layer wants driver-native strings.
+ *  - {@see M0ValuePolicy} — the historical scalar-only policy (every M1 tag `Unsupported`), kept for
+ *    the M0 conformance tests.
  */
 interface ValuePolicy
 {

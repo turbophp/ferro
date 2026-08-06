@@ -288,4 +288,63 @@ final class ConnectionStreamTest extends TestCase
         ]);
         $this->assertSame([['n' => 1]], $this->connectionWith($t)->query('SELECT 1 AS n'));
     }
+
+    /**
+     * **The `$colNames` regression lock (M1-S7 Task 7, F25/hazard 47).**
+     *
+     * `Connection::stream()` drops the streamed `ColMeta` TAG and keeps only the column NAME — and
+     * so does the buffered `ExecCodec::decode()`. That is deliberate: row decoding is driven by the
+     * PER-CELL tag, so the metadata tag is redundant on both paths. This test is what makes that
+     * claim falsifiable now that the M1 value policy turns cells into value objects: the SAME row,
+     * carrying all eight M1-S7 canonical tags, must decode to EQUAL values whichever channel it
+     * arrived on. If anyone ever "fixes" the `list<string>` shape on one path only, this goes red.
+     */
+    public function testStreamedAndBufferedRowsDecodeIdentically(): void
+    {
+        $cols = [
+            ['name' => 'n', 'tag' => C::TAG_I64],
+            ['name' => 'amount', 'tag' => C::TAG_DECIMAL],
+            ['name' => 'big', 'tag' => C::TAG_U64],
+            ['name' => 'd', 'tag' => C::TAG_DATE],
+            ['name' => 't', 'tag' => C::TAG_TIME],
+            ['name' => 'naive', 'tag' => C::TAG_TIMESTAMP],
+            ['name' => 'inst', 'tag' => C::TAG_TIMESTAMPTZ],
+            ['name' => 'id', 'tag' => C::TAG_UUID],
+            ['name' => 'doc', 'tag' => C::TAG_JSON],
+        ];
+        $row = [
+            ['tag' => C::TAG_I64, 'data' => 7],
+            ['tag' => C::TAG_DECIMAL, 'data' => '-12345.6700'],
+            ['tag' => C::TAG_U64, 'data' => '18446744073709551615'],
+            ['tag' => C::TAG_DATE, 'data' => '2026-08-05'],
+            ['tag' => C::TAG_TIME, 'data' => '13:45:07.250000'],
+            ['tag' => C::TAG_TIMESTAMP, 'data' => '2026-08-05 13:45:07.250000'],
+            ['tag' => C::TAG_TIMESTAMPTZ, 'data' => '2026-08-05T13:45:07.250000Z'],
+            ['tag' => C::TAG_UUID, 'data' => '3f2b8c1a-0000-4fff-8000-abcdefabcdef'],
+            ['tag' => C::TAG_JSON, 'data' => '{"a":[1,2]}'],
+        ];
+
+        $bt = new FakeTransport();
+        $this->feedOk($bt, 1, [
+            'cols' => $cols,
+            'rows' => [$row],
+            'affected' => 0,
+            'last_insert_id' => null,
+            'stats' => ['queue_us' => 0, 'exec_us' => 0, 'rows' => 1, 'bytes' => 0],
+        ]);
+        $buffered = $this->connectionWith($bt)->query('SELECT *');
+
+        $st = new FakeTransport();
+        $this->feedHead($st, 1, $cols);
+        $this->feedData($st, 1, [$row]);
+        $this->feedTerminalOk($st, 1);
+        $streamed = iterator_to_array($this->connectionWith($st)->stream('SELECT *'), false);
+
+        $this->assertEquals($buffered, $streamed);
+        $this->assertCount(1, $streamed);
+        $this->assertInstanceOf(\Ferro\Decimal::class, $streamed[0]['amount']);
+        $this->assertInstanceOf(\Ferro\NaiveTimestamp::class, $streamed[0]['naive']);
+        $this->assertSame('UTC', $streamed[0]['inst']->getTimezone()->getName());
+        $this->assertSame('18446744073709551615', (string) $streamed[0]['big']);
+    }
 }

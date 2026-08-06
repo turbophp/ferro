@@ -88,17 +88,31 @@ final class TypePolicyOptionsTest extends TestCase
 
     // ---- the pinned `naive_datetime_zone=error` scope --------------------------------------------
 
-    /** @return array<string,int> every canonical tag EXCEPT TAG_TIMESTAMP */
+    /**
+     * Every canonical tag EXCEPT `TAG_TIMESTAMP`, DERIVED from the generated registry constants
+     * rather than hand-listed.
+     *
+     * A hand-written list is an unfalsifiable guard: it is complete the day it is written, and a
+     * future `TAG_18` added to `/proto/types.toml` would silently escape the scope proof below —
+     * the tests would stay green while an entire new tag's behaviour under
+     * `naive_datetime_zone=error` went unasserted. Reflecting over `Constants` means a new tag joins
+     * this set the moment `gen-php.php` regenerates.
+     *
+     * @return array<string,int> tag NAME (without the `TAG_` prefix) → tag value
+     */
     private static function everyOtherTag(): array
     {
-        return [
-            'NULL' => C::TAG_NULL, 'BOOL' => C::TAG_BOOL, 'I64' => C::TAG_I64, 'U64' => C::TAG_U64,
-            'F64' => C::TAG_F64, 'DECIMAL' => C::TAG_DECIMAL, 'TEXT' => C::TAG_TEXT,
-            'BYTES' => C::TAG_BYTES, 'DATE' => C::TAG_DATE, 'TIME' => C::TAG_TIME,
-            'TIMESTAMPTZ' => C::TAG_TIMESTAMPTZ, 'UUID' => C::TAG_UUID, 'JSON' => C::TAG_JSON,
-            'ARRAY' => C::TAG_ARRAY, 'INTERVAL' => C::TAG_INTERVAL, 'INET' => C::TAG_INET,
-            'VECTOR' => C::TAG_VECTOR,
-        ];
+        $out = [];
+        /** @var array<string,mixed> $constants */
+        $constants = (new \ReflectionClass(C::class))->getConstants();
+        foreach ($constants as $name => $value) {
+            if (!str_starts_with($name, 'TAG_') || !is_int($value) || $value === C::TAG_TIMESTAMP) {
+                continue;
+            }
+            $out[substr($name, 4)] = $value;
+        }
+        self::assertNotEmpty($out, 'no TAG_* constants found — the registry generator changed shape');
+        return $out;
     }
 
     public function testErrorZoneRefusesTheNaiveTimestampTag(): void
