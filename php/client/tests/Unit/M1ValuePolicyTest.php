@@ -170,6 +170,49 @@ final class M1ValuePolicyTest extends TestCase
         $p->decode(C::TAG_TIMESTAMP, '2026-08-05 13:45:07');
     }
 
+    /**
+     * The refusal must NOT mask a wire fault. `naive_datetime_zone=error` is an operator setting, so
+     * it may only refuse a payload the engine rendered CORRECTLY; a malformed one is an engine defect
+     * and must stay a {@see ProtocolException} under every knob setting — otherwise S8's DBAL
+     * `ExceptionConverter` reports a broken renderer as a configuration choice.
+     */
+    public function testNaiveDatetimeZoneErrorNeverMasksAMalformedPayload(): void
+    {
+        $p = new M1ValuePolicy(new TypePolicyOptions(naiveDatetimeZone: 'error'));
+
+        // well-formed canonical text → the operator's policy refusal
+        try {
+            $p->decode(C::TAG_TIMESTAMP, '2026-08-05 13:45:07');
+            self::fail('a well-formed naive TIMESTAMP must be refused by the policy');
+        } catch (TypePolicyException) {
+            // expected
+        }
+
+        // malformed canonical text → still a WIRE fault, in both directions of the split
+        foreach (['garbage', '', '2026-08-05T13:45:07Z', '2026-02-30 00:00:00', '2026-08-05 13:45:07.25'] as $bad) {
+            try {
+                $p->decode(C::TAG_TIMESTAMP, $bad);
+                self::fail('tag TIMESTAMP accepted a malformed payload: ' . var_export($bad, true));
+            } catch (TypePolicyException) {
+                self::fail('a malformed TIMESTAMP was masked as a policy refusal: ' . var_export($bad, true));
+            } catch (ProtocolException) {
+                self::assertTrue(true);
+            }
+        }
+
+        // and a wrong-FAMILY payload is a wire fault too (the property the old ordering did keep)
+        $this->expectException(ProtocolException::class);
+        $p->decode(C::TAG_TIMESTAMP, 12345);
+    }
+
+    /** A well-formed SENTINEL is still refused: the knob must fail EVERY read of a naive column. */
+    public function testNaiveDatetimeZoneErrorRefusesSentinelsToo(): void
+    {
+        $p = new M1ValuePolicy(new TypePolicyOptions(naiveDatetimeZone: 'error'));
+        $this->expectException(TypePolicyException::class);
+        $p->decode(C::TAG_TIMESTAMP, '0000-00-00 00:00:00');
+    }
+
     // ---- sentinels (PROTOCOL.md §3.2: literal, deliberately NOT parseable) ------------------------
 
     /**

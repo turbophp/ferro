@@ -2,6 +2,7 @@
 declare(strict_types=1);
 namespace Ferro;
 
+use Ferro\Client\Error\TypePolicyException;
 use Ferro\Client\Value\CanonicalText;
 
 /**
@@ -45,13 +46,20 @@ final class U64 implements \Stringable
     }
 
     /**
-     * @throws \RangeException when the value exceeds `PHP_INT_MAX` — a silent truncation here would
-     *   be the exact data corruption this object exists to prevent.
+     * The refusal is a {@see TypePolicyException} — the SPEC §9.1 class for "this `U64` has no
+     * lossless PHP `int` form", which is the SAME condition `u64_overflow=error` refuses at decode;
+     * only the asker differs. It therefore stays inside the {@see \Ferro\Client\Error\FerroException}
+     * tree (a bare `\RangeException` escapes `catch (FerroException)` entirely), and stays out of both
+     * the wire-fault class (nothing was malformed — the value arrived intact) and the §19.3 fate
+     * branches (it is client-side and deterministic, so nothing may retry on it).
+     *
+     * @throws TypePolicyException when the value exceeds `PHP_INT_MAX` — a silent truncation here
+     *   would be the exact data corruption this object exists to prevent.
      */
     public function toInt(): int
     {
         if (!$this->fitsInt()) {
-            throw new \RangeException(
+            throw new TypePolicyException(
                 'Ferro\U64: ' . $this->value . ' exceeds PHP_INT_MAX and cannot be narrowed to an int '
                 . 'without loss — use (string) or the `u64_overflow: string` policy (SPEC §9.1)',
             );

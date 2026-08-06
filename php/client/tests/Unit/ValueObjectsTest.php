@@ -2,7 +2,9 @@
 declare(strict_types=1);
 namespace Ferro\Tests\Unit;
 
+use Ferro\Client\Error\FerroException;
 use Ferro\Client\Error\ProtocolException;
+use Ferro\Client\Error\TypePolicyException;
 use Ferro\Date;
 use Ferro\Decimal;
 use Ferro\Json;
@@ -199,10 +201,27 @@ final class ValueObjectsTest extends TestCase
         self::assertFalse((new U64('9223372036854775808'))->fitsInt());
     }
 
+    /**
+     * The refusal stays INSIDE the {@see FerroException} tree. A bare `\RangeException` would escape
+     * an application's `catch (FerroException)` entirely — the one wrapper every Ferro caller writes.
+     * It is a {@see TypePolicyException} (the §9.1 "no lossless PHP int form" class, the same
+     * condition `u64_overflow=error` refuses at decode) and NOT a {@see ProtocolException}: nothing
+     * was malformed, the value arrived intact.
+     */
     public function testU64ToIntRefusesToTruncate(): void
     {
-        $this->expectException(\RangeException::class);
-        (new U64('18446744073709551615'))->toInt();
+        $caught = null;
+        try {
+            (new U64('18446744073709551615'))->toInt();
+            self::fail('toInt() must refuse a value above PHP_INT_MAX rather than truncate it');
+        } catch (FerroException $e) {   // the property under test: it is catchable as one
+            $caught = $e;
+        }
+        self::assertInstanceOf(TypePolicyException::class, $caught);
+        self::assertNotInstanceOf(ProtocolException::class, $caught);
+        self::assertStringContainsString('PHP_INT_MAX', $caught->getMessage());
+
+        self::assertSame(PHP_INT_MAX, (new U64((string) PHP_INT_MAX))->toInt()); // the boundary fits
     }
 
     public function testU64RejectsOutOfRangeAndMalformedText(): void

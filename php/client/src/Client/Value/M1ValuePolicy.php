@@ -122,14 +122,20 @@ final class M1ValuePolicy implements ValuePolicy
      * `naive_datetime_zone` — `utc` (default): a {@see NaiveTimestamp} pinned to an explicit UTC
      * zone; `error`: refuse the tag outright.
      *
-     * The refusal is checked BEFORE the value is interpreted (but after the payload family is
-     * verified, so a genuine wire fault is still reported as one): the knob's purpose is migrating a
-     * schema off naive columns, so every read of one must fail — uniformly, not only for rows that
-     * happen to be constructible.
+     * The payload is FULLY VALIDATED first — family AND canonical text — and only then refused: a
+     * malformed `TIMESTAMP` is an engine defect, so it must stay a wire fault
+     * ({@see \Ferro\Client\Error\ProtocolException}) under EVERY knob setting. Refusing first would
+     * let `naive_datetime_zone=error` mask a broken renderer as an operator configuration choice,
+     * which is exactly the mis-attribution the two exception classes exist to prevent (and would make
+     * S8's DBAL `ExceptionConverter` report it as one).
+     *
+     * The refusal still fires BEFORE the value is INTERPRETED, and it covers the sentinels too: the
+     * knob's purpose is migrating a schema off naive columns, so every read of a well-formed one must
+     * fail — uniformly, not only for rows that happen to be constructible.
      */
     private function decodeTimestamp(mixed $data): string|NaiveTimestamp
     {
-        $text = CanonicalText::requireString($data, C::TAG_TIMESTAMP);
+        $canonical = CanonicalText::timestamp(CanonicalText::requireString($data, C::TAG_TIMESTAMP));
         if ($this->options->refusesNaiveTimestamp(C::TAG_TIMESTAMP)) {
             throw new TypePolicyException(
                 'naive_datetime_zone=error refuses a naive TIMESTAMP: the wire carries no zone for '
@@ -137,7 +143,6 @@ final class M1ValuePolicy implements ValuePolicy
                 . '(the default) or read the column with a raw-string policy (SPEC §9.1).',
             );
         }
-        $canonical = CanonicalText::timestamp($text);
         if (!CanonicalText::timestampIsInstant($canonical)) {
             return $canonical; // infinity / zero date / zero-in-date: verbatim, never parsed
         }
