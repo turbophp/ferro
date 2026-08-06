@@ -5,6 +5,7 @@
 pub mod bind;
 pub mod conn;
 pub mod error_map;
+pub mod pgtext;
 pub mod placeholder;
 pub mod query;
 pub mod rowmap;
