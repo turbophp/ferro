@@ -181,6 +181,55 @@ fn write_stream_data(name: &str, req: u32, data: &StreamData) {
     );
 }
 
+// --- M1-S7 canonical-tag helpers (/proto/PROTOCOL.md §3.2) ---------------------------------
+// Every S7 payload is TEXT-canonical (msgpack `str`) except `U64` (msgpack uint), so the whole
+// set round-trips through the vector JSON `message` field with no `bin` → list<int> workaround —
+// which is exactly why the wire contract is text-canonical. The cols and the row are built by the
+// SAME two helpers for both the buffered (`sql_exec_response_types_scalars`) and streamed
+// (`stream_data_types`) vectors, so the two paths can never drift apart.
+
+/// The everyday canonical payload for each S7 tag, in `s7_scalar_cols()` order.
+///
+/// The `U64` here is deliberately SMALL (`5`). **Hard constraint on any golden-vector `U64`:** it
+/// must be `<= 0xffffffff` or `> PHP_INT_MAX`, and NEVER inside `(2^32, 2^63]`. rmp emits marker
+/// `0xcf` from 2^32 up; PHP `PurePacker::be()` returns a decimal STRING for every `0xcf` uint64
+/// while `ext-msgpack` returns an int, and `VectorConformanceTest::hasBigUint` does NOT skip a
+/// value in that band (its decimal string is `<= PHP_INT_MAX`), so the ext-vs-pure parity test
+/// would fail in CI, which provisions ext-msgpack. `u64::MAX` therefore lives ALONE in
+/// `sql_exec_response_types_u64`: a `> PHP_INT_MAX` uint makes `hasBigUint` skip that WHOLE
+/// vector's parity assertion, and isolating it keeps that coverage for every other tag.
+fn s7_scalar_row() -> Vec<Value> {
+    vec![
+        // Display scale preserved: "-12345.6700" and "-12345.67" are DISTINCT payloads.
+        Value::Decimal("-12345.6700".into()),
+        Value::Date("2026-08-05".into()),
+        Value::Time("13:45:07".into()),
+        // Naive — no zone suffix, ever. Sub-second present => exactly six digits.
+        Value::Timestamp("2026-08-05 13:45:07.250000".into()),
+        // RFC3339, always normalized to UTC, always the literal `Z`.
+        Value::TimestampTz("2026-08-05T13:45:07.250000Z".into()),
+        // 36-char canonical lowercase hyphenated — never raw bytes.
+        Value::Uuid("6ba7b810-9dad-11d1-80b4-00c04fd430c8".into()),
+        // Nested object + array + a `null` + a non-ASCII char: proves the raw JSON document text
+        // survives UTF-8 intact through both codecs and through the vector JSON itself.
+        Value::Json(r#"{"a":[1,2,{"b":null}],"n":"café"}"#.into()),
+        Value::U64(5),
+    ]
+}
+
+/// `ColMeta` for `s7_scalar_row()` — same order, so `cols` and `rows` agree cell for cell.
+fn s7_scalar_cols() -> Vec<ColMeta> {
+    let names = ["dec", "d", "t", "ts", "tstz", "uu", "js", "u"];
+    s7_scalar_row()
+        .iter()
+        .zip(names)
+        .map(|(v, name)| ColMeta {
+            name: name.into(),
+            tag: v.tag(),
+        })
+        .collect()
+}
+
 fn main() {
     std::fs::create_dir_all(dir().join("negative")).unwrap();
 
@@ -500,6 +549,116 @@ fn main() {
     };
     write_sql_response("sql_exec_response_typedvalue", 18, &resp_typedvalue);
 
+    // M1-S7 canonical tags, everyday shapes: one cell per S7 tag (§3.2). The `sql_exec_response_`
+    // prefix is MANDATORY — PHP's byte-lock provider `VectorConformanceTest::sqlVectors()` keys on
+    // it, so a differently-named vector would silently get only the generic header/unpack tests.
+    let resp_types_scalars = ExecOk {
+        cols: s7_scalar_cols(),
+        rows: vec![s7_scalar_row()],
+        affected: 0,
+        last_insert_id: None,
+        stats: Stats {
+            queue_us: 5,
+            exec_us: 21,
+            rows: 1,
+            bytes: 0,
+        },
+    };
+    write_sql_response("sql_exec_response_types_scalars", 40, &resp_types_scalars);
+
+    // The sentinels and the fraction-omission rule — the shapes a naive parser silently corrupts.
+    // `"infinity"` / `"-infinity"` / `"0000-00-00"` / `"0000-00-00 00:00:00"` are LITERAL payloads
+    // carried verbatim and deliberately NOT parseable as a calendar value (§3.2).
+    //
+    // The bare 30-digit DECIMAL is DELIBERATE — it is the DBAL-realistic big-integer-in-a-`numeric`
+    // shape. Its only cost is that `VectorConformanceTest::hasBigUint` sees an all-digit string
+    // above PHP_INT_MAX and skips THIS vector's ext-vs-pure comparison; the byte lock never
+    // consults `hasBigUint`, so coverage of the bytes themselves is unaffected. Do not "fix" it.
+    let resp_types_edge = ExecOk {
+        cols: vec![
+            ColMeta {
+                name: "nan".into(),
+                tag: consts::tag::DECIMAL,
+            },
+            ColMeta {
+                name: "big".into(),
+                tag: consts::tag::DECIMAL,
+            },
+            ColMeta {
+                name: "inf".into(),
+                tag: consts::tag::DATE,
+            },
+            ColMeta {
+                name: "zerod".into(),
+                tag: consts::tag::DATE,
+            },
+            ColMeta {
+                name: "t24".into(),
+                tag: consts::tag::TIME,
+            },
+            ColMeta {
+                name: "tneg".into(),
+                tag: consts::tag::TIME,
+            },
+            ColMeta {
+                name: "whole".into(),
+                tag: consts::tag::TIMESTAMP,
+            },
+            ColMeta {
+                name: "zerots".into(),
+                tag: consts::tag::TIMESTAMP,
+            },
+            ColMeta {
+                name: "neginf".into(),
+                tag: consts::tag::TIMESTAMPTZ,
+            },
+        ],
+        rows: vec![vec![
+            // PG NUMERIC allows NaN/Infinity/-Infinity; they are legal DECIMAL payloads.
+            Value::Decimal("NaN".into()),
+            Value::Decimal("123456789012345678901234567890".into()),
+            Value::Date("infinity".into()),
+            Value::Date("0000-00-00".into()), // MySQL zero date under a permissive sql_mode
+            Value::Time("24:00:00".into()),   // PG-legal, chrono-hostile (chrono wraps it to 00:00)
+            Value::Time("-838:59:58.000001".into()), // MySQL TIME spans +/-838h and may be negative
+            // Sub-second zero => NO `.ffffff` group at all (never a trimmed variant).
+            Value::Timestamp("2026-08-05 13:45:07".into()),
+            Value::Timestamp("0000-00-00 00:00:00".into()), // MySQL zero datetime
+            Value::TimestampTz("-infinity".into()),
+        ]],
+        affected: 0,
+        last_insert_id: None,
+        stats: Stats {
+            queue_us: 6,
+            exec_us: 33,
+            rows: 1,
+            bytes: 0,
+        },
+    };
+    write_sql_response("sql_exec_response_types_edge", 41, &resp_types_edge);
+
+    // `u64::MAX` ALONE, on purpose: it rides marker 0xcf, which PHP's pure decoder returns as a
+    // decimal STRING while ext-msgpack returns a lossy int/float, so `hasBigUint` skips this
+    // vector's ext-vs-pure parity test. Isolating it means the other seven S7 tags (in
+    // sql_exec_response_types_scalars) keep that parity coverage. The JSON `data` is the decimal
+    // string for the same reason `HelloAck.boot_epoch` is — a JSON number past 2^53 is lossy.
+    let resp_types_u64 = ExecOk {
+        cols: vec![ColMeta {
+            name: "big".into(),
+            tag: consts::tag::U64,
+        }],
+        rows: vec![vec![Value::U64(u64::MAX)]],
+        affected: 0,
+        last_insert_id: None,
+        stats: Stats {
+            queue_us: 1,
+            exec_us: 2,
+            rows: 1,
+            bytes: 0,
+        },
+    };
+    write_sql_response("sql_exec_response_types_u64", 42, &resp_types_u64);
+
     // --- STREAM service vectors (M1-S5 Task 1; /proto/PROTOCOL.md §10). HEAD carries the column
     // metadata (reusing the exact ColMeta shape ExecOk.cols uses); DATA carries a batch of rows
     // (reusing the exact Value [tag,payload] scalar codec ExecOk.rows uses). Neither is wrapped in
@@ -542,6 +701,15 @@ fn main() {
         ],
     };
     write_stream_data("stream_data_rows", 30, &stream_data_rows);
+
+    // The SAME S7 scalar row as sql_exec_response_types_scalars, on the STREAMED path — the client
+    // decodes a DATA frame through the same per-cell TypedValue codec (`decodeRow`), so this
+    // byte-locks the streamed direction independently rather than assuming the buffered lock
+    // covers it. The `stream_data_` prefix is MANDATORY (`VectorConformanceTest::streamVectors()`).
+    let stream_data_types = StreamData {
+        rows: vec![s7_scalar_row()],
+    };
+    write_stream_data("stream_data_types", 31, &stream_data_types);
 
     // --- TX service vectors (S6; /proto/PROTOCOL.md §9). Requests are the positional message
     // payload (flags 0). tx_begin_response is the terminal Outcome::Ok(BeginResponse) envelope

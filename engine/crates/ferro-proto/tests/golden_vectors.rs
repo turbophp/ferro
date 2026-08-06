@@ -1,4 +1,5 @@
 use ferro_proto::header::Header;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -32,7 +33,98 @@ fn positive_vectors_header_decodes_and_frame_len_is_consistent() {
         assert_eq!(h.method as u64, v["header"]["method"].as_u64().unwrap());
         count += 1;
     }
-    assert!(count >= 7, "expected >=7 positive vectors, found {count}");
+    // Non-vacuity only: this loop asserts a per-vector property, so it must have SEEN vectors.
+    // It is deliberately NOT a coverage claim — the old `count >= 7` read like one while being
+    // permanently satisfied by every committed vector set since M0, so it locked nothing. The real
+    // coverage lock is `every_implemented_tag_has_a_vector` below, whose required set is DERIVED
+    // from /proto/types.toml's `implemented` list and so cannot drift from the registry.
+    assert!(
+        count > 0,
+        "no positive vectors found in {:?}",
+        vectors_dir()
+    );
+}
+
+/// Decode every committed positive vector with the REAL codec and collect the union of every
+/// TypedValue tag it exercises: both `ColMeta.tag` (what the wire PROMISES a column is) and the
+/// `Value::tag()` of every param / row cell / `last_insert_id` (what it actually DELIVERS).
+///
+/// Deliberately NOT a text scan of the vector JSON — a scan would pass on a vector whose `message`
+/// claims a tag its `frame_hex` does not carry, which is precisely the bytes-vs-message drift the
+/// byte lock exists to catch.
+fn tags_present_in_committed_vectors() -> BTreeSet<u8> {
+    use ferro_proto::consts::{flags, method_sql, method_stream, service};
+    use ferro_proto::messages::*;
+
+    let mut seen: BTreeSet<u8> = BTreeSet::new();
+    for entry in fs::read_dir(vectors_dir()).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let frame = unhex(v["frame_hex"].as_str().unwrap());
+        let h = Header::decode(&frame).expect("header decodes");
+        let payload = &frame[16..];
+        match (h.service, h.method) {
+            // A SQL EXEC request (no END flag) carries its bind params.
+            (s, m) if s == service::SQL && m == method_sql::EXEC && (h.flags & flags::END) == 0 => {
+                let r = ExecRequest::decode(payload).expect("ExecRequest decodes");
+                seen.extend(r.params.iter().map(|val| val.tag()));
+            }
+            // A SQL EXEC response (END flag): the terminal Outcome::Ok(ExecOk) — cols + rows +
+            // the optional last_insert_id.
+            (s, m) if s == service::SQL && m == method_sql::EXEC => {
+                if let Outcome::Ok(body) = Outcome::decode(payload).expect("Outcome decodes") {
+                    let ok = ExecOk::decode(&body).expect("ExecOk decodes");
+                    seen.extend(ok.cols.iter().map(|c| c.tag));
+                    seen.extend(ok.rows.iter().flatten().map(|val| val.tag()));
+                    seen.extend(ok.last_insert_id.iter().map(|val| val.tag()));
+                }
+            }
+            (s, m) if s == service::STREAM && m == method_stream::HEAD => {
+                let head = StreamHead::decode(payload).expect("StreamHead decodes");
+                seen.extend(head.cols.iter().map(|c| c.tag));
+            }
+            (s, m) if s == service::STREAM && m == method_stream::DATA => {
+                let data = StreamData::decode(payload).expect("StreamData decodes");
+                seen.extend(data.rows.iter().flatten().map(|val| val.tag()));
+            }
+            // Core/TX/error vectors carry no TypedValue.
+            _ => {}
+        }
+    }
+    seen
+}
+
+/// Every tag in the registry's IMPLEMENTED set must have at least one committed golden vector
+/// exercising it — and no DEFERRED tag may have one. The required set is derived from
+/// /proto/types.toml (the single source of truth that also feeds TYPE_REGISTRY_HASH) so the two
+/// cannot drift; a hardcoded parallel list is exactly how the old `m0_scalar` key went dead.
+#[test]
+fn every_implemented_tag_has_a_vector() {
+    use ferro_proto::registry::Registry;
+
+    let proto = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../proto");
+    let reg = Registry::from_toml_dir(&proto);
+    let seen = tags_present_in_committed_vectors();
+
+    for name in &reg.implemented {
+        let t = reg.tags[name];
+        assert!(
+            seen.contains(&t),
+            "no golden vector exercises implemented tag {name} ({t})"
+        );
+    }
+    for (name, t) in &reg.tags {
+        if !reg.implemented.contains(name) {
+            assert!(
+                !seen.contains(t),
+                "a golden vector exercises DEFERRED tag {name} ({t}) — the vectors claim coverage \
+                 the codec does not have"
+            );
+        }
+    }
 }
 
 #[test]

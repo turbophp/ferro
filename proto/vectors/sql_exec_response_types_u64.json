@@ -1,0 +1,34 @@
+{
+  "frame_hex": "f7010200020001002a0000001e0000009200959192a36269670391919203cfffffffffffffffff00c09401020100",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 42,
+    "service": 2
+  },
+  "message": {
+    "affected": 0,
+    "cols": [
+      {
+        "name": "big",
+        "tag": 3
+      }
+    ],
+    "last_insert_id": null,
+    "rows": [
+      [
+        {
+          "data": "18446744073709551615",
+          "tag": 3
+        }
+      ]
+    ],
+    "stats": {
+      "bytes": 0,
+      "exec_us": 2,
+      "queue_us": 1,
+      "rows": 1
+    }
+  },
+  "name": "sql_exec_response_types_u64"
+}

@@ -348,6 +348,47 @@ final class VectorConformanceTest extends TestCase
         };
     }
 
+    /**
+     * COVERAGE GUARD (M1-S7). A golden vector earns its cross-language byte lock ONLY through its
+     * NAME PREFIX — `sqlVectors()` keys on `sql_exec_`, `streamVectors()` on `stream_head_`/
+     * `stream_data_`. A vector named outside those prefixes still passes the generic header/unpack
+     * tests above, so it LOOKS covered while getting no byte lock at all. This asserts (a) the four
+     * M1-S7 canonical-tag vectors landed inside the byte-locked providers, and (b) every committed
+     * vector is accounted for by some byte-lock test — a derived accounting, not a hardcoded count,
+     * so adding a well-named vector never needs an edit here but a misnamed one fails immediately.
+     */
+    public function testEveryCommittedVectorIsByteLocked(): void
+    {
+        $prefixLocked = [];
+        foreach (self::sqlVectors() as [$v]) { $prefixLocked[] = (string) $v['name']; }
+        foreach (self::streamVectors() as [$v]) { $prefixLocked[] = (string) $v['name']; }
+
+        // The four vectors this task added — each must be inside a PREFIX-keyed provider.
+        foreach ([
+            'sql_exec_response_types_scalars',
+            'sql_exec_response_types_edge',
+            'sql_exec_response_types_u64',
+            'stream_data_types',
+        ] as $name) {
+            $this->assertContains($name, $prefixLocked,
+                "{$name} must match the sql_exec_*/stream_data_* prefix rule or it gets NO byte lock");
+        }
+
+        // Vectors byte-locked by a name-keyed test rather than a prefix provider.
+        $namedLocked = ['tx_begin_response', 'error_protocol'];
+        foreach (self::txRequestVectors() as [$v]) { $namedLocked[] = (string) $v['name']; }
+        // The six core messages the client encodes (testPurePackerEncodesMessageToExactVectorBytes).
+        $coreLocked = ['hello', 'hello_ack', 'ping', 'pong', 'goodbye', 'window_update'];
+
+        $locked = array_merge($prefixLocked, $namedLocked, $coreLocked);
+        $all = [];
+        foreach (self::vectors() as [$v]) { $all[] = (string) $v['name']; }
+        $unlocked = array_values(array_diff($all, $locked));
+        $this->assertSame([], $unlocked,
+            'these committed vectors have NO cross-language byte lock (wrong name prefix?): '
+            . implode(', ', $unlocked));
+    }
+
     /** @return array<string,mixed> */
     private static function loadVector(string $file): array
     {

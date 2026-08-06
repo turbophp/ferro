@@ -6,8 +6,10 @@ bytes — neither language's test suite is the source of truth; these files are.
 
 ## Layout
 
-- `*.json` — positive vectors: one complete, valid frame per case (7 files: `hello`,
-  `hello_ack`, `ping`, `pong`, `goodbye`, `window_update`, `error_protocol`).
+- `*.json` — positive vectors: one complete, valid frame per case, covering the CORE messages, the
+  `ERROR`/`Outcome` envelopes, and the SQL / TX / STREAM services. The authoritative index (what
+  each vector locks and why) is `/proto/PROTOCOL.md` §7, with the per-service tables at §8.3, §9.6
+  and §10.3 — deliberately not duplicated here, and deliberately not a file count, which drifts.
 - `negative/*.bin` — malformed frame seeds that a conformant decoder MUST reject (4 files:
   `bad_magic`, `bad_version`, `oversize_len`, `reserved_flag`). These are raw bytes only (no
   JSON sidecar) since there is no canonical decoded form to assert — the point is rejection.
