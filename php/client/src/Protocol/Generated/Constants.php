@@ -110,5 +110,5 @@ final class Constants
     public const ERR_WRITE_UNCONFIRMED = 8193;
     public const ERR_WRITE_UNCONFIRMED_BRANCH = 2;
 
-    public const TYPE_REGISTRY_HASH = 'fc0807a28c0d0ab4';
+    public const TYPE_REGISTRY_HASH = '82a29fc665e4baf2';
 }

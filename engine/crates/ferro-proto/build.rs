@@ -21,6 +21,10 @@ struct Registry {
     methods: BTreeMap<String, BTreeMap<String, u16>>,
     features: BTreeMap<String, BTreeMap<String, u16>>,
     outcome: BTreeMap<String, u8>,
+    // Not emitted as a constant; declared because `deny_unknown_fields` would otherwise reject the
+    // lock and panic the build. It still feeds TYPE_REGISTRY_HASH via the raw lock bytes (M1-S7).
+    #[allow(dead_code)]
+    implemented: Vec<String>,
     tags: BTreeMap<String, u8>,
     branches: BTreeMap<String, u8>,
     codes: BTreeMap<String, ErrCode>,

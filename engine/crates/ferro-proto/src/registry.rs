@@ -16,6 +16,10 @@ pub struct Registry {
     pub methods: BTreeMap<String, BTreeMap<String, u16>>,
     pub features: BTreeMap<String, BTreeMap<String, u16>>,
     pub outcome: BTreeMap<String, u8>,
+    /// The tags implemented end-to-end, SORTED. Part of the hashed lock: changing this set moves
+    /// `TYPE_REGISTRY_HASH`, so an engine/client pair with different type coverage fails fast at
+    /// the handshake instead of throwing mid-query on the first row of a new type (M1-S7).
+    pub implemented: Vec<String>,
     pub tags: BTreeMap<String, u8>,
     pub branches: BTreeMap<String, u8>,
     pub codes: BTreeMap<String, ErrCode>,
@@ -27,8 +31,9 @@ pub struct ErrCode {
     pub branch: u8,
 }
 
-// Deserialize shapes for the three TOML files. serde ignores unknown keys, so `m0_scalar` in
-// types.toml is simply not read here.
+// Deserialize shapes for the three TOML files. serde ignores unknown keys, so a TOML key absent
+// from these structs never reaches the lock (which is exactly how the old `m0_scalar` key became
+// dead documentation — M1-S7 replaced it with the real, parsed `implemented` list below).
 #[derive(Deserialize)]
 struct MethodsToml {
     protocol_version: u8,
@@ -44,6 +49,7 @@ struct MethodsToml {
 }
 #[derive(Deserialize)]
 struct TypesToml {
+    implemented: Vec<String>,
     tags: BTreeMap<String, u8>,
 }
 #[derive(Deserialize)]
@@ -60,6 +66,10 @@ impl Registry {
         let m: MethodsToml = toml::from_str(&read("methods.toml")).unwrap();
         let t: TypesToml = toml::from_str(&read("types.toml")).unwrap();
         let e: ErrorsToml = toml::from_str(&read("errors.toml")).unwrap();
+        // SORTED on the way in: the lock (and therefore the hash) must be stable against a
+        // cosmetic reorder of the TOML list, or a no-op edit mints a spurious handshake failure.
+        let mut implemented = t.implemented;
+        implemented.sort();
         Registry {
             protocol_version: m.protocol_version,
             magic: m.magic,
@@ -71,6 +81,7 @@ impl Registry {
             methods: m.methods,
             features: m.features,
             outcome: m.outcome,
+            implemented,
             tags: t.tags,
             branches: e.branches,
             codes: e.codes,

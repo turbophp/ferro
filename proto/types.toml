@@ -1,8 +1,14 @@
 # Canonical TypedValue tags (SPEC §9). [tag, value] 2-element msgpack array (W-1).
 
-# M0 EXEC/PG path implements only these (T-1); others => NonRetryable{Unsupported}.
-# MUST precede the [tags] table so it is a TOP-LEVEL key, not absorbed as tags.m0_scalar.
-m0_scalar = ["NULL", "BOOL", "I64", "F64", "TEXT", "BYTES"]
+# The tags implemented END-TO-END (engine both backends + PHP client). This list FEEDS
+# registry.lock.json and therefore TYPE_REGISTRY_HASH: changing it changes the hash, so an
+# engine/client pair with different type coverage fails FAST at the handshake instead of
+# throwing mid-query on the first row of a newly-supported type (M1-S7 decision).
+# SORTED so a cosmetic reorder cannot mint a spurious handshake failure.
+# MUST precede the [tags] table so it is a TOP-LEVEL key, not absorbed as tags.implemented.
+implemented = ["BOOL", "BYTES", "DATE", "DECIMAL", "F64", "I64", "JSON", "NULL",
+               "TEXT", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "U64", "UUID"]
+# Deferred (registry constants only; a loud NonRetryable{Unsupported}): ARRAY, INTERVAL, INET, VECTOR.
 
 [tags]
 NULL = 0

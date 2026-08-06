@@ -59,6 +59,22 @@
     "ERROR": 1,
     "OK": 0
   },
+  "implemented": [
+    "BOOL",
+    "BYTES",
+    "DATE",
+    "DECIMAL",
+    "F64",
+    "I64",
+    "JSON",
+    "NULL",
+    "TEXT",
+    "TIME",
+    "TIMESTAMP",
+    "TIMESTAMPTZ",
+    "U64",
+    "UUID"
+  ],
   "tags": {
     "ARRAY": 14,
     "BOOL": 1,
