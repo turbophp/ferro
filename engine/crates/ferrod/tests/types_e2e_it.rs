@@ -119,7 +119,7 @@ fn read_exclusions(e: Engine) -> &'static [(u8, &'static str)] {
     match e {
         Engine::Pg => &[(
             tag::U64,
-            "PostgreSQL has no unsigned integer type — nothing can produce U64 (§22.2)",
+            "PostgreSQL has no unsigned integer type — nothing can produce U64 (§22.2 (e))",
         )],
         Engine::Mysql => &[(
             tag::UUID,
@@ -148,7 +148,7 @@ fn bind_exclusions(e: Engine) -> &'static [(u8, &'static str)] {
         Engine::Pg => &[(
             tag::U64,
             "PgU64Text::accepts is false for EVERY PG type — a deliberate known-fate rejection, \
-             since no PG type holds the top half of the u64 range (§22.2)",
+             since no PG type holds the top half of the u64 range (§22.2 (e))",
         )],
         Engine::Mysql | Engine::MariaDb => &[],
     }

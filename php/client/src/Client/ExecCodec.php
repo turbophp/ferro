@@ -181,14 +181,22 @@ final class ExecCodec
      * {@see HydrationException} (the same class a missing column raises), naming the DTO, the
      * column, the value's actual type and the SPEC §9.1 knob that would change it.
      *
-     * `\ArgumentCountError` extends `\TypeError`, so the same arm covers a plan/row arity fault.
+     * `\ArgumentCountError` extends `\TypeError`, so the same arm covers a plan/row arity fault
+     * *against that constructor*.
+     *
+     * **The wrap is SCOPED to the constructor's OWN argument binding** ({@see isConstructorArgError}).
+     * A `\TypeError`/`\ArgumentCountError` raised from INSIDE the constructor *body* is an ordinary
+     * application bug that has nothing to do with §9.1 type policy, and re-labelling it attached
+     * confidently wrong advice ("type the DTO property to match") to, say, a bad internal helper call
+     * — actively misleading, and it hid the real bug behind `getPrevious()`. Those rethrow UNCHANGED.
      *
      * @template T of object
      * @param class-string<T> $class
      * @param list<string> $cols
      * @param list<mixed> $row
      * @return T
-     * @throws HydrationException
+     * @throws HydrationException on a constructor ARGUMENT fault (the §9.1 boundary).
+     * @throws \TypeError unchanged, when the fault came from inside the constructor body.
      */
     public function hydrateDto(string $class, array $cols, array $row): object
     {
@@ -196,6 +204,9 @@ final class ExecCodec
         try {
             return (new \ReflectionClass($class))->newInstanceArgs($args);
         } catch (\TypeError $e) {
+            if (!self::isConstructorArgError($class, $e)) {
+                throw $e;
+            }
             throw new HydrationException(sprintf(
                 'cannot hydrate %s: %s. The row supplied [%s] — a SPEC §9 canonical column hydrates '
                 . 'to its value object (Ferro\{Decimal, Date, Time, Uuid, Json, U64, '
@@ -211,6 +222,31 @@ final class ExecCodec
                 )),
             ), 0, $e);
         }
+    }
+
+    /**
+     * Did `$e` come from binding the DTO constructor's OWN arguments, or from executing its body?
+     *
+     * PHP names the failing callee in both message shapes, and only those two shapes are raised at
+     * the argument-binding boundary (measured on PHP 8.4):
+     *
+     *   - `Acme\Dto::__construct(): Argument #1 ($x) must be of type string, Ferro\Decimal given`
+     *   - `Too few arguments to function Acme\Dto::__construct(), 1 passed and exactly 2 expected`
+     *
+     * A fault raised INSIDE the body names the inner callee instead (`needsTwo(): Argument #2 …`,
+     * `Too few arguments to function needsTwo(), …`), so the class-qualified prefix separates them
+     * without touching stack-trace internals. The prefix is built from the constructor's DECLARING
+     * class, not `$class`, because an inherited constructor is reported under the parent's name.
+     *
+     * @param class-string $class
+     */
+    private static function isConstructorArgError(string $class, \TypeError $e): bool
+    {
+        $owner = (new \ReflectionClass($class))->getConstructor()?->getDeclaringClass()->getName() ?? $class;
+        $msg = $e->getMessage();
+
+        return str_starts_with($msg, $owner . '::__construct(): Argument #')
+            || str_starts_with($msg, 'Too few arguments to function ' . $owner . '::__construct(),');
     }
 
     /**

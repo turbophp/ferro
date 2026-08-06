@@ -1,7 +1,7 @@
 # .github/workflows/ci.yml
 name: ci
 on:
-  push: { branches: [main, m0-build] }
+  push: { branches: [main, m0-build, m1-build] }
   pull_request:
 jobs:
   rust:
@@ -11,8 +11,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "rustfmt, clippy" }
       - run: cargo fmt --check
-      - run: cargo clippy --workspace -- -D warnings
-      - run: cargo test --workspace          # offline: integration tests skip (no FERRO_TEST_PG_URL)
+      # `--all-targets` is load-bearing, not cosmetic: without it clippy never lints tests,
+      # benches or examples — which is where the live acceptance gates live.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace          # offline: live suites skip (no FERRO_TEST_{PG,MYSQL,MARIADB}_URL)
       # Stable-toolchain type-check for the ferrod fuzz target's standalone workspace (see
       # fuzz-smoke's NOTE below for why its actual `cargo fuzz run` is nightly-only/deferred):
       # `cargo check` alone doesn't need coverage instrumentation, so it compiles cleanly on
@@ -20,22 +22,50 @@ jobs:
       # the nightly ICE fix.
       - run: cd engine/crates/ferrod/fuzz && cargo check
 
+  # The LIVE acceptance lane. It must be able to FAIL: every live suite in this repo is
+  # `skip`-if-unconfigured by design, so a DSN this lane forgets to export turns its whole tier
+  # into a silent no-op that reports "N passed" with zero database contact. Through M1-S6 this lane
+  # started `pg` only, which meant the MySQL/MariaDB tier — its §19.3 chaos matrix, its pin/hygiene
+  # hard gate and the S7 type suite — had never actually run in CI. All three engines now run.
+  #
+  # It brings the backends up with `testkit/docker-compose.yml` itself rather than a `services:`
+  # block, because a `services:` container CANNOT do two things the MySQL tier depends on:
+  #   1. override the image `command:` — the OK-packet session trackers
+  #      (`session_track_state_change` / `_transaction_info` / a CURATED `_system_variables` list)
+  #      are server-START flags, and they are the MySQL pin engine's AUTHORITY (the S1 RFQ analog);
+  #   2. mount `/docker-entrypoint-initdb.d` — services start BEFORE checkout, so `mysql-init.sql`
+  #      (the `ferro_smoke` seed and the §7.1 `p_set_session()` in-stored-program fixture) could
+  #      never be applied.
+  # Using the compose file also keeps the images DIGEST-PINNED and the credentials/healthchecks
+  # identical to local dev by construction, instead of by hand-copy that can drift.
   integration:
     runs-on: ubuntu-latest
-    services:
-      pg:
-        image: postgres:17
-        env: { POSTGRES_USER: ferro, POSTGRES_PASSWORD: ferro, POSTGRES_DB: ferro }
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U ferro -d ferro" --health-interval 1s
-          --health-timeout 3s --health-retries 30
     env:
-      FERRO_TEST_PG_URL: postgres://ferro:ferro@localhost:5432/ferro
+      FERRO_TEST_PG_URL: postgres://ferro:ferro@127.0.0.1:55432/ferro
+      FERRO_TEST_MYSQL_URL: mysql://ferro:ferro@127.0.0.1:33060/ferro
+      FERRO_TEST_MARIADB_URL: mysql://ferro:ferro@127.0.0.1:33061/ferro
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace          # integration lane: FERRO_TEST_PG_URL is set
+      # `--wait` blocks on each service's compose healthcheck, so the suite never races a backend
+      # that is listening but still running its init script.
+      - run: docker compose -f testkit/docker-compose.yml up -d --wait pg mysql mariadb
+      - name: live suite (all three engines)
+        run: |
+          set -o pipefail
+          cargo test --workspace -- --nocapture 2>&1 | tee live.log
+      # Belt-and-braces against this lane rotting back into a no-op: EVERY live suite here prints
+      # `skip: FERRO_TEST_*_URL unset` and returns green when its DSN is missing, which is exactly
+      # how the MySQL/MariaDB tier stayed "23 passed" with zero database contact. In THIS lane a
+      # skip is a lane FAILURE, not a pass.
+      - name: a skipped live suite fails the lane
+        run: |
+          if grep -n 'skip:' live.log; then
+            echo "::error::a live suite skipped itself — a FERRO_TEST_*_URL is missing or its backend is unreachable"
+            exit 1
+          fi
+      - if: always()
+        run: docker compose -f testkit/docker-compose.yml logs --no-color --tail=80
 
   php:
     runs-on: ubuntu-latest
@@ -51,8 +81,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The FULL `cargo deny check` — advisories + bans + licenses + sources. `check bans` alone
+      # enforced only the D9 "no deadpool/bb8" rule and silently ignored the `[advisories]` and
+      # `[licenses]` sections deny.toml actually configures.
       - uses: EmbarkStudios/cargo-deny-action@v2
-        with: { command: check bans }
+        with: { command: check }
 
   fuzz-smoke:
     runs-on: ubuntu-latest

@@ -14,6 +14,8 @@ use Ferro\Decimal;
 use Ferro\NaiveTimestamp;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Msgpack\PackerFactory;
+use Ferro\Tests\Support\BuggyBodyInvoiceDto;
+use Ferro\Tests\Support\BuggyBodyTypeInvoiceDto;
 use Ferro\Tests\Support\InvoiceDto;
 use Ferro\Tests\Support\StringAmountInvoiceDto;
 use PHPUnit\Framework\TestCase;
@@ -187,5 +189,69 @@ final class DtoHydrationTest extends TestCase
         $codec = $this->codec();
         $this->expectException(HydrationException::class);
         $codec->hydrateDto(InvoiceDto::class, ['id', 'amount'], [1, new Decimal('1.00')]);
+    }
+
+    /**
+     * **The wrap is SCOPED (fix round 1).** `\ArgumentCountError` extends `\TypeError`, so the catch
+     * arm used to swallow a fault raised from INSIDE the DTO's own constructor body and relabel it
+     * with irrelevant §9.1 advice — `HydrationException: cannot hydrate …: Too few arguments to
+     * function needsTwo() … so type the DTO property to match, or decode with a §9.1 string policy`.
+     * The row hydrated perfectly; the bug was the application's. It must escape unchanged.
+     */
+    public function testAnArityBugInsideTheConstructorBodyEscapesUnwrapped(): void
+    {
+        $codec = $this->codec();
+        $row = $codec->decodeRow(self::wireRow());
+
+        try {
+            $codec->hydrateDto(BuggyBodyInvoiceDto::class, self::cols(), $row);
+            $this->fail('expected the constructor body\'s own \ArgumentCountError');
+        } catch (HydrationException $e) {
+            $this->fail('an application bug was mislabelled as a §9.1 hydration fault: ' . $e->getMessage());
+        } catch (\ArgumentCountError $e) {
+            $this->assertStringContainsString('needsTwo()', $e->getMessage());
+            $this->assertStringNotContainsString('§9.1', $e->getMessage(), 'no advice is attached');
+        }
+    }
+
+    /** The other in-body shape: a plain `\TypeError` from a helper call, likewise unwrapped. */
+    public function testATypeBugInsideTheConstructorBodyEscapesUnwrapped(): void
+    {
+        $codec = $this->codec();
+        $row = $codec->decodeRow(self::wireRow());
+
+        try {
+            $codec->hydrateDto(BuggyBodyTypeInvoiceDto::class, self::cols(), $row);
+            $this->fail('expected the constructor body\'s own \TypeError');
+        } catch (HydrationException $e) {
+            $this->fail('an application bug was mislabelled as a §9.1 hydration fault: ' . $e->getMessage());
+        } catch (\TypeError $e) {
+            $this->assertStringContainsString('needsTwo(): Argument #2', $e->getMessage());
+        }
+    }
+
+    /**
+     * A pin on the PHP MESSAGE SHAPE the narrowed wrap keys off, so the arity half cannot rot into a
+     * silent no-op. `HydrationPlan` emits exactly one argument per constructor parameter, so a
+     * DTO-own-`__construct` arity fault is not reachable through `hydrateDto` today — but
+     * `ExecCodec::isConstructorArgError` still claims that shape, and this fails the moment PHP
+     * stops producing it.
+     */
+    public function testTheDtoOwnConstructorArityMessageShapeIsStillTheOneTheWrapMatches(): void
+    {
+        $codec = $this->codec();
+        $ctor = (new \ReflectionClass(InvoiceDto::class))->getConstructor();
+        $this->assertNotNull($ctor);
+
+        try {
+            $ctor->getDeclaringClass()->newInstanceArgs([7]);
+            $this->fail('expected an \ArgumentCountError');
+        } catch (\ArgumentCountError $e) {
+            $this->assertStringStartsWith(
+                'Too few arguments to function ' . InvoiceDto::class . '::__construct(),',
+                $e->getMessage(),
+                'the message shape ExecCodec::isConstructorArgError matches on',
+            );
+        }
     }
 }
