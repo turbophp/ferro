@@ -74,7 +74,10 @@ locked by the golden vectors, not by this prose, but this prose explains what th
   losslessly by `ext-msgpack`, which decodes it to a lossy float. The pure-PHP decoder is
   authoritative for this case and MUST decode such a value to a decimal string instead. Rust has no
   such limit (`u64` is native). Only **full-range** `u64` fields need this treatment. The wire has
-  exactly one today: `HelloAck.boot_epoch` (a random per-start id, §19.1). All OTHER `u64` fields
+  **two**: `HelloAck.boot_epoch` (a random per-start id, §19.1) and the **`U64` TypedValue payload
+  (tag 3, M1-S7 — §3.2)**, which carries a user column value and is therefore full-range by
+  definition. Both MUST take the decimal-string path above; applying the native-PHP-int rule to
+  either silently truncates every value above `PHP_INT_MAX`. All OTHER `u64` fields
   are contractually **bounded < 2^63** and are decoded as native PHP ints: `ExecOk.affected`, the
   four `Stats` fields (`queue_us`, `exec_us`, `rows`, `bytes`), and the TX `tx_id`
   (`ExecRequest.tx_id`, `BeginResponse.tx_id`, `TxControl.tx_id`, `SavepointRequest.tx_id` — a
@@ -122,14 +125,22 @@ it and is directly comparable across the two codecs.
 | `DECIMAL` | 5 | `str` | `"-12345.6700"` — full precision, **display scale preserved** | `"NaN"`, `"Infinity"`, `"-Infinity"` are legal payloads (PG `NUMERIC` allows them). `1.10` and `1.1` are **distinct** payloads and must never be normalized to each other. |
 | `DATE` | 8 | `str` | `"YYYY-MM-DD"` | `"infinity"` / `"-infinity"` for the PG sentinels; `"0000-00-00"` for a MySQL zero date. |
 | `TIME` | 9 | `str` | `"HH:MM:SS"` or `"HH:MM:SS.ffffff"` | Hours may exceed 23 (PG `time '24:00:00'`); a MySQL `TIME` spans ±838 h and may be negative → a leading `-`. |
-| `TIMESTAMP` | 10 | `str` | `"YYYY-MM-DD HH:MM:SS[.ffffff]"` | **Naive** — no zone suffix, ever. |
-| `TIMESTAMPTZ` | 11 | `str` | `"YYYY-MM-DDTHH:MM:SS[.ffffff]Z"` | RFC3339, **always normalized to UTC**, always the literal `Z`. |
+| `TIMESTAMP` | 10 | `str` | `"YYYY-MM-DD HH:MM:SS[.ffffff]"` | **Naive** — no zone suffix, ever. Sentinels: `"infinity"` / `"-infinity"` for the PG values; `"0000-00-00 00:00:00"` for a MySQL zero datetime. |
+| `TIMESTAMPTZ` | 11 | `str` | `"YYYY-MM-DDTHH:MM:SS[.ffffff]Z"` | RFC3339, **always normalized to UTC**, always the literal `Z`. Sentinels: `"infinity"` / `"-infinity"` (PG); `"0000-00-00 00:00:00"` for a MySQL zero `TIMESTAMP`. |
 | `UUID` | 12 | `str` | 36-char canonical **lowercase** hyphenated | Never raw bytes. |
 | `JSON` | 13 | `str` | the raw UTF-8 JSON document text | Not re-serialized and not validated by the engine; the client decodes lazily. |
 
 **Fractional seconds** (`TIME`, `TIMESTAMP`, `TIMESTAMPTZ`): emit **no** `.ffffff` group when the
 sub-second part is zero; otherwise emit **exactly six** digits. Never emit a trailing-zero-trimmed
 variant — the payload must be byte-stable for the golden vectors.
+
+**Sentinels** (`DATE`, `TIMESTAMP`, `TIMESTAMPTZ`): the forms above (`"infinity"`, `"-infinity"`,
+`"0000-00-00"`, `"0000-00-00 00:00:00"`) are **literal payloads carried verbatim** — they are
+deliberately NOT parseable as a calendar value. A backend renderer emits them as-is rather than
+inventing a date, and a client decoder must branch on them **before** attempting to construct a
+date/time object; feeding one to a parser yields either an exception or a nonsense date, both of
+which are silent-corruption classes §9.1 exists to prevent. PG's ±infinity arrive as the `i32`/`i64`
+extremes; a MySQL zero date is a legal value under a permissive `sql_mode`.
 
 **`U64` uses the canonical narrowing ladder**, not a fixed `0xcf`. `Value::U64(0)` is a positive
 fixint (`0x92 0x03 0x00`); the marker widens through `0xcc`/`0xcd`/`0xce` and reaches `0xcf` only

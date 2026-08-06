@@ -35,8 +35,8 @@ Text-canonical. Chosen because PHP's `PurePacker` cannot decode msgpack **maps o
 | `DECIMAL` | 5 | `str` | `"-12345.6700"` — full precision, **display scale preserved** | `"NaN"`, `"Infinity"`, `"-Infinity"` are legal payloads (PG NUMERIC allows them). `1.10` and `1.1` are **distinct** payloads. |
 | `DATE` | 8 | `str` | `"YYYY-MM-DD"` | `"infinity"` / `"-infinity"` for the PG sentinels; `"0000-00-00"` for a MySQL zero date. |
 | `TIME` | 9 | `str` | `"HH:MM:SS"` or `"HH:MM:SS.ffffff"` | Hours may exceed 23 (PG `time '24:00:00'`; MySQL `TIME` spans ±838h and may be negative → a leading `-`). |
-| `TIMESTAMP` | 10 | `str` | `"YYYY-MM-DD HH:MM:SS[.ffffff]"` | **Naive** — no zone suffix, ever. |
-| `TIMESTAMPTZ` | 11 | `str` | `"YYYY-MM-DDTHH:MM:SS[.ffffff]Z"` | RFC3339, **always normalized to UTC**, always the literal `Z`. |
+| `TIMESTAMP` | 10 | `str` | `"YYYY-MM-DD HH:MM:SS[.ffffff]"` | **Naive** — no zone suffix, ever. Sentinels: `"infinity"` / `"-infinity"` (PG); `"0000-00-00 00:00:00"` (MySQL zero datetime). |
+| `TIMESTAMPTZ` | 11 | `str` | `"YYYY-MM-DDTHH:MM:SS[.ffffff]Z"` | RFC3339, **always normalized to UTC**, always the literal `Z`. Sentinels: `"infinity"` / `"-infinity"` (PG); `"0000-00-00 00:00:00"` (MySQL zero `TIMESTAMP`). |
 | `UUID` | 12 | `str` | 36-char canonical **lowercase** hyphenated | Never raw bytes (see the `bin` hazard). |
 | `JSON` | 13 | `str` | the raw UTF-8 JSON document text | Not re-serialized, not validated by the engine; PHP decodes lazily. |
 
