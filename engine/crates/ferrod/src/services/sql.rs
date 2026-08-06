@@ -1094,6 +1094,19 @@ fn estimate_row_bytes(row: &[Value]) -> usize {
             Value::I64(_) | Value::F64(_) => 9,
             Value::Text(s) => s.len() + 5,
             Value::Bytes(b) => b.len() + 5,
+            // M1-S7: `U64` is the uint ladder (≤ 9 bytes, same as `I64`); every other canonical tag
+            // rides the `str` family, so its cost is length-proportional — worst-case `str32`
+            // header (5) + the tag. A flat catch-all here would UNDER-size the soft batch bound for
+            // a large JSON document and let a valid request trip `send_data`'s hard `Oversized`
+            // check mid-stream.
+            Value::U64(_) => 9,
+            Value::Decimal(s)
+            | Value::Date(s)
+            | Value::Time(s)
+            | Value::Timestamp(s)
+            | Value::TimestampTz(s)
+            | Value::Uuid(s)
+            | Value::Json(s) => s.len() + 5,
         })
         .sum::<usize>()
         + 2

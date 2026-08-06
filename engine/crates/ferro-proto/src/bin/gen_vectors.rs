@@ -76,6 +76,26 @@ fn v_json(v: &Value) -> serde_json::Value {
             let ints: Vec<u64> = b.iter().map(|x| *x as u64).collect();
             serde_json::json!({ "tag": 7, "data": ints })
         }
+        // M1-S7. A `u64` above `0xffffffff` rides the msgpack `uint64` marker, which PHP's pure
+        // decoder returns as a DECIMAL STRING (and which a JSON number cannot carry losslessly past
+        // 2^53 anyway) — so mirror the decoder exactly: number at or below u32::MAX, string above.
+        // Same convention as `HelloAck.boot_epoch`.
+        Value::U64(n) => {
+            let data = if *n <= u32::MAX as u64 {
+                serde_json::json!(n)
+            } else {
+                serde_json::json!(n.to_string())
+            };
+            serde_json::json!({ "tag": consts::tag::U64, "data": data })
+        }
+        // The str-payload S7 tags: the canonical text goes into the vector verbatim.
+        Value::Decimal(s) => serde_json::json!({ "tag": consts::tag::DECIMAL, "data": s }),
+        Value::Date(s) => serde_json::json!({ "tag": consts::tag::DATE, "data": s }),
+        Value::Time(s) => serde_json::json!({ "tag": consts::tag::TIME, "data": s }),
+        Value::Timestamp(s) => serde_json::json!({ "tag": consts::tag::TIMESTAMP, "data": s }),
+        Value::TimestampTz(s) => serde_json::json!({ "tag": consts::tag::TIMESTAMPTZ, "data": s }),
+        Value::Uuid(s) => serde_json::json!({ "tag": consts::tag::UUID, "data": s }),
+        Value::Json(s) => serde_json::json!({ "tag": consts::tag::JSON, "data": s }),
     }
 }
 fn values_json(vs: &[Value]) -> serde_json::Value {

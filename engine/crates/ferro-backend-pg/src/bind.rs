@@ -47,6 +47,21 @@ fn value_to_boxed(v: &Value) -> Box<dyn ToSql + Sync + Send> {
         Value::F64(f) => Box::new(*f),
         Value::Text(s) => Box::new(s.clone()),
         Value::Bytes(b) => Box::new(b.clone()),
+        // M1-S7 Task 1: UNREACHABLE while `accepts` (below) returns false for these tags — the
+        // query path calls `accepts` on every param BEFORE it ever reaches this boxing step
+        // (`query.rs` buffered + streaming). Task 8b lands the per-tag `ToSql` newtypes and flips
+        // both sides in lockstep. Documented rather than silently plausible.
+        Value::U64(_)
+        | Value::Decimal(_)
+        | Value::Date(_)
+        | Value::Time(_)
+        | Value::Timestamp(_)
+        | Value::TimestampTz(_)
+        | Value::Uuid(_)
+        | Value::Json(_) => unreachable!(
+            "M1-S7 Task 1: bind::accepts rejects these tags until Task 8b; value_to_boxed is only \
+             reached for a Value that accepts() approved"
+        ),
     }
 }
 
@@ -72,6 +87,18 @@ pub fn accepts(v: &Value, ty: &Type) -> bool {
         Value::F64(_) => <f64 as ToSql>::accepts(ty),
         Value::Text(_) => <String as ToSql>::accepts(ty),
         Value::Bytes(_) => <Vec<u8> as ToSql>::accepts(ty),
+        // M1-S7 Task 1: the eight canonical tags are READ-side only for now. Rejecting them here is
+        // the §19.3 known-fate gate — a clean, pre-send "cannot bind" instead of a post-send
+        // failure whose fate would be unknown. Task 8b replaces this arm with per-tag newtypes,
+        // each carrying its OWN narrow `accepts` (never `PgNull`'s universally-true one).
+        Value::U64(_)
+        | Value::Decimal(_)
+        | Value::Date(_)
+        | Value::Time(_)
+        | Value::Timestamp(_)
+        | Value::TimestampTz(_)
+        | Value::Uuid(_)
+        | Value::Json(_) => false,
     }
 }
 
@@ -85,6 +112,14 @@ pub fn value_kind(v: &Value) -> &'static str {
         Value::F64(_) => "F64",
         Value::Text(_) => "TEXT",
         Value::Bytes(_) => "BYTES",
+        Value::U64(_) => "U64",
+        Value::Decimal(_) => "DECIMAL",
+        Value::Date(_) => "DATE",
+        Value::Time(_) => "TIME",
+        Value::Timestamp(_) => "TIMESTAMP",
+        Value::TimestampTz(_) => "TIMESTAMPTZ",
+        Value::Uuid(_) => "UUID",
+        Value::Json(_) => "JSON",
     }
 }
 
@@ -149,5 +184,58 @@ mod tests {
         assert_eq!(value_kind(&Value::Text(String::new())), "TEXT");
         assert_eq!(value_kind(&Value::Bytes(vec![])), "BYTES");
         assert_eq!(value_kind(&Value::Bool(true)), "BOOL");
+        // M1-S7 canonical tags: a label per tag so a bind rejection names the real canonical type.
+        assert_eq!(value_kind(&Value::U64(1)), "U64");
+        assert_eq!(value_kind(&Value::Decimal("1".into())), "DECIMAL");
+        assert_eq!(value_kind(&Value::Date("2026-01-01".into())), "DATE");
+        assert_eq!(value_kind(&Value::Time("00:00:00".into())), "TIME");
+        assert_eq!(
+            value_kind(&Value::Timestamp("2026-01-01 00:00:00".into())),
+            "TIMESTAMP"
+        );
+        assert_eq!(
+            value_kind(&Value::TimestampTz("2026-01-01T00:00:00Z".into())),
+            "TIMESTAMPTZ"
+        );
+        assert_eq!(
+            value_kind(&Value::Uuid("00000000-0000-0000-0000-000000000000".into())),
+            "UUID"
+        );
+        assert_eq!(value_kind(&Value::Json("null".into())), "JSON");
+    }
+
+    /// M1-S7 Task 1: the eight canonical tags are read-side only until Task 8b, and `accepts` is
+    /// where that is ENFORCED — it is the §19.3 known-fate pre-flight, and `value_to_boxed`'s
+    /// `unreachable!` for these variants is sound only while this holds. If Task 8b is skipped or
+    /// half-landed, this test fails loudly instead of the daemon panicking on a live bind.
+    #[test]
+    fn s7_canonical_tags_are_rejected_by_accepts_until_task_8b() {
+        for (v, ty) in [
+            (Value::U64(1), Type::INT8),
+            (Value::Decimal("1".into()), Type::NUMERIC),
+            (Value::Date("2026-01-01".into()), Type::DATE),
+            (Value::Time("00:00:00".into()), Type::TIME),
+            (
+                Value::Timestamp("2026-01-01 00:00:00".into()),
+                Type::TIMESTAMP,
+            ),
+            (
+                Value::TimestampTz("2026-01-01T00:00:00Z".into()),
+                Type::TIMESTAMPTZ,
+            ),
+            (
+                Value::Uuid("00000000-0000-0000-0000-000000000000".into()),
+                Type::UUID,
+            ),
+            (Value::Json("null".into()), Type::JSONB),
+        ] {
+            assert!(
+                !accepts(&v, &ty),
+                "{} must stay a known-fate bind rejection until Task 8b",
+                value_kind(&v)
+            );
+            // ...and also against TEXT, so nothing sneaks through a permissive target type.
+            assert!(!accepts(&v, &Type::TEXT));
+        }
     }
 }

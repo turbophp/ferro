@@ -53,6 +53,22 @@ fn value_to_my(v: &Value) -> MyValue {
         Value::F64(f) => MyValue::Double(*f),
         Value::Text(s) => MyValue::Bytes(s.clone().into_bytes()),
         Value::Bytes(b) => MyValue::Bytes(b.clone()),
+        // ---- M1-S7 canonical tags. The mapping stays TOTAL (the module invariant above): every
+        // variant has a driver representation, so no arm can fail and mint a fate-unknown error.
+        Value::U64(n) => MyValue::UInt(*n),
+        // DECIMAL/UUID/JSON: the canonical text IS what the server wants as a string param.
+        Value::Decimal(s) | Value::Uuid(s) | Value::Json(s) => {
+            MyValue::Bytes(s.clone().into_bytes())
+        }
+        // DATE / TIME / TIMESTAMP / TIMESTAMPTZ: Task 8b parses the canonical text into a TYPED
+        // param (`MyValue::Date` / `MyValue::Time`). A Bytes passthrough of the `Z`-suffixed
+        // TIMESTAMPTZ text is REJECTED by both servers (MySQL 8 `1292 Incorrect datetime value`
+        // under STRICT_TRANS_TABLES; MariaDB 11 rejects offsets in datetime literals outright), so
+        // this arm is correct for DATE and naive TIMESTAMP and WRONG for TIMESTAMPTZ — Task 8b is
+        // not optional. It stays total (never panics) so the module invariant holds meanwhile.
+        Value::Date(s) | Value::Time(s) | Value::Timestamp(s) | Value::TimestampTz(s) => {
+            MyValue::Bytes(s.clone().into_bytes())
+        }
     }
 }
 
@@ -127,6 +143,52 @@ mod tests {
                     "Text binds as a byte string"
                 );
                 assert!(matches!(vs[5], MyValue::Bytes(_)));
+            }
+            other => panic!("expected Params::Positional, got {other:?}"),
+        }
+    }
+
+    /// The module's documented invariant, restated for M1-S7: `value_to_my` is TOTAL over every
+    /// canonical `Value` variant — no panic, no fallible arm, and only `Value::Null` produces a
+    /// driver `NULL`. (MySQL has no `accepts`-style pre-flight — see the module docs — so totality
+    /// is what keeps a bind from ever becoming a fate-unknown error.)
+    #[test]
+    fn value_to_my_is_total_over_every_canonical_variant() {
+        let all = [
+            Value::Null,
+            Value::Bool(true),
+            Value::I64(-200),
+            Value::F64(1.5),
+            Value::Text("hi".to_string()),
+            Value::Bytes(vec![0xde, 0xad]),
+            Value::U64(u64::MAX),
+            Value::Decimal("-12345.6700".to_string()),
+            Value::Date("2026-08-05".to_string()),
+            Value::Time("-838:59:58.000001".to_string()),
+            Value::Timestamp("2026-08-05 13:45:07.250000".to_string()),
+            Value::TimestampTz("2026-08-05T13:45:07.250000Z".to_string()),
+            Value::Uuid("3f2b8c1a-0000-4fff-8000-abcdefabcdef".to_string()),
+            Value::Json(r#"{"a":[1,2]}"#.to_string()),
+        ];
+        assert_eq!(all.len(), 14, "one instance of every canonical tag");
+
+        match to_params(&all) {
+            Params::Positional(vs) => {
+                assert_eq!(vs.len(), 14);
+                for (i, (v, my)) in all.iter().zip(vs.iter()).enumerate() {
+                    let is_null = matches!(my, MyValue::NULL);
+                    assert_eq!(
+                        is_null,
+                        matches!(v, Value::Null),
+                        "param {i} ({v:?}) NULL-ness must mirror the canonical value"
+                    );
+                }
+                // U64 above i64::MAX must survive as an UNSIGNED driver value, not wrap to Int.
+                assert!(
+                    matches!(vs[6], MyValue::UInt(u64::MAX)),
+                    "U64(u64::MAX) must bind as MyValue::UInt, got {:?}",
+                    vs[6]
+                );
             }
             other => panic!("expected Params::Positional, got {other:?}"),
         }

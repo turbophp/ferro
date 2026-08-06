@@ -82,6 +82,111 @@ fn roundtrip_all_scalars() {
 }
 
 #[test]
+fn s7_text_tags_roundtrip() {
+    let cases = vec![
+        Value::U64(u64::MAX),
+        Value::U64(0),
+        Value::Decimal("-12345.6700".into()),
+        Value::Decimal("NaN".into()),
+        Value::Date("2026-08-05".into()),
+        Value::Date("-infinity".into()),
+        Value::Time("24:00:00".into()),
+        Value::Time("-838:59:58.000001".into()),
+        Value::Timestamp("2026-08-05 13:45:07.250000".into()),
+        Value::TimestampTz("2026-08-05T13:45:07.250000Z".into()),
+        Value::Uuid("3f2b8c1a-0000-4fff-8000-abcdefabcdef".into()),
+        Value::Json(r#"{"a":[1,2],"b":null}"#.into()),
+    ];
+    for v in cases {
+        let mut buf = Vec::new();
+        v.encode(&mut buf);
+        let mut rd = &buf[..];
+        let got = Value::decode(&mut rd).expect("decodes");
+        assert_eq!(got, v, "roundtrip mismatch");
+        assert!(rd.is_empty(), "trailing bytes left for {v:?}");
+    }
+}
+
+/// Hazard 46: U64 uses the CANONICAL NARROWING ladder (write_uint), so a small U64 is a positive
+/// fixint on the wire — byte-identical to PHP `PurePacker::packUint`. A marker-strict reader
+/// (`dec::read_u64`) would reject exactly this.
+#[test]
+fn s7_u64_uses_the_canonical_narrowing_ladder() {
+    let mut small = Vec::new();
+    Value::U64(0).encode(&mut small);
+    assert_eq!(
+        small,
+        vec![0x92, 0x03, 0x00],
+        "U64(0) must narrow to a positive fixint"
+    );
+    let mut big = Vec::new();
+    Value::U64(u64::MAX).encode(&mut big);
+    assert_eq!(big[2], 0xcf, "U64::MAX must ride the uint64 marker");
+}
+
+#[test]
+fn s7_tags_report_their_registry_tag() {
+    use ferro_proto::consts::tag;
+    assert_eq!(Value::U64(1).tag(), tag::U64);
+    assert_eq!(Value::Decimal("1".into()).tag(), tag::DECIMAL);
+    assert_eq!(Value::Date("2026-01-01".into()).tag(), tag::DATE);
+    assert_eq!(Value::Time("00:00:00".into()).tag(), tag::TIME);
+    assert_eq!(
+        Value::Timestamp("2026-01-01 00:00:00".into()).tag(),
+        tag::TIMESTAMP
+    );
+    assert_eq!(
+        Value::TimestampTz("2026-01-01T00:00:00Z".into()).tag(),
+        tag::TIMESTAMPTZ
+    );
+    assert_eq!(
+        Value::Uuid("00000000-0000-0000-0000-000000000000".into()).tag(),
+        tag::UUID
+    );
+    assert_eq!(Value::Json("null".into()).tag(), tag::JSON);
+}
+
+/// The still-deferred tags MUST stay rejected — this is the §22.2 deferral, enforced.
+#[test]
+fn deferred_tags_are_still_rejected() {
+    use ferro_proto::consts::tag;
+    for t in [tag::ARRAY, tag::INTERVAL, tag::INET, tag::VECTOR] {
+        let mut buf = Vec::new();
+        rmp::encode::write_array_len(&mut buf, 2).unwrap();
+        rmp::encode::write_pfix(&mut buf, t).unwrap();
+        rmp::encode::write_nil(&mut buf).unwrap();
+        let mut rd = &buf[..];
+        assert!(
+            Value::decode(&mut rd).is_err(),
+            "tag {t} must still be unsupported"
+        );
+    }
+}
+
+/// Hazard 2: every new str-payload tag must inherit the bounds discipline.
+#[test]
+fn s7_str_tags_reject_a_lying_length_prefix() {
+    use ferro_proto::consts::tag;
+    for t in [
+        tag::DECIMAL,
+        tag::DATE,
+        tag::TIME,
+        tag::TIMESTAMP,
+        tag::TIMESTAMPTZ,
+        tag::UUID,
+        tag::JSON,
+    ] {
+        // str32 claiming 4 GiB with no bytes behind it.
+        let buf = [0x92, t, 0xdb, 0xff, 0xff, 0xff, 0xff];
+        let mut rd = &buf[..];
+        assert!(
+            Value::decode(&mut rd).is_err(),
+            "tag {t} must reject a lying length"
+        );
+    }
+}
+
+#[test]
 fn lying_length_prefix_is_rejected_before_allocating() {
     // str32 (0xdb) claiming ~4 GiB with no body must error via the bound check, NOT pre-allocate.
     let s = [0x92u8, 0x06, 0xdb, 0xff, 0xff, 0xff, 0xff];

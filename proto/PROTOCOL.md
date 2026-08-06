@@ -88,9 +88,12 @@ locked by the golden vectors, not by this prose, but this prose explains what th
 `TypedValue` is the canonical row/param value encoding (SPEC §9): a 2-element MessagePack array
 `[tag: u8, payload]`. `NULL` is tag `0` with a `nil` payload — there is no separate "is null" bit.
 
-M0 implements encode/decode for exactly six scalar tags (decision T-1); all other tags in
-`/proto/types.toml`'s `[tags]` table are registry constants only — attempting to use them is a
-`NonRetryable{Unsupported}` error, not a codec crash:
+As of **M1-S7**, encode/decode is implemented for **fourteen** tags (M0's six, decision T-1, plus
+the eight canonical tags below). The remaining tags in `/proto/types.toml`'s `[tags]` table are
+registry constants only — attempting to use one is a `NonRetryable{Unsupported}` error, not a codec
+crash.
+
+### 3.1 M0 scalars
 
 | tag name | tag value | payload MessagePack family |
 |---|---|---|
@@ -101,11 +104,63 @@ M0 implements encode/decode for exactly six scalar tags (decision T-1); all othe
 | `TEXT` | 6 | `str` family |
 | `BYTES` | 7 | `bin` family |
 
-(Tag numbering is not contiguous across the implemented set — `U64`=3, `DECIMAL`=5 sit between
-`I64`/`F64` and `TEXT` in the full registry; they are simply unimplemented in M0.) The full tag
-table (`NULL` through `VECTOR`) lives in `/proto/types.toml` and `consts::tag::*`; it is not
-repeated here to avoid a second source of truth — see the registry lock file for the numeric
-assignments.
+### 3.2 M1-S7 canonical tags — **text-canonical payloads**
+
+Every tag added in M1-S7 rides the msgpack **`str`** family carrying **canonical text**, except
+`U64` which rides the **uint** family. No S7 tag uses `bin`.
+
+*Why text, and why never `bin`:* PHP's pure decoder (`PurePacker`) cannot decode msgpack **maps or
+ext types at all**, and §2 bans ext types outright; separately, `str` and `bin` are
+**indistinguishable in PHP after unpack** (both come back as a PHP string, so the TypedValue tag is
+the only discriminator), which would force a `list<int>` special case *and* make the payload
+un-round-trippable through the golden-vector JSON `message` field. Canonical text sidesteps all of
+it and is directly comparable across the two codecs.
+
+| tag name | tag value | msgpack family | canonical payload | notes |
+|---|---|---|---|---|
+| `U64` | 3 | uint family | unsigned 64-bit integer | The ONLY non-`str` addition. |
+| `DECIMAL` | 5 | `str` | `"-12345.6700"` — full precision, **display scale preserved** | `"NaN"`, `"Infinity"`, `"-Infinity"` are legal payloads (PG `NUMERIC` allows them). `1.10` and `1.1` are **distinct** payloads and must never be normalized to each other. |
+| `DATE` | 8 | `str` | `"YYYY-MM-DD"` | `"infinity"` / `"-infinity"` for the PG sentinels; `"0000-00-00"` for a MySQL zero date. |
+| `TIME` | 9 | `str` | `"HH:MM:SS"` or `"HH:MM:SS.ffffff"` | Hours may exceed 23 (PG `time '24:00:00'`); a MySQL `TIME` spans ±838 h and may be negative → a leading `-`. |
+| `TIMESTAMP` | 10 | `str` | `"YYYY-MM-DD HH:MM:SS[.ffffff]"` | **Naive** — no zone suffix, ever. |
+| `TIMESTAMPTZ` | 11 | `str` | `"YYYY-MM-DDTHH:MM:SS[.ffffff]Z"` | RFC3339, **always normalized to UTC**, always the literal `Z`. |
+| `UUID` | 12 | `str` | 36-char canonical **lowercase** hyphenated | Never raw bytes. |
+| `JSON` | 13 | `str` | the raw UTF-8 JSON document text | Not re-serialized and not validated by the engine; the client decodes lazily. |
+
+**Fractional seconds** (`TIME`, `TIMESTAMP`, `TIMESTAMPTZ`): emit **no** `.ffffff` group when the
+sub-second part is zero; otherwise emit **exactly six** digits. Never emit a trailing-zero-trimmed
+variant — the payload must be byte-stable for the golden vectors.
+
+**`U64` uses the canonical narrowing ladder**, not a fixed `0xcf`. `Value::U64(0)` is a positive
+fixint (`0x92 0x03 0x00`); the marker widens through `0xcc`/`0xcd`/`0xce` and reaches `0xcf` only
+above `0xffffffff`. This is byte-identical to PHP `PurePacker::packUint`, so a decoder must accept
+**any** uint marker for tag 3 — a marker-strict `uint64`-only reader is a defect. Consequence for
+the PHP side: a `U64` at or below `0xffffffff` decodes to a PHP `int`, while anything above it
+decodes to a **decimal string** (the §2 `uint64` overflow rule), so the value's PHP type follows its
+**magnitude**, not its tag.
+
+The `str`-family payloads are **canonical text produced by the backend**. The codecs move that text
+verbatim and validate nothing beyond UTF-8 — the rendering decision lives where the source format is
+known (the backend), never in the codec.
+
+> **Rollout status (M1-S7 in progress).** This table is the *contract*, pinned first so both codecs
+> are written against one text. The Rust codec (`ferro_proto::value::Value`) implements all fourteen
+> tags today; the PHP codec and the per-tag golden vectors land later in the same slice, and until
+> they do the PHP side still rejects tags 3/5/8–13 as `Unsupported`. Remove this note when the
+> vectors land.
+
+### 3.3 Still unimplemented
+
+`ARRAY` (14), `INTERVAL` (15), `INET` (16) and `VECTOR` (17) remain **registry constants only** and
+stay a loud `NonRetryable{Unsupported}` (SPEC §22.2). Decoding one is an error by construction, and
+that is asserted (`ferro-proto/tests/value.rs::deferred_tags_are_still_rejected`).
+
+The full tag table (`NULL` through `VECTOR`) lives in `/proto/types.toml` and `consts::tag::*`; the
+numeric assignments are not duplicated beyond the tables above — see the registry lock file.
+
+**Tag-byte encoding.** The tag is always a **bare positive fixint** (written with `write_pfix`, read
+with `read_pfix`), which is exact for the whole registry (0..=17). A multi-byte encoding of the same
+tag number is **not** accepted — this keeps the `[tag, payload]` pair canonical byte-for-byte.
 
 ## 4. Core-service messages
 

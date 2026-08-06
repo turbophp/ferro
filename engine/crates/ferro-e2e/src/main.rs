@@ -241,6 +241,17 @@ fn render_value(v: &Value) -> String {
         Value::F64(f) => f.to_string(),
         Value::Text(s) => format!("{s:?}"),
         Value::Bytes(b) => format!("<{} bytes>", b.len()),
+        // M1-S7 canonical tags: render the canonical text as-is, prefixed with the tag name so the
+        // e2e transcript shows WHICH canonical type a cell arrived as (a TIMESTAMP and a
+        // TIMESTAMPTZ are otherwise easy to confuse by eye).
+        Value::U64(n) => n.to_string(),
+        Value::Decimal(s) => format!("DECIMAL({s})"),
+        Value::Date(s) => format!("DATE({s})"),
+        Value::Time(s) => format!("TIME({s})"),
+        Value::Timestamp(s) => format!("TIMESTAMP({s})"),
+        Value::TimestampTz(s) => format!("TIMESTAMPTZ({s})"),
+        Value::Uuid(s) => format!("UUID({s})"),
+        Value::Json(s) => format!("JSON({s})"),
     }
 }
 
