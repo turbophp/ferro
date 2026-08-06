@@ -177,8 +177,9 @@ async fn kill_conn(raw: &mut Conn, id: u64) {
 }
 
 /// `CREATE TABLE IF NOT EXISTS` the counter table over the raw side connection (fixture setup,
-/// out-of-band from ferrod). Signed `BIGINT` (never `BIGINT UNSIGNED` — the unsigned-64 policy is
-/// deferred, SPEC §9.1), so the read-back maps cleanly to `Value::I64`.
+/// out-of-band from ferrod). Signed `BIGINT`, so the read-back maps to `Value::I64` — this suite
+/// asserts §19.3 fates, not type coverage, and a signed counter keeps those assertions on one tag.
+/// (`BIGINT UNSIGNED` is no longer out of scope: M1-S7 admits it as `U64`.)
 async fn raw_ensure_table(raw: &mut Conn, table: &str) {
     raw.query_drop(format!(
         "CREATE TABLE IF NOT EXISTS {table} (k VARCHAR(190) PRIMARY KEY, n BIGINT NOT NULL)"

@@ -82,7 +82,10 @@ async fn read_sbs_raw(raw: &mut ferro_backend_mysql::MysqlConn) -> u64 {
 }
 
 /// The physical connection id (the MySQL protocol handshake thread id off the driver — NOT
-/// `CONNECTION_ID()`, whose `BIGINT UNSIGNED` result is the deferred unsigned-64 type, SPEC §9).
+/// `CONNECTION_ID()`, which is a server-side value that a `COM_RESET_CONNECTION` also preserves but
+/// which would need a query round trip to read; the driver already holds the handshake id.
+/// Its `BIGINT UNSIGNED` type is no longer a blocker — M1-S7 admits it as `U64` — but the protocol
+/// id remains the more direct signal).
 /// `COM_RESET_CONNECTION` preserves this id (it re-initializes session state on the same TCP conn),
 /// so equal ids across two checkouts proves the SAME physical conn was reused.
 fn conn_id(co: &Checkout<MysqlBackend>) -> u32 {

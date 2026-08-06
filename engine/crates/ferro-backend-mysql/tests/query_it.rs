@@ -4,8 +4,11 @@
 //! Proves — against real Dockerized MySQL 8 + MariaDB 11 — that:
 //!   * every scoped scalar round-trips `query` → `rowmap` (SIGNED bigint, double, text, blob, bool,
 //!     null), with the right `ColMeta` tags built off the prepared statement;
-//!   * an out-of-scope column (`BIGINT UNSIGNED`, `DECIMAL`) is a LOUD `Unsupported` — never a silent
-//!     miscast — raised before the query runs (conn stays clean);
+//!   * a still-deferred column type (`YEAR`, `BIT`, `ENUM`, `SET` — M1-S7 §22.2) is a LOUD
+//!     `Unsupported` — never a silent miscast — raised before the query runs (conn stays clean).
+//!     **REPOINTED in M1-S7:** this used to assert `BIGINT UNSIGNED` and `DECIMAL`, both of which
+//!     are now SUPPORTED (`U64` / `DECIMAL`, see `mysql_types_it.rs`), so the assertion moved to
+//!     types that are genuinely still refused rather than being deleted;
 //!   * a bind-arity mismatch is a KNOWN-FATE `Unsupported`, NEVER `ConnectionLost` (§19.3 safety);
 //!   * `last_insert_id` is populated after an INSERT on a SIGNED `AUTO_INCREMENT`;
 //!   * a duplicate key (errno 1062) is a generic SQL NonRetryable (`Unique`), NOT `Protocol`;
@@ -107,34 +110,53 @@ async fn scoped_scalars_round_trip(backend: &MysqlBackend, label: &str) {
     conn.mysql.disconnect().await.ok();
 }
 
-/// An out-of-scope column type is a LOUD `Unsupported`, raised before the query runs (conn stays
-/// clean). Both `BIGINT UNSIGNED` (the deferred unsigned-64 policy) and `DECIMAL`.
+/// A still-deferred column type is a LOUD `Unsupported`, raised before the query runs (conn stays
+/// clean).
+///
+/// **REPOINTED in M1-S7 (Task 5b), not deleted.** This test used to create
+/// `ferro_oos (u BIGINT UNSIGNED, m DECIMAL(10,2))` and assert BOTH were refused. Both are now
+/// SUPPORTED (`U64` and `DECIMAL` — proven end-to-end in `mysql_types_it.rs`), so the assertion
+/// moves to the types S7 genuinely still defers (SPEC §22.2): `YEAR`, `BIT`, `ENUM`, `SET`.
+///
+/// Two things deliberately NOT in this list, because they are measurably not refusable:
+/// MariaDB's native `UUID` (and `INET4`/`INET6`) reach the wire as `MYSQL_TYPE_STRING` in a
+/// utf8mb4 charset carrying their text form — indistinguishable from a `CHAR(36)` — and MariaDB's
+/// `JSON` is a `LONGTEXT` alias. Both therefore classify as `TEXT` by design; `mysql_types_it.rs`
+/// asserts that outcome explicitly rather than pretending it is a refusal.
 async fn out_of_scope_column_is_unsupported(backend: &MysqlBackend, label: &str) {
     let mut conn = backend.connect().await.expect("connect");
     backend
         .simple_query(
             &mut conn,
-            "CREATE TEMPORARY TABLE ferro_oos (u BIGINT UNSIGNED, m DECIMAL(10, 2))",
+            "CREATE TEMPORARY TABLE ferro_oos (y YEAR, b BIT(8), e ENUM('a','b'), s SET('x','y'))",
         )
         .await
         .expect("create temp table");
     backend
-        .query(
+        .simple_query(
             &mut conn,
-            "INSERT INTO ferro_oos (u, m) VALUES (?, ?)",
-            &[Value::I64(1), Value::F64(3.5)],
+            "INSERT INTO ferro_oos (y, b, e, s) VALUES (2026, b'10101010', 'a', 'x')",
         )
         .await
-        .expect("insert (bind is fine; the READ types are what's out of scope)");
+        .expect("insert (the READ types are what's out of scope, not the write)");
 
-    for col in ["u", "m"] {
+    for col in ["y", "b", "e", "s"] {
         let err = backend
             .query(&mut conn, &format!("SELECT {col} FROM ferro_oos"), &[])
             .await
             .unwrap_err();
         assert!(
             matches!(err, PoolError::Unsupported(_)),
-            "[{label}] out-of-scope column `{col}` must be Unsupported (loud, never a miscast), got {err:?}"
+            "[{label}] deferred column `{col}` must be Unsupported (loud, never a miscast), got {err:?}"
+        );
+        // The refusal names the COLUMN (an ENUM/SET member list is per-table, so the type code
+        // alone identifies nothing an operator can act on).
+        let PoolError::Unsupported(msg) = &err else {
+            unreachable!()
+        };
+        assert!(
+            msg.contains(col),
+            "[{label}] the refusal must name the column `{col}`: {msg}"
         );
     }
 
