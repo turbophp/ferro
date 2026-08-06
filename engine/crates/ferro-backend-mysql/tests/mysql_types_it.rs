@@ -941,6 +941,322 @@ async fn mariadb_extended_types_classify_as_text(url: &str, label: &str) {
     conn.mysql.disconnect().await.ok();
 }
 
+/// **Task 8b — the BIND path: read → bind straight back → read again is BYTE-IDENTICAL.**
+///
+/// Deliberately a round trip rather than a literal comparison: both reads come from the SAME column
+/// type, so what is asserted is "a value Ferro handed you is a value Ferro can put back" — which is
+/// what a DBAL insert of a hydrated entity actually does. The load-bearing case is `TIMESTAMPTZ`:
+/// its canonical text carries a `Z` that no MySQL/MariaDB datetime literal accepts (hazard 41), so
+/// it must reach the server as TYPED components — and those components are only correct because the
+/// session is UTC-pinned, which is re-asserted here.
+async fn bind_round_trip_is_byte_identical(url: &str, label: &str) {
+    let backend = MysqlBackend::new(url);
+    let mut conn = backend.connect().await.expect("connect");
+    let maria = is_mariadb(&mut conn).await;
+    assert_eq!(
+        read_text(&mut conn, "SELECT @@session.time_zone").await,
+        "+00:00",
+        "[{label}] the TIMESTAMPTZ bind is only correct under the UTC pin — the two are coupled"
+    );
+    let sql_mode = read_text(&mut conn, "SELECT @@session.sql_mode").await;
+
+    backend
+        .simple_query(
+            &mut conn,
+            "CREATE TEMPORARY TABLE ferro_s7_bind (
+                 id BIGINT PRIMARY KEY,
+                 d  DECIMAL(30,10),
+                 d2 DECIMAL(10,2),
+                 un BIGINT UNSIGNED,
+                 da DATE,
+                 tm TIME(6),
+                 dt DATETIME(6),
+                 ts TIMESTAMP(6) NULL,
+                 j  JSON,
+                 uu CHAR(36)
+             )",
+        )
+        .await
+        .expect("create temp table");
+
+    const COLS: &str = "d, d2, un, da, tm, dt, ts, j";
+    const PLACEHOLDERS: &str = "?, ?, ?, ?, ?, ?, ?, ?";
+    // Seeds are written with TEXT LITERALS (no params), so the FIRST read is an independent oracle
+    // and not an echo of the bind path. Row 1 is fractional, row 2 is whole-second (the canonical
+    // payload must carry NO `.ffffff` group — and a re-bind must not grow one) with a SMALL
+    // `BIGINT UNSIGNED` (hazard 23: ≤ i64::MAX arrives as the driver's `Int`, not `UInt`).
+    let seeds: &[(i64, &str)] = &[
+        (
+            1,
+            "'-12345.6700000000', '1.1', 18446744073709551615, '2026-08-05', \
+             '-838:59:58.000001', '2026-08-05 11:45:07.250000', '2026-08-05 11:45:07.250000', \
+             '{\"a\": [1, 2]}'",
+        ),
+        (
+            2,
+            "'0.0000000001', '0.00', 5, '1970-01-02', '26:00:00', \
+             '2026-08-05 11:45:07', '2026-08-05 11:45:07', 'null'",
+        ),
+    ];
+
+    for (id, literals) in seeds {
+        backend
+            .simple_query(
+                &mut conn,
+                &format!("INSERT INTO ferro_s7_bind (id, {COLS}) VALUES ({id}, {literals})"),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] seed row {id}: {e:?}"));
+
+        // (1) READ.
+        let first = backend
+            .query(
+                &mut conn,
+                &format!("SELECT {COLS} FROM ferro_s7_bind WHERE id = {id}"),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] read seed row {id}: {e:?}"));
+        let v1 = first.rows[0].clone();
+
+        // (2) BIND those exact canonical values straight back.
+        let echo_id = id + 100;
+        let mut params = vec![Value::I64(echo_id)];
+        params.extend(v1.iter().cloned());
+        backend
+            .query(
+                &mut conn,
+                &format!("INSERT INTO ferro_s7_bind (id, {COLS}) VALUES (?, {PLACEHOLDERS})"),
+                &params,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] BIND-BACK of row {id} failed: {e:?}"));
+
+        // (3) READ AGAIN — byte-identical, per column.
+        let second = backend
+            .query(
+                &mut conn,
+                &format!("SELECT {COLS} FROM ferro_s7_bind WHERE id = {echo_id}"),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] read echo row {echo_id}: {e:?}"));
+
+        for (i, (a, b)) in v1.iter().zip(second.rows[0].iter()).enumerate() {
+            assert_eq!(
+                a, b,
+                "[{label}] row {id}, column {} ({i}): read -> bind -> read must be BYTE-IDENTICAL",
+                first.cols[i].name
+            );
+            assert_eq!(
+                first.cols[i].tag, second.cols[i].tag,
+                "[{label}] row {id}, column {i}: the tag must survive the round trip too"
+            );
+        }
+        println!("  [{label}] row {id} round trip: {v1:?}");
+    }
+
+    // The precision/instant claims, spelled out rather than left implicit in the equality above.
+    let r = backend
+        .query(
+            &mut conn,
+            "SELECT d2, un, tm, dt, ts FROM ferro_s7_bind WHERE id = 101",
+            &[],
+        )
+        .await
+        .expect("read the echoed row 1");
+    assert_eq!(
+        r.rows[0][0],
+        Value::Decimal("1.10".into()),
+        "[{label}] the DISPLAY SCALE survives a bind: `1.10` must not come back as `1.1`"
+    );
+    assert_eq!(
+        r.rows[0][1],
+        Value::U64(u64::MAX),
+        "[{label}] the top of the BIGINT UNSIGNED range survives (never wrapped through i64)"
+    );
+    assert_eq!(
+        r.rows[0][2],
+        Value::Time("-838:59:58.000001".into()),
+        "[{label}] a NEGATIVE, >24 h TIME survives — it is a signed duration, not a time of day"
+    );
+    assert_eq!(
+        r.rows[0][3],
+        Value::Timestamp("2026-08-05 11:45:07.250000".into()),
+        "[{label}] the naive DATETIME survives unshifted"
+    );
+    assert_eq!(
+        r.rows[0][4],
+        Value::TimestampTz("2026-08-05T11:45:07.250000Z".into()),
+        "[{label}] the UTC INSTANT survives a bind of the `Z`-suffixed canonical text — which is \
+         only possible because it went out as TYPED components under the UTC pin (hazard 41)"
+    );
+    let r = backend
+        .query(
+            &mut conn,
+            "SELECT tm, dt, ts FROM ferro_s7_bind WHERE id = 102",
+            &[],
+        )
+        .await
+        .expect("read the echoed row 2");
+    assert_eq!(r.rows[0][0], Value::Time("26:00:00".into()));
+    assert_eq!(
+        r.rows[0][1],
+        Value::Timestamp("2026-08-05 11:45:07".into()),
+        "[{label}] a whole-second DATETIME(6) must NOT grow a fraction group through the bind"
+    );
+    assert_eq!(
+        r.rows[0][2],
+        Value::TimestampTz("2026-08-05T11:45:07Z".into()),
+        "[{label}] a whole-second TIMESTAMP(6) must NOT grow a fraction group through the bind"
+    );
+
+    // **The two documented engine asymmetries, asserted on the BIND side too (hazard 25).** MySQL 8
+    // has no native UUID type and MariaDB's `JSON` is a `LONGTEXT` alias, so neither column can
+    // READ back as its canonical tag — but both must still accept the canonical payload byte-for-
+    // byte, which is what the S8 DBAL tier will do with a `Ferro\Uuid` / `Ferro\Json`.
+    const UUID_TEXT: &str = "3f2b8c1a-0000-4fff-8000-abcdefabcdef";
+    backend
+        .query(
+            &mut conn,
+            "INSERT INTO ferro_s7_bind (id, uu, j) VALUES (?, ?, ?)",
+            &[
+                Value::I64(300),
+                Value::Uuid(UUID_TEXT.to_string()),
+                Value::Json(r#"{"a": [1, 2]}"#.to_string()),
+            ],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] UUID/JSON canonical bind failed: {e:?}"));
+    let r = backend
+        .query(
+            &mut conn,
+            "SELECT uu, j FROM ferro_s7_bind WHERE id = 300",
+            &[],
+        )
+        .await
+        .expect("read the UUID/JSON row");
+    assert_eq!(
+        r.rows[0][0],
+        Value::Text(UUID_TEXT.into()),
+        "[{label}] a canonical UUID binds into CHAR(36) verbatim and reads back as TEXT — MySQL 8 \
+         has no native UUID type, and MariaDB's is deferred (§22.2)"
+    );
+    assert_eq!(r.cols[0].tag, tag::TEXT);
+    assert_eq!(
+        r.cols[1].tag,
+        if maria { tag::TEXT } else { tag::JSON },
+        "[{label}] MariaDB JSON is a LONGTEXT alias -> TEXT by design; MySQL 8 has a real JSON type"
+    );
+    println!(
+        "  [{label}] canonical UUID -> CHAR(36) -> TEXT verbatim; JSON column tag = {}",
+        r.cols[1].tag
+    );
+
+    // **The zero sentinels round-trip too** — under a permissive `sql_mode`, because MySQL 8's
+    // default includes `NO_ZERO_DATE` while MariaDB 11's does not (F35). They are bound as the
+    // all-zero driver components, never as a parsed calendar value and never as a panic.
+    backend
+        .simple_query(&mut conn, "SET SESSION sql_mode = ''")
+        .await
+        .expect("permit zero dates for this block");
+    backend
+        .query(
+            &mut conn,
+            "INSERT INTO ferro_s7_bind (id, da, dt, ts) VALUES (?, ?, ?, ?)",
+            &[
+                Value::I64(400),
+                Value::Date("0000-00-00".into()),
+                Value::Timestamp("0000-00-00 00:00:00".into()),
+                // The one canonical TIMESTAMPTZ payload that is NOT RFC3339.
+                Value::TimestampTz("0000-00-00 00:00:00".into()),
+            ],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] zero-sentinel bind failed: {e:?}"));
+    // A zero-in-date (`2026-00-05`), legal without NO_ZERO_IN_DATE, carries through component-wise.
+    backend
+        .query(
+            &mut conn,
+            "INSERT INTO ferro_s7_bind (id, da) VALUES (?, ?)",
+            &[Value::I64(401), Value::Date("2026-00-05".into())],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] zero-in-date bind failed: {e:?}"));
+    let r = backend
+        .query(
+            &mut conn,
+            "SELECT da, dt, ts FROM ferro_s7_bind WHERE id = 400",
+            &[],
+        )
+        .await
+        .expect("read the zero-sentinel row");
+    assert_eq!(
+        r.rows[0],
+        vec![
+            Value::Date("0000-00-00".into()),
+            Value::Timestamp("0000-00-00 00:00:00".into()),
+            Value::TimestampTz("0000-00-00 00:00:00".into()),
+        ],
+        "[{label}] the zero sentinels survive a bind verbatim — never an invented date"
+    );
+    let r = backend
+        .query(
+            &mut conn,
+            "SELECT da FROM ferro_s7_bind WHERE id = 401",
+            &[],
+        )
+        .await
+        .expect("read the zero-in-date row");
+    assert_eq!(r.rows[0][0], Value::Date("2026-00-05".into()));
+    backend
+        .simple_query(&mut conn, &format!("SET SESSION sql_mode = '{sql_mode}'"))
+        .await
+        .expect("restore sql_mode");
+    println!("  [{label}] zero sentinels + zero-in-date round-trip verbatim through the bind");
+
+    // **A payload MySQL has no representation for is a CLEAN TYPED ERROR — never a panic and never
+    // a substituted date.** PG's `infinity` / `-infinity` / `NaN` are legal canonical payloads that
+    // a cross-engine application can genuinely hand to a MySQL pool (read from PG, written to
+    // MySQL). The binder refuses to fabricate components for them: they fall back to a byte-string
+    // param and the SERVER rejects them, which is a known-fate SQL error the client can classify.
+    let mut id = 500;
+    for (v, col) in [
+        (Value::Date("infinity".into()), "da"),
+        (Value::Date("-infinity".into()), "da"),
+        (Value::Timestamp("infinity".into()), "dt"),
+        (Value::TimestampTz("-infinity".into()), "ts"),
+        (Value::Decimal("NaN".into()), "d"),
+        (Value::Time("839:00:00".into()), "tm"),
+    ] {
+        id += 1;
+        let r = backend
+            .query(
+                &mut conn,
+                &format!("INSERT INTO ferro_s7_bind (id, {col}) VALUES (?, ?)"),
+                &[Value::I64(id), v.clone()],
+            )
+            .await;
+        match r {
+            Err(PoolError::Sql { .. }) => {}
+            Err(PoolError::ConnectionLost) => panic!(
+                "[{label}] {v:?} -> {col}: a non-representable payload must NEVER be \
+                 ConnectionLost — that would mint a false §19.3 Indeterminate"
+            ),
+            other => panic!("[{label}] {v:?} -> {col}: expected a clean SQL error, got {other:?}"),
+        }
+        // The connection survives: the statement failed server-side, nothing was corrupted.
+        let ok = backend
+            .query(&mut conn, "SELECT 1", &[])
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] conn must survive {v:?}: {e:?}"));
+        assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
+        println!("  [{label}] non-representable {v:?} -> {col}: clean SQL error, conn clean");
+    }
+
+    conn.mysql.disconnect().await.ok();
+}
+
 // ---------------------------------------------------------------------------------------------
 // Entry points: every body above runs against BOTH engines, each skipping cleanly without its URL.
 // ---------------------------------------------------------------------------------------------
@@ -1005,6 +1321,11 @@ both_engines!(
     expression_columns_classify_off_metadata_alone,
     mysql_expression_columns_classify_off_metadata_alone,
     mariadb_expression_columns_classify_off_metadata_alone
+);
+both_engines!(
+    bind_round_trip_is_byte_identical,
+    mysql_bind_round_trip_is_byte_identical,
+    mariadb_bind_round_trip_is_byte_identical
 );
 
 /// MariaDB-only (the types do not exist on MySQL 8).

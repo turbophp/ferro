@@ -62,7 +62,10 @@ use mysql_async::Value as MyValue;
 /// truncates it to `838:59:59.000000` under a permissive `sql_mode`, but **MariaDB stores and
 /// returns it exactly** (measured live on MariaDB 11.8: `CAST('838:59:59.999999' AS TIME(6))` →
 /// `838:59:59.999999`). A bound narrowed to MySQL's clamp would reject a legal MariaDB value.
-const MAX_TIME_US: u64 = ((838 * 3600) + (59 * 60) + 59) * 1_000_000 + 999_999;
+///
+/// Shared with [`crate::bind`] (M1-S7 Task 8b) so the read and write directions agree by
+/// construction: a magnitude this renderer refuses to emit is one the binder refuses to type.
+pub(crate) const MAX_TIME_US: u64 = ((838 * 3600) + (59 * 60) + 59) * 1_000_000 + 999_999;
 
 const US_PER_SECOND: u64 = 1_000_000;
 
@@ -207,7 +210,10 @@ pub fn json_to_text(v: &MyValue) -> Result<String, PoolError> {
 
 /// The verbatim zero-datetime sentinel (PROTOCOL.md §3.2) — carried as-is for both the `TIMESTAMP`
 /// and `TIMESTAMPTZ` tags, deliberately not parseable as a calendar value.
-const ZERO_DATETIME: &str = "0000-00-00 00:00:00";
+///
+/// Shared with [`crate::bind`] (M1-S7 Task 8b), which must recognise the exact same literal on the
+/// way back in — it is the one canonical `TIMESTAMPTZ` payload that is not RFC3339.
+pub(crate) const ZERO_DATETIME: &str = "0000-00-00 00:00:00";
 
 /// Destructure a [`MyValue::Date`] or fail with the §9.1 decode-mismatch error.
 #[allow(clippy::type_complexity)]

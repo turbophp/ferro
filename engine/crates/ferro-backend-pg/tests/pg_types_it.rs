@@ -883,6 +883,293 @@ async fn domains_resolve_to_their_base_type_in_both_directions() {
     println!("  domain over timetz        -> Unsupported: {msg}");
 }
 
+/// **Task 8b — the BIND path: read → bind straight back → read again is BYTE-IDENTICAL.**
+///
+/// This is the acceptance shape for the write direction, and it is deliberately a *round trip*
+/// rather than a literal comparison: both reads come from the SAME column type, so the assertion is
+/// "the value Ferro handed you is a value Ferro can put back", which is what a DBAL insert of a
+/// hydrated entity actually does. A one-sided test (bind a literal, compare to a hand-written
+/// expectation) would pass while the bind silently re-rendered `1.10` → `1.1` or shifted an instant.
+///
+/// Everything runs under a deliberately **non-UTC** session `TimeZone`, so a `timestamptz` bound
+/// without its `Z` — or bound to the wrong column type — comes back shifted by four hours instead
+/// of passing by luck.
+#[tokio::test(flavor = "multi_thread")]
+async fn bind_round_trip_is_byte_identical() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+    pin_non_utc_session_zone(&mut co).await;
+
+    co.exec("DROP TABLE IF EXISTS ferro_s7_bind")
+        .await
+        .expect("drop");
+    co.exec(
+        "CREATE TABLE ferro_s7_bind (
+             -- `bigint`, not `int`: the canonical `I64` binds as `int8`, and the narrowing
+             -- bind path (`I64` -> an inferred `int4`) is a named, sized S8 carry, not S7 work.
+             id   bigint primary key,
+             d    numeric,
+             dt   date,
+             tm   time,
+             ts   timestamp,
+             tstz timestamptz,
+             u    uuid,
+             j    json,
+             jb   jsonb
+         )",
+    )
+    .await
+    .expect("create");
+
+    const COLS: &str = "d, dt, tm, ts, tstz, u, j, jb";
+    // Row 1 is written with TEXT LITERALS (no params at all), so the first read is an independent
+    // oracle rather than an echo of the bind path. `.250000` exercises the fraction group, the
+    // whole-second row below exercises its ABSENCE, and `1.10` pins the display scale.
+    let seeds: &[(i64, &str)] = &[
+        (
+            1,
+            "'1.10', '2026-08-05', '24:00:00', '2026-08-05 11:45:07.250000', \
+             '2026-08-05 11:45:07.250000-04', '3F2B8C1A-0000-4FFF-8000-ABCDEFABCDEF', \
+             '{\"b\": 1, \"a\": [1, 2], \"u\": \"héllo\"}', '{\"b\": 1, \"a\": [1, 2]}'",
+        ),
+        (
+            // The whole-second row: the canonical payload must carry NO `.ffffff` group, and a
+            // re-bind must not grow one.
+            2,
+            "'-12345.6700000000', '0001-01-01', '00:00:00', '2026-08-05 11:45:07', \
+             '2026-08-05 11:45:07-04', '00000000-0000-0000-0000-000000000000', 'null', '[]'",
+        ),
+        (
+            // Sentinels + `NaN`: the payloads a numeric/date encoder could never represent, which
+            // is exactly why the bind is text-format.
+            3,
+            "'NaN', 'infinity', '23:59:59.999999', '-infinity', 'infinity', \
+             'ffffffff-ffff-ffff-ffff-ffffffffffff', '{}', '{}'",
+        ),
+    ];
+
+    for (id, literals) in seeds {
+        co.exec(&format!(
+            "INSERT INTO ferro_s7_bind (id, {COLS}) VALUES ({id}, {literals})"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("seed row {id}: {e:?}"));
+
+        // (1) READ.
+        let first = co
+            .query(
+                &format!("SELECT {COLS} FROM ferro_s7_bind WHERE id = $1"),
+                &[Value::I64(*id)],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("read seed row {id}: {e:?}"));
+        let v1 = first.rows[0].clone();
+
+        // (2) BIND those exact canonical values straight back into a second row. This is the code
+        // path Task 8b lands: eight text-format `ToSql` newtypes, each pre-flighted by `accepts`
+        // against the column's inferred type.
+        let echo_id = id + 100;
+        let mut params = vec![Value::I64(echo_id)];
+        params.extend(v1.iter().cloned());
+        co.query(
+            &format!("INSERT INTO ferro_s7_bind (id, {COLS}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"),
+            &params,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("BIND-BACK of row {id} failed: {e:?}"));
+
+        // (3) READ AGAIN — byte-identical, per column.
+        let second = co
+            .query(
+                &format!("SELECT {COLS} FROM ferro_s7_bind WHERE id = $1"),
+                &[Value::I64(echo_id)],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("read echo row {echo_id}: {e:?}"));
+        let v2 = second.rows[0].clone();
+
+        for (i, (a, b)) in v1.iter().zip(v2.iter()).enumerate() {
+            assert_eq!(
+                a, b,
+                "row {id}, column {} ({}): read -> bind -> read must be BYTE-IDENTICAL",
+                first.cols[i].name, i
+            );
+            assert_eq!(
+                first.cols[i].tag, second.cols[i].tag,
+                "row {id}, column {i}: the tag must survive the round trip too"
+            );
+        }
+        println!("  row {id} round trip: {v1:?}");
+    }
+
+    // The precision claims, spelled out rather than left implicit in the equality above.
+    let r = co
+        .query("SELECT d FROM ferro_s7_bind WHERE id = 101", &[])
+        .await
+        .expect("read the echoed decimal");
+    assert_eq!(
+        r.rows[0][0],
+        Value::Decimal("1.10".into()),
+        "the DISPLAY SCALE survives a bind: `1.10` must not come back as `1.1`"
+    );
+    let r = co
+        .query("SELECT ts, tstz FROM ferro_s7_bind WHERE id = 102", &[])
+        .await
+        .expect("read the echoed whole-second row");
+    assert_eq!(
+        r.rows[0][0],
+        Value::Timestamp("2026-08-05 11:45:07".into()),
+        "a whole-second timestamp must NOT grow a fraction group through the bind"
+    );
+    assert_eq!(
+        r.rows[0][1],
+        Value::TimestampTz("2026-08-05T15:45:07Z".into()),
+        "the UTC INSTANT survives: 11:45:07-04 is 15:45:07Z, under a non-UTC session zone, in both \
+         directions"
+    );
+
+    // **The bind pre-flight is still narrow.** A param whose canonical tag does not match the
+    // column's type is a KNOWN-FATE rejection raised BEFORE the statement is sent (§19.3), not a
+    // post-send failure — and the connection is immediately reusable afterwards.
+    for (v, col) in [
+        (Value::Decimal("1.10".into()), "dt"),
+        (Value::Timestamp("2026-08-05 00:00:00".into()), "tstz"),
+        (Value::TimestampTz("2026-08-05T00:00:00Z".into()), "ts"),
+        (
+            Value::Uuid("00000000-0000-0000-0000-000000000000".into()),
+            "j",
+        ),
+        (Value::U64(1), "d"),
+        // A sentinel that arrived as a BARE STRING (`TAG_TEXT`, byte-verbatim — a plain string's
+        // contents are never sniffed for a temporal tag) is refused rather than miscast.
+        (Value::Text("infinity".into()), "ts"),
+    ] {
+        let err = co
+            .query(
+                &format!("INSERT INTO ferro_s7_bind (id, {col}) VALUES (999, $1)"),
+                std::slice::from_ref(&v),
+            )
+            .await
+            .unwrap_err_or_panic(&format!("{v:?} -> {col}"));
+        assert!(
+            matches!(err, PoolError::Sql { .. }),
+            "{v:?} -> {col} must be a known-fate bind rejection, got {err:?}"
+        );
+        let ok = co.query("SELECT 1", &[]).await.expect("conn stays clean");
+        assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
+        println!("  bind pre-flight refused {v:?} -> column {col}, conn clean");
+    }
+
+    co.exec("DROP TABLE IF EXISTS ferro_s7_bind")
+        .await
+        .expect("cleanup");
+}
+
+/// **A canonical payload PG has no representation for is a CLEAN TYPED ERROR — never a panic, and
+/// never a substituted date.**
+///
+/// These are MySQL-origin payloads (zero dates, a zero-in-date, a negative / >24 h `TIME`) that a
+/// cross-engine application can genuinely hand to a PG pool: read from MySQL, written to PG. The
+/// binder does not parse or "fix" them — it hands PG the canonical text and PG's own input parser
+/// refuses it, which is a known-fate SQL error the client can classify. The two failure modes this
+/// closes are a panicking tokio task (not a §19.3 fate at all) and a silently substituted value.
+///
+/// The mirror direction — PG's `infinity` / `NaN` bound at a MySQL pool — is asserted in
+/// `ferro-backend-mysql`'s `bind_round_trip_is_byte_identical`.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_engine_payloads_are_clean_errors_never_panics() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+    pin_non_utc_session_zone(&mut co).await;
+
+    co.exec("DROP TABLE IF EXISTS ferro_s7_xengine")
+        .await
+        .expect("drop");
+    co.exec(
+        "CREATE TABLE ferro_s7_xengine (id bigint primary key, dt date, tm time, \
+         ts timestamp, tstz timestamptz)",
+    )
+    .await
+    .expect("create");
+
+    let mut id = 0i64;
+    for (v, col) in [
+        // MySQL zero dates / zero-in-dates: legal there, unrepresentable in PG.
+        (Value::Date("0000-00-00".into()), "dt"),
+        (Value::Date("2026-00-05".into()), "dt"),
+        (Value::Timestamp("0000-00-00 00:00:00".into()), "ts"),
+        (Value::TimestampTz("0000-00-00 00:00:00".into()), "tstz"),
+        // A MySQL `TIME` is a signed duration spanning ±838 h; PG's `time` is a time of day
+        // (0..=24:00:00), so both of these are out of PG's domain. Nothing here goes through a
+        // time-of-day type on the way out — that would WRAP `24:00:00` to `00:00:00` (hazard 14).
+        (Value::Time("-838:59:58.000001".into()), "tm"),
+        (Value::Time("26:00:00".into()), "tm"),
+    ] {
+        id += 1;
+        let r = co
+            .query(
+                &format!("INSERT INTO ferro_s7_xengine (id, {col}) VALUES ($1, $2)"),
+                &[Value::I64(id), v.clone()],
+            )
+            .await;
+        match r {
+            Err(PoolError::Sql { .. }) => {}
+            Err(PoolError::ConnectionLost) => panic!(
+                "{v:?} -> {col}: a non-representable payload must NEVER be ConnectionLost — that \
+                 would mint a false §19.3 Indeterminate for a write that never happened"
+            ),
+            other => panic!("{v:?} -> {col}: expected a clean SQL error, got {other:?}"),
+        }
+        let ok = co.query("SELECT 1", &[]).await.expect("conn stays clean");
+        assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
+        println!("  non-representable {v:?} -> {col}: clean SQL error, conn clean");
+    }
+
+    // ...while PG's OWN sentinels bind and round-trip untouched (the positive control: the refusals
+    // above are PG's domain speaking, not the binder mangling every unusual payload).
+    co.query(
+        "INSERT INTO ferro_s7_xengine (id, dt, tm, ts, tstz) VALUES ($1, $2, $3, $4, $5)",
+        &[
+            Value::I64(99),
+            Value::Date("infinity".into()),
+            Value::Time("24:00:00".into()),
+            Value::Timestamp("-infinity".into()),
+            Value::TimestampTz("infinity".into()),
+        ],
+    )
+    .await
+    .expect("PG's own sentinels must bind");
+    let r = co
+        .query(
+            "SELECT dt, tm, ts, tstz FROM ferro_s7_xengine WHERE id = 99",
+            &[],
+        )
+        .await
+        .expect("read back the sentinels");
+    assert_eq!(
+        r.rows[0],
+        vec![
+            Value::Date("infinity".into()),
+            Value::Time("24:00:00".into()),
+            Value::Timestamp("-infinity".into()),
+            Value::TimestampTz("infinity".into()),
+        ],
+        "PG's sentinels survive a bind verbatim: `infinity` is not parsed, and `24:00:00` does not \
+         wrap to `00:00:00`"
+    );
+    println!("  PG sentinels bind + round-trip: {:?}", r.rows[0]);
+
+    co.exec("DROP TABLE IF EXISTS ferro_s7_xengine")
+        .await
+        .expect("cleanup");
+}
+
 /// Tiny helper so the loop above reads cleanly.
 trait UnwrapErrOrPanic<T> {
     fn unwrap_err_or_panic(self, what: &str) -> PoolError;
