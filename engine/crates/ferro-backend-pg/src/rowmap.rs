@@ -82,15 +82,19 @@ pub enum ExtractType {
     Jsonb,
 }
 
-/// Maps a PG column OID to the canonical `Value` tag (for `ColMeta`). Returns
+/// Maps a PG column's type to the canonical `Value` tag (for `ColMeta`). Returns
 /// `PoolError::Unsupported` for any OID outside the supported set — a loud typed error, never a
-/// silent miscast (T-1). The message names the OID so a deferred column type is diagnosable.
+/// silent miscast (T-1).
+///
+/// Takes the column NAME and the resolved [`Type`] (not a bare `Oid`) so the refusal can name both:
+/// a custom OID is **database-local** (the same `citext` is a different number in every install),
+/// so an operator needs `"amount" (numeric)`, not just an integer, to act on the error.
 ///
 /// This is the **cols-build (pre-execution)** half of the two-gate pair; [`extract_value`] is the
 /// **per-cell (mid-stream)** half. Both are matches over [`oid_extract_type`] so the tag `HEAD`
 /// promises is, by construction, the tag the producer emits — see the module docs (hazard 18).
-pub fn oid_to_tag(oid: Oid) -> Result<u8, PoolError> {
-    match oid_extract_type(oid) {
+pub fn oid_to_tag(col_name: &str, ty: &Type) -> Result<u8, PoolError> {
+    match oid_extract_type(ty.oid()) {
         Some(ExtractType::Bool) => Ok(tag::BOOL),
         Some(ExtractType::I16 | ExtractType::I32 | ExtractType::I64) => Ok(tag::I64),
         Some(ExtractType::F32 | ExtractType::F64) => Ok(tag::F64),
@@ -103,13 +107,19 @@ pub fn oid_to_tag(oid: Oid) -> Result<u8, PoolError> {
         Some(ExtractType::TimestampTz) => Ok(tag::TIMESTAMPTZ),
         Some(ExtractType::Uuid) => Ok(tag::UUID),
         Some(ExtractType::Json | ExtractType::Jsonb) => Ok(tag::JSON),
-        None => Err(unsupported_oid(oid)),
+        None => Err(unsupported_column(col_name, ty)),
     }
 }
 
 /// Maps a PG column OID to the Rust type extraction must use. `None` ⇒ a type Ferro deliberately
-/// does not support yet (`timetz`, arrays, `interval`, `inet`, and every domain/enum/composite/
-/// range, which arrive with a CUSTOM oid and are an S8 carry) — those stay a loud `Unsupported`.
+/// does not support yet (`timetz`, arrays, `interval`, `inet`, and every enum/composite/range,
+/// which arrive with a CUSTOM oid and are an S8 carry) — those stay a loud `Unsupported`.
+///
+/// **DOMAINs are NOT in that list and need no `Kind::Domain` unwrap.** PG resolves a domain to its
+/// BASE type when it builds the `RowDescription` (`printtup.c` → `getBaseTypeAndTypmod`), so the
+/// domain's own OID never reaches the wire: a domain over a supported base is admitted by that base
+/// OID (`numeric` ⇒ 1700 ⇒ `DECIMAL`) and a domain over an unsupported base is refused by it
+/// (`timetz` ⇒ 1266 ⇒ `Unsupported`). Proven live in `pg_types_it.rs`.
 ///
 /// **This is the SOLE type authority.** `pgtext::RawBytes` accepts every `Type` by design, so a
 /// raw read that skipped this table would decode an unsupported column as garbage (hazard 16).
@@ -217,7 +227,16 @@ pub fn extract_value(row: &Row, idx: usize, oid: Oid) -> Result<crate::Value, Po
             Ok(raw_text(row, idx, |b| pgtext::json_to_text(b, true))?
                 .map_or(Value::Null, Value::Json))
         }
-        None => Err(unsupported_oid(oid)),
+        // Unreachable in practice — `oid_to_tag` refused this OID at cols-build, before the query
+        // ran. Kept as the belt-and-braces half of the lockstep pair (hazard 18), and it names the
+        // column off the ROW's own descriptor, which is where the identity lives mid-stream.
+        None => Err(match row.columns().get(idx) {
+            Some(col) => unsupported_column(col.name(), col.type_()),
+            None => PoolError::Unsupported(format!(
+                "unsupported column at index {idx} (PG OID {oid}), which is past the end of the \
+                 row descriptor"
+            )),
+        }),
     }
 }
 
@@ -233,16 +252,26 @@ where
 }
 
 /// The loud, diagnosable refusal for a column type Ferro does not support (charter rule 6 — never
-/// a silent miscast). The message names the offending OID, the CURRENT supported set, and the
-/// deferrals by name, so an operator can tell "not implemented yet" from "you hit a bug".
+/// a silent miscast). The message LEADS with the two human-readable identifiers — the column name
+/// and PG's own name for its type — then the OID, the CURRENT supported set, and the deferrals by
+/// name, so an operator can tell "not implemented yet" from "you hit a bug" AND know which column
+/// to change.
+///
+/// The name/type pair is not a nicety: a custom OID (enum, composite, `citext`) is assigned per
+/// database, so the bare number is **not reproducible across installs** and identifies nothing on
+/// its own. It is still included because it is the exact key `oid_extract_type` matched on.
 ///
 /// Kept in sync with [`oid_extract_type`] by `unsupported_message_describes_the_current_supported_set`.
-fn unsupported_oid(oid: Oid) -> PoolError {
+fn unsupported_column(col_name: &str, ty: &Type) -> PoolError {
     PoolError::Unsupported(format!(
-        "unsupported column type (PG OID {oid}). Supported: NULL/BOOL/I64/F64/TEXT/BYTES \
+        "unsupported type for column \"{col_name}\": PG type {} (OID {}). \
+         Supported: NULL/BOOL/I64/F64/TEXT/BYTES \
          (bool, int2/4/8, float4/8, text/varchar/bpchar, bytea) plus the M1-S7 canonical tags \
          DECIMAL (numeric), DATE, TIME, TIMESTAMP, TIMESTAMPTZ, UUID and JSON (json/jsonb). \
-         Deferred: timetz, arrays, interval, inet, and every domain/enum/composite/range type"
+         Deferred: timetz, arrays, interval, inet, and every enum/composite/range type. \
+         (A DOMAIN is reported by PG as its BASE type, so it is supported iff that base is.)",
+        ty.name(),
+        ty.oid()
     ))
 }
 
@@ -250,18 +279,24 @@ fn unsupported_oid(oid: Oid) -> PoolError {
 mod tests {
     use super::*;
 
+    /// `oid_to_tag` under test always gets a placeholder column name — the name only ever reaches
+    /// the `Unsupported` message, never the tag decision.
+    fn tag_of(ty: &Type) -> Result<u8, PoolError> {
+        oid_to_tag("c", ty)
+    }
+
     #[test]
     fn oid_to_tag_covers_m0_scalar_set() {
-        assert_eq!(oid_to_tag(Type::BOOL.oid()).unwrap(), tag::BOOL);
-        assert_eq!(oid_to_tag(Type::INT2.oid()).unwrap(), tag::I64);
-        assert_eq!(oid_to_tag(Type::INT4.oid()).unwrap(), tag::I64);
-        assert_eq!(oid_to_tag(Type::INT8.oid()).unwrap(), tag::I64);
-        assert_eq!(oid_to_tag(Type::FLOAT4.oid()).unwrap(), tag::F64);
-        assert_eq!(oid_to_tag(Type::FLOAT8.oid()).unwrap(), tag::F64);
-        assert_eq!(oid_to_tag(Type::TEXT.oid()).unwrap(), tag::TEXT);
-        assert_eq!(oid_to_tag(Type::VARCHAR.oid()).unwrap(), tag::TEXT);
-        assert_eq!(oid_to_tag(Type::BPCHAR.oid()).unwrap(), tag::TEXT);
-        assert_eq!(oid_to_tag(Type::BYTEA.oid()).unwrap(), tag::BYTES);
+        assert_eq!(tag_of(&Type::BOOL).unwrap(), tag::BOOL);
+        assert_eq!(tag_of(&Type::INT2).unwrap(), tag::I64);
+        assert_eq!(tag_of(&Type::INT4).unwrap(), tag::I64);
+        assert_eq!(tag_of(&Type::INT8).unwrap(), tag::I64);
+        assert_eq!(tag_of(&Type::FLOAT4).unwrap(), tag::F64);
+        assert_eq!(tag_of(&Type::FLOAT8).unwrap(), tag::F64);
+        assert_eq!(tag_of(&Type::TEXT).unwrap(), tag::TEXT);
+        assert_eq!(tag_of(&Type::VARCHAR).unwrap(), tag::TEXT);
+        assert_eq!(tag_of(&Type::BPCHAR).unwrap(), tag::TEXT);
+        assert_eq!(tag_of(&Type::BYTEA).unwrap(), tag::BYTES);
     }
 
     #[test]
@@ -298,7 +333,7 @@ mod tests {
                 oid_extract_type(ty.oid()).is_some(),
                 "{ty:?} must be admitted in S7"
             );
-            assert_eq!(oid_to_tag(ty.oid()).unwrap(), want, "{ty:?} tag");
+            assert_eq!(tag_of(&ty).unwrap(), want, "{ty:?} tag");
         }
     }
 
@@ -338,7 +373,7 @@ mod tests {
                 "{ty:?} must stay Unsupported in S7"
             );
             assert!(
-                matches!(oid_to_tag(ty.oid()), Err(PoolError::Unsupported(_))),
+                matches!(tag_of(&ty), Err(PoolError::Unsupported(_))),
                 "{ty:?} tag must be Unsupported"
             );
         }
@@ -347,9 +382,13 @@ mod tests {
     /// The `Unsupported` message must describe the CURRENT contract. It said "out-of-M0 … only
     /// NULL/BOOL/I64/F64/TEXT/BYTES are supported in M0" until M1-S7, which is now false in both
     /// directions (the set is wider, and "M0" is the wrong milestone).
+    ///
+    /// It must also NAME THE COLUMN and its native type. A custom OID is database-local (the same
+    /// enum is a different number in every install), so a bare number identifies nothing an
+    /// operator can act on; the column name plus PG's own type name do.
     #[test]
     fn unsupported_message_describes_the_current_supported_set() {
-        let msg = match oid_to_tag(Type::INTERVAL.oid()) {
+        let msg = match oid_to_tag("elapsed", &Type::INTERVAL) {
             Err(PoolError::Unsupported(m)) => m,
             other => panic!("expected Unsupported, got {other:?}"),
         };
@@ -357,12 +396,28 @@ mod tests {
             !msg.contains("M0"),
             "the message still names the M0 milestone: {msg}"
         );
+        assert!(
+            msg.contains("elapsed"),
+            "message must name the offending COLUMN: {msg}"
+        );
+        assert!(
+            msg.contains(Type::INTERVAL.name()),
+            "message must name the column's NATIVE type ({}): {msg}",
+            Type::INTERVAL.name()
+        );
         for named in ["DECIMAL", "TIMESTAMPTZ", "UUID", "JSON", "interval"] {
             assert!(msg.contains(named), "message must mention {named}: {msg}");
         }
         assert!(
             msg.contains(&Type::INTERVAL.oid().to_string()),
             "message must name the offending OID: {msg}"
+        );
+        // F1: PG resolves a DOMAIN to its base type in the RowDescription, so domains are NOT a
+        // deferral — the message must not claim they are.
+        assert!(
+            !msg.contains("domain/enum") && !msg.contains("domains"),
+            "domains are NOT deferred (PG reports the base type); the message must not say so: \
+             {msg}"
         );
     }
 
@@ -374,9 +429,18 @@ mod tests {
     ///
     /// The containment is structural, and this test locks the structure: `RawBytes` is
     /// `pub(crate)` (so it cannot leak out of the crate at all), and inside the crate it is NAMED
-    /// only in `pgtext.rs` (its definition) and in exactly one function of `rowmap.rs` —
-    /// `extract_value`, which the OID gate has already run for. A `get_opt::<RawBytes>` added
-    /// anywhere else reddens this test.
+    /// only in `pgtext.rs` (its definition) and inside `extract_value`'s LINE SPAN in `rowmap.rs`,
+    /// which the OID gate has already run for. A `get_opt::<RawBytes>` added anywhere else reddens
+    /// this test.
+    ///
+    /// **The span check is deliberately not a `fn`-chunk split** (T4b review F3). Splitting the
+    /// source on `"\nfn "`/`"\npub fn "` made every other qualifier a non-boundary, so a
+    /// `pub(crate) fn` / `async fn` / `const fn` / `pub(super) fn` inserted right after
+    /// `extract_value` rode INSIDE its chunk and escaped the guard — demonstrated live with a
+    /// `pub(crate) fn evil_raw_read` that called `get_opt::<RawBytes>` ungated and left the test
+    /// GREEN. Line containment has no qualifier vocabulary to keep up with: `extract_value` runs
+    /// from its `pub fn` line to its column-0 `}`, and every line naming `RawBytes` must be inside
+    /// that range, whatever surrounds it.
     #[test]
     fn raw_getter_is_only_named_behind_the_oid_gate() {
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -407,16 +471,32 @@ mod tests {
                     checked_definition = true;
                 }
                 "rowmap.rs" => {
-                    // Split the code into top-level `fn` chunks; only `extract_value` may name it.
-                    for chunk in code.split("\nfn ").flat_map(|c| c.split("\npub fn ")) {
-                        if !chunk.contains("RawBytes") {
+                    // `extract_value`'s LINE SPAN: its top-level `pub fn` line through the first
+                    // column-0 `}`. Every line naming RawBytes must fall inside it — no `fn`
+                    // qualifier can widen the span, because the span is not made of `fn`s.
+                    let lines: Vec<&str> = code.lines().collect();
+                    let start = lines
+                        .iter()
+                        .position(|l| l.starts_with("pub fn extract_value"))
+                        .expect("`extract_value` must be a top-level `pub fn` in rowmap.rs");
+                    let end = start
+                        + 1
+                        + lines[start + 1..]
+                            .iter()
+                            .position(|l| *l == "}")
+                            .expect("`extract_value` must close with a column-0 `}`");
+                    for (i, l) in lines.iter().enumerate() {
+                        if !l.contains("RawBytes") {
                             continue;
                         }
                         assert!(
-                            chunk.starts_with("extract_value"),
-                            "RawBytes is named outside `extract_value`, which would bypass the \
-                             OID gate (hazard 16):\n{}",
-                            &chunk[..chunk.len().min(160)]
+                            (start..=end).contains(&i),
+                            "rowmap.rs line {} names RawBytes OUTSIDE `extract_value` (lines \
+                             {}..={}), which would bypass the OID gate (hazard 16):\n{}",
+                            i + 1,
+                            start + 1,
+                            end + 1,
+                            l.trim()
                         );
                         checked_call_sites = true;
                     }

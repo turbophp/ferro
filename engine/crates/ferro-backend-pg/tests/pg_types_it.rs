@@ -29,6 +29,9 @@
 //! 4. **The deferrals are still refused, live.** `timetz` in particular must never fall into the
 //!    `TIME` arm: its payload is 12 bytes (i64 µs + i32 zone), so admitting it would fail
 //!    mid-decode, after `HEAD` is on the wire.
+//! 5. **DOMAINs need no unwrap.** PG reports a domain as its BASE type in the `RowDescription`, so
+//!    a domain over a supported base is admitted and one over an unsupported base is refused — by
+//!    the base OID, in both cases. Only a live server can prove that resolution happens.
 
 use std::time::Duration;
 
@@ -786,6 +789,98 @@ async fn deferred_column_types_are_refused_before_execution() {
         assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
         println!("  deferred {expr:<28} -> Unsupported, conn clean");
     }
+}
+
+/// **DOMAINs need no `Kind::Domain` unwrap — the plan's "domains are deferred" carry was FALSE**
+/// (T4b review F1). PG resolves a domain to its BASE type when it builds the `RowDescription`
+/// (`printtup.c` → `getBaseTypeAndTypmod`), so the domain's own custom OID never reaches the wire
+/// and `oid_extract_type`'s pure-OID match sees the base.
+///
+/// Both directions, live:
+/// 1. a domain over a SUPPORTED base (`numeric(10,2)`) is admitted by OID 1700 and round-trips as
+///    `DECIMAL` with its display scale intact — on a cast expression AND on a real table column
+///    (the column case is the one `information_schema` introspection actually hits);
+/// 2. a domain over an UNSUPPORTED base (`timetz`) is refused by OID **1266**, at cols-build, with
+///    the same loud `Unsupported` the bare base type gets — no domain-shaped hole in the gate.
+///
+/// The domains live in `pg_temp`, so they are session-scoped and need no cleanup.
+#[tokio::test(flavor = "multi_thread")]
+async fn domains_resolve_to_their_base_type_in_both_directions() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    co.exec("CREATE DOMAIN pg_temp.ferro_dom_num AS numeric(10,2)")
+        .await
+        .expect("create a domain over a SUPPORTED base");
+    co.exec("CREATE DOMAIN pg_temp.ferro_dom_ttz AS timetz")
+        .await
+        .expect("create a domain over an UNSUPPORTED base");
+
+    // (1a) cast expression over the numeric domain.
+    let (t, v) = one(&mut co, "'1.50'::pg_temp.ferro_dom_num").await;
+    assert_eq!(t, tag::DECIMAL, "a domain over numeric must report DECIMAL");
+    assert_eq!(
+        v,
+        Value::Decimal("1.50".to_string()),
+        "the domain's base rendering must be byte-identical to bare numeric(10,2) — display \
+         scale included"
+    );
+
+    // (1b) a REAL table column typed as the domain — the introspection-shaped case.
+    co.exec("CREATE TEMP TABLE ferro_dom_tbl (amount pg_temp.ferro_dom_num)")
+        .await
+        .expect("create temp table with a domain column");
+    co.exec("INSERT INTO ferro_dom_tbl (amount) VALUES ('1.50')")
+        .await
+        .expect("insert through the domain");
+    let r = co
+        .query("SELECT amount FROM ferro_dom_tbl", &[])
+        .await
+        .expect("read the domain column back");
+    assert_eq!(r.cols.len(), 1);
+    assert_eq!(
+        r.cols[0].tag,
+        tag::DECIMAL,
+        "a domain-typed COLUMN must report DECIMAL too (not just a cast expression)"
+    );
+    assert_eq!(r.rows, vec![vec![Value::Decimal("1.50".to_string())]]);
+    assert_eq!(
+        r.cols[0].tag,
+        r.rows[0][0].tag(),
+        "HEAD-vs-producer must agree on a domain column"
+    );
+
+    // (2) a domain over an UNSUPPORTED base is refused BY THAT BASE, at cols-build.
+    let err = co
+        .query(
+            "SELECT '12:34:56+02'::pg_temp.ferro_dom_ttz AS clock_in",
+            &[],
+        )
+        .await
+        .unwrap_err_or_panic("a domain over timetz");
+    let msg = match &err {
+        PoolError::Unsupported(m) => m.clone(),
+        other => panic!("a domain over timetz must be a loud Unsupported, got {other:?}"),
+    };
+    // The refusal names the BASE type and the BASE oid — proof PG never sent the domain's own OID.
+    assert!(
+        msg.contains("timetz") && msg.contains("1266"),
+        "the refusal must name the resolved BASE type/oid (timetz, 1266): {msg}"
+    );
+    // F2: and it names the column, so an operator knows WHICH column to change.
+    assert!(
+        msg.contains("clock_in"),
+        "the refusal must name the offending column: {msg}"
+    );
+    // Raised at cols-build, before execution — the conn is clean and immediately reusable.
+    let ok = co.query("SELECT 1", &[]).await.expect("conn survives");
+    assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
+
+    println!("  domain over numeric(10,2) -> DECIMAL \"1.50\" (expr AND column)");
+    println!("  domain over timetz        -> Unsupported: {msg}");
 }
 
 /// Tiny helper so the loop above reads cleanly.

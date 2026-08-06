@@ -66,7 +66,9 @@ pub async fn run(client: &Client, sql: &str, params: &[Value]) -> Result<QueryRe
     // detects an unsupported column type before running the query (Unsupported, conn stays clean).
     let mut cols = Vec::with_capacity(stmt.columns().len());
     for col in stmt.columns() {
-        let tag = rowmap::oid_to_tag(col.type_().oid())?;
+        // The column name + resolved `Type` (not a bare OID) so an `Unsupported` refusal names the
+        // column and PG's own type name — a custom OID alone is database-local and unactionable.
+        let tag = rowmap::oid_to_tag(col.name(), col.type_())?;
         cols.push(ferro_proto::messages::sql::ColMeta {
             name: col.name().to_string(),
             tag,
@@ -171,7 +173,8 @@ pub async fn stream(
     let mut cols = Vec::with_capacity(stmt.columns().len());
     let mut oids = Vec::with_capacity(stmt.columns().len());
     for col in stmt.columns() {
-        let tag = rowmap::oid_to_tag(col.type_().oid())?;
+        // Same as `run`: name + resolved `Type`, so the refusal is diagnosable (see `run`).
+        let tag = rowmap::oid_to_tag(col.name(), col.type_())?;
         cols.push(ColMeta {
             name: col.name().to_string(),
             tag,
