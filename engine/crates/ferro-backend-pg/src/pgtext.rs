@@ -188,6 +188,15 @@ pub fn time_to_text(raw: &[u8]) -> Result<String, PoolError> {
             "time: negative time-of-day ({us} µs) is not a legal PG `time` payload"
         )));
     }
+    // Upper bound mirrors the negative guard above: PG's `time` domain is 0..=86_400_000_000 µs
+    // inclusive (24:00:00 IS legal). Only a corrupt payload can exceed it, and without this an
+    // `i64::MAX` would render the implausible-but-silent "2562047788:00:54.775807" instead of
+    // failing — the loud-rejection posture this module exists to hold.
+    if us > US_PER_DAY {
+        return Err(backend(format!(
+            "time: time-of-day ({us} µs) exceeds the legal PG `time` maximum of {US_PER_DAY} µs"
+        )));
+    }
     Ok(fmt_time_of_day(us))
 }
 
@@ -513,8 +522,11 @@ mod tests {
         );
         assert_eq!(numeric_to_text(&hex("0001000000000000000c")).unwrap(), "12");
         assert_eq!(numeric_to_text(&hex("00000000c0000000")).unwrap(), "NaN");
-        // NOTE the real ±Infinity payloads carry dscale = 0x0020, so the special-sign check MUST
-        // precede any dscale validation — captured proof that the ordering is load-bearing.
+        // NOTE the real ±Infinity payloads carry dscale = 0x0020 (32). What that actually makes
+        // load-bearing is that the special-sign match precedes *rendering*: reach the digit loop
+        // with this header and `Infinity` renders as "0." followed by 32 zeros. (It need NOT
+        // precede dscale *validation* — 32 is well under MAX_DSCALE, so reordering against the
+        // validation alone leaves the suite green. Verified by mutation in the T4a review.)
         assert_eq!(
             numeric_to_text(&hex("00000000d0000020")).unwrap(),
             "Infinity"
@@ -785,6 +797,18 @@ mod tests {
         // a negative time-of-day is not a legal PG `time` payload
         assert!(matches!(
             time_to_text(&(-1i64).to_be_bytes()),
+            Err(PoolError::Backend(_))
+        ));
+        // 24:00:00 exactly IS legal and must survive (the no-wrap rule above).
+        assert_eq!(time_to_text(&US_PER_DAY.to_be_bytes()).unwrap(), "24:00:00");
+        // ...but one microsecond past it is not. Without the upper guard this rendered the
+        // implausible-but-silent "2562047788:00:54.775807" for i64::MAX (T4a review nit).
+        assert!(matches!(
+            time_to_text(&(US_PER_DAY + 1).to_be_bytes()),
+            Err(PoolError::Backend(_))
+        ));
+        assert!(matches!(
+            time_to_text(&i64::MAX.to_be_bytes()),
             Err(PoolError::Backend(_))
         ));
     }
