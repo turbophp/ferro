@@ -806,10 +806,18 @@ mod tests {
     }
 
     // A numeric(30,10) holding -12345.67 must ZERO-PAD the 4 available fractional digits to 10.
+    //
+    // NOTE (v2.1 correction, found by the Task 4a implementer against live postgres:17):
+    // weight is **1**, not 0. PG's `numeric_send('-12345.67'::numeric(30,10))` returns
+    // `000300014000000a000109291a2c` — i.e. ndigits=3, weight=1, sign=0x4000, dscale=10,
+    // digits=[1,2345,6700]. With weight=0 the same digits evaluate to 1 + 2345/10^4 +
+    // 6700/10^8 = "1.2345670000", so a decoder written to satisfy a weight=0 literal would
+    // be off by one base-10000 group AND still pass every unit test. Verify NUMERIC
+    // expectations against real `numeric_send` output, never against a hand-built header.
     #[test]
     fn numeric_pads_out_to_the_declared_scale() {
         assert_eq!(
-            numeric_to_text(&num_header(3, 0, 0x4000, 10, &[1, 2345, 6700])).unwrap(),
+            numeric_to_text(&num_header(3, 1, 0x4000, 10, &[1, 2345, 6700])).unwrap(),
             "-12345.6700000000"
         );
     }
