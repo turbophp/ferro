@@ -23,6 +23,7 @@ use ferro_pool::backend::Dialect;
 pub mod bind;
 pub mod conn;
 pub mod error_map;
+pub mod mytext;
 pub mod query;
 pub mod rowmap;
 pub mod tracker;

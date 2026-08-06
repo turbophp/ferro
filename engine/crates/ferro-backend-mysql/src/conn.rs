@@ -198,8 +198,27 @@ impl PoolBackend for MysqlBackend {
             .setup(vec![
                 "SET SESSION session_track_state_change = ON".to_string(),
                 "SET SESSION session_track_transaction_info = 'STATE'".to_string(),
+                // M1-S7: `time_zone` is folded into THIS statement (not appended as a 4th) so the UTC
+                // pin costs no extra round trip on connect or on any COM_RESET_CONNECTION recycle
+                // (`run_setup_commands` issues one `query_drop` per element and re-runs the whole
+                // list after a reset).
+                //
+                // WHY UTC: SPEC §9 maps MySQL `timestamp` -> TIMESTAMPTZ, a UTC INSTANT, and MySQL
+                // converts TIMESTAMP into the SESSION zone on retrieval while the driver returns
+                // zone-LESS `Value::Date(y,m,d,h,mi,s,us)` components (mysql_common value/mod.rs) —
+                // so the `Z` that `crate::mytext::timestamptz_to_text` stamps is truthful ONLY under
+                // this pin. Under pooling an unpinned session zone makes the same column read
+                // differently depending on which connection served the request: a correctness
+                // defect, not a preference. `time_zone` is already in CURATED_SESSION_TRACK_VARS, so
+                // a user `SET time_zone` still TAINTS (`PinCause::SessionTracker`) and hygiene
+                // (COM_RESET_CONNECTION -> setup re-run) restores this pin.
+                //
+                // Consequence (recorded in SPEC §9.1 + §22.2): NOW()/CURDATE()/CURTIME() are UTC on
+                // every Ferro MySQL connection — the same choice Doctrine/Laravel already make.
+                // Proven live, fresh AND recycled, on both engines: `tests/utc_pin_it.rs`.
                 format!(
-                    "SET SESSION session_track_system_variables = '{CURATED_SESSION_TRACK_VARS}'"
+                    "SET SESSION session_track_system_variables = '{CURATED_SESSION_TRACK_VARS}', \
+                     time_zone = '+00:00'"
                 ),
             ])
             .into();
