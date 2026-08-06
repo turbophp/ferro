@@ -142,6 +142,13 @@ date/time object; feeding one to a parser yields either an exception or a nonsen
 which are silent-corruption classes §9.1 exists to prevent. PG's ±infinity arrive as the `i32`/`i64`
 extremes; a MySQL zero date is a legal value under a permissive `sql_mode`.
 
+**Calendar range** (`DATE`, `TIMESTAMP`, `TIMESTAMPTZ`): the canonical `YYYY-MM-DD` form defines
+**years `0001`–`9999` only**. A backend value outside that range — a BC date, or a year above 9999
+(PG's `date`/`timestamp` reach 5874897 AD) — is a loud `NonRetryable{Unsupported}` naming the year,
+never an invented `" BC"` suffix, negative year or 7-digit year, since a guessed form would differ
+between the two codecs. Widening it means adding an extended-year/BC canonical form here, to both
+codecs, and to the golden vectors (SPEC §22.2).
+
 **`U64` uses the canonical narrowing ladder**, not a fixed `0xcf`. `Value::U64(0)` is a positive
 fixint (`0x92 0x03 0x00`); the marker widens through `0xcc`/`0xcd`/`0xce` and reaches `0xcf` only
 above `0xffffffff`. This is byte-identical to PHP `PurePacker::packUint`, so a decoder must accept

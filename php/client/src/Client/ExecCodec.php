@@ -2,6 +2,7 @@
 declare(strict_types=1);
 namespace Ferro\Client;
 
+use Ferro\Client\Error\HydrationException;
 use Ferro\Client\Error\ProtocolException;
 use Ferro\Client\Error\TypePolicyException;
 use Ferro\Client\Hydration\PlanCache;
@@ -168,16 +169,48 @@ final class ExecCodec
     }
 
     /**
+     * Hydrate one row into `$class` via its constructor.
+     *
+     * **The value objects made this fallible (hazard 35).** Through M1-S6 every decoded cell was a
+     * PHP scalar, so `newInstanceArgs` only ever failed on a genuinely broken DTO. As of M1-S7 a
+     * `DECIMAL` column arrives as a {@see \Ferro\Decimal} and a `TIMESTAMP` as a
+     * {@see \Ferro\NaiveTimestamp}, so a DTO whose promoted parameter is typed `string` (or `int`,
+     * or a different value object) now throws a bare `\TypeError` — which would ESCAPE the
+     * {@see \Ferro\Client\Error\FerroException} contract the whole client surface is caught by, and
+     * land in application code as an engine-internals leak. It is translated here into
+     * {@see HydrationException} (the same class a missing column raises), naming the DTO, the
+     * column, the value's actual type and the SPEC §9.1 knob that would change it.
+     *
+     * `\ArgumentCountError` extends `\TypeError`, so the same arm covers a plan/row arity fault.
+     *
      * @template T of object
      * @param class-string<T> $class
      * @param list<string> $cols
      * @param list<mixed> $row
      * @return T
+     * @throws HydrationException
      */
     public function hydrateDto(string $class, array $cols, array $row): object
     {
         $args = $this->plans->planFor($class, $cols)->argsFor($row);
-        return (new \ReflectionClass($class))->newInstanceArgs($args);
+        try {
+            return (new \ReflectionClass($class))->newInstanceArgs($args);
+        } catch (\TypeError $e) {
+            throw new HydrationException(sprintf(
+                'cannot hydrate %s: %s. The row supplied [%s] — a SPEC §9 canonical column hydrates '
+                . 'to its value object (Ferro\{Decimal, Date, Time, Uuid, Json, U64, '
+                . 'NaiveTimestamp} or a \DateTimeImmutable), so type the DTO property to match, or '
+                . 'decode with a §9.1 string policy (decimal/uuid/u64_overflow = "string") or the '
+                . 'RawStringValuePolicy.',
+                $class,
+                $e->getMessage(),
+                implode(', ', array_map(
+                    static fn (string $c, mixed $v): string => $c . ': ' . get_debug_type($v),
+                    $cols,
+                    $row,
+                )),
+            ), 0, $e);
+        }
     }
 
     /**
