@@ -400,6 +400,52 @@ async fn timestamp_is_a_utc_instant_and_datetime_is_naive(url: &str, label: &str
         println!("  [{label}] writer {zone}: ts -> {want_utc}   dt -> {WALL} (naive)");
     }
 
+    // **The fraction-omission rule, live, for the OTHER two canonical temporal tags.** `PROTOCOL.md`
+    // §3.2: no `.ffffff` group at all when the sub-second part is zero, exactly six digits
+    // otherwise. `TIME` already has this locked live (`time_spans_the_full_signed_range`); these are
+    // the `TIMESTAMP`/`TIMESTAMPTZ` halves, and the columns are declared `(6)` precisely so the
+    // server's own DISPLAY text would pad `.000000` — which is exactly why the oracle here is the
+    // canonical literal and NOT `CAST(col AS CHAR)` (carry C15). The write goes through the
+    // UTC-pinned reader, so the whole-second wall clock IS the whole-second UTC instant.
+    const WHOLE: &str = "2026-08-05 11:45:07";
+    backend
+        .simple_query(
+            &mut reader,
+            &format!("REPLACE INTO ferro_s7_ts (id, ts, dt) VALUES (9, '{WHOLE}', '{WHOLE}')"),
+        )
+        .await
+        .expect("write the whole-second fixture");
+    let r = backend
+        .query(
+            &mut reader,
+            "SELECT ts, dt FROM ferro_s7_ts WHERE id = 9",
+            &[],
+        )
+        .await
+        .expect("read back the whole-second fixture");
+    assert_eq!(
+        r.rows[0][0],
+        Value::TimestampTz("2026-08-05T11:45:07Z".into()),
+        "[{label}] a whole-second TIMESTAMP(6) must OMIT the fraction group — the server's display \
+         text pads `.000000`, the canonical payload does not"
+    );
+    assert_eq!(
+        r.rows[0][1],
+        Value::Timestamp(WHOLE.into()),
+        "[{label}] a whole-second DATETIME(6) must OMIT the fraction group"
+    );
+    for (n, v) in r.rows[0].iter().enumerate() {
+        assert_eq!(
+            r.cols[n].tag,
+            v.tag(),
+            "[{label}] HEAD vs producer, whole-second column {n}"
+        );
+    }
+    println!(
+        "  [{label}] whole second: ts -> {:?}   dt -> {:?} (no .000000 group)",
+        r.rows[0][0], r.rows[0][1]
+    );
+
     backend
         .simple_query(&mut reader, "DROP TABLE IF EXISTS ferro_s7_ts")
         .await
@@ -471,7 +517,14 @@ async fn expression_columns_classify_off_metadata_alone(url: &str, label: &str) 
             "[{label}] MySQL keeps BIGINT UNSIGNED -> U64"
         );
     }
-    println!("  [{label}] CAST(1 AS UNSIGNED) -> tag {head} (MariaDB narrows to INT UNSIGNED)");
+    println!(
+        "  [{label}] CAST(1 AS UNSIGNED) -> tag {head}  ({})",
+        if maria {
+            "MariaDB narrows to INT UNSIGNED -> I64"
+        } else {
+            "MySQL keeps BIGINT UNSIGNED -> U64"
+        }
+    );
     conn.mysql.disconnect().await.ok();
 }
 

@@ -24,12 +24,23 @@
 //! `oid_to_tag` and `extract_value`.
 //!
 //! **The two gates fire at DIFFERENT times and must move in LOCKSTEP (hazard 18).**
-//! [`column_to_tag`] runs at cols-build, pre-execution; [`extract_value`] runs **per cell,
-//! mid-stream, after `HEAD` is already on the wire**. Admitting a type in one but not the other
-//! yields a `HEAD` promising a tag the producer cannot fill. Both are matches over the single
-//! [`column_kind`] classifier precisely so they cannot drift, and the agreement is asserted on real
-//! cells offline (`head_tag_equals_emitted_tag_for_every_admitted_column`) and live on BOTH engines
+//! [`column_to_tag`] runs at cols-build, pre-execution, and decides what `HEAD` promises;
+//! [`extract_value`] runs **per cell** and is the producer that has to fill that promise. Admitting
+//! a type in one but not the other yields a `HEAD` promising a tag the producer cannot fill. Both
+//! are matches over the single [`column_kind`] classifier precisely so they cannot drift, and the
+//! agreement is asserted on real cells offline
+//! (`head_tag_equals_emitted_tag_for_every_admitted_column`) and live on BOTH engines
 //! (`tests/mysql_types_it.rs`).
+//!
+//! *When the per-cell gate fires, on MySQL, today:* this backend's read path is **buffered** —
+//! [`crate::query`] drains the whole result set and maps the rows only after the drain, and
+//! `fetch:stream` on a MySQL pool is still a clean `Unsupported` (§22.2) — so nothing is on the wire
+//! yet when an `extract_value` refusal is raised, and it surfaces as an ordinary request error. The
+//! invariant being defended is nonetheless the streaming one — *HEAD promises exactly what the
+//! producer emits* — because that is what the buffered path would silently violate the moment it is
+//! made incremental. PG streams today, so there the same disagreement genuinely lands after `HEAD`
+//! is on the wire; MySQL streaming (a later slice) will need its own gate pair proved against the
+//! incremental path.
 //!
 //! **M1-S7 canonical text.** The canonical tags added in this slice (`DECIMAL`/`DATE`/`TIME`/
 //! `TIMESTAMP`/`TIMESTAMPTZ`/`JSON`) are carried as canonical **text** (`PROTOCOL.md` §3.2),
@@ -220,9 +231,12 @@ pub fn column_to_tag(col: &Column) -> Result<u8, PoolError> {
 /// driver `Value` variant that does not match the column kind is a client-side decode mismatch
 /// surfaced as `Backend` (NonRetryable) — NEVER `ConnectionLost` (no false §19.3 Indeterminate).
 ///
-/// This is the **per-cell, mid-stream** gate: it fires AFTER `HEAD` is already on the wire, which is
-/// why it and [`column_to_tag`] are both matches over the single [`column_kind`] classifier
-/// (hazard 18).
+/// This is the **per-cell** gate — the producer half of the promise [`column_to_tag`] already made
+/// in `HEAD` for the same column — which is why the two are both matches over the single
+/// [`column_kind`] classifier (hazard 18). On MySQL today the read path is buffered
+/// ([`crate::query`] maps rows after the full drain; `fetch:stream` is `Unsupported`), so nothing is
+/// on the wire when this fires; the invariant it defends is the streaming one, and MySQL streaming
+/// will need its own gate pair. See the module docs.
 pub fn extract_value(value: &MyValue, col: &Column) -> Result<Value, PoolError> {
     if matches!(value, MyValue::NULL) {
         return Ok(Value::Null);
@@ -679,133 +693,187 @@ mod tests {
     /// every newly-admitted column type, drive a REAL cell through the extractor and assert the
     /// emitted tag equals what the classifier promised — plus the exact canonical text, so a
     /// mis-routed renderer (DATE vs DATETIME) is caught here and not only live.
+    ///
+    /// **Completeness is enforced by the COMPILER, not by a count.** The matrix is *generated* from
+    /// two exhaustive matches over [`MyKind`] ([`cases_for_kind`] and [`next_kind`]), so adding a
+    /// variant to `MyKind` fails to compile until it has both a case and a place in the walk. The
+    /// earlier `assert!(cases.len() >= 13)` was the silent-drift shape this slice has been deleting
+    /// everywhere else: a 13th kind would have satisfied it while never being exercised.
     #[test]
     fn head_tag_equals_emitted_tag_for_every_admitted_column() {
-        let cases: Vec<(Column, MyValue, Value)> = vec![
-            // ---- M0 set, unchanged.
-            (
-                col(ColumnType::MYSQL_TYPE_TINY, NO_FLAGS, 1, BIN),
-                MyValue::Int(1),
-                Value::Bool(true),
-            ),
-            (
-                col(ColumnType::MYSQL_TYPE_LONGLONG, NO_FLAGS, 20, BIN),
-                MyValue::Int(-42),
-                Value::I64(-42),
-            ),
-            (
-                col(ColumnType::MYSQL_TYPE_DOUBLE, NO_FLAGS, 22, BIN),
-                MyValue::Double(2.5),
-                Value::F64(2.5),
-            ),
-            (
-                col(
-                    ColumnType::MYSQL_TYPE_VAR_STRING,
-                    NO_FLAGS,
-                    1020,
-                    UTF8MB4_MYSQL,
-                ),
-                MyValue::Bytes("héllo".as_bytes().to_vec()),
-                Value::Text("héllo".into()),
-            ),
-            (
-                col(
-                    ColumnType::MYSQL_TYPE_BLOB,
-                    ColumnFlags::BINARY_FLAG,
-                    65535,
-                    BIN,
-                ),
-                MyValue::Bytes(vec![0xde, 0xad]),
-                Value::Bytes(vec![0xde, 0xad]),
-            ),
-            // ---- M1-S7 admissions.
-            (
-                col(ColumnType::MYSQL_TYPE_LONGLONG, UNSIGNED, 20, BIN),
-                MyValue::Int(5),
-                Value::U64(5),
-            ),
-            (
-                col(ColumnType::MYSQL_TYPE_LONGLONG, UNSIGNED, 20, BIN),
-                MyValue::UInt(u64::MAX),
-                Value::U64(u64::MAX),
-            ),
-            (
-                col(ColumnType::MYSQL_TYPE_NEWDECIMAL, NO_FLAGS, 32, BIN),
-                MyValue::Bytes(b"-12345.6700000000".to_vec()),
-                Value::Decimal("-12345.6700000000".into()),
-            ),
-            (
-                col(
-                    ColumnType::MYSQL_TYPE_DATE,
-                    ColumnFlags::BINARY_FLAG,
-                    10,
-                    BIN,
-                ),
-                MyValue::Date(2026, 8, 5, 0, 0, 0, 0),
-                Value::Date("2026-08-05".into()),
-            ),
-            (
-                col(
-                    ColumnType::MYSQL_TYPE_DATETIME,
-                    ColumnFlags::BINARY_FLAG,
-                    26,
-                    BIN,
-                ),
-                MyValue::Date(2026, 8, 5, 11, 45, 7, 250_000),
-                Value::Timestamp("2026-08-05 11:45:07.250000".into()),
-            ),
-            (
-                col(
-                    ColumnType::MYSQL_TYPE_TIMESTAMP,
-                    UNSIGNED | ColumnFlags::BINARY_FLAG,
-                    26,
-                    BIN,
-                ),
-                MyValue::Date(2026, 8, 5, 11, 45, 7, 250_000),
-                Value::TimestampTz("2026-08-05T11:45:07.250000Z".into()),
-            ),
-            (
-                col(
-                    ColumnType::MYSQL_TYPE_TIME,
-                    ColumnFlags::BINARY_FLAG,
-                    17,
-                    BIN,
-                ),
-                MyValue::Time(true, 34, 22, 59, 58, 1),
-                Value::Time("-838:59:58.000001".into()),
-            ),
-            (
-                col(
-                    ColumnType::MYSQL_TYPE_JSON,
-                    ColumnFlags::BLOB_FLAG | ColumnFlags::BINARY_FLAG,
-                    4_294_967_295,
-                    BIN,
-                ),
-                MyValue::Bytes(br#"{"a": 1}"#.to_vec()),
-                Value::Json(r#"{"a": 1}"#.into()),
-            ),
-        ];
-
-        for (c, cell, want) in &cases {
-            let head = column_to_tag(c).expect("classifier admits this column");
-            let got = extract_value(cell, c).expect("producer fills it");
-            assert_eq!(got, *want, "value for {:?}", c.column_type());
-            assert_eq!(
-                head,
-                got.tag(),
-                "HEAD promised tag {head} for {:?} but the producer emitted {} — the cols-build \
-                 gate and the per-cell gate disagree",
-                c.column_type(),
-                got.tag()
-            );
-            // A SQL NULL in the same column is `Value::Null`, never a decode error — and HEAD still
-            // promises the column's own tag.
-            assert_eq!(extract_value(&MyValue::NULL, c).unwrap(), Value::Null);
+        /// The case(s) for ONE kind: `(column, driver cell, canonical value)`. EXHAUSTIVE over
+        /// `MyKind` — a new variant is a non-exhaustive-match compile error here.
+        fn cases_for_kind(kind: MyKind) -> Vec<(Column, MyValue, Value)> {
+            match kind {
+                // ---- M0 set, unchanged.
+                MyKind::Bool => vec![(
+                    col(ColumnType::MYSQL_TYPE_TINY, NO_FLAGS, 1, BIN),
+                    MyValue::Int(1),
+                    Value::Bool(true),
+                )],
+                MyKind::I64 => vec![(
+                    col(ColumnType::MYSQL_TYPE_LONGLONG, NO_FLAGS, 20, BIN),
+                    MyValue::Int(-42),
+                    Value::I64(-42),
+                )],
+                // Hazard 23: a `BIGINT UNSIGNED` ≤ `i64::MAX` arrives as `Int`, above it as `UInt` —
+                // both driver forms belong to this ONE kind, hence two cases.
+                MyKind::U64 => vec![
+                    (
+                        col(ColumnType::MYSQL_TYPE_LONGLONG, UNSIGNED, 20, BIN),
+                        MyValue::Int(5),
+                        Value::U64(5),
+                    ),
+                    (
+                        col(ColumnType::MYSQL_TYPE_LONGLONG, UNSIGNED, 20, BIN),
+                        MyValue::UInt(u64::MAX),
+                        Value::U64(u64::MAX),
+                    ),
+                ],
+                MyKind::F64 => vec![(
+                    col(ColumnType::MYSQL_TYPE_DOUBLE, NO_FLAGS, 22, BIN),
+                    MyValue::Double(2.5),
+                    Value::F64(2.5),
+                )],
+                MyKind::Text => vec![(
+                    col(
+                        ColumnType::MYSQL_TYPE_VAR_STRING,
+                        NO_FLAGS,
+                        1020,
+                        UTF8MB4_MYSQL,
+                    ),
+                    MyValue::Bytes("héllo".as_bytes().to_vec()),
+                    Value::Text("héllo".into()),
+                )],
+                MyKind::Bytes => vec![(
+                    col(
+                        ColumnType::MYSQL_TYPE_BLOB,
+                        ColumnFlags::BINARY_FLAG,
+                        65535,
+                        BIN,
+                    ),
+                    MyValue::Bytes(vec![0xde, 0xad]),
+                    Value::Bytes(vec![0xde, 0xad]),
+                )],
+                // ---- M1-S7 admissions.
+                MyKind::Decimal => vec![(
+                    col(ColumnType::MYSQL_TYPE_NEWDECIMAL, NO_FLAGS, 32, BIN),
+                    MyValue::Bytes(b"-12345.6700000000".to_vec()),
+                    Value::Decimal("-12345.6700000000".into()),
+                )],
+                MyKind::Date => vec![(
+                    col(
+                        ColumnType::MYSQL_TYPE_DATE,
+                        ColumnFlags::BINARY_FLAG,
+                        10,
+                        BIN,
+                    ),
+                    MyValue::Date(2026, 8, 5, 0, 0, 0, 0),
+                    Value::Date("2026-08-05".into()),
+                )],
+                MyKind::Time => vec![(
+                    col(
+                        ColumnType::MYSQL_TYPE_TIME,
+                        ColumnFlags::BINARY_FLAG,
+                        17,
+                        BIN,
+                    ),
+                    MyValue::Time(true, 34, 22, 59, 58, 1),
+                    Value::Time("-838:59:58.000001".into()),
+                )],
+                MyKind::Timestamp => vec![(
+                    col(
+                        ColumnType::MYSQL_TYPE_DATETIME,
+                        ColumnFlags::BINARY_FLAG,
+                        26,
+                        BIN,
+                    ),
+                    MyValue::Date(2026, 8, 5, 11, 45, 7, 250_000),
+                    Value::Timestamp("2026-08-05 11:45:07.250000".into()),
+                )],
+                MyKind::TimestampTz => vec![(
+                    col(
+                        ColumnType::MYSQL_TYPE_TIMESTAMP,
+                        UNSIGNED | ColumnFlags::BINARY_FLAG,
+                        26,
+                        BIN,
+                    ),
+                    MyValue::Date(2026, 8, 5, 11, 45, 7, 250_000),
+                    Value::TimestampTz("2026-08-05T11:45:07.250000Z".into()),
+                )],
+                MyKind::Json => vec![(
+                    col(
+                        ColumnType::MYSQL_TYPE_JSON,
+                        ColumnFlags::BLOB_FLAG | ColumnFlags::BINARY_FLAG,
+                        4_294_967_295,
+                        BIN,
+                    ),
+                    MyValue::Bytes(br#"{"a": 1}"#.to_vec()),
+                    Value::Json(r#"{"a": 1}"#.into()),
+                )],
+            }
         }
-        assert!(
-            cases.len() >= 13,
-            "the matrix must cover every admitted kind"
-        );
+
+        /// The variant chain that DRIVES the matrix, also EXHAUSTIVE over `MyKind`: a new variant
+        /// cannot be walked without naming its predecessor's successor, so it cannot slip in
+        /// uncovered. `None` ends the walk.
+        fn next_kind(kind: MyKind) -> Option<MyKind> {
+            Some(match kind {
+                MyKind::Bool => MyKind::I64,
+                MyKind::I64 => MyKind::U64,
+                MyKind::U64 => MyKind::F64,
+                MyKind::F64 => MyKind::Text,
+                MyKind::Text => MyKind::Bytes,
+                MyKind::Bytes => MyKind::Decimal,
+                MyKind::Decimal => MyKind::Date,
+                MyKind::Date => MyKind::Time,
+                MyKind::Time => MyKind::Timestamp,
+                MyKind::Timestamp => MyKind::TimestampTz,
+                MyKind::TimestampTz => MyKind::Json,
+                MyKind::Json => return None,
+            })
+        }
+
+        let mut walked: Vec<MyKind> = Vec::new();
+        let mut cursor = Some(MyKind::Bool);
+        while let Some(kind) = cursor {
+            assert!(
+                !walked.contains(&kind),
+                "the {kind:?} arm of `next_kind` re-enters the chain — the walk must visit each \
+                 kind exactly once"
+            );
+            walked.push(kind);
+            cursor = next_kind(kind);
+        }
+
+        for kind in &walked {
+            let cases = cases_for_kind(*kind);
+            assert!(!cases.is_empty(), "{kind:?} has no matrix case");
+            for (c, cell, want) in &cases {
+                // The case must actually be filed under the kind it claims — a case parked in the
+                // wrong arm would otherwise leave its own kind untested.
+                assert_eq!(
+                    column_kind(c).expect("classifier admits this column"),
+                    *kind,
+                    "a {:?} column is filed under the {kind:?} arm",
+                    c.column_type()
+                );
+                let head = column_to_tag(c).expect("classifier admits this column");
+                let got = extract_value(cell, c).expect("producer fills it");
+                assert_eq!(got, *want, "value for {:?}", c.column_type());
+                assert_eq!(
+                    head,
+                    got.tag(),
+                    "HEAD promised tag {head} for {:?} but the producer emitted {} — the \
+                     cols-build gate and the per-cell gate disagree",
+                    c.column_type(),
+                    got.tag()
+                );
+                // A SQL NULL in the same column is `Value::Null`, never a decode error — and HEAD
+                // still promises the column's own tag.
+                assert_eq!(extract_value(&MyValue::NULL, c).unwrap(), Value::Null);
+            }
+        }
     }
 
     /// **Carry C16.** `mytext::date_to_text` rejects a cell carrying a time part, which is the
