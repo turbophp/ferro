@@ -96,8 +96,9 @@ final class ValueTest extends TestCase
         $v = Value::decode($p, $wire, $off);
         $this->expectException(CodecException::class);
         $this->expectExceptionMessage("TypedValue tag {$tag}: expected a canonical-text string payload");
+        // No trailing ->fail(): it is unreachable under expectException and reads as a second
+        // guard that is not one. expectException* IS the assertion.
         $v->encode($p);
-        $this->fail("tag {$name} accepted a non-string payload");
     }
 
     /** @return array<string, array{0:int, 1:string}> */

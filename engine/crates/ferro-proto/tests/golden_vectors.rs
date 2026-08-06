@@ -110,7 +110,12 @@ fn every_implemented_tag_has_a_vector() {
     let seen = tags_present_in_committed_vectors();
 
     for name in &reg.implemented {
-        let t = reg.tags[name];
+        // `.get()` rather than `reg.tags[name]`: a typo in types.toml's `implemented` (e.g.
+        // "TIMESTMAP") is a plausible future edit, and direct indexing panics with rustc's opaque
+        // "no entry found for key" instead of naming the offending entry.
+        let t = *reg.tags.get(name).unwrap_or_else(|| {
+            panic!("implemented tag {name} has no entry in the [tags] table of types.toml")
+        });
         assert!(
             seen.contains(&t),
             "no golden vector exercises implemented tag {name} ({t})"
