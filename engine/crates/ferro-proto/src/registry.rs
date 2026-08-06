@@ -16,9 +16,11 @@ pub struct Registry {
     pub methods: BTreeMap<String, BTreeMap<String, u16>>,
     pub features: BTreeMap<String, BTreeMap<String, u16>>,
     pub outcome: BTreeMap<String, u8>,
-    /// The tags implemented end-to-end, SORTED. Part of the hashed lock: changing this set moves
-    /// `TYPE_REGISTRY_HASH`, so an engine/client pair with different type coverage fails fast at
-    /// the handshake instead of throwing mid-query on the first row of a new type (M1-S7).
+    /// The tags the canonical WIRE CODEC carries, SORTED — a codec/wire scope, NOT a per-engine
+    /// availability claim (a listed tag is one both codecs can move, not one every backend can
+    /// produce; the per-engine matrix is SPEC §22.2). Part of the hashed lock: changing this set
+    /// moves `TYPE_REGISTRY_HASH`, so an engine/client pair with different type coverage fails
+    /// fast at the handshake instead of throwing mid-query on the first row of a new type (M1-S7).
     pub implemented: Vec<String>,
     pub tags: BTreeMap<String, u8>,
     pub branches: BTreeMap<String, u8>,

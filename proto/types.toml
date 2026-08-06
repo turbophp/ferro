@@ -1,6 +1,11 @@
 # Canonical TypedValue tags (SPEC §9). [tag, value] 2-element msgpack array (W-1).
 
-# The tags implemented END-TO-END (engine both backends + PHP client). This list FEEDS
+# The tags the canonical WIRE CODEC carries — i.e. what `Value::{encode,decode}` and the PHP
+# codec implement. This is a codec/wire scope, NOT a per-engine availability claim: a tag listed
+# here is one both codecs can move, not one every backend can produce. The per-engine matrix
+# lives in SPEC §22.2 (e.g. MySQL 8 has no native UUID type, and MariaDB `JSON` is `LONGTEXT`
+# with no recoverable metadata, so it classifies as TEXT by design — promoting it to JSON would
+# be a silent miscast, charter rule 6). This list FEEDS
 # registry.lock.json and therefore TYPE_REGISTRY_HASH: changing it changes the hash, so an
 # engine/client pair with different type coverage fails FAST at the handshake instead of
 # throwing mid-query on the first row of a newly-supported type (M1-S7 decision).
