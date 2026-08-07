@@ -108,7 +108,16 @@ async fn run_demo(socket_path: &Path) -> Result<(), BoxErr> {
     let hs = client.hello(1).await?;
     println!("[1] HELLO -> HELLO_ACK");
     println!("      boot_epoch = {}", hs.boot_epoch);
-    println!("      pools      = {:?}", hs.pools);
+    // M1-S8a: `HelloAck.pools` carries the whole `PoolInfo` triple, so print name + backend family
+    // + the (Task-12) server version rather than just the name.
+    for p in &hs.pools {
+        println!(
+            "      pool       = {} (kind={}, server_version={})",
+            p.name,
+            p.kind,
+            p.server_version.as_deref().unwrap_or("<unknown>")
+        );
+    }
     println!();
 
     // [2] SELECT 1 — a single-row read, with queue/exec timings.

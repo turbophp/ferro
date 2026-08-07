@@ -13,7 +13,8 @@ use PHPUnit\Framework\TestCase;
  *
  * Two properties are load-bearing and asserted here rather than left to the M1 policy (Task 7):
  *   1. `naive_datetime_zone=server` is REJECTED as deferred (nothing on the wire carries the
- *      backend session timezone — `HelloAck` has no pool metadata yet), never silently downgraded.
+ *      backend session timezone — M1-S8a's `HelloAck` pool metadata carries the backend family and
+ *      version, not a timezone), never silently downgraded.
  *   2. `naive_datetime_zone=error` is scoped to `TAG_TIMESTAMP` ALONE. An undefined scope would
  *      make TIMESTAMPTZ/DATE/TIME columns unreadable with no escape hatch, so the scope lives in
  *      the options object where it is testable against every tag at once.

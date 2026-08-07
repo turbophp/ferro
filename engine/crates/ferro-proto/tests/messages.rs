@@ -25,6 +25,35 @@ fn hello_ack_roundtrip_with_large_epoch() {
     assert_eq!(HelloAck::decode(&a.encode()).unwrap(), a);
 }
 
+/// `HelloAck.pools` carries STRUCTURED metadata, not bare names. Arity of `HelloAck` itself is
+/// unchanged (5) — it is the ELEMENT shape that grew, which is why the version bump (not arity) is
+/// what makes a skewed pair fail fast.
+#[test]
+fn hello_ack_carries_structured_pool_metadata() {
+    let ack = HelloAck {
+        engine_version: 1,
+        boot_epoch: 7,
+        features: 0,
+        pools: vec![
+            PoolInfo {
+                name: "main".into(),
+                kind: "postgres".into(),
+                server_version: Some("PostgreSQL 17.10 (Debian 17.10-1.pgdg13+1)".into()),
+            },
+            PoolInfo {
+                name: "reporting".into(),
+                kind: "mysql".into(),
+                server_version: None,
+            },
+        ],
+        type_registry_hash: "deadbeef".into(),
+    };
+    let back = HelloAck::decode(&ack.encode()).expect("round trip");
+    assert_eq!(back, ack);
+    assert_eq!(back.pools[0].kind, "postgres");
+    assert_eq!(back.pools[1].server_version, None);
+}
+
 #[test]
 fn ping_pong_goodbye_roundtrip() {
     assert_eq!(

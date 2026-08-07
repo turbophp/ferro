@@ -24,6 +24,29 @@ final class HeaderTest extends TestCase
         $this->expectException(CodecException::class);
         Header::decode($b);
     }
+    /**
+     * The PHP half of the M1-S8a skew tripwire (the Rust half is
+     * `ferro-proto/tests/header.rs::a_frame_from_the_previous_protocol_version_is_rejected_by_the_header`).
+     * A frame written by an OLDER-protocol engine is refused at byte 1, before a single payload byte
+     * is unpacked — which is what makes the `HelloAck.pools` reshape safe: an old engine's ack never
+     * reaches {@see \Ferro\Protocol\HelloAck::decode}.
+     *
+     * The expectation is derived from `C::PROTOCOL_VERSION`, never a literal — a hand-written
+     * protocol constant is a charter rule 2 defect, tests included.
+     *
+     * What this does NOT prove: that the failure is a TYPED handshake rejection. It is not. It is a
+     * codec error, and the message the operator sees is "bad version N" (PROTOCOL.md §1).
+     */
+    public function testRejectsThePreviousProtocolVersionBeforeReadingAnyPayload(): void
+    {
+        $stale = C::PROTOCOL_VERSION - 1;
+        $b = (new Header(0, C::SERVICE_CORE, C::METHOD_CORE_HELLO_ACK, 1, 0))->encode();
+        $b[1] = chr($stale);
+        $this->expectException(CodecException::class);
+        $this->expectExceptionMessage('bad version ' . $stale);
+        Header::decode($b);
+    }
+
     public function testRejectsOversizeLen(): void
     {
         $b = (new Header(0, 2, 1, 1, 0))->encode();

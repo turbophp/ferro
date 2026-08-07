@@ -26,7 +26,7 @@ final class Message
                 $p->packUint(self::i($f, 'engine_version')),
                 $p->packUint(self::u($f, 'boot_epoch')),   // string-safe for > PHP_INT_MAX
                 $p->packUint(self::i($f, 'features')),
-                self::strArray($p, $f['pools'] ?? []),
+                self::poolInfoArray($p, $f['pools'] ?? []),
                 $p->packStr(self::s($f, 'type_registry_hash')),
             ]),
             'ping', 'pong' => self::arr($p, [$p->packUint(self::u($f, 'token'))]),
@@ -41,11 +41,29 @@ final class Message
     {
         return $p->packArrayLen(count($items)) . implode('', $items);
     }
-    private static function strArray(PackerInterface $p, mixed $pools): string
+    /**
+     * `HelloAck.pools` (M1-S8a): an array of NESTED `[name, kind, server_version]` triples, not
+     * bare names. The input is either a golden vector's decoded-JSON `message.pools` (a list of
+     * assoc arrays) or a list of {@see PoolInfo}; both narrow to the same positional triple, so the
+     * byte lock exercises exactly the shape {@see PoolInfo::toWire} produces.
+     */
+    private static function poolInfoArray(PackerInterface $p, mixed $pools): string
     {
         $list = is_array($pools) ? $pools : [];
         $out = $p->packArrayLen(count($list));
-        foreach ($list as $s) { $out .= $p->packStr(self::scalarToStr($s)); }
+        foreach ($list as $entry) {
+            if ($entry instanceof PoolInfo) { $entry = $entry->toWire(); }
+            if (!is_array($entry)) {
+                throw new CodecException('hello_ack: each pool must be a [name, kind, server_version] triple');
+            }
+            $name = $entry['name'] ?? $entry[0] ?? null;
+            $kind = $entry['kind'] ?? $entry[1] ?? null;
+            $version = $entry['server_version'] ?? $entry[2] ?? null;
+            $out .= $p->packArrayLen(3)
+                . $p->packStr(self::scalarToStr($name))
+                . $p->packStr(self::scalarToStr($kind))
+                . ($version === null ? $p->packNil() : $p->packStr(self::scalarToStr($version)));
+        }
         return $out;
     }
     /** @param array<string,mixed> $f */

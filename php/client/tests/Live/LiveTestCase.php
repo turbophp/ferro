@@ -142,7 +142,44 @@ abstract class LiveTestCase extends TestCase
      */
     protected function launchedPools(): array
     {
-        return $this->mysqlUrl === '' ? ['default'] : ['default', self::MYSQL_POOL];
+        return array_keys($this->launchedPoolDsns());
+    }
+
+    /**
+     * The `name => DSN` map this harness hands `ferrod`, in the same order as {@see launchedPools}.
+     * Both that method and {@see launchedPoolKinds} read it, so the pool set is stated ONCE.
+     *
+     * @return array<string, string>
+     */
+    private function launchedPoolDsns(): array
+    {
+        $pools = ['default' => $this->pgUrl];
+        if ($this->mysqlUrl !== '') {
+            $pools[self::MYSQL_POOL] = $this->mysqlUrl;
+        }
+        return $pools;
+    }
+
+    /**
+     * The backend FAMILY this harness expects `HELLO_ACK` to advertise per pool (M1-S8a), DERIVED
+     * from the DSN scheme the harness itself passed — mirroring `config::infer_pool_kind`, which is
+     * the engine's only source for `PoolSpec.kind` (there is no `kind=` knob). Deriving it means a
+     * run pointed at a MariaDB DSN, or a renamed pool, still produces the right expectation, while
+     * an engine that mislabels a family still FAILS.
+     *
+     * @return list<string> one family string per {@see launchedPools} entry, same order
+     */
+    protected function launchedPoolKinds(): array
+    {
+        $kinds = [];
+        foreach ($this->launchedPoolDsns() as $dsn) {
+            $scheme = strtolower((string) strstr($dsn, '://', true));
+            $kinds[] = match ($scheme) {
+                'mysql', 'mariadb' => 'mysql',
+                default => 'postgres',
+            };
+        }
+        return $kinds;
     }
 
     /**

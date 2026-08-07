@@ -7,7 +7,12 @@ use Ferro\Protocol\Msgpack\PackerInterface;
  * Decoder value object for the `CORE/HELLO_ACK` reply (server -> client only). Mirrors the Rust
  * `messages::HelloAck` BYTES: a positional fixarray of 5 fields in declaration order (see
  * `engine/crates/ferro-proto/src/messages.rs`) —
- *   [engine_version:u32, boot_epoch:u64, features:u32, pools:Vec<String>, type_registry_hash:String].
+ *   [engine_version:u32, boot_epoch:u64, features:u32, pools:Vec<PoolInfo>, type_registry_hash:String].
+ *
+ * M1-S8a reshaped field 4: each element is now a nested `[name, kind, server_version]` triple
+ * ({@see PoolInfo}) rather than a bare name. `HelloAck`'s OWN arity is unchanged (5) — the skew
+ * tripwire for that reshape is `protocol_version` 1 -> 2, checked in {@see Header::decode} at byte 1
+ * of every frame, NOT this arity check (which would only ever fire on a different kind of bug).
  *
  * `boot_epoch` is a full-range random `u64` (SPEC §19.1) and is stored EXACTLY as {@see PurePacker}
  * yields it: an `int` when it narrowed to a marker <= uint32, or a DECIMAL STRING when it rode a
@@ -19,7 +24,8 @@ final class HelloAck
 {
     /**
      * @param int|string $bootEpoch OPAQUE: int, or a decimal string for a uint64-encoded epoch.
-     * @param list<string> $pools the pool names the client may reference in `ExecRequest.pool`.
+     * @param list<PoolInfo> $pools the pools this engine serves — name (what `ExecRequest.pool`
+     *        references), backend family, and server version when the engine has learned it.
      */
     public function __construct(
         public readonly int $engineVersion,
@@ -46,7 +52,7 @@ final class HelloAck
         }
 
         $pools = [];
-        foreach (SqlValueCodec::listOf($w[3]) as $name) { $pools[] = SqlValueCodec::toStr($name); }
+        foreach (SqlValueCodec::listOf($w[3]) as $entry) { $pools[] = PoolInfo::fromWire($entry); }
 
         return new self(
             SqlValueCodec::toInt($w[0]),

@@ -13,7 +13,7 @@
 use ferro_proto::consts::{TYPE_REGISTRY_HASH, flags, method_core, method_sql, service};
 use ferro_proto::header::Header;
 use ferro_proto::messages::sql::ExecRequest;
-use ferro_proto::messages::{Hello, HelloAck, Outcome};
+use ferro_proto::messages::{Hello, HelloAck, Outcome, PoolInfo};
 use ferro_proto::value::Value;
 use ferrod::session::codec::{FrameCodec, InFrame, OutFrame};
 use futures::{SinkExt, StreamExt};
@@ -26,9 +26,13 @@ use tokio_util::codec::Framed;
 pub type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 /// The HELLO/HELLO_ACK result the demo prints: the daemon's `boot_epoch` and advertised pools.
+///
+/// `pools` follows `HelloAck.pools`, which became structured per-pool metadata in M1-S8a — a
+/// `PoolInfo { name, kind, server_version }` triple rather than a bare name — so the demo prints the
+/// whole triple.
 pub struct Handshake {
     pub boot_epoch: u64,
-    pub pools: Vec<String>,
+    pub pools: Vec<PoolInfo>,
 }
 
 /// A framed connection to a `ferrod` session server over a UDS socket.

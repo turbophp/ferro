@@ -26,8 +26,13 @@ pub(crate) fn from_slice<'a, T: Deserialize<'a>>(b: &'a [u8]) -> Result<T, Codec
     Ok(v)
 }
 
+/// Declares one positional wire message. The leading `$(#[$meta:meta])*` capture is what lets a
+/// `///` doc comment ride the invocation: without it rustc emits `unused_doc_comments` (a
+/// `-D warnings` build failure), because a doc comment written in front of a macro CALL documents
+/// nothing — the expansion has to carry it onto the generated struct.
 macro_rules! msg {
-    ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
+    ($(#[$meta:meta])* $name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
+        $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
         pub struct $name { $(pub $field: $ty),* }
         impl $name {
@@ -38,7 +43,30 @@ macro_rules! msg {
 }
 
 msg!(Hello { client_version: u32, type_registry_hash: String, manifest_hash: Option<String>, pid: u32, features: u32 });
-msg!(HelloAck { engine_version: u32, boot_epoch: u64, features: u32, pools: Vec<String>, type_registry_hash: String });
+msg!(
+    /// One pool's advertised metadata (M1-S8a). A positional fixarray of 3, nested inside
+    /// `HelloAck.pools`.
+    ///
+    /// The doc comment lives INSIDE the `msg!` invocation on purpose: a `///` written in FRONT of a
+    /// macro call is attached to the invocation item and never enters the macro's token stream, so
+    /// it documents nothing and rustc raises `unused_doc_comments` (a `-D warnings` failure).
+    ///
+    /// `kind` is the backend FAMILY (`"postgres"` / `"mysql"`), which the engine has known since
+    /// `PoolRegistry::build` (from the DSN scheme) but never put on the wire. `server_version` is
+    /// the backend's own `version()` string, **verbatim and unnormalised** — parsing it into a
+    /// platform decision is a client-tier concern (a Doctrine driver needs `mariadb` to appear in
+    /// the string for the MariaDB branch, and PG's leading word stripped), and normalising it here
+    /// would bake one ecosystem's conventions into the protocol.
+    ///
+    /// `server_version` is `nil` when the engine has not learned it — a pool whose backend was
+    /// unreachable at handshake time. The handshake never depends on backend availability. M1-S8a
+    /// Task 11 emits `None` unconditionally; Task 12 is what fills it.
+    ///
+    /// Still NEVER exposed: the DSN (§12 server secret).
+    PoolInfo { name: String, kind: String, server_version: Option<String> }
+);
+
+msg!(HelloAck { engine_version: u32, boot_epoch: u64, features: u32, pools: Vec<PoolInfo>, type_registry_hash: String });
 msg!(Ping { token: u64 });
 msg!(Pong { token: u64 });
 msg!(Goodbye {});

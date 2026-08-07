@@ -24,7 +24,7 @@ alignment — the payload starts at byte 16.
 | offset | field | type | notes |
 |---|---|---|---|
 | 0 | `magic` | `u8` | always `0xF7` (`consts::MAGIC`) |
-| 1 | `version` | `u8` | protocol major version, currently `1` (`consts::PROTOCOL_VERSION`) |
+| 1 | `version` | `u8` | protocol major version, currently `2` (`consts::PROTOCOL_VERSION`) |
 | 2 | `flags` | `u16` | bitfield: `STREAM 0x01`, `END 0x02`, `CANCEL 0x04`, `OOB_FD 0x08`, `COMPRESSED 0x10` (reserved, unimplemented before post-M3) |
 | 4 | `service` | `u16` | `CORE 1`, `SQL 2`, `TX 3`, `STREAM 4`, `ADMIN 5` |
 | 6 | `method` | `u16` | per-service method id, registry `/proto/methods.toml` |
@@ -35,6 +35,38 @@ Total: 16 bytes. Field order above is the encode/decode order — do not reorder
 packs/unpacks this with `pack('CCvvvVV', magic, version, flags, service, method, request_id,
 payload_len)` / the matching `unpack` format (all fields little-endian; `C`=u8, `v`=u16 LE,
 `V`=u32 LE, matching PHP's `pack()` on little-endian platforms).
+
+**`protocol_version` went `1` → `2` in M1-S8a**, and the reason is the only reason it ever moves: a
+message SHAPE changed in a way nothing else would catch. `HELLO_ACK`'s `pools` became structured
+per-pool metadata (§4), and `TYPE_REGISTRY_HASH` — the other cross-version tripwire — is FNV-1a over
+`registry.lock.json`, which carries protocol version / magic / flags / services / methods / error
+codes / type tags but **no message layouts**. Without the bump a skewed pair would handshake
+"successfully" (the engine compares only the hash) and then fail deep inside `HelloAck::decode`.
+Bumping the version *also* changes the lock file, so the hash moves too — two independent tripwires,
+one of which fires first.
+
+**What the skew failure LOOKS like, honestly.** Byte 1 is checked in `Header::decode` on **both**
+sides — Rust `header.rs` and PHP `Header.php` — **before any payload is decoded**, so a mismatch is
+caught deterministically at the first byte pair of the first frame, in both directions (an old
+client's `HELLO` reaching a new engine; an old engine's frame reaching a new client). But it is a
+**codec-class** failure, not a typed handshake rejection, and the two look different in three ways
+worth knowing before you debug one. Measured end to end against a live `ferrod` at
+`protocol_version = 2`:
+
+| what arrived | engine's terminal on `request_id=0` | message |
+|---|---|---|
+| a `HELLO` frame with version byte `1` | `errc::PROTOCOL` (`0x3009`) | `unsupported protocol version: expected 2, got 1` |
+| a well-formed v2 `HELLO` with a stale `type_registry_hash` | `errc::UNSUPPORTED` (`0x300A`) | `type_registry_hash mismatch: client sent …, engine is …` |
+
+So: (1) the code is `PROTOCOL`, not `UNSUPPORTED` — anything keying on `errc::UNSUPPORTED` to mean
+"we disagree" will not fire on a version skew; (2) the engine's own log/terminal message *does* name
+both versions, so the engine-side diagnosis is good; but (3) **the old client cannot read that
+terminal**, because the reply frame itself carries version `2` and dies in the client's
+`Header::decode` as `CodecException('bad version 2')`. The client-side symptom is therefore a bare
+codec error with no server text at all. That asymmetry is a deliberate trade, not an oversight —
+carrying a version inside the `HELLO` *payload* and rejecting it as a typed error is a strictly
+larger change and was not in scope for M1-S8a. Do not file the missing typed error as a bug against
+this section.
 
 **Hard ceiling:** `MAX_FRAME_PAYLOAD = 16777216` (16 MiB, `consts::MAX_FRAME_PAYLOAD`). A frame
 declaring a larger `payload_len` MUST be rejected with a `Protocol` error **before any allocation
@@ -211,8 +243,28 @@ service's terminal frame carries.
 | 1 | `engine_version` | `u32` | |
 | 2 | `boot_epoch` | `u64` | unique per daemon start (§19.1); see §2 uint64-overflow note |
 | 3 | `features` | `u32` | engine feature bitfield: `MEMFD 0x01`, `LISTEN_STREAMS 0x02`, `MANIFEST 0x04` |
-| 4 | `pools` | `array<str>` | pool names available on this engine |
+| 4 | `pools` | `array<[str, str, str \| nil]>` | one nested positional triple per pool available on this engine — `[name, kind, server_version]`; see below (M1-S8a) |
 | 5 | `type_registry_hash` | `str` | echoed back; mismatch vs. the client's hash is a hard error |
+
+**`pools` element (`PoolInfo`, M1-S8a)** — a positional fixarray of 3, in this order:
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `name` | `str` | what a client puts in `ExecRequest.pool` / `BeginRequest.pool` |
+| 2 | `kind` | `str` | the backend FAMILY: `"postgres"` or `"mysql"` (MariaDB is `"mysql"` — it is the same family and the same wire protocol; the *product* is distinguishable only from `server_version`). Derived engine-side from the DSN SCHEME, so it is known without dialling the backend |
+| 3 | `server_version` | `str \| nil` | the backend's own `version()` output, **verbatim and unnormalised**; `nil` when the engine has not learned it |
+
+Two rules that are contract, not implementation detail. **`server_version` is never normalised on
+the wire** — stripping PostgreSQL's leading product word or extracting a `major.minor.patch` is a
+consuming tier's job (a Doctrine driver needs the literal substring `mariadb` to take its MariaDB
+branch), and normalising here would bake one ecosystem's conventions into the protocol. And
+**`nil` is a legitimate steady state, not an error**: the handshake never depends on a backend being
+reachable — `ferrod` boots and serves `HELLO_ACK` with every upstream down — so a client must treat
+an absent version as "unknown", never as a failure. M1-S8a Task 11 emits `nil` for every pool; Task
+12 is what learns the real string.
+
+The DSN is **never** on the wire (SPEC §12 — it is a server-side secret), and `pools` is ordered by
+`name` so two connections to one engine see the identical list.
 
 ### `PING` (service `CORE`, method `PING` = 3) — either direction
 
@@ -284,6 +336,16 @@ the vector wins.
 **Core service + the cross-cutting envelopes** (§4/§5/§6): `hello`, `hello_ack` (also locks the §2
 `boot_epoch` uint64 → decimal-string rule), `ping`, `pong`, `goodbye`, `window_update`, and
 `error_protocol` (a terminal `Outcome::Error(ERROR)` with `sqlstate` and `errno` both `nil`).
+
+**M1-S8a reshaped `hello_ack`** (§4): its `pools` list carries **two** nested `PoolInfo` triples —
+`["main", "postgres", "PostgreSQL 17.10"]` and `["reporting", "mysql", nil]` — covering both the
+`Some` and the `nil` arm of `server_version`, with pairwise-distinct field values. Non-empty is
+load-bearing: the pre-S8a fixture was `pools: []`, which byte-locks **no** element shape at all, and
+that was measured — with the empty fixture a deliberately swapped `name`/`kind` order in the PHP
+encoder passes the byte lock; with these two triples it fails. The same commit bumped
+`protocol_version` 1 → 2 (§1), so **every** committed vector's `frame_hex` changed in byte 1 and
+every `negative/*.bin` fixture was regenerated with it (`bad_version.bin` alone is unchanged — its
+version byte is an explicit `0x99` that must stay wrong).
 
 **M1-S8a:** `error_mysql_errno` — the FIRST vector locking a **non-null `errno`** (field 4, §5)
 alongside a real `sqlstate`: a MySQL duplicate key, `errno 1062` / SQLSTATE `23000`, carried in a

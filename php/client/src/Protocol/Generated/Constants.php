@@ -8,7 +8,7 @@ namespace Ferro\Protocol\Generated;
 
 final class Constants
 {
-    public const PROTOCOL_VERSION = 1;
+    public const PROTOCOL_VERSION = 2;
     public const MAGIC = 247;
     public const MAX_FRAME_PAYLOAD = 16777216;
     public const DEFAULT_CREDIT_FRAMES = 64;
@@ -110,5 +110,5 @@ final class Constants
     public const ERR_WRITE_UNCONFIRMED = 8193;
     public const ERR_WRITE_UNCONFIRMED_BRANCH = 2;
 
-    public const TYPE_REGISTRY_HASH = '82a29fc665e4baf2';
+    public const TYPE_REGISTRY_HASH = 'c84a88cd97f6c689';
 }

@@ -63,7 +63,7 @@ final class SessionHandshakeTest extends TestCase
             'engine_version' => 1,
             'boot_epoch' => $bigEpoch,
             'features' => 0,
-            'pools' => ['default'],
+            'pools' => [['name' => 'default', 'kind' => 'postgres', 'server_version' => 'PostgreSQL 17.10']],
             'type_registry_hash' => C::TYPE_REGISTRY_HASH,
         ], $packer);
         // request_id deliberately NOT the HELLO id (=1): the session must not assert they match.
@@ -78,7 +78,10 @@ final class SessionHandshakeTest extends TestCase
         $this->assertIsString($ack->bootEpoch, 'a > PHP_INT_MAX epoch must stay a string');
         $this->assertSame($bigEpoch, $ack->bootEpoch, 'value preserved exactly, not collapsed');
         $this->assertSame($bigEpoch, $session->bootEpoch(), 'cached opaquely on the session');
-        $this->assertSame(['default'], $ack->pools);
+        $this->assertSame(['default'], array_map(static fn ($p) => $p->name, $ack->pools));
+        $this->assertSame('postgres', $ack->pools[0]->kind);
+        $this->assertSame('PostgreSQL 17.10', $ack->pools[0]->serverVersion);
+        $this->assertSame(['default'], $session->pools());
         $this->assertTrue($session->handshakeComplete());
     }
 
@@ -91,7 +94,10 @@ final class SessionHandshakeTest extends TestCase
             'engine_version' => 1,
             'boot_epoch' => 42,
             'features' => 0,
-            'pools' => ['default', 'replica'],
+            'pools' => [
+                ['name' => 'default', 'kind' => 'postgres', 'server_version' => null],
+                ['name' => 'replica', 'kind' => 'mysql', 'server_version' => '8.4.11'],
+            ],
             'type_registry_hash' => C::TYPE_REGISTRY_HASH,
         ], $packer);
         $header = new Header(0, C::SERVICE_CORE, C::METHOD_CORE_HELLO_ACK, 1, strlen($payload));
@@ -102,6 +108,12 @@ final class SessionHandshakeTest extends TestCase
 
         $ack = $session->hello();
         $this->assertSame(42, $ack->bootEpoch);
-        $this->assertSame(['default', 'replica'], $ack->pools);
+        // The nested triple decodes field-for-field, including the `nil` server_version arm.
+        $this->assertSame(['default', 'replica'], array_map(static fn ($p) => $p->name, $ack->pools));
+        $this->assertSame(['postgres', 'mysql'], array_map(static fn ($p) => $p->kind, $ack->pools));
+        $this->assertSame([null, '8.4.11'], array_map(static fn ($p) => $p->serverVersion, $ack->pools));
+        // The name-only accessor is preserved for `ExecRequest.pool` callers.
+        $this->assertSame(['default', 'replica'], $session->pools());
+        $this->assertSame($ack->pools, $session->poolInfo());
     }
 }

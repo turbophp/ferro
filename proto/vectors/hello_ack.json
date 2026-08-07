@@ -1,5 +1,5 @@
 {
-  "frame_hex": "f70100000100020001000000160000009501cffffffffffffffff00090a86465616462656566",
+  "frame_hex": "f70200000100020001000000480000009501cffffffffffffffff0009293a46d61696ea8706f737467726573b0506f737467726553514c2031372e313093a97265706f7274696e67a56d7973716cc0a86465616462656566",
   "header": {
     "flags": 0,
     "method": 2,
@@ -10,7 +10,18 @@
     "boot_epoch": "18446744073709551600",
     "engine_version": 1,
     "features": 0,
-    "pools": [],
+    "pools": [
+      {
+        "kind": "postgres",
+        "name": "main",
+        "server_version": "PostgreSQL 17.10"
+      },
+      {
+        "kind": "mysql",
+        "name": "reporting",
+        "server_version": null
+      }
+    ],
     "type_registry_hash": "deadbeef"
   },
   "name": "hello_ack"

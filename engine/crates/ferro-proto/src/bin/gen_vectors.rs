@@ -255,7 +255,22 @@ fn main() {
         engine_version: 1,
         boot_epoch: 0xFFFF_FFFF_FFFF_FFF0,
         features: 0,
-        pools: vec![],
+        // NON-EMPTY on purpose: an empty list byte-locks no element shape. Both the Some and the
+        // None arm of `server_version` are present so the nested fixarray is fully pinned, and the
+        // two elements carry DIFFERENT `name`/`kind` values so a field-order swap in either codec
+        // moves the bytes (a fixture whose fields were interchangeable would not catch one).
+        pools: vec![
+            PoolInfo {
+                name: "main".into(),
+                kind: "postgres".into(),
+                server_version: Some("PostgreSQL 17.10".into()),
+            },
+            PoolInfo {
+                name: "reporting".into(),
+                kind: "mysql".into(),
+                server_version: None,
+            },
+        ],
         type_registry_hash: "deadbeef".into(),
     };
     write_case(
@@ -266,7 +281,12 @@ fn main() {
         1,
         ack.encode(),
         serde_json::json!({ "engine_version":1, "boot_epoch":"18446744073709551600",
-                            "features":0, "pools":[], "type_registry_hash":"deadbeef" }),
+                            "features":0,
+                            "pools":[
+                              {"name":"main","kind":"postgres","server_version":"PostgreSQL 17.10"},
+                              {"name":"reporting","kind":"mysql","server_version":null}
+                            ],
+                            "type_registry_hash":"deadbeef" }),
     );
 
     write_case(

@@ -19,9 +19,10 @@ use Ferro\Protocol\Generated\Constants as C;
  * metadata are an M1-S8 carry (they are also what `naive_datetime_zone: server` waits on, below).
  *
  * **`naive_datetime_zone: server` is NOT implementable in M1** and is rejected loudly rather than
- * silently downgraded to `utc`: nothing on the wire carries the backend's session timezone
- * (`HelloAck` is `[engine_version, boot_epoch, features, pools, type_registry_hash]`). It lands with
- * the S8 `HELLO_ACK` pool metadata (SPEC §22.2).
+ * silently downgraded to `utc`: nothing on the wire carries the backend's session timezone.
+ * M1-S8a's `HELLO_ACK` pool metadata (`HelloAck.pools` is now a list of
+ * `[name, kind, server_version]` triples) advertises the backend FAMILY and VERSION — not a session
+ * timezone — so this policy still waits on a further metadata field (SPEC §22.2).
  *
  * **`naive_datetime_zone: error` has a PINNED SCOPE: `TAG_TIMESTAMP` alone** (see
  * {@see refusesNaiveTimestamp}). `TIMESTAMPTZ`, `DATE` and `TIME` decode normally under it. Its

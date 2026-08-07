@@ -12,6 +12,7 @@ use Ferro\Protocol\Hello;
 use Ferro\Protocol\HelloAck;
 use Ferro\Protocol\Message;
 use Ferro\Protocol\Outcome;
+use Ferro\Protocol\PoolInfo;
 use Ferro\Protocol\Msgpack\PackerFactory;
 use Ferro\Protocol\Msgpack\PackerInterface;
 use Ferro\Protocol\StreamData;
@@ -42,8 +43,8 @@ final class Session implements SessionInterface, StreamingSessionInterface
 
     /** Cached from HELLO_ACK; OPAQUE — int, or a decimal string for a uint64-encoded epoch. */
     private int|string|null $bootEpoch = null;
-    /** @var list<string> cached pool names from HELLO_ACK */
-    private array $pools = [];
+    /** @var list<PoolInfo> cached pool metadata from HELLO_ACK (M1-S8a: name + family + version) */
+    private array $poolInfo = [];
     private bool $handshakeDone = false;
 
     /**
@@ -103,7 +104,7 @@ final class Session implements SessionInterface, StreamingSessionInterface
             }
             $ack = HelloAck::decode($body, $this->decodePacker);
             $this->bootEpoch = $ack->bootEpoch;
-            $this->pools = $ack->pools;
+            $this->poolInfo = $ack->pools;
             $this->handshakeDone = true;
             return $ack;
         }
@@ -224,8 +225,17 @@ final class Session implements SessionInterface, StreamingSessionInterface
     /** @return array{0:int,1:int}|null the `(service, method)` of the last frame sent, or null. */
     public function lastInFlight(): ?array { return $this->lastInFlight; }
 
-    /** @return list<string> the pool names advertised in HELLO_ACK. */
-    public function pools(): array { return $this->pools; }
+    /** @return list<string> the pool NAMES, for `ExecRequest.pool`. Unchanged surface. */
+    public function pools(): array
+    {
+        return array_map(static fn (PoolInfo $p): string => $p->name, $this->poolInfo);
+    }
+
+    /** @return list<PoolInfo> the full advertised metadata (name + backend family + server version). */
+    public function poolInfo(): array
+    {
+        return $this->poolInfo;
+    }
 
     public function handshakeComplete(): bool { return $this->handshakeDone; }
 

@@ -14,7 +14,7 @@ fn encode_is_16_bytes_little_endian() {
     let b = h.encode();
     assert_eq!(b.len(), 16);
     assert_eq!(b[0], consts::MAGIC); // 0xF7
-    assert_eq!(b[1], consts::PROTOCOL_VERSION); // 1
+    assert_eq!(b[1], consts::PROTOCOL_VERSION);
     assert_eq!(u16::from_le_bytes([b[2], b[3]]), flags::END);
     assert_eq!(u16::from_le_bytes([b[4], b[5]]), consts::service::CORE);
     assert_eq!(u16::from_le_bytes([b[6], b[7]]), consts::method_core::PING);
@@ -72,6 +72,39 @@ fn rejects_bad_version() {
             got: 99
         })
     );
+}
+
+/// The M1-S8a skew tripwire: a frame from an OLDER-protocol peer is rejected at the FIRST BYTE
+/// PAIR, before any payload is parsed — which is what makes the `HelloAck` shape change safe.
+///
+/// `expected` is read from `consts::PROTOCOL_VERSION`, never written as a literal: a hand-written
+/// protocol constant is a defect wherever it appears, tests included (charter rule 2). `got` is
+/// derived the same way, so this test keeps working — and keeps meaning the same thing — through
+/// the next bump.
+///
+/// What this proves and what it does NOT: it proves the rejection is a CODEC error raised by the
+/// header decoder, not a typed handshake rejection. An old peer's frame never reaches
+/// `HelloAck::decode`, and the operator-visible failure is "bad frame version", not
+/// `errc::UNSUPPORTED` (PROTOCOL.md §1).
+#[test]
+fn a_frame_from_the_previous_protocol_version_is_rejected_by_the_header() {
+    let stale = consts::PROTOCOL_VERSION - 1;
+    let mut buf = Header {
+        flags: 0,
+        service: 1,
+        method: 1,
+        request_id: 1,
+        payload_len: 0,
+    }
+    .encode();
+    buf[1] = stale;
+    match Header::decode(&buf) {
+        Err(CodecError::BadVersion { expected, got }) => {
+            assert_eq!(expected, consts::PROTOCOL_VERSION);
+            assert_eq!(got, stale);
+        }
+        other => panic!("a stale protocol version must be rejected by the header, got {other:?}"),
+    }
 }
 
 #[test]
