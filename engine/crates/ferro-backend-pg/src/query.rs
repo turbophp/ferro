@@ -122,6 +122,12 @@ pub async fn run(client: &Client, sql: &str, params: &[Value]) -> Result<QueryRe
         cols,
         rows,
         affected,
+        // PG has no LAST_INSERT_ID protocol field; the idiomatic form is `INSERT … RETURNING id`,
+        // which arrives as an ordinary row. Explicit `None` (not `..Default::default()`) so a
+        // future RETURNING-aware path is a visible edit here. It must NOT be emulated with a
+        // follow-up `lastval()`: on a transaction-mode pool that lands on another session and
+        // either throws `55000` or — once that session has used any sequence — returns ITS value.
+        last_insert_id: None,
     })
 }
 

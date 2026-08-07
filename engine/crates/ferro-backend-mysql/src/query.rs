@@ -15,7 +15,7 @@
 //!    PG there is no server-side type to check the payload against — the canonical grammar is.)
 //! 4. Bind + `exec_iter`, fully draining the single result set (BUFFERED — constant-memory streaming
 //!    is S7). Each cell maps through [`rowmap::extract_value`]. `affected` and `last_insert_id` come
-//!    off the OK packet (via the driver's per-conn cache).
+//!    off THIS statement's OK packet and both land on the returned `QueryResult` (M1-S8a).
 //!
 //! On ANY prepare/exec/transport error → `Err` (via [`MysqlConn::map_stmt_error`], which marks the
 //! conn `closed` on a session-fatal failure and routes through `error_map`). The `Err` is
@@ -70,14 +70,14 @@ pub async fn run(
 
     // (4) bind + buffered exec. `drain` confines the driver's `&mut Conn` borrow entirely to itself
     // and returns OWNED rows + affected + last_insert_id, so `conn` is free again afterward.
-    let (raw_rows, affected, _last_insert_id) = match drain(conn, &stmt, bound).await {
+    let (raw_rows, affected, last_insert_id) = match drain(conn, &stmt, bound).await {
         Ok(t) => t,
         Err(e) => return Err(conn.map_stmt_error(&e)),
     };
 
     // Post-drain: record the §7.1 session-mutation taint (same as `simple_query`). `last_insert_id`
-    // is intentionally NOT carried on `QueryResult` (a shared type; S7's DBAL reads it off the conn
-    // via `MysqlConn::last_insert_id`, which the drain above leaves populated).
+    // IS carried on `QueryResult` as of M1-S8a — reading it back off the conn is not an option for a
+    // transaction-mode pool, where the caller's next statement lands on a different connection.
     conn.record_session_mutation();
 
     // Map each cell through the SAME classifier `cols` used, so rows and cols never disagree.
@@ -101,6 +101,7 @@ pub async fn run(
         cols,
         rows,
         affected,
+        last_insert_id,
     })
 }
 

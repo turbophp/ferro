@@ -25,6 +25,9 @@ use Ferro\Protocol\TxControl;
  */
 final class TxHandle
 {
+    /** The auto-generated key the LAST statement in this transaction reported, or null. */
+    private int|string|null $lastInsertId = null;
+
     /** §19.3: reads declare readonly=true (a lost read is Retryable); writes default readonly=false. */
     public function __construct(
         private readonly SessionInterface $session,
@@ -36,6 +39,17 @@ final class TxHandle
 
     /** This transaction's engine-assigned id (monotonic, never reused; native int, < 2^63). */
     public function txId(): int { return $this->txId; }
+
+    /**
+     * The auto-generated key produced by the most recent statement IN THIS TRANSACTION, or `null`.
+     * Same contract as {@see Connection::lastInsertId} — it rides the statement's own terminal
+     * frame (MySQL's OK packet), is `null` on PostgreSQL, and is never emulated with a follow-up
+     * query, which on a transaction-mode pool would read another connection's session state.
+     */
+    public function lastInsertId(): int|string|null
+    {
+        return $this->lastInsertId;
+    }
 
     /**
      * Execute a write inside the transaction. `readonly` defaults false (the write fate); a lost
@@ -150,7 +164,7 @@ final class TxHandle
      * exception (it propagates out of the closure to the tx runner); a garbled body → ProtocolException.
      *
      * @param list<mixed> $params
-     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int}
+     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
      */
     private function run(string $sql, array $params, bool $readonly, int $fetch): array
     {
@@ -163,7 +177,9 @@ final class TxHandle
         if (!$outcome->isOk()) {
             throw ErrorMapper::fromOutcome($outcome);
         }
-        return $this->codec->decode($outcome);
+        $decoded = $this->codec->decode($outcome);
+        $this->lastInsertId = $decoded['last_insert_id'];
+        return $decoded;
     }
 
     /** Send a `SERVICE_TX` control frame; a non-`Ok` terminal throws the mapped taxonomy exception. */

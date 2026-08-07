@@ -48,6 +48,9 @@ final class Connection
     private readonly PackerInterface $decodePacker;
     private readonly TypePolicyOptions $types;
 
+    /** The auto-generated key the LAST statement on this connection reported, or null. */
+    private int|string|null $lastInsertId = null;
+
     /**
      * `codec:` and the `values:`/`plans:`/`types:` PARTS are mutually exclusive, and so are
      * `values:` and `types:` — see the constructor body for why (each combination used to, or would,
@@ -137,6 +140,25 @@ final class Connection
     public function reconnectCount(): int
     {
         return $this->reconnect?->reconnectCount() ?? 0;
+    }
+
+    /**
+     * The auto-generated key produced by the most recent statement on this connection, or `null`
+     * when the backend reported none.
+     *
+     * MySQL/MariaDB report it on the OK packet of an `INSERT` into an `AUTO_INCREMENT` table.
+     * **PostgreSQL always reports `null`** — it has no such protocol field; the idiomatic form is
+     * `INSERT … RETURNING id`, which comes back as an ordinary row.
+     *
+     * This is NOT emulated with a follow-up query, and that is a correctness rule rather than an
+     * optimization: on a transaction-mode pool the follow-up lands on a DIFFERENT connection, where
+     * MySQL's `SELECT LAST_INSERT_ID()` returns `0` and PG's `SELECT lastval()` either throws
+     * `55000` or — once that session has itself used any sequence — returns ITS value, a silently
+     * WRONG key. The value rides the statement's own terminal frame or it does not exist.
+     */
+    public function lastInsertId(): int|string|null
+    {
+        return $this->lastInsertId;
     }
 
     // ---- autocommit query API -------------------------------------------------------------------
@@ -451,7 +473,7 @@ final class Connection
      * READ (bounded by the policy). A lost WRITE / Indeterminate / exhausted read propagates.
      *
      * @param list<mixed> $params
-     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int}
+     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
      */
     private function dispatchAutocommit(string $sql, array $params, bool $readonly, int $fetch): array
     {
@@ -489,7 +511,12 @@ final class Connection
             }
 
             if ($outcome->isOk()) {
-                return $this->codec->decode($outcome);
+                $decoded = $this->codec->decode($outcome);
+                // Record the generated key BEFORE returning: this is the ONLY moment it exists.
+                // It is overwritten by EVERY statement — including a read, which reports null — so
+                // `lastInsertId()` can never serve a stale key from an earlier INSERT.
+                $this->lastInsertId = $decoded['last_insert_id'];
+                return $decoded;
             }
 
             // Server responded with a definite error.

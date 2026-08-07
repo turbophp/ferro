@@ -1021,6 +1021,10 @@ async fn run_streamed_exec<B: PoolBackend>(
                     Ok(end) => {
                         let body = build_stream_terminal_body(
                             end.affected,
+                            // `StreamEnd` carries no generated key: PG (the only streaming backend)
+                            // has no LAST_INSERT_ID protocol field, and MySQL streaming is deferred
+                            // (§22.2 (n)). A streaming backend that reports one wires it HERE.
+                            None,
                             streamed_rows,
                             end.stats.queue_us,
                             exec_us,
@@ -1077,8 +1081,15 @@ async fn abort_stream<B: PoolBackend>(
 /// loop, so — unlike the buffered `build_terminal_body` — no `stats.bytes` fixed-point is needed
 /// (the value is not self-referential: it counts the DATA-channel frames, not this terminal frame).
 /// No one-frame size-check is needed either — with no rows and no cols the terminal body is tiny.
+///
+/// `last_insert_id` rides the SAME [`last_insert_id_value`] conversion as the buffered terminal so
+/// the two can never disagree on the tag. It is `None` on every streaming backend TODAY — the only
+/// one is PG, which has no such protocol field, and MySQL row streaming is deferred (§22.2 (n)) —
+/// but it is a parameter rather than a hardcoded `None` so wiring a future streaming backend that
+/// DOES report one is an edit at its call site, not a silent drop here.
 fn build_stream_terminal_body(
     affected: u64,
+    last_insert_id: Option<u64>,
     streamed_rows: u64,
     queue_us: u64,
     exec_us: u64,
@@ -1088,7 +1099,7 @@ fn build_stream_terminal_body(
         cols: Vec::new(),
         rows: Vec::new(),
         affected,
-        last_insert_id: None,
+        last_insert_id: last_insert_id_value(last_insert_id),
         stats: Stats {
             queue_us,
             exec_us,
@@ -1503,6 +1514,20 @@ fn encode_exec_ok_fixpoint(exec_ok: &mut ExecOk) -> Vec<u8> {
     body
 }
 
+/// THE `Option<u64>` → wire `Option<Value>` conversion for `ExecOk.last_insert_id` (M1-S8a). One
+/// site, so the tag choice cannot diverge between the buffered and the streamed terminal.
+///
+/// `I64` while the id fits (the overwhelmingly common case, and the shape the golden vector
+/// `sql_exec_response_lastid.json` already locks — a plain PHP `int` on the client), `U64` only above
+/// `i64::MAX`, which a `BIGINT UNSIGNED` AUTO_INCREMENT can legally reach. Saturating into `I64`
+/// there would be a silent wrong key.
+fn last_insert_id_value(id: Option<u64>) -> Option<Value> {
+    id.map(|n| match i64::try_from(n) {
+        Ok(v) => Value::I64(v),
+        Err(_) => Value::U64(n),
+    })
+}
+
 /// Shape `result` by `fetch`, encode the `ExecOk` terminal body, and size-check the fully-encoded
 /// `Outcome::Ok` payload. Returns the encoded body on success, or an `Unsupported` `ErrorPayload`
 /// if the result would exceed one frame. Split out (no pool/DB) so the size-cap and shaping are
@@ -1522,13 +1547,11 @@ fn build_terminal_body(
     };
     let nrows = rows.len() as u64;
 
-    // PG has no LAST_INSERT_ID (callers use `RETURNING`), so `last_insert_id` is always `None` on
-    // this backend in M0. The field/codec path is exercised by the golden vectors, not here.
     let mut exec_ok = ExecOk {
         cols: result.cols,
         rows,
         affected: result.affected,
-        last_insert_id: None,
+        last_insert_id: last_insert_id_value(result.last_insert_id),
         stats: Stats {
             queue_us,
             exec_us,
@@ -1627,6 +1650,53 @@ mod tests {
         );
     }
 
+    /// The I64/U64 boundary is exact and a `None` stays `None`. `i64::MAX` is the last I64 value;
+    /// `i64::MAX as u64 + 1` is the first U64 one.
+    #[test]
+    fn last_insert_id_value_picks_the_narrowest_truthful_tag() {
+        assert_eq!(last_insert_id_value(None), None);
+        assert_eq!(last_insert_id_value(Some(0)), Some(Value::I64(0)));
+        assert_eq!(last_insert_id_value(Some(200)), Some(Value::I64(200)));
+        assert_eq!(
+            last_insert_id_value(Some(i64::MAX as u64)),
+            Some(Value::I64(i64::MAX))
+        );
+        assert_eq!(
+            last_insert_id_value(Some(i64::MAX as u64 + 1)),
+            Some(Value::U64(9_223_372_036_854_775_808)),
+            "above i64::MAX the tag must widen, never saturate"
+        );
+        assert_eq!(
+            last_insert_id_value(Some(u64::MAX)),
+            Some(Value::U64(u64::MAX))
+        );
+    }
+
+    /// The buffered terminal must CARRY the pool's `last_insert_id`, not drop it: drive a real
+    /// `QueryResult` through the real `build_terminal_body` and read the field back off the encoded
+    /// `ExecOk`. Behavioural (rule 3) — it fails the moment the field is hardcoded to `None` again.
+    #[test]
+    fn buffered_terminal_carries_the_generated_key() {
+        let result = QueryResult {
+            cols: vec![],
+            rows: vec![],
+            affected: 1,
+            last_insert_id: Some(7),
+        };
+        let body = build_terminal_body(result, FETCH_NONE, 0, 0).expect("fits");
+        let ok = ExecOk::decode(&body).expect("decode ExecOk");
+        assert_eq!(ok.last_insert_id, Some(Value::I64(7)));
+
+        // …and a backend that reports none leaves the wire field absent.
+        let none = QueryResult {
+            affected: 1,
+            ..Default::default()
+        };
+        let body = build_terminal_body(none, FETCH_NONE, 0, 0).expect("fits");
+        let ok = ExecOk::decode(&body).expect("decode ExecOk");
+        assert_eq!(ok.last_insert_id, None);
+    }
+
     /// An over-one-frame result is a clean per-request `Unsupported` — NEVER a body the frame codec
     /// would reject (which would tear down the whole session; BLOCKER-v2).
     #[test]
@@ -1636,6 +1706,7 @@ mod tests {
             cols: vec![],
             rows: vec![vec![Value::Bytes(big)]],
             affected: 0,
+            ..Default::default()
         };
         let err = build_terminal_body(result, FETCH_ROWS, 1, 2)
             .expect_err("an over-one-frame result must error cleanly, not tear down");
@@ -1653,6 +1724,7 @@ mod tests {
             }],
             rows: vec![vec![Value::I64(1)]],
             affected: 0,
+            ..Default::default()
         };
         let body = build_terminal_body(result, FETCH_ROWS, 5, 9).expect("small result fits");
         let ok = ExecOk::decode(&body).expect("decode ExecOk");
@@ -1677,6 +1749,7 @@ mod tests {
             cols: vec![],
             rows: vec![vec![Value::Text("x".repeat(200))]],
             affected: 0,
+            ..Default::default()
         };
         let body = build_terminal_body(result, FETCH_ROWS, 1, 2).expect("fits one frame");
         assert!(body.len() > 127, "body must cross the uint8 width boundary");
@@ -1699,6 +1772,7 @@ mod tests {
             }],
             rows: vec![vec![Value::I64(1)], vec![Value::I64(2)]],
             affected: 2,
+            ..Default::default()
         };
         let body = build_terminal_body(result, FETCH_NONE, 0, 0).expect("fits");
         let ok = ExecOk::decode(&body).expect("decode ExecOk");
@@ -1970,6 +2044,7 @@ mod tests {
             }],
             rows: vec![vec![Value::I64(42)]],
             affected: 1,
+            ..Default::default()
         });
         let pool = Pool::new(backend, autocommit_test_pool_config());
         let mut co = pool.checkout().await.expect("checkout");

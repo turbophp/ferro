@@ -80,7 +80,16 @@ final class ExecCodec
     /**
      * Decode an `Ok` {@see ExecOk} body into column names + value-policy-decoded rows.
      *
-     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int}
+     * `last_insert_id` is returned RAW (`int|string|null`), deliberately NOT through the
+     * {@see \Ferro\Client\Value\ValuePolicy}: it is a scalar terminal field, not a column, and the
+     * DBAL contract for `lastInsertId()` is `int|string`. A key that needs a msgpack **uint64**
+     * (>= 2^32) arrives as its canonical decimal STRING, not an int — `PurePacker`, the
+     * spec-authoritative decoder `PackerFactory::forDecode()` always returns, never narrows a `0xcf`
+     * payload (measured: 2^32-1 -> int, 2^32 -> `'4294967296'`). That is why `int|string` is the
+     * honest return type, and why the turnover is at 2^32 rather than at `PHP_INT_MAX`; the engine's
+     * `I64`/`U64` tag choice (`ferrod`'s `last_insert_id_value`) is a separate, higher boundary.
+     *
+     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
      */
     public function decode(Outcome $outcome): array
     {
@@ -105,11 +114,50 @@ final class ExecCodec
                 $rows[] = $this->decodeRow(SqlValueCodec::listOf($row));
             }
 
-            return ['cols' => $cols, 'rows' => $rows, 'affected' => SqlValueCodec::toInt($ok['affected'] ?? 0)];
+            $lastId = $ok['last_insert_id'] ?? null;
+
+            return [
+                'cols' => $cols,
+                'rows' => $rows,
+                'affected' => SqlValueCodec::toInt($ok['affected'] ?? 0),
+                'last_insert_id' => self::rawLastInsertId(is_array($lastId) ? $lastId : null),
+            ];
         } catch (CodecException $e) {
             // A terminal that read fully but failed to parse is a protocol fault, not a fate signal.
             throw new ProtocolException('failed to decode SQL terminal: ' . $e->getMessage(), 0, $e);
         }
+    }
+
+    /**
+     * Narrow the ALREADY-DECODED `last_insert_id` cell to the raw scalar.
+     *
+     * **It must NOT call {@see SqlValueCodec::fromWire} again.** {@see ExecOk::mapFromWire} has
+     * already run it (`ExecOk.php:57`), so what arrives here is a decoded `['tag' => int, 'data' =>
+     * mixed]` cell, not a wire `[tag, payload]` pair. Re-decoding happens to be idempotent for an
+     * `I64`, which is why the mistake is invisible in the common case — but it is a real fault for a
+     * `TAG_BYTES` cell (whose `data` is already a `list<int>`, not the wire string), and it makes
+     * this method's contract a lie about what it receives.
+     *
+     * `null` (no id) stays null; otherwise the payload is an `int` (anything the decoder narrowed)
+     * or a canonical decimal `string` (any key in the msgpack uint64 band, >= 2^32 — see
+     * {@see decode}). Deliberately no coercion: a malformed payload is a wire fault, not a
+     * silently-zeroed key.
+     *
+     * @param array<array-key, mixed>|null $cell the decoded `{tag, data}` cell from
+     *   {@see ExecOk::mapFromWire}, or null when the terminal carried a bare nil
+     */
+    private static function rawLastInsertId(?array $cell): int|string|null
+    {
+        if ($cell === null) {
+            return null;
+        }
+        $data = $cell['data'] ?? null;
+        if ($data === null || is_int($data) || is_string($data)) {
+            return $data;
+        }
+        throw new CodecException(
+            'ExecOk.last_insert_id: expected an int or decimal string, got ' . get_debug_type($data),
+        );
     }
 
     /**
@@ -137,7 +185,7 @@ final class ExecCodec
     }
 
     /**
-     * @param array{cols: list<string>, rows: list<list<mixed>>, affected: int} $res
+     * @param array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id?: int|string|null} $res
      * @return list<array<string,mixed>>
      */
     public function assocRows(array $res): array

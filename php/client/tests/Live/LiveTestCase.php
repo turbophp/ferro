@@ -39,11 +39,20 @@ abstract class LiveTestCase extends TestCase
     private const STOP_TIMEOUT_SEC = 6.0;
     private const POLL_INTERVAL_US = 100_000;
 
+    /**
+     * The SECOND pool's name (M1-S8a). `ferrod` infers a pool's KIND from its DSN scheme — there is
+     * no `kind=` knob — so naming it `mysql` is documentation, not configuration
+     * (`engine/crates/ferrod/src/config.rs:88-104`).
+     */
+    protected const MYSQL_POOL = 'mysql';
+
     protected string $socketPath = '';
     private string $stderrPath = '';
     /** The located ferrod binary + upstream DSN, kept so {@see restartFerrod} can relaunch. */
     private string $ferrodBin = '';
     private string $pgUrl = '';
+    /** The optional second (MySQL-family) pool's DSN; `''` when the env var is unset. */
+    private string $mysqlUrl = '';
     /** @var resource|null the ferrod process handle */
     private $proc = null;
 
@@ -53,6 +62,13 @@ abstract class LiveTestCase extends TestCase
         if (!is_string($pgUrl) || $pgUrl === '') {
             $this->markTestSkipped('FERRO_TEST_PG_URL is unset — skipping live ferrod tests');
         }
+
+        // MySQL is OPTIONAL for the harness (so a PG-only dev loop still runs every PG test) but
+        // MANDATORY in CI: the `php` job provisions it and the live tier runs with
+        // `--fail-on-skipped`, so a missing second pool turns into a red lane rather than a silent
+        // no-op. A test that needs it calls {@see requireMysqlPool}.
+        $mysqlUrl = getenv('FERRO_TEST_MYSQL_URL');
+        $this->mysqlUrl = is_string($mysqlUrl) ? $mysqlUrl : '';
 
         $bin = self::locateFerrod();
         if ($bin === null) {
@@ -93,10 +109,40 @@ abstract class LiveTestCase extends TestCase
      * A resilient {@see Connection} (the real {@see Ferro::connect} path) bound to this test's ferrod
      * over its UDS socket — the epoch-aware reconnect loop + fate classifier are wired in, so the
      * daemon-restart test exercises the true §19.1 recovery path.
+     *
+     * `$pool` selects which of the launched pools the connection binds to; it defaults to the PG
+     * `default` pool, so every pre-S8a caller is unchanged.
      */
-    protected function connectConnection(?RetryPolicy $policy = null): Connection
+    protected function connectConnection(?RetryPolicy $policy = null, string $pool = 'default'): Connection
     {
-        return Ferro::connect($this->socketPath, 'default', 2.0, 5.0, $policy);
+        return Ferro::connect($this->socketPath, $pool, 2.0, 5.0, $policy);
+    }
+
+    /**
+     * The MySQL-family pool's name, or a SKIP when this run has no `FERRO_TEST_MYSQL_URL`. The skip
+     * is fatal in the CI live lane (`phpunit tests/Live --fail-on-skipped`), which is what stops a
+     * MySQL-only assertion from quietly vanishing.
+     */
+    protected function requireMysqlPool(): string
+    {
+        if ($this->mysqlUrl === '') {
+            $this->markTestSkipped('FERRO_TEST_MYSQL_URL is unset — skipping the MySQL-pool live test');
+        }
+        return self::MYSQL_POOL;
+    }
+
+    /**
+     * The pool names THIS harness configured `ferrod` with, in order — the one source of truth for
+     * both {@see launchFerrod}'s `FERRO_POOLS` and any assertion about what `HELLO_ACK` advertises.
+     * It is derived from the run's env (one pool without `FERRO_TEST_MYSQL_URL`, two with it), so an
+     * assertion against it still FAILS if the engine drops, renames or invents a pool — what it
+     * removes is the hard-coded `['default']` that broke the moment the harness grew a second pool.
+     *
+     * @return list<string>
+     */
+    protected function launchedPools(): array
+    {
+        return $this->mysqlUrl === '' ? ['default'] : ['default', self::MYSQL_POOL];
     }
 
     /**
@@ -134,8 +180,15 @@ abstract class LiveTestCase extends TestCase
         // Inherit the current environment, then add the ferrod config (verified recipe, D-S7-1).
         $env = getenv();
         $env['FERRO_SOCK'] = $this->socketPath;
-        $env['FERRO_POOLS'] = 'default';
+        // `ferrod` resolves per-pool DSNs from FERRO_POOL_<env_name(NAME)>_DSN and infers each
+        // pool's KIND from the DSN scheme (there is no kind= knob) —
+        // engine/crates/ferrod/src/config.rs:88-104,:332. Pools are LAZY (Pool::new dials nothing),
+        // so declaring a second one costs no connection until a request names it.
+        $env['FERRO_POOLS'] = implode(',', $this->launchedPools());
         $env['FERRO_POOL_DEFAULT_DSN'] = $pgUrl;
+        if ($this->mysqlUrl !== '') {
+            $env['FERRO_POOL_MYSQL_DSN'] = $this->mysqlUrl;
+        }
 
         $descriptors = [
             0 => ['pipe', 'r'],

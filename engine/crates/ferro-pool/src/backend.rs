@@ -22,6 +22,18 @@ pub struct QueryResult {
     pub cols: Vec<ColMeta>,
     pub rows: Vec<Vec<Value>>,
     pub affected: u64,
+    /// The auto-generated key this statement produced, when the BACKEND PROTOCOL reports one
+    /// (M1-S8a). MySQL/MariaDB fill it from the OK packet's `LAST_INSERT_ID()`; Postgres always
+    /// leaves it `None` (PG has no such protocol field — callers use `INSERT … RETURNING`).
+    ///
+    /// **It cannot be recovered by a follow-up query.** Measured live on a transaction-mode pool:
+    /// `SELECT LAST_INSERT_ID()` after an INSERT returned **0**, and PG's `SELECT lastval()` threw
+    /// `55000` — the follow-up statement lands on a DIFFERENT pooled connection. Worse, once that
+    /// other PG session HAS touched a sequence, `lastval()` stops erroring and returns ITS OWN last
+    /// value (measured: `1`, from an unrelated table) — a silently WRONG key, which is strictly
+    /// worse than an error. So the value is carried here, off the statement's own OK packet, or it
+    /// is lost.
+    pub last_insert_id: Option<u64>,
 }
 
 /// The real transaction status of a pooled connection, surfaced from Postgres's `ReadyForQuery`

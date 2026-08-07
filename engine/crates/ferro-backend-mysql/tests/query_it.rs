@@ -249,6 +249,66 @@ async fn last_insert_id_after_insert(backend: &MysqlBackend, label: &str) {
     conn.mysql.disconnect().await.ok();
 }
 
+/// M1-S8a: the OK packet's `LAST_INSERT_ID()` must reach `QueryResult` itself, not just the driver's
+/// per-conn cache. It CANNOT be recovered later: in a transaction-mode pool a follow-up
+/// `SELECT LAST_INSERT_ID()` lands on a DIFFERENT connection and returns 0 (measured), so the value
+/// is carried off this statement's OK packet or it is lost.
+async fn insert_carries_last_insert_id_on_query_result(backend: &MysqlBackend, label: &str) {
+    let mut conn = backend.connect().await.expect("connect");
+    backend
+        .simple_query(
+            &mut conn,
+            "CREATE TEMPORARY TABLE s8a_lid (id BIGINT AUTO_INCREMENT PRIMARY KEY, v INT)",
+        )
+        .await
+        .expect("create temp table");
+
+    let r1 = backend
+        .query(
+            &mut conn,
+            "INSERT INTO s8a_lid (v) VALUES (?)",
+            &[Value::I64(1)],
+        )
+        .await
+        .expect("insert 1");
+    let r2 = backend
+        .query(
+            &mut conn,
+            "INSERT INTO s8a_lid (v) VALUES (?)",
+            &[Value::I64(2)],
+        )
+        .await
+        .expect("insert 2");
+
+    let id1 = r1
+        .last_insert_id
+        .expect("MySQL INSERT must carry a last_insert_id");
+    let id2 = r2
+        .last_insert_id
+        .expect("MySQL INSERT must carry a last_insert_id");
+    assert_eq!(
+        id2,
+        id1 + 1,
+        "[{label}] AUTO_INCREMENT ids must advance ({id1} -> {id2})"
+    );
+
+    // A SELECT carries none — the field is not a stale carry-over from an earlier statement.
+    let r3 = backend
+        .query(&mut conn, "SELECT v FROM s8a_lid ORDER BY id", &[])
+        .await
+        .expect("select");
+    assert_eq!(
+        r3.last_insert_id, None,
+        "[{label}] a SELECT must not report a last_insert_id"
+    );
+    println!(
+        "[{label}] QueryResult.last_insert_id: INSERT -> {id1}, {id2}; SELECT -> {:?}",
+        r3.last_insert_id
+    );
+
+    conn.mysql.disconnect().await.ok();
+}
+
 /// A duplicate key (errno 1062) is a generic SQL NonRetryable (`Unique`), NEVER `Protocol` — the T3
 /// fallback fix. `ferro_smoke` id=1 is seeded, so re-inserting it collides.
 async fn duplicate_key_is_unique_nonretryable(backend: &MysqlBackend, label: &str) {
@@ -447,6 +507,7 @@ async fn run_query_suite(url: &str, label: &str) {
     out_of_scope_column_is_unsupported(&backend, label).await;
     bind_arity_mismatch_is_known_fate(&backend, label).await;
     last_insert_id_after_insert(&backend, label).await;
+    insert_carries_last_insert_id_on_query_result(&backend, label).await;
     duplicate_key_is_unique_nonretryable(&backend, label).await;
     deadlock_two_txs_is_retryable(url, label).await;
     checkout_force_taint_on_query_error(url, label).await;

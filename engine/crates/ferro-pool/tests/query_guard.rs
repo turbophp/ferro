@@ -58,6 +58,7 @@ async fn query_returns_canned_rows_for_normal_statement() {
         ],
         rows: vec![vec![Value::I64(7), Value::Text("ferro".to_string())]],
         affected: 0,
+        ..Default::default()
     });
     let pool = Pool::new(backend, PoolConfig::default());
     let mut c = pool.checkout().await.expect("checkout should succeed");
