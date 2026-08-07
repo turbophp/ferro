@@ -491,8 +491,21 @@ pub fn check_param(v: &Value, ty: &Type) -> Result<(), String> {
     let base = resolve_domain(ty);
     // `ty.name()` for the operator ("positive_int"), `base.name()` for the actual constraint
     // ("int4") — a message naming only one of them is unactionable.
+    //
+    // The middle arm is the PAST-BOUND case (Task 5 fix round 1, F3). When the chain is nested
+    // deeper than `MAX_DOMAIN_DEPTH`, `resolve_domain` gives up with `base` still a DOMAIN, and the
+    // two-arm form printed `dom_nest_8 (domain over dom_nest_0)` — naming another domain as if it
+    // were the base type, and never saying the nesting bound was what refused the bind. Loud and
+    // known-fate either way; this only makes it actionable for the operator who hits it.
     let named = if std::ptr::eq(base, ty) {
         ty.name().to_string()
+    } else if matches!(base.kind(), tokio_postgres::types::Kind::Domain(_)) {
+        format!(
+            "{} (domain nesting exceeds the {MAX_DOMAIN_DEPTH}-level resolver bound; resolution \
+             stopped at {}, which is itself a domain)",
+            ty.name(),
+            base.name()
+        )
     } else {
         format!("{} (domain over {})", ty.name(), base.name())
     };
@@ -552,9 +565,15 @@ fn check_range(v: &Value, ty: &Type) -> Result<(), String> {
             // The boundary is REPRESENTABILITY, not normality: `1e-45` binds, because it lands on
             // the smallest f32 subnormal (`1.401298464324817e-45`) — byte-for-byte what PG stores
             // for the literal `'1e-45'`, which PG accepts.
+            //
+            // Rendered `{f:e}`, not `{f}` (Task 5 fix round 1, F4): `Display` for `f64` spells a
+            // subnormal out in full, so `1e-46` printed as 46 zeros and `f64::MIN_POSITIVE`'s
+            // subnormal (`5e-324`) would put ~330 characters of zeros into an operator-facing
+            // string. Scientific notation is the only readable form for the magnitudes this arm
+            // exists to reject.
             if *ty == Type::FLOAT4 && *f != 0.0 && (*f as f32) == 0.0 {
                 return Err(format!(
-                    "canonical F64 value {f} is out of range for PG type float4 (it would \
+                    "canonical F64 value {f:e} is out of range for PG type float4 (it would \
                      silently become zero; pre-send rejection: the statement was never executed)"
                 ));
             }
@@ -736,6 +755,23 @@ mod tests {
         assert!(wrong_type.contains("cannot bind"), "{wrong_type}");
         assert!(wrong_type.contains("TEXT"), "{wrong_type}");
         assert!(!wrong_type.contains("out of range"), "{wrong_type}");
+
+        // The UNDERFLOW arm renders the value SCIENTIFICALLY (Task 5 fix round 1, F4). `Display`
+        // for `f64` spells a subnormal out in full, so `{f}` printed `1e-46` as 46 zeros and
+        // `f64`'s smallest subnormal as ~330 characters of them — technically correct and
+        // operationally useless. `{f:e}` is the only readable form for the magnitudes this arm
+        // exists to reject.
+        let underflow =
+            check_param(&Value::F64(5e-324), &Type::FLOAT4).expect_err("underflows float4");
+        assert!(
+            underflow.contains("5e-324"),
+            "the offending value must be named in scientific notation: {underflow}"
+        );
+        assert!(
+            !underflow.contains("0.0000"),
+            "...never spelled out digit by digit ({} chars): {underflow}",
+            underflow.len()
+        );
     }
 
     /// PG resolves a domain to its BASE type in the `RowDescription` (so READS already work), but
@@ -891,6 +927,26 @@ mod tests {
         assert!(
             !accepts(&Value::I64(1), &past_bound),
             "past the bound the resolver gives up — and giving up means REFUSE, not accept"
+        );
+
+        // ...and the refusal SAYS SO (Task 5 fix round 1, F3). Past the bound `base` is itself a
+        // domain, so the original two-arm message read `dom_nest_8 (domain over dom_nest_0)` — it
+        // named another DOMAIN as if it were the base type and never mentioned nesting at all,
+        // leaving the one operator who hits this with nothing to act on. Derived from the const, so
+        // moving `MAX_DOMAIN_DEPTH` moves the assertion with it.
+        let why = check_param(&Value::I64(1), &past_bound)
+            .expect_err("past the bound the bind is refused");
+        assert!(
+            why.contains("nesting"),
+            "a past-bound refusal must say the NESTING bound is what refused it: {why}"
+        );
+        assert!(
+            why.contains(&format!("{MAX_DOMAIN_DEPTH}-level")),
+            "...and must name the bound it exceeded: {why}"
+        );
+        assert!(
+            !why.contains("domain over"),
+            "...and must NOT claim an inner domain is the base type: {why}"
         );
 
         // ...and past the bound the boxed impl refuses too, so the two still agree. This is the
@@ -1071,6 +1127,30 @@ mod tests {
             Type::INTERVAL,
             Type::INET,
             Type::INT4_ARRAY,
+            // **The one NAME-SENSITIVE encoder in the fixture** (Task 5 fix round 1, F1). Every
+            // other entry above is bound by an impl whose `to_sql` IGNORES the `Type` it is handed,
+            // which made the payload-BYTES clause of
+            // [`s8a_every_arm_treats_a_domain_exactly_as_its_base`] a guard that could not fail:
+            // with `pg_domain_aware_param`'s `to_sql` mutated to use the UNRESOLVED `ty`, all 19
+            // offline tests stayed green.
+            //
+            // `<&str as ToSql>::to_sql` (which `String`'s forwards to, which `PgText` wraps)
+            // switches on `ty.name()`: `ltree`/`lquery`/`ltxtquery` get a leading VERSION byte,
+            // everything else is written verbatim. So a `PgText` handed the declared `dom_of_ltree`
+            // instead of the resolved `ltree` writes DIFFERENT BYTES — `[120]` where the base wrote
+            // `[1, 120]` — and the bytes clause goes red. `accepts` still resolves under that
+            // mutation, so clauses (1) and (2) stay green: this entry is the ONLY thing standing
+            // between the payload half of §22.2 (g) and unfalsifiability.
+            //
+            // The oid is in the `16_38x` band, not the `900_0xx` synthetic band: `ltree` is an
+            // EXTENSION type, so PG really does assign it a user-space oid here (hazard 11 —
+            // a fixture must not lie about what PG would have sent).
+            Type::new(
+                "ltree".to_string(),
+                16_385,
+                Kind::Simple,
+                "public".to_string(),
+            ),
             // M1-S8a: domains, which `stmt.params()` reports VERBATIM for a parameter slot (unlike
             // `RowDescription`, which resolves to the base). Without these the cross-product proof
             // never exercises `resolve_domain` at all.
@@ -1308,6 +1388,13 @@ mod tests {
     ///    `Kind::Domain` handling — and the half the rejected v1 design omitted;
     /// 3. when both succeed, the PAYLOAD BYTES are identical. Resolving a domain must change what
     ///    the bind is *checked against*, never what it *writes*.
+    ///
+    /// **Correction (Task 5 fix round 1, F1).** Clause (3) shipped UNFALSIFIABLE and was described
+    /// as mutation-proven when only clauses (1)/(2) were: every entry `every_target_type` then held
+    /// is bound by an impl whose `to_sql` ignores the `Type`, so mutating `pg_domain_aware_param`'s
+    /// `to_sql` to use the UNRESOLVED `ty` left all 19 offline tests green. The `ltree` entry (see
+    /// [`every_target_type`]) is what makes clause (3) bite: its encoder switches on `ty.name()`.
+    /// Measured RED under exactly that mutation, GREEN restored.
     ///
     /// This is the guard that covers the arms the hand-written domain tests do not name
     /// individually (the seven canonical-text tags, whose resolution lives in one macro body).

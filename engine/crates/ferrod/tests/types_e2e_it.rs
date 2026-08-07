@@ -998,6 +998,85 @@ async fn pg_domain_reads_and_binds() {
         "read -> bind -> read through a DOMAIN column must be byte-identical"
     );
 
+    // **The domains `postgres-types` cannot handle on its own** (Task 5 fix round 1, coverage gap).
+    //
+    // The `numeric` domain above is NOT sufficient at this layer: it routes through
+    // `PgDecimalText`, a FERRO-OWNED newtype that already resolved on both sides, so this test
+    // stayed GREEN with the boxed `Bool`/`Text`/`Bytes` arms reverted to their bare
+    // `postgres-types` impls (the rejected v1 shape). `postgres-types` has ZERO `Kind::Domain`
+    // handling, so text/bool/bytea are exactly the arms where a half-applied unwrap — pre-flight
+    // resolves, boxed impl does not — makes the pre-flight LOOSER than the impl it fronts:
+    // `to_sql_checked` fails instead, that error carries no `DbError`, `is_session_fatal` reads it
+    // as a lost connection, and §19.3 mints a **false `Indeterminate`** for a write that was never
+    // sent. Binding all three through the real daemon is what turns that defect RED here rather
+    // than only inside `bind.rs`'s unit tests.
+    for stmt in [
+        "DROP TABLE IF EXISTS ferro_s8a_e2e_dom3",
+        "DROP DOMAIN IF EXISTS ferro_s8a_e2e_txt CASCADE",
+        "DROP DOMAIN IF EXISTS ferro_s8a_e2e_flag CASCADE",
+        "DROP DOMAIN IF EXISTS ferro_s8a_e2e_blob CASCADE",
+        "CREATE DOMAIN ferro_s8a_e2e_txt AS text CHECK (VALUE <> '')",
+        "CREATE DOMAIN ferro_s8a_e2e_flag AS bool",
+        "CREATE DOMAIN ferro_s8a_e2e_blob AS bytea",
+        "CREATE TABLE ferro_s8a_e2e_dom3 (t ferro_s8a_e2e_txt, b ferro_s8a_e2e_flag, \
+         y ferro_s8a_e2e_blob)",
+        "INSERT INTO ferro_s8a_e2e_dom3 VALUES ('a.b.c', true, '\\xdead'::bytea)",
+    ] {
+        rid += 1;
+        ddl(&mut client, rid, stmt).await;
+    }
+
+    // READ: the RowDescription resolves each domain to its base, so the tags are the base tags.
+    rid += 1;
+    let dom3 = exec_ok(
+        &mut client,
+        rid,
+        &req("SELECT t, b, y FROM ferro_s8a_e2e_dom3"),
+    )
+    .await;
+    assert_eq!(
+        dom3.cols.iter().map(|c| c.tag).collect::<Vec<_>>(),
+        vec![tag::TEXT, tag::BOOL, tag::BYTES],
+        "a domain over text/bool/bytea reads as its base tag"
+    );
+    assert_eq!(
+        dom3.rows[0],
+        vec![
+            Value::Text("a.b.c".into()),
+            Value::Bool(true),
+            Value::Bytes(vec![0xde, 0xad]),
+        ]
+    );
+
+    // BIND: the exact values just read, straight back into the same domain columns. With the boxed
+    // side not resolving, EVERY one of these three is a `to_sql_checked` failure → a false
+    // `Indeterminate` terminal, and `exec_ok` fails the test.
+    let mut ins3 = req("INSERT INTO ferro_s8a_e2e_dom3 (t, b, y) VALUES (?, ?, ?)");
+    ins3.readonly = false;
+    ins3.fetch = 1;
+    ins3.params = dom3.rows[0].clone();
+    rid += 1;
+    let ok3 = exec_ok(&mut client, rid, &ins3).await;
+    assert_eq!(
+        ok3.affected, 1,
+        "TEXT/BOOL/BYTES read from domain columns must bind straight back into them"
+    );
+
+    // ...and byte-identically, so the unwrap changed what the bind is CHECKED against and not what
+    // it WROTE (the daemon-level mirror of `s8a_every_arm_treats_a_domain_exactly_as_its_base`).
+    rid += 1;
+    let back3 = exec_ok(
+        &mut client,
+        rid,
+        &req("SELECT t, b, y FROM ferro_s8a_e2e_dom3"),
+    )
+    .await;
+    assert_eq!(back3.rows.len(), 2);
+    assert_eq!(
+        back3.rows[0], back3.rows[1],
+        "read -> bind -> read through text/bool/bytea DOMAIN columns must be byte-identical"
+    );
+
     // The unwrap WIDENS NOTHING: a domain over a base Ferro does not support is still a clean,
     // pre-send, known-fate refusal — never a fate-unknown Indeterminate. This is the branch this
     // test used to assert for EVERY domain; keeping it here is what stops the fix from having
@@ -1049,6 +1128,10 @@ async fn pg_domain_reads_and_binds() {
     for stmt in [
         "DROP TABLE IF EXISTS ferro_s8a_e2e_ttz_t",
         "DROP DOMAIN IF EXISTS ferro_s8a_e2e_ttz2 CASCADE",
+        "DROP TABLE IF EXISTS ferro_s8a_e2e_dom3",
+        "DROP DOMAIN IF EXISTS ferro_s8a_e2e_txt CASCADE",
+        "DROP DOMAIN IF EXISTS ferro_s8a_e2e_flag CASCADE",
+        "DROP DOMAIN IF EXISTS ferro_s8a_e2e_blob CASCADE",
     ] {
         rid += 1;
         ddl(&mut client, rid, stmt).await;
