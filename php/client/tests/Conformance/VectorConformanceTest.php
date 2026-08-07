@@ -445,7 +445,17 @@ final class VectorConformanceTest extends TestCase
     {
         $src = (string) file_get_contents(__FILE__);
         $m = [];
-        preg_match_all("/loadVector\\(\\s*'([A-Za-z0-9_]+)\\.json'\\s*\\)/", $src, $m);
+        // Anchored to an ASSIGNMENT, not a bare mention: the evidence here is textual, so an
+        // unanchored pattern lets a COMMENT count as a call site. Proven in the M1-S8a Task 3
+        // review — with the byte-lock test deleted and a comment reading
+        // `// TODO: someday write self::loadVector('error_mysql_errno.json') here.`, this guard
+        // went GREEN over an unlocked vector. Every real call site is `$x = self::loadVector(...)`,
+        // which this matches and no comment does.
+        preg_match_all(
+            "/\\\$\\w+\\s*=\\s*self::loadVector\\(\\s*'([A-Za-z0-9_]+)\\.json'\\s*\\)/",
+            $src,
+            $m,
+        );
         /** @var list<string> $names */
         $names = array_values(array_unique(is_array($m[1] ?? null) ? $m[1] : []));
         return $names;

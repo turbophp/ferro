@@ -541,7 +541,14 @@ mod tests {
     ///
     /// **Why this shape and not `a_postgres_sql_error_carries_no_errno`**: that test would feed in a
     /// `PoolError` the test itself built with `errno: None` (via the `sql()` helper) and assert
-    /// `None` came out — a TAUTOLOGY. It could not fail for any change to `fate.rs`. This one drives
+    /// `None` came out. **Correction (M1-S8a Task 3 review):** an earlier version of this comment
+    /// called that "a TAUTOLOGY … it could not fail for any change to `fate.rs`", and that was
+    /// OVERSTATED — the reviewer re-created the test verbatim and it went RED under the
+    /// `errno.or(Some(code))` mutation. Its real defect is narrower: its **name and claim are about
+    /// PostgreSQL** while it only exercises this file's mirror, so it proves a `fate.rs` property
+    /// under a PG label. (Recorded rather than quietly reworded: in a repo whose dominant defect
+    /// class is guards that cannot fail, a comment OVERSTATING a falsifiability proof is the same
+    /// hazard inverted, and is worth catching in review.) This one drives
     /// BOTH arms of the mirror across a table, so hard-coding either `errno: None` or a derived
     /// value in the `Sql` arm goes RED; and it pins that the arms which have no backend behind them
     /// (`ConnectionLost`, `Timeout`) report `None` — the property that would break if someone
