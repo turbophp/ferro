@@ -6,6 +6,7 @@ use Ferro\Client\Error\ConnectionLostException;
 use Ferro\Client\Error\EpochChangedException;
 use Ferro\Client\Error\ErrorMapper;
 use Ferro\Client\Error\IndeterminateException;
+use Ferro\Client\Error\InvalidTransactionStateException;
 use Ferro\Client\Error\NonRetryableException;
 use Ferro\Client\Error\ProtocolException;
 use Ferro\Client\Error\RetryableException;
@@ -50,6 +51,23 @@ final class Connection
 
     /** The auto-generated key the LAST statement on this connection reported, or null. */
     private int|string|null $lastInsertId = null;
+
+    /**
+     * The handle for an IMPERATIVE transaction opened by {@see begin}, or null.
+     *
+     * Non-null makes every statement method on this Connection route through it, so a statement
+     * issued between `begin()` and `commit()`/`rollBack()` carries the transaction's `tx_id`. It is
+     * a real {@see TxHandle} — the SAME object the closure form uses — precisely so the imperative
+     * path inherits {@see TxHandle::runForConnection}'s bare send-and-classify semantics: NO
+     * transparent reconnect, NO re-issue (charter rule 3). Reconnecting mid-transaction would void
+     * the `tx_id` silently and the next statement would land on a tombstoned id.
+     *
+     * It is cleared on EVERY exit — commit, rollback, and the failure of either — because a handle
+     * left behind after a dead transaction would make {@see inTransaction} report `true` forever and
+     * every later statement would target a `tx_id` the engine has already tombstoned, with no way
+     * back short of discarding the Connection.
+     */
+    private ?TxHandle $tx = null;
 
     /**
      * `codec:` and the `values:`/`plans:`/`types:` PARTS are mutually exclusive, and so are
@@ -143,19 +161,28 @@ final class Connection
     }
 
     /**
-     * The auto-generated key produced by the most recent **autocommit** statement on this
-     * connection, or `null` when the backend reported none.
+     * The auto-generated key produced by the most recent statement issued **through this
+     * Connection**, or `null` when the backend reported none.
      *
-     * **It is NOT updated by statements executed inside `transaction()`** — those run on a
-     * {@see TxHandle}, whose key is read with {@see TxHandle::lastInsertId()} and is deliberately
-     * not propagated back here (M1-S8a Task 2; propagation lands with the imperative transaction
-     * API in Task 9). So after a transaction this still reports the last *autocommit* key, which is
-     * a DIFFERENT, EARLIER statement's — measured: autocommit INSERT → 1, in-transaction INSERT → 2
-     * via the handle, and this accessor still → 1. A caller that maps a driver-level
-     * `lastInsertId()` straight onto this method therefore gets a silently WRONG key for any
-     * transactional insert — the exact class the no-emulation rule below exists to prevent. Pinned
-     * by `ConnectionLastInsertIdTest::testATransactionDoesNotUpdateTheConnectionLevelKey`; when
-     * Task 9 wires propagation, that test changes with the contract, deliberately.
+     * "Through this Connection" is the whole contract, and it covers exactly two paths (M1-S8a
+     * Task 9 widened it from autocommit-only, which is what Task 2's docblock promised):
+     *
+     *  * an **autocommit** statement ({@see dispatchAutocommit}); and
+     *  * a statement issued while an **imperative** transaction is open ({@see begin} …
+     *    {@see commit}/{@see rollBack}), which routes through {@see $tx} and propagates the key
+     *    back here — so a DBAL driver's `lastInsertId()` is correct for a transactional INSERT,
+     *    which is where nearly every real one happens.
+     *
+     * **It is still NOT updated by the CLOSURE form's statements.** `transaction(fn ($tx) => …)`
+     * hands the closure its own {@see TxHandle}; that object records the key and exposes it as
+     * {@see TxHandle::lastInsertId()}, and nothing propagates it back to the Connection (the handle
+     * is the closure's, and a value read after the closure returned would be from a transaction
+     * that no longer exists). So after a closure transaction this still reports the last key from an
+     * autocommit or imperative statement — measured at Task 2: autocommit INSERT → 1, in-closure
+     * INSERT → 2 via the handle, and this accessor still → 1. Read the key inside the closure, off
+     * the handle. Pinned by `ConnectionImperativeTxTest`
+     * (`testAnInsertInsideAnImperativeTransactionPropagatesItsKey` and
+     * `testTheClosureFormStillDoesNotPropagateTheKey`).
      *
      * MySQL/MariaDB report it on the OK packet of an `INSERT` into an `AUTO_INCREMENT` table.
      * **PostgreSQL always reports `null`** — it has no such protocol field; the idiomatic form is
@@ -183,7 +210,7 @@ final class Connection
      */
     public function exec(string $sql, array $params = [], bool $readonly = false): int
     {
-        return $this->dispatchAutocommit($sql, $params, $readonly, ExecCodec::FETCH_NONE)['affected'];
+        return $this->dispatch($sql, $params, $readonly, ExecCodec::FETCH_NONE)['affected'];
     }
 
     /**
@@ -194,7 +221,7 @@ final class Connection
      */
     public function query(string $sql, array $params = [], ?string $dto = null): array
     {
-        $res = $this->dispatchAutocommit($sql, $params, true, ExecCodec::FETCH_ROWS);
+        $res = $this->dispatch($sql, $params, true, ExecCodec::FETCH_ROWS);
         if ($dto === null) {
             return $this->codec->assocRows($res);
         }
@@ -213,7 +240,7 @@ final class Connection
      */
     public function queryOne(string $sql, array $params = [], ?string $dto = null): array|object|null
     {
-        $res = $this->dispatchAutocommit($sql, $params, true, ExecCodec::FETCH_ROWS);
+        $res = $this->dispatch($sql, $params, true, ExecCodec::FETCH_ROWS);
         $firstRow = $res['rows'][0] ?? null;
         if ($firstRow === null) {
             return null;
@@ -226,7 +253,7 @@ final class Connection
     /** @param list<mixed> $params */
     public function scalar(string $sql, array $params = []): mixed
     {
-        $res = $this->dispatchAutocommit($sql, $params, true, ExecCodec::FETCH_ROWS);
+        $res = $this->dispatch($sql, $params, true, ExecCodec::FETCH_ROWS);
         $firstRow = $res['rows'][0] ?? null;
         return $firstRow === null ? null : ($firstRow[0] ?? null);
     }
@@ -237,7 +264,7 @@ final class Connection
      */
     public function rows(string $sql, array $params = []): array
     {
-        return $this->codec->assocRows($this->dispatchAutocommit($sql, $params, true, ExecCodec::FETCH_ROWS));
+        return $this->codec->assocRows($this->dispatch($sql, $params, true, ExecCodec::FETCH_ROWS));
     }
 
     /**
@@ -261,6 +288,17 @@ final class Connection
      * Requires the active session to implement {@see StreamingSessionInterface} (the concrete
      * {@see Session}); throws {@see ProtocolException} otherwise rather than mis-reading frames.
      *
+     * **Inside an imperative transaction the stream is tx-SCOPED** ({@see begin}): it carries the
+     * open transaction's `tx_id` and rides that transaction's OWN session. Either half missing is a
+     * silent wrong answer — an autocommit stream runs OUTSIDE the open transaction and sees none of
+     * its uncommitted writes, and a `tx_id` sent on a different session than the one that owns it is
+     * `NotFoundOrForbidden`. The engine routes a tx-scoped streamed fetch to the owning actor
+     * (`ferrod/src/services/sql.rs`), so this is a supported shape, not a workaround.
+     *
+     * Note that this method is a GENERATOR: nothing below runs — and no frame is written — until the
+     * caller starts iterating. That is why the `lastInsertId` reset lives in the body rather than at
+     * call time: a stream that is never iterated never ran, so it must not clear anything.
+     *
      * @template T of object
      * @param list<mixed> $params
      * @param class-string<T>|null $dto
@@ -268,13 +306,29 @@ final class Connection
      */
     public function stream(string $sql, array $params = [], ?string $dto = null): iterable
     {
-        $session = $this->session();
+        // A tx-scoped stream MUST go out on the transaction's own session, not on
+        // `session()` (the reconnect loop's CURRENT one). They are the same object today because
+        // nothing reconnects while a transaction is open — but "today" is not an invariant, and the
+        // failure if they ever diverge is the engine refusing a tx_id it does not own.
+        $session = $this->tx?->session() ?? $this->session();
         if (!$session instanceof StreamingSessionInterface) {
             throw new ProtocolException(
                 'stream() requires a session implementing StreamingSessionInterface (the concrete Session)',
             );
         }
-        $payload = $this->codec->encode($this->pool, $sql, $params, true, ExecCodec::FETCH_STREAM, null);
+        $payload = $this->codec->encode(
+            $this->pool,
+            $sql,
+            $params,
+            true,
+            ExecCodec::FETCH_STREAM,
+            $this->tx?->txId(),
+        );
+        // A streamed read reports no generated key, and — like every other statement — it CLEARS the
+        // previous one rather than letting it linger (the `lastInsertId()` contract is "the last
+        // statement's key", never a stale carry-over from two statements ago). The HEAD/DATA/END
+        // producer carries no `last_insert_id` field at all, so `null` is the honest value.
+        $this->lastInsertId = null;
 
         $opened = $session->openStream(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
         if ($opened['type'] === 'end') {
@@ -337,6 +391,162 @@ final class Connection
         }
     }
 
+    // ---- imperative transaction (the DBAL shape) -------------------------------------------------
+
+    /** Whether an imperative transaction opened by {@see begin} is currently open. */
+    public function inTransaction(): bool
+    {
+        return $this->tx !== null;
+    }
+
+    /**
+     * Open a transaction IMPERATIVELY and leave it open until {@see commit} or {@see rollBack}.
+     *
+     * This is the shape a Doctrine DBAL driver needs: DBAL's `Connection::beginTransaction()`,
+     * `commit()` and `rollBack()` are three unrelated calls with the caller's code in between, it
+     * owns its own nesting counter (implemented with `SAVEPOINT` SQL), and its `transactional()`
+     * helper is built ON TOP of the trio — DBAL never hands a closure to a driver.
+     *
+     * **Retry is the CALLER's.** Unlike {@see transaction}, nothing here re-runs anything: there is
+     * no closure to re-run, and re-issuing an individual in-transaction statement would be
+     * meaningless (the transaction it belonged to is already dead). What the caller IS given is a
+     * FATE — every failure below arrives as a taxonomy exception, so the caller can tell a lost
+     * BEGIN (nothing opened, safe to re-run) from a lost COMMIT (§19.3 Indeterminate, never
+     * re-runnable). A driver should construct its Connection with {@see RetryPolicy::none()} so the
+     * autocommit read-retry does not double up with the caller's own policy.
+     *
+     * Nesting is not supported — call `SAVEPOINT` SQL instead, which passes through inside an open
+     * transaction (M1-S8a Task 7). Attempting to nest, or to {@see transaction} while one is open,
+     * throws {@see InvalidTransactionStateException}.
+     *
+     * Isolation is deliberately NOT a parameter: named isolation constants would mean hand-written
+     * protocol numbers on the PHP side (charter rule 2), and Doctrine sets isolation with a
+     * `SET SESSION TRANSACTION ISOLATION LEVEL …` statement, not a driver flag.
+     */
+    public function begin(bool $readonly = false): void
+    {
+        if ($this->tx !== null) {
+            throw new InvalidTransactionStateException(
+                'a transaction is already open on this connection; Ferro does not nest transactions '
+                    . '(use SAVEPOINT SQL, which passes through inside an open transaction)',
+            );
+        }
+        $session = $this->session();
+        $payload = BeginRequest::encode(
+            ['pool' => $this->pool, 'isolation' => null, 'readonly' => $readonly],
+            $this->encodePacker,
+        );
+        try {
+            $outcome = $session->sendRequest(C::SERVICE_TX, C::METHOD_TX_BEGIN, $payload);
+        } catch (ConnectionLostException | TransportException $e) {
+            // A LOST BEGIN must be handed to the caller as a FATE, not as a raw transport error.
+            // "The caller owns retry" only means anything if the caller is told what it is ALLOWED
+            // to retry — and a lost BEGIN opened nothing, so it is Retryable. The closure form
+            // already routes this through the same classifier ({@see transaction}'s BEGIN arm); the
+            // imperative form must not be the one path that leaks an untyped TransportException.
+            //
+            // NOTE the deliberate difference from the closure form: no reconnect and no re-issue
+            // happen here (charter rule 3). The typed exception is the whole answer.
+            throw $this->fate->classifyLoss(
+                OpKind::TxBegin,
+                true,
+                'BEGIN lost: ' . $e->getMessage(),
+                $e instanceof ConnectionLostException ? $e->errorPayload() : null,
+                $this->reconnect?->lastEpochChanged() ?? false,
+            );
+        } catch (CodecException $e) {
+            throw new ProtocolException('failed to decode BEGIN terminal: ' . $e->getMessage(), 0, $e);
+        }
+        if (!$outcome->isOk()) {
+            // A REJECTED BEGIN opened nothing either, so nothing is left dangling. The taxonomy
+            // exception propagates verbatim and the CALLER decides whether to retry.
+            throw ErrorMapper::fromOutcome($outcome);
+        }
+        // `$this->tx` is assigned LAST: every throw above leaves this Connection transaction-free,
+        // so a failed begin() can never wedge `inTransaction()` at true.
+        $this->tx = new TxHandle(
+            $session,
+            $this->codec,
+            $this->pool,
+            $this->decodeTxId($outcome),
+            $this->encodePacker,
+        );
+    }
+
+    /**
+     * COMMIT the transaction opened by {@see begin}.
+     *
+     * A lost COMMIT is the §19.3 Indeterminate carve-out and propagates as
+     * {@see IndeterminateException} — it is NEVER retried, here or anywhere. The handle is cleared
+     * BEFORE the exception escapes so a failed commit cannot leave this Connection wedged in a
+     * transaction that no longer exists engine-side.
+     */
+    public function commit(): void
+    {
+        $tx = $this->requireTx('commit');
+        $this->tx = null;
+        try {
+            $tx->commit();
+        } catch (ConnectionLostException | TransportException $e) {
+            throw $this->fate->classifyLoss(
+                OpKind::TxCommit,
+                false,
+                'COMMIT lost: ' . $e->getMessage(),
+                null,
+                $this->reconnect?->lastEpochChanged() ?? false,
+            );
+        }
+    }
+
+    /**
+     * ROLLBACK the transaction opened by {@see begin}. The handle is cleared either way.
+     *
+     * **A lost ROLLBACK does not throw.** This is a deliberate asymmetry with {@see commit}, and it
+     * exists because of how the caller uses it: `Doctrine\DBAL\Connection::transactional()` — and
+     * essentially every hand-written `try { … } catch { $conn->rollBack(); throw; }` — calls this
+     * from a `catch`/`finally` block, where the caller is ALREADY carrying the error that matters.
+     * A raw throw from here would replace that error with a transport failure and the real cause
+     * would never be seen.
+     *
+     * It is also harmless, which is what makes it correct rather than merely convenient: a rollback
+     * whose response was lost has the same OUTCOME as one that succeeded. The transaction is dead
+     * either way — the engine rolls back and tombstones the `tx_id` on session death, on deadline
+     * and on drop (§19.3; `OpKind::TxRollback` classifies Retryable precisely because "a lost
+     * rollback is not a lost write"). There is nothing for the caller to decide, so there is nothing
+     * to report.
+     *
+     * A SERVER-side rejection (a well-formed `Outcome::Error`, e.g. an unknown `tx_id`) is a
+     * different thing and still throws: that is the engine telling us our state is wrong, not a link
+     * failure, and swallowing it would hide a real bug.
+     */
+    public function rollBack(): void
+    {
+        $tx = $this->requireTx('rollBack');
+        $this->tx = null;
+        try {
+            $tx->rollback();
+        } catch (ConnectionLostException | TransportException) {
+            // Intentionally swallowed — see the docblock. The transaction is dead either way, and
+            // this is almost always called from a `finally` that is carrying the real error.
+        }
+    }
+
+    /**
+     * The open imperative transaction, or the loud misuse error naming the method that wanted one.
+     *
+     * A statement that FAILS mid-transaction deliberately does NOT clear `$this->tx`: the caller's
+     * `finally` must still be able to call {@see rollBack} and have it stay quiet. Clearing there
+     * would turn every such `finally` into an {@see InvalidTransactionStateException} that MASKS the
+     * error the caller was already carrying — the exact failure {@see rollBack}'s swallowing arm
+     * exists to prevent.
+     */
+    private function requireTx(string $method): TxHandle
+    {
+        return $this->tx ?? throw new InvalidTransactionStateException(
+            $method . '() with no open transaction (call begin() first)',
+        );
+    }
+
     // ---- transaction ----------------------------------------------------------------------------
 
     /**
@@ -358,6 +568,17 @@ final class Connection
      */
     public function transaction(callable $fn, ?RetryPolicy $policy = null): mixed
     {
+        // Refuse to nest inside an imperative transaction (M1-S8a Task 9). Running the closure form
+        // here would BEGIN a second, unrelated transaction on the same Connection while `$this->tx`
+        // still points at the first — and, worse, its §19.1 re-run loop could reconnect underneath
+        // the open imperative tx and silently void its `tx_id`. Everything below this guard is
+        // unchanged.
+        if ($this->tx !== null) {
+            throw new InvalidTransactionStateException(
+                'transaction() cannot be called while an imperative transaction is open '
+                    . '(commit() or rollBack() first); Ferro does not nest transactions',
+            );
+        }
         $policy ??= $this->policy;
         $attempt = 0;
 
@@ -477,6 +698,36 @@ final class Connection
         if (!$outcome->isOk()) {
             throw ErrorMapper::fromOutcome($outcome);
         }
+    }
+
+    /**
+     * The ONE fork every statement method takes: an open imperative transaction routes through its
+     * {@see TxHandle}, everything else takes the autocommit path.
+     *
+     * It is deliberately NOT folded into {@see dispatchAutocommit} — that method's transparent
+     * reconnect + re-issue loop is precisely what an in-transaction statement must bypass (a
+     * mid-transaction reconnect would void the `tx_id` silently, and re-issuing a statement whose
+     * transaction is already dead is meaningless). {@see TxHandle::runForConnection} is the bare
+     * send-and-classify the closure form has always used, reused verbatim rather than duplicated.
+     *
+     * Being ONE fork rather than five copy-pasted ones is the point: a statement method that missed
+     * the delegation would silently run OUTSIDE the caller's open transaction, which is unobservable
+     * until a rollback fails to undo it.
+     *
+     * @param list<mixed> $params
+     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
+     */
+    private function dispatch(string $sql, array $params, bool $readonly, int $fetch): array
+    {
+        if ($this->tx === null) {
+            return $this->dispatchAutocommit($sql, $params, $readonly, $fetch);
+        }
+        $res = $this->tx->runForConnection($sql, $params, $readonly, $fetch);
+        // Propagate the generated key to the connection level (M1-S8a Task 9): a driver's
+        // `lastInsertId()` is read off the Connection, and nearly every real INSERT happens inside a
+        // transaction. The closure form deliberately does NOT propagate — see {@see lastInsertId}.
+        $this->lastInsertId = $res['last_insert_id'];
+        return $res;
     }
 
     /**

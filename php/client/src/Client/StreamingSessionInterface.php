@@ -10,7 +10,8 @@ use Ferro\Protocol\Outcome;
  * {@see SessionInterface::sendRequest}'s one-frame-in/one-frame-out shape, so it gets its own
  * primitives. Implemented by the concrete {@see Session} (over a real/fake {@see TransportInterface});
  * {@see Connection::stream} checks `instanceof` and refuses cleanly on a session that lacks it
- * (e.g. a scripted {@see \Ferro\Tests\Support\FakeSession} used only for the buffered-path tests).
+ * (any implementation of {@see SessionInterface} alone — the one-frame-in/one-frame-out surface —
+ * would otherwise mis-read a multi-frame reply).
  *
  * Sequencing contract: {@see openStream} then repeated {@see readStreamFrame} until it returns the
  * `end` shape (which clears the session's "stream open" guard); {@see sendWindowUpdate} replenishes

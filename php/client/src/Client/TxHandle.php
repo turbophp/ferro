@@ -22,6 +22,17 @@ use Ferro\Protocol\TxControl;
  * `commit`/`rollback` are the closure runner's to call ({@see Connection::transaction}); a closure
  * returns normally to commit or throws to roll back — it does not call them directly. Savepoints
  * ({@see savepoint}/{@see release}/{@see rollbackTo}) are exposed for nested-scope use.
+ *
+ * The same class backs {@see Connection}'s IMPERATIVE trio ({@see Connection::begin} …
+ * {@see Connection::commit}/{@see Connection::rollBack}), which holds one privately and routes every
+ * statement through {@see runForConnection} — that is how the imperative path inherits these
+ * semantics instead of re-implementing them. There is deliberately **no `stream()` here**: a
+ * streamed read is many frames per request and lives on {@see Connection::stream}, which carries
+ * {@see txId} and rides {@see session} when a transaction is open, so a tx-scoped stream is reached
+ * through the Connection rather than duplicated onto this handle. Consequence worth knowing: calling
+ * `Connection::stream()` from inside a `transaction()` CLOSURE streams in AUTOCOMMIT — the closure
+ * form's handle is not the Connection's `$tx`, so the Connection has no way to know a transaction is
+ * open. A caller that needs a tx-scoped stream uses the imperative form.
  */
 final class TxHandle
 {
@@ -39,6 +50,17 @@ final class TxHandle
 
     /** This transaction's engine-assigned id (monotonic, never reused; native int, < 2^63). */
     public function txId(): int { return $this->txId; }
+
+    /**
+     * The session this transaction lives on.
+     *
+     * A `tx_id` is only meaningful to the session that opened it — the engine's tx registry is
+     * per-session and refuses a foreign id ({@see \Ferro\Client\Error\NonRetryableException},
+     * `NotFoundOrForbidden`). Exposed so {@see Connection::stream} can send a tx-scoped streamed
+     * fetch on the RIGHT session rather than on `Connection::session()`, which is the reconnect
+     * loop's CURRENT one and is only incidentally the same object.
+     */
+    public function session(): SessionInterface { return $this->session; }
 
     /**
      * The auto-generated key produced by the most recent statement IN THIS TRANSACTION, or `null`.
@@ -157,6 +179,23 @@ final class TxHandle
     public function rollback(): void
     {
         $this->control(C::METHOD_TX_ROLLBACK, TxControl::encode(['tx_id' => $this->txId], $this->encodePacker));
+    }
+
+    /**
+     * {@see run}, for {@see Connection}'s IMPERATIVE transaction path only (M1-S8a Task 9) — same
+     * body, same return shape.
+     *
+     * It exists so `Connection::begin()`…`commit()` reuses these semantics VERBATIM instead of
+     * growing a second in-transaction statement path: one bare send-and-classify, no transparent
+     * reconnect, no re-issue (charter rule 3). A statement issued between `begin()` and
+     * `commit()`/`rollBack()` is this method.
+     *
+     * @param list<mixed> $params
+     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
+     */
+    public function runForConnection(string $sql, array $params, bool $readonly, int $fetch): array
+    {
+        return $this->run($sql, $params, $readonly, $fetch);
     }
 
     /**
