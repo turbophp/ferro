@@ -29,9 +29,12 @@
 //! 4. **The deferrals are still refused, live.** `timetz` in particular must never fall into the
 //!    `TIME` arm: its payload is 12 bytes (i64 µs + i32 zone), so admitting it would fail
 //!    mid-decode, after `HEAD` is on the wire.
-//! 5. **DOMAINs need no unwrap.** PG reports a domain as its BASE type in the `RowDescription`, so
-//!    a domain over a supported base is admitted and one over an unsupported base is refused — by
-//!    the base OID, in both cases. Only a live server can prove that resolution happens.
+//! 5. **DOMAINs need no unwrap on the READ side, and DO on the BIND side.** PG reports a domain as
+//!    its BASE type in the `RowDescription`, so a domain over a supported base is admitted and one
+//!    over an unsupported base is refused — by the base OID, in both cases. It does NOT do that for
+//!    `stmt.params()`, which reports a parameter's DOMAIN oid verbatim, so the bind pre-flight has
+//!    to resolve it itself (M1-S8a, `bind::resolve_domain`). Only a live server can prove either
+//!    asymmetry: `s8a_narrowing_and_domain_binds_round_trip` covers the bind half.
 
 use std::time::Duration;
 
@@ -1168,6 +1171,285 @@ async fn cross_engine_payloads_are_clean_errors_never_panics() {
     co.exec("DROP TABLE IF EXISTS ferro_s7_xengine")
         .await
         .expect("cleanup");
+}
+
+/// Row count of the S8a fixture table, so the pre-send refusals below are proven by a READ-BACK.
+async fn s8a_row_count(co: &mut Checkout<PgBackend>) -> Value {
+    let r = co
+        .query("SELECT count(*) FROM s8a_narrow", &[])
+        .await
+        .expect("count");
+    r.rows[0][0].clone()
+}
+
+/// **M1-S8a acceptance: the two bind fixes, against a real server.**
+///
+/// (a) a PHP-shaped `int` inserts into `int2`/`int4`/`int8` columns (and a PHP float into
+///     `float4`/`float8`) and reads back exactly — Task 4's narrowing bind;
+/// (b) an out-of-range narrowing is a KNOWN-FATE pre-send refusal — asserted by a READ-BACK showing
+///     the table is unchanged, not merely by the error type (an error alone would not distinguish a
+///     pre-send refusal from a post-send failure, which is the whole §19.3 point). Proven for a
+///     bare `int4` AND for a **domain over `float4`**, which is the one assertion that shows
+///     `check_range` is handed the RESOLVED base rather than the domain;
+/// (c) a DOMAIN-typed parameter binds — over `int4`, `text`, `bool`, `bytea`, `float4` and over
+///     another DOMAIN — closing SPEC §22.2 (g)'s "readable but not bindable". The `text`/`bool`/
+///     `bytea` cases are the load-bearing ones: `postgres-types` has no `Kind::Domain` handling, so
+///     those are exactly the arms where resolving in the pre-flight alone would make it LOOSER than
+///     the impl it fronts;
+/// (d) a domain over an UNSUPPORTED base (`timetz`) is still a pre-send `Sql{Unsupported}` — the
+///     unwrap widens nothing — and its message names BOTH the domain and its base.
+///
+/// **(d) is also what proves this whole test is not a false green.** The message can only read
+/// `s8a_dttz (domain over timetz)` if `stmt.params()` really reported the DOMAIN's own oid; had PG
+/// resolved the parameter to its base (as it does for `RowDescription`), the type would be plain
+/// `timetz` and no unwrap would ever have been needed.
+#[tokio::test(flavor = "multi_thread")]
+async fn s8a_narrowing_and_domain_binds_round_trip() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    for stmt in [
+        "DROP TABLE IF EXISTS s8a_narrow",
+        "DROP TABLE IF EXISTS s8a_dttz_t",
+        "DROP DOMAIN IF EXISTS s8a_dnested CASCADE",
+        "DROP DOMAIN IF EXISTS s8a_posint CASCADE",
+        "DROP DOMAIN IF EXISTS s8a_dtext CASCADE",
+        "DROP DOMAIN IF EXISTS s8a_dbool CASCADE",
+        "DROP DOMAIN IF EXISTS s8a_dbytea CASCADE",
+        "DROP DOMAIN IF EXISTS s8a_dfloat CASCADE",
+        "DROP DOMAIN IF EXISTS s8a_dttz CASCADE",
+        "CREATE DOMAIN s8a_posint AS int4 CHECK (VALUE > 0)",
+        "CREATE DOMAIN s8a_dtext AS text",
+        "CREATE DOMAIN s8a_dbool AS bool",
+        "CREATE DOMAIN s8a_dbytea AS bytea",
+        "CREATE DOMAIN s8a_dfloat AS float4",
+        // A domain over a DOMAIN: legal in PG, and the reason the resolver is a bounded LOOP.
+        "CREATE DOMAIN s8a_dnested AS s8a_posint",
+        // A domain over a base Ferro does not support at all.
+        "CREATE DOMAIN s8a_dttz AS timetz",
+        "CREATE TABLE s8a_narrow (id serial PRIMARY KEY, small int2, med int4, big int8, \
+         r float4, d float8, dom s8a_posint, dtext s8a_dtext, dbool s8a_dbool, \
+         dbytea s8a_dbytea, dfloat s8a_dfloat, dnested s8a_dnested)",
+        "CREATE TABLE s8a_dttz_t (c s8a_dttz)",
+    ] {
+        co.exec(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("setup `{stmt}`: {e:?}"));
+    }
+
+    const DOM_COLS: &str = "dom, dtext, dbool, dbytea, dfloat, dnested";
+
+    // ---- (a) the narrowing bind + every domain base, in ONE statement.
+    co.query(
+        &format!(
+            "INSERT INTO s8a_narrow (small, med, big, r, d, {DOM_COLS}) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)"
+        ),
+        &[
+            Value::I64(7),
+            Value::I64(2_147_483_647),
+            Value::I64(i64::MAX),
+            Value::F64(1.5),
+            Value::F64(2.25),
+            // dom (int4), dtext, dbool, dbytea, dfloat, dnested (domain over domain over int4)
+            Value::I64(11),
+            Value::Text("hello".into()),
+            Value::Bool(true),
+            Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
+            Value::F64(1.5),
+            Value::I64(13),
+        ],
+    )
+    .await
+    .expect(
+        "a PHP int must bind int2/int4/int8 AND a domain over int4; a PHP string/bool/binary must \
+         bind a domain over text/bool/bytea",
+    );
+
+    let back = co
+        .query(
+            &format!("SELECT small, med, big, r, d, {DOM_COLS} FROM s8a_narrow"),
+            &[],
+        )
+        .await
+        .expect("read back");
+    assert_eq!(
+        back.rows[0],
+        vec![
+            Value::I64(7),
+            Value::I64(2_147_483_647),
+            Value::I64(i64::MAX),
+            Value::F64(1.5),
+            Value::F64(2.25),
+            Value::I64(11),
+            Value::Text("hello".into()),
+            Value::Bool(true),
+            Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
+            Value::F64(1.5),
+            Value::I64(13),
+        ],
+        "every narrowed/domain-bound value must read back exactly"
+    );
+
+    // ---- (b) the pre-send refusal, proven by the READ-BACK, not just by the error type.
+    let before = s8a_row_count(&mut co).await;
+    assert_eq!(before, Value::I64(1));
+
+    for (what, sql, param, why) in [
+        (
+            "int4 overflow",
+            "INSERT INTO s8a_narrow (med) VALUES ($1)",
+            Value::I64(i64::from(i32::MAX) + 1),
+            "out of range",
+        ),
+        // The DOMAIN half of the range gate: `s8a_dfloat` is a domain over `float4`, so this only
+        // refuses if `check_range` was handed the RESOLVED base. Bound to the domain, `1e39` would
+        // otherwise become `inf` — a silent corrupt write.
+        (
+            "float4 overflow through a DOMAIN",
+            "INSERT INTO s8a_narrow (dfloat) VALUES ($1)",
+            Value::F64(1e39),
+            "silently become infinity",
+        ),
+        // The UNDERFLOW mirror (Task 4 review). PG's OWN parser refuses the identical text literal
+        // — measured on this very server: `INSERT INTO … (r) VALUES ('1e-46')` returns
+        // `22003 "1e-46" is out of range for type real` — while before this fix Ferro's bind
+        // returned `Ok` and stored `0.0`. Driven through the DOMAIN as well, so the resolved-base
+        // path carries both directions of the float gate.
+        (
+            "float4 underflow through a DOMAIN",
+            "INSERT INTO s8a_narrow (dfloat) VALUES ($1)",
+            Value::F64(1e-46),
+            "silently become zero",
+        ),
+    ] {
+        let err = co
+            .query(sql, &[param])
+            .await
+            .unwrap_err_or_panic(&format!("{what} must be refused"));
+        match &err {
+            PoolError::Sql {
+                code,
+                sqlstate,
+                message,
+                ..
+            } => {
+                assert_eq!(*code, ferro_proto::consts::errc::UNSUPPORTED);
+                assert_eq!(
+                    *sqlstate, None,
+                    "no SQLSTATE: the server never saw the statement"
+                );
+                assert!(message.contains("out of range"), "{message}");
+                assert!(
+                    message.contains(why),
+                    "the refusal must say WHICH corruption it prevented ({why}): {message}"
+                );
+            }
+            other => panic!("expected a known-fate Sql refusal for {what}, got {other:?}"),
+        }
+        println!("  [pg] {what:<34} -> pre-send refusal: {err:?}");
+    }
+    // ...and PG's OWN parser agrees about the underflow literal, on this same server: the engine is
+    // not inventing a stricter rule than the database it fronts.
+    let pg_own = co
+        .exec("INSERT INTO s8a_narrow (r) VALUES ('1e-46')")
+        .await
+        .unwrap_err_or_panic("PG itself must refuse the float4 underflow literal");
+    match &pg_own {
+        PoolError::Sql { sqlstate, .. } => assert_eq!(
+            sqlstate.as_deref(),
+            Some("22003"),
+            "PG's own out-of-range SQLSTATE: {pg_own:?}"
+        ),
+        other => panic!("expected PG's own 22003, got {other:?}"),
+    }
+    println!("  [pg] PG's own parser on '1e-46'::float4      -> {pg_own:?}");
+
+    let after = s8a_row_count(&mut co).await;
+    assert_eq!(
+        after,
+        Value::I64(1),
+        "the refused inserts must not have applied"
+    );
+
+    // ---- (c) the domain read/write symmetry SPEC §22.2 (g) said was broken: take the values just
+    // READ out of the domain columns and bind them straight back in. This is the exact shape a DBAL
+    // insert of a hydrated entity performs.
+    let dom_row = back.rows[0][5..].to_vec();
+    assert_eq!(dom_row.len(), 6, "five domain bases plus the nested one");
+    co.query(
+        &format!("INSERT INTO s8a_narrow ({DOM_COLS}) VALUES ($1,$2,$3,$4,$5,$6)"),
+        &dom_row,
+    )
+    .await
+    .expect("a value read from a domain column must bind back into it");
+    let echo = co
+        .query(
+            &format!("SELECT {DOM_COLS} FROM s8a_narrow ORDER BY id DESC LIMIT 1"),
+            &[],
+        )
+        .await
+        .expect("read the echoed row");
+    assert_eq!(
+        echo.rows[0], dom_row,
+        "read -> bind -> read through a DOMAIN column must be byte-identical"
+    );
+    println!("  [pg] domain round trip (int4/text/bool/bytea/float4/nested): {dom_row:?}");
+
+    // ---- (d) a domain over an UNSUPPORTED base is STILL refused, pre-send, and the message names
+    // both halves — which is simultaneously the proof that `stmt.params()` reported the DOMAIN.
+    let err = co
+        .query(
+            "INSERT INTO s8a_dttz_t (c) VALUES ($1)",
+            &[Value::Time("12:00:00".into())],
+        )
+        .await
+        .unwrap_err_or_panic("a domain over timetz must not become bindable");
+    let msg = match &err {
+        PoolError::Sql {
+            code,
+            sqlstate,
+            message,
+            ..
+        } => {
+            assert_eq!(*code, ferro_proto::consts::errc::UNSUPPORTED);
+            assert_eq!(*sqlstate, None, "pre-send: the server never saw it");
+            message.clone()
+        }
+        other => panic!("expected a known-fate Sql refusal, got {other:?}"),
+    };
+    assert!(
+        msg.contains("s8a_dttz"),
+        "the refusal must name the DOMAIN an operator declared: {msg}"
+    );
+    assert!(
+        msg.contains("domain over") && msg.contains("timetz"),
+        "the refusal must name the BASE the constraint actually came from — and this clause is \
+         only reachable if stmt.params() reported the DOMAIN's own oid, which is the premise of \
+         this whole task: {msg}"
+    );
+    println!("  [pg] domain over an unsupported base -> {msg}");
+
+    // The conn is clean after every refusal: nothing was sent, nothing to unwind.
+    let ok = co.query("SELECT 1", &[]).await.expect("conn survives");
+    assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
+
+    for stmt in [
+        "DROP TABLE IF EXISTS s8a_narrow",
+        "DROP TABLE IF EXISTS s8a_dttz_t",
+        "DROP DOMAIN IF EXISTS s8a_dnested CASCADE",
+        "DROP DOMAIN IF EXISTS s8a_posint CASCADE",
+        "DROP DOMAIN IF EXISTS s8a_dtext CASCADE",
+        "DROP DOMAIN IF EXISTS s8a_dbool CASCADE",
+        "DROP DOMAIN IF EXISTS s8a_dbytea CASCADE",
+        "DROP DOMAIN IF EXISTS s8a_dfloat CASCADE",
+        "DROP DOMAIN IF EXISTS s8a_dttz CASCADE",
+    ] {
+        co.exec(stmt).await.expect("cleanup");
+    }
 }
 
 /// Tiny helper so the loop above reads cleanly.

@@ -918,16 +918,21 @@ async fn pg_deferrals_are_still_loud_through_the_daemon() {
     println!("  [pg] interval/inet/array/timetz/enum/domain-over-timetz still loud");
 }
 
-/// **A PG DOMAIN is READABLE but NOT BINDABLE** (T8b review, item 12) — the asymmetry, live through
-/// the daemon.
+/// **A PG DOMAIN now READS *and* BINDS** — SPEC §22.2 (g) closed, live through the daemon.
 ///
-/// PG resolves a domain to its BASE type when it builds the `RowDescription`, so a domain over a
-/// supported base reads fine (which is why domains are NOT on the deferral list). It does **not**
-/// do that for parameters: `stmt.params()` reports the DOMAIN's own OID, and `bind::accepts`
-/// matches on `Type` IDENTITY — so binding the very value just read back into the same column is
-/// refused. Pre-existing (it applies to M0's scalars too) and SAFE: a known-fate, pre-send
-/// rejection that leaves the connection clean, never a fate-unknown `Indeterminate`. Recorded in
-/// SPEC §22.2 and sized into the S8 narrowing-bind carry.
+/// **This test is a REGRESSION LOCK with a flipped expectation, not a new test** (M1-S8a Task 5).
+/// It was `pg_domain_reads_but_does_not_bind`, and it pinned the asymmetry: PG resolves a domain to
+/// its BASE type when it builds the `RowDescription`, so a domain over a supported base always read
+/// fine (which is why domains are NOT on the deferral list), but it does **not** do that for
+/// parameters — `stmt.params()` reports the DOMAIN's own OID, and `bind::accepts` matched on `Type`
+/// IDENTITY, so binding the very value just read back into the same column was refused.
+///
+/// `bind::resolve_domain` now unwraps the domain — in `accepts` **and** inside every concrete
+/// `ToSql` the value boxes as, which is the load-bearing half: `postgres-types` has zero
+/// `Kind::Domain` handling of its own, so resolving only in the pre-flight would have made it
+/// LOOSER than the impl it fronts and turned a type mismatch into a false `Indeterminate` (§19.3).
+/// The refusal branch this test used to assert is kept below for the UNSUPPORTED base (`timetz`),
+/// where a domain must still be a clean pre-send rejection: the unwrap widens nothing.
 ///
 /// Deliberately its own server/session: a query against a CUSTOM OID makes `tokio-postgres` cache
 /// an internal typeinfo statement on that physical connection, and the S3 full hygiene profile
@@ -937,7 +942,7 @@ async fn pg_deferrals_are_still_loud_through_the_daemon() {
 /// task rather than papered over, and this test avoids it by not sharing a pool with the enum /
 /// domain-over-timetz probes above.
 #[tokio::test(flavor = "multi_thread")]
-async fn pg_domain_reads_but_does_not_bind() {
+async fn pg_domain_reads_and_binds() {
     let Some(url) = pg_url() else {
         return;
     };
@@ -963,17 +968,64 @@ async fn pg_domain_reads_but_does_not_bind() {
     assert_eq!(head, tag::DECIMAL, "a domain over numeric(10,2) -> DECIMAL");
     assert_eq!(v, Value::Decimal("12.34".into()));
 
-    // BIND: the same value, back into the same column -> a known-fate refusal.
+    // BIND: the same value, back into the same column. M1-S8a: this now SUCCEEDS — the asymmetry
+    // §22.2 (g) recorded is closed.
     let mut ins = req("INSERT INTO ferro_s7_e2e_dom (v) VALUES (?)");
     ins.readonly = false;
     ins.fetch = 1;
     ins.params = vec![v.clone()];
     rid += 1;
-    let ep = exec_err(&mut client, rid, &ins).await;
+    let ok = exec_ok(&mut client, rid, &ins).await;
+    assert_eq!(
+        ok.affected, 1,
+        "a value read from a domain column must bind straight back into it"
+    );
+
+    // ...and it landed as the SAME value, not a re-rendered one: two rows, both `12.34`.
+    rid += 1;
+    let read_back = exec_ok(
+        &mut client,
+        rid,
+        &req("SELECT v FROM ferro_s7_e2e_dom ORDER BY v"),
+    )
+    .await;
+    assert_eq!(
+        read_back.rows,
+        vec![
+            vec![Value::Decimal("12.34".into())],
+            vec![Value::Decimal("12.34".into())]
+        ],
+        "read -> bind -> read through a DOMAIN column must be byte-identical"
+    );
+
+    // The unwrap WIDENS NOTHING: a domain over a base Ferro does not support is still a clean,
+    // pre-send, known-fate refusal — never a fate-unknown Indeterminate. This is the branch this
+    // test used to assert for EVERY domain; keeping it here is what stops the fix from having
+    // quietly turned the pre-flight into a rubber stamp.
+    rid += 1;
+    ddl(
+        &mut client,
+        rid,
+        "CREATE DOMAIN ferro_s8a_e2e_ttz2 AS timetz",
+    )
+    .await;
+    rid += 1;
+    ddl(
+        &mut client,
+        rid,
+        "CREATE TABLE ferro_s8a_e2e_ttz_t (c ferro_s8a_e2e_ttz2)",
+    )
+    .await;
+    let mut bad = req("INSERT INTO ferro_s8a_e2e_ttz_t (c) VALUES (?)");
+    bad.readonly = false;
+    bad.fetch = 1;
+    bad.params = vec![Value::Time("12:00:00".into())];
+    rid += 1;
+    let ep = exec_err(&mut client, rid, &bad).await;
     assert_eq!(
         ep.code,
         errc::UNSUPPORTED,
-        "a domain bind is a KNOWN-FATE rejection, got {ep:?}"
+        "a domain over an UNSUPPORTED base is still a KNOWN-FATE rejection, got {ep:?}"
     );
     assert_ne!(
         ep.branch,
@@ -981,17 +1033,26 @@ async fn pg_domain_reads_but_does_not_bind() {
         "a pre-send bind rejection must never mint a false Indeterminate (§19.3)"
     );
     assert!(
-        ep.message.contains("ferro_s7_e2e_num2"),
-        "the rejection must name the domain type it could not bind to: {}",
+        ep.message.contains("ferro_s8a_e2e_ttz2") && ep.message.contains("timetz"),
+        "the rejection must name BOTH the domain and the base its constraint came from: {}",
         ep.message
     );
 
     // The connection is clean and the session alive: nothing was sent, nothing to unwind.
     assert_session_alive(&mut client, 7).await;
+    println!("  [pg] domain READS {v:?} and now BINDS it back (§22.2 (g) closed)");
     println!(
-        "  [pg] domain READS {v:?} but does NOT bind: {}",
+        "  [pg] domain over an unsupported base is still loud: {}",
         ep.message
     );
+
+    for stmt in [
+        "DROP TABLE IF EXISTS ferro_s8a_e2e_ttz_t",
+        "DROP DOMAIN IF EXISTS ferro_s8a_e2e_ttz2 CASCADE",
+    ] {
+        rid += 1;
+        ddl(&mut client, rid, stmt).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
