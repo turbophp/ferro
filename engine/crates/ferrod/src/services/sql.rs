@@ -1256,13 +1256,18 @@ async fn begin_on_pool<B: PoolBackend>(
     max_tx: Duration,
     teardown_timeout: Duration,
 ) {
-    let begin_sql = match actor::compose_begin_sql(req.isolation, req.readonly) {
-        Ok(s) => s,
-        Err(msg) => {
-            responder.end_error(protocol(msg));
-            return;
-        }
-    };
+    // M1-S8a Task 8: the BEGIN is composed for the POOL's dialect (`PoolBackend::dialect()` is a
+    // synchronous per-backend constant), so a MySQL pool gets `START TRANSACTION [READ ONLY]` with
+    // the isolation as a `SET TRANSACTION …;` prefix in the SAME statement string, and PG keeps its
+    // byte-identical `BEGIN …` strings. SPEC §22.2 (s).
+    let begin_sql =
+        match actor::compose_begin_sql(pool.backend().dialect(), req.isolation, req.readonly) {
+            Ok(s) => s,
+            Err(msg) => {
+                responder.end_error(protocol(msg));
+                return;
+            }
+        };
 
     let mut co = match pool.checkout().await {
         Ok(co) => co,

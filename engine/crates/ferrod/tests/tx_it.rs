@@ -1078,3 +1078,90 @@ async fn savepoint_sql_outside_a_transaction_is_refused() {
     // The session survives all of them — exactly one END each (charter rule 4).
     assert_session_alive(&mut c, 0xC0FFEE).await;
 }
+
+// -------------------------------------------------------------------------------------------------
+// M1-S8a Task 8 — the dialect split did NOT move PostgreSQL (SPEC §22.2 (s)).
+// -------------------------------------------------------------------------------------------------
+
+/// PG is untouched by the dialect split — the composed strings are byte-identical to M1-S6's. This
+/// mirrors the existing live isolation assertion in `tx_isolation_observed`, but with `readonly` ON,
+/// so the `BEGIN ISOLATION LEVEL … READ ONLY` cell is exercised end to end and not only in the
+/// table test.
+///
+/// The direct `current_setting('transaction_isolation')` read is valid HERE and not on MySQL:
+/// PG's `BEGIN ISOLATION LEVEL …` sets the CURRENT transaction's level and reports it, while
+/// MySQL's `SET TRANSACTION …` prefix applies to the NEXT transaction and is invisible in
+/// `@@transaction_isolation` (see `mysql_it.rs`'s lock-conflict proof).
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_begin_isolation_and_readonly_are_unchanged() {
+    let Some(url) = pg_url() else {
+        return; // prints `skip: FERRO_TEST_PG_URL unset`
+    };
+    let server = common::exec_server(url);
+    let mut c = server.connect().await;
+    c.hello(0).await;
+
+    exec_ok(&mut c, 1, &ddl("DROP TABLE IF EXISTS s8a_pg_ro")).await;
+    exec_ok(&mut c, 2, &ddl("CREATE TABLE s8a_pg_ro (v int)")).await;
+
+    let tx = begin(
+        &mut c,
+        3,
+        "default",
+        Some(u8::from(Isolation::Serializable)),
+        true,
+    )
+    .await;
+
+    let iso = exec_ok(
+        &mut c,
+        4,
+        &tx_req(
+            tx,
+            "SELECT current_setting('transaction_isolation')",
+            Vec::new(),
+            sql::FETCH_ROWS,
+            true,
+        ),
+    )
+    .await;
+    assert_eq!(
+        iso.rows,
+        vec![vec![Value::Text("serializable".to_string())]],
+        "PG still reports the composed isolation level inside the tx: {:?}",
+        iso.rows
+    );
+
+    let e = match exec_in_tx(
+        &mut c,
+        5,
+        tx,
+        "INSERT INTO s8a_pg_ro (v) VALUES (1)",
+        Vec::new(),
+        sql::FETCH_NONE,
+        false,
+    )
+    .await
+    {
+        Outcome::Error(ep) => ep,
+        other => panic!("a write in a READ ONLY tx must be refused, got {other:?}"),
+    };
+    assert_eq!(
+        e.sqlstate.as_deref(),
+        Some("25006"),
+        "PG enforces READ ONLY with the same SQLSTATE: {e:?}"
+    );
+
+    assert!(matches!(rollback(&mut c, 6, tx).await, Outcome::Ok(_)));
+
+    // NOTE — there is deliberately NO "the next transaction did not inherit SERIALIZABLE"
+    // assertion here. It was written, then measured to be a guard that CANNOT FAIL: with the PG arm
+    // mutated to ALSO emit `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL …` (a genuine
+    // cross-tenant leak), it stayed GREEN — the S3 targeted hygiene profile's `RESET ALL` wipes the
+    // session default at the next checkout before anything can observe it. The falsifiable leak
+    // guard lives on a RAW connection, with no hygiene in the way: `ferro-backend-mysql`'s
+    // `begin_dialect_it::the_batched_isolation_never_survives_the_transaction`.
+
+    exec_ok(&mut c, 10, &ddl("DROP TABLE IF EXISTS s8a_pg_ro")).await;
+    assert_session_alive(&mut c, 0xC0FFF0).await;
+}

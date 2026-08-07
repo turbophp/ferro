@@ -356,10 +356,11 @@ async fn exec_within(
     Outcome::decode(&t.payload).expect("decode terminal Outcome")
 }
 
-// ---- TX plumbing (bare BEGIN only — MySQL isolation-BEGIN is deferred to S8, SPEC §22.2) ---------
+// ---- TX plumbing (this suite only ever needs a bare BEGIN) ---------------------------------------
 
-/// BEGIN a bare transaction (isolation=None, readonly=false → the composed SQL is the bare `BEGIN`,
-/// which MySQL accepts as `START TRANSACTION`). Returns its `tx_id`.
+/// BEGIN a bare transaction (isolation=None, readonly=false → the composed SQL is a bare
+/// `START TRANSACTION`; the isolation/readonly forms landed in M1-S8a and are gated in
+/// `mysql_it.rs`, SPEC §22.2 (s)). Returns its `tx_id`.
 async fn begin(client: &mut TestClient, rid: u32, pool: &str) -> u64 {
     let breq = BeginRequest {
         pool: pool.to_string(),
@@ -646,7 +647,7 @@ async fn mysql_connection_kill_mid_write_is_indeterminate() {
 // =================================================================================================
 // Case 4. in-tx timeout_ms write -> the actor cancels (KILL QUERY) + drains + ROLLBACK + tombstones
 //         -> the ONE terminal is TxDeadline{Retryable}; counter == 0 (rolled back); tx_id unusable.
-//         (bare BEGIN — MySQL isolation-BEGIN is deferred to S8, §22.2.)
+//         (a bare BEGIN — this case does not need an isolation level.)
 // =================================================================================================
 
 #[tokio::test(flavor = "multi_thread")]

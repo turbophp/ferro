@@ -24,7 +24,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use ferro_pool::backend::{Cancel, PoolBackend, QueryResult};
+use ferro_pool::backend::{Cancel, Dialect, PoolBackend, QueryResult};
 use ferro_pool::error::PoolError;
 use ferro_pool::pool::Checkout;
 use ferro_proto::messages::tx::Isolation;
@@ -34,29 +34,97 @@ use crate::services::sql::StreamEnded;
 
 use super::{CtlReply, ExecReply, TxCommand, TxRegistry};
 
-/// Compose the engine's `BEGIN` statement from the request's `isolation` (a `u8` off the wire) and
-/// `readonly` flag — a pure function, unit-tested per combination. `readonly` uses `READ ONLY`
-/// (there is no separate `SET`), and `isolation == None` leaves the server/pool default in place
-/// (no `ISOLATION LEVEL` clause). An unknown isolation `u8` is a client error (returned as `Err`,
-/// mapped by the handler to `Protocol`), never coerced to a default.
+/// Compose the engine's transaction-opening statement for `dialect` from the request's `isolation`
+/// (a `u8` off the wire) and `readonly` flag. Pure, and unit-tested per (dialect × isolation ×
+/// readonly) cell. `isolation == None` leaves the server/pool default in place (no `ISOLATION LEVEL`
+/// clause). An unknown isolation byte is a client error (`Err`, mapped by the handler to
+/// `Protocol`), never coerced to a default.
 ///
-/// Examples: `(None,false) → "BEGIN"`; `(None,true) → "BEGIN READ ONLY"`;
-/// `(Some(RepeatableRead),true) → "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"`.
-pub fn compose_begin_sql(isolation: Option<u8>, readonly: bool) -> Result<String, String> {
-    let mut sql = String::from("BEGIN");
-    if let Some(iso) = isolation {
-        let level = match Isolation::try_from(iso).map_err(|e| e.to_string())? {
+/// **The result is ONE statement string, always.** [`Checkout::begin_tx_with`] issues exactly one
+/// `simple_query` and wraps it in the whole pin/RFQ/tracker/Rule-A sequence, so a second call would
+/// re-run that sequence — the MySQL isolation forms are therefore a `CLIENT_MULTI_STATEMENTS` batch
+/// (already negotiated by the vendored fork), not two calls.
+///
+/// **Why MySQL cannot use the PG spelling** (measured on MySQL 8.4.11 AND MariaDB 11.8.8):
+/// `BEGIN READ ONLY`, `BEGIN ISOLATION LEVEL …` and `START TRANSACTION ISOLATION LEVEL …` are all
+/// `ERROR 1064 (42000)`. The only working forms are `START TRANSACTION [READ ONLY]` and a
+/// `SET TRANSACTION …;` prefix, whose modifier applies to the NEXT transaction only — so it must
+/// immediately precede the `START TRANSACTION`.
+///
+/// **Why the BATCH and not two statements** (also measured): a STANDALONE `SET TRANSACTION …`
+/// returns an OK packet with `SERVER_SESSION_STATE_CHANGED` and NO trackers, which
+/// `ferro_backend_mysql::tracker::is_mutation` reads as a real session mutation — so it would taint
+/// EVERY isolation/readonly transaction into a full `COM_RESET_CONNECTION` at the next recycle.
+/// Batched, `query_drop` drains both result sets and the FINAL OK packet carries a
+/// `TransactionState` tracker, which gates the bare-flag path off: no taint, `tx_status` reads
+/// `InTx`, and `SERVER_STATUS_IN_TRANS_READONLY` confirms the read-only mode took.
+///
+/// The batch consequently MASKS the intermediate statement's own trackers (only the final OK packet
+/// is read). That is acceptable here and only here: the engine composes this string itself. A USER
+/// batch still goes through `Checkout::exec`, which is unchanged.
+///
+/// **The `SESSION`/`GLOBAL` scoped spellings are FORBIDDEN here.**
+/// `SET SESSION TRANSACTION ISOLATION LEVEL …` would persist the level on the POOLED connection past
+/// `COMMIT`, so the next tenant would inherit it — a cross-tenant connection-state leak (charter
+/// rule 6). The next-transaction-only spelling is correct *because* it does not persist; its
+/// observable consequence is that the level is NOT readable back from `@@transaction_isolation`
+/// (which keeps reporting the session default, rendered by MySQL with a hyphen: `REPEATABLE-READ`),
+/// so it must be verified by a LOCK CONFLICT, never by reading that variable. See SPEC §22.2 (s).
+///
+/// Examples: `(Postgres, None, false) → "BEGIN"`; `(Postgres, None, true) → "BEGIN READ ONLY"`;
+/// `(MySql, Some(Serializable), true) →
+/// "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; START TRANSACTION READ ONLY"`.
+pub fn compose_begin_sql(
+    dialect: Dialect,
+    isolation: Option<u8>,
+    readonly: bool,
+) -> Result<String, String> {
+    let level = match isolation {
+        None => None,
+        Some(iso) => Some(match Isolation::try_from(iso).map_err(|e| e.to_string())? {
             Isolation::ReadCommitted => "READ COMMITTED",
             Isolation::RepeatableRead => "REPEATABLE READ",
             Isolation::Serializable => "SERIALIZABLE",
-        };
-        sql.push_str(" ISOLATION LEVEL ");
-        sql.push_str(level);
+        }),
+    };
+
+    // Exhaustive on purpose: a new `Dialect` variant must break the build here rather than silently
+    // inherit PG syntax. NEVER add a `_ =>` arm.
+    match dialect {
+        Dialect::Postgres => {
+            let mut sql = String::from("BEGIN");
+            if let Some(level) = level {
+                sql.push_str(" ISOLATION LEVEL ");
+                sql.push_str(level);
+            }
+            if readonly {
+                sql.push_str(" READ ONLY");
+            }
+            Ok(sql)
+        }
+        Dialect::MySql => {
+            let start = if readonly {
+                "START TRANSACTION READ ONLY"
+            } else {
+                "START TRANSACTION"
+            };
+            Ok(match level {
+                None => start.to_string(),
+                Some(level) => format!("SET TRANSACTION ISOLATION LEVEL {level}; {start}"),
+            })
+        }
+        Dialect::Sqlite => {
+            if level.is_some() || readonly {
+                Err(
+                    "isolation/readonly BEGIN is not supported on the sqlite dialect (no SQLite \
+                     backend exists yet; this arm exists so one cannot silently inherit PG syntax)"
+                        .to_string(),
+                )
+            } else {
+                Ok("BEGIN".to_string())
+            }
+        }
     }
-    if readonly {
-        sql.push_str(" READ ONLY");
-    }
-    Ok(sql)
 }
 
 /// The engine-named savepoint stack for one transaction (`sp_1`, `sp_2`, … — a monotonic per-tx
@@ -584,38 +652,123 @@ mod tests {
 
     // ---- pure helpers -----------------------------------------------------------------------
 
+    /// The full (dialect × isolation × readonly) matrix, verbatim. The 8 PostgreSQL strings are
+    /// UNCHANGED from M1-S6 — M1-S8a Task 8 must not move them.
     #[test]
     fn compose_begin_sql_table() {
-        // isolation None: server/pool default, optionally READ ONLY.
-        assert_eq!(compose_begin_sql(None, false).unwrap(), "BEGIN");
-        assert_eq!(compose_begin_sql(None, true).unwrap(), "BEGIN READ ONLY");
-        // Each isolation level × readonly.
+        use ferro_pool::backend::Dialect;
+        let iso_rc = Some(u8::from(Isolation::ReadCommitted));
+        let iso_rr = Some(u8::from(Isolation::RepeatableRead));
+        let iso_ser = Some(u8::from(Isolation::Serializable));
+
+        // --- PostgreSQL: unchanged.
+        let pg: &[(Option<u8>, bool, &str)] = &[
+            (None, false, "BEGIN"),
+            (None, true, "BEGIN READ ONLY"),
+            (iso_rc, false, "BEGIN ISOLATION LEVEL READ COMMITTED"),
+            (
+                iso_rc,
+                true,
+                "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY",
+            ),
+            (iso_rr, false, "BEGIN ISOLATION LEVEL REPEATABLE READ"),
+            (
+                iso_rr,
+                true,
+                "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+            ),
+            (iso_ser, false, "BEGIN ISOLATION LEVEL SERIALIZABLE"),
+            (
+                iso_ser,
+                true,
+                "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY",
+            ),
+        ];
+        for (iso, ro, want) in pg {
+            assert_eq!(
+                compose_begin_sql(Dialect::Postgres, *iso, *ro).unwrap(),
+                *want,
+                "pg({iso:?}, {ro})"
+            );
+        }
+
+        // --- MySQL/MariaDB: `BEGIN READ ONLY` and `BEGIN ISOLATION LEVEL …` are ERROR 1064 on BOTH
+        // engines (measured), and so is `START TRANSACTION ISOLATION LEVEL …`. The isolation forms
+        // are therefore a `SET TRANSACTION …;` prefix in the SAME statement string — ONE
+        // `simple_query`, which is all `begin_tx_with` issues, and the only form that does not taint.
+        let my: &[(Option<u8>, bool, &str)] = &[
+            (None, false, "START TRANSACTION"),
+            (None, true, "START TRANSACTION READ ONLY"),
+            (
+                iso_rc,
+                false,
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; START TRANSACTION",
+            ),
+            (
+                iso_rc,
+                true,
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; START TRANSACTION READ ONLY",
+            ),
+            (
+                iso_rr,
+                false,
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; START TRANSACTION",
+            ),
+            (
+                iso_rr,
+                true,
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; START TRANSACTION READ ONLY",
+            ),
+            (
+                iso_ser,
+                false,
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; START TRANSACTION",
+            ),
+            (
+                iso_ser,
+                true,
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; START TRANSACTION READ ONLY",
+            ),
+        ];
+        for (iso, ro, want) in my {
+            assert_eq!(
+                compose_begin_sql(Dialect::MySql, *iso, *ro).unwrap(),
+                *want,
+                "mysql({iso:?}, {ro})"
+            );
+        }
+
+        // The SESSION form is FORBIDDEN (it would persist the level on the pooled connection past
+        // COMMIT — a cross-tenant leak, charter rule 6). Asserted over the WHOLE composed matrix,
+        // not a spot check, so no future cell can reintroduce it.
+        for (iso, ro, _) in pg.iter().chain(my.iter()) {
+            for d in [Dialect::Postgres, Dialect::MySql] {
+                let sql = compose_begin_sql(d, *iso, *ro).unwrap();
+                assert!(
+                    !sql.to_ascii_uppercase().contains("SET SESSION"),
+                    "{d:?}({iso:?}, {ro}) must never emit a SESSION-scoped isolation: {sql:?}"
+                );
+                assert!(
+                    !sql.to_ascii_uppercase().contains("GLOBAL"),
+                    "{d:?}({iso:?}, {ro}) must never emit a GLOBAL-scoped isolation: {sql:?}"
+                );
+            }
+        }
+
+        // --- SQLite: no backend exists yet. A bare BEGIN is composable; anything else is a LOUD
+        // refusal rather than a silently-PG-shaped string a future backend would choke on.
         assert_eq!(
-            compose_begin_sql(Some(Isolation::ReadCommitted.into()), false).unwrap(),
-            "BEGIN ISOLATION LEVEL READ COMMITTED"
+            compose_begin_sql(Dialect::Sqlite, None, false).unwrap(),
+            "BEGIN"
         );
-        assert_eq!(
-            compose_begin_sql(Some(Isolation::ReadCommitted.into()), true).unwrap(),
-            "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY"
-        );
-        assert_eq!(
-            compose_begin_sql(Some(Isolation::RepeatableRead.into()), false).unwrap(),
-            "BEGIN ISOLATION LEVEL REPEATABLE READ"
-        );
-        assert_eq!(
-            compose_begin_sql(Some(Isolation::RepeatableRead.into()), true).unwrap(),
-            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
-        );
-        assert_eq!(
-            compose_begin_sql(Some(Isolation::Serializable.into()), false).unwrap(),
-            "BEGIN ISOLATION LEVEL SERIALIZABLE"
-        );
-        assert_eq!(
-            compose_begin_sql(Some(Isolation::Serializable.into()), true).unwrap(),
-            "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY"
-        );
-        // An unknown isolation u8 is rejected (not coerced to a default).
-        assert!(compose_begin_sql(Some(3), false).is_err());
+        assert!(compose_begin_sql(Dialect::Sqlite, None, true).is_err());
+        assert!(compose_begin_sql(Dialect::Sqlite, iso_ser, false).is_err());
+
+        // An unknown isolation byte is a client error on EVERY dialect, never coerced to a default.
+        for d in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
+            assert!(compose_begin_sql(d, Some(3), false).is_err(), "{d:?}");
+            assert!(compose_begin_sql(d, Some(99), false).is_err(), "{d:?}");
+        }
     }
 
     #[test]

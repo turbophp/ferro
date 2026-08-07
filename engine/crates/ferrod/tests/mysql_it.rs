@@ -11,7 +11,9 @@
 //!    is DEFERRED — SPEC §22.2 (n)) — NOT a mid-stream error;
 //!  * (M1-S8a) refuses it IDENTICALLY on BOTH EXEC arms — autocommit and tx-scoped — off the ONE
 //!    `PoolBackend::supports_row_streaming()` authority, the tx-scoped one BEFORE the actor can
-//!    touch (and force-taint) the pinned connection.
+//!    touch (and force-taint) the pinned connection;
+//!  * (M1-S8a Task 8) opens an ISOLATION-scoped and/or READ ONLY transaction — the dialect-aware
+//!    `compose_begin_sql` batch (SPEC §22.2 (s)), which before this slice was ERROR 1064.
 //!
 //! Every test SKIPS (does not fail) when `FERRO_TEST_MYSQL_URL` / `FERRO_TEST_MARIADB_URL` are unset
 //! — same discipline as `sql_exec_it.rs` / `tx_it.rs` — so `cargo test --workspace` stays green
@@ -29,12 +31,12 @@ mod common;
 use std::time::Duration;
 
 use common::{TestClient, exec, exec_err, exec_ok, mariadb_url, mysql_url, req};
-use ferro_proto::consts::{errc, flags, method_tx, service};
+use ferro_proto::consts::{branch, errc, flags, method_tx, service};
 use ferro_proto::messages::Outcome;
 use ferro_proto::messages::sql::ExecRequest;
-use ferro_proto::messages::tx::{BeginRequest, BeginResponse, TxControl};
+use ferro_proto::messages::tx::{BeginRequest, BeginResponse, Isolation, TxControl};
 use ferro_proto::value::Value;
-use ferrod::services::sql::{FETCH_NONE, FETCH_STREAM};
+use ferrod::services::sql::{FETCH_NONE, FETCH_ROWS, FETCH_STREAM};
 
 // -------------------------------------------------------------------------------------------------
 // Targets: run each scenario against every configured dialect (MySQL 8 + MariaDB 11) that is set.
@@ -55,16 +57,26 @@ fn mysql_targets() -> Vec<(&'static str, String)> {
 
 // -------------------------------------------------------------------------------------------------
 // Minimal TX client helpers (a self-contained subset of `tx_it.rs`'s, kept local so the MySQL story
-// lives in one file). BEGIN uses isolation=None / readonly=false → the composed SQL is the bare
-// `BEGIN`, which MySQL accepts as `START TRANSACTION` (the PG-flavored `BEGIN READ ONLY` / `BEGIN
-// ISOLATION LEVEL ...` forms are NOT valid MySQL — out of scope for this daemon-plumbing task).
+// lives in one file).
 // -------------------------------------------------------------------------------------------------
 
-async fn begin(client: &mut TestClient, rid: u32, pool: &str) -> u64 {
+/// `service=TX, method=BEGIN` — assert the one-END terminal shape and decode the `BeginResponse`.
+///
+/// `isolation`/`readonly` were hard-coded to `None`/`false` before M1-S8a, because the PG-flavoured
+/// `BEGIN READ ONLY` / `BEGIN ISOLATION LEVEL …` forms are ERROR 1064 on MySQL and MariaDB and there
+/// was nothing else to send. `compose_begin_sql` is dialect-aware now, so they are real parameters —
+/// the same signature `tx_it.rs::begin` has always had.
+async fn begin(
+    client: &mut TestClient,
+    rid: u32,
+    pool: &str,
+    isolation: Option<u8>,
+    readonly: bool,
+) -> u64 {
     let breq = BeginRequest {
         pool: pool.to_string(),
-        isolation: None,
-        readonly: false,
+        isolation,
+        readonly,
     };
     client
         .send_request(rid, service::TX, method_tx::BEGIN, breq.encode())
@@ -83,33 +95,48 @@ async fn begin(client: &mut TestClient, rid: u32, pool: &str) -> u64 {
     }
 }
 
-fn tx_req(tx_id: u64, sql: &str) -> ExecRequest {
+/// A tx-scoped `ExecRequest`, with the fetch mode and readonly flag the caller needs.
+fn tx_req(tx_id: u64, sql: &str, readonly: bool, fetch: u8) -> ExecRequest {
     ExecRequest {
         pool: "default".to_string(),
         sql: Some(sql.to_string()),
         query_id: None,
         params: Vec::new(),
         timeout_ms: None,
-        readonly: true,
-        fetch: 0, // rows
+        readonly,
+        fetch,
         tx_id: Some(tx_id),
     }
 }
 
-async fn commit(client: &mut TestClient, rid: u32, tx_id: u64) -> Outcome {
+/// A tx-scoped READ (`readonly = true`, `fetch:rows`) — the shape the pre-M1-S8a `tx_req` had.
+fn tx_read_req(tx_id: u64, sql: &str) -> ExecRequest {
+    tx_req(tx_id, sql, true, FETCH_ROWS)
+}
+
+/// A `service=TX` control frame (`COMMIT`/`ROLLBACK`) carrying a `TxControl{tx_id}`. Asserts the
+/// one-END shape + TX/method echoes and returns the decoded `Outcome`.
+async fn tx_control(client: &mut TestClient, rid: u32, tx_id: u64, method: u16) -> Outcome {
     client
-        .send_request(
-            rid,
-            service::TX,
-            method_tx::COMMIT,
-            TxControl { tx_id }.encode(),
-        )
+        .send_request(rid, service::TX, method, TxControl { tx_id }.encode())
         .await;
     let t = client.recv().await;
-    assert_eq!(t.header.flags & flags::END, flags::END, "COMMIT → one END");
+    assert_eq!(
+        t.header.flags & flags::END,
+        flags::END,
+        "tx-control → one END"
+    );
     assert_eq!(t.header.service, service::TX);
-    assert_eq!(t.header.method, method_tx::COMMIT);
-    Outcome::decode(&t.payload).expect("decode COMMIT Outcome")
+    assert_eq!(t.header.method, method);
+    Outcome::decode(&t.payload).expect("decode tx-control Outcome")
+}
+
+async fn commit(client: &mut TestClient, rid: u32, tx_id: u64) -> Outcome {
+    tx_control(client, rid, tx_id, method_tx::COMMIT).await
+}
+
+async fn rollback(client: &mut TestClient, rid: u32, tx_id: u64) -> Outcome {
+    tx_control(client, rid, tx_id, method_tx::ROLLBACK).await
 }
 
 /// The `I64` in the first cell of the first row.
@@ -162,10 +189,10 @@ async fn mysql_tx_begin_commit_roundtrips() {
         client.hello(1).await;
 
         // BEGIN → a real tx_id (the actor now owns a pinned Checkout<MysqlBackend>).
-        let tx_id = begin(&mut client, 20, "default").await;
+        let tx_id = begin(&mut client, 20, "default", None, false).await;
 
         // An in-tx buffered SELECT rides SQL/EXEC with tx_id set → forwarded to the owning actor.
-        match exec(&mut client, 21, &tx_req(tx_id, "SELECT 7")).await {
+        match exec(&mut client, 21, &tx_read_req(tx_id, "SELECT 7")).await {
             Outcome::Ok(body) => {
                 let ok = ferro_proto::messages::sql::ExecOk::decode(&body).expect("decode ExecOk");
                 assert_eq!(first_i64(&ok), 7, "[{label}] in-tx SELECT 7 → I64(7)");
@@ -266,8 +293,8 @@ async fn mysql_stream_is_refused_identically_on_both_arms_and_the_tx_survives() 
         let auto = exec_err(&mut client, 1, &auto_req).await;
 
         // (b) tx-scoped arm.
-        let tx_id = begin(&mut client, 2, "default").await;
-        let mut scoped_req = tx_req(tx_id, "SELECT 1");
+        let tx_id = begin(&mut client, 2, "default", None, false).await;
+        let mut scoped_req = tx_read_req(tx_id, "SELECT 1");
         scoped_req.fetch = FETCH_STREAM;
         let scoped = exec_err(&mut client, 3, &scoped_req).await;
 
@@ -322,7 +349,7 @@ async fn mysql_stream_is_refused_identically_on_both_arms_and_the_tx_survives() 
         );
 
         // The tx was never touched: a normal statement still runs and COMMIT succeeds.
-        let ok = exec_ok(&mut client, 4, &tx_req(tx_id, "SELECT 7")).await;
+        let ok = exec_ok(&mut client, 4, &tx_read_req(tx_id, "SELECT 7")).await;
         assert_eq!(
             first_i64(&ok),
             7,
@@ -348,19 +375,10 @@ fn ddl(sql: &str) -> ExecRequest {
     r
 }
 
-/// A tx-scoped WRITE request (`readonly = false`, `fetch = FETCH_NONE`) — `tx_req` above is the
+/// A tx-scoped WRITE request (`readonly = false`, `fetch = FETCH_NONE`) — `tx_read_req` above is the
 /// read-only/rows-fetching form the earlier scenarios use.
 fn tx_write_req(tx_id: u64, sql: &str) -> ExecRequest {
-    ExecRequest {
-        pool: "default".to_string(),
-        sql: Some(sql.to_string()),
-        query_id: None,
-        params: Vec::new(),
-        timeout_ms: None,
-        readonly: false,
-        fetch: FETCH_NONE,
-        tx_id: Some(tx_id),
-    }
+    tx_req(tx_id, sql, false, FETCH_NONE)
 }
 
 /// Doctrine's nested-transaction emulation, verbatim, on BOTH MySQL-family engines. The read-back
@@ -386,7 +404,7 @@ async fn savepoint_sql_passes_through_inside_a_transaction() {
         exec_ok(&mut c, 1, &ddl("DROP TABLE IF EXISTS s8a_sp")).await;
         exec_ok(&mut c, 2, &ddl("CREATE TABLE s8a_sp (v INT)")).await;
 
-        let tx = begin(&mut c, 3, "default").await;
+        let tx = begin(&mut c, 3, "default", None, false).await;
         for (rid, stmt) in [
             (4, "INSERT INTO s8a_sp (v) VALUES (1)"),
             (5, "SAVEPOINT DOCTRINE_1"),
@@ -444,7 +462,7 @@ async fn boundary_sql_stays_refused_inside_a_transaction() {
         exec_ok(&mut c, 1, &ddl("DROP TABLE IF EXISTS s8a_boundary")).await;
         exec_ok(&mut c, 2, &ddl("CREATE TABLE s8a_boundary (v INT)")).await;
 
-        let tx = begin(&mut c, 3, "default").await;
+        let tx = begin(&mut c, 3, "default", None, false).await;
         match exec(
             &mut c,
             4,
@@ -553,5 +571,175 @@ async fn savepoint_sql_outside_a_transaction_is_refused() {
         );
 
         common::assert_session_alive(&mut c, 0xC0FFEE).await;
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// (7) M1-S8a Task 8 — dialect-aware isolation/readonly BEGIN (SPEC §22.2 (s)).
+// -------------------------------------------------------------------------------------------------
+
+/// Before M1-S8a, `BEGIN ISOLATION LEVEL …` / `BEGIN READ ONLY` were ERROR 1064 on both engines, so
+/// EVERY isolation/readonly BEGIN failed. Nothing pinned that (every MySQL tx test used
+/// `isolation: None`), so this is a pure addition.
+///
+/// READ ONLY is asserted directly (SQLSTATE 25006 on a write). ISOLATION cannot be: a
+/// next-transaction-only `SET TRANSACTION` is deliberately NOT reflected in `@@transaction_isolation`
+/// — and the SESSION form that WOULD be reflected is forbidden here, because it persists onto the
+/// pooled connection for the next tenant (charter rule 6). So isolation is proven by a LOCK
+/// CONFLICT, with an `isolation: None` control run that must NOT conflict.
+///
+/// The contending `UPDATE` is bounded by the request's own `timeout_ms` (the S4 per-request CANCEL
+/// path), so a blocked write terminates as a `57014` cancel instead of hanging the suite on InnoDB's
+/// 50-second `innodb_lock_wait_timeout`.
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_begin_honours_isolation_and_readonly() {
+    let targets = mysql_targets();
+    if targets.is_empty() {
+        return; // offline: both URLs unset (each printed its own skip line)
+    }
+    for (label, url) in targets {
+        let server = common::exec_server(url);
+        let mut c = server.connect().await;
+        c.hello(0).await;
+
+        // ---- (a) READ ONLY is enforced.
+        exec_ok(&mut c, 1, &ddl("DROP TABLE IF EXISTS s8a_ro")).await;
+        exec_ok(
+            &mut c,
+            2,
+            &ddl("CREATE TABLE s8a_ro (id INT PRIMARY KEY, v INT)"),
+        )
+        .await;
+        exec_ok(&mut c, 3, &ddl("INSERT INTO s8a_ro VALUES (1, 1)")).await;
+
+        let tx = begin(
+            &mut c,
+            4,
+            "default",
+            Some(u8::from(Isolation::Serializable)),
+            true,
+        )
+        .await;
+        let e = match exec(
+            &mut c,
+            5,
+            &tx_write_req(tx, "INSERT INTO s8a_ro VALUES (2, 2)"),
+        )
+        .await
+        {
+            Outcome::Error(ep) => ep,
+            other => panic!("[{label}] a write in a READ ONLY tx must be refused, got {other:?}"),
+        };
+        assert_eq!(
+            e.sqlstate.as_deref(),
+            Some("25006"),
+            "[{label}] READ ONLY must be enforced (errno 1792 / SQLSTATE 25006), got {e:?}"
+        );
+        match rollback(&mut c, 6, tx).await {
+            Outcome::Ok(_) => {}
+            other => panic!("[{label}] ROLLBACK of the read-only tx: {other:?}"),
+        }
+
+        // ---- (b) SERIALIZABLE is enforced: a read inside the tx LOCKS the row.
+        let tx = begin(
+            &mut c,
+            7,
+            "default",
+            Some(u8::from(Isolation::Serializable)),
+            false,
+        )
+        .await;
+        match exec(
+            &mut c,
+            8,
+            &tx_read_req(tx, "SELECT v FROM s8a_ro WHERE id = 1"),
+        )
+        .await
+        {
+            Outcome::Ok(_) => {}
+            other => panic!("[{label}] the in-tx read must succeed: {other:?}"),
+        }
+
+        // A SECOND session, so the UPDATE genuinely contends rather than sharing the pinned conn.
+        let mut other = server.connect().await;
+        other.hello(0).await;
+        let mut upd = req("UPDATE s8a_ro SET v = 99 WHERE id = 1");
+        upd.readonly = false;
+        upd.fetch = FETCH_NONE;
+        upd.timeout_ms = Some(1_500); // bounded: a blocked write ends at the deadline, never hangs
+        let blocked = exec_err(&mut other, 9, &upd).await;
+        // NOTE — the terminal is NOT a raw `57014`, and it cannot be. The contending statement is an
+        // AUTOCOMMIT WRITE, and the S4 §19.3 fate matrix deliberately re-labels a cancelled/timed-out
+        // dispatched write as `WriteUnconfirmed{Indeterminate}` (`fate.rs`'s `is_57014` override
+        // arm), replacing the raw SQLSTATE with the engine's own payload — so `sqlstate` is `None`
+        // here by construction. Asserting the §19.3 cell is the truthful form of "the deadline
+        // cancelled it", and the message check separates it from the OTHER producer of
+        // `WriteUnconfirmed` (a `ConnectionLost` on a sent write).
+        assert_eq!(
+            blocked.code,
+            errc::WRITE_UNCONFIRMED,
+            "[{label}] under SERIALIZABLE the in-tx read must LOCK the row, so a concurrent UPDATE \
+             blocks until the request deadline cancels it (§19.3 Indeterminate) — got {blocked:?}"
+        );
+        assert_eq!(
+            blocked.branch,
+            branch::INDETERMINATE,
+            "[{label}] a cancelled autocommit write is the §19.3 Indeterminate branch: {blocked:?}"
+        );
+        assert!(
+            blocked.message.contains("cancelled or timed out"),
+            "[{label}] the block must end at the DEADLINE, not at a lost connection: {blocked:?}"
+        );
+        match rollback(&mut c, 10, tx).await {
+            Outcome::Ok(_) => {}
+            other_out => panic!("[{label}] ROLLBACK of the serializable tx: {other_out:?}"),
+        }
+
+        // ---- (c) THE CONTROL. Same scenario with isolation: None (REPEATABLE READ) — the read is a
+        // non-locking consistent read, so the UPDATE goes straight through. Without this run, (b)
+        // would pass for any reason the UPDATE happened to be slow.
+        let tx = begin(&mut c, 11, "default", None, false).await;
+        match exec(
+            &mut c,
+            12,
+            &tx_read_req(tx, "SELECT v FROM s8a_ro WHERE id = 1"),
+        )
+        .await
+        {
+            Outcome::Ok(_) => {}
+            other_out => panic!("[{label}] the in-tx read must succeed: {other_out:?}"),
+        }
+        let mut upd2 = req("UPDATE s8a_ro SET v = 42 WHERE id = 1");
+        upd2.readonly = false;
+        upd2.fetch = FETCH_NONE;
+        upd2.timeout_ms = Some(1_500);
+        match exec(&mut other, 13, &upd2).await {
+            Outcome::Ok(_) => {}
+            other_out => panic!(
+                "[{label}] under the DEFAULT isolation the concurrent UPDATE must NOT block — if \
+                 this fails, (b) proves nothing: {other_out:?}"
+            ),
+        }
+        match rollback(&mut c, 14, tx).await {
+            Outcome::Ok(_) => {}
+            other_out => panic!("[{label}] ROLLBACK of the control tx: {other_out:?}"),
+        }
+
+        // ---- (d) THE CROSS-TENANT LEAK GUARD IS NOT HERE, AND THAT IS DELIBERATE.
+        // A pool-level "the next tenant did not inherit SERIALIZABLE" assertion here would be a
+        // guard that CANNOT FAIL, and it was measured as such before being deleted: with the
+        // composer mutated to emit the forbidden `SET SESSION TRANSACTION ISOLATION LEVEL …`, this
+        // block stayed GREEN — because `MysqlBackend::clean_reset_profile()` is `Some(Full)`, so
+        // EVERY MySQL recycle runs `COM_RESET_CONNECTION` and wipes the leaked level before the next
+        // tenant can observe it. (The PG mirror in `tx_it.rs` was measured the same way and is
+        // masked by the targeted profile's `RESET ALL`.) The falsifiable leak guard therefore lives
+        // one layer down, on a RAW backend connection with no hygiene in the way:
+        // `ferro-backend-mysql`'s `begin_dialect_it::the_batched_isolation_never_survives_the_transaction`,
+        // which goes RED (`SERIALIZABLE` vs `REPEATABLE-READ`) under exactly that mutation.
+        // Hygiene masking the leak is defence in depth, NOT the property being asserted — and it is
+        // one of the concrete holes any future tracker-clean hygiene skip (§7.2, R2) must close.
+
+        exec_ok(&mut c, 15, &ddl("DROP TABLE IF EXISTS s8a_ro")).await;
+        common::assert_session_alive(&mut c, 0xC0FFF0).await;
     }
 }
