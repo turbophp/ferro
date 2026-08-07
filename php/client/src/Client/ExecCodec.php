@@ -132,12 +132,18 @@ final class ExecCodec
     /**
      * Narrow the ALREADY-DECODED `last_insert_id` cell to the raw scalar.
      *
-     * **It must NOT call {@see SqlValueCodec::fromWire} again.** {@see ExecOk::mapFromWire} has
-     * already run it (`ExecOk.php:57`), so what arrives here is a decoded `['tag' => int, 'data' =>
-     * mixed]` cell, not a wire `[tag, payload]` pair. Re-decoding happens to be idempotent for an
-     * `I64`, which is why the mistake is invisible in the common case — but it is a real fault for a
-     * `TAG_BYTES` cell (whose `data` is already a `list<int>`, not the wire string), and it makes
-     * this method's contract a lie about what it receives.
+     * **It must NOT call {@see SqlValueCodec::fromWire} again — but that rule is UNASSERTABLE at
+     * this site; it is hygiene only.** {@see ExecOk::mapFromWire} has already run it
+     * (`ExecOk.php:57`), so what arrives here is a decoded `['tag' => int, 'data' => mixed]` cell,
+     * not a wire `[tag, payload]` pair, and calling it twice makes this method's contract a lie
+     * about what it receives. It is nonetheless behaviourally invisible, so no test can lock it:
+     * a decoded cell has `count() === 2`, so `fromWire`'s arity check does NOT reject it; every tag
+     * `last_insert_id` can actually carry (`I64`/`U64`/`TEXT`) re-decodes to itself, since
+     * `TAG_BYTES` is `fromWire`'s only special case; and a `TAG_BYTES` cell throws the identical
+     * {@see CodecException} either way (double-decoded its `list<int>` becomes `[]`, undecoded it
+     * stays a `list<int>` — both are `array`, both hit the `got array` throw below). Measured: a
+     * double decode injected here leaves the whole offline suite green. The params and rows paths
+     * ARE guarded (see `ExecRequest`/`ExecOk` round-trip tests); this one rests on review.
      *
      * `null` (no id) stays null; otherwise the payload is an `int` (anything the decoder narrowed)
      * or a canonical decimal `string` (any key in the msgpack uint64 band, >= 2^32 — see

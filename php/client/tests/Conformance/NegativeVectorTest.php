@@ -18,21 +18,30 @@ final class NegativeVectorTest extends TestCase
         return $buf;
     }
 
-    public function testBadMagicThrows(): void
+    // Each fixture must be rejected FOR ITS OWN REASON, so the message is asserted, not just the
+    // class. `Header::decode` checks magic, then version, then length and stops at the first
+    // failure: a `bad_magic.bin` or `oversize_len.bin` whose version byte drifted (e.g. left at 1
+    // across the v1->v2 bump) would be rejected by the VERSION check without ever reaching the
+    // property the fixture exists to pin — and a class-only `expectException` would stay green.
+
+    public function testBadMagicThrowsForTheMagicReason(): void
     {
         $this->expectException(CodecException::class);
+        $this->expectExceptionMessageMatches('/bad magic/');
         Header::decode(self::load('bad_magic.bin'));
     }
 
-    public function testBadVersionThrows(): void
+    public function testBadVersionThrowsForTheVersionReason(): void
     {
         $this->expectException(CodecException::class);
+        $this->expectExceptionMessageMatches('/bad version/');
         Header::decode(self::load('bad_version.bin'));
     }
 
-    public function testOversizeLenThrows(): void
+    public function testOversizeLenThrowsForTheLengthReason(): void
     {
         $this->expectException(CodecException::class);
+        $this->expectExceptionMessageMatches('/frame too large/');
         Header::decode(self::load('oversize_len.bin'));
     }
 

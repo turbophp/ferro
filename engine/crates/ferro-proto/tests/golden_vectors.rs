@@ -238,8 +238,49 @@ fn message_payloads_are_canonical_and_byte_stable() {
     }
 }
 
+/// The version-skew failure MESSAGE that `/proto/PROTOCOL.md` §"Version skew" publishes to operators
+/// — `unsupported protocol version: expected 2, got 1` — must be the string the codec actually
+/// produces. Built by taking a REAL committed v2 vector and rolling only its version byte to 1, so
+/// this is the exact byte sequence an old client would put on the wire.
+///
+/// SCOPE, stated honestly: this locks the STRING and the fact that the *header* decoder is what
+/// rejects an old frame. It does NOT prove the engine delivers that string in an `errc::PROTOCOL`
+/// terminal on `request_id=0` — that needs a live `ferrod` and is carried (see the task-11 report's
+/// fix-round section). The documented `errc::PROTOCOL` code half remains derived, not asserted here.
 #[test]
-fn negative_vectors_are_rejected() {
+fn a_v1_frame_is_rejected_with_the_documented_skew_message() {
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(vectors_dir().join("hello.json")).unwrap())
+            .unwrap();
+    let mut frame = unhex(v["frame_hex"].as_str().unwrap());
+    assert_eq!(
+        frame[1],
+        ferro_proto::consts::PROTOCOL_VERSION,
+        "the hello vector must be a CURRENT-version frame before we roll it back"
+    );
+    frame[1] = 1; // an old (v1) client's HELLO reaching a v2 engine
+    let err = Header::decode(&frame).expect_err("a v1 frame must be rejected");
+    assert_eq!(
+        err.to_string(),
+        "unsupported protocol version: expected 2, got 1",
+        "the skew message published in /proto/PROTOCOL.md must be the one the codec emits"
+    );
+}
+
+/// Every negative vector must be rejected FOR ITS OWN REASON.
+///
+/// A bare `is_err()` here could not tell a right answer from a lucky one: `Header::decode` checks
+/// magic, then version, then length, and stops at the first failure — so a `bad_magic.bin` or
+/// `oversize_len.bin` whose version byte drifted (e.g. left at 1 across the v1->v2 bump) would be
+/// rejected by the VERSION check, never reaching the property it exists to pin, and a reason-blind
+/// assertion would stay green. Each fixture therefore names its expected `CodecError` variant, and
+/// the variant's fields are derived from the bytes actually on disk (rather than hardcoded) so the
+/// error must also REPORT what it saw. A `.bin` with no expectation here is a hard failure.
+#[test]
+fn negative_vectors_are_rejected_for_their_own_reason() {
+    use ferro_proto::CodecError;
+    use ferro_proto::consts::{MAGIC, MAX_FRAME_PAYLOAD, PROTOCOL_VERSION};
+
     let neg = vectors_dir().join("negative");
     let mut seen = std::collections::HashSet::new();
     for entry in fs::read_dir(&neg).unwrap() {
@@ -249,21 +290,46 @@ fn negative_vectors_are_rejected() {
         }
         let name = p.file_name().unwrap().to_str().unwrap().to_string();
         let bytes = fs::read(&p).unwrap();
-        if name == "reserved_flag.bin" {
-            // This one has a VALID header (good magic/version/len) but sets the reserved OOB_FD
-            // flag — it is rejected at the flags layer, not by Header::decode. Assert both facts.
-            let h =
-                Header::decode(&bytes).expect("reserved_flag.bin has a structurally valid header");
-            assert_eq!(
-                ferro_proto::flags::validate(h.flags),
-                Err(ferro_proto::CodecError::UnsupportedFlag),
-                "reserved_flag.bin flags must be rejected by flags::validate"
-            );
-        } else {
-            assert!(
-                Header::decode(&bytes).is_err(),
-                "negative vector {name} was NOT rejected by header decode"
-            );
+        let got = Header::decode(&bytes);
+        match name.as_str() {
+            "bad_magic.bin" => assert_eq!(
+                got,
+                Err(CodecError::BadMagic {
+                    expected: MAGIC,
+                    got: bytes[0]
+                }),
+                "bad_magic.bin must be rejected BY THE MAGIC CHECK, reporting byte 0"
+            ),
+            "bad_version.bin" => assert_eq!(
+                got,
+                Err(CodecError::BadVersion {
+                    expected: PROTOCOL_VERSION,
+                    got: bytes[1]
+                }),
+                "bad_version.bin must be rejected BY THE VERSION CHECK, reporting byte 1"
+            ),
+            "oversize_len.bin" => assert_eq!(
+                got,
+                Err(CodecError::FrameTooLarge {
+                    len: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+                    max: MAX_FRAME_PAYLOAD
+                }),
+                "oversize_len.bin must be rejected BY THE LENGTH CHECK, reporting payload_len"
+            ),
+            "reserved_flag.bin" => {
+                // This one has a VALID header (good magic/version/len) but sets the reserved OOB_FD
+                // flag — it is rejected at the flags layer, not by Header::decode. Assert both facts.
+                let h = got.expect("reserved_flag.bin has a structurally valid header");
+                assert_eq!(
+                    ferro_proto::flags::validate(h.flags),
+                    Err(CodecError::UnsupportedFlag),
+                    "reserved_flag.bin flags must be rejected by flags::validate"
+                );
+            }
+            other => panic!(
+                "negative vector {other} has no expected-reason arm — add one (a reason-blind \
+                 assertion is what this test exists to prevent)"
+            ),
         }
         seen.insert(name);
     }
