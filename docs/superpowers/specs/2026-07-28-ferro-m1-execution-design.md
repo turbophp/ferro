@@ -101,10 +101,52 @@ A real MySQL/MariaDB backend at `PoolBackend` parity (M1-D5).
 - **Key artifacts:** widened `ferro-backend-{pg,mysql}/src/rowmap.rs`, the per-tag golden vectors, `php/client/src/Client/Value/` (M1 policy + value objects), the §9.1 policy plumbing.
 
 ### S8 — Doctrine DBAL-4 driver  *(depends: S5, S6, S7)*
-The first drop-in tier — DBAL `^4.0` (D2). **Carries the S6 deferrals** (verified present by S6 close-out research): MySQL `query_stream` (so `iterate*()` never buffers on either backend), dialect-aware isolation `BEGIN` (`compose_begin_sql` is PG-only today), **errno-on-wire** (the `ErrorPayload.errno` slot already exists in both codecs but is hard-coded `None`; DBAL's stock MySQL `ExceptionConverter` keys *exclusively* on the vendor errno, so this is load-bearing), `HELLO_ACK` pool metadata (backend **kind** + **server version** — neither is on the wire today, yet `getDatabasePlatform()`/`getServerVersion()` are mandatory in DBAL 4), an imperative `begin/commit/rollBack` client API (the client has only the closure form), `last_insert_id` end-to-end (dropped at all three links today), and re-evaluating the tracker-clean `None`-skip.
-- **Build:** `ferro/doctrine-dbal-driver` (PHP, on the `ferro/client` PHP client): `Ferro\DBAL\Driver` (`connect()` → a pool-bound `Connection`; `getDatabasePlatform()` from `HELLO_ACK` pool metadata + server version; `getExceptionConverter()` → the §9.2 tree → DBAL exceptions uniformly across PG/MySQL, plus `Ferro\DBAL\IndeterminateWriteException`); `Connection` (`prepare/query/exec/lastInsertId/beginTransaction/commit/rollBack` → TX frames; savepoints via DBAL's path; `quote()` client-side per platform, D5; `getServerVersion()`; `getNativeConnection()` → the `Ferro\Client\Session`, a documented break); `Statement`/`Result` (`bindValue` `ParameterType`→canonical; `fetch*` from row frames; `rowCount` from `affected`; **`iterate*()` uses the S5 streamed path, never buffers**).
-- **Gate:** unit (platform selection, exception conversion table, param mapping, streamed iterate) + live (a representative DBAL usage against PG + MySQL: prepared params, transactions/savepoints, `lastInsertId` per backend, streamed iteration). PHPStan L9; runtime dependency-free beyond `doctrine/dbal ^4`.
+
+**SPLIT into S8a → S8b** (decided 2026-08-07, after the S8 grounding research). The research found the
+driver needs ~10 engine/client prerequisites before a single DBAL test can pass — including **two
+blockers the original scope never named**: DBAL's wrapper emits savepoints as **plain SQL**
+(`SAVEPOINT DOCTRINE_1`), which Ferro currently refuses as a bare transaction-control statement on
+both backends; and **schema introspection is dead on both engines** (PG `name`/`"char"`/`oid`/
+`regtype` and MySQL's `information_schema` **ENUM** columns are all `Unsupported`, so DBAL's exact
+schema-manager SQL fails). Building the package on top of those would mean a very long stretch with
+nothing demonstrably working, so the foundations land first and are independently live-testable.
+
+#### S8a — engine + client DBAL-readiness  *(depends: S7)*
+No DBAL dependency at all; every item is provable against the live backends on its own.
+- **Build:** the **PG narrowing bind** (`bind::accepts` is `Type`-identity, so a PHP `int` against an
+  `int4`/`int2` column is a hard `NonRetryable` — the highest-frequency blocker, hit by every DBAL
+  insert into a `serial`); **errno-on-wire** (`PoolError::Sql` gains an errno slot; the MySQL
+  `error_map` already has it in hand and discards it — without this DBAL's MySQL converter is
+  **inert**, and SQLSTATEs cannot substitute since dup-key and NOT-NULL both arrive as `23000`);
+  **`last_insert_id`** (wire + PHP + golden vectors are already complete — only the engine half is
+  missing); **savepoint passthrough**; **catalog + ENUM type coverage** (the schema-introspection
+  blocker); an **imperative `begin`/`commit`/`rollBack`** client API; **`BINARY`/`LARGE_OBJECT`
+  binding** (`TAG_BYTES` is unreachable from PHP today); **dialect-aware isolation `BEGIN`** (the
+  batched `SET TRANSACTION …; START TRANSACTION …` form — verified live to work AND not taint, where
+  a standalone `SET TRANSACTION` does taint and `BEGIN ISOLATION LEVEL` is `ERROR 1064` on both
+  MySQL 8.4 and MariaDB 11.8); and **`HELLO_ACK` pool metadata** (backend kind + server version).
+- **Gate:** each item live on PG + MySQL + MariaDB; charter gates green.
+
+#### S8b — the `ferro/doctrine-dbal-driver` package  *(depends: S8a)*
+- **Build:** as originally specified — `Ferro\DBAL\{Driver,Connection,Statement,Result}` +
+  the `ExceptionConverter` (PG keys on SQLSTATE, MySQL **exclusively** on the vendor errno) +
+  `Ferro\DBAL\IndeterminateWriteException`. **The driver must convert the temporal tags itself**:
+  DBAL's stock format strings do not match Ferro's canonical text — `datetimetz` throws on *every*
+  value (no fallback) and `time` throws on a fractional second.
+- **Gate:** unit (platform selection, exception-conversion table, param mapping, streamed iterate) +
+  live (representative DBAL usage against PG + MySQL: prepared params, transactions/savepoints,
+  `lastInsertId` per backend, streamed iteration). PHPStan L9; runtime dependency-free beyond
+  `doctrine/dbal ^4`.
 - **Key artifacts:** `php/doctrine-dbal/`, the exception-converter map, the streamed `Result`.
+
+**DEFERRED from S8 (decided 2026-08-07):** MySQL `query_stream`. `iterate*()` therefore **buffers on
+MySQL and streams on PG** — a documented asymmetry, not a defect (buffering is correct, just
+memory-hungry). The blocker is structural: the owned route type-checks, but `mysql_async` exposes no
+way to recover the `Conn` from a `ResultSetStream` (no `into_inner`; dropping it closes the
+connection), so it needs a **third** vendored-fork divergence *and* a restructure of
+`Checkout::finalize_stream`, which reads `tx_status()` synchronously. Also note
+`ResultSetStream::affected_rows()` returns the **previous** statement's count (measured), so any
+future implementation must read `Conn::last_ok_packet()` post-drain. Record in SPEC §22.2.
 
 ### S9 — DBAL 4 upstream suite green (PG + MySQL) + incompat doc  *(depends: S8)*  — **the exit-gate slice**
 - **Build:** wire the upstream Doctrine DBAL 4 test suite to run against a Ferro-backed connection (the harness launches `ferrod` + PG + MySQL, points DBAL at the Ferro driver). Triage failures into: real bugs (fix) vs genuine incompatibilities (a **committed allow-list** with per-case rationale, §14/D4/D8). Write the first-class **incompat doc page** (§14 — `getNativeConnection`-expects-PDO, dump-credential passthrough, COPY, persistent-connection advice).
