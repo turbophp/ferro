@@ -119,7 +119,20 @@ fn php_generated_constant_matches_the_rust_hash() {
         .find(needle)
         .expect("Constants.php declares TYPE_REGISTRY_HASH")
         + needle.len();
-    let hash = &php[start..start + 16];
+    // Slice to the CLOSING QUOTE, not to a fixed 16 bytes: a fixed width silently truncates a
+    // longer literal, so a generator bug that emitted
+    // `TYPE_REGISTRY_HASH = '82a29fc665e4baf2deadbeef'` compared its first 16 chars, passed GREEN,
+    // and shipped a 24-char hash the handshake rejects at runtime.
+    let end = php[start..]
+        .find('\'')
+        .expect("TYPE_REGISTRY_HASH literal is unterminated in Constants.php");
+    let hash = &php[start..start + end];
+    assert_eq!(
+        hash.len(),
+        16,
+        "TYPE_REGISTRY_HASH must be exactly 16 hex chars (FNV-1a u64), got {}: {hash:?}",
+        hash.len()
+    );
     assert_eq!(
         hash,
         ferro_proto::consts::TYPE_REGISTRY_HASH,

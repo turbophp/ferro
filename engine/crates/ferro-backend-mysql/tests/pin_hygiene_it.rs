@@ -372,7 +372,7 @@ async fn run_pin_cause_parity(url: &str, label: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mysql_hard_gate_and_pin_cause_parity() {
     let Ok(url) = std::env::var("FERRO_TEST_MYSQL_URL") else {
-        eprintln!("SKIP mysql_hard_gate_and_pin_cause_parity: FERRO_TEST_MYSQL_URL unset");
+        eprintln!("skip: FERRO_TEST_MYSQL_URL unset (mysql_hard_gate_and_pin_cause_parity)");
         return;
     };
     run_hard_gate(&url, "MYSQL").await;
@@ -382,7 +382,7 @@ async fn mysql_hard_gate_and_pin_cause_parity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mariadb_hard_gate_and_pin_cause_parity() {
     let Ok(url) = std::env::var("FERRO_TEST_MARIADB_URL") else {
-        eprintln!("SKIP mariadb_hard_gate_and_pin_cause_parity: FERRO_TEST_MARIADB_URL unset");
+        eprintln!("skip: FERRO_TEST_MARIADB_URL unset (mariadb_hard_gate_and_pin_cause_parity)");
         return;
     };
     run_hard_gate(&url, "MARIADB").await;

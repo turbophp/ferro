@@ -222,7 +222,7 @@ async fn run_backend_suite(url: &str, label: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mysql_backend_behavior() {
     let Ok(url) = std::env::var("FERRO_TEST_MYSQL_URL") else {
-        eprintln!("SKIP mysql_backend_behavior: FERRO_TEST_MYSQL_URL unset");
+        eprintln!("skip: FERRO_TEST_MYSQL_URL unset (mysql_backend_behavior)");
         return;
     };
     run_backend_suite(&url, "MYSQL").await;
@@ -231,7 +231,7 @@ async fn mysql_backend_behavior() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mariadb_backend_behavior() {
     let Ok(url) = std::env::var("FERRO_TEST_MARIADB_URL") else {
-        eprintln!("SKIP mariadb_backend_behavior: FERRO_TEST_MARIADB_URL unset");
+        eprintln!("skip: FERRO_TEST_MARIADB_URL unset (mariadb_backend_behavior)");
         return;
     };
     run_backend_suite(&url, "MARIADB").await;

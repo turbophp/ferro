@@ -21,6 +21,10 @@ jobs:
       # stable and catches API drift between session_classify.rs and ferrod without waiting on
       # the nightly ICE fix.
       - run: cd engine/crates/ferrod/fuzz && cargo check
+      # The M0 EXIT GATE (SPEC §16.1 / D12): a bench run must stay committed under bench/results/.
+      # The script existed since M0 but was wired into no workflow, so deleting the recorded
+      # measurement would have been green. It needs no toolchain or backend — it is a file check.
+      - run: ./ci/check-d12-recorded.sh
 
   # The LIVE acceptance lane. It must be able to FAIL: every live suite in this repo is
   # `skip`-if-unconfigured by design, so a DSN this lane forgets to export turns its whole tier
@@ -57,25 +61,45 @@ jobs:
       # Belt-and-braces against this lane rotting back into a no-op: EVERY live suite here prints
       # `skip: FERRO_TEST_*_URL unset` and returns green when its DSN is missing, which is exactly
       # how the MySQL/MariaDB tier stayed "23 passed" with zero database contact. In THIS lane a
-      # skip is a lane FAILURE, not a pass.
+      # skip is a lane FAILURE, not a pass. The detector is a SHARED script (case-insensitive,
+      # word-anchored) so `ci/local-gate.sh` cannot drift into a weaker check — see its header for
+      # why the old inline `grep -n 'skip:'` missed nine uppercase `SKIP name:` lines.
       - name: a skipped live suite fails the lane
-        run: |
-          if grep -n 'skip:' live.log; then
-            echo "::error::a live suite skipped itself — a FERRO_TEST_*_URL is missing or its backend is unreachable"
-            exit 1
-          fi
+        run: ./ci/assert-no-skips.sh live.log
       - if: always()
         run: docker compose -f testkit/docker-compose.yml logs --no-color --tail=80
 
+  # The PHP tier, OFFLINE + LIVE. Through M1-S7 this job had no database, no FERRO_TEST_PG_URL and
+  # no `ferrod` binary, so every `php/client/tests/Live/*` self-skipped and PHPUnit still exited 0
+  # — the same silent-no-op class the `integration` lane closed, one tier over. `Live/TypesLiveTest`
+  # (the client half of the S7 canonical-type acceptance: 8 tests, 57 assertions against real PG)
+  # contributed ZERO assertions in CI. It now gets the compose PG, a built `ferrod`, and a
+  # live-only re-run under `--fail-on-skipped` so a skipped live tier FAILS the lane.
   php:
     runs-on: ubuntu-latest
+    env:
+      FERRO_TEST_PG_URL: postgres://ferro:ferro@127.0.0.1:55432/ferro
     steps:
       - uses: actions/checkout@v4
       - uses: shivammathur/setup-php@v2
         with: { php-version: "8.4", extensions: msgpack, tools: composer }
+      - uses: dtolnay/rust-toolchain@stable
+      - run: docker compose -f testkit/docker-compose.yml up -d --wait pg
+      # PHP cannot host the daemon in-process, so LiveTestCase spawns a REAL ferrod per test and
+      # locates it at `target/debug/ferrod` (or `$FERRO_FERROD_BIN`). No binary => every live test
+      # skips, which is precisely the hole this step closes.
+      - run: cargo build -p ferrod
       - run: (cd php/client && composer install --no-interaction)
       - run: (cd php/client && ./vendor/bin/phpunit)
+      # The live tier again, ALONE, with skips fatal. It cannot be `--fail-on-skipped` on the whole
+      # suite: the conformance tier skips legitimately (decode-only vectors, ext-msgpack lossy
+      # uint64). Scoped to `tests/Live` by PATH (not a phpunit.xml testsuite, which PHPUnit 11 warns
+      # about when a file belongs to two suites), the ONLY two skip reasons are the missing
+      # prerequisites this job now provides — so a skip here means the lane stopped testing.
+      - run: (cd php/client && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
       - run: (cd php/client && ./vendor/bin/phpstan analyse src --level 9)
+      - if: always()
+        run: docker compose -f testkit/docker-compose.yml logs --no-color --tail=80 pg
 
   deny:
     runs-on: ubuntu-latest

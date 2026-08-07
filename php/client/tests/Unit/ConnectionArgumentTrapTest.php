@@ -92,6 +92,12 @@ final class ConnectionArgumentTrapTest extends TestCase
     /**
      * The facade must actually expose the knob, or nothing an app can call ever reaches
      * {@see Connection}. Checked by reflection because `Ferro::connect` needs a live socket.
+     *
+     * **This asserts the SIGNATURE ONLY — it is not the forwarding guard** (M1-S7 review, G4).
+     * Dropping `$types` from both `self::assemble(...)` calls in {@see Ferro} left this test, all
+     * 469 others, and PHPStan level 9 green while the knob went inert. Forwarding is guarded by
+     * `Ferro::assemble`'s now-REQUIRED `$types` parameter (statically) and by
+     * `tests/Live/TypesLiveTest::testFerroConnectForwardsTheTypePolicyLive` (behaviourally).
      */
     public function testFerroFacadeThreadsTheTypePolicyThrough(): void
     {

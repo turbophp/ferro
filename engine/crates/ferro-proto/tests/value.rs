@@ -147,10 +147,30 @@ fn s7_tags_report_their_registry_tag() {
 }
 
 /// The still-deferred tags MUST stay rejected — this is the §22.2 deferral, enforced.
+///
+/// The set is DERIVED (`registry.tags` − `registry.implemented`), never hardcoded: a hand-written
+/// `[ARRAY, INTERVAL, INET, VECTOR]` stops covering the moment `/proto/types.toml` grows an
+/// eighteenth tag, and it silently keeps passing while the new tag goes untested — `/proto` is the
+/// single source of truth (charter rule 2), including for what is NOT implemented yet.
 #[test]
 fn deferred_tags_are_still_rejected() {
-    use ferro_proto::consts::tag;
-    for t in [tag::ARRAY, tag::INTERVAL, tag::INET, tag::VECTOR] {
+    use ferro_proto::registry::Registry;
+    let reg = Registry::from_toml_dir(
+        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../proto"),
+    );
+    let deferred: Vec<(&String, u8)> = reg
+        .tags
+        .iter()
+        .filter(|(name, _)| !reg.implemented.contains(*name))
+        .map(|(name, id)| (name, *id))
+        .collect();
+    // A vacuous loop is the failure mode this whole review round is about: if `implemented` ever
+    // covers every tag, this test must say so out loud rather than pass over an empty set.
+    assert!(
+        !deferred.is_empty(),
+        "no deferred tags left — delete this test deliberately, do not let it pass vacuously"
+    );
+    for (name, t) in deferred {
         let mut buf = Vec::new();
         rmp::encode::write_array_len(&mut buf, 2).unwrap();
         rmp::encode::write_pfix(&mut buf, t).unwrap();
@@ -158,7 +178,7 @@ fn deferred_tags_are_still_rejected() {
         let mut rd = &buf[..];
         assert!(
             Value::decode(&mut rd).is_err(),
-            "tag {t} must still be unsupported"
+            "tag {name} ({t}) is not in /proto `implemented` but the codec decodes it"
         );
     }
 }

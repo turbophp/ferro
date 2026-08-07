@@ -456,7 +456,7 @@ async fn run_query_suite(url: &str, label: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mysql_query_data_path() {
     let Ok(url) = std::env::var("FERRO_TEST_MYSQL_URL") else {
-        eprintln!("SKIP mysql_query_data_path: FERRO_TEST_MYSQL_URL unset");
+        eprintln!("skip: FERRO_TEST_MYSQL_URL unset (mysql_query_data_path)");
         return;
     };
     run_query_suite(&url, "MYSQL").await;
@@ -465,7 +465,7 @@ async fn mysql_query_data_path() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mariadb_query_data_path() {
     let Ok(url) = std::env::var("FERRO_TEST_MARIADB_URL") else {
-        eprintln!("SKIP mariadb_query_data_path: FERRO_TEST_MARIADB_URL unset");
+        eprintln!("skip: FERRO_TEST_MARIADB_URL unset (mariadb_query_data_path)");
         return;
     };
     run_query_suite(&url, "MARIADB").await;

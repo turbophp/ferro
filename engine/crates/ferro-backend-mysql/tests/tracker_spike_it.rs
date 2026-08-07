@@ -30,7 +30,7 @@ use mysql_async::{Conn, Opts};
 #[tokio::test]
 async fn session_track_fork_surfaces_trackers_live() {
     let Some(url) = std::env::var("FERRO_TEST_MYSQL_URL").ok() else {
-        eprintln!("SKIP session_track_fork_surfaces_trackers_live: FERRO_TEST_MYSQL_URL unset");
+        eprintln!("skip: FERRO_TEST_MYSQL_URL unset (session_track_fork_surfaces_trackers_live)");
         return;
     };
 

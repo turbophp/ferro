@@ -31,8 +31,14 @@ use PHPUnit\Framework\TestCase;
  * `PoolConfig` knobs to avoid, so it gets an end-to-end assertion through the real decode path:
  * bytes on a fake socket → `Session` → `ExecCodec::decode` → the policy → the PHP value.
  *
- * These tests go RED if the default-policy site reverts to `M0ValuePolicy`, or if `types:` stops
- * reaching it.
+ * **Scope, precisely (M1-S7 review, G4).** These tests go RED if the default-policy site reverts to
+ * `M0ValuePolicy`, or if `types:` stops reaching it FROM `Connection`'s constructor — they build
+ * `new Connection(types: …)` directly, so they never traverse the FIRST hop and an earlier version
+ * of this docblock overclaimed by implying they did. Dropping `$types` from `Ferro::connect`'s
+ * `self::assemble(...)` call left every test here green. That hop now has two guards of its own:
+ * `Ferro::assemble`'s REQUIRED `$types` parameter (a PHPStan level 9 error if the forward is
+ * dropped) and the behavioural
+ * `tests/Live/TypesLiveTest::testFerroConnectForwardsTheTypePolicyLive`.
  */
 final class ConnectionTypePolicyWiringTest extends TestCase
 {

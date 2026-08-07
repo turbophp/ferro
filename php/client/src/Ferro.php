@@ -77,13 +77,21 @@ final class Ferro
      * Open the first session via `$factory`, then wire the epoch-aware reconnect loop + fate
      * classifier around it.
      *
+     * `$types` is deliberately REQUIRED (no `= null` default), and that is load-bearing rather than
+     * stylistic: with a default, dropping `$types` from either `self::assemble(...)` call above left
+     * PHPUnit green AND PHPStan level 9 clean while `Ferro::connect(types: …)` became an inert
+     * public knob — every DECIMAL/TIMESTAMP/UUID/U64 read silently reverting to the default policy.
+     * Required, that same drop is a static error (`invoked with 3 parameters, 4 required`), so the
+     * forward cannot rot unnoticed. The behavioural half of the guard is
+     * `tests/Live/TypesLiveTest::testFerroConnectForwardsTheTypePolicyLive`.
+     *
      * @param \Closure(): SessionInterface $factory
      */
     private static function assemble(
         \Closure $factory,
         string $pool,
         ?RetryPolicy $policy,
-        ?TypePolicyOptions $types = null,
+        ?TypePolicyOptions $types,
     ): Connection {
         $policy ??= RetryPolicy::default();
         $session = $factory();

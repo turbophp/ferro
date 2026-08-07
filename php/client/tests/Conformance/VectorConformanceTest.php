@@ -21,6 +21,17 @@ final class VectorConformanceTest extends TestCase
 {
     private const DIR = __DIR__ . '/../../../../proto/vectors';
 
+    /**
+     * The core messages the client actually ENCODES — the single source for both the byte-lock
+     * provider filter and the accounting in {@see testEveryCommittedVectorIsByteLocked}. It used to
+     * be written out twice by hand, so deleting a name from the byte-lock filter silently dropped
+     * that message's cross-language lock while the accounting guard, reading its own copy, stayed
+     * green. One const, two readers: a drop is now RED at the accounting guard.
+     *
+     * `error_protocol` is deliberately absent: it is an Outcome the client only ever decodes.
+     */
+    private const CLIENT_ENCODED_MESSAGES = ['hello', 'hello_ack', 'ping', 'pong', 'goodbye', 'window_update'];
+
     /** @return iterable<string, array{0:array<string,mixed>}> */
     public static function vectors(): iterable
     {
@@ -69,7 +80,7 @@ final class VectorConformanceTest extends TestCase
     public function testPurePackerEncodesMessageToExactVectorBytes(array $v): void
     {
         $name = (string) $v['name'];
-        if (!in_array($name, ['hello', 'hello_ack', 'ping', 'pong', 'goodbye', 'window_update'], true)) {
+        if (!in_array($name, self::CLIENT_ENCODED_MESSAGES, true)) {
             $this->markTestSkipped("{$name} is decode-only for the client in S1 (no message encoder)");
         }
         $fields = is_array($v['message']) ? $v['message'] : [];
@@ -377,8 +388,9 @@ final class VectorConformanceTest extends TestCase
         // Vectors byte-locked by a name-keyed test rather than a prefix provider.
         $namedLocked = ['tx_begin_response', 'error_protocol'];
         foreach (self::txRequestVectors() as [$v]) { $namedLocked[] = (string) $v['name']; }
-        // The six core messages the client encodes (testPurePackerEncodesMessageToExactVectorBytes).
-        $coreLocked = ['hello', 'hello_ack', 'ping', 'pong', 'goodbye', 'window_update'];
+        // The core messages the client encodes (testPurePackerEncodesMessageToExactVectorBytes) —
+        // read from the SAME const that test filters on, so the two can never disagree.
+        $coreLocked = self::CLIENT_ENCODED_MESSAGES;
 
         $locked = array_merge($prefixLocked, $namedLocked, $coreLocked);
         $all = [];

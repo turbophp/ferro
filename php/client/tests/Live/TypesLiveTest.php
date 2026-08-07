@@ -9,6 +9,7 @@ use Ferro\Client\Error\TypePolicyException;
 use Ferro\Client\Value\TypePolicyOptions;
 use Ferro\Date;
 use Ferro\Decimal;
+use Ferro\Ferro;
 use Ferro\Json;
 use Ferro\NaiveTimestamp;
 use Ferro\Tests\Support\InvoiceDto;
@@ -291,6 +292,55 @@ final class TypesLiveTest extends LiveTestCase
             $this->assertStringContainsString('at: string', $e->getMessage());
         } finally {
             $conn->session()->close();
+        }
+    }
+
+    /**
+     * **THE FACADE HOP, behaviourally.** Every other test in this file builds `new Connection(…,
+     * types: …)` directly, so nothing here — or anywhere in the suite — ever proved that the ONE
+     * entry point an application actually calls, `Ferro::connect(types: …)`, forwards the policy.
+     * It didn't have to: `Ferro::connect` hands `$types` to a private `assemble()`, and dropping it
+     * from that call left the whole suite green while the public knob went inert and every
+     * DECIMAL/TIMESTAMP/UUID/U64 read silently reverted to the default object policy.
+     *
+     * Both arms run through the facade, on the same column, so this asserts the FORWARD and not
+     * merely "some decimal came back": with the policy the cell is a canonical `string`, without it
+     * the same cell is a {@see Decimal}. The static half of the guard is `assemble()`'s now-required
+     * `$types` parameter (see {@see \Ferro\Ferro}).
+     */
+    public function testFerroConnectForwardsTheTypePolicyLive(): void
+    {
+        $sql = "SELECT '-12345.6700000000'::numeric AS d,
+                       'A1B2C3D4-0000-4FFF-8000-ABCDEFABCDEF'::uuid AS u";
+
+        $configured = Ferro::connect(
+            $this->socketPath,
+            'default',
+            types: new TypePolicyOptions(decimal: 'string', uuid: 'string'),
+        );
+        try {
+            $row = $configured->queryOne($sql);
+            $this->assertIsArray($row);
+            $this->assertSame(
+                '-12345.6700000000',
+                $row['d'],
+                'Ferro::connect(types:) is not reaching the Connection — the §9.1 knob is inert',
+            );
+            $this->assertSame('a1b2c3d4-0000-4fff-8000-abcdefabcdef', $row['u']);
+        } finally {
+            $configured->session()->close();
+        }
+
+        // The control: the SAME facade, the SAME query, no policy — object forms, so the assertions
+        // above cannot be satisfied by the default path.
+        $default = Ferro::connect($this->socketPath, 'default');
+        try {
+            $row = $default->queryOne($sql);
+            $this->assertIsArray($row);
+            $this->assertInstanceOf(Decimal::class, $row['d']);
+            $this->assertInstanceOf(Uuid::class, $row['u']);
+        } finally {
+            $default->session()->close();
         }
     }
 }

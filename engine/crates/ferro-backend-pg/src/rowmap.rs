@@ -22,10 +22,11 @@
 //!
 //! **M1-S7 canonical text.** The eight tags added in this slice (`DECIMAL`/`DATE`/`TIME`/
 //! `TIMESTAMP`/`TIMESTAMPTZ`/`UUID`/`JSON`) are carried as canonical **text** (`PROTOCOL.md` §3.2),
-//! rendered from the raw binary payload by [`crate::pgtext`]. Those arms read the column through
-//! `pgtext::RawBytes`, whose `accepts` is universally true — see its docs: [`oid_extract_type`] is
-//! the sole type authority and the raw getter is never reachable without passing it first
-//! (hazard 16, locked by `raw_getter_is_only_named_behind_the_oid_gate`).
+//! rendered from the raw binary payload by [`crate::pgtext`]. Those arms read the column through a
+//! raw-passthrough `FromSql` whose `accepts` is universally true, declared as a FUNCTION-LOCAL item
+//! inside [`extract_value`] itself: [`oid_extract_type`] is the sole type authority, and the raw
+//! getter is unnameable — hence unreachable — anywhere the gate has not already run (hazard 16,
+//! locked by `the_only_raw_from_sql_is_inside_the_oid_gate`).
 //!
 //! All of the above is unit-tested (no Docker) against the `Type` OID constants, including the
 //! still-deferred ones (`timetz`, arrays, `interval`, `inet`).
@@ -54,8 +55,9 @@ pub enum ExtractType {
     Text,
     /// `bytea` — read as `Vec<u8>`.
     Bytes,
-    // ---- M1-S7 canonical-text tags. Each reads the RAW binary payload (`pgtext::RawBytes`) and
-    // renders it with the matching `pgtext` decoder; `postgres-types` either has no `FromSql` for
+    // ---- M1-S7 canonical-text tags. Each reads the RAW binary payload (through the gate-local
+    // raw `FromSql` declared inside `extract_value`) and renders it with the matching `pgtext`
+    // decoder; `postgres-types` either has no `FromSql` for
     // these at all (`numeric`) or only a lossy/ambiguous one (`SystemTime`'s
     // `accepts!(TIMESTAMP, TIMESTAMPTZ)` erases the naive-vs-UTC distinction by construction).
     /// `numeric` — raw base-10000 payload → `Value::Decimal` (display scale preserved).
@@ -121,8 +123,9 @@ pub fn oid_to_tag(col_name: &str, ty: &Type) -> Result<u8, PoolError> {
 /// OID (`numeric` ⇒ 1700 ⇒ `DECIMAL`) and a domain over an unsupported base is refused by it
 /// (`timetz` ⇒ 1266 ⇒ `Unsupported`). Proven live in `pg_types_it.rs`.
 ///
-/// **This is the SOLE type authority.** `pgtext::RawBytes` accepts every `Type` by design, so a
-/// raw read that skipped this table would decode an unsupported column as garbage (hazard 16).
+/// **This is the SOLE type authority.** The raw-passthrough `FromSql` the M1-S7 arms read through
+/// accepts every `Type` by design, so a raw read that skipped this table would decode an
+/// unsupported column as garbage (hazard 16). That is why it is declared INSIDE [`extract_value`].
 pub fn oid_extract_type(oid: Oid) -> Option<ExtractType> {
     match oid {
         o if o == Type::BOOL.oid() => Some(ExtractType::Bool),
@@ -157,12 +160,45 @@ pub fn oid_extract_type(oid: Oid) -> Option<ExtractType> {
 ///
 /// This is the **per-cell, mid-stream** gate: it fires AFTER `HEAD` is already on the wire, which
 /// is why it and [`oid_to_tag`] are both matches over the single [`oid_extract_type`] table
-/// (hazard 18). The M1-S7 arms read the raw binary payload through `pgtext::RawBytes` — every one
-/// of those call sites is inside a match arm `oid_extract_type` has ALREADY selected, which is the
-/// containment that keeps `RawBytes`'s universally-true `accepts` harmless (hazard 16).
+/// (hazard 18). The M1-S7 arms read the raw binary payload through a raw-passthrough `FromSql`
+/// declared as a function-local item BELOW — unnameable outside this function, so every one of its
+/// call sites is necessarily inside a match arm `oid_extract_type` has ALREADY selected. That is
+/// the containment which keeps its universally-true `accepts` harmless (hazard 16).
 pub fn extract_value(row: &Row, idx: usize, oid: Oid) -> Result<crate::Value, PoolError> {
     use crate::Value;
-    use crate::pgtext::{self, RawBytes};
+    use crate::pgtext;
+
+    /// A raw-payload passthrough `FromSql`: hands back the column's binary bytes untouched, so the
+    /// `pgtext` decoders can render them (result format is BINARY and is not per-statement
+    /// selectable — see that module's docs).
+    ///
+    /// **DANGER (hazard 16) — this is why it is declared HERE, inside the gate.** Its `accepts` is
+    /// universally `true`, which **DEFEATS tokio-postgres' own type check**: `try_get::<RawBytes>`
+    /// will happily hand back the bytes of *any* column, including a type Ferro does not support
+    /// and cannot render, which would decode as garbage instead of raising the loud `Unsupported`
+    /// this module exists to guarantee (charter rule 6, "no silent miscasts").
+    /// [`oid_extract_type`] is the SOLE type authority, and the containment is now the COMPILER's,
+    /// not a grep's: a function-local item is unnameable outside `extract_value`, so no other
+    /// function — in this file, in `pgtext.rs`, or anywhere in the crate — can reach the raw
+    /// getter, directly or through an indirection. It previously lived in `pgtext.rs` as a
+    /// `pub(crate) struct`, where a `pub(crate) fn raw_slice(row, idx)` wrapper called ungated from
+    /// `query.rs` compiled cleanly and left the name-based guard GREEN.
+    struct RawBytes<'a>(&'a [u8]);
+
+    impl<'a> tokio_postgres::types::FromSql<'a> for RawBytes<'a> {
+        fn from_sql(
+            _ty: &Type,
+            raw: &'a [u8],
+        ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+            Ok(RawBytes(raw))
+        }
+
+        /// Universally true BY DESIGN — see the type docs. The OID gate, not this predicate,
+        /// decides what may be read.
+        fn accepts(_ty: &Type) -> bool {
+            true
+        }
+    }
 
     /// Reads the raw binary payload of an ALREADY-GATED column and renders it to canonical text.
     /// SQL `NULL` short-circuits to `None` before any rendering. Returns `Option<String>` (not a
@@ -360,7 +396,7 @@ mod tests {
 
     /// The DEFERRAL guard (hazards 15/20). Note it asserts `oid_extract_type(..).is_none()` — it is
     /// a deferral lock, NOT the hazard-16 "raw getter is unreachable" guard (that one is
-    /// `raw_getter_is_only_named_behind_the_oid_gate`).
+    /// `the_only_raw_from_sql_is_inside_the_oid_gate`).
     ///
     /// `TIMETZ` in particular must never fall into the `TIME` arm: its payload is 12 bytes
     /// (i64 µs + i32 zone), so it has no `FromSql` under any feature and would be rejected
@@ -421,102 +457,174 @@ mod tests {
         );
     }
 
-    /// **Hazard 16, mechanically enforced.** `pgtext::RawBytes` is a `FromSql` whose
-    /// `accepts(_) -> true` DEFEATS tokio-postgres' own type check; `oid_extract_type` must remain
-    /// the SOLE type authority. If any path calls the raw getter without first passing the OID
-    /// gate, an unsupported/unknown type decodes as garbage instead of raising the loud
-    /// `Unsupported` this module exists to guarantee.
+    /// **Hazard 16, mechanically enforced — on the CAPABILITY, not on a name.**
     ///
-    /// The containment is structural, and this test locks the structure: `RawBytes` is
-    /// `pub(crate)` (so it cannot leak out of the crate at all), and inside the crate it is NAMED
-    /// only in `pgtext.rs` (its definition) and inside `extract_value`'s LINE SPAN in `rowmap.rs`,
-    /// which the OID gate has already run for. A `get_opt::<RawBytes>` added anywhere else reddens
-    /// this test.
+    /// A `FromSql` whose `accepts(_) -> true` DEFEATS tokio-postgres' own type check: it hands
+    /// back the bytes of *any* column, so a read that reached it without first passing
+    /// [`oid_extract_type`] would decode an unsupported type as garbage instead of raising the
+    /// loud `Unsupported` this module exists to guarantee. `oid_extract_type` must remain the SOLE
+    /// type authority.
+    ///
+    /// **Why this guard was rewritten.** It used to assert that the IDENTIFIER `RawBytes` appeared
+    /// only in `pgtext.rs` and inside `extract_value`'s line span — which said nothing about what
+    /// `pgtext.rs` could EXPORT. Surviving mutation: add `pub(crate) fn raw_slice(row, idx) ->
+    /// Option<Vec<u8>>` to `pgtext.rs` (its body does the `try_get::<Option<RawBytes>>`) and call
+    /// it ungated from `query.rs` — guard GREEN, 57 lib tests green, clippy clean, OID gate gone.
+    /// One indirection defeated a name check, exactly as a `pub(crate) fn` escape had once before.
+    ///
+    /// The fix is structural first and a test second: the raw `FromSql` now lives INSIDE
+    /// `extract_value` as a function-local item, so it is unnameable anywhere else and that
+    /// `raw_slice` no longer COMPILES. This test locks the property the compiler cannot state —
+    /// that nobody declares a SECOND one somewhere else under a different name:
+    ///
+    /// 1. every `impl … FromSql …` in the crate's production source must sit inside
+    ///    `extract_value`'s line span (headers are read to their opening `{`, so a rustfmt-split
+    ///    or `where`-claused header cannot slip past a line-shaped pattern); and
+    /// 2. the identifier `RawBytes` must likewise appear only there — belt to the compiler's
+    ///    braces, and the assertion that keeps naming the hazard where a reader will meet it.
     ///
     /// **The span check is deliberately not a `fn`-chunk split** (T4b review F3). Splitting the
     /// source on `"\nfn "`/`"\npub fn "` made every other qualifier a non-boundary, so a
     /// `pub(crate) fn` / `async fn` / `const fn` / `pub(super) fn` inserted right after
     /// `extract_value` rode INSIDE its chunk and escaped the guard — demonstrated live with a
-    /// `pub(crate) fn evil_raw_read` that called `get_opt::<RawBytes>` ungated and left the test
-    /// GREEN. Line containment has no qualifier vocabulary to keep up with: `extract_value` runs
-    /// from its `pub fn` line to its column-0 `}`, and every line naming `RawBytes` must be inside
-    /// that range, whatever surrounds it.
+    /// `pub(crate) fn evil_raw_read` that read raw bytes ungated and left the test GREEN. Line
+    /// containment has no qualifier vocabulary to keep up with: `extract_value` runs from its
+    /// `pub fn` line to its column-0 `}`, whatever surrounds it.
     #[test]
-    fn raw_getter_is_only_named_behind_the_oid_gate() {
+    fn the_only_raw_from_sql_is_inside_the_oid_gate() {
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         collect_rs(&src_dir, &mut files);
-        assert!(
-            files.len() >= 8,
-            "source walk found too few files: {files:?}"
-        );
 
-        let mut checked_definition = false;
-        let mut checked_call_sites = false;
+        // The span is computed ONCE, from rowmap.rs, and every file is judged against it (only
+        // rowmap.rs can be inside it). A file count would be a hardcoded number that says nothing;
+        // the `visited_*` flags below prove the walk actually reached the code that matters.
+        let rowmap = files
+            .iter()
+            .find(|f| f.file_name().unwrap() == "rowmap.rs")
+            .expect("the source walk must reach rowmap.rs");
+        let rowmap_code = production_code(rowmap);
+        let (gate_start, gate_end) = extract_value_span(&rowmap_code);
+
+        let mut visited_pgtext = false;
+        let mut gated_from_sql_impls = 0usize;
+        let mut gated_raw_uses = 0usize;
         for f in &files {
             let name = f.file_name().unwrap().to_string_lossy().to_string();
-            let text = std::fs::read_to_string(f).expect("read source");
-            // Comments are documentation, not reachability — the guard is about CODE, and every
-            // containment note in this crate necessarily names the type it is describing. The
-            // `#[cfg(test)]` tail is cut for the same reason: this very test names `RawBytes`,
-            // and a test binary is not a production read path.
-            let code = strip_comments(text.split("\n#[cfg(test)]").next().unwrap_or(&text));
-            match name.as_str() {
-                "pgtext.rs" => {
-                    assert!(
-                        code.contains("pub(crate) struct RawBytes"),
-                        "RawBytes must be declared `pub(crate)` in pgtext.rs — a `pub` one escapes \
-                         the crate entirely and the OID gate with it"
-                    );
-                    checked_definition = true;
+            let code = production_code(f);
+            let is_rowmap = name == "rowmap.rs";
+            if name == "pgtext.rs" {
+                visited_pgtext = true;
+            }
+
+            // (1) THE CAPABILITY: a custom `FromSql` is the only way to get unchecked raw bytes
+            // out of a `Row` — tokio-postgres' own impls all have a real `accepts`. Renaming the
+            // type defeats a name check; it cannot defeat this one.
+            for (line, header) in from_sql_impls(&code) {
+                assert!(
+                    is_rowmap && (gate_start..=gate_end).contains(&line),
+                    "{name}:{} declares a FromSql OUTSIDE `extract_value` (rowmap.rs lines \
+                     {}..={}). A FromSql with a permissive `accepts` bypasses the OID gate \
+                     (hazard 16); a gated one belongs inside the gate:\n{}",
+                    line + 1,
+                    gate_start + 1,
+                    gate_end + 1,
+                    header.trim()
+                );
+                gated_from_sql_impls += 1;
+            }
+
+            // (2) THE NAME, still: a call site added elsewhere in rowmap.rs would not compile, but
+            // this keeps the failure legible if the containment is ever loosened again.
+            for (i, l) in code.lines().enumerate() {
+                if !l.contains("RawBytes") {
+                    continue;
                 }
-                "rowmap.rs" => {
-                    // `extract_value`'s LINE SPAN: its top-level `pub fn` line through the first
-                    // column-0 `}`. Every line naming RawBytes must fall inside it — no `fn`
-                    // qualifier can widen the span, because the span is not made of `fn`s.
-                    let lines: Vec<&str> = code.lines().collect();
-                    let start = lines
-                        .iter()
-                        .position(|l| l.starts_with("pub fn extract_value"))
-                        .expect("`extract_value` must be a top-level `pub fn` in rowmap.rs");
-                    let end = start
-                        + 1
-                        + lines[start + 1..]
-                            .iter()
-                            .position(|l| *l == "}")
-                            .expect("`extract_value` must close with a column-0 `}`");
-                    for (i, l) in lines.iter().enumerate() {
-                        if !l.contains("RawBytes") {
-                            continue;
-                        }
-                        assert!(
-                            (start..=end).contains(&i),
-                            "rowmap.rs line {} names RawBytes OUTSIDE `extract_value` (lines \
-                             {}..={}), which would bypass the OID gate (hazard 16):\n{}",
-                            i + 1,
-                            start + 1,
-                            end + 1,
-                            l.trim()
-                        );
-                        checked_call_sites = true;
-                    }
-                }
-                _ => assert!(
-                    !code.contains("RawBytes"),
-                    "{name} names RawBytes in code; only pgtext.rs (the definition) and \
-                     rowmap.rs's `extract_value` (behind the OID gate) may"
-                ),
+                assert!(
+                    is_rowmap && (gate_start..=gate_end).contains(&i),
+                    "{name}:{} names RawBytes OUTSIDE `extract_value` (rowmap.rs lines {}..={}), \
+                     which would bypass the OID gate (hazard 16):\n{}",
+                    i + 1,
+                    gate_start + 1,
+                    gate_end + 1,
+                    l.trim()
+                );
+                gated_raw_uses += 1;
             }
         }
+
         assert!(
-            checked_definition,
+            visited_pgtext,
             "pgtext.rs was not visited — the source walk is broken, not the invariant"
         );
-        assert!(
-            checked_call_sites,
-            "no RawBytes call site was found in rowmap.rs — either the M1-S7 arms regressed to a \
-             typed FromSql, or this guard has stopped looking where the code is"
+        assert_eq!(
+            gated_from_sql_impls, 1,
+            "expected EXACTLY the one raw FromSql inside `extract_value`; found \
+             {gated_from_sql_impls}. Zero means the M1-S7 arms regressed to a typed FromSql (or \
+             this guard stopped looking where the code is); more than one means a second raw \
+             reader was added and each needs its own review."
         );
+        assert!(
+            gated_raw_uses >= 2,
+            "RawBytes must be declared AND read inside the gate; found {gated_raw_uses} mentions"
+        );
+    }
+
+    /// A file's production source: whole-line comments blanked and the `#[cfg(test)]` tail cut.
+    fn production_code(f: &std::path::Path) -> String {
+        let text = std::fs::read_to_string(f).expect("read source");
+        strip_comments(text.split("\n#[cfg(test)]").next().unwrap_or(&text))
+    }
+
+    /// `extract_value`'s LINE SPAN: its top-level `pub fn` line through the first column-0 `}`.
+    fn extract_value_span(code: &str) -> (usize, usize) {
+        let lines: Vec<&str> = code.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("pub fn extract_value"))
+            .expect("`extract_value` must be a top-level `pub fn` in rowmap.rs");
+        let end = start
+            + 1
+            + lines[start + 1..]
+                .iter()
+                .position(|l| *l == "}")
+                .expect("`extract_value` must close with a column-0 `}`");
+        (start, end)
+    }
+
+    /// Every `impl … FromSql …` block in `code`, as (line index of `impl`, full header text).
+    ///
+    /// The header is read forward to the `{` that opens the block, so a header rustfmt split
+    /// across lines — or one carrying a `where` clause — is still matched. A line-shaped
+    /// `impl.*FromSql` regex would miss exactly those, which is the loosening a safety guard must
+    /// never take. Generic BOUNDS (`T: FromSql<'a>`) are not impls and are correctly ignored:
+    /// they read through whatever impls already exist and mint no new one.
+    fn from_sql_impls(code: &str) -> Vec<(usize, String)> {
+        let lines: Vec<&str> = code.lines().collect();
+        let mut out = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            let t = l.trim_start();
+            if !t.starts_with("impl")
+                || t[4..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let mut header = String::new();
+            for l2 in &lines[i..] {
+                header.push_str(l2.trim());
+                header.push(' ');
+                if l2.contains('{') {
+                    break;
+                }
+            }
+            if header.contains("FromSql") {
+                out.push((i, header));
+            }
+        }
+        out
     }
 
     /// Drops WHOLE-LINE `//` comments (which is every doc comment in this crate) and nothing else.

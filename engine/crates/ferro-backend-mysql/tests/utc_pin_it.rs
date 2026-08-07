@@ -83,7 +83,7 @@ async fn utc_pin_holds_fresh_and_recycled(url: &str, label: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mysql_utc_pin_holds_fresh_and_recycled() {
     let Ok(url) = std::env::var("FERRO_TEST_MYSQL_URL") else {
-        eprintln!("SKIP mysql_utc_pin_holds_fresh_and_recycled: FERRO_TEST_MYSQL_URL unset");
+        eprintln!("skip: FERRO_TEST_MYSQL_URL unset (mysql_utc_pin_holds_fresh_and_recycled)");
         return;
     };
     utc_pin_holds_fresh_and_recycled(&url, "MYSQL").await;
@@ -92,7 +92,7 @@ async fn mysql_utc_pin_holds_fresh_and_recycled() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mariadb_utc_pin_holds_fresh_and_recycled() {
     let Ok(url) = std::env::var("FERRO_TEST_MARIADB_URL") else {
-        eprintln!("SKIP mariadb_utc_pin_holds_fresh_and_recycled: FERRO_TEST_MARIADB_URL unset");
+        eprintln!("skip: FERRO_TEST_MARIADB_URL unset (mariadb_utc_pin_holds_fresh_and_recycled)");
         return;
     };
     utc_pin_holds_fresh_and_recycled(&url, "MARIADB").await;
