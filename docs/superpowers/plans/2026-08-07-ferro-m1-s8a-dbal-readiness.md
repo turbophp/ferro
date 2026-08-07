@@ -471,8 +471,8 @@ and in `engine/crates/ferro-backend-pg/src/conn.rs`'s tests:
 ```
 FERRO_TEST_MYSQL_URL=mysql://ferro:ferro@127.0.0.1:33060/ferro \
   cargo test -p ferrod --test mysql_it mysql_stream_is_refused_identically -- --nocapture
-cargo test -p ferro-backend-mysql supports_row_streaming
-cargo test -p ferro-backend-pg supports_row_streaming
+cargo test -p ferro-backend-mysql row_streaming
+cargo test -p ferro-backend-pg row_streaming
 ```
 Expected: PASS.
 
