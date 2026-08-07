@@ -356,7 +356,7 @@ async fn exec_within(
     Outcome::decode(&t.payload).expect("decode terminal Outcome")
 }
 
-// ---- TX plumbing (bare BEGIN only — MySQL isolation-BEGIN is deferred to S7, SPEC §22.2) ---------
+// ---- TX plumbing (bare BEGIN only — MySQL isolation-BEGIN is deferred to S8, SPEC §22.2) ---------
 
 /// BEGIN a bare transaction (isolation=None, readonly=false → the composed SQL is the bare `BEGIN`,
 /// which MySQL accepts as `START TRANSACTION`). Returns its `tx_id`.
@@ -646,7 +646,7 @@ async fn mysql_connection_kill_mid_write_is_indeterminate() {
 // =================================================================================================
 // Case 4. in-tx timeout_ms write -> the actor cancels (KILL QUERY) + drains + ROLLBACK + tombstones
 //         -> the ONE terminal is TxDeadline{Retryable}; counter == 0 (rolled back); tx_id unusable.
-//         (bare BEGIN — MySQL isolation-BEGIN is deferred, §22.2.)
+//         (bare BEGIN — MySQL isolation-BEGIN is deferred to S8, §22.2.)
 // =================================================================================================
 
 #[tokio::test(flavor = "multi_thread")]

@@ -31,10 +31,12 @@
 //!   emit a leading `-` for a negative value.
 //! - **Fractional seconds** are emitted as **no group at all** when zero, otherwise **exactly six**
 //!   digits — never trailing-zero-trimmed, so the payload is byte-stable for the golden vectors.
-//! - **Zero dates** (`'0000-00-00'`, `'0000-00-00 00:00:00'`) are legal MySQL values under a
-//!   permissive `sql_mode` and arrive with `year = 0`. They render as the **verbatim, deliberately
-//!   non-parseable sentinel text** PROTOCOL.md §3.2 pins — never as an error, and never as an
-//!   invented calendar date.
+//! - **Zero dates** (`'0000-00-00'`, `'0000-00-00 00:00:00'`, `year = 0`) AND **zero-in-dates**
+//!   (only some components zero: `'2026-00-05'`, `'2026-08-00'`) are legal MySQL values under a
+//!   permissive `sql_mode`. Both render as the **verbatim, deliberately non-parseable sentinel
+//!   text** PROTOCOL.md §3.2 pins — never as an error, and never as an invented calendar date. §3.2
+//!   defines the sentinel class by a **zero-component test**, not by the four named literal forms,
+//!   precisely so the partial case cannot be parsed as a calendar day by a conforming decoder.
 //! - **`DECIMAL` is passed through byte-for-byte.** The server's own ASCII rendering already carries
 //!   the display scale; parsing and re-rendering it (through any numeric type, and *especially*
 //!   through a float) is the precision loss §9.1 exists to prevent.
@@ -224,8 +226,9 @@ fn date_parts(v: &MyValue, what: &str) -> Result<(u16, u8, u8, u8, u8, u8, u32),
     }
 }
 
-/// `YYYY-MM-DD`. Month/day are NOT range-checked: `0` is legal in both (a zero date, or a
-/// zero-in-date such as `2026-00-05` under a permissive `sql_mode`) and PROTOCOL.md §3.2 pins those
+/// `YYYY-MM-DD`. Month/day are NOT range-checked below 1: `0` is legal in both (a zero date, or a
+/// zero-in-date such as `2026-00-05` wherever `sql_mode` omits `NO_ZERO_IN_DATE` — MariaDB 11's
+/// default), and PROTOCOL.md §3.2's **Sentinels** paragraph pins any zero year/month/day component
 /// as verbatim sentinel text. The year is a `u16` the server bounds to 9999, so `{:04}` is exact.
 fn canonical_date(y: u16, mo: u8, d: u8) -> String {
     format!("{y:04}-{mo:02}-{d:02}")

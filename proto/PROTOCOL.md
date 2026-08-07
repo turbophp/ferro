@@ -123,7 +123,7 @@ it and is directly comparable across the two codecs.
 |---|---|---|---|---|
 | `U64` | 3 | uint family | unsigned 64-bit integer | The ONLY non-`str` addition. |
 | `DECIMAL` | 5 | `str` | `"-12345.6700"` — full precision, **display scale preserved** | `"NaN"`, `"Infinity"`, `"-Infinity"` are legal payloads (PG `NUMERIC` allows them). `1.10` and `1.1` are **distinct** payloads and must never be normalized to each other. |
-| `DATE` | 8 | `str` | `"YYYY-MM-DD"` | `"infinity"` / `"-infinity"` for the PG sentinels; `"0000-00-00"` for a MySQL zero date. |
+| `DATE` | 8 | `str` | `"YYYY-MM-DD"` | `"infinity"` / `"-infinity"` for the PG sentinels; `"0000-00-00"` for a MySQL zero date, and any zero month/day component (`"2026-00-05"`) — see **Sentinels** below for the full class. |
 | `TIME` | 9 | `str` | `"HH:MM:SS"` or `"HH:MM:SS.ffffff"` | Hours may exceed 23 (PG `time '24:00:00'`); a MySQL `TIME` spans ±838 h and may be negative → a leading `-`. |
 | `TIMESTAMP` | 10 | `str` | `"YYYY-MM-DD HH:MM:SS[.ffffff]"` | **Naive** — no zone suffix, ever. Sentinels: `"infinity"` / `"-infinity"` for the PG values; `"0000-00-00 00:00:00"` for a MySQL zero datetime. |
 | `TIMESTAMPTZ` | 11 | `str` | `"YYYY-MM-DDTHH:MM:SS[.ffffff]Z"` | RFC3339, **always normalized to UTC**, always the literal `Z`. Sentinels: `"infinity"` / `"-infinity"` (PG); `"0000-00-00 00:00:00"` for a MySQL zero `TIMESTAMP`. |
@@ -134,13 +134,22 @@ it and is directly comparable across the two codecs.
 sub-second part is zero; otherwise emit **exactly six** digits. Never emit a trailing-zero-trimmed
 variant — the payload must be byte-stable for the golden vectors.
 
-**Sentinels** (`DATE`, `TIMESTAMP`, `TIMESTAMPTZ`): the forms above (`"infinity"`, `"-infinity"`,
-`"0000-00-00"`, `"0000-00-00 00:00:00"`) are **literal payloads carried verbatim** — they are
-deliberately NOT parseable as a calendar value. A backend renderer emits them as-is rather than
-inventing a date, and a client decoder must branch on them **before** attempting to construct a
-date/time object; feeding one to a parser yields either an exception or a nonsense date, both of
-which are silent-corruption classes §9.1 exists to prevent. PG's ±infinity arrive as the `i32`/`i64`
-extremes; a MySQL zero date is a legal value under a permissive `sql_mode`.
+**Sentinels** (`DATE`, `TIMESTAMP`, `TIMESTAMPTZ`): the two infinity forms (`"infinity"`,
+`"-infinity"`) **and every value whose year, month or day component is ZERO** are **literal payloads
+carried verbatim** — they are deliberately NOT parseable as a calendar value. The zero-component
+class is larger than the two all-zero forms and is **not** a fixed list: it covers the zero date
+`"0000-00-00"` / `"0000-00-00 00:00:00"` *and* a **zero-IN-date**, where only some components are
+zero — `"2026-00-05"`, `"2026-08-00"`, `"2026-00-05 12:00:00"`. A decoder MUST therefore test the
+components, never string-compare against the four named forms; a zero-in-date passed to a calendar
+parser is exactly the silent-corruption class this paragraph exists to prevent. A backend renderer
+emits all of them as-is rather than inventing a date, and a client decoder must branch on them
+**before** attempting to construct a date/time object; feeding one to a parser yields either an
+exception or a nonsense date. PG's ±infinity arrive as the `i32`/`i64` extremes; a MySQL zero date
+is legal wherever `sql_mode` omits `NO_ZERO_DATE`, and a zero-in-date wherever it omits
+`NO_ZERO_IN_DATE` (MariaDB 11's default; MySQL 8's default sets both, so writing one there needs an
+explicit `SET SESSION sql_mode = ''`). Month and day are consequently NOT range-checked below 1 —
+only above 12 / 31. Shipped on both sides: `ferro-backend-mysql`'s `mytext.rs` and the client's
+`CanonicalText::dateIsSentinel` / `timestampIsInstant` / `timestamptzIsInstant`.
 
 **Calendar range** (`DATE`, `TIMESTAMP`, `TIMESTAMPTZ`): the canonical `YYYY-MM-DD` form defines
 **years `0001`–`9999` only**. A backend value outside that range — a BC date, or a year above 9999
@@ -153,9 +162,12 @@ codecs, and to the golden vectors (SPEC §22.2).
 fixint (`0x92 0x03 0x00`); the marker widens through `0xcc`/`0xcd`/`0xce` and reaches `0xcf` only
 above `0xffffffff`. This is byte-identical to PHP `PurePacker::packUint`, so a decoder must accept
 **any** uint marker for tag 3 — a marker-strict `uint64`-only reader is a defect. Consequence for
-the PHP side: a `U64` at or below `0xffffffff` decodes to a PHP `int`, while anything above it
-decodes to a **decimal string** (the §2 `uint64` overflow rule), so the value's PHP type follows its
-**magnitude**, not its tag.
+the PHP side **under the PURE decoder** (`PurePacker`, the authoritative one for this case per §2):
+a `U64` at or below `0xffffffff` decodes to a PHP `int`, while anything above it decodes to a
+**decimal string**, so the value's PHP type follows its **magnitude**, not its tag. `ext-msgpack`
+does NOT split at the same point — it returns a native `int` for those same `0xcf` markers all the
+way up to `PHP_INT_MAX` and only goes lossy (a float) above it, which is why §8.3 bars a
+golden-vector `U64` from the `(2^32, 2^63]` band where the two decoders disagree.
 
 The `str`-family payloads are **canonical text produced by the backend**. The codecs move that text
 verbatim and validate nothing beyond UTF-8 — the rendering decision lives where the source format is

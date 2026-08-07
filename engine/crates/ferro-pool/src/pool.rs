@@ -762,12 +762,28 @@ impl<B: PoolBackend> Checkout<B> {
     /// sequence [`Checkout::query`] runs after its buffered `RowStream` is drained, factored here so
     /// the streaming path replicates it byte-for-byte (rather than the handle poking at the private
     /// `tx_open`/`tainted` fields inline). MUST be called only AFTER the underlying stream has been
-    /// drained to `None`, so the RFQ atomic (`tx_status`) is a valid POST-DRAIN read (the S1 rule).
-    /// `errored` is `true` iff any `next()` yielded an `Err`.
+    /// drained to `None`. `errored` is `true` iff any `next()` yielded an `Err`.
+    ///
+    /// **Which signal is load-bearing depends on `errored` — read this before touching either.**
+    /// On the CLEAN arm (`errored == false`) the drain really did consume the terminating
+    /// `ReadyForQuery`, so the `tx_status` read below is a valid POST-DRAIN read (the S1 rule) and is
+    /// the authority. On the ERRORED arm it is NOT: a backend `RowStream` latches itself finished on
+    /// the first `Err` (`PgRowStream::next` sets `done = true` and thereafter returns `None`
+    /// immediately), so the drain loop in [`RowStreamHandle::finish`] exits on its FIRST poll having
+    /// read *nothing* — no `CommandComplete`, no `ReadyForQuery`. `tx_status` is then a STALE
+    /// PRE-drain read (observable: a clean 6000-row stream reports `affected = 6000`, the same
+    /// stream poisoned mid-way by an `extract_value` refusal reports `affected = 0`, because the
+    /// command tag was never read). What makes that harmless is the **Rule-A force below — not the
+    /// drain**: it overwrites both bits unconditionally, so whatever `apply_tx_status` just wrote is
+    /// irrelevant on that path. Verified live: 5 rounds on a `max_size=1` pool, same backend pid, no
+    /// protocol desync and no leaked transaction. **The force is therefore NOT redundant with the
+    /// drain**; deleting it on the reasoning that "the drain already guarantees a post-drain RFQ
+    /// read" would silently reopen the cross-tenant-leak class (charter rule 6).
     fn finalize_stream(&mut self, errored: bool, sql: &str) {
         let pool = Arc::clone(&self.pool);
-        // RFQ authority (SPEC §7.1): trustworthy only post-drain (the handle guarantees that); on an
-        // errored stream it may be stale, so the Err-arm force below fails safe.
+        // RFQ authority (SPEC §7.1): trustworthy only post-drain — which holds on the CLEAN arm
+        // only. On an errored stream the drain read nothing, so this IS a stale pre-drain read and
+        // whatever it writes is discarded by the Err-arm force below (see the fn doc).
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
         // M1-S6: the SECOND assist signal, read at the same post-statement point. No-op for PG/Fake
@@ -775,10 +791,13 @@ impl<B: PoolBackend> Checkout<B> {
         self.apply_session_tracker();
         if errored {
             // Rule A fail-safe (uniform with the six instrumented methods): on ANY mid-stream error
-            // the terminating `ReadyForQuery` may not have been consumed and a statement can open a
-            // tx before erroring, so neither `apply_tx_status` nor a pre-captured `tx_open` can be
-            // trusted. Force BOTH bits UNCONDITIONALLY so the checkout-time recycle runs ROLLBACK
-            // *then* DISCARD ALL and a possibly-poisoned conn is NEVER handed to the next tenant
+            // the terminating `ReadyForQuery` has NOT been consumed — the stream latched itself
+            // finished on the `Err`, so `finish`'s drain loop was a no-op — and a statement can open
+            // a tx before erroring, so neither `apply_tx_status` (stale, PRE-drain) nor a
+            // pre-captured `tx_open` can be trusted. THIS force, not the drain, is the mechanism
+            // that keeps the errored path safe. Force BOTH bits UNCONDITIONALLY so the checkout-time
+            // recycle runs ROLLBACK *then* DISCARD ALL and a possibly-poisoned conn is NEVER handed
+            // to the next tenant
             // (charter rule 6). Over-forcing on a clean autocommit error costs one harmless extra
             // ROLLBACK+reset — the safe direction (charter rule 5).
             self.tx_open = true;
@@ -813,12 +832,14 @@ impl<B: PoolBackend> Drop for Checkout<B> {
 }
 
 /// The terminal result of a finished [`RowStreamHandle`] (S5 Task 3): the command-tag affected-row
-/// count (valid because [`RowStreamHandle::finish`] fully drains the stream first) plus the checkout
-/// [`CheckoutStats`], so the `fetch:stream` producer (Task 4) can frame the terminal `END` without
-/// reaching back into the `Checkout` (whose borrow `finish` has already consumed).
+/// count (valid because [`RowStreamHandle::finish`] fully drains the stream first — on a stream that
+/// ERRORED mid-way the drain is a no-op and this is `0`, since the command tag never arrived) plus
+/// the checkout [`CheckoutStats`], so the `fetch:stream` producer (Task 4) can frame the terminal
+/// `END` without reaching back into the `Checkout` (whose borrow `finish` has already consumed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamEnd {
-    /// Command-tag affected-row count (never a hardcoded 0 — the S4 defect), read post-drain.
+    /// Command-tag affected-row count (never a hardcoded 0 — the S4 defect), read post-drain on a
+    /// clean stream; `0` on an errored one, where the tag was never read.
     pub affected: u64,
     /// The owning checkout's stats (currently `queue_us`), captured at `finish`.
     pub stats: CheckoutStats,
@@ -872,13 +893,21 @@ impl<'a, B: PoolBackend> RowStreamHandle<'a, B> {
         }
     }
 
-    /// MANDATORY terminal (the normal exit path). Drains any rows the caller did not pull — so the
-    /// underlying stream reaches its terminating `ReadyForQuery` and the RFQ read is a valid
-    /// POST-DRAIN read (the S1 rule) — then runs the EXACT pin/taint sequence [`Checkout::query`]
-    /// runs (RFQ `apply_tx_status` + the Rule-A Err-arm force-taint + the S2 `apply_classify`, via
-    /// `Checkout::finalize_stream`), and returns the command-tag `affected` count plus checkout
-    /// `stats`. Consumes the handle, releasing the `&mut Checkout` borrow so the connection can be
-    /// returned to the pool correctly pinned/tainted.
+    /// MANDATORY terminal (the normal exit path). Drains any rows the caller did not pull, then runs
+    /// the EXACT pin/taint sequence [`Checkout::query`] runs (RFQ `apply_tx_status` + the Rule-A
+    /// Err-arm force-taint + the S2 `apply_classify`, via `Checkout::finalize_stream`), and returns
+    /// the command-tag `affected` count plus checkout `stats`. Consumes the handle, releasing the
+    /// `&mut Checkout` borrow so the connection can be returned to the pool correctly pinned/tainted.
+    ///
+    /// **The drain only does its job on a stream that has not errored.** On a clean stream it does
+    /// carry the connection to its terminating `ReadyForQuery`, making the RFQ read a valid
+    /// POST-DRAIN read (the S1 rule) and `affected` a real command-tag count. Once any `next()` has
+    /// yielded an `Err`, the backend stream has latched itself finished (`PgRowStream` sets
+    /// `done = true` on the error and returns `None` from then on), so the loop below exits on its
+    /// first poll having read NOTHING: no `CommandComplete` (`affected` falls back to 0) and no
+    /// `ReadyForQuery` (the RFQ read is stale pre-drain state). Safety on that path rests entirely
+    /// on `finalize_stream`'s **Rule-A force**, which sets `tx_open`/`tainted` unconditionally and
+    /// discards the stale read — see its doc comment before assuming the two are redundant.
     pub async fn finish(mut self) -> Result<StreamEnd, PoolError> {
         // Drain the remainder (a no-op if the caller already pulled to `None`). Going through
         // `self.next()` records any late error into `self.errored`.

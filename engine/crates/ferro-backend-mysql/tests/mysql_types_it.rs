@@ -1140,7 +1140,9 @@ async fn bind_round_trip_is_byte_identical(url: &str, label: &str) {
         r.rows[0][0],
         Value::Text(UUID_TEXT.into()),
         "[{label}] a canonical UUID binds into CHAR(36) verbatim and reads back as TEXT — MySQL 8 \
-         has no native UUID type, and MariaDB's is deferred (§22.2)"
+         has no native UUID type, and MariaDB's native UUID is TEXT BY DESIGN, not deferred: it \
+         reaches the wire as MYSQL_TYPE_STRING/utf8mb4, byte-indistinguishable from a CHAR(36) \
+         (§22.2 (e)). No MySQL-family backend ever emits the UUID tag."
     );
     assert_eq!(r.cols[0].tag, tag::TEXT);
     assert_eq!(
