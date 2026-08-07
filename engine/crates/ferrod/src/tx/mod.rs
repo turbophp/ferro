@@ -202,6 +202,12 @@ pub struct TxHandle {
     /// The actor holds the paired `watch::Sender`; dropping it (a panicked/finished task) also
     /// resolves an awaiter, so a dead actor never wedges `abort_session`.
     pub done: watch::Receiver<bool>,
+    /// Whether the backend this tx is pinned to can stream rows
+    /// (`PoolBackend::supports_row_streaming`), captured at BEGIN. The forwarding handler needs it
+    /// because `TxHandle` is backend-AGNOSTIC: without it, a tx-scoped `fetch:stream` on MySQL could
+    /// only be refused INSIDE the actor — i.e. after checkout + BEGIN, force-tainting the pinned
+    /// connection.
+    pub streaming: bool,
 }
 
 /// The reason a [`TxRegistry::lookup`] failed.
@@ -409,6 +415,8 @@ mod tests {
             cmd_tx,
             abort: CancellationToken::new(),
             done: done_rx,
+            // Registry/lookup fixtures only; `true` is the trait default (PG's real value).
+            streaming: true,
         }
     }
 

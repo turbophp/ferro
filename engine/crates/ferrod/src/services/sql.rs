@@ -74,9 +74,13 @@ const TX_CMD_CHANNEL_CAP: usize = 16;
 /// `ExecRequest.fetch` modes. 0 = rows, 1 = none (affected only), 2 = stream (M1-S5: the windowed
 /// DATA-channel producer — autocommit path in Task 4b, tx-scoped path in Task 5). Kept as named
 /// constants (not magic numbers) at the handler boundary.
-const FETCH_ROWS: u8 = 0;
-const FETCH_NONE: u8 = 1;
-const FETCH_STREAM: u8 = 2;
+///
+/// `pub` since M1-S8a so an INTEGRATION test (a separate crate) can name the mode it is exercising
+/// instead of writing a literal `2` — a hand-written protocol constant in a test is charter rule 2's
+/// defect. Values and definition site are unchanged; this is a visibility change only.
+pub const FETCH_ROWS: u8 = 0;
+pub const FETCH_NONE: u8 = 1;
+pub const FETCH_STREAM: u8 = 2;
 
 /// Bytes `Outcome::Ok(body).encode()` prepends to `body`: the outer 2-element fixarray marker
 /// (`0x92`) plus the 1-byte positive-fixint status (`outcome::OK`). The terminal size-check MUST
@@ -240,6 +244,16 @@ async fn handle_exec(
                 }
             };
 
+            // M1-S8a: the SAME streaming authority the autocommit arm reads, captured at BEGIN.
+            if req.fetch == FETCH_STREAM && !handle.streaming {
+                // Refuse BEFORE handing the `Responder` to the actor: the actor would reach
+                // `Checkout::query_stream`, whose Err arm force-taints the PINNED tx connection
+                // (`ferro-pool/src/pool.rs`'s `finalize_stream(true, ..)`) for a request that never
+                // should have been dispatched. Exactly one END either way (charter rule 4).
+                responder.end_error(stream_unsupported());
+                return;
+            }
+
             // A tx-scoped streamed fetch (M1-S5 Task 5): the actor owns the pinned conn and
             // `query_stream` borrows its `&mut co`, so the FORWARDING HANDLER cannot stream — it hands
             // the `Responder` INTO the actor, which runs the shared producer, emits HEAD/DATA, and
@@ -339,16 +353,17 @@ async fn handle_exec(
                 return;
             };
 
-            // M1-S6: `fetch:stream` is not yet wired for MySQL (the streaming bridge lands in
-            // M1-S7 with `MysqlBackend::query_stream`). Reject it EARLY — before any checkout — with
-            // a clean, documented terminal, so the client sees a precise Unsupported rather than a
-            // mid-stream error surfaced from the backend's `query_stream` `Unsupported`. The buffered
-            // FETCH_ROWS/FETCH_NONE MySQL paths run normally; PG streaming is unchanged.
-            if req.fetch == FETCH_STREAM && matches!(pool, AnyPool::Mysql(_)) {
-                responder.end_error(unsupported(
-                    "fetch=stream is not yet supported on MySQL (lands in M1-S7 with the \
-                     streaming bridge)",
-                ));
+            // ONE authority for the streaming capability (M1-S8a): the backend's own
+            // `supports_row_streaming()`, not a `matches!(pool, AnyPool::Mysql(_))` restated here.
+            // Still refused EARLY — before any checkout — so the client sees a precise Unsupported
+            // rather than a mid-stream error surfaced from the backend's `query_stream`. The
+            // buffered FETCH_ROWS/FETCH_NONE paths run normally; PG streaming is unchanged.
+            let streams = match pool {
+                AnyPool::Pg(p) => p.backend().supports_row_streaming(),
+                AnyPool::Mysql(p) => p.backend().supports_row_streaming(),
+            };
+            if req.fetch == FETCH_STREAM && !streams {
+                responder.end_error(stream_unsupported());
                 return;
             }
 
@@ -1282,6 +1297,9 @@ async fn begin_on_pool<B: PoolBackend>(
             cmd_tx,
             abort: abort.clone(),
             done: done_rx,
+            // Captured at BEGIN from the ONE authority, so the (backend-agnostic) forwarding
+            // handler can refuse a tx-scoped `fetch:stream` WITHOUT touching the pinned conn.
+            streaming: pool.backend().supports_row_streaming(),
         },
     );
     tokio::spawn(actor::run(
@@ -1532,6 +1550,22 @@ fn build_terminal_body(
     Ok(body)
 }
 
+/// THE `fetch:stream`-unsupported terminal. One constructor, read by BOTH the autocommit arm and the
+/// tx-scoped forwarding arm, so the two can never drift (they did: the tx arm used to fall through to
+/// the backend's own string). Cites §22.2 so an operator can find the deferral rationale.
+///
+/// `pub` so the live gate can assert the observed terminal against THIS constructor rather than
+/// against a literal copied into the test. That is what makes the guard falsifiable: a backend's own
+/// late `query_stream` refusal carries a DIFFERENT string, so an arm that stops refusing pre-dispatch
+/// (or a backend whose capability is wrongly `true`) is caught by an equality that is derived from
+/// production code instead of restated beside it.
+pub fn stream_unsupported() -> ErrorPayload {
+    unsupported(
+        "fetch=stream is not supported on this pool's backend (MySQL/MariaDB row streaming is \
+         deferred — SPEC §22.2 (n)); re-issue with fetch=rows",
+    )
+}
+
 fn unsupported(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: errc::UNSUPPORTED,
@@ -1687,6 +1721,9 @@ mod tests {
             cmd_tx,
             abort: CancellationToken::new(),
             done: done_rx,
+            // These fixtures only exercise `resolve_active`'s lookup states, never a streamed
+            // fetch; `true` is the trait default (PG's real value).
+            streaming: true,
         }
     }
 

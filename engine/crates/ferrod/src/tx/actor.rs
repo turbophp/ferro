@@ -685,6 +685,9 @@ mod tests {
                 cmd_tx: cmd_tx.clone(),
                 abort: abort.clone(),
                 done: done_rx.clone(),
+                // Derived from the ONE authority, exactly as `begin_on_pool` does (FakeBackend
+                // inherits the `true` default) — never a literal restated here.
+                streaming: pool.backend().supports_row_streaming(),
             },
         );
         tokio::spawn(run(
@@ -1255,6 +1258,8 @@ mod tests {
                 cmd_tx,
                 abort: abort.clone(),
                 done: done_rx,
+                // Derived from the ONE authority, exactly as `begin_on_pool` does.
+                streaming: pool.backend().supports_row_streaming(),
             },
         );
         // A SHORT teardown bound: the blocked ROLLBACK is abandoned at 50ms, not held forever.

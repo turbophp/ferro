@@ -194,6 +194,20 @@ pub trait PoolBackend: Send + Sync + 'static {
         false
     }
 
+    /// Can this backend produce an INCREMENTAL row stream ([`PoolBackend::query_stream`]) at all?
+    ///
+    /// The ONE authority for the `fetch:stream` capability. It exists because the SQL service has
+    /// TWO dispatch arms (autocommit and tx-scoped) and, before M1-S8a, only the autocommit one
+    /// carried a hand-written `matches!(pool, AnyPool::Mysql(_))` check — so a tx-scoped stream
+    /// refused LATE (after checkout + BEGIN), force-tainting the pinned connection on the way out
+    /// (`Checkout::query_stream`'s Err arm). Both arms now read THIS method, so a backend that
+    /// gains streaming flips one line and both arms follow.
+    ///
+    /// **Default `true`** — Postgres and the `FakeBackend` stream today and are unchanged.
+    fn supports_row_streaming(&self) -> bool {
+        true
+    }
+
     /// Hygiene reset, run at checkout before a recycled conn is handed to a new caller (v2/B1;
     /// profile-parameterized in M1-S3, SPEC §7.2). `profile` selects HOW MUCH state to release:
     /// [`ResetProfile::Full`] (e.g. Postgres `DISCARD ALL`) for a tainted conn, or

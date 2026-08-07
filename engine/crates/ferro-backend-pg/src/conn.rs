@@ -267,6 +267,15 @@ mod tests {
         assert_eq!(backend.clean_reset_profile(), Some(ResetProfile::Targeted));
     }
 
+    /// M1-S8a: PG inherits the trait default and DOES stream — so `supports_row_streaming` can
+    /// never be "false everywhere" and silently disable the PG producer (the M1-S5 windowed
+    /// DATA-channel path). Behavioural: it calls the real method through the real trait.
+    #[test]
+    fn pg_supports_row_streaming() {
+        let backend = PgBackend::new("postgres://unused/unused");
+        assert!(backend.supports_row_streaming());
+    }
+
     /// The exact targeted batch string, verbatim (task brief + SPEC §7.2 + the plan's
     /// verification-fix addenda): `DISCARD ALL` minus the two prepare-destroying statements, plus
     /// `CLOSE ALL` (holdable-cursor leak fix) and `SET SESSION AUTHORIZATION DEFAULT`

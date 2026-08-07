@@ -1,7 +1,7 @@
 //! `PoolBackend::query` for MySQL/MariaDB (M1-S6 Task 4): the buffered, param-bound, row-returning
 //! path — the MySQL counterpart of `ferro-backend-pg`'s `query::run`.
 //!
-//! Flow (buffered; MySQL streaming is deferred to M1-S7):
+//! Flow (buffered; MySQL row streaming is deferred — SPEC §22.2 (n)):
 //! 1. `COM_STMT_PREPARE` the SQL (`?` is MySQL's NATIVE placeholder — no `?`→`$n` normalization,
 //!    unlike PG). One round trip that yields the result-column metadata.
 //! 2. Build `Vec<ColMeta>` from the prepared statement's columns via [`rowmap::column_to_tag`] — a
