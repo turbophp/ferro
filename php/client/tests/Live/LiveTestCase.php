@@ -99,8 +99,28 @@ abstract class LiveTestCase extends TestCase
         if ($this->stderrPath !== '' && file_exists($this->stderrPath)) { @unlink($this->stderrPath); }
     }
 
-    /** Connect a fresh {@see Session} to this test's running ferrod over its UDS socket. */
+    /**
+     * Connect a fresh {@see Session} to this test's running ferrod over its UDS socket, HANDSHAKEN.
+     *
+     * The handshake is not optional bookkeeping: `HELLO_ACK` is where the session learns
+     * `boot_epoch`, the advertised pools and (since M1-S8a) each pool's kind and server version. A
+     * `Session` that never handshook reports an EMPTY pool list, so a test reading metadata off one
+     * fails for a reason that has nothing to do with what it is testing.
+     *
+     * A test that needs to drive the handshake ITSELF (asserting on the returned {@see HelloAck})
+     * uses {@see connectRaw} instead — calling `hello()` twice on one session is not a handshake.
+     */
     protected function connect(): Session
+    {
+        $session = $this->connectRaw();
+        $session->hello();
+        return $session;
+    }
+
+    /**
+     * Connect a fresh, UN-handshaken {@see Session} — for the tests whose subject IS the handshake.
+     */
+    protected function connectRaw(): Session
     {
         return new Session(Transport::connectUnix($this->socketPath, 2.0, 5.0));
     }
@@ -263,8 +283,7 @@ abstract class LiveTestCase extends TestCase
 
             $session = null;
             try {
-                $session = $this->connect();
-                $session->hello();
+                $session = $this->connect(); // handshakes
                 $outcome = $session->sendRequest(C::SERVICE_SQL, C::METHOD_SQL_EXEC, self::selectOnePayload());
                 if ($outcome->isOk()) {
                     $session->close();

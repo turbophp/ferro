@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     // seam). Its `abort_session` teardown wait mirrors the graceful-drain deadline.
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
     let factory = sql::make_handler(
-        registry,
+        registry.clone(),
         tx_registry.clone(),
         config.idle_in_tx,
         config.max_tx,
@@ -53,7 +53,16 @@ async fn main() -> anyhow::Result<()> {
     let drain = Drain::new();
     spawn_signal_watchers(drain.clone())?;
 
-    serve(listener, config, epoch, drain, tx_registry, factory).await;
+    serve(
+        listener,
+        config,
+        epoch,
+        drain,
+        registry,
+        tx_registry,
+        factory,
+    )
+    .await;
 
     tracing::info!("ferrod exiting");
     Ok(())

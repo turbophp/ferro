@@ -63,13 +63,13 @@ fn exec_server_with_deadlines(url: String, idle_in_tx: Duration, max_tx: Duratio
     let registry = PoolRegistry::build(&config);
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
     let factory = sql::make_handler(
-        registry,
+        registry.clone(),
         tx_registry.clone(),
         config.idle_in_tx,
         config.max_tx,
         config.tx_teardown_timeout,
     );
-    TestServer::spawn_with_factory(BootEpoch(1), tx_registry, factory)
+    TestServer::spawn_with_factory(BootEpoch(1), registry, tx_registry, factory)
 }
 
 /// `service=TX, method=BEGIN` — assert the one-END terminal shape and decode the `BeginResponse`,

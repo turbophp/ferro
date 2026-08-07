@@ -113,6 +113,9 @@ impl TestServer {
         // (S6 seam): these scripted-handler tests never open a transaction, so `abort_session` at
         // cleanup is a no-op and behaviour is identical to the pre-seam harness.
         let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+        // These scripted-handler tests configure no pools and none of them reads `HelloAck.pools`,
+        // so an EMPTY registry built from their own `Config` is the faithful shape (M1-S8a Task 12).
+        let pool_registry = PoolRegistry::build(&config);
         let factory: HandlerFactory = Arc::new(move |_sid| handler.clone());
 
         tokio::spawn(async move {
@@ -125,6 +128,7 @@ impl TestServer {
                     stream,
                     config.clone(),
                     epoch,
+                    pool_registry.clone(),
                     tx_registry.clone(),
                     factory.clone(),
                 ));
@@ -140,6 +144,7 @@ impl TestServer {
     /// `exec_server` uses this so its EXEC handler is built exactly as `main` builds it.
     pub fn spawn_with_factory(
         epoch: BootEpoch,
+        pool_registry: Arc<PoolRegistry>,
         tx_registry: Arc<TxRegistry>,
         factory: HandlerFactory,
     ) -> Self {
@@ -160,6 +165,7 @@ impl TestServer {
                     stream,
                     config.clone(),
                     epoch,
+                    pool_registry.clone(),
                     tx_registry.clone(),
                     factory.clone(),
                 ));
@@ -177,6 +183,7 @@ impl TestServer {
     pub fn spawn_with_factory_and_config(
         epoch: BootEpoch,
         config: Config,
+        pool_registry: Arc<PoolRegistry>,
         tx_registry: Arc<TxRegistry>,
         factory: HandlerFactory,
     ) -> Self {
@@ -197,6 +204,7 @@ impl TestServer {
                     stream,
                     config.clone(),
                     epoch,
+                    pool_registry.clone(),
                     tx_registry.clone(),
                     factory.clone(),
                 ));
@@ -251,13 +259,15 @@ pub fn spawn_one_session_with_config(
     let listener = ferrod::listener::bind_uds(&config).expect("bind_uds in test harness");
     // Wrap the plain `HandlerFn` as a session-agnostic factory + a throwaway `TxRegistry` (S6 seam).
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    // Pool-less by construction (these `Config`s declare none), so an empty registry (M1-S8a).
+    let pool_registry = PoolRegistry::build(&config);
     let factory: HandlerFactory = Arc::new(move |_sid| handler.clone());
     let handle = tokio::spawn(async move {
         let (stream, _addr) = listener
             .accept()
             .await
             .expect("accept the one test connection");
-        Session::run_with_handler(stream, config, epoch, tx_registry, factory).await;
+        Session::run_with_handler(stream, config, epoch, pool_registry, tx_registry, factory).await;
     });
     (socket_path, handle)
 }
@@ -291,8 +301,18 @@ pub fn spawn_serve_with_config(
     let listener = ferrod::listener::bind_uds(&config).expect("bind_uds in test harness");
     // Wrap the plain `HandlerFn` as a session-agnostic factory + a throwaway `TxRegistry` (S6 seam).
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    // Pool-less by construction (these `Config`s declare none), so an empty registry (M1-S8a).
+    let pool_registry = PoolRegistry::build(&config);
     let factory: HandlerFactory = Arc::new(move |_sid| handler.clone());
-    let handle = tokio::spawn(serve(listener, config, epoch, drain, tx_registry, factory));
+    let handle = tokio::spawn(serve(
+        listener,
+        config,
+        epoch,
+        drain,
+        pool_registry,
+        tx_registry,
+        factory,
+    ));
     (socket_path, handle)
 }
 
@@ -568,13 +588,55 @@ pub fn exec_server(url: String) -> TestServer {
     let registry = PoolRegistry::build(&config);
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
     let factory = sql::make_handler(
-        registry,
+        registry.clone(),
         tx_registry.clone(),
         config.idle_in_tx,
         config.max_tx,
         config.tx_teardown_timeout,
     );
-    TestServer::spawn_with_factory(BootEpoch(1), tx_registry, factory)
+    TestServer::spawn_with_factory(BootEpoch(1), registry, tx_registry, factory)
+}
+
+/// A live `ferrod` session server over a registry of N named pools. The N-pool sibling of
+/// [`exec_server`], for the M1-S8a `HELLO_ACK` metadata gates: `kind` is inferred per pool from its
+/// own DSN scheme, so one call can mix a Postgres and a MySQL pool. No `ferrod` PROCESS is spawned
+/// — the registry is built in-process and the real `Session::run_with_handler` runs against it,
+/// exactly as `exec_server` already does.
+///
+/// Returns the `TestServer` AND the `Arc<PoolRegistry>`, because the metadata tests assert on
+/// `registry.probes_issued()` — the counter that makes "learned once" observable rather than merely
+/// plausible.
+pub fn pools_server(pools: &[(&str, &str)]) -> (TestServer, Arc<PoolRegistry>) {
+    let config = Config {
+        pools: pools
+            .iter()
+            .map(|(name, dsn)| PoolSpec {
+                name: (*name).to_string(),
+                dsn: (*dsn).to_string(),
+                kind: ferrod::config::infer_pool_kind(dsn),
+                pin_functions: Vec::new(),
+                pin_on_unknown: true,
+            })
+            .collect(),
+        ..Config::default()
+    };
+    let registry = PoolRegistry::build(&config);
+    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let factory = sql::make_handler(
+        registry.clone(),
+        tx_registry.clone(),
+        config.idle_in_tx,
+        config.max_tx,
+        config.tx_teardown_timeout,
+    );
+    let server = TestServer::spawn_with_factory_and_config(
+        BootEpoch(1),
+        config,
+        registry.clone(),
+        tx_registry,
+        factory,
+    );
+    (server, registry)
 }
 
 /// Like [`exec_server`], but with a caller-chosen SMALL per-request credit window
@@ -600,13 +662,13 @@ pub fn stream_server(url: String, credit_frames: u32) -> TestServer {
     let registry = PoolRegistry::build(&config);
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
     let factory = sql::make_handler(
-        registry,
+        registry.clone(),
         tx_registry.clone(),
         config.idle_in_tx,
         config.max_tx,
         config.tx_teardown_timeout,
     );
-    TestServer::spawn_with_factory_and_config(BootEpoch(1), config, tx_registry, factory)
+    TestServer::spawn_with_factory_and_config(BootEpoch(1), config, registry, tx_registry, factory)
 }
 
 /// A base read-only `EXEC "sql"` against the "default" pool, fetch=rows, no params.

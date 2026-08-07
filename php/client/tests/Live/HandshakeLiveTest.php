@@ -25,7 +25,7 @@ final class HandshakeLiveTest extends LiveTestCase
 {
     public function testHandshakeReturnsBootEpochAndPools(): void
     {
-        $s1 = $this->connect();
+        $s1 = $this->connectRaw();
         $ack1 = $s1->hello();
 
         // boot_epoch is present and OPAQUE (int, or a decimal string for a uint64-encoded epoch).
@@ -43,18 +43,24 @@ final class HandshakeLiveTest extends LiveTestCase
             self::kinds($ack1->pools),
             'HELLO_ACK advertises each pool\'s backend family, inferred from the DSN scheme',
         );
-        $this->assertSame(
-            array_fill(0, count($this->launchedPools()), null),
-            array_map(static fn (PoolInfo $p): ?string => $p->serverVersion, $ack1->pools),
-            'server_version rides as nil in Task 11; Task 12 fills it',
-        );
+        // M1-S8a Task 12 fills `server_version`, learned lazily off a live probe. Asserted here
+        // only as "a reachable pool advertises SOMETHING non-empty" — the per-engine shape
+        // (`PostgreSQL …` / a MySQL digit) is {@see PoolMetadataLiveTest}'s subject; this test's
+        // subject is the handshake.
+        foreach ($ack1->pools as $p) {
+            $this->assertIsString(
+                $p->serverVersion,
+                "pool {$p->name}: a reachable backend's server_version is learned at handshake",
+            );
+            $this->assertNotSame('', $p->serverVersion);
+        }
         // The name-only accessor still answers what `ExecRequest.pool` needs.
         $this->assertSame($this->launchedPools(), $s1->pools());
         $this->assertSame($ack1->pools, $s1->poolInfo());
 
         // A SECOND connection in the same run: the running instance drew its epoch once, so the two
         // must match exactly (same value AND same type — an === comparison of the opaque scalar).
-        $s2 = $this->connect();
+        $s2 = $this->connectRaw();
         $ack2 = $s2->hello();
         $this->assertSame($ack1->bootEpoch, $ack2->bootEpoch, 'one running instance -> one boot_epoch');
         $this->assertSame($this->launchedPools(), self::names($ack2->pools));

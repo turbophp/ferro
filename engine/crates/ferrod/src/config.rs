@@ -66,6 +66,23 @@ pub enum PoolKind {
     Mysql,
 }
 
+impl PoolKind {
+    /// The backend-family token advertised in `HELLO_ACK`'s `PoolInfo.kind` (PROTOCOL.md §4) — the
+    /// string a DBAL driver reads to pick a platform family before it has seen any server version.
+    ///
+    /// ONE source of truth on purpose: both the config-derived fallback
+    /// (`session::handshake::pool_info_from_config`) and the registry-derived metadata
+    /// (`pools::PoolRegistry::pool_info`) call this, so the two can never drift into advertising
+    /// different strings for the same pool. The match is exhaustive with no `_` arm, so a third
+    /// backend family breaks the build here rather than silently inheriting `"postgres"`.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            PoolKind::Postgres => "postgres",
+            PoolKind::Mysql => "mysql",
+        }
+    }
+}
+
 /// The ONLY portion of a DSN that is safe to log (SPEC §12): the scheme token — the substring
 /// strictly BEFORE a real `://` separator. In a URL-form DSN the credentials always follow `://`
 /// (`scheme://user:pass@host`), so the scheme itself can never carry them. When the DSN has no

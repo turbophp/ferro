@@ -63,7 +63,7 @@ async fn main() -> Result<(), BoxErr> {
     let registry = PoolRegistry::build(&config);
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
     let handler = sql::make_handler(
-        registry,
+        registry.clone(),
         tx_registry.clone(),
         config.idle_in_tx,
         config.max_tx,
@@ -77,6 +77,7 @@ async fn main() -> Result<(), BoxErr> {
         config,
         epoch,
         drain.clone(),
+        registry,
         tx_registry,
         handler,
     ));

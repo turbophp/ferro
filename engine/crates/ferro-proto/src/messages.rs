@@ -58,9 +58,11 @@ msg!(
     /// the string for the MariaDB branch, and PG's leading word stripped), and normalising it here
     /// would bake one ecosystem's conventions into the protocol.
     ///
-    /// `server_version` is `nil` when the engine has not learned it — a pool whose backend was
-    /// unreachable at handshake time. The handshake never depends on backend availability. M1-S8a
-    /// Task 11 emits `None` unconditionally; Task 12 is what fills it.
+    /// `server_version` is `nil` when the engine has not learned it — never learned (an unreachable
+    /// backend), learned and since expired, or not learned YET (a probe that outran the handshake's
+    /// bounded budget). All three are one contract to a client: "unknown", never a failure. The
+    /// handshake never depends on backend availability. Filled since M1-S8a Task 12, off a lazy,
+    /// concurrent, TTL'd per-pool probe in `ferrod`'s `PoolRegistry::pool_info`.
     ///
     /// Still NEVER exposed: the DSN (§12 server secret).
     PoolInfo { name: String, kind: String, server_version: Option<String> }

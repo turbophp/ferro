@@ -38,6 +38,7 @@ use tokio_util::codec::Framed;
 use crate::config::Config;
 use crate::epoch::BootEpoch;
 use crate::peercred;
+use crate::pools::PoolRegistry;
 use crate::session::codec::FrameCodec;
 use crate::session::error::SessionError;
 use crate::session::{HandlerFactory, Session};
@@ -46,13 +47,18 @@ use crate::tx::TxRegistry;
 
 /// Drive `listener`'s peercred-gated accept loop until `drain` is triggered, then let already-
 /// spawned session tasks finish (up to `config.drain_deadline`) before returning. Every accepted
-/// connection is driven via `Session::run_with_handler(.., tx_registry.clone(), factory.clone())`;
-/// the one `tx_registry` is shared by every session (S6 seam).
+/// connection is driven via
+/// `Session::run_with_handler(.., pool_registry.clone(), tx_registry.clone(), factory.clone())`;
+/// the one `tx_registry` is shared by every session (S6 seam), and so is the one `pool_registry` —
+/// which is what makes the `HELLO_ACK` server-version cache a per-DAEMON cache rather than a
+/// per-connection one (M1-S8a Task 12; a per-connection cache would re-probe on every handshake,
+/// which is exactly what the cache exists to prevent).
 pub async fn serve(
     listener: UnixListener,
     config: Config,
     epoch: BootEpoch,
     drain: Drain,
+    pool_registry: Arc<PoolRegistry>,
     tx_registry: Arc<TxRegistry>,
     factory: HandlerFactory,
 ) {
@@ -92,12 +98,14 @@ pub async fn serve(
                     Ok(uid) if config.uid_allowed(uid) => {
                         let session_config = config.clone();
                         let session_factory = factory.clone();
+                        let session_pool_registry = pool_registry.clone();
                         let session_tx_registry = tx_registry.clone();
                         sessions.spawn(async move {
                             Session::run_with_handler(
                                 stream,
                                 session_config,
                                 epoch,
+                                session_pool_registry,
                                 session_tx_registry,
                                 session_factory,
                             )

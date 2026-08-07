@@ -166,6 +166,7 @@ use ferro_proto::messages::{ErrorPayload, Outcome, Ping, WindowUpdate};
 use crate::config::Config;
 use crate::dispatch::{self, CoreMethod, Route};
 use crate::epoch::BootEpoch;
+use crate::pools::PoolRegistry;
 use crate::tx::TxRegistry;
 use classify::Classification;
 use codec::{ControlMsg, FrameCodec, InFrame, OutFrame};
@@ -217,8 +218,13 @@ impl Session {
     /// `Session::run`) untouched by the S6 seam.
     pub async fn run(stream: UnixStream, config: Config, epoch: BootEpoch) {
         let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+        // Its own pool registry, exactly as it already mints its own throwaway `TxRegistry`
+        // (M1-S8a Task 12). The `Config`s used on this path carry no pools, so this builds an EMPTY
+        // registry and dials nothing — and if one ever does carry pools, `Pool::new` is lazy, so it
+        // still dials nothing until a checkout asks.
+        let pool_registry = PoolRegistry::build(&config);
         let factory: HandlerFactory = Arc::new(|_session_id| default_handler_fn());
-        Self::run_with_handler(stream, config, epoch, tx_registry, factory).await;
+        Self::run_with_handler(stream, config, epoch, pool_registry, tx_registry, factory).await;
     }
 
     /// Drive one accepted connection end to end: split the framed stream, spawn the writer task,
@@ -230,6 +236,12 @@ impl Session {
     /// drawn from it once here, the per-connection handler is built via `factory(session_id)`, and
     /// on every session-end route the owned transactions are aborted (see the cleanup path below).
     ///
+    /// `pool_registry` is the same shared, process-global [`PoolRegistry`] the handler resolves
+    /// pools out of (M1-S8a Task 12). The session needs it for ONE thing: the `HELLO_ACK` pool
+    /// metadata, whose `server_version` is learned lazily off the registry's per-pool cache. It is
+    /// deliberately the SAME registry the SQL handler uses, so a version probe checks out of the
+    /// very pool a subsequent statement will run on.
+    ///
     /// `epoch` is the daemon's single boot-time draw, passed in (not redrawn per connection) so
     /// every connection served by this running instance observes the identical `boot_epoch`
     /// (SPEC §19.1) — the caller (`main`, or a test harness) is responsible for drawing it once
@@ -238,6 +250,7 @@ impl Session {
         stream: UnixStream,
         config: Config,
         epoch: BootEpoch,
+        pool_registry: Arc<PoolRegistry>,
         tx_registry: Arc<TxRegistry>,
         factory: HandlerFactory,
     ) {
@@ -339,10 +352,22 @@ impl Session {
             }
         };
 
+        // The per-pool metadata, with `server_version` learned lazily per pool, CONCURRENTLY, and
+        // bounded AS A WHOLE by `PoolRegistry::VERSION_PROBE_BUDGET` — never fatal: a pool whose
+        // backend is unreachable (or merely slow) advertises `server_version: nil` and the
+        // handshake still completes. The budget is deliberately well under the client's default
+        // 5 s `ioTimeout`, which covers the HELLO_ACK read (`Ferro.php`/`Transport.php`).
+        //
+        // The registry is the SINGLE source of the advertised pool list — deliberately not "the
+        // registry, or `config.pools` when the registry is empty". Every `PoolRegistry` in the tree
+        // is built FROM a `Config`, so a pool-bearing config never yields a pool-less registry and
+        // such a fallback branch could not fire; and two derivations of one wire field are exactly
+        // how the two drift. `Session::run`'s pool-less path builds its own (empty) registry and so
+        // advertises no pools, which is what it has.
         let ack = handshake::hello_ack_frame(
             first.header.request_id,
             epoch,
-            handshake::pool_info_from_config(&config),
+            pool_registry.pool_info().await,
         );
         if control_tx.send(ControlMsg::bare(ack)).await.is_err() {
             // Writer already gone; nothing left to do.

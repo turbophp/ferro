@@ -260,8 +260,12 @@ consuming tier's job (a Doctrine driver needs the literal substring `mariadb` to
 branch), and normalising here would bake one ecosystem's conventions into the protocol. And
 **`nil` is a legitimate steady state, not an error**: the handshake never depends on a backend being
 reachable — `ferrod` boots and serves `HELLO_ACK` with every upstream down — so a client must treat
-an absent version as "unknown", never as a failure. M1-S8a Task 11 emits `nil` for every pool; Task
-12 is what learns the real string.
+an absent version as "unknown", never as a failure. Since M1-S8a Task 12 the engine LEARNS the
+string, lazily, on the first handshake that asks: every pool is probed concurrently under one
+bounded budget, a success is cached with a TTL and a failure with a short backoff, and any pool that
+has not answered when the budget expires simply rides as `nil` for that handshake. So `nil` may mean
+"never learned", "learned then expired", or "not learned YET" — all three are the same contract to a
+client, and none of them can fail or delay the handshake.
 
 The DSN is **never** on the wire (SPEC §12 — it is a server-side secret), and `pools` is ordered by
 `name` so two connections to one engine see the identical list.

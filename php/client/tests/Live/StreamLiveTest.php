@@ -34,8 +34,7 @@ final class StreamLiveTest extends LiveTestCase
 
     private function connection(): Connection
     {
-        $session = $this->connect();
-        $session->hello();
+        $session = $this->connect(); // handshakes (LiveTestCase::connect)
         return new Connection($session, 'default');
     }
 

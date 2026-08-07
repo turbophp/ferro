@@ -34,8 +34,7 @@ final class TypesLiveTest extends LiveTestCase
 
     private function connection(?TypePolicyOptions $types = null): Connection
     {
-        $session = $this->connect();
-        $session->hello();
+        $session = $this->connect(); // handshakes (LiveTestCase::connect)
         return new Connection($session, 'default', types: $types);
     }
 
