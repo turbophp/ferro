@@ -57,7 +57,16 @@
 //!   `json_valid()` CHECK, byte-identical on the wire to a plain `LONGTEXT`. Promoting a utf8
 //!   `LONGTEXT` to `JSON` would be the silent miscast charter rule 6 forbids.
 //!
-//! Out-of-scope types (`YEAR`, `BIT`, `ENUM`/`SET`, `GEOMETRY`, `VECTOR`, …) are a LOUD
+//! **M1-S8a: `ENUM` is admitted as a string.** An `ENUM` cell's binary-protocol value IS its label
+//! string in the column's charset, so it takes the SAME charset branch as every other string type
+//! (`Text`, or `Bytes` on a binary collation) — lossless, not a promotion. Measured on both
+//! engines, an `ENUM` column arrives as `MYSQL_TYPE_STRING` carrying `ENUM_FLAG` (the dedicated
+//! `MYSQL_TYPE_ENUM` code never reaches the client), which is what unblocks DBAL's schema manager:
+//! `information_schema.COLUMNS.COLUMN_KEY` and `referential_constraints.UPDATE_RULE` are ENUMs on
+//! MySQL 8. **`SET` stays out of scope** — its wire form is a comma-joined MULTI-value string, a
+//! different type rather than a longer one.
+//!
+//! Out-of-scope types (`YEAR`, `BIT`, `SET`, `GEOMETRY`, `VECTOR`, …) are a LOUD
 //! `PoolError::Unsupported` NAMING the column and its native type — never a silent miscast. A cell
 //! whose driver `Value` variant does not match its column kind is a client-side decode mismatch
 //! surfaced as `PoolError::Backend` (NonRetryable) — NEVER `ConnectionLost`, so it can never mint a
@@ -119,6 +128,18 @@ pub enum MyKind {
     Json,
 }
 
+/// The string/blob family's Text-vs-Bytes decision: the binary collation (63) means a byte string,
+/// anything else is character data. Shared by the `STRING`-family arm and the standalone
+/// `MYSQL_TYPE_ENUM` arm so the two can never diverge — the ENUM rejection used to live in BOTH
+/// places, and the string-family one is the only one live traffic ever reaches.
+fn string_family_kind(col: &Column) -> MyKind {
+    if col.character_set() == BINARY_COLLATION_ID {
+        MyKind::Bytes
+    } else {
+        MyKind::Text
+    }
+}
+
 /// Classify a MySQL column into its canonical [`MyKind`], or a LOUD `Unsupported` naming the column
 /// and its out-of-scope native type. This is the single source of truth for BOTH the `ColMeta` tag
 /// and the cell extraction, so `cols` and `rows` can never disagree on a column's type.
@@ -167,8 +188,8 @@ pub fn column_kind(col: &Column) -> Result<MyKind, PoolError> {
         // MySQL 8 only. MariaDB has no JSON type code at all, so this arm simply never fires there
         // and its `JSON` column falls into the string family below as `Text` (by design, hazard 25).
         ColumnType::MYSQL_TYPE_JSON => Ok(MyKind::Json),
-        // The string/blob family: charset decides Text vs Bytes. ENUM/SET arrive here (as STRING
-        // with a flag) but are out of scope — reject them loudly rather than treat as Text.
+        // The string/blob family: charset decides Text vs Bytes. ENUM and SET arrive here (as
+        // STRING carrying a flag); ENUM is admitted as of M1-S8a, SET stays out of scope.
         ColumnType::MYSQL_TYPE_VARCHAR
         | ColumnType::MYSQL_TYPE_VAR_STRING
         | ColumnType::MYSQL_TYPE_STRING
@@ -176,23 +197,34 @@ pub fn column_kind(col: &Column) -> Result<MyKind, PoolError> {
         | ColumnType::MYSQL_TYPE_TINY_BLOB
         | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
         | ColumnType::MYSQL_TYPE_LONG_BLOB => {
-            if flags.contains(ColumnFlags::ENUM_FLAG) {
-                return Err(unsupported(col, "ENUM"));
-            }
+            // M1-S8a: `ENUM_FLAG` is NO LONGER a rejection. An ENUM cell's binary-protocol value IS
+            // the label string in the column's charset — carrying it as TEXT is lossless, not a
+            // promotion (contrast MariaDB's JSON-as-LONGTEXT, which WOULD be a promotion because
+            // the wire cannot distinguish it from a plain LONGTEXT).
+            //
+            // THIS is the fix that unblocks DBAL's schema manager, and it is sufficient on its own:
+            // measured on MySQL 8.4 and MariaDB 11.8, an ENUM column — whether it is
+            // `information_schema.COLUMNS.COLUMN_KEY`, `referential_constraints.UPDATE_RULE`, or a
+            // user-declared `ENUM('a','b')` — arrives as MYSQL_TYPE_STRING + ENUM_FLAG and lands
+            // here. The dedicated MYSQL_TYPE_ENUM code never reaches the client.
             if flags.contains(ColumnFlags::SET_FLAG) {
+                // SET stays out of scope: its wire form is a COMMA-JOINED multi-value string, a
+                // different type rather than a longer one.
                 return Err(unsupported(col, "SET"));
             }
-            if col.character_set() == BINARY_COLLATION_ID {
-                Ok(MyKind::Bytes)
-            } else {
-                Ok(MyKind::Text)
-            }
+            Ok(string_family_kind(col))
         }
         // Still deferred in S7 (SPEC §22.2) — each a loud, diagnosable refusal, named individually
         // so the message tells an operator WHICH type they hit rather than "something".
         ColumnType::MYSQL_TYPE_YEAR => Err(unsupported(col, "YEAR")),
         ColumnType::MYSQL_TYPE_BIT => Err(unsupported(col, "BIT")),
-        ColumnType::MYSQL_TYPE_ENUM => Err(unsupported(col, "ENUM")),
+        // Unreachable from any server this project tests against: both engines send an ENUM column
+        // as MYSQL_TYPE_STRING + ENUM_FLAG (handled above). Fixed anyway so a server or driver
+        // version that DOES send the dedicated code cannot hit a stale refusal — but deliberately
+        // NOT the subject of a live test, because no live traffic can reach it and such a test
+        // would be a guard that cannot fail. The offline `column_kind` unit tests, which build the
+        // `Column` fixture directly, are its only coverage and that is the honest amount.
+        ColumnType::MYSQL_TYPE_ENUM => Ok(string_family_kind(col)),
         ColumnType::MYSQL_TYPE_SET => Err(unsupported(col, "SET")),
         ColumnType::MYSQL_TYPE_GEOMETRY => Err(unsupported(col, "GEOMETRY")),
         ColumnType::MYSQL_TYPE_VECTOR => Err(unsupported(col, "VECTOR")),
@@ -407,7 +439,7 @@ fn unsupported(col: &Column, what: &str) -> PoolError {
          BINARY/VARBINARY/BLOB) plus the M1-S7 canonical tags DECIMAL, DATE, TIME, \
          TIMESTAMP (datetime), TIMESTAMPTZ (timestamp) and JSON (MySQL 8's JSON type; MariaDB's \
          JSON is a LONGTEXT alias and reads as TEXT). \
-         Deferred: YEAR, BIT, ENUM, SET, GEOMETRY and VECTOR.",
+         Deferred: YEAR, BIT, SET, GEOMETRY and VECTOR.",
         col.name_str(),
         col.column_type(),
         col.flags(),
@@ -622,8 +654,76 @@ mod tests {
         );
     }
 
+    /// M1-S8a: an ENUM column classifies as its charset's string kind, in BOTH places the type can
+    /// be spelled. The FIRST case is the one live traffic actually takes (measured: both engines
+    /// send an ENUM as `MYSQL_TYPE_STRING | ENUM_FLAG`); the SECOND can only be reached from a
+    /// hand-built `Column`, which is exactly why it is tested here and NOT in the live gate — a
+    /// live test aimed at it could never fail.
+    #[test]
+    fn s8a_enum_classifies_as_a_string_in_both_spellings() {
+        // The reachable spelling.
+        assert_eq!(
+            kind(
+                ColumnType::MYSQL_TYPE_STRING,
+                ColumnFlags::ENUM_FLAG,
+                4,
+                UTF8MB4_MYSQL
+            ),
+            MyKind::Text
+        );
+        assert_eq!(
+            kind(
+                ColumnType::MYSQL_TYPE_STRING,
+                ColumnFlags::ENUM_FLAG,
+                4,
+                UTF8MB4_MARIA
+            ),
+            MyKind::Text
+        );
+        // A binary-collation ENUM takes the SAME charset branch as every other string type.
+        assert_eq!(
+            kind(
+                ColumnType::MYSQL_TYPE_STRING,
+                ColumnFlags::ENUM_FLAG,
+                4,
+                BIN
+            ),
+            MyKind::Bytes
+        );
+        // The unreachable-but-fixed spelling.
+        assert_eq!(
+            kind(ColumnType::MYSQL_TYPE_ENUM, NO_FLAGS, 4, UTF8MB4_MYSQL),
+            MyKind::Text
+        );
+    }
+
+    /// SET stays out of scope in BOTH spellings, and the refusal names the type in a way that
+    /// CANNOT be satisfied by the message's trailing "Deferred: …" list (hazard 65).
+    #[test]
+    fn s8a_set_stays_unsupported_in_both_spellings() {
+        for (ct, flags) in [
+            (ColumnType::MYSQL_TYPE_STRING, ColumnFlags::SET_FLAG),
+            (ColumnType::MYSQL_TYPE_SET, NO_FLAGS),
+        ] {
+            let c = col(ct, flags, 12, UTF8MB4_MARIA);
+            let msg = match column_kind(&c) {
+                Err(PoolError::Unsupported(m)) => m,
+                other => panic!("{ct:?} must stay Unsupported, got {other:?}"),
+            };
+            assert!(
+                msg.contains("MySQL SET ("),
+                "the refusal must name SET as the OFFENDING type, not merely list it among the \
+                 deferred ones: {msg}"
+            );
+        }
+    }
+
     /// The DEFERRAL lock. These stay a loud `Unsupported` in S7 (§22.2) — repointed from the
     /// pre-S7 set, which claimed `BIGINT UNSIGNED`/`DECIMAL`/the date family were out of scope.
+    ///
+    /// **M1-S8a shrinks it by exactly one case.** `MYSQL_TYPE_STRING | ENUM_FLAG` — the spelling
+    /// every live ENUM column actually arrives as — is now ADMITTED as a string, so it moved to
+    /// `s8a_enum_classifies_as_a_string_in_both_spellings`. Everything else here is untouched.
     #[test]
     fn deferred_types_stay_unsupported() {
         let cases = [
@@ -634,12 +734,6 @@ mod tests {
                 BIN,
             ),
             (ColumnType::MYSQL_TYPE_BIT, UNSIGNED, 8, BIN),
-            (
-                ColumnType::MYSQL_TYPE_STRING,
-                ColumnFlags::ENUM_FLAG,
-                4,
-                UTF8MB4_MYSQL,
-            ),
             (
                 ColumnType::MYSQL_TYPE_STRING,
                 ColumnFlags::SET_FLAG,

@@ -280,6 +280,25 @@ pub fn json_to_text(raw: &[u8], jsonb: bool) -> Result<String, PoolError> {
         .map_err(|e| backend(format!("json: payload is not valid UTF-8: {e}")))
 }
 
+/// PG's `"char"` (OID 18) is a SINGLE BYTE, not a string — `postgres-types` reads it as `i8`. Render
+/// it the way PG's own `charout` does: `'\0'` is the EMPTY string (which is what `pg_attribute
+/// .attidentity` holds for a non-identity column, and what DBAL's schema manager compares against),
+/// any ASCII byte is that one character.
+///
+/// A non-ASCII byte has no canonical-text form (`PROTOCOL.md` §3.2 defines none) and inventing one
+/// would differ between the two codecs — so it is a client-side decode mismatch:
+/// `PoolError::Backend` (NonRetryable), **never** `ConnectionLost`, so it can never mint a false
+/// §19.3 `Indeterminate` (SPEC §9.1).
+pub(crate) fn char_byte_to_text(b: u8) -> Result<String, PoolError> {
+    match b {
+        0 => Ok(String::new()),
+        0x01..=0x7f => Ok((b as char).to_string()),
+        _ => Err(backend(format!(
+            "PG \"char\" byte 0x{b:02x} is not ASCII and has no canonical text form"
+        ))),
+    }
+}
+
 /// Emits the first `take` (1..=4) decimal characters of one base-10000 group. With
 /// `strip_leading`, leading zeros are suppressed but the **last** character is always emitted —
 /// PG's own first-group rule, which is what makes a zero `numeric` render `"0"` and not `""`.

@@ -1095,12 +1095,9 @@ async fn mysql_family_deferrals_are_still_loud_through_the_daemon() {
         )
         .await;
 
-        for (col, native) in [
-            ("c_year", "YEAR"),
-            ("c_bit", "BIT"),
-            ("c_enum", "ENUM"),
-            ("c_set", "SET"),
-        ] {
+        // M1-S8a (§22.2 (q)): `c_enum` left this loop — an ENUM now READS as its label. The
+        // coverage MOVED to the positive assertion right after it, on the same live table.
+        for (col, native) in [("c_year", "YEAR"), ("c_bit", "BIT"), ("c_set", "SET")] {
             rid += 1;
             assert_unsupported(
                 &mut client,
@@ -1111,6 +1108,18 @@ async fn mysql_family_deferrals_are_still_loud_through_the_daemon() {
             )
             .await;
         }
+
+        // M1-S8a: the ENUM column is ADMITTED, end to end through the daemon, on BOTH engines —
+        // its binary-protocol value IS the label string, so carrying it as TEXT is lossless.
+        rid += 1;
+        let (head, v) = probe(&mut client, rid, &format!("SELECT c_enum FROM {t}")).await;
+        assert_eq!(
+            head,
+            tag::TEXT,
+            "[{}] an ENUM column classifies as TEXT since M1-S8a (§22.2 (q))",
+            engine.label()
+        );
+        assert_eq!(v, Value::Text("a".into()));
 
         // MariaDB's native UUID: measured, NOT Unsupported. It reaches the wire as
         // MYSQL_TYPE_STRING/utf8mb4 — byte-identical to a CHAR(36) — so it classifies TEXT by
@@ -1145,7 +1154,10 @@ async fn mysql_family_deferrals_are_still_loud_through_the_daemon() {
         }
 
         assert_session_alive(&mut client, 7).await;
-        println!("  [{}] YEAR/BIT/ENUM/SET still loud", engine.label());
+        println!(
+            "  [{}] YEAR/BIT/SET still loud; ENUM reads as TEXT",
+            engine.label()
+        );
     }
 }
 

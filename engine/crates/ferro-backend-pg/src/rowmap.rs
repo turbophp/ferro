@@ -82,6 +82,19 @@ pub enum ExtractType {
     /// `jsonb` — one version byte + the document text → `Value::Json` (PG normalizes jsonb, so the
     /// document text is PG's normalized form, not the client's input bytes).
     Jsonb,
+    // ---- M1-S8a catalog scalars (the types DBAL's `AbstractSchemaManager` selects). `name`
+    // (OID 19) is NOT here: `Type::NAME` is already in `String`'s `FromSql::accepts` list, so it
+    // folds straight into the existing `Text` arm with no new machinery.
+    /// `"char"` (OID 18) — ONE byte read as `i8`, rendered by [`crate::pgtext::char_byte_to_text`].
+    /// Not `Text`: the payload is a bare byte, so `String`'s `FromSql` would reject it outright.
+    CharByte,
+    /// `oid` (OID 26) — read as `u32`, widened losslessly to `Value::I64`.
+    OidU32,
+    /// The `reg*` alias family (`regtype` 2206, `regclass` 2205) — their BINARY payload is a bare
+    /// 4-byte OID (`regtypesend` IS `oidsend`), so the only truthful report is the numeric oid.
+    /// A caller wanting the NAME casts in SQL (`::text` / `format_type(...)`); resolving it here
+    /// would mean a catalog round trip the engine must not make (charter rule 6).
+    RegOid,
 }
 
 /// Maps a PG column's type to the canonical `Value` tag (for `ColMeta`). Returns
@@ -98,9 +111,15 @@ pub enum ExtractType {
 pub fn oid_to_tag(col_name: &str, ty: &Type) -> Result<u8, PoolError> {
     match oid_extract_type(ty.oid()) {
         Some(ExtractType::Bool) => Ok(tag::BOOL),
-        Some(ExtractType::I16 | ExtractType::I32 | ExtractType::I64) => Ok(tag::I64),
+        Some(
+            ExtractType::I16
+            | ExtractType::I32
+            | ExtractType::I64
+            | ExtractType::OidU32
+            | ExtractType::RegOid,
+        ) => Ok(tag::I64),
         Some(ExtractType::F32 | ExtractType::F64) => Ok(tag::F64),
-        Some(ExtractType::Text) => Ok(tag::TEXT),
+        Some(ExtractType::Text | ExtractType::CharByte) => Ok(tag::TEXT),
         Some(ExtractType::Bytes) => Ok(tag::BYTES),
         Some(ExtractType::Numeric) => Ok(tag::DECIMAL),
         Some(ExtractType::Date) => Ok(tag::DATE),
@@ -134,7 +153,13 @@ pub fn oid_extract_type(oid: Oid) -> Option<ExtractType> {
         o if o == Type::INT8.oid() => Some(ExtractType::I64),
         o if o == Type::FLOAT4.oid() => Some(ExtractType::F32),
         o if o == Type::FLOAT8.oid() => Some(ExtractType::F64),
-        o if o == Type::TEXT.oid() || o == Type::VARCHAR.oid() || o == Type::BPCHAR.oid() => {
+        // `name` (OID 19) folds into the EXISTING Text arm: `Type::NAME` is already in `String`'s
+        // `FromSql::accepts` list, so no raw read and no new extraction kind is involved.
+        o if o == Type::TEXT.oid()
+            || o == Type::VARCHAR.oid()
+            || o == Type::BPCHAR.oid()
+            || o == Type::NAME.oid() =>
+        {
             Some(ExtractType::Text)
         }
         o if o == Type::BYTEA.oid() => Some(ExtractType::Bytes),
@@ -148,6 +173,10 @@ pub fn oid_extract_type(oid: Oid) -> Option<ExtractType> {
         o if o == Type::UUID.oid() => Some(ExtractType::Uuid),
         o if o == Type::JSON.oid() => Some(ExtractType::Json),
         o if o == Type::JSONB.oid() => Some(ExtractType::Jsonb),
+        // ---- M1-S8a catalog scalars.
+        o if o == Type::CHAR.oid() => Some(ExtractType::CharByte),
+        o if o == Type::OID.oid() => Some(ExtractType::OidU32),
+        o if o == Type::REGTYPE.oid() || o == Type::REGCLASS.oid() => Some(ExtractType::RegOid),
         _ => None,
     }
 }
@@ -263,6 +292,29 @@ pub fn extract_value(row: &Row, idx: usize, oid: Oid) -> Result<crate::Value, Po
             Ok(raw_text(row, idx, |b| pgtext::json_to_text(b, true))?
                 .map_or(Value::Null, Value::Json))
         }
+        // ---- M1-S8a catalog scalars.
+        Some(ExtractType::CharByte) => Ok(get_opt::<i8>(row, idx)?
+            .map_or(Ok(Value::Null), |b| {
+                pgtext::char_byte_to_text(b as u8).map(Value::Text)
+            })?),
+        Some(ExtractType::OidU32) => {
+            Ok(get_opt::<u32>(row, idx)?.map_or(Value::Null, |n| Value::I64(i64::from(n))))
+        }
+        // `u32`'s `FromSql::accepts` is `Type::OID` ONLY, so a `regtype`/`regclass` cannot use it.
+        // The payload is nevertheless a 4-byte big-endian oid, read here through the gate-local raw
+        // getter and decoded explicitly — never guessed.
+        Some(ExtractType::RegOid) => Ok(match get_opt::<RawBytes>(row, idx)? {
+            None => Value::Null,
+            Some(b) => {
+                let arr: [u8; 4] = b.0.try_into().map_err(|_| {
+                    PoolError::Backend(format!(
+                        "PG reg* payload must be 4 bytes, got {}",
+                        b.0.len()
+                    ))
+                })?;
+                Value::I64(i64::from(u32::from_be_bytes(arr)))
+            }
+        }),
         // Unreachable in practice — `oid_to_tag` refused this OID at cols-build, before the query
         // ran. Kept as the belt-and-braces half of the lockstep pair (hazard 18), and it names the
         // column off the ROW's own descriptor, which is where the identity lives mid-stream.
@@ -303,8 +355,12 @@ fn unsupported_column(col_name: &str, ty: &Type) -> PoolError {
         "unsupported type for column \"{col_name}\": PG type {} (OID {}). \
          Supported: NULL/BOOL/I64/F64/TEXT/BYTES \
          (bool, int2/4/8, float4/8, text/varchar/bpchar, bytea) plus the M1-S7 canonical tags \
-         DECIMAL (numeric), DATE, TIME, TIMESTAMP, TIMESTAMPTZ, UUID and JSON (json/jsonb). \
-         Deferred: timetz, arrays, interval, inet, and every enum/composite/range type. \
+         DECIMAL (numeric), DATE, TIME, TIMESTAMP, TIMESTAMPTZ, UUID and JSON (json/jsonb) \
+         plus the M1-S8a catalog scalars name and \"char\" (as TEXT) and oid, regtype and \
+         regclass (as I64 — their binary payload IS a 4-byte oid; cast to ::text or \
+         format_type(..) for the name). \
+         Deferred: timetz, arrays (incl. oidvector), interval, inet, and every \
+         enum/composite/range type. \
          (A DOMAIN is reported by PG as its BASE type, so it is supported iff that base is.)",
         ty.name(),
         ty.oid()
@@ -413,6 +469,64 @@ mod tests {
                 "{ty:?} tag must be Unsupported"
             );
         }
+    }
+
+    /// M1-S8a: the catalog scalars DBAL's `AbstractSchemaManager` selects on every introspection.
+    /// Both gates must admit them — `oid_to_tag` (cols-build) and `oid_extract_type` (per-cell) are
+    /// matches over ONE table precisely so they cannot drift (hazard 7).
+    #[test]
+    fn s8a_catalog_scalars_are_admitted_by_both_gates() {
+        for (ty, want) in [
+            (Type::NAME, tag::TEXT),
+            (Type::CHAR, tag::TEXT),
+            (Type::OID, tag::I64),
+            (Type::REGTYPE, tag::I64),
+            (Type::REGCLASS, tag::I64),
+        ] {
+            assert!(
+                oid_extract_type(ty.oid()).is_some(),
+                "{ty:?} must have an extraction type"
+            );
+            assert_eq!(
+                oid_to_tag("c", &ty).expect("admitted"),
+                want,
+                "{ty:?} must map to the canonical tag {want}"
+            );
+        }
+    }
+
+    /// The still-deferred neighbours stay LOUD — admitting the catalog family must not quietly
+    /// widen anything else.
+    #[test]
+    fn s8a_catalog_admission_does_not_widen_the_deferred_set() {
+        for ty in [
+            Type::TIMETZ,
+            Type::INTERVAL,
+            Type::INET,
+            Type::INT4_ARRAY,
+            Type::OID_VECTOR,
+        ] {
+            assert!(
+                oid_to_tag("c", &ty).is_err(),
+                "{ty:?} must stay a loud Unsupported"
+            );
+        }
+    }
+
+    /// PG's `"char"` is one BYTE, and `'\0'` — what `attidentity` holds on a non-identity column —
+    /// renders as the EMPTY string, exactly as PG's own text output does. A non-ASCII byte has no
+    /// canonical text form and is a loud decode mismatch, never a lossy replacement character.
+    #[test]
+    fn s8a_char_byte_rendering_matches_pg_text_output() {
+        assert_eq!(crate::pgtext::char_byte_to_text(0).unwrap(), "");
+        assert_eq!(crate::pgtext::char_byte_to_text(b'a').unwrap(), "a");
+        assert_eq!(crate::pgtext::char_byte_to_text(b'd').unwrap(), "d");
+        let e =
+            crate::pgtext::char_byte_to_text(0xff).expect_err("non-ASCII has no canonical form");
+        assert!(
+            matches!(e, PoolError::Backend(_)),
+            "a decode mismatch is Backend, never ConnectionLost"
+        );
     }
 
     /// The `Unsupported` message must describe the CURRENT contract. It said "out-of-M0 … only

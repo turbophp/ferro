@@ -829,6 +829,10 @@ async fn zero_dates_render_as_the_verbatim_sentinel(url: &str, label: &str) {
 
 /// The live DEFERRAL guard: each must be a loud `Unsupported` raised at cols-build — BEFORE the
 /// query runs, so the connection stays clean and immediately reusable.
+///
+/// **M1-S8a removed `ENUM` from the refusal list and MOVED it, in this same function, to a positive
+/// read assertion** — an ENUM cell's binary-protocol value IS its label string, so it now reads as
+/// `TEXT`. The coverage is relocated, not deleted: `e` is still exercised on the same live table.
 async fn deferred_column_types_are_refused_before_execution(url: &str, label: &str) {
     let backend = MysqlBackend::new(url);
     let mut conn = backend.connect().await.expect("connect");
@@ -848,7 +852,8 @@ async fn deferred_column_types_are_refused_before_execution(url: &str, label: &s
         .await
         .expect("seed");
 
-    for (col, native) in [("y", "YEAR"), ("b", "BIT"), ("e", "ENUM"), ("s", "SET")] {
+    // M1-S8a: `e` (ENUM) is no longer here — see the positive assertion after the loop.
+    for (col, native) in [("y", "YEAR"), ("b", "BIT"), ("s", "SET")] {
         let err = backend
             .query(&mut conn, &format!("SELECT {col} FROM ferro_deferred"), &[])
             .await
@@ -870,6 +875,23 @@ async fn deferred_column_types_are_refused_before_execution(url: &str, label: &s
         assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
         println!("  [{label}] deferred {native:<5} -> Unsupported, conn clean");
     }
+
+    // M1-S8a: ENUM is ADMITTED as its label string, on the same table the refusals above use.
+    let enum_row = backend
+        .query(&mut conn, "SELECT e FROM ferro_deferred", &[])
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] an ENUM column must now READ, got {e:?}"));
+    assert_eq!(
+        enum_row.rows,
+        vec![vec![Value::Text("a".into())]],
+        "[{label}] an ENUM cell's wire value IS its label string"
+    );
+    assert_eq!(
+        enum_row.cols[0].tag,
+        enum_row.rows[0][0].tag(),
+        "[{label}] HEAD vs producer on the ENUM column"
+    );
+    println!("  [{label}] admitted ENUM  -> TEXT(\"a\")");
     conn.mysql.disconnect().await.ok();
 }
 

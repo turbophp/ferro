@@ -26,9 +26,10 @@
 //!    values PG can store, and — for wire shapes PG never *emits* but does *accept*, notably
 //!    `dscale` truncation — a crafted binary payload pushed in through `COPY ... (FORMAT binary)`
 //!    and rendered back by PG itself.
-//! 4. **The deferrals are still refused, live.** `timetz` in particular must never fall into the
-//!    `TIME` arm: its payload is 12 bytes (i64 µs + i32 zone), so admitting it would fail
-//!    mid-decode, after `HEAD` is on the wire.
+//! 4. **The deferrals are still refused, live** — and, since M1-S8a (§22.2 (q)), the CATALOG
+//!    scalars beside them are admitted, in the same test, on the same connection. `timetz` in
+//!    particular must never fall into the `TIME` arm: its payload is 12 bytes (i64 µs + i32 zone),
+//!    so admitting it would fail mid-decode, after `HEAD` is on the wire.
 //! 5. **DOMAINs need no unwrap on the READ side, and DO on the BIND side.** PG reports a domain as
 //!    its BASE type in the `RowDescription`, so a domain over a supported base is admitted and one
 //!    over an unsupported base is refused — by the base OID, in both cases. It does NOT do that for
@@ -755,7 +756,11 @@ async fn head_tag_equals_emitted_tag_on_both_paths() {
 }
 
 /// The live DEFERRAL guard. Each of these must be a loud `Unsupported` raised at cols-build —
-/// BEFORE the query runs, so the connection stays clean and usable.
+/// BEFORE the query runs, so the connection stays clean and usable — paired, since M1-S8a, with
+/// the ADMISSION guard for the catalog scalars that left this list (`"char"`, `name`, `oid`,
+/// `regtype`, `regclass`). Keeping both halves in one test on one connection is what makes the
+/// boundary visible: `oidvector` is a catalog type too and stays refused, so the family was
+/// admitted by OID, not by association.
 ///
 /// `timetz` carries the real trap: its payload is 12 bytes (i64 µs + i32 zone) against `time`'s 8,
 /// so admitting it into the `TIME` arm would fail MID-DECODE, after `HEAD` is already on the wire.
@@ -772,9 +777,12 @@ async fn deferred_column_types_are_refused_before_execution() {
         "ARRAY[1,2]::int4[]",
         "'1 day'::interval",
         "'10.0.0.1'::inet",
-        // NB the quotes: `::char` is `bpchar` (a SUPPORTED text type); `::"char"` is PG's internal
-        // 1-byte `"char"` (OID 18), a named S8 catalog-scalar carry that is still refused today.
-        "'a'::\"char\"",
+        // M1-S8a (§22.2 (q)): `'a'::"char"` LEFT this list — PG's internal 1-byte `"char"` (OID 18)
+        // is now admitted as TEXT, together with `name`/`oid`/`regtype`/`regclass`. The coverage
+        // MOVED to the positive assertion after the loop, so it is relocated, not dropped.
+        // (`oidvector` takes its place here: an array-shaped catalog type that stays deferred, so
+        // admitting the catalog family did not quietly widen the array class.)
+        "'1 2'::oidvector",
     ] {
         let err = co
             .query(&format!("SELECT {expr}"), &[])
@@ -791,6 +799,35 @@ async fn deferred_column_types_are_refused_before_execution() {
             .unwrap_or_else(|e| panic!("conn must survive the refusal of `{expr}`: {e:?}"));
         assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
         println!("  deferred {expr:<28} -> Unsupported, conn clean");
+    }
+
+    // M1-S8a: the catalog scalars are ADMITTED, on the same live connection. `"char"` is the one
+    // that needs a value assertion rather than a bare tag: it is a single BYTE, and `'\0'` — what
+    // `pg_attribute.attidentity` holds on a non-identity column — must render as the EMPTY string,
+    // exactly as PG's own text output does.
+    for (expr, want) in [
+        ("'a'::\"char\"", Value::Text("a".into())),
+        // `0::int4::"char"` is the NUL byte (PG's `i4tochar`); `chr(0)` is rejected by PG itself
+        // with `54000 null character not permitted`, so it cannot be the fixture. This is the
+        // `pg_attribute.attidentity`-on-a-non-identity-column value, and PG's own text output for
+        // it is the EMPTY string — `length(0::int4::"char"::text)` is 0, measured on PG 17.
+        ("0::int4::\"char\"", Value::Text(String::new())),
+        ("'int4'::name", Value::Text("int4".into())),
+        ("23::oid", Value::I64(23)),
+        ("'int4'::regtype", Value::I64(23)),
+        ("'pg_class'::regclass", Value::I64(1259)),
+    ] {
+        let ok = co
+            .query(&format!("SELECT {expr} AS v"), &[])
+            .await
+            .unwrap_or_else(|e| panic!("`{expr}` must be admitted since M1-S8a: {e:?}"));
+        assert_eq!(ok.rows, vec![vec![want.clone()]], "value of `{expr}`");
+        assert_eq!(
+            ok.cols[0].tag,
+            ok.rows[0][0].tag(),
+            "HEAD vs producer on `{expr}`"
+        );
+        println!("  admitted {expr:<28} -> {want:?}");
     }
 }
 

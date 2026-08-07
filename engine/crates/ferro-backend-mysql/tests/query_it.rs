@@ -116,7 +116,9 @@ async fn scoped_scalars_round_trip(backend: &MysqlBackend, label: &str) {
 /// **REPOINTED in M1-S7 (Task 5b), not deleted.** This test used to create
 /// `ferro_oos (u BIGINT UNSIGNED, m DECIMAL(10,2))` and assert BOTH were refused. Both are now
 /// SUPPORTED (`U64` and `DECIMAL` — proven end-to-end in `mysql_types_it.rs`), so the assertion
-/// moves to the types S7 genuinely still defers (SPEC §22.2): `YEAR`, `BIT`, `ENUM`, `SET`.
+/// moves to the types S7 genuinely still defers (SPEC §22.2): `YEAR`, `BIT`, `SET` — and, since
+/// M1-S8a closed the `ENUM` deferral (§22.2 (q)), `ENUM` moved out of the refusal loop into a
+/// positive read assertion on the SAME table, so the coverage is relocated rather than dropped.
 ///
 /// Two things deliberately NOT in this list, because they are measurably not refusable:
 /// MariaDB's native `UUID` (and `INET4`/`INET6`) reach the wire as `MYSQL_TYPE_STRING` in a
@@ -140,7 +142,8 @@ async fn out_of_scope_column_is_unsupported(backend: &MysqlBackend, label: &str)
         .await
         .expect("insert (the READ types are what's out of scope, not the write)");
 
-    for col in ["y", "b", "e", "s"] {
+    // M1-S8a: `e` (ENUM) left this list — it now reads as its label; see the assertion below.
+    for col in ["y", "b", "s"] {
         let err = backend
             .query(&mut conn, &format!("SELECT {col} FROM ferro_oos"), &[])
             .await
@@ -159,6 +162,13 @@ async fn out_of_scope_column_is_unsupported(backend: &MysqlBackend, label: &str)
             "[{label}] the refusal must name the column `{col}`: {msg}"
         );
     }
+
+    // M1-S8a: ENUM is ADMITTED as its label string (`MYSQL_TYPE_STRING | ENUM_FLAG`).
+    let e = backend
+        .query(&mut conn, "SELECT e FROM ferro_oos", &[])
+        .await
+        .unwrap_or_else(|err| panic!("[{label}] an ENUM column must now READ, got {err:?}"));
+    assert_eq!(e.rows, vec![vec![Value::Text("a".into())]]);
 
     // The conn stayed clean (we errored during cols-build, before running the query).
     let ok = backend
