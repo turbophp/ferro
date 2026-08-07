@@ -115,6 +115,12 @@ async fn drain(
 ) -> Result<(Vec<Row>, u64, Option<u64>), mysql_async::Error> {
     let mut result = conn.mysql.exec_iter(stmt, params).await?;
     let rows = result.collect::<Row>().await?;
+    // ORDER IS LOAD-BEARING — read these AFTER `collect()` has drained the set. Before the drain,
+    // the driver is still reporting the PREVIOUS statement's OK packet, so hoisting either read
+    // above `collect()` makes a SELECT report the prior INSERT's key. Note the engines disagree
+    // about how loudly: hoisting it turns MariaDB 11 RED (`left: Some(1) right: None`) while
+    // MySQL 8 stays GREEN, so this is only caught because BOTH engines run in the integration
+    // lane — do not "simplify" by grouping the reads next to `exec_iter`. (M1-S8a Task 2 review.)
     let affected = result.affected_rows();
     let last_insert_id = result.last_insert_id();
     // Drain any trailing state so the conn is clean for the next statement and `last_ok_packet`

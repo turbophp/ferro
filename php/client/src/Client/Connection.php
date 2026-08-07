@@ -143,8 +143,19 @@ final class Connection
     }
 
     /**
-     * The auto-generated key produced by the most recent statement on this connection, or `null`
-     * when the backend reported none.
+     * The auto-generated key produced by the most recent **autocommit** statement on this
+     * connection, or `null` when the backend reported none.
+     *
+     * **It is NOT updated by statements executed inside `transaction()`** — those run on a
+     * {@see TxHandle}, whose key is read with {@see TxHandle::lastInsertId()} and is deliberately
+     * not propagated back here (M1-S8a Task 2; propagation lands with the imperative transaction
+     * API in Task 9). So after a transaction this still reports the last *autocommit* key, which is
+     * a DIFFERENT, EARLIER statement's — measured: autocommit INSERT → 1, in-transaction INSERT → 2
+     * via the handle, and this accessor still → 1. A caller that maps a driver-level
+     * `lastInsertId()` straight onto this method therefore gets a silently WRONG key for any
+     * transactional insert — the exact class the no-emulation rule below exists to prevent. Pinned
+     * by `ConnectionLastInsertIdTest::testATransactionDoesNotUpdateTheConnectionLevelKey`; when
+     * Task 9 wires propagation, that test changes with the contract, deliberately.
      *
      * MySQL/MariaDB report it on the OK packet of an `INSERT` into an `AUTO_INCREMENT` table.
      * **PostgreSQL always reports `null`** — it has no such protocol field; the idiomatic form is
