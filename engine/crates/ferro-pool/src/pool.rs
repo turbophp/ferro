@@ -44,7 +44,8 @@ enum TxControlVerdict {
     /// Not transaction-control-shaped — run it on the entry's normal path.
     Proceed,
     /// A savepoint operation on a checkout that already has a transaction open. Allowed, but it
-    /// MUST run on the raw TEXT leaf (`PoolBackend::simple_query`) — see [`Checkout::query`].
+    /// MUST run on the raw TEXT leaf (`PoolBackend::simple_query`) — see [`Checkout::query`] — and
+    /// it MUST NOT be fed to the assist lexer — see [`Checkout::apply_classify_for`].
     SavepointPassthrough,
 }
 
@@ -620,7 +621,7 @@ impl<B: PoolBackend> Checkout<B> {
     /// `PoolBackend::simple_query`.
     pub async fn exec(&mut self, sql: &str) -> Result<u64, PoolError> {
         // `exec` binds no parameters, so the guard's no-params rule is trivially satisfied.
-        self.guard_tx_control(sql, &[], "exec")?;
+        let verdict = self.guard_tx_control(sql, &[], "exec")?;
         let pool = Arc::clone(&self.pool);
         // RFQ authority (SPEC §7.1): tx_status is trustworthy only on the Ok arm (post-drain); on
         // Err the atomic may hold a STALE byte, so we read it but let the `is_err() && tx_open`
@@ -651,7 +652,8 @@ impl<B: PoolBackend> Checkout<B> {
         // Assist signal (SPEC §7.1): runs on BOTH the Ok and Err arms — a session-mutating
         // statement that errored is still labeled + tainted (idempotent alongside the Err-arm
         // force above). Never touches `tx_open`/`pin`; RFQ (above) stays the tx authority.
-        self.apply_classify(sql);
+        // SKIPPED for a savepoint passthrough — see `apply_classify_for`.
+        self.apply_classify_for(verdict, sql);
         r
     }
 
@@ -720,7 +722,8 @@ impl<B: PoolBackend> Checkout<B> {
         // Assist signal (SPEC §7.1): runs on BOTH the Ok and Err arms — a session-mutating
         // statement that errored is still labeled + tainted (idempotent alongside the Err-arm
         // force above). Never touches `tx_open`/`pin`; RFQ (above) stays the tx authority.
-        self.apply_classify(sql);
+        // SKIPPED for a savepoint passthrough — see `apply_classify_for`.
+        self.apply_classify_for(verdict, sql);
         r
     }
 
@@ -862,6 +865,41 @@ impl<B: PoolBackend> Checkout<B> {
     /// clears a taint and NEVER touches `self.pin`/`self.tx_open` (those are the RFQ's/tx's).
     /// `classify()` is total (never panics) and multi-statement-aware, so `exec`'s batch path is
     /// covered.
+    /// [`Checkout::apply_classify`], gated on what [`Checkout::guard_tx_control`] decided about this
+    /// same statement — the ONE place the M1-S8a savepoint passthrough opts out of the assist lexer.
+    ///
+    /// **Why a savepoint passthrough must NOT be classified.** `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`
+    /// are not on `ferro-classify`'s safe list, so classifying them yields `Unknown` under the
+    /// default `pin_on_unknown` and TAINTS the connection. On Postgres that is not merely a wasted
+    /// reset, it is the LESS safe direction: a taint selects the FULL reset profile, whose
+    /// `DISCARD ALL` runs `DEALLOCATE ALL` — the exact trigger for the tokio-postgres typeinfo-cache
+    /// poisoning recorded in SPEC §22.2 (m) and ticketed in
+    /// `docs/followups/2026-08-06-discard-all-typeinfo-cache-poisoning.md` (a later custom-type
+    /// lookup then fails with a bare `26000` instead of the loud `Unsupported`). Doctrine emits
+    /// `SAVEPOINT DOCTRINE_<n>` for EVERY nested transaction, so classifying here would poison
+    /// essentially every pooled PG connection that ever served one.
+    ///
+    /// **Why skipping is safe — the taint was never load-bearing.** The engine's own byte-identical
+    /// `SAVEPOINT sp_N` has always run through [`Checkout::tx_control`], which never called the
+    /// lexer at all; and by the time this runs, `guard_tx_control` has already established that the
+    /// statement is a LONE, param-free, savepoint-class statement inside an OPEN transaction. A
+    /// savepoint leaves no session state that outlives its enclosing transaction, and the tx actor
+    /// owns every exit path of that transaction. The narrowness matters: this skip keys off the
+    /// GUARD's verdict, not off a keyword, so a savepoint reaching any path that did NOT pass the
+    /// guard's three refusals is still classified. (Widening `ferro-classify`'s
+    /// `SAFE_LEADING_KEYWORDS` instead would have exempted them everywhere — rejected.)
+    ///
+    /// Everything else — including a user `SET`, `LISTEN`, or temp DDL inside the SAME transaction —
+    /// still runs the full assist lexer and still taints (charter rule 6, proved by
+    /// `s8a_savepoint_passthrough_does_not_taint`).
+    fn apply_classify_for(&mut self, verdict: TxControlVerdict, sql: &str) {
+        // Exhaustive on purpose: a future verdict must decide this question explicitly.
+        match verdict {
+            TxControlVerdict::Proceed => self.apply_classify(sql),
+            TxControlVerdict::SavepointPassthrough => {}
+        }
+    }
+
     fn apply_classify(&mut self, sql: &str) {
         if let Some(trigger) = ferro_classify::classify(
             sql,

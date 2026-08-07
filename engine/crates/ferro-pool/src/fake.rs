@@ -30,6 +30,24 @@ pub struct FakeConn {
     /// Every SQL string passed to `simple_query`/`reset`, in order — lets pin-stub tests
     /// (Task 4) assert the exact sequence (e.g. `["BEGIN", "COMMIT"]`).
     pub recorded: Vec<String>,
+    /// The same statements as `recorded`, but each tagged with WHICH BACKEND LEAF it arrived on:
+    /// `TEXT:{sql}` for `simple_query` (the raw text protocol) and `PREPARED:{sql}` for
+    /// `query`/`query_stream` (the extended/prepared protocol) — the `RESET:{profile:?}` convention,
+    /// applied to statements.
+    ///
+    /// **Why this is a SEPARATE vector and not a prefix on `recorded`.** `recorded` is asserted
+    /// by-value across several suites (`tx/actor.rs`, `pin_stub.rs`, …); re-tagging it in place
+    /// would be a wide, mechanical edit of files unrelated to this concern. This log is purely
+    /// additive, so every existing `recorded` assertion is untouched.
+    ///
+    /// **What it makes falsifiable (M1-S8a, review F2).** The savepoint passthrough deliberately
+    /// routes `Checkout::query` to the TEXT leaf, because MySQL 8.4 rejects `SAVEPOINT` on the
+    /// prepared path with errno `1295`. Without a leaf tag the fake records the bare SQL identically
+    /// on both leaves, so the routing was provable ONLY against a live MySQL 8 container — if the
+    /// container left the lane, the guard went blind. With it,
+    /// `s8a_tx_control_guard_matrix_across_every_guarded_entry` goes RED offline the moment the
+    /// passthrough is re-routed through `PoolBackend::query`.
+    pub leaf_log: Vec<String>,
     pub tx_open: bool,
     fail_next_ping: bool,
     /// One-shot: when set, the NEXT `simple_query()` on this conn returns `PoolError::Backend`
@@ -530,6 +548,7 @@ impl PoolBackend for FakeBackend {
             closed: false,
             created_at: Instant::now(),
             recorded: Vec::new(),
+            leaf_log: Vec::new(),
             tx_open: false,
             fail_next_ping: false,
             fail_next_simple_query: false,
@@ -588,6 +607,8 @@ impl PoolBackend for FakeBackend {
 
     async fn simple_query(&self, conn: &mut Self::Conn, sql: &str) -> Result<u64, PoolError> {
         conn.recorded.push(sql.to_string());
+        // Leaf tag (see `FakeConn::leaf_log`): this IS the raw TEXT protocol.
+        conn.leaf_log.push(format!("TEXT:{sql}"));
         apply_leading_tx_verb(conn, sql);
         // One-shot armed failure (see `arm_fail_next_simple_query`): return a statement-level error
         // WITHOUT flipping `tx_status`, modelling the Err-arm stale-`Idle` case. Consumed here.
@@ -617,6 +638,9 @@ impl PoolBackend for FakeBackend {
         // reaches here, so a test can assert `recorded` to prove `Checkout::query`'s guard fired
         // (or didn't) before delegation.
         conn.recorded.push(sql.to_string());
+        // Leaf tag (see `FakeConn::leaf_log`): this IS the extended/PREPARED protocol — the one
+        // MySQL 8.4 rejects a savepoint on (errno 1295).
+        conn.leaf_log.push(format!("PREPARED:{sql}"));
         apply_leading_tx_verb(conn, sql);
 
         // One-shot armed error (see `arm_next_query_err`): return immediately, bypassing
@@ -659,6 +683,8 @@ impl PoolBackend for FakeBackend {
         // `recorded` stays EMPTY when `Checkout::query_stream` rejects a bare tx-control statement
         // BEFORE delegating here (the cross-tenant-leak guard).
         conn.recorded.push(sql.to_string());
+        // Leaf tag (see `FakeConn::leaf_log`): streaming is the extended/PREPARED protocol too.
+        conn.leaf_log.push(format!("PREPARED:{sql}"));
         apply_leading_tx_verb(conn, sql);
 
         // OPEN gate (item 1): if armed, park here — modelling a slow/blocked prepare+query_raw. The

@@ -166,8 +166,13 @@ fn skip_leading_noise(sql: &str) -> &str {
 /// (bare, `;`-terminated, `WORK`, `TRANSACTION`) ends the transaction.
 ///
 /// **SCOPE — this is a leading-keyword classifier, NOT a parser.** It reads at most the first two
-/// words, so a COMPOUND statement is classified by its leading verb only: `SELECT 1; COMMIT` is
-/// `None`. That is pre-existing behaviour (the guard has always worked this way) and it is not a
+/// **contiguous** words, so a COMPOUND statement is classified by its leading verb only:
+/// `SELECT 1; COMMIT` is `None`. "Contiguous" is load-bearing and narrower than it looks:
+/// [`skip_leading_noise`] strips only LEADING comments, and [`leading_words`] then treats a
+/// comment body's letters as a word — so an INTERIOR comment defeats every two-word rule
+/// (`START /*x*/ TRANSACTION` reads `["START", "X"]` and classifies `None`). All of that is
+/// pre-existing behaviour (the guard has always worked this way), pinned by table rows in
+/// `s8a_tx_control_class_splits_boundary_from_savepoint`, and it is not a
 /// leak — `crate::pool::Checkout::apply_tx_status` reads the real post-statement transaction status
 /// off the protocol signal, so the pin engine still sees a transaction a compound statement opened.
 /// `Checkout`'s guard adds ITS own single-statement requirement on top for the savepoint class,
@@ -421,6 +426,30 @@ mod tests {
             ("SELECT 1; COMMIT", None),
             ("SAVEPOINT s2; START TRANSACTION", Some(Savepoint)),
             ("BEGIN; SELECT 1", Some(Boundary)),
+            // INTERIOR comments: `skip_leading_noise` strips only LEADING noise, and `leading_words`
+            // treats the comment body's letters as a word — so the two words this classifier reads
+            // must be CONTIGUOUS. A comment BETWEEN them defeats every two-word rule. Pinned here as
+            // the measured limit rather than left to be assumed (review F3); each row is the CURRENT
+            // behaviour, not an aspiration.
+            //
+            // The two-word BOUNDARY forms fall to `None` — the only rows here in the permissive
+            // direction. NOT a leak, and measured live on PG 17: the statement runs, then
+            // `Checkout::apply_tx_status` reads the real RFQ `T` byte, sets `tx_open`, and the next
+            // checkout of that conn recycles it (`tx_open=false` for the next tenant). The pin
+            // AUTHORITY is the protocol signal; this classifier is defense-in-depth, never the
+            // authority (SPEC §7.1). Widening it to skip interior comments would mean lexing SQL —
+            // out of scope, and the authority already covers the case.
+            ("START /*x*/ TRANSACTION", None),
+            ("START -- c\nTRANSACTION", None),
+            ("PREPARE /*x*/ TRANSACTION 'x'", None),
+            // The `ROLLBACK`-family rows fall the SAFE way: the second word is no longer `TO`, so
+            // they classify Boundary and the guarded entries REFUSE them. A false refusal, never a
+            // false admission.
+            ("ROLLBACK /*x*/ TO SAVEPOINT s", Some(Boundary)),
+            ("ROLLBACK -- c\nTO SAVEPOINT s", Some(Boundary)),
+            // A comment AFTER the pair is harmless — the two words were already contiguous.
+            ("START TRANSACTION /*x*/ READ ONLY", Some(Boundary)),
+            ("ROLLBACK TO /*x*/ SAVEPOINT s", Some(Savepoint)),
         ];
         for (sql, want) in cases {
             assert_eq!(tx_control_class(sql), *want, "tx_control_class({sql:?})");

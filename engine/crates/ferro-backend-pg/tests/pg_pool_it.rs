@@ -488,6 +488,179 @@ async fn pg_tx_control_savepoint_roundtrip() {
     co.commit_tx().await.expect("commit the tx");
 }
 
+/// **M1-S8a review F1, live on PG: a savepoint passthrough must NOT taint — and the proof is a
+/// prepared statement that SURVIVES the recycle.**
+///
+/// Savepoint verbs are not on `ferro-classify`'s safe list, so feeding a passthrough savepoint to
+/// the assist lexer returns `Unknown` under the default `pin_on_unknown` and TAINTS. On Postgres
+/// that is not "one extra hygiene reset" — it is the LESS safe direction, and this test is what
+/// makes that concrete: a taint selects `ResetProfile::Full` (`DISCARD ALL`), whose `DEALLOCATE ALL`
+/// is the exact trigger for the tokio-postgres typeinfo-cache poisoning recorded in SPEC §22.2 (m)
+/// and ticketed in `docs/followups/2026-08-06-discard-all-typeinfo-cache-poisoning.md`. Doctrine
+/// emits `SAVEPOINT DOCTRINE_<n>` for EVERY nested transaction, so tainting here would poison
+/// essentially every pooled PG connection that has ever served one.
+///
+/// **Why a prepared statement is the right instrument.** `ResetProfile::Targeted` is DEFINED as
+/// `DISCARD ALL` minus the two prepare-destroying statements (`DEALLOCATE ALL`, `DISCARD PLANS`), so
+/// a server-side prepared statement is the one observable that distinguishes the two profiles at
+/// recycle. It is created through `tx_control` — the raw, UNGUARDED text leaf, which never runs the
+/// assist lexer — because a `PREPARE` through `exec()` would taint as `PinCause::Prepare` all by
+/// itself and make the profile question moot. It is read back through the raw client's TEXT
+/// protocol, so the read cannot itself re-prepare anything.
+///
+/// **Falsifiable, and falsified.** With the `apply_classify_for` skip mutated away
+/// (`SavepointPassthrough => self.apply_classify(sql)`) this goes RED at the first `tainted()`
+/// assertion; with those assertions also removed, the `EXECUTE zz_p` below fails with SQLSTATE
+/// `26000` ("prepared statement \"zz_p\" does not exist") — measured, `DISCARD ALL` ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_s8a_savepoint_passthrough_does_not_taint_and_keeps_prepares_across_recycle() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        // Raw, unguarded, un-lexed: create the observable without tainting.
+        co.tx_control("DEALLOCATE ALL").await.expect("clean slate");
+        co.tx_control("PREPARE zz_p AS SELECT 1")
+            .await
+            .expect("PREPARE zz_p via the unguarded tx_control leaf");
+        assert!(
+            !co.tainted(),
+            "pre-condition: the raw tx_control PREPARE must not taint, or this test would be \
+             measuring the wrong thing"
+        );
+
+        co.begin_tx(TxId(41)).await.expect("begin tx");
+        let pid = backend_pid(&mut co).await;
+
+        // THE STATEMENTS UNDER TEST — Doctrine's own nested-transaction SQL, verbatim, through the
+        // guarded `query()` entry (the M1-S8a passthrough).
+        for sql in [
+            "SAVEPOINT DOCTRINE_1",
+            "RELEASE SAVEPOINT DOCTRINE_1",
+            "SAVEPOINT DOCTRINE_2",
+            "ROLLBACK TO SAVEPOINT DOCTRINE_2",
+        ] {
+            co.query(sql, &[])
+                .await
+                .unwrap_or_else(|e| panic!("passthrough {sql:?}: {e:?}"));
+            assert!(
+                !co.tainted(),
+                "F1: a passthrough savepoint must leave the conn UNTAINTED: {sql:?}"
+            );
+            assert_eq!(
+                co.last_pin_cause(),
+                Some(PinCause::Tx),
+                "the cause stays the RFQ tx AUTHORITY, never the lexer's Unknown: {sql:?}"
+            );
+        }
+
+        co.commit_tx().await.expect("commit the tx");
+        assert!(
+            !co.tainted(),
+            "the whole nested-transaction round trip left the conn untainted"
+        );
+        pid
+        // `co` drops -> back to idle UNTAINTED. PG's `clean_reset_profile()` is `Some(Targeted)`, so
+        // a reset still runs at the next checkout -- the TARGETED one, which spares prepares.
+    };
+
+    let mut co2 = pool
+        .checkout()
+        .await
+        .expect("checkout again (recycle runs)");
+    let pid2 = backend_pid(&mut co2).await;
+    assert_eq!(
+        pid1, pid2,
+        "max_size=1 must reuse the SAME backend pid — on a fresh connection `zz_p` would not exist \
+         either, which would make the assertion below a false RED"
+    );
+
+    // TEXT protocol read-back: this cannot itself create a prepared statement.
+    co2.conn_mut()
+        .client
+        .simple_query("EXECUTE zz_p")
+        .await
+        .unwrap_or_else(|e| {
+            // Print the SQLSTATE, not just "db error": the whole point is that the failure mode is
+            // a bare `26000` (prepared statement does not exist), i.e. `DEALLOCATE ALL` ran.
+            let code = e.code().map(|c| c.code().to_string());
+            panic!(
+                "the TARGETED profile must have preserved `zz_p` across the recycle, but EXECUTE \
+                 failed (sqlstate {code:?}: {e}) — DISCARD ALL ran, i.e. the passthrough savepoint \
+                 tainted the conn"
+            )
+        });
+
+    co2.tx_control("DEALLOCATE ALL").await.expect("cleanup");
+}
+
+/// **Charter rule 6, live on PG: the F1 skip is per-statement, NOT a lexer off-switch.**
+///
+/// The savepoint passthrough opts out of `apply_classify` by the GUARD's verdict, so anything else
+/// running on the same checkout — including inside the same transaction, immediately after a
+/// savepoint — is still lexed and still taints. Without this, F1's fix would have widened into a
+/// cross-tenant session-state leak. Proven end-to-end: the `SET` taints (`PinCause::Set`), the
+/// recycle therefore runs the FULL profile, and the next tenant on the SAME backend pid does not
+/// inherit the `search_path`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_s8a_savepoint_skip_does_not_disable_the_lexer_for_other_statements() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout");
+        co.begin_tx(TxId(43)).await.expect("begin tx");
+        co.query("SAVEPOINT DOCTRINE_1", &[])
+            .await
+            .expect("passthrough savepoint");
+        assert!(!co.tainted(), "the savepoint itself must not taint");
+
+        co.exec("SET search_path TO ferro_test_s8a")
+            .await
+            .expect("SET inside the same transaction");
+        assert!(
+            co.tainted(),
+            "charter rule 6: a user SET inside the SAME tx, right after a savepoint, must STILL \
+             taint"
+        );
+        assert_eq!(co.last_pin_cause(), Some(PinCause::Set), "pin-cause DoD");
+
+        // A savepoint AFTER the taint must never CLEAR it (the skip is a no-op, not a reset).
+        co.query("SAVEPOINT DOCTRINE_2", &[])
+            .await
+            .expect("second passthrough savepoint");
+        assert!(
+            co.tainted(),
+            "a savepoint must never clear a taint another statement already set"
+        );
+
+        co.commit_tx().await.expect("commit the tx");
+        backend_pid(&mut co).await
+    };
+
+    let mut co2 = pool
+        .checkout()
+        .await
+        .expect("checkout again (FULL reset runs)");
+    let pid2 = backend_pid(&mut co2).await;
+    assert_eq!(
+        pid1, pid2,
+        "max_size=1 must reuse the SAME backend pid — a fresh conn also starts at the default \
+         search_path, which would be a false green"
+    );
+    let search_path = query_first_text(&mut co2, "SELECT current_setting('search_path')").await;
+    assert_ne!(
+        search_path, "ferro_test_s8a",
+        "the taint selected DISCARD ALL at recycle, so the next tenant must NOT inherit the \
+         search_path; got {search_path:?}"
+    );
+}
+
 /// S6 live: the out-of-band `cancel_handle` cancels an in-flight `Checkout::query` (`pg_sleep`),
 /// which errors with SQLSTATE 57014 (query_canceled) — NOT a hang and NOT a silent success — and
 /// the pinned conn is usable again after a `rollback_tx`. This is the deadline/abort mechanism the

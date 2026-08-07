@@ -157,6 +157,40 @@ async fn s8a_tx_control_guard_matrix_across_every_guarded_entry() {
             "BOTH passthroughs must have reached the backend verbatim: {sql:?}"
         );
 
+        // ROUTING (review F2). The whole reason `Checkout::query` re-routes a savepoint passthrough
+        // is that MySQL 8.4 rejects `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` on the PREPARED path with
+        // errno 1295. `recorded` alone cannot see that — it logs the bare SQL identically on both
+        // leaves — so before `leaf_log` existed this deviation was falsifiable ONLY against a live
+        // MySQL 8 container. The `TEXT:` tag on the THIRD entry (the `query()` passthrough) is what
+        // makes the re-route falsifiable offline: route it back through `PoolBackend::query` and
+        // that entry becomes `PREPARED:` and this assertion goes RED.
+        assert_eq!(
+            co.conn().leaf_log,
+            vec![
+                format!("TEXT:BEGIN"),
+                format!("TEXT:{sql}"),
+                format!("TEXT:{sql}"),
+            ],
+            "a savepoint passthrough must take the raw TEXT leaf on BOTH entries — the prepared \
+             leaf is errno 1295 on MySQL 8.4: {sql:?}"
+        );
+
+        // TAINT (review F1). A savepoint passthrough must NOT be fed to the assist lexer: savepoint
+        // verbs are not on `ferro-classify`'s safe list, so classifying them yields `Unknown` and
+        // taints — which on PG selects the FULL `DISCARD ALL` profile, whose `DEALLOCATE ALL` is the
+        // SPEC §22.2 (m) typeinfo-cache poisoning trigger. Doctrine emits `SAVEPOINT DOCTRINE_<n>`
+        // per nested transaction, so a taint here would poison essentially every pooled PG conn.
+        assert!(
+            !co.tainted(),
+            "a savepoint passthrough must leave the connection UNTAINTED: {sql:?}"
+        );
+        assert_eq!(
+            co.last_pin_cause(),
+            Some(ferro_pool::pin::PinCause::Tx),
+            "the RFQ tx authority stays the observed cause — the lexer never labels a savepoint \
+             `Unknown`: {sql:?}"
+        );
+
         // ...but NOT via `query_stream`: a savepoint returns no result set, so there is nothing to
         // stream and the passthrough deliberately does not extend there.
         assert!(
@@ -165,6 +199,76 @@ async fn s8a_tx_control_guard_matrix_across_every_guarded_entry() {
                 Err(PoolError::Unsupported(_))
             ),
             "a savepoint is refused on query_stream() even inside a tx: {sql:?}"
+        );
+    }
+}
+
+/// **A savepoint passthrough must not taint — and must not blunt anything else that does** (M1-S8a
+/// review F1).
+///
+/// Savepoint verbs are not on `ferro-classify`'s `SAFE_LEADING_KEYWORDS`, so feeding one to the
+/// assist lexer under the default `pin_on_unknown` returns `Unknown` and TAINTS. On Postgres a taint
+/// is not a free extra reset: it selects the FULL profile, whose `DISCARD ALL` runs `DEALLOCATE ALL`
+/// — the exact trigger for the tokio-postgres typeinfo-cache poisoning recorded in SPEC §22.2 (m)
+/// (`docs/followups/2026-08-06-discard-all-typeinfo-cache-poisoning.md`), where a later custom-type
+/// lookup then fails with a bare `26000` instead of the loud `Unsupported`. Doctrine emits
+/// `SAVEPOINT DOCTRINE_<n>` for every nested transaction, so tainting here would poison essentially
+/// every pooled PG connection that has served one.
+///
+/// The skip is keyed off `guard_tx_control`'s VERDICT, not off a keyword, and is deliberately
+/// narrow. The second half of this test is the charter-rule-6 half: a user `SET` inside the SAME
+/// transaction, on the same checkout, immediately after a savepoint, must STILL taint — the
+/// cross-tenant session-state leak class stays closed.
+#[tokio::test]
+async fn s8a_savepoint_passthrough_does_not_taint() {
+    use ferro_pool::pin::PinCause;
+
+    for sql in [
+        "SAVEPOINT DOCTRINE_1",
+        "RELEASE SAVEPOINT DOCTRINE_1",
+        "ROLLBACK TO SAVEPOINT DOCTRINE_1",
+    ] {
+        // --- exec() leaf
+        let pool = fake_pool();
+        let mut co = pool.checkout().await.unwrap();
+        co.begin_tx_with(TxId(1), "BEGIN").await.unwrap();
+        assert!(!co.tainted(), "a fresh BEGIN does not taint");
+
+        co.exec(sql).await.unwrap();
+        assert!(!co.tainted(), "exec() savepoint must not taint: {sql:?}");
+        assert_eq!(
+            co.last_pin_cause(),
+            Some(PinCause::Tx),
+            "cause stays the RFQ authority, never the lexer's Unknown: {sql:?}"
+        );
+
+        // --- query() leaf, same statement, fresh checkout
+        let pool = fake_pool();
+        let mut co = pool.checkout().await.unwrap();
+        co.begin_tx_with(TxId(1), "BEGIN").await.unwrap();
+        co.query(sql, &[]).await.unwrap();
+        assert!(!co.tainted(), "query() savepoint must not taint: {sql:?}");
+        assert_eq!(co.last_pin_cause(), Some(PinCause::Tx));
+
+        // --- charter rule 6: the leak class is still closed. A user `SET` on the SAME checkout,
+        // inside the SAME transaction, immediately after the savepoint, still taints. (The skip is
+        // per-statement and keyed off the guard's verdict — it does not disable the lexer.)
+        co.exec("SET search_path TO evil").await.unwrap();
+        assert!(
+            co.tainted(),
+            "a user SET inside the same tx must STILL taint, after {sql:?}"
+        );
+        assert_eq!(
+            co.last_pin_cause(),
+            Some(PinCause::Set),
+            "the lexer still labels the SET, after {sql:?}"
+        );
+
+        // ...and a savepoint AFTER the taint never CLEARS it (the skip is a no-op, not a reset).
+        co.exec(sql).await.unwrap();
+        assert!(
+            co.tainted(),
+            "a savepoint must never clear an existing taint: {sql:?}"
         );
     }
 }
