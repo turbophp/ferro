@@ -218,7 +218,11 @@ async fn query_wrong_param_count_is_known_fate_not_connection_lost() {
         .expect_err("one placeholder, zero params supplied must fail");
     match err {
         PoolError::Sql {
-            code, branch: b, ..
+            code,
+            branch: b,
+            sqlstate,
+            errno,
+            ..
         } => {
             assert_eq!(
                 code,
@@ -226,6 +230,18 @@ async fn query_wrong_param_count_is_known_fate_not_connection_lost() {
                 "a bind arity mismatch is a known-fate Unsupported Sql error"
             );
             assert_eq!(b, branch::NON_RETRYABLE);
+            assert_eq!(
+                sqlstate, None,
+                "the server never saw the statement, so there is no SQLSTATE"
+            );
+            // M1-S8a: a PRE-SEND rejection must never FABRICATE a vendor errno either. The errno is
+            // populated at exactly ONE site (the MySQL `error_map`, from a real `ServerError`); PG
+            // has no integer errno at all, and no server answered here. Mirrors the MySQL twin at
+            // `ferro-backend-mysql/src/bind.rs`.
+            assert_eq!(
+                errno, None,
+                "a pre-send bind rejection has no vendor errno — no server answered"
+            );
         }
         PoolError::ConnectionLost => panic!(
             "REGRESSION: a wrong param count was classified ConnectionLost \
@@ -239,11 +255,16 @@ async fn query_wrong_param_count_is_known_fate_not_connection_lost() {
     assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
 }
 
-/// `Value::I64` bound against an `int4` PK column is a KNOWN-FATE bind error, NOT `ConnectionLost`
-/// (§19.3). This is the EXACT input that would have produced a false `WriteUnconfirmed`: the
-/// canonical `I64` boxes as `int8`, which does not `accept` the `int4` the column (a serial-style
-/// PK) inferred for the parameter. Pre-validation rejects it before the INSERT is sent, so the row
-/// provably never inserted and the connection stays clean.
+/// **M1-S8a, live**: an IN-RANGE `Value::I64` now BINDS an `int4` PK column (the narrowing bind),
+/// and an OUT-OF-RANGE one is still a KNOWN-FATE bind error, NOT `ConnectionLost` (§19.3).
+///
+/// Under M0 this test pinned the opposite for the in-range case — `I64` boxed as `int8`, which does
+/// not `accept` the `int4` a serial-style PK infers for the parameter, so every DBAL insert into a
+/// `serial` PK was refused. `PgInt` now writes the native `int4`. The §19.3 property the test exists
+/// for is UNCHANGED and is carried by the out-of-range half: a value the target width cannot hold is
+/// refused by the VALUE-aware pre-flight, before anything is sent, so it is a diagnosable
+/// `Sql{Unsupported}` and can never be MISCLASSIFIED as the fate-unknown `ConnectionLost` that
+/// §19.3 turns into a false `WriteUnconfirmed{Indeterminate}` on a write.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_i64_against_int4_is_known_fate_not_connection_lost() {
     let Some(url) = test_url() else {
@@ -257,31 +278,74 @@ async fn query_i64_against_int4_is_known_fate_not_connection_lost() {
         .await
         .expect("create temp table");
 
-    let err = co
-        .query("INSERT INTO ferro_s5_pk (id) VALUES (?)", &[Value::I64(1)])
+    // (a) IN RANGE: the narrowing bind lands the row, natively, against a real server.
+    let ins = co
+        .query("INSERT INTO ferro_s5_pk (id) VALUES (?)", &[Value::I64(7)])
         .await
-        .expect_err("I64 (int8) cannot bind an int4 column in M0");
+        .expect("M1-S8a: an in-range I64 binds an int4 column");
+    assert_eq!(ins.affected, 1, "the narrowing bind actually inserted");
+    let back = co
+        .query("SELECT id FROM ferro_s5_pk WHERE id = ?", &[Value::I64(7)])
+        .await
+        .expect("read back through the same narrowing bind");
+    assert_eq!(back.rows, vec![vec![Value::I64(7)]]);
+
+    // (b) OUT OF RANGE: a value int4 cannot hold is refused PRE-SEND, known-fate.
+    let too_big = i64::from(i32::MAX) + 1;
+    let err = co
+        .query(
+            "INSERT INTO ferro_s5_pk (id) VALUES (?)",
+            &[Value::I64(too_big)],
+        )
+        .await
+        .expect_err("an out-of-range I64 cannot bind an int4 column");
     match err {
         PoolError::Sql {
-            code, branch: b, ..
+            code,
+            branch: b,
+            ref sqlstate,
+            errno,
+            ref message,
         } => {
             assert_eq!(
                 code,
                 errc::UNSUPPORTED,
-                "an uncastable bind is a known-fate Unsupported Sql error"
+                "an out-of-range bind is a known-fate Unsupported Sql error"
             );
             assert_eq!(b, branch::NON_RETRYABLE);
+            assert_eq!(
+                *sqlstate, None,
+                "the server never saw the statement, so there is no SQLSTATE"
+            );
+            // M1-S8a: the NEW narrowing rejection is a pre-send `bind_error` too, so it must not
+            // FABRICATE a vendor errno. The errno is populated at exactly ONE site (the MySQL
+            // `error_map`, from a real `ServerError`); PG has none, and no server answered here.
+            assert_eq!(
+                errno, None,
+                "a pre-send range rejection has no vendor errno — no server answered"
+            );
+            assert!(
+                message.contains("out of range") && message.contains(&too_big.to_string()),
+                "the refusal must name the reason and the offending value: {message}"
+            );
         }
         PoolError::ConnectionLost => panic!(
-            "REGRESSION: an I64-vs-int4 bind was classified ConnectionLost (fate-unknown) — \
-             this is the exact false-Indeterminate the pre-validation fix prevents"
+            "REGRESSION: an out-of-range I64-vs-int4 bind was classified ConnectionLost \
+             (fate-unknown) — this is the exact false-Indeterminate the pre-validation prevents"
         ),
         other => panic!("expected known-fate PoolError::Sql{{Unsupported}}, got {other:?}"),
     }
 
-    // Nothing was inserted (bind rejected pre-send) and the conn is clean: still usable.
-    let ok = co.query("SELECT 1", &[]).await.expect("conn still usable");
-    assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
+    // The out-of-range row provably never inserted (bind rejected pre-send) and the conn is clean.
+    let rows = co
+        .query("SELECT count(*)::int8 FROM ferro_s5_pk", &[])
+        .await
+        .expect("conn still usable");
+    assert_eq!(
+        rows.rows,
+        vec![vec![Value::I64(1)]],
+        "only the in-range insert landed"
+    );
 }
 
 /// A DML statement reports `affected` from the command tag — NEVER a hardcoded 0 (the S4

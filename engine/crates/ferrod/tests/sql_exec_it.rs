@@ -153,8 +153,14 @@ async fn exec_syntax_error() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// COMMIT-1 end-to-end proof: a Value::I64 param against an int4 PK column is known-fate Unsupported,
-// NOT WriteUnconfirmed/Indeterminate — EVEN on a non-readonly (write) statement.
+// COMMIT-1 end-to-end proof: a Value::I64 param that the int4 PK column CANNOT HOLD is known-fate
+// Unsupported, NOT WriteUnconfirmed/Indeterminate — EVEN on a non-readonly (write) statement.
+//
+// M1-S8a moved the trigger without moving the property. Under M0 ANY I64 against int4 was refused
+// (I64 boxed as int8, which does not accept int4); the narrowing bind now writes int2/int4/int8, so
+// the refusal that remains is the VALUE-aware one — a magnitude the target width cannot hold. It
+// fires in the same place (the pre-flight, before anything is sent), so the fate is still KNOWN and
+// the error can still never be MISCLASSIFIED into a false Indeterminate.
 // -------------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -166,7 +172,7 @@ async fn exec_wrong_param_type_not_indeterminate() {
     let mut client = server.connect().await;
     client.hello(1).await;
 
-    // int4 PK ⇒ PG infers the INSERT's parameter as int4; I64→int8 cannot bind it (M0).
+    // int4 PK ⇒ PG infers the INSERT's parameter as int4; an I64 above i32::MAX cannot bind it.
     let mut ddl = req("CREATE TABLE IF NOT EXISTS ferro_s5_pk4 (id int4 primary key)");
     ddl.readonly = false;
     ddl.fetch = 1;
@@ -175,7 +181,7 @@ async fn exec_wrong_param_type_not_indeterminate() {
     let mut insert = req("INSERT INTO ferro_s5_pk4 (id) VALUES (?)");
     insert.readonly = false; // a WRITE — the readonly override would fire IF this were ConnectionLost
     insert.fetch = 1;
-    insert.params = vec![Value::I64(1)];
+    insert.params = vec![Value::I64(i64::from(i32::MAX) + 1)];
     let ep = exec_err(&mut client, 41, &insert).await;
 
     // Known-fate Unsupported (the bind never executed), NOT the fate-unknown Indeterminate.
@@ -190,6 +196,13 @@ async fn exec_wrong_param_type_not_indeterminate() {
         "REGRESSION: a bind error on a write must NOT become WriteUnconfirmed/Indeterminate"
     );
     assert_ne!(ep.branch, branch::INDETERMINATE);
+    // ...and it is the RANGE gate that fired, not some other refusal that would make this test
+    // green for the wrong reason (M1-S8a).
+    assert!(
+        ep.message.contains("out of range") && ep.message.contains("2147483648"),
+        "the refusal must name the reason and the offending value: {}",
+        ep.message
+    );
 
     // Nothing inserted, connection clean: the session (and pool) keep working.
     assert_session_alive(&mut client, 8).await;

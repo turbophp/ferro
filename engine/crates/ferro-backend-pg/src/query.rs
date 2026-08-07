@@ -29,12 +29,17 @@
 //!    count with an empty row set. `query` always returns rows + affected + cols; the SELECT-vs-DML
 //!    shaping (`fetch:none` drops the rows, keeps `affected`) is the SERVICE's job (Task 3).
 //!
-//! **M0 bind mapping (deliberate, fails LOUDLY):** the canonical scalars map DIRECTLY —
-//! `I64`→`int8`, `F64`→`float8`, `Bool`→`bool`, `Text`→`text`, `Bytes`→`bytea`. A narrower target
-//! column (`int4`/`int2`/`float4`/`serial`) needs a client-side cast; without one, step 4 rejects
-//! the bind as a known-fate `Unsupported` — a clear, diagnosable error, NEVER a silent miscast and
-//! NEVER a fate-unknown `Indeterminate`. Widening these binds (client cast injection, or binding
-//! `I64` as `int4` when the target is narrower) is post-M0.
+//! **Bind mapping (deliberate, fails LOUDLY).** `Bool`→`bool`, `Text`→`text`, `Bytes`→`bytea` map
+//! directly. Since **M1-S8a** the two numeric tags NARROW: `I64` binds `int2`/`int4`/`int8` and
+//! `F64` binds `float4`/`float8`, so a `serial`/`int4` PK — the highest-frequency DBAL target — no
+//! longer needs a client-side cast. What step 4 now rejects is a canonical type with no legal target
+//! (`TEXT` against `int4`) **or a VALUE the target width cannot hold** (an `i64` above `i32::MAX`
+//! against `int4`; a finite `f64` that would become `inf` in `float4`). Both are known-fate
+//! `Unsupported` — a clear, diagnosable error, NEVER a silent miscast and NEVER a fate-unknown
+//! `Indeterminate`. The range half of that check MUST stay in `bind::check_param` (which sees the
+//! VALUE) rather than in `ToSql::to_sql` (which sees only the `Type`): a `to_sql` failure carries no
+//! `DbError`, so `is_session_fatal` would read it as a transport failure → `ConnectionLost` → §19.3
+//! would mint a false `WriteUnconfirmed{Indeterminate}` for a statement that never left the process.
 //!
 //! All server-side errors go through `error_map::map` (`as_db_error()`-first). Nothing here
 //! re-runs the statement (charter rule 3).
@@ -88,13 +93,8 @@ pub async fn run(client: &Client, sql: &str, params: &[Value]) -> Result<QueryRe
         )));
     }
     for (i, (v, ty)) in params.iter().zip(expected).enumerate() {
-        if !bind::accepts(v, ty) {
-            return Err(bind_error(format!(
-                "parameter {i} type mismatch: canonical {} cannot bind to PG type {} \
-                 (M0 maps I64->int8 / F64->float8 directly; a narrower column needs a client cast)",
-                bind::value_kind(v),
-                ty.name()
-            )));
+        if let Err(why) = bind::check_param(v, ty) {
+            return Err(bind_error(format!("parameter {i}: {why}")));
         }
     }
 
@@ -201,13 +201,8 @@ pub async fn stream(
         )));
     }
     for (i, (v, ty)) in params.iter().zip(expected).enumerate() {
-        if !bind::accepts(v, ty) {
-            return Err(bind_error(format!(
-                "parameter {i} type mismatch: canonical {} cannot bind to PG type {} \
-                 (M0 maps I64->int8 / F64->float8 directly; a narrower column needs a client cast)",
-                bind::value_kind(v),
-                ty.name()
-            )));
+        if let Err(why) = bind::check_param(v, ty) {
+            return Err(bind_error(format!("parameter {i}: {why}")));
         }
     }
 

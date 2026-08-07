@@ -57,11 +57,13 @@ impl ToSql for PgNull {
 /// that writes its canonical text VERBATIM in PG's **text** wire format and `accepts` ONLY the PG
 /// types named at the call site.
 ///
-/// **Why one newtype per tag (hazard 19 / F17).** [`accepts`] is the §19.3 known-fate pre-flight —
-/// `query.rs` runs it BEFORE the statement is sent. The rule is DIRECTIONAL: it may be STRICTER
+/// **Why one newtype per tag (hazard 19 / F17).** [`check_param`] is the §19.3 known-fate pre-flight
+/// — `query.rs` runs it BEFORE the statement is sent. The rule is DIRECTIONAL: it may be STRICTER
 /// than the concrete `ToSql` it fronts (a clean, diagnosable pre-send rejection), but it must NEVER
-/// be looser, because a looser `accepts` lets `to_sql_checked` fail POST-send — precisely the
-/// false-`Indeterminate` path the pre-flight exists to prevent. One SHARED newtype would have to
+/// be looser, because a looser pre-flight lets `to_sql_checked` fail instead — and THAT failure is
+/// MISCLASSIFIED (`Error::to_sql(..)` carries no `DbError`, so `is_session_fatal` reads it as a lost
+/// connection → §19.3 mints a false `Indeterminate`), which is precisely the path the pre-flight
+/// exists to prevent. One SHARED newtype would have to
 /// accept the union of every target type the eight tags touch (`numeric ∪ date ∪ time ∪ timestamp ∪
 /// timestamptz ∪ uuid ∪ json ∪ jsonb`), disabling the pre-flight for all eight at once: a
 /// `Value::Decimal` would sail into a `date` column and fail on the wire. And never copy
@@ -148,6 +150,86 @@ pg_canonical_text_param! {
     PgJsonText accepts [JSON, JSONB]
 }
 
+/// A canonical `I64` bound against whichever PG integer width the prepared statement inferred
+/// (M1-S8a). PG's own `ToSql for i64` accepts `int8` ONLY, so before this every DBAL insert into a
+/// `serial`/`int4` PK — and every `$qb->setParameter('id', 5)` against one — was a hard, pre-send
+/// `NonRetryable` refusal.
+///
+/// **Format is BINARY**, not text: PG's param format IS per-param selectable (`encode_format`), but
+/// there is nothing to gain here — `<i16/i32/i64 as ToSql>` already writes the exact native binary
+/// form, so this delegates rather than re-rendering a decimal string PG would have to re-parse.
+///
+/// **The range check is NOT here.** It lives in [`check_param`], which sees the VALUE (unlike
+/// `ToSql::accepts`, which sees only the `Type`), one step earlier. The reason is **misclassification**,
+/// not transmission: `encode_bind_raw` serialises every param into a LOCAL buffer BEFORE `start`
+/// writes anything to the socket, so a `to_sql` failure means the statement provably never left the
+/// process — but it surfaces as `Error::to_sql(..)`, whose `as_db_error()` is `None`, which
+/// `conn.rs`'s `is_session_fatal` reads as a transport failure → `PoolError::ConnectionLost` →
+/// which §19.3 turns into `WriteUnconfirmed{Indeterminate}` on a sent, non-readonly, non-in-tx op.
+/// A statement that never left the process would then be reported as a write of UNKNOWN fate. The
+/// `try_from`s below are therefore a totality backstop for a caller that skipped the pre-flight —
+/// they yield a typed `WrongType`-class error, never a panic.
+#[derive(Debug)]
+struct PgInt(i64);
+
+impl ToSql for PgInt {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        // Equality, not constant patterns — see `check_range` (hazard 57: `Type` is not `Copy`) and
+        // the S7 macro's own `[Type::X].contains(ty)` idiom.
+        if *ty == Type::INT2 {
+            i16::try_from(self.0)?.to_sql(ty, out)
+        } else if *ty == Type::INT4 {
+            i32::try_from(self.0)?.to_sql(ty, out)
+        } else if *ty == Type::INT8 {
+            self.0.to_sql(ty, out)
+        } else {
+            Err(format!("PgInt cannot bind PG type {}", ty.name()).into())
+        }
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        [Type::INT2, Type::INT4, Type::INT8].contains(ty)
+    }
+
+    to_sql_checked!();
+}
+
+/// A canonical `F64` bound against `float4` or `float8` (M1-S8a). Same shape and same rationale as
+/// [`PgInt`]; the range guard for `float4` lives in [`check_param`].
+///
+/// **Precision loss inside the f32 range is ACCEPTED and is not a miscast**: it is the column's own
+/// precision, and PG's own input parser would round a text literal identically. What is NOT accepted
+/// is a *finite* `f64` that overflows `f32` and becomes `inf` — a silent corrupt write, refused
+/// pre-send by [`check_param`].
+#[derive(Debug)]
+struct PgFloat(f64);
+
+impl ToSql for PgFloat {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        if *ty == Type::FLOAT4 {
+            (self.0 as f32).to_sql(ty, out)
+        } else if *ty == Type::FLOAT8 {
+            self.0.to_sql(ty, out)
+        } else {
+            Err(format!("PgFloat cannot bind PG type {}", ty.name()).into())
+        }
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        [Type::FLOAT4, Type::FLOAT8].contains(ty)
+    }
+
+    to_sql_checked!();
+}
+
 /// `U64` has **no** PG target type in S7 — PostgreSQL has no unsigned integer type, so there is
 /// nothing a `U64` param could bind to without a widening guess (`int8` cannot hold the top half of
 /// the range; `numeric` would silently change the column's type semantics). Its `accepts` is
@@ -193,8 +275,11 @@ fn value_to_boxed(v: &Value) -> Box<dyn ToSql + Sync + Send> {
     match v {
         Value::Null => Box::new(PgNull),
         Value::Bool(b) => Box::new(*b),
-        Value::I64(n) => Box::new(*n),
-        Value::F64(f) => Box::new(*f),
+        // ---- M1-S8a: NARROWING. `i64`/`f64` box as the widest PG type only (`int8`/`float8`), so
+        // these two go through newtypes that also write `int2`/`int4`/`float4`. The VALUE-aware
+        // range gate stays in `check_param`/`check_range`, never here — see [`PgInt`].
+        Value::I64(n) => Box::new(PgInt(*n)),
+        Value::F64(f) => Box::new(PgFloat(*f)),
         Value::Text(s) => Box::new(s.clone()),
         Value::Bytes(b) => Box::new(b.clone()),
         // ---- M1-S7 (Task 8b): one text-format newtype PER TAG, each with a NARROW `accepts`
@@ -212,26 +297,30 @@ fn value_to_boxed(v: &Value) -> Box<dyn ToSql + Sync + Send> {
     }
 }
 
-/// Whether the concrete `ToSql` impl `value_to_boxed` would box this `Value` as `accepts` the
-/// prepared statement's inferred `Type` for this parameter slot.
+/// The §19.3 bind PRE-FLIGHT for one parameter slot: is this the exact bind `query_raw` will
+/// perform, and will it succeed? Returns the operator-facing REASON on refusal.
 ///
-/// This is the **pre-flight of the exact bind `query_raw` will perform** — it MUST mirror
-/// `value_to_boxed` arm-for-arm, because `query_raw`'s own `to_sql_checked` calls `accepts` on
-/// precisely these concrete types. `query.rs` runs this BEFORE sending the statement so a bind
-/// error (an uncastable param — the canonical `Value::I64`→`i64`→`int8` bound against an
-/// `int4`/serial column being the common one) surfaces as a KNOWN-FATE error (the statement
-/// provably never executed), never the fate-unknown `ConnectionLost` a post-send transport failure
-/// yields. Surfacing it as `ConnectionLost` is exactly what would let the SQL service mint a FALSE
-/// `WriteUnconfirmed{Indeterminate}` for a write that never happened (§19.3).
+/// It MUST mirror `value_to_boxed` arm-for-arm, because `query_raw`'s own `to_sql_checked` calls
+/// `accepts` on precisely these concrete types. `query.rs` runs it BEFORE sending the statement so a
+/// bind error surfaces as a KNOWN-FATE error (the statement provably never executed).
+///
+/// The rule is DIRECTIONAL (see the module docs): this may be STRICTER than the concrete `ToSql`
+/// impl `value_to_boxed` boxes — which is exactly what [`check_range`] below does — but it must
+/// NEVER be looser. A looser pre-flight lets `to_sql_checked` fail instead, and that failure is
+/// MISCLASSIFIED: `Error::to_sql(..)` carries no `DbError`, `conn.rs`'s `is_session_fatal` reads
+/// that as a transport failure → `PoolError::ConnectionLost` → §19.3 mints a false
+/// `WriteUnconfirmed{Indeterminate}` for a write that never happened.
 ///
 /// `Value::Null` accepts every type: it is bound via [`PgNull`], whose `accepts` is `true` for any
 /// `Type`, so a NULL never mis-binds.
-pub fn accepts(v: &Value, ty: &Type) -> bool {
-    match v {
+pub fn check_param(v: &Value, ty: &Type) -> Result<(), String> {
+    let accepted = match v {
         Value::Null => true,
         Value::Bool(_) => <bool as ToSql>::accepts(ty),
-        Value::I64(_) => <i64 as ToSql>::accepts(ty),
-        Value::F64(_) => <f64 as ToSql>::accepts(ty),
+        // ---- M1-S8a: the NARROWING arms. Each delegates to the newtype `value_to_boxed` boxes it
+        // as, so widening one without the other fails the lockstep proof.
+        Value::I64(_) => <PgInt as ToSql>::accepts(ty),
+        Value::F64(_) => <PgFloat as ToSql>::accepts(ty),
         Value::Text(_) => <String as ToSql>::accepts(ty),
         Value::Bytes(_) => <Vec<u8> as ToSql>::accepts(ty),
         // ---- M1-S7 (Task 8b): each tag delegates to the SAME newtype `value_to_boxed` boxes it
@@ -246,7 +335,60 @@ pub fn accepts(v: &Value, ty: &Type) -> bool {
         Value::TimestampTz(_) => <PgTimestampTzText as ToSql>::accepts(ty),
         Value::Uuid(_) => <PgUuidText as ToSql>::accepts(ty),
         Value::Json(_) => <PgJsonText as ToSql>::accepts(ty),
+    };
+    if !accepted {
+        return Err(format!(
+            "canonical {} cannot bind to PG type {}",
+            value_kind(v),
+            ty.name()
+        ));
     }
+    check_range(v, ty)
+}
+
+/// The VALUE-aware half of the pre-flight. `ToSql::accepts` sees only the target type, so a
+/// narrowing overflow is invisible to it; caught here the refusal is KNOWN-FATE and pre-send.
+///
+/// Split out as its own function so [`check_param`] stays one screen and so a future domain unwrap
+/// has exactly ONE place to pass the resolved base type.
+///
+/// Spelled with `==` rather than constant patterns: `match (v, *ty)` is E0507 (`Type` is not
+/// `Copy`), and `Type` is a non-structural type, so equality is both the compiling and the durable
+/// form (hazard 57).
+fn check_range(v: &Value, ty: &Type) -> Result<(), String> {
+    match v {
+        Value::I64(n) => {
+            if *ty == Type::INT4 && i32::try_from(*n).is_err() {
+                return Err(format!(
+                    "canonical I64 value {n} is out of range for PG type int4 \
+                     (pre-send rejection: the statement was never executed)"
+                ));
+            }
+            if *ty == Type::INT2 && i16::try_from(*n).is_err() {
+                return Err(format!(
+                    "canonical I64 value {n} is out of range for PG type int2 \
+                     (pre-send rejection: the statement was never executed)"
+                ));
+            }
+            Ok(())
+        }
+        Value::F64(f) => {
+            if *ty == Type::FLOAT4 && f.is_finite() && !(*f as f32).is_finite() {
+                return Err(format!(
+                    "canonical F64 value {f} is out of range for PG type float4 (it would \
+                     silently become infinity; pre-send rejection: the statement was never executed)"
+                ));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Whether [`check_param`] accepts this pair. Retained as the boolean façade so the directional
+/// lockstep proof and every existing call site read the SAME predicate the pre-flight enforces.
+pub fn accepts(v: &Value, ty: &Type) -> bool {
+    check_param(v, ty).is_ok()
 }
 
 /// The canonical-type label for a `Value`, used only to build a clear diagnostic bind-error
@@ -299,18 +441,20 @@ mod tests {
     }
 
     /// `accepts` mirrors `value_to_boxed`: it is the pre-flight of the exact bind `query_raw`
-    /// performs. The load-bearing case is `I64` vs `int4` — the common false-Indeterminate trigger
-    /// (a canonical `I64` bound against an `int4`/serial PK): `i64` boxes as `int8`, which does NOT
-    /// accept `int4`. Offline (no Docker) proof of the COMMIT-1 fix's core predicate.
+    /// performs. Since M1-S8a the integer/float arms NARROW (`I64` → `int2`/`int4`/`int8`, `F64` →
+    /// `float4`/`float8`) via [`PgInt`]/[`PgFloat`], so the M0 `I64`-vs-`int4` refusal is gone for
+    /// an IN-RANGE value; the out-of-range refusal it replaced is pinned by
+    /// `s8a_out_of_range_narrowing_is_refused_before_send`. Offline (no Docker) proof of the
+    /// COMMIT-1 fix's core predicate.
     #[test]
     fn accepts_mirrors_boxed_binding() {
-        // The trigger: I64 -> i64 -> int8 does NOT accept int4/int2 (narrower column).
+        // M1-S8a: an in-range I64 binds every PG integer width (the M0 int4/int2 refusal is gone).
         assert!(accepts(&Value::I64(1), &Type::INT8));
-        assert!(!accepts(&Value::I64(1), &Type::INT4));
-        assert!(!accepts(&Value::I64(1), &Type::INT2));
-        // F64 -> f64 -> float8 does NOT accept float4.
+        assert!(accepts(&Value::I64(1), &Type::INT4));
+        assert!(accepts(&Value::I64(1), &Type::INT2));
+        // ...and an F64 binds both float widths.
         assert!(accepts(&Value::F64(1.0), &Type::FLOAT8));
-        assert!(!accepts(&Value::F64(1.0), &Type::FLOAT4));
+        assert!(accepts(&Value::F64(1.0), &Type::FLOAT4));
         // The straightforward same-type binds accept.
         assert!(accepts(&Value::Bool(true), &Type::BOOL));
         assert!(accepts(&Value::Text("x".to_string()), &Type::TEXT));
@@ -321,6 +465,77 @@ mod tests {
         assert!(accepts(&Value::Null, &Type::TEXT));
         // A canonical mismatch is caught (Text cannot bind int4).
         assert!(!accepts(&Value::Text("x".to_string()), &Type::INT4));
+    }
+
+    /// M1-S8a: a canonical `I64` binds to EVERY PG integer width, and an `F64` to both float widths.
+    /// This is the single highest-frequency DBAL blocker — `Types\IntegerType` returns a PHP `int`,
+    /// and `IntegerType`/`SmallIntType` map to PG `INT`/`SMALLINT`, so every insert into a
+    /// `serial`/`int4` PK and every identifier lookup binds exactly this pair.
+    #[test]
+    fn s8a_i64_binds_to_every_integer_width_and_f64_to_both_floats() {
+        for ty in [Type::INT2, Type::INT4, Type::INT8] {
+            assert!(accepts(&Value::I64(42), &ty), "I64 must bind {ty:?}");
+        }
+        for ty in [Type::FLOAT4, Type::FLOAT8] {
+            assert!(accepts(&Value::F64(1.5), &ty), "F64 must bind {ty:?}");
+        }
+        // Still NARROW: widening the integer arms must not make an int bindable anywhere else.
+        for ty in [
+            Type::TEXT,
+            Type::NUMERIC,
+            Type::DATE,
+            Type::TIMESTAMP,
+            Type::UUID,
+            Type::BOOL,
+        ] {
+            assert!(!accepts(&Value::I64(42), &ty), "I64 must not bind {ty:?}");
+            assert!(!accepts(&Value::F64(1.5), &ty), "F64 must not bind {ty:?}");
+        }
+    }
+
+    /// The range check is a PRE-SEND, known-fate rejection — NOT a `to_sql` failure. A value outside
+    /// the target width is refused here, where the statement provably has not been sent, so it can
+    /// never mint a false §19.3 `WriteUnconfirmed{Indeterminate}`.
+    #[test]
+    fn s8a_out_of_range_narrowing_is_refused_before_send() {
+        assert!(!accepts(&Value::I64(i64::from(i32::MAX) + 1), &Type::INT4));
+        assert!(!accepts(&Value::I64(i64::from(i32::MIN) - 1), &Type::INT4));
+        assert!(!accepts(&Value::I64(i64::from(i16::MAX) + 1), &Type::INT2));
+        assert!(!accepts(&Value::I64(i64::from(i16::MIN) - 1), &Type::INT2));
+        // ...and the in-range boundaries DO bind.
+        assert!(accepts(&Value::I64(i64::from(i32::MAX)), &Type::INT4));
+        assert!(accepts(&Value::I64(i64::from(i16::MIN)), &Type::INT2));
+        // int8 is the full range.
+        assert!(accepts(&Value::I64(i64::MAX), &Type::INT8));
+
+        // f64 -> float4: a finite value that OVERFLOWS f32 becomes `inf` — a silent corrupt write.
+        assert!(!accepts(&Value::F64(1e39), &Type::FLOAT4));
+        assert!(!accepts(&Value::F64(-1e39), &Type::FLOAT4));
+        assert!(accepts(&Value::F64(1e38), &Type::FLOAT4));
+        // Non-finite values are representable in BOTH widths and stay bindable.
+        assert!(accepts(&Value::F64(f64::INFINITY), &Type::FLOAT4));
+        assert!(accepts(&Value::F64(f64::NAN), &Type::FLOAT4));
+        // float8 never narrows, so nothing is out of range there.
+        assert!(accepts(&Value::F64(1e300), &Type::FLOAT8));
+    }
+
+    /// The refusal REASON distinguishes "wrong type" from "out of range" — an operator staring at a
+    /// failed insert needs to know which. Both are `Sql{Unsupported}` known-fate rejections.
+    #[test]
+    fn s8a_check_param_reasons_are_distinct_and_actionable() {
+        let too_big = check_param(&Value::I64(i64::from(i32::MAX) + 1), &Type::INT4)
+            .expect_err("out of range");
+        assert!(too_big.contains("out of range"), "{too_big}");
+        assert!(too_big.contains("int4"), "{too_big}");
+        assert!(
+            too_big.contains("2147483648"),
+            "the offending VALUE must be named: {too_big}"
+        );
+
+        let wrong_type = check_param(&Value::Text("x".into()), &Type::INT4).expect_err("mismatch");
+        assert!(wrong_type.contains("cannot bind"), "{wrong_type}");
+        assert!(wrong_type.contains("TEXT"), "{wrong_type}");
+        assert!(!wrong_type.contains("out of range"), "{wrong_type}");
     }
 
     #[test]
@@ -352,12 +567,23 @@ mod tests {
     }
 
     /// One instance of every canonical `Value` variant — the totality fixture.
+    ///
+    /// Completeness is NOT checkable from here (it is a hand-written `Vec`); [`_exhaustive`] below
+    /// is the compile-forced guard that a variant cannot go missing.
     fn every_variant() -> Vec<Value> {
         vec![
             Value::Null,
             Value::Bool(true),
             Value::I64(-200),
+            // M1-S8a: the magnitudes the narrowing range gate exists for. Without these three the
+            // cross-product proof below only ever sees an in-range integer and the gate is UNPROVEN
+            // (the hard-coded-fixture failure mode).
+            Value::I64(i64::MAX),
+            Value::I64(i64::from(i32::MAX) + 1),
+            Value::I64(i64::from(i16::MAX) + 1),
             Value::F64(1.5),
+            Value::F64(1e39),
+            Value::F64(f64::NAN),
             Value::Text("x".to_string()),
             Value::Bytes(vec![0xde, 0xad]),
             Value::U64(u64::MAX),
@@ -371,8 +597,45 @@ mod tests {
         ]
     }
 
+    /// **Compile-forced completeness for [`every_variant`].**
+    ///
+    /// `every_variant` is a hand-written `Vec`, so `assert_eq!(x.len(), every_variant().len())`
+    /// proves only that boxing drops nothing — it is a TAUTOLOGY with respect to a variant that was
+    /// never added. This match has **no `_` arm**, so adding a 15th variant to
+    /// `ferro_proto::value::Value` breaks THIS FILE's build.
+    ///
+    /// **When that build break happens, the fix is to add the variant to `every_variant()` above**
+    /// (and to give it a real box in `value_to_boxed` and a real arm in `check_param`) — NOT to add
+    /// an arm here and move on. The arms below exist only to make the omission impossible to miss.
+    #[allow(dead_code)]
+    fn _exhaustive(v: &Value) {
+        match v {
+            Value::Null => (),
+            Value::Bool(_) => (),
+            Value::I64(_) => (),
+            Value::F64(_) => (),
+            Value::Text(_) => (),
+            Value::Bytes(_) => (),
+            Value::U64(_) => (),
+            Value::Decimal(_) => (),
+            Value::Date(_) => (),
+            Value::Time(_) => (),
+            Value::Timestamp(_) => (),
+            Value::TimestampTz(_) => (),
+            Value::Uuid(_) => (),
+            Value::Json(_) => (),
+        }
+    }
+
     /// Every PG `Type` any of the arms above could plausibly be aimed at, plus a few that must
     /// never be accepted. Used for the cross-product directional proof below.
+    ///
+    /// **This fixture gets NO compile-forced guard, deliberately** (unlike [`every_variant`], whose
+    /// guard is [`_exhaustive`]). `tokio_postgres::types::Type` is an EXTERNAL, OPEN type — any OID
+    /// constructs one — so no `match` over it can be exhaustive and no compile-forced completeness
+    /// check exists. Behavioural cross-product coverage is the right and only guard here; the
+    /// standing obligation is to GROW this list whenever an arm admits a new target type, and to
+    /// mutation-prove that the growth was load-bearing. Do not "fix" the asymmetry with `_`.
     fn every_target_type() -> Vec<Type> {
         vec![
             Type::BOOL,
@@ -532,9 +795,12 @@ mod tests {
     /// **The lockstep proof (carry C2/C3/C12).** Over the FULL cross product of every canonical
     /// variant × every plausible target type: whenever `accepts` says yes, the concrete boxed impl
     /// must actually bind. That is the directional rule mechanically — `accepts` can be stricter
-    /// (a clean pre-send rejection), never looser (a POST-send `to_sql_checked` failure, which is
-    /// the false-`Indeterminate` path §19.3 forbids). It also proves `accepts` and `value_to_boxed`
-    /// were flipped together: widening one without the other fails here.
+    /// (a clean pre-send rejection), never looser (which would let `to_sql_checked` fail instead,
+    /// and a `to_sql` failure carries no `DbError` → it is MISCLASSIFIED as a lost connection →
+    /// §19.3 mints a false `Indeterminate`). It also proves `accepts` and `value_to_boxed` were
+    /// flipped together: widening one without the other fails here. M1-S8a made it load-bearing for
+    /// the range gate too — the out-of-range magnitudes in `every_variant` are the inputs that
+    /// separate "the pre-flight is stricter" from "the pre-flight is looser".
     #[test]
     fn s7_accepts_is_never_looser_than_the_boxed_impl() {
         for v in every_variant() {
@@ -547,7 +813,8 @@ mod tests {
                 assert!(
                     boxed.to_sql_checked(&ty, &mut buf).is_ok(),
                     "accepts({v:?}, {ty:?}) said yes but the boxed impl refuses it — a LOOSER \
-                     accepts lets to_sql_checked fail POST-send (false Indeterminate, §19.3)"
+                     pre-flight lets to_sql_checked fail instead, and a to_sql failure carries no \
+                     DbError, so it is misclassified as ConnectionLost (false Indeterminate, §19.3)"
                 );
             }
         }
@@ -568,7 +835,14 @@ mod tests {
                 let _ = boxed.to_sql_checked(&ty, &mut buf);
             }
         }
-        assert_eq!(to_boxed_params(&every_variant()).len(), 14);
+        // One boxed ToSql per fixture value. NOT a completeness check — `_exhaustive` above is the
+        // guard that a variant cannot go missing; this only pins that boxing is total and drops
+        // nothing. Written derived rather than as a literal so the fixture can grow freely.
+        assert_eq!(
+            to_boxed_params(&every_variant()).len(),
+            every_variant().len(),
+            "one boxed ToSql per fixture value"
+        );
     }
 
     /// **Sentinel discipline, preserved from Task 8a.** A `TIMESTAMP`/`TIMESTAMPTZ` sentinel
