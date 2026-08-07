@@ -9,6 +9,7 @@ use Ferro\Client\Hydration\PlanCache;
 use Ferro\Client\Value\M1ValuePolicy;
 use Ferro\Client\Value\TypePolicyOptions;
 use Ferro\Client\Value\ValuePolicy;
+use Ferro\Bytes;
 use Ferro\Date;
 use Ferro\Decimal;
 use Ferro\Json;
@@ -367,13 +368,20 @@ final class ExecCodec
             $v instanceof Uuid    => ['tag' => C::TAG_UUID,    'data' => $v->value],
             $v instanceof Json    => ['tag' => C::TAG_JSON,    'data' => $v->raw],
             $v instanceof U64     => ['tag' => C::TAG_U64,     'data' => $v->value],
+            // The explicit BINARY marker (SPEC §22.2 (k)(4)). `TAG_BYTES` rides the msgpack `bin`
+            // family, so a non-UTF-8 payload survives — unlike `TAG_TEXT`, whose `str` family is
+            // rejected by the engine's reader as `invalid utf8` before the bind pre-flight.
+            $v instanceof Bytes   => ['tag' => C::TAG_BYTES,   'data' => $v->value],
             // NaiveTimestamp EXTENDS DateTimeImmutable — it MUST stay ahead of the arm below (F14).
             $v instanceof NaiveTimestamp     => ['tag' => C::TAG_TIMESTAMP,   'data' => $this->naiveTimestampText($v)],
             $v instanceof \DateTimeInterface => ['tag' => C::TAG_TIMESTAMPTZ, 'data' => self::utcInstantText($v)],
             default => throw new ProtocolException(sprintf(
                 'unsupported bind parameter type %s (bind null/bool/int/float/string, a '
                 . '\DateTimeInterface, or one of the SPEC §9 value objects: Ferro\{Decimal, Date, '
-                . 'Time, Uuid, Json, U64, NaiveTimestamp})',
+                . 'Time, Uuid, Json, U64, NaiveTimestamp, Bytes}). A binary payload or a stream '
+                . 'binds through Ferro\Bytes / Ferro\Bytes::fromStream($h) — there is deliberately '
+                . 'no implicit resource arm, because reading a stream into memory is the caller\'s '
+                . 'decision to make.',
                 get_debug_type($v),
             )),
         };

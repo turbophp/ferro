@@ -44,7 +44,19 @@ final class ExtPacker implements PackerInterface
     public function packUint(int|string $n): string { return $this->pure->packUint($n); }
     public function packFloat64(float $f): string { return \msgpack_pack($f); }
     public function packStr(string $s): string { return \msgpack_pack($s); }
-    public function packBin(string $s): string { return \msgpack_pack($s); }
+    /**
+     * Delegated to the pure limb encoder — deliberately NOT `\msgpack_pack()`.
+     *
+     * `\msgpack_pack()` on a PHP string emits msgpack **`str`** (measured on pecl msgpack 3.0.0:
+     * `msgpack_pack("ab")` is `a26162`, a fixstr), while the wire contract for `TAG_BYTES` is the
+     * **`bin`** family and the engine's decoder is marker-strict (`read_bin` accepts only
+     * `0xc4`/`0xc5`/`0xc6`). The extension has no way to express the distinction: PHP has one string
+     * type, and the `bin` emitter in the extension's own `pack_template.h` has no callers. This was
+     * latent while nothing bound `TAG_BYTES` and `PackerFactory::forEncode()` returned `PurePacker`
+     * regardless; {@see \Ferro\Bytes} creates the first call path. Same shape and same reason as
+     * {@see packUint}.
+     */
+    public function packBin(string $s): string { return $this->pure->packBin($s); }
     public function packArrayLen(int $n): string { throw new CodecException('ExtPacker packs whole values, not array headers'); }
     public function unpack(string $buf, int &$offset): mixed { $v = \msgpack_unpack($buf); $offset = strlen($buf); return $v; }
 }

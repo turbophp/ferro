@@ -7,9 +7,11 @@ use Ferro\Protocol\Msgpack\PackerInterface;
 /**
  * Encodes/decodes a single canonical TypedValue between the golden-vector "message" JSON shape
  * {tag, data} and the wire `[tag, payload]` 2-array, byte-for-byte with the Rust `Value` codec
- * (value.rs). BYTES `data` is a list of byte ints so a non-UTF8 blob survives JSON and re-encodes
- * exactly. Also hosts the scalar-narrowing helpers the SQL message codecs share (PHPStan level 9
- * requires every decoded `mixed` be narrowed before use).
+ * (value.rs). DECODED BYTES `data` is a list of byte ints so a non-UTF8 blob survives JSON and
+ * re-encodes exactly; on ENCODE both that list and a raw byte string are accepted, because
+ * `ExecCodec::bindOne` emits the string form for a {@see \Ferro\Bytes} param — see
+ * {@see bytesPayload}. Also hosts the scalar-narrowing helpers the SQL message codecs share
+ * (PHPStan level 9 requires every decoded `mixed` be narrowed before use).
  */
 final class SqlValueCodec
 {
@@ -24,7 +26,7 @@ final class SqlValueCodec
             C::TAG_I64 => Value::i64(self::toInt($data)),
             C::TAG_F64 => Value::f64(self::toFloat($data)),
             C::TAG_TEXT => Value::text(self::toStr($data)),
-            C::TAG_BYTES => Value::bytes(self::bytesFromInts($data)),
+            C::TAG_BYTES => Value::bytes(self::bytesPayload($data)),
             // M1-S7 canonical tags (/proto/PROTOCOL.md §3.2). Routed through the Value factories
             // so the payload guards live in exactly ONE place (Value::requireStr/requireUint) —
             // deliberately NOT through self::toStr/toInt, whose 0/''/0.0 fallbacks would turn a
@@ -137,6 +139,35 @@ final class SqlValueCodec
         $s = '';
         foreach (self::listOf($data) as $b) { $s .= chr(self::toInt($b) & 0xff); }
         return $s;
+    }
+
+    /**
+     * A `TAG_BYTES` payload, from EITHER of its two legitimate producers.
+     *
+     * *  a raw **byte string** — what {@see \Ferro\Client\ExecCodec::bindOne} emits for a
+     *    {@see \Ferro\Bytes} bind. A blob is bound as-is: converting it to a `list<int>` first would
+     *    inflate a 1 MiB `LARGE_OBJECT` into a million-element PHP array, and the `Ferro\Bytes` path
+     *    exists precisely to carry large binary parameters.
+     * *  a **`list<int>`** of bytes — what {@see fromWire} produces and what the golden vectors'
+     *    `message` JSON carries (JSON cannot hold arbitrary bytes), so a decoded wire cell or a
+     *    committed vector re-encodes byte-identically.
+     *
+     * The two are unambiguous, so both are accepted; anything else THROWS. That refusal is the
+     * point: until M1-S8a this arm was `bytesFromInts($data)` alone, whose `listOf()` returns `[]`
+     * for a string — so a raw-string payload encoded as `c400`, an **EMPTY bin**. Nothing produced
+     * one while `TAG_BYTES` was unreachable from PHP; `Ferro\Bytes` created the first producer, and
+     * a silently-empty blob is exactly the silent corrupt WRITE §9.1 exists to prevent.
+     *
+     * @throws CodecException
+     */
+    private static function bytesPayload(mixed $data): string
+    {
+        if (is_string($data)) { return $data; }
+        if (is_array($data)) { return self::bytesFromInts($data); }
+        throw new CodecException(
+            'TypedValue tag ' . C::TAG_BYTES . ': expected a byte string or a list<int> of bytes, got '
+            . get_debug_type($data),
+        );
     }
     /** @return list<int> */
     private static function intsFromBytes(string $s): array
