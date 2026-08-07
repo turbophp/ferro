@@ -147,6 +147,24 @@ fn first_i64(ok: &ferro_proto::messages::sql::ExecOk) -> i64 {
     }
 }
 
+/// The scalar in the first cell of the first row, whatever its tag — for the isolation reads below,
+/// which must compare two engine-rendered strings without assuming either literal.
+fn first_scalar(ok: &ferro_proto::messages::sql::ExecOk) -> Value {
+    ok.rows
+        .first()
+        .and_then(|r| r.first())
+        .cloned()
+        .unwrap_or_else(|| panic!("expected one scalar row, got {:?}", ok.rows))
+}
+
+/// The SESSION-scoped isolation level of whatever connection serves this request.
+///
+/// Deliberately `@@SESSION.` and not the bare `@@transaction_isolation`: this must read the level
+/// that OUTLIVES the transaction (the one a pooled connection would hand to the next tenant), never
+/// the next-transaction-only modifier `SET TRANSACTION …` installs. See
+/// `mysql_begin_honours_isolation_and_readonly`'s in-tx guard.
+const SESSION_ISOLATION_SQL: &str = "SELECT @@SESSION.transaction_isolation";
+
 // -------------------------------------------------------------------------------------------------
 // (1) Buffered `SELECT 1` (fetch:rows) round-trips e2e through a kind=mysql pool.
 // -------------------------------------------------------------------------------------------------
@@ -602,6 +620,11 @@ async fn mysql_begin_honours_isolation_and_readonly() {
         let mut c = server.connect().await;
         c.hello(0).await;
 
+        // The SESSION default, read off the pool BEFORE any isolation-scoped transaction exists.
+        // Read, never hard-coded: MySQL 8 and MariaDB 11 both render it `REPEATABLE-READ` today, but
+        // the guard below is a genuine before/after comparison, not a literal check.
+        let base = first_scalar(&exec_ok(&mut c, 20, &req(SESSION_ISOLATION_SQL)).await);
+
         // ---- (a) READ ONLY is enforced.
         exec_ok(&mut c, 1, &ddl("DROP TABLE IF EXISTS s8a_ro")).await;
         exec_ok(
@@ -649,6 +672,21 @@ async fn mysql_begin_honours_isolation_and_readonly() {
             false,
         )
         .await;
+
+        // ---- THE CROSS-TENANT LEAK GUARD, read INSIDE the pinned transaction (Task 8/9 review, F1).
+        // No hygiene can run here — the connection is pinned to this `tx_id` until COMMIT/ROLLBACK —
+        // so this is the one place the engine's own SQL is observable end to end through the daemon.
+        // The composed BEGIN must not have moved the SESSION-scoped level: a `SET SESSION` /
+        // `SET @@SESSION.…` spelling would show up as SERIALIZABLE here and outlive the transaction.
+        let in_tx =
+            first_scalar(&exec_ok(&mut c, 21, &tx_read_req(tx, SESSION_ISOLATION_SQL)).await);
+        assert_eq!(
+            in_tx, base,
+            "[{label}] the composed BEGIN must leave the SESSION-scoped isolation alone — a level \
+             set at SESSION scope survives COMMIT on the pooled connection and is inherited by the \
+             next tenant (charter rule 6)"
+        );
+
         match exec(
             &mut c,
             8,
@@ -725,19 +763,22 @@ async fn mysql_begin_honours_isolation_and_readonly() {
             other_out => panic!("[{label}] ROLLBACK of the control tx: {other_out:?}"),
         }
 
-        // ---- (d) THE CROSS-TENANT LEAK GUARD IS NOT HERE, AND THAT IS DELIBERATE.
-        // A pool-level "the next tenant did not inherit SERIALIZABLE" assertion here would be a
-        // guard that CANNOT FAIL, and it was measured as such before being deleted: with the
-        // composer mutated to emit the forbidden `SET SESSION TRANSACTION ISOLATION LEVEL …`, this
-        // block stayed GREEN — because `MysqlBackend::clean_reset_profile()` is `Some(Full)`, so
-        // EVERY MySQL recycle runs `COM_RESET_CONNECTION` and wipes the leaked level before the next
-        // tenant can observe it. (The PG mirror in `tx_it.rs` was measured the same way and is
-        // masked by the targeted profile's `RESET ALL`.) The falsifiable leak guard therefore lives
-        // one layer down, on a RAW backend connection with no hygiene in the way:
-        // `ferro-backend-mysql`'s `begin_dialect_it::the_batched_isolation_never_survives_the_transaction`,
-        // which goes RED (`SERIALIZABLE` vs `REPEATABLE-READ`) under exactly that mutation.
-        // Hygiene masking the leak is defence in depth, NOT the property being asserted — and it is
-        // one of the concrete holes any future tracker-clean hygiene skip (§7.2, R2) must close.
+        // ---- (d) WHY THE LEAK GUARD IS THE *IN-TX* READ ABOVE AND NOT A NEXT-TENANT READ HERE.
+        // A "the next tenant did not inherit SERIALIZABLE" assertion at THIS point is a guard that
+        // cannot fail, and it was measured as such: with the composer mutated to emit the forbidden
+        // SESSION-scoped form, a next-tenant read stayed GREEN — `MysqlBackend::clean_reset_profile()`
+        // is `Some(Full)`, so EVERY MySQL recycle runs `COM_RESET_CONNECTION` and wipes the leaked
+        // level before the next tenant can observe it. (The PG mirror in `tx_it.rs` was measured the
+        // same way and is masked by the targeted profile's `RESET ALL`.) Hygiene masking the leak is
+        // defence in depth, NOT the property being asserted — and it is one of the concrete holes
+        // any future tracker-clean hygiene skip (§7.2, R2) must close.
+        //
+        // The falsifiable pool-level guard is therefore the read INSIDE the pinned transaction (step
+        // (b)), where hygiene provably cannot have run yet: mutated, it reads `SERIALIZABLE` against
+        // a `REPEATABLE-READ` base and goes RED on both engines. A second, independent guard lives
+        // one layer further down on a RAW backend connection —
+        // `ferro-backend-mysql`'s `begin_dialect_it::the_batched_isolation_never_survives_the_transaction`
+        // — which additionally proves the level is gone AFTER the transaction ends.
 
         exec_ok(&mut c, 15, &ddl("DROP TABLE IF EXISTS s8a_ro")).await;
         common::assert_session_alive(&mut c, 0xC0FFF0).await;

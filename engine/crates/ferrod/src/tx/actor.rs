@@ -69,7 +69,10 @@ use super::{CtlReply, ExecReply, TxCommand, TxRegistry};
 /// rule 6). The next-transaction-only spelling is correct *because* it does not persist; its
 /// observable consequence is that the level is NOT readable back from `@@transaction_isolation`
 /// (which keeps reporting the session default, rendered by MySQL with a hyphen: `REPEATABLE-READ`),
-/// so it must be verified by a LOCK CONFLICT, never by reading that variable. See SPEC §22.2 (s).
+/// so the level that WAS applied must be verified by a LOCK CONFLICT, never by reading that
+/// variable. Reading it is still the right way to verify the *converse* — that the session default
+/// was NOT moved — and that is exactly what the live in-transaction guards do (see the tripwire
+/// note in `compose_begin_sql_table`). See SPEC §22.2 (s).
 ///
 /// Examples: `(Postgres, None, false) → "BEGIN"`; `(Postgres, None, true) → "BEGIN READ ONLY"`;
 /// `(MySql, Some(Serializable), true) →
@@ -738,9 +741,20 @@ mod tests {
             );
         }
 
-        // The SESSION form is FORBIDDEN (it would persist the level on the pooled connection past
-        // COMMIT — a cross-tenant leak, charter rule 6). Asserted over the WHOLE composed matrix,
-        // not a spot check, so no future cell can reintroduce it.
+        // A CHEAP TRIPWIRE, NOT THE GUARANTEE. The SESSION form is forbidden (it would persist the
+        // level on the pooled connection past COMMIT — a cross-tenant leak, charter rule 6), and
+        // this catches the two obvious spellings over the WHOLE composed matrix rather than a spot
+        // check. But it is a SOURCE-TEXT containment check, and a respelling defeats it:
+        // `SET @@SESSION.transaction_isolation = 'SERIALIZABLE'` contains neither `SET SESSION` nor
+        // `GLOBAL`, sets the session variable on both engines (measured), and leaves this table
+        // GREEN. Do NOT read a green run here as "no session-scoped isolation is emitted".
+        //
+        // The LOAD-BEARING guard is BEHAVIOURAL and lives live: `ferrod`'s
+        // `mysql_it::mysql_begin_honours_isolation_and_readonly` and
+        // `tx_it::pg_begin_isolation_and_readonly_are_unchanged` read the SESSION-scoped level
+        // INSIDE the pinned transaction (where no checkout hygiene can have run) and compare it to
+        // the session default. Those catch the `@@SESSION` respelling too — measured RED on MySQL,
+        // MariaDB and PostgreSQL under exactly that mutation.
         for (iso, ro, _) in pg.iter().chain(my.iter()) {
             for d in [Dialect::Postgres, Dialect::MySql] {
                 let sql = compose_begin_sql(d, *iso, *ro).unwrap();

@@ -42,6 +42,20 @@ use Ferro\Protocol\Outcome;
  */
 final class Connection
 {
+    /**
+     * The wire error codes that mean "the transaction you named is not here any more", which
+     * {@see rollBack} swallows alongside a lost link. Codes, not messages: a message check would be
+     * source-text matching against engine strings that are free to change.
+     *
+     * `ERR_TX_DEADLINE` is `ferrod`'s tombstone arm (the tx was rolled back + released by a deadline
+     * or an in-tx cancel); `ERR_PROTOCOL` is its unknown-or-forbidden `tx_id` and its
+     * "transaction is no longer active" (the actor is already gone). Both are engine-side facts
+     * about a transaction that has ALREADY ended — see {@see rollBack}'s docblock.
+     *
+     * @var list<int>
+     */
+    private const TX_ALREADY_GONE = [C::ERR_TX_DEADLINE, C::ERR_PROTOCOL];
+
     private readonly ExecCodec $codec;
     private readonly RetryPolicy $policy;
     private readonly FateClassifier $fate;
@@ -515,9 +529,30 @@ final class Connection
      * rollback is not a lost write"). There is nothing for the caller to decide, so there is nothing
      * to report.
      *
-     * A SERVER-side rejection (a well-formed `Outcome::Error`, e.g. an unknown `tx_id`) is a
-     * different thing and still throws: that is the engine telling us our state is wrong, not a link
-     * failure, and swallowing it would hide a real bug.
+     * **The same reasoning covers "that transaction is already gone", which is NOT a link failure**
+     * and is in fact the COMMONEST way a mid-transaction failure lands. When an in-transaction
+     * statement hits `idle_in_tx` / `max_tx` / an in-tx cancel, the engine rolls the transaction
+     * back, releases the pinned connection and TOMBSTONES the `tx_id`; the caller's `finally` then
+     * sends `ROLLBACK` on that dead id and gets back a well-formed `Outcome::Error` —
+     * {@see C::ERR_TX_DEADLINE} (`resolve_active`'s tombstone arm) or {@see C::ERR_PROTOCOL}
+     * ("unknown or forbidden tx_id", "transaction is no longer active"). Letting those throw
+     * defeated the exact property this swallow exists to protect: the `finally` replaced the
+     * caller's real error with a `RetryableException` about a transaction that was already dead.
+     * They are swallowed for the identical reason a lost ROLLBACK is — there is nothing left to
+     * decide. (Reported in the M1-S8a Task 8/9 review, F4.)
+     *
+     * **It is NOT blanket**, and deliberately so. Any OTHER server-side rejection still throws — a
+     * backend failure during the rollback itself ({@see C::ERR_CONNECTION_LOST} out of the fate
+     * matrix) is the engine reporting something that HAPPENED, not "that transaction does not
+     * exist", and swallowing every class here would leave `rollBack()` unable to report anything at
+     * all. The closure form's rollback arm is a blanket `catch (\Throwable)`; this one is scoped.
+     *
+     * Known cost of keying on the wire code: `ERR_PROTOCOL` on a ROLLBACK has a third producer — a
+     * malformed `TxControl` body, i.e. a CLIENT codec defect — which is indistinguishable on the
+     * wire from the two "tx is gone" cases and is therefore swallowed here too. It stays loud on
+     * COMMIT and on every savepoint op, which do not swallow. A dedicated `TxNotFound` error code in
+     * `/proto` would remove the ambiguity; that is a registry change and is left to the tier that
+     * owns `/proto`.
      */
     public function rollBack(): void
     {
@@ -528,6 +563,13 @@ final class Connection
         } catch (ConnectionLostException | TransportException) {
             // Intentionally swallowed — see the docblock. The transaction is dead either way, and
             // this is almost always called from a `finally` that is carrying the real error.
+        } catch (RetryableException | NonRetryableException $e) {
+            // Both classes are reachable for the same fact: the wire `branch` byte picks the class
+            // (tombstone → Retryable, unknown-id → NonRetryable), so the decision is made on the
+            // `code`, which is what actually identifies "that transaction is gone".
+            if (!in_array($e->errorCode(), self::TX_ALREADY_GONE, true)) {
+                throw $e;
+            }
         }
     }
 

@@ -1092,6 +1092,12 @@ async fn savepoint_sql_outside_a_transaction_is_refused() {
 /// PG's `BEGIN ISOLATION LEVEL …` sets the CURRENT transaction's level and reports it, while
 /// MySQL's `SET TRANSACTION …` prefix applies to the NEXT transaction and is invisible in
 /// `@@transaction_isolation` (see `mysql_it.rs`'s lock-conflict proof).
+/// PostgreSQL's SESSION-scoped isolation default — the one that would OUTLIVE a transaction on a
+/// pooled connection. Deliberately NOT `transaction_isolation`, which reports the CURRENT
+/// transaction's level and is legitimately `serializable` inside a `BEGIN ISOLATION LEVEL
+/// SERIALIZABLE`.
+const PG_SESSION_ISOLATION_SQL: &str = "SELECT current_setting('default_transaction_isolation')";
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_begin_isolation_and_readonly_are_unchanged() {
     let Some(url) = pg_url() else {
@@ -1104,6 +1110,13 @@ async fn pg_begin_isolation_and_readonly_are_unchanged() {
     exec_ok(&mut c, 1, &ddl("DROP TABLE IF EXISTS s8a_pg_ro")).await;
     exec_ok(&mut c, 2, &ddl("CREATE TABLE s8a_pg_ro (v int)")).await;
 
+    // The SESSION-scoped default, read off the pool BEFORE any isolation-scoped transaction exists.
+    // Read, never hard-coded (`read committed` on a stock server), so the guard below is a genuine
+    // before/after comparison.
+    let base = exec_ok(&mut c, 20, &req(PG_SESSION_ISOLATION_SQL))
+        .await
+        .rows;
+
     let tx = begin(
         &mut c,
         3,
@@ -1112,6 +1125,33 @@ async fn pg_begin_isolation_and_readonly_are_unchanged() {
         true,
     )
     .await;
+
+    // ---- THE CROSS-TENANT LEAK GUARD, read INSIDE the pinned transaction (Task 8/9 review, F1).
+    // The connection is pinned to this `tx_id`, so no checkout hygiene can run between the composed
+    // BEGIN and this read. `transaction_isolation` is the CURRENT transaction's level and is
+    // legitimately `serializable` here; `default_transaction_isolation` is the SESSION-scoped one
+    // that would OUTLIVE the transaction on a pooled connection — the composed BEGIN must not have
+    // touched it. A `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL …` spelling reads
+    // `serializable` here and goes RED.
+    let in_tx = exec_ok(
+        &mut c,
+        21,
+        &tx_req(
+            tx,
+            PG_SESSION_ISOLATION_SQL,
+            Vec::new(),
+            sql::FETCH_ROWS,
+            true,
+        ),
+    )
+    .await
+    .rows;
+    assert_eq!(
+        in_tx, base,
+        "the composed BEGIN must leave the SESSION-scoped default alone — a level set at SESSION \
+         scope survives COMMIT on the pooled connection and is inherited by the next tenant \
+         (charter rule 6)"
+    );
 
     let iso = exec_ok(
         &mut c,
@@ -1154,13 +1194,14 @@ async fn pg_begin_isolation_and_readonly_are_unchanged() {
 
     assert!(matches!(rollback(&mut c, 6, tx).await, Outcome::Ok(_)));
 
-    // NOTE — there is deliberately NO "the next transaction did not inherit SERIALIZABLE"
-    // assertion here. It was written, then measured to be a guard that CANNOT FAIL: with the PG arm
-    // mutated to ALSO emit `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL …` (a genuine
-    // cross-tenant leak), it stayed GREEN — the S3 targeted hygiene profile's `RESET ALL` wipes the
-    // session default at the next checkout before anything can observe it. The falsifiable leak
-    // guard lives on a RAW connection, with no hygiene in the way: `ferro-backend-mysql`'s
-    // `begin_dialect_it::the_batched_isolation_never_survives_the_transaction`.
+    // NOTE — there is deliberately NO "the NEXT TENANT did not inherit SERIALIZABLE" assertion here.
+    // It was written, then measured to be a guard that CANNOT FAIL: with the PG arm mutated to ALSO
+    // emit `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL …` (a genuine cross-tenant
+    // leak), it stayed GREEN — the S3 targeted hygiene profile's `RESET ALL` wipes the session
+    // default at the next checkout before anything can observe it. The falsifiable pool-level guard
+    // is the `default_transaction_isolation` read INSIDE the pinned transaction above, where hygiene
+    // provably has not run: mutated, it reads `serializable` against a `read committed` base and
+    // goes RED.
 
     exec_ok(&mut c, 10, &ddl("DROP TABLE IF EXISTS s8a_pg_ro")).await;
     assert_session_alive(&mut c, 0xC0FFF0).await;

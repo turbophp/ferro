@@ -26,6 +26,7 @@
 
 use ferro_backend_mysql::MysqlBackend;
 use ferro_pool::backend::{PoolBackend, TxStatus};
+use ferro_pool::error::PoolError;
 
 /// Run `f` once per configured MySQL-family engine.
 ///
@@ -95,16 +96,26 @@ async fn a_standalone_set_transaction_taints_but_the_batched_form_does_not() {
             "[{label}] and it must actually open the transaction"
         );
 
-        // ...and READ ONLY genuinely took.
-        let e = backend
+        // ...and READ ONLY genuinely took. The SQLSTATE is asserted EXACTLY: a bare `is_some()` here
+        // passed for ANY error — a typo in the DDL, a dropped connection, a syntax error — so it did
+        // not actually pin the read-only property it claimed to (M1-S8a Task 8/9 review, F3).
+        // MySQL/MariaDB report errno 1792 / SQLSTATE 25006 for a write in a read-only transaction.
+        match backend
             .simple_query(&mut conn, "CREATE TEMPORARY TABLE s8a_ro (i INT)")
             .await
-            .err();
-        // MySQL/MariaDB report 1792 / SQLSTATE 25006 for a write in a read-only transaction.
-        assert!(
-            e.is_some(),
-            "[{label}] a write inside a READ ONLY transaction must fail"
-        );
+        {
+            Err(PoolError::Sql {
+                sqlstate, errno, ..
+            }) => assert_eq!(
+                sqlstate.as_deref(),
+                Some("25006"),
+                "[{label}] READ ONLY must be enforced with SQLSTATE 25006 (got errno {errno:?})"
+            ),
+            other => panic!(
+                "[{label}] a write inside a READ ONLY transaction must be refused by the SERVER \
+                 (a `PoolError::Sql` carrying SQLSTATE 25006), got {other:?}"
+            ),
+        }
         backend.simple_query(&mut conn, "ROLLBACK").await.ok();
     })
     .await;

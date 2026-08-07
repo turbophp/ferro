@@ -11,9 +11,11 @@ use Ferro\Client\ExecCodec;
 use Ferro\Client\ReconnectLoop;
 use Ferro\Client\SessionInterface;
 use Ferro\Client\TxHandle;
+use Ferro\Protocol\ErrorPayload;
 use Ferro\Protocol\ExecRequest;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Msgpack\PurePacker;
+use Ferro\Protocol\TxControl;
 use Ferro\Tests\Support\FakeSession;
 use PHPUnit\Framework\TestCase;
 
@@ -224,6 +226,135 @@ final class ConnectionImperativeTxTest extends TestCase
         }
         $this->assertNotNull($original);
         $this->assertFalse($c->inTransaction());
+    }
+
+    // ---- rollBack() on a transaction the engine has already ended (Task 8/9 review, F4/F5) -------
+
+    /** A well-formed engine terminal, built positionally so the wire shape is explicit. */
+    private static function errorPayload(int $code, int $branch, string $message): ErrorPayload
+    {
+        return new ErrorPayload(
+            code: $code,
+            branch: $branch,
+            sqlstate: null,
+            errno: null,
+            message: $message,
+            detail: null,
+            retryAfterMs: null,
+        );
+    }
+
+    /**
+     * THE realistic mid-transaction failure, and the one the swallow exists for.
+     *
+     * An in-transaction statement trips `idle_in_tx` / `max_tx` / an in-tx cancel, so `ferrod` rolls
+     * the transaction back, releases the pinned connection and TOMBSTONES the `tx_id`, emitting ONE
+     * `TxDeadline{Retryable}` terminal (`services/sql.rs`'s `resolve_active`). The caller's
+     * `finally { rollBack(); }` then sends ROLLBACK on that dead id and the engine answers with the
+     * SAME well-formed terminal — no link failure anywhere, so the old two-class catch let it
+     * through and the `finally` replaced the caller's real error with a `RetryableException` about a
+     * transaction that had already ended.
+     *
+     * The wire shape is asserted, not just the absence of a throw: ROLLBACK really did go out, on
+     * `SERVICE_TX/METHOD_TX_ROLLBACK`, carrying the tombstoned `tx_id` — otherwise a `rollBack()`
+     * that silently sent nothing would pass this test.
+     */
+    public function testARollbackOnATombstonedTxIdCannotMaskTheCallersError(): void
+    {
+        $tombstoned = self::errorPayload(
+            C::ERR_TX_DEADLINE,
+            C::BRANCH_RETRYABLE,
+            'transaction deadline exceeded; the pinned connection was rolled back and released',
+        );
+        $session = FakeSession::withTxBegin(txId: 71)
+            ->push(FakeSession::errorOutcome($tombstoned), [C::SERVICE_SQL, C::METHOD_SQL_EXEC])
+            ->push(FakeSession::errorOutcome($tombstoned), [C::SERVICE_TX, C::METHOD_TX_ROLLBACK]);
+        $c = new Connection(session: $session);
+        $c->begin();
+
+        $original = null;
+        try {
+            try {
+                $c->exec('INSERT INTO t VALUES (1)');
+            } catch (\Throwable $e) {
+                $original = $e;
+                throw $e;
+            } finally {
+                $c->rollBack(); // the tx_id is tombstoned — this must NOT throw
+            }
+        } catch (\Throwable $seen) {
+            $this->assertSame($original, $seen, "the caller's own error must reach the caller");
+        }
+        $this->assertInstanceOf(RetryableException::class, $original);
+        $this->assertFalse($c->inTransaction());
+
+        // The ROLLBACK frame genuinely went out, on the right service/method, for the right tx.
+        $sent = $session->lastRequest();
+        $this->assertSame(C::SERVICE_TX, $sent['service']);
+        $this->assertSame(C::METHOD_TX_ROLLBACK, $sent['method']);
+        $off = 0;
+        $this->assertSame(
+            ['tx_id' => 71],
+            TxControl::mapFromWire((array) (new PurePacker())->unpack($sent['payload'], $off)),
+        );
+    }
+
+    /**
+     * The other "the transaction is gone" terminal: an unknown-or-forbidden `tx_id`, which
+     * `resolve_active` reports as `Protocol` (NonRetryable) — a client can never tell an unknown id
+     * from another session's. Same conclusion, different branch byte, so the swallow must key on the
+     * `code` rather than on the exception class.
+     */
+    public function testARollbackOnAnUnknownTxIdIsAlsoSwallowed(): void
+    {
+        $session = FakeSession::withTxBegin(txId: 72)->push(
+            FakeSession::errorOutcome(self::errorPayload(
+                C::ERR_PROTOCOL,
+                C::BRANCH_NON_RETRYABLE,
+                'unknown or forbidden tx_id (committed, rolled back, aborted, or another session\'s)',
+            )),
+            [C::SERVICE_TX, C::METHOD_TX_ROLLBACK],
+        );
+        $c = new Connection(session: $session);
+        $c->begin();
+
+        $c->rollBack(); // must not throw
+
+        $this->assertFalse($c->inTransaction());
+    }
+
+    /**
+     * The documented rule the swallow is scoped AGAINST: a server-side rejection that is NOT "that
+     * transaction is gone" still throws.
+     *
+     * `ConnectionLost` here is the engine's own §9.2 terminal — it reached the transaction's actor
+     * and the BACKEND connection died while the ROLLBACK statement itself ran. That is a report
+     * about something that happened, not "no such transaction", and swallowing every class would
+     * leave `rollBack()` unable to report anything at all — the swallow would stop being falsifiable.
+     *
+     * Until this test existed the rule was asserted only in a docblock and in SPEC §22.2 (t) with
+     * nothing driving it (Task 8/9 review, F5).
+     */
+    public function testAServerErrorThatIsNotAMissingTransactionStillThrows(): void
+    {
+        $session = FakeSession::withTxBegin(txId: 73)->push(
+            FakeSession::errorOutcome(self::errorPayload(
+                C::ERR_CONNECTION_LOST,
+                C::BRANCH_RETRYABLE,
+                'connection to backend lost',
+            )),
+            [C::SERVICE_TX, C::METHOD_TX_ROLLBACK],
+        );
+        $c = new Connection(session: $session);
+        $c->begin();
+
+        try {
+            $c->rollBack();
+            $this->fail('a server error that is not "the transaction is gone" must surface');
+        } catch (RetryableException $e) {
+            $this->assertSame(C::ERR_CONNECTION_LOST, $e->errorCode());
+        }
+        $this->assertFalse($c->inTransaction(), 'the handle is cleared either way');
     }
 
     // ---- last_insert_id propagation (M1-S8a C3) -------------------------------------------------
