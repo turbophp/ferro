@@ -427,8 +427,9 @@ async fn pg_begin_tx_with_composed_isolation_and_same_pid() {
 }
 
 /// S6 live: `tx_control` runs engine-composed SAVEPOINT/RELEASE on a pinned conn via the UNGUARDED
-/// passthrough (the guarded `query` would reject them as bare tx-control), and the conn stays on
-/// the same backend pid throughout.
+/// passthrough, and the conn stays on the same backend pid throughout. Since M1-S8a the guarded
+/// `query` ALSO admits a savepoint inside an open transaction (SPEC §22.2 (r)) — the tail of this
+/// test pins the difference that remains: boundary verbs and compound savepoints stay refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_tx_control_savepoint_roundtrip() {
     let Some(url) = test_url() else {
@@ -461,13 +462,27 @@ async fn pg_tx_control_savepoint_roundtrip() {
         "the savepoint statements must all run on the SAME pinned backend pid"
     );
 
-    // Sanity: the guarded query() still rejects a bare SAVEPOINT (the bypass is tx_control ONLY).
+    // M1-S8a (SPEC §22.2 (r)): the guarded `query()` no longer rejects a savepoint on a conn that
+    // HAS a transaction open — that is the Doctrine nested-transaction passthrough. What it still
+    // rejects on the very same pinned conn is a transaction-BOUNDARY verb (the pin authority), and
+    // a COMPOUND statement leading with a savepoint (which the text protocol would run whole).
+    co.query("SAVEPOINT s3", &[])
+        .await
+        .expect("M1-S8a: a savepoint passes through the guarded query() inside a transaction");
     assert!(
-        matches!(
-            co.query("SAVEPOINT s3", &[]).await,
-            Err(PoolError::Unsupported(_))
-        ),
-        "the guarded query() must still reject bare tx-control even on a pinned conn"
+        co.tx_open(),
+        "a savepoint must not close the transaction (PG's RFQ byte does not flip)"
+    );
+    for refused in ["COMMIT", "ROLLBACK", "BEGIN", "SAVEPOINT s4; COMMIT"] {
+        assert!(
+            matches!(co.query(refused, &[]).await, Err(PoolError::Unsupported(_))),
+            "the guarded query() must still reject {refused:?} on a pinned conn"
+        );
+    }
+    assert_eq!(
+        backend_pid(&mut co).await,
+        pid,
+        "the passthrough savepoint and every refusal stayed on the SAME pinned backend pid"
     );
 
     co.commit_tx().await.expect("commit the tx");

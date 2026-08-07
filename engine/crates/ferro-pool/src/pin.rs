@@ -4,7 +4,7 @@
 //! (I/T/E), surfaced as [`crate::backend::TxStatus`], the AUTHORITY: after every statement the pool
 //! reads `tx_status` and `Checkout::apply_tx_status` updates the pin state from the real I/T/E (pin
 //! on `T`/`E`, unpin on `I`). The explicit `begin_tx`/`commit_tx`/`rollback_tx` sets and the
-//! `is_bare_tx_control` guard remain as DEFENSE-IN-DEPTH, not the authority. M1-S2 (this module)
+//! `tx_control_class` guard remain as DEFENSE-IN-DEPTH, not the authority. M1-S2 (this module)
 //! adds the ASSIST-lexer's 7 `PinCause` variants (`ferro-classify`'s `PinTrigger`, via
 //! `From<PinTrigger>`) alongside the original RFQ-only `Tx` — the RFQ byte remains the sole
 //! transaction-pin AUTHORITY; the lexer only ever ADDS a taint + cause label for protocol-invisible
@@ -83,21 +83,32 @@ impl From<ferro_classify::PinTrigger> for PinCause {
     }
 }
 
-/// Single-word statements that open/close/manage a transaction on their own.
-const SINGLE_WORD_TX_CONTROL: [&str; 7] = [
-    "BEGIN",
-    "SAVEPOINT",
-    "COMMIT",
-    "END",
-    "ROLLBACK",
-    "ABORT",
-    "RELEASE",
-];
+/// What KIND of transaction-control statement a SQL string leads with (M1-S8a).
+///
+/// The split exists because the two classes have different safety properties. A **boundary** verb
+/// changes whether a transaction is OPEN — the pin AUTHORITY — so running one through a guarded
+/// entry would let a client open a transaction the pool believes is not open, on a connection that
+/// then returns to the pool for the next tenant (charter rule 6), with no `tx_id`, no actor, no
+/// deadline and no rollback-on-session-death. A **savepoint** verb changes nothing about
+/// transaction status — real Postgres's `ReadyForQuery` byte does not flip on any of them, which is
+/// exactly what [`leading_tx_verb`] already models as "preserve" — and every savepoint dies with
+/// its enclosing transaction, which the tx actor owns. So savepoints may pass through *inside a
+/// transaction*, and Doctrine's nested-transaction emulation (`SAVEPOINT DOCTRINE_1` /
+/// `RELEASE SAVEPOINT …` / `ROLLBACK TO SAVEPOINT …`, all plain `exec()` SQL) works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxControlClass {
+    /// Opens or closes a transaction block. ALWAYS refused on the guarded entries.
+    Boundary,
+    /// Manages a savepoint WITHIN a transaction. Allowed iff the checkout already has one open.
+    Savepoint,
+}
 
-/// Two-word tx-control verbs (Postgres synonyms) — v2/M2's load-bearing addition, since
-/// `START TRANSACTION` is the missing open-tx verb a single-word check would miss.
-const TWO_WORD_TX_CONTROL: [(&str, &str); 2] =
-    [("START", "TRANSACTION"), ("PREPARE", "TRANSACTION")];
+/// Boundary verbs that stand alone.
+const BOUNDARY_SINGLE: [&str; 4] = ["BEGIN", "COMMIT", "END", "ABORT"];
+/// Boundary verbs spelled as two words.
+const BOUNDARY_PAIR: [(&str, &str); 2] = [("START", "TRANSACTION"), ("PREPARE", "TRANSACTION")];
+/// Savepoint verbs that stand alone (`SAVEPOINT n`, `RELEASE [SAVEPOINT] n`).
+const SAVEPOINT_SINGLE: [&str; 2] = ["SAVEPOINT", "RELEASE"];
 
 /// Extracts up to `max` leading "words" (maximal runs of ASCII alphabetic characters, uppercased)
 /// from `sql`, treating everything else (whitespace, digits, punctuation) as a separator. This is
@@ -118,7 +129,7 @@ fn leading_words(sql: &str, max: usize) -> Vec<String> {
 /// Without this, a leading comment's own letters become the "first word" under `leading_words`'s
 /// non-alphabetic-is-a-separator rule — e.g. `/* x */ BEGIN` would extract `"X"` as the first
 /// word, never seeing `BEGIN` at all, letting a commented-out-looking `BEGIN`/`ROLLBACK`/etc slip
-/// past `is_bare_tx_control` and bypass the pin stub via `Checkout::exec` (MINOR 4, S4 review).
+/// past [`tx_control_class`] and bypass the pin stub via `Checkout::exec` (MINOR 4, S4 review).
 fn skip_leading_noise(sql: &str) -> &str {
     let mut rest = sql;
     loop {
@@ -146,27 +157,79 @@ fn skip_leading_noise(sql: &str) -> &str {
     }
 }
 
-/// True if `sql` starts with a bare transaction-control verb (`BEGIN`, `START TRANSACTION`,
-/// `SAVEPOINT`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, `RELEASE`, `PREPARE TRANSACTION`),
-/// case-insensitively, after skipping leading whitespace and leading `--`/`/* */` comments. Used
-/// by `Checkout::exec` (the guarded, user-facing entry) to reject statements that would bypass the
-/// pin stub; the pin hook itself (`begin_tx`/`commit_tx`/`rollback_tx`) goes through the raw,
-/// unguarded `PoolBackend::simple_query` instead and is never subject to this check.
-pub(crate) fn is_bare_tx_control(sql: &str) -> bool {
+/// Classify `sql`'s leading keyword(s), comment/whitespace tolerant (the same scan the pre-M1-S8a
+/// `is_bare_tx_control` used), as [`TxControlClass::Boundary`] / [`TxControlClass::Savepoint`], or
+/// `None` for anything that is not transaction control at all.
+///
+/// `ROLLBACK` is the ONLY verb in both classes and the only one whose SECOND word decides:
+/// `ROLLBACK TO [SAVEPOINT] n` is a savepoint operation, everything else spelled `ROLLBACK …`
+/// (bare, `;`-terminated, `WORK`, `TRANSACTION`) ends the transaction.
+///
+/// **SCOPE — this is a leading-keyword classifier, NOT a parser.** It reads at most the first two
+/// words, so a COMPOUND statement is classified by its leading verb only: `SELECT 1; COMMIT` is
+/// `None`. That is pre-existing behaviour (the guard has always worked this way) and it is not a
+/// leak — `crate::pool::Checkout::apply_tx_status` reads the real post-statement transaction status
+/// off the protocol signal, so the pin engine still sees a transaction a compound statement opened.
+/// `Checkout`'s guard adds ITS own single-statement requirement on top for the savepoint class,
+/// because a savepoint passthrough runs on the multi-statement-capable text protocol.
+pub(crate) fn tx_control_class(sql: &str) -> Option<TxControlClass> {
     let sql = skip_leading_noise(sql);
     let words = leading_words(sql, 2);
-    let Some(first) = words.first() else {
-        return false;
-    };
-    if SINGLE_WORD_TX_CONTROL.contains(&first.as_str()) {
-        return true;
+    let first = words.first()?.as_str();
+    let second = words.get(1).map(String::as_str);
+
+    if first == "ROLLBACK" {
+        return Some(if second == Some("TO") {
+            TxControlClass::Savepoint
+        } else {
+            TxControlClass::Boundary
+        });
     }
-    if let Some(second) = words.get(1) {
-        return TWO_WORD_TX_CONTROL
+    if BOUNDARY_SINGLE.contains(&first) {
+        return Some(TxControlClass::Boundary);
+    }
+    if SAVEPOINT_SINGLE.contains(&first) {
+        return Some(TxControlClass::Savepoint);
+    }
+    if let Some(second) = second
+        && BOUNDARY_PAIR
             .iter()
-            .any(|(a, b)| a == first && b == second);
+            .any(|(a, b)| *a == first && *b == second)
+    {
+        return Some(TxControlClass::Boundary);
     }
-    false
+    None
+}
+
+/// True if `sql` is a LONE statement — it carries no `;` other than an optional trailing one.
+///
+/// Deliberately conservative and deliberately NOT a parser: a `;` inside a quoted identifier or a
+/// trailing comment (`SAVEPOINT "a;b"`) reads as a separator here and makes this `false`. Every
+/// caller uses it to REFUSE, so the only possible error is refusing a statement that would have
+/// been fine — never admitting one that would not. That direction is the whole point: it is the
+/// condition [`crate::pool::Checkout`] puts on a savepoint PASSTHROUGH, which runs on the raw text
+/// protocol, where both engines execute every statement in the string (PG `batch_execute`, MySQL
+/// with `CLIENT_MULTI_STATEMENTS` negotiated). Without it, allowing a leading `SAVEPOINT` would
+/// also allow the `COMMIT` riding behind it in `SAVEPOINT s; COMMIT`.
+pub(crate) fn is_lone_statement(sql: &str) -> bool {
+    let trimmed = sql.trim_end();
+    let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
+    !body.contains(';')
+}
+
+/// True if `sql` starts with a bare transaction-control verb (`BEGIN`, `START TRANSACTION`,
+/// `SAVEPOINT`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, `RELEASE`, `PREPARE TRANSACTION`),
+/// case-insensitively, after skipping leading whitespace and leading `--`/`/* */` comments.
+///
+/// This WAS the guard on `Checkout::exec`/`query`/`query_stream` until M1-S8a; those entries now
+/// call the class-aware `Checkout::guard_tx_control` instead, so the boolean has no production
+/// caller left. It is RETAINED, `#[cfg(test)]`, as a REGRESSION FIXTURE: it is derived from
+/// [`tx_control_class`], so `s8a_is_bare_tx_control_is_unchanged_from_pre_s8a` (which asserts it
+/// against the hand-written PRE-S8a expectations, not against `tx_control_class(..).is_some()`)
+/// goes RED the moment a verb is dropped from, or added to, either class.
+#[cfg(test)]
+pub(crate) fn is_bare_tx_control(sql: &str) -> bool {
+    tx_control_class(sql).is_some()
 }
 
 /// Whether a leading transaction-control verb OPENS a transaction block (`BEGIN`,
@@ -180,13 +243,12 @@ pub(crate) enum TxVerb {
 }
 
 /// Classifies `sql`'s leading keyword(s) (comment/whitespace tolerant, same scan as
-/// [`is_bare_tx_control`]) as [`TxVerb::Open`]/[`TxVerb::Close`], or `None` if the leading verb
+/// [`tx_control_class`]) as [`TxVerb::Open`]/[`TxVerb::Close`], or `None` if the leading verb
 /// must leave transaction status UNCHANGED — i.e. "preserve", not "idle by default".
 ///
 /// This is the shared scan `FakeBackend` (Task 3) uses to model `TxStatus` per-connection from the
 /// SQL it records, so the fake's modeled `I`/`T`/`E` stays faithful to what real Postgres's RFQ
-/// byte would report for the same statement — NOT merely "matches `is_bare_tx_control`'s bare
-/// tx-control list". In particular a SAVEPOINT operation does NOT end the surrounding
+/// byte would report for the same statement — NOT merely "matches the guard's tx-control list". In particular a SAVEPOINT operation does NOT end the surrounding
 /// transaction on real Postgres (RFQ stays `T`), so:
 ///
 /// - `BEGIN` / `START TRANSACTION` → [`TxVerb::Open`] (RFQ `I`→`T`).
@@ -201,9 +263,10 @@ pub(crate) enum TxVerb {
 ///   one of these to model a specific status drives `FakeConn::set_tx_status` explicitly instead.
 /// - An ordinary, non-tx-control statement → `None` (PRESERVE, unchanged from before).
 ///
-/// Does NOT change [`is_bare_tx_control`]'s own behavior — that guard's job (rejecting
-/// `SAVEPOINT`/`RELEASE`/`ROLLBACK` at `Checkout::exec`/`query`) is a separate concern from this
-/// status model, and its bare-tx-control list intentionally stays exactly as it was.
+/// Separate concern from [`tx_control_class`], which decides what the guarded `Checkout` entries
+/// ADMIT. The two agree about savepoints for the same underlying reason — the RFQ byte does not
+/// flip on them — but they answer different questions: this one models the resulting STATUS, that
+/// one decides ADMISSION.
 pub(crate) fn leading_tx_verb(sql: &str) -> Option<TxVerb> {
     let sql = skip_leading_noise(sql);
     let words = leading_words(sql, 2);
@@ -256,7 +319,10 @@ pub(crate) fn tx_status_bits(st: TxStatus) -> (bool, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PinCause, TxVerb, is_bare_tx_control, leading_tx_verb, tx_status_bits};
+    use super::{
+        PinCause, TxControlClass, TxVerb, is_bare_tx_control, is_lone_statement, leading_tx_verb,
+        tx_control_class, tx_status_bits,
+    };
     use crate::backend::TxStatus;
     use ferro_classify::PinTrigger;
 
@@ -287,6 +353,139 @@ mod tests {
         assert_eq!(tx_status_bits(TxStatus::InTx), (true, false));
         // Failed (E): open AND aborted -> must taint before reuse.
         assert_eq!(tx_status_bits(TxStatus::Failed), (true, true));
+    }
+
+    /// The split that makes savepoint passthrough safe. `ROLLBACK` is in BOTH classes and is the
+    /// only verb whose SECOND word decides — bare `ROLLBACK` ends the transaction, `ROLLBACK TO …`
+    /// does not (real PG's RFQ byte does not flip on the latter, `leading_tx_verb`'s own rationale).
+    #[test]
+    fn s8a_tx_control_class_splits_boundary_from_savepoint() {
+        use TxControlClass::{Boundary, Savepoint};
+        let cases: &[(&str, Option<TxControlClass>)] = &[
+            ("BEGIN", Some(Boundary)),
+            ("begin;", Some(Boundary)),
+            ("START TRANSACTION READ ONLY", Some(Boundary)),
+            ("COMMIT", Some(Boundary)),
+            ("END", Some(Boundary)),
+            ("ABORT", Some(Boundary)),
+            ("ROLLBACK", Some(Boundary)),
+            ("ROLLBACK;", Some(Boundary)),
+            ("ROLLBACK WORK", Some(Boundary)),
+            ("PREPARE TRANSACTION 'x'", Some(Boundary)),
+            ("SAVEPOINT DOCTRINE_1", Some(Savepoint)),
+            ("savepoint doctrine_1", Some(Savepoint)),
+            ("SavePoint DOCTRINE_1", Some(Savepoint)),
+            ("RELEASE SAVEPOINT DOCTRINE_1", Some(Savepoint)),
+            ("RELEASE DOCTRINE_1", Some(Savepoint)),
+            ("ROLLBACK TO SAVEPOINT DOCTRINE_1", Some(Savepoint)),
+            ("ROLLBACK TO DOCTRINE_1", Some(Savepoint)),
+            ("rollback to savepoint doctrine_1", Some(Savepoint)),
+            // Whitespace/newline tolerance — `skip_leading_noise` trims, `leading_words` treats any
+            // non-alphabetic run as a separator, so a leading newline/tab must not hide the verb.
+            ("   SAVEPOINT s   ", Some(Savepoint)),
+            ("\n\tROLLBACK TO SAVEPOINT s\n", Some(Savepoint)),
+            ("\n  COMMIT\n", Some(Boundary)),
+            // Comment tolerance is inherited from `skip_leading_noise` and must survive.
+            ("/* x */ ROLLBACK TO SAVEPOINT s", Some(Savepoint)),
+            ("/* x */ SAVEPOINT s", Some(Savepoint)),
+            ("-- x\nSAVEPOINT s", Some(Savepoint)),
+            ("-- c\nBEGIN", Some(Boundary)),
+            // A QUOTED savepoint identifier that is itself a keyword: `leading_words` reads
+            // `["SAVEPOINT", "COMMIT"]` and the FIRST word decides, so the quoted `"commit"` can
+            // never flip the class to Boundary. (Live-verified on PG: `SAVEPOINT "commit"` /
+            // `RELEASE SAVEPOINT "commit"` both run and keep the transaction open.)
+            (r#"SAVEPOINT "commit""#, Some(Savepoint)),
+            (r#"RELEASE SAVEPOINT "commit""#, Some(Savepoint)),
+            (r#"ROLLBACK TO SAVEPOINT "commit""#, Some(Savepoint)),
+            // `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] n` is legal PG, but only the TWO leading
+            // words are read, so the filler forms classify Boundary → REFUSED. That is a false
+            // refusal in the SAFE direction (never the reverse), and no DBAL platform emits it:
+            // `AbstractPlatform::createRollbackToSavepointSQL()` is `ROLLBACK TO SAVEPOINT <n>`.
+            ("ROLLBACK WORK TO SAVEPOINT s", Some(Boundary)),
+            ("ROLLBACK TRANSACTION TO SAVEPOINT s", Some(Boundary)),
+            // Not tx control at all.
+            ("SELECT 1", None),
+            ("INSERT INTO t VALUES (1)", None),
+            ("UPDATE savepoints SET x = 1", None),
+            ("", None),
+            ("   ", None),
+            // COMPOUND statements: the classifier sees the LEADING verb ONLY, so a boundary verb in
+            // a later position is invisible to it. Pinned here as the CURRENT, DELIBERATE behaviour
+            // (hazard 64), not as an aspiration — this is what stops SPEC §22.2 (r) from claiming a
+            // guarantee the guard does not provide. The pin AUTHORITY (`apply_tx_status`) is what
+            // keeps a compound statement honest; this guard is not, and never was, a parser.
+            // NOTE: the SAVEPOINT-leading compound rows classify `Savepoint` HERE and are still
+            // REFUSED by `Checkout`'s guard, which additionally requires a savepoint passthrough to
+            // be a LONE statement — see `pool.rs`'s `guard_tx_control`. Classification and the
+            // guard's policy are deliberately separate concerns.
+            ("SELECT 1; COMMIT", None),
+            ("SAVEPOINT s2; START TRANSACTION", Some(Savepoint)),
+            ("BEGIN; SELECT 1", Some(Boundary)),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(tx_control_class(sql), *want, "tx_control_class({sql:?})");
+        }
+    }
+
+    /// A savepoint PASSTHROUGH must be a lone statement, because it runs on the raw TEXT protocol
+    /// where both engines execute every statement in the string. Conservative by design — a `;`
+    /// inside a quoted identifier reads as a separator and is refused (the safe direction).
+    #[test]
+    fn s8a_is_lone_statement_rejects_anything_with_an_embedded_separator() {
+        for sql in [
+            "SAVEPOINT DOCTRINE_1",
+            "SAVEPOINT DOCTRINE_1;",
+            "  SAVEPOINT DOCTRINE_1 ;  ",
+            "ROLLBACK TO SAVEPOINT DOCTRINE_1\n",
+            "SELECT 1",
+        ] {
+            assert!(is_lone_statement(sql), "must be a lone statement: {sql:?}");
+        }
+        for sql in [
+            "SAVEPOINT s; COMMIT",
+            "SAVEPOINT s;COMMIT;",
+            "SAVEPOINT s;;",
+            "SELECT 1; COMMIT",
+            r#"SAVEPOINT "a;b""#, // conservative: quoted `;` is refused, the safe direction
+        ] {
+            assert!(
+                !is_lone_statement(sql),
+                "must NOT be a lone statement: {sql:?}"
+            );
+        }
+    }
+
+    /// The boolean façade stays EXACTLY as strict as the pre-M1-S8a `is_bare_tx_control` was.
+    ///
+    /// **Asserted against the pre-S8a expected values, NOT against `tx_control_class(..).is_some()`**
+    /// — the façade is now *defined* as that expression, so comparing the two would be a tautology
+    /// (`assert_eq!(f(x), f(x))`) and could not fail for any classifier change. This table is the
+    /// pre-change behaviour written out, so dropping a verb from either class goes RED here.
+    #[test]
+    fn s8a_is_bare_tx_control_is_unchanged_from_pre_s8a() {
+        let cases: &[(&str, bool)] = &[
+            ("BEGIN", true),
+            ("COMMIT", true),
+            ("END", true),
+            ("ABORT", true),
+            ("ROLLBACK", true),
+            ("START TRANSACTION", true),
+            ("PREPARE TRANSACTION 'x'", true),
+            ("SAVEPOINT s", true),
+            ("RELEASE s", true),
+            ("RELEASE SAVEPOINT s", true),
+            ("ROLLBACK TO s", true),
+            ("ROLLBACK TO SAVEPOINT s", true),
+            ("SELECT 1", false),
+            ("UPDATE savepoints SET x = 1", false),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(
+                is_bare_tx_control(sql),
+                *want,
+                "is_bare_tx_control({sql:?})"
+            );
+        }
     }
 
     #[test]

@@ -35,6 +35,19 @@ pub(crate) struct IdleConn<B: PoolBackend> {
     tainted: bool,
 }
 
+/// What [`Checkout::guard_tx_control`] decided about one statement on one guarded entry (M1-S8a).
+/// A refusal is an `Err` from the guard, so this enum only ever names the ALLOWED outcomes — and
+/// every call site matches it exhaustively, so a future variant breaks the build rather than
+/// silently falling into "run it normally".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxControlVerdict {
+    /// Not transaction-control-shaped — run it on the entry's normal path.
+    Proceed,
+    /// A savepoint operation on a checkout that already has a transaction open. Allowed, but it
+    /// MUST run on the raw TEXT leaf (`PoolBackend::simple_query`) — see [`Checkout::query`].
+    SavepointPassthrough,
+}
+
 /// `pub(crate)` (+ every field) so `health::spawn_reaper`/`reap_once` can read `backend`/`config`,
 /// lock `idle`, and (S4 CRITICAL fix) acquire its own owned permit from `semaphore` while pinging
 /// a connection it has pulled out of `idle` — the mechanism that makes a pinged conn count against
@@ -309,6 +322,10 @@ impl<B: PoolBackend> Checkout<B> {
     /// Whether this connection currently has an OPEN transaction, per the authoritative RFQ status
     /// (`apply_tx_status`) — the reuse-safety bit that makes the next checkout run a defensive
     /// `ROLLBACK`. Exposed so the RFQ-pin tests can assert the reuse-safety bits directly.
+    ///
+    /// M1-S8a: this is ALSO the condition [`Checkout::guard_tx_control`] reads to decide whether a
+    /// savepoint statement may pass through. It stays a plain `pub fn` (never `#[cfg(test)]`)
+    /// because `tests/query_guard.rs` is a separate crate that asserts through it.
     pub fn tx_open(&self) -> bool {
         self.tx_open
     }
@@ -354,8 +371,8 @@ impl<B: PoolBackend> Checkout<B> {
             // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
             // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
             // trailing `ReadyForQuery` is decoded — AND a statement can OPEN a tx before erroring:
-            // `exec` forwards a multi-statement batch to `batch_execute`, and `is_bare_tx_control`
-            // only checks the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
+            // `exec` forwards a multi-statement batch to `batch_execute`, and the tx-control
+            // guard only classifies the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
             // opens a tx mid-batch from autocommit, then errors — leaving an OPEN, ABORTED tx while
             // the atomic still reads stale-`Idle`. So neither `apply_tx_status` nor a pre-captured
             // `tx_open` can be trusted here. Force BOTH bits UNCONDITIONALLY so the checkout-time
@@ -377,7 +394,7 @@ impl<B: PoolBackend> Checkout<B> {
     }
 
     /// ENGINE-ONLY transaction-control passthrough (S6): runs `sql` via the RAW, UNGUARDED
-    /// `PoolBackend::simple_query` — with **NO `is_bare_tx_control` guard** — for engine-COMPOSED
+    /// `PoolBackend::simple_query` — with **NO tx-control guard at all** — for engine-COMPOSED
     /// `SAVEPOINT sp_n` / `RELEASE sp_n` / `ROLLBACK TO sp_n` on a pinned connection.
     ///
     /// MUST NEVER receive client-raw SQL. The guard on the user-facing [`Checkout::query`] /
@@ -404,8 +421,8 @@ impl<B: PoolBackend> Checkout<B> {
             // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
             // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
             // trailing `ReadyForQuery` is decoded — AND a statement can OPEN a tx before erroring:
-            // `exec` forwards a multi-statement batch to `batch_execute`, and `is_bare_tx_control`
-            // only checks the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
+            // `exec` forwards a multi-statement batch to `batch_execute`, and the tx-control
+            // guard only classifies the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
             // opens a tx mid-batch from autocommit, then errors — leaving an OPEN, ABORTED tx while
             // the atomic still reads stale-`Idle`. So neither `apply_tx_status` nor a pre-captured
             // `tx_open` can be trusted here. Force BOTH bits UNCONDITIONALLY so the checkout-time
@@ -452,8 +469,8 @@ impl<B: PoolBackend> Checkout<B> {
             // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
             // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
             // trailing `ReadyForQuery` is decoded — AND a statement can OPEN a tx before erroring:
-            // `exec` forwards a multi-statement batch to `batch_execute`, and `is_bare_tx_control`
-            // only checks the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
+            // `exec` forwards a multi-statement batch to `batch_execute`, and the tx-control
+            // guard only classifies the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
             // opens a tx mid-batch from autocommit, then errors — leaving an OPEN, ABORTED tx while
             // the atomic still reads stale-`Idle`. So neither `apply_tx_status` nor a pre-captured
             // `tx_open` can be trusted here. Force BOTH bits UNCONDITIONALLY so the checkout-time
@@ -493,8 +510,8 @@ impl<B: PoolBackend> Checkout<B> {
             // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
             // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
             // trailing `ReadyForQuery` is decoded — AND a statement can OPEN a tx before erroring:
-            // `exec` forwards a multi-statement batch to `batch_execute`, and `is_bare_tx_control`
-            // only checks the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
+            // `exec` forwards a multi-statement batch to `batch_execute`, and the tx-control
+            // guard only classifies the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
             // opens a tx mid-batch from autocommit, then errors — leaving an OPEN, ABORTED tx while
             // the atomic still reads stale-`Idle`. So neither `apply_tx_status` nor a pre-captured
             // `tx_open` can be trusted here. Force BOTH bits UNCONDITIONALLY so the checkout-time
@@ -522,18 +539,88 @@ impl<B: PoolBackend> Checkout<B> {
         self.last_pin_cause
     }
 
-    /// The guarded, user-facing statement entry (v2/M1). Rejects bare transaction-control
-    /// statements (`BEGIN`, `START TRANSACTION`, `SAVEPOINT`, `COMMIT`, `END`, `ROLLBACK`,
-    /// `ABORT`, `RELEASE`, `PREPARE TRANSACTION` — case-insensitive leading keyword, v2/M2) with
-    /// `PoolError::Unsupported` so the pin stub cannot be bypassed; the real TX path is the TX
-    /// service (S6). Anything else goes straight to the raw `PoolBackend::simple_query`.
-    pub async fn exec(&mut self, sql: &str) -> Result<u64, PoolError> {
-        if pin::is_bare_tx_control(sql) {
-            return Err(PoolError::Unsupported(format!(
-                "bare transaction-control statement not allowed via exec(): {sql:?} \
+    /// The tx-control guard shared by [`Checkout::exec`], [`Checkout::query`] and
+    /// [`Checkout::query_stream`] — ONE implementation, so a future entry point cannot be added
+    /// with a subtly different rule (before M1-S8a the rule was copy-pasted three times).
+    ///
+    /// Exhaustive over [`pin::TxControlClass`] on purpose: a new class breaks the build here rather
+    /// than silently falling into "allowed".
+    ///
+    /// **Why savepoints are different from boundary verbs.** A BOUNDARY verb changes whether a
+    /// transaction is OPEN — the pin AUTHORITY — so one slipping through a guarded entry would
+    /// leave a transaction the pool believes is not open on a connection that then returns to the
+    /// pool for the next tenant (charter rule 6), with no `tx_id`, no actor, no deadline and no
+    /// rollback-on-session-death. A SAVEPOINT verb does none of that: it cannot change transaction
+    /// status (real Postgres's `ReadyForQuery` byte does not flip on any of them — the reason
+    /// [`pin::leading_tx_verb`] has classified them "preserve" since M1-S1), and every savepoint is
+    /// destroyed by the enclosing transaction's commit or rollback, which the tx actor owns on
+    /// every exit path. So a savepoint may pass through *inside a transaction*, which is what makes
+    /// Doctrine's nested-transaction emulation (`SAVEPOINT DOCTRINE_1` / `RELEASE SAVEPOINT …` /
+    /// `ROLLBACK TO SAVEPOINT …`, all plain `exec()` SQL, never a driver API) work.
+    ///
+    /// **The three things a savepoint passthrough must ALSO satisfy**, all of them REFUSALS (each
+    /// can only reject a statement that might have been fine — never admit one that is not):
+    ///
+    /// 1. **A transaction must already be open.** Not for symmetry: MySQL silently IGNORES a bare
+    ///    `SAVEPOINT` under autocommit (no transaction is started and the savepoint has no effect),
+    ///    so delegating would hand the caller a rollback point that does not exist. (`ROLLBACK TO`
+    ///    / `RELEASE` under autocommit are already loud — measured `1305`/`42000` on MariaDB,
+    ///    `25P01` on PG — the rule covers all three because a rule that is loud for one verb and
+    ///    delegated for two is a rule nobody can reason about.)
+    /// 2. **No bound parameters.** A savepoint passthrough runs on the raw TEXT leaf, which cannot
+    ///    bind; accepting params would silently drop them (charter rule 6, no silent miscasts).
+    /// 3. **A LONE statement** ([`pin::is_lone_statement`]). The text leaf executes EVERY statement
+    ///    in the string on both engines, so without this, admitting a leading `SAVEPOINT` would
+    ///    also admit the `COMMIT` riding behind it in `SAVEPOINT s; COMMIT` — a boundary verb
+    ///    through the front door this guard exists to close.
+    fn guard_tx_control(
+        &self,
+        sql: &str,
+        params: &[Value],
+        entry: &str,
+    ) -> Result<TxControlVerdict, PoolError> {
+        match pin::tx_control_class(sql) {
+            None => Ok(TxControlVerdict::Proceed),
+            Some(pin::TxControlClass::Savepoint) if self.tx_open => {
+                if !params.is_empty() {
+                    return Err(PoolError::Unsupported(format!(
+                        "savepoint statement with bound parameters not allowed via {entry}(): \
+                         {sql:?} (a savepoint passthrough runs on the text protocol, which cannot \
+                         bind — inline the name instead)"
+                    )));
+                }
+                if !pin::is_lone_statement(sql) {
+                    return Err(PoolError::Unsupported(format!(
+                        "compound savepoint statement not allowed via {entry}(): {sql:?} \
+                         (a savepoint passthrough must be a single statement — the text protocol \
+                         would run every statement in the string, including a transaction-boundary \
+                         verb behind the savepoint)"
+                    )));
+                }
+                Ok(TxControlVerdict::SavepointPassthrough)
+            }
+            Some(pin::TxControlClass::Savepoint) => Err(PoolError::Unsupported(format!(
+                "savepoint statement outside a transaction not allowed via {entry}(): {sql:?} \
+                 (open a transaction first; MySQL silently ignores a savepoint under autocommit)"
+            ))),
+            Some(pin::TxControlClass::Boundary) => Err(PoolError::Unsupported(format!(
+                "bare transaction-control statement not allowed via {entry}(): {sql:?} \
                  (use the TX service instead)"
-            )));
+            ))),
         }
+    }
+
+    /// The guarded, user-facing statement entry (v2/M1). Rejects a transaction-BOUNDARY statement
+    /// (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, a bare `ROLLBACK`, `ABORT`,
+    /// `PREPARE TRANSACTION` — case-insensitive leading keyword, v2/M2) with
+    /// `PoolError::Unsupported` so the pin stub cannot be bypassed; the real TX path is the TX
+    /// service (S6). A SAVEPOINT statement is allowed iff a transaction is already open (M1-S8a,
+    /// SPEC §22.2 (r)) — and needs no special routing here, since this entry's normal path IS the
+    /// raw text leaf a savepoint passthrough requires. Anything else goes straight to
+    /// `PoolBackend::simple_query`.
+    pub async fn exec(&mut self, sql: &str) -> Result<u64, PoolError> {
+        // `exec` binds no parameters, so the guard's no-params rule is trivially satisfied.
+        self.guard_tx_control(sql, &[], "exec")?;
         let pool = Arc::clone(&self.pool);
         // RFQ authority (SPEC §7.1): tx_status is trustworthy only on the Ok arm (post-drain); on
         // Err the atomic may hold a STALE byte, so we read it but let the `is_err() && tx_open`
@@ -548,8 +635,8 @@ impl<B: PoolBackend> Checkout<B> {
             // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
             // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
             // trailing `ReadyForQuery` is decoded — AND a statement can OPEN a tx before erroring:
-            // `exec` forwards a multi-statement batch to `batch_execute`, and `is_bare_tx_control`
-            // only checks the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
+            // `exec` forwards a multi-statement batch to `batch_execute`, and the tx-control
+            // guard only classifies the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
             // opens a tx mid-batch from autocommit, then errors — leaving an OPEN, ABORTED tx while
             // the atomic still reads stale-`Idle`. So neither `apply_tx_status` nor a pre-captured
             // `tx_open` can be trusted here. Force BOTH bits UNCONDITIONALLY so the checkout-time
@@ -569,25 +656,45 @@ impl<B: PoolBackend> Checkout<B> {
     }
 
     /// The guarded, user-facing **row-returning** statement entry (S5, BLOCKER-2). Mirrors
-    /// [`Checkout::exec`]'s guard structure EXACTLY: it runs `pin::is_bare_tx_control(sql)` FIRST
-    /// and rejects a bare transaction-control statement (`BEGIN`/`COMMIT`/`ROLLBACK`/…, leading
+    /// [`Checkout::exec`]'s guard structure EXACTLY: it runs [`Checkout::guard_tx_control`] FIRST
+    /// and rejects a transaction-BOUNDARY statement (`BEGIN`/`COMMIT`/a bare `ROLLBACK`/…, leading
     /// comment/whitespace tolerant) with `PoolError::Unsupported` — so an `EXEC BEGIN` can never
     /// reach the raw client and open an untracked transaction that the next tenant on this pooled
-    /// connection would inherit (a cross-tenant leak; charter rule 6). Only a non-tx-control
-    /// statement is delegated to `PoolBackend::query`.
+    /// connection would inherit (a cross-tenant leak; charter rule 6). A SAVEPOINT statement inside
+    /// an open transaction is allowed (M1-S8a, SPEC §22.2 (r)); anything else non-tx-control is
+    /// delegated to `PoolBackend::query`.
+    ///
+    /// **A savepoint passthrough is routed to `PoolBackend::simple_query`, not `query`** — the raw
+    /// TEXT leaf, the SAME one [`Checkout::tx_control`] already uses for the engine's own composed
+    /// `SAVEPOINT sp_N`. Two reasons, in order of force: (1) **MySQL 8 cannot run these on the
+    /// prepared path at all** — measured on 8.4.11, `COM_STMT_PREPARE` of `SAVEPOINT` /
+    /// `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` fails with errno `1295` ("This command is not
+    /// supported in the prepared statement protocol yet"), while MariaDB 11.8 and PG 17 accept
+    /// them; relaxing the guard alone would therefore leave Doctrine's nested transactions broken
+    /// on the single most important DBAL backend. (2) A savepoint statement takes no parameters and
+    /// returns no rows, so the prepared/extended protocol buys nothing here. The guard's no-params
+    /// and lone-statement rules are what make this routing safe.
     pub async fn query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, PoolError> {
-        if pin::is_bare_tx_control(sql) {
-            return Err(PoolError::Unsupported(format!(
-                "bare transaction-control statement not allowed via query(): {sql:?} \
-                 (use the TX service instead)"
-            )));
-        }
+        let verdict = self.guard_tx_control(sql, params, "query")?;
         let pool = Arc::clone(&self.pool);
         // RFQ authority (SPEC §7.1): tx_status is trustworthy only on the Ok arm — `query::run`
         // fully drains the RowStream before returning, so on success the atomic holds this
         // statement's terminating RFQ; on Err (`ErrorResponse` before the trailing RFQ is consumed)
         // it may be STALE, so the guard below taints any error while a tx is open.
-        let r = pool.backend.query(self.conn_mut(), sql, params).await;
+        let r = match verdict {
+            TxControlVerdict::Proceed => pool.backend.query(self.conn_mut(), sql, params).await,
+            // A savepoint yields no columns and no rows on either engine, so the empty
+            // `QueryResult` is the faithful shape, not a stub. `affected` is whatever the backend's
+            // text leaf reports for the statement (0 on both engines for a savepoint op).
+            TxControlVerdict::SavepointPassthrough => pool
+                .backend
+                .simple_query(self.conn_mut(), sql)
+                .await
+                .map(|affected| QueryResult {
+                    affected,
+                    ..Default::default()
+                }),
+        };
         let st = pool.backend.tx_status(self.conn());
         self.apply_tx_status(st);
         // M1-S6: the SECOND assist signal, read at the same post-statement point. No-op for PG/Fake
@@ -597,8 +704,8 @@ impl<B: PoolBackend> Checkout<B> {
             // Rule A fail-safe (uniform across all 6 instrumented methods): on Err the RFQ atomic
             // is stale-UNTRUSTWORTHY — postgres-protocol returns Err at `ErrorResponse` BEFORE the
             // trailing `ReadyForQuery` is decoded — AND a statement can OPEN a tx before erroring:
-            // `exec` forwards a multi-statement batch to `batch_execute`, and `is_bare_tx_control`
-            // only checks the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
+            // `exec` forwards a multi-statement batch to `batch_execute`, and the tx-control
+            // guard only classifies the LEADING keyword, so `SELECT 1; BEGIN; SELECT 1/0` passes the guard,
             // opens a tx mid-batch from autocommit, then errors — leaving an OPEN, ABORTED tx while
             // the atomic still reads stale-`Idle`. So neither `apply_tx_status` nor a pre-captured
             // `tx_open` can be trusted here. Force BOTH bits UNCONDITIONALLY so the checkout-time
@@ -619,11 +726,17 @@ impl<B: PoolBackend> Checkout<B> {
 
     /// The guarded, user-facing **INCREMENTAL** row-returning entry (S5 Task 3, the constant-memory
     /// `fetch:stream` producer path). Mirrors [`Checkout::query`]'s guard EXACTLY: runs
-    /// `pin::is_bare_tx_control(sql)` FIRST and rejects a bare tx-control statement with
+    /// [`Checkout::guard_tx_control`] FIRST and rejects a transaction-BOUNDARY statement with
     /// `PoolError::Unsupported` so an `EXEC BEGIN` can never reach the raw client and open an
     /// untracked transaction the next tenant on this pooled connection would inherit (a cross-tenant
     /// leak; charter rule 6). Only a non-tx-control statement is delegated to
     /// `PoolBackend::query_stream`.
+    ///
+    /// **A savepoint is refused HERE even inside a transaction** — the one place the M1-S8a
+    /// passthrough does not apply. A savepoint operation returns no result set, so there is nothing
+    /// to stream; and the passthrough's routing (the raw text leaf, see [`Checkout::query`]) has no
+    /// streaming counterpart to route to. Refusing is the honest answer, and it is a REFUSAL, so it
+    /// cannot widen anything.
     ///
     /// Returns a [`RowStreamHandle`] that borrows `&mut self` — the borrow makes it impossible to
     /// return the `Checkout` to the pool (or run another statement on it) while the stream is live.
@@ -638,11 +751,14 @@ impl<B: PoolBackend> Checkout<B> {
         sql: &str,
         params: &[Value],
     ) -> Result<RowStreamHandle<'_, B>, PoolError> {
-        if pin::is_bare_tx_control(sql) {
-            return Err(PoolError::Unsupported(format!(
-                "bare transaction-control statement not allowed via query_stream(): {sql:?} \
-                 (use the TX service instead)"
-            )));
+        match self.guard_tx_control(sql, params, "query_stream")? {
+            TxControlVerdict::Proceed => {}
+            TxControlVerdict::SavepointPassthrough => {
+                return Err(PoolError::Unsupported(format!(
+                    "savepoint statement not allowed via query_stream(): {sql:?} \
+                     (a savepoint operation returns no rows — run it through exec()/query())"
+                )));
+            }
         }
         // Clone the Arc so the `&self.pool` borrow does not collide with the `self.conn_mut()`
         // borrow the backend call needs (same pattern as `query`/`exec`).

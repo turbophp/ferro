@@ -34,7 +34,7 @@ use ferro_proto::messages::Outcome;
 use ferro_proto::messages::sql::ExecRequest;
 use ferro_proto::messages::tx::{BeginRequest, BeginResponse, TxControl};
 use ferro_proto::value::Value;
-use ferrod::services::sql::FETCH_STREAM;
+use ferrod::services::sql::{FETCH_NONE, FETCH_STREAM};
 
 // -------------------------------------------------------------------------------------------------
 // Targets: run each scenario against every configured dialect (MySQL 8 + MariaDB 11) that is set.
@@ -332,5 +332,226 @@ async fn mysql_stream_is_refused_identically_on_both_arms_and_the_tx_survives() 
             Outcome::Ok(_) => {}
             other => panic!("[{label}] COMMIT after a refused tx-scoped stream: {other:?}"),
         }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// (6) M1-S8a Task 7 — savepoint SQL passthrough on the MySQL family (SPEC §22.2 (r)).
+// -------------------------------------------------------------------------------------------------
+
+/// A statement that returns no rows (DDL / INSERT / a savepoint op): `readonly = false`,
+/// `fetch = FETCH_NONE`.
+fn ddl(sql: &str) -> ExecRequest {
+    let mut r = req(sql);
+    r.readonly = false;
+    r.fetch = FETCH_NONE;
+    r
+}
+
+/// A tx-scoped WRITE request (`readonly = false`, `fetch = FETCH_NONE`) — `tx_req` above is the
+/// read-only/rows-fetching form the earlier scenarios use.
+fn tx_write_req(tx_id: u64, sql: &str) -> ExecRequest {
+    ExecRequest {
+        pool: "default".to_string(),
+        sql: Some(sql.to_string()),
+        query_id: None,
+        params: Vec::new(),
+        timeout_ms: None,
+        readonly: false,
+        fetch: FETCH_NONE,
+        tx_id: Some(tx_id),
+    }
+}
+
+/// Doctrine's nested-transaction emulation, verbatim, on BOTH MySQL-family engines. The read-back
+/// is what proves the savepoint took: an accepted statement that did nothing would pass a "no
+/// error" assertion.
+///
+/// This is also the gate on the ROUTING half of the fix. MySQL 8 cannot run a savepoint verb on the
+/// prepared-statement path at all (measured on 8.4.11: `COM_STMT_PREPARE` of `SAVEPOINT` /
+/// `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` → errno 1295), while MariaDB 11.8 can — so an
+/// implementation that only relaxed the guard and left the passthrough on the prepared path is
+/// GREEN on MariaDB and RED here on MySQL.
+#[tokio::test(flavor = "multi_thread")]
+async fn savepoint_sql_passes_through_inside_a_transaction() {
+    let targets = mysql_targets();
+    if targets.is_empty() {
+        return; // offline: both URLs unset (each printed its own skip line)
+    }
+    for (label, url) in targets {
+        let server = common::exec_server(url);
+        let mut c = server.connect().await;
+        c.hello(0).await;
+
+        exec_ok(&mut c, 1, &ddl("DROP TABLE IF EXISTS s8a_sp")).await;
+        exec_ok(&mut c, 2, &ddl("CREATE TABLE s8a_sp (v INT)")).await;
+
+        let tx = begin(&mut c, 3, "default").await;
+        for (rid, stmt) in [
+            (4, "INSERT INTO s8a_sp (v) VALUES (1)"),
+            (5, "SAVEPOINT DOCTRINE_1"),
+            (6, "INSERT INTO s8a_sp (v) VALUES (2)"),
+            (7, "ROLLBACK TO SAVEPOINT DOCTRINE_1"),
+            (8, "INSERT INTO s8a_sp (v) VALUES (3)"),
+            (9, "RELEASE SAVEPOINT DOCTRINE_1"),
+        ] {
+            match exec(&mut c, rid, &tx_write_req(tx, stmt)).await {
+                Outcome::Ok(_) => {}
+                other => {
+                    panic!("[{label}] {stmt:?} must pass through inside a transaction: {other:?}")
+                }
+            }
+        }
+        match commit(&mut c, 10, tx).await {
+            Outcome::Ok(_) => {}
+            other => panic!("[{label}] COMMIT: {other:?}"),
+        }
+
+        let rows = exec_ok(&mut c, 11, &req("SELECT v FROM s8a_sp ORDER BY v")).await;
+        let got: Vec<i64> = rows
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::I64(n) => *n,
+                other => panic!("[{label}] unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![1, 3],
+            "[{label}] the savepoint must have rolled 2 back and kept 1 and 3"
+        );
+
+        exec_ok(&mut c, 12, &ddl("DROP TABLE IF EXISTS s8a_sp")).await;
+        common::assert_session_alive(&mut c, 0xC0FFEE).await;
+    }
+}
+
+/// A transaction-BOUNDARY verb stays refused INSIDE a transaction on both engines — including one
+/// disguised by case/comments, and one riding behind a savepoint in a COMPOUND statement (which the
+/// text protocol would otherwise happily execute, `CLIENT_MULTI_STATEMENTS` being negotiated).
+#[tokio::test(flavor = "multi_thread")]
+async fn boundary_sql_stays_refused_inside_a_transaction() {
+    let targets = mysql_targets();
+    if targets.is_empty() {
+        return;
+    }
+    for (label, url) in targets {
+        let server = common::exec_server(url);
+        let mut c = server.connect().await;
+        c.hello(0).await;
+
+        exec_ok(&mut c, 1, &ddl("DROP TABLE IF EXISTS s8a_boundary")).await;
+        exec_ok(&mut c, 2, &ddl("CREATE TABLE s8a_boundary (v INT)")).await;
+
+        let tx = begin(&mut c, 3, "default").await;
+        match exec(
+            &mut c,
+            4,
+            &tx_write_req(tx, "INSERT INTO s8a_boundary (v) VALUES (1)"),
+        )
+        .await
+        {
+            Outcome::Ok(_) => {}
+            other => panic!("[{label}] seed insert: {other:?}"),
+        }
+
+        let mut rid = 5;
+        for boundary in [
+            "COMMIT",
+            "commit;",
+            "  RollBack  ",
+            "BEGIN",
+            "START TRANSACTION",
+            "END",
+            "/* nested */ COMMIT",
+            "-- nested\nROLLBACK",
+            "SAVEPOINT X1; COMMIT",
+        ] {
+            match exec(&mut c, rid, &tx_write_req(tx, boundary)).await {
+                Outcome::Error(ep) => assert_eq!(
+                    ep.code,
+                    errc::UNSUPPORTED,
+                    "[{label}] {boundary:?} must be UNSUPPORTED, got {ep:?}"
+                ),
+                other => {
+                    panic!("[{label}] {boundary:?} must be refused inside a transaction: {other:?}")
+                }
+            }
+            rid += 1;
+        }
+
+        // The transaction survived every refusal, so a savepoint still works and COMMIT commits.
+        match exec(&mut c, rid, &tx_write_req(tx, "SAVEPOINT AFTER_REFUSALS")).await {
+            Outcome::Ok(_) => {}
+            other => panic!("[{label}] the tx must still be usable after the refusals: {other:?}"),
+        }
+        rid += 1;
+        match commit(&mut c, rid, tx).await {
+            Outcome::Ok(_) => {}
+            other => panic!("[{label}] COMMIT after the refusals: {other:?}"),
+        }
+        rid += 1;
+
+        let rows = exec_ok(&mut c, rid, &req("SELECT v FROM s8a_boundary ORDER BY v")).await;
+        let got: Vec<i64> = rows
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::I64(n) => *n,
+                other => panic!("[{label}] unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![1],
+            "[{label}] the refused boundary verbs neither committed nor rolled back the tx"
+        );
+        rid += 1;
+
+        exec_ok(&mut c, rid, &ddl("DROP TABLE IF EXISTS s8a_boundary")).await;
+        common::assert_session_alive(&mut c, 0xC0FFEF).await;
+    }
+}
+
+/// Outside a transaction all three savepoint verbs stay refused — deliberately, because MySQL
+/// SILENTLY IGNORES a bare `SAVEPOINT` under autocommit (no transaction is started, the savepoint
+/// has no effect), so delegating would hand a driver a rollback point that does not exist.
+#[tokio::test(flavor = "multi_thread")]
+async fn savepoint_sql_outside_a_transaction_is_refused() {
+    let targets = mysql_targets();
+    if targets.is_empty() {
+        return;
+    }
+    for (label, url) in targets {
+        let server = common::exec_server(url);
+        let mut c = server.connect().await;
+        c.hello(0).await;
+
+        let mut rid = 1;
+        for sp in [
+            "SAVEPOINT DOCTRINE_1",
+            "ROLLBACK TO SAVEPOINT DOCTRINE_1",
+            "RELEASE SAVEPOINT DOCTRINE_1",
+        ] {
+            let e = exec_err(&mut c, rid, &ddl(sp)).await;
+            assert_eq!(e.code, errc::UNSUPPORTED, "[{label}] {sp:?} -> {e:?}");
+            assert!(
+                e.message.contains("outside a transaction"),
+                "[{label}] {sp:?} -> {}",
+                e.message
+            );
+            rid += 1;
+        }
+
+        let e2 = exec_err(&mut c, rid, &ddl("COMMIT")).await;
+        assert_eq!(e2.code, errc::UNSUPPORTED);
+        assert!(
+            e2.message.contains("use the TX service"),
+            "[{label}] {}",
+            e2.message
+        );
+
+        common::assert_session_alive(&mut c, 0xC0FFEE).await;
     }
 }

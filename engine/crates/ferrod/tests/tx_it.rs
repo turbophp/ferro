@@ -24,7 +24,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{TestClient, TestServer, assert_session_alive, exec, exec_ok, pg_url, req};
+use common::{TestClient, TestServer, assert_session_alive, exec, exec_err, exec_ok, pg_url, req};
 use ferro_proto::consts::{branch, errc, flags, method_tx, service, tag};
 use ferro_proto::messages::Outcome;
 use ferro_proto::messages::sql::ExecRequest;
@@ -859,4 +859,222 @@ async fn tx_unknown_id_protocol() {
         other => panic!("expected Protocol, got {other:?}"),
     }
     assert_session_alive(&mut client, 112).await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// M1-S8a Task 7 — savepoint SQL passthrough (SPEC §22.2 (r)). Doctrine's nested-transaction
+// emulation is PLAIN SQL through `exec()`, never a driver API, so these are the literal strings
+// `Doctrine\DBAL\Connection` emits.
+// -------------------------------------------------------------------------------------------------
+
+/// A statement that returns no rows (DDL / INSERT): the base `req` with `readonly = false` and
+/// `fetch = FETCH_NONE`.
+fn ddl(sql: &str) -> ExecRequest {
+    let mut r = req(sql);
+    r.readonly = false;
+    r.fetch = sql::FETCH_NONE;
+    r
+}
+
+/// Doctrine's nested-transaction emulation, verbatim: it emits `SAVEPOINT DOCTRINE_1` /
+/// `ROLLBACK TO SAVEPOINT DOCTRINE_1` / `RELEASE SAVEPOINT DOCTRINE_1` as PLAIN SQL through
+/// `exec()`, never a driver API. The read-back is what proves the savepoint actually took — an
+/// accepted statement that did nothing would pass a "no error" assertion.
+#[tokio::test(flavor = "multi_thread")]
+async fn savepoint_sql_passes_through_inside_a_transaction() {
+    let Some(url) = pg_url() else {
+        return; // prints `skip: FERRO_TEST_PG_URL unset`
+    };
+    let server = common::exec_server(url);
+    let mut c = server.connect().await;
+    c.hello(0).await;
+
+    exec_ok(&mut c, 1, &ddl("DROP TABLE IF EXISTS s8a_sp")).await;
+    exec_ok(&mut c, 2, &ddl("CREATE TABLE s8a_sp (v int)")).await;
+
+    let tx = begin(&mut c, 3, "default", None, false).await;
+    for (rid, sql) in [
+        (4, "INSERT INTO s8a_sp (v) VALUES (1)"),
+        (5, "SAVEPOINT DOCTRINE_1"),
+        (6, "INSERT INTO s8a_sp (v) VALUES (2)"),
+        (7, "ROLLBACK TO SAVEPOINT DOCTRINE_1"),
+        (8, "INSERT INTO s8a_sp (v) VALUES (3)"),
+        (9, "RELEASE SAVEPOINT DOCTRINE_1"),
+    ] {
+        match exec_in_tx(&mut c, rid, tx, sql, Vec::new(), sql::FETCH_NONE, false).await {
+            Outcome::Ok(_) => {}
+            other => panic!("{sql:?} must pass through inside a transaction, got {other:?}"),
+        }
+    }
+    match commit(&mut c, 10, tx).await {
+        Outcome::Ok(_) => {}
+        other => panic!("COMMIT: {other:?}"),
+    }
+
+    let rows = exec_ok(&mut c, 11, &req("SELECT v FROM s8a_sp ORDER BY v")).await;
+    let got: Vec<i64> = rows
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::I64(n) => *n,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![1, 3],
+        "the savepoint must have rolled 2 back and kept 1 and 3"
+    );
+
+    exec_ok(&mut c, 12, &ddl("DROP TABLE IF EXISTS s8a_sp")).await;
+    assert_session_alive(&mut c, 0xC0FFEE).await;
+}
+
+/// A transaction-BOUNDARY verb stays refused INSIDE a transaction too — the half of the split that
+/// protects the pin authority. Each refusal is a clean terminal that leaves the transaction usable,
+/// which the trailing savepoint + COMMIT + read-back proves.
+#[tokio::test(flavor = "multi_thread")]
+async fn boundary_sql_stays_refused_inside_a_transaction() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = common::exec_server(url);
+    let mut c = server.connect().await;
+    c.hello(0).await;
+
+    exec_ok(&mut c, 1, &ddl("DROP TABLE IF EXISTS s8a_boundary")).await;
+    exec_ok(&mut c, 2, &ddl("CREATE TABLE s8a_boundary (v int)")).await;
+
+    let tx = begin(&mut c, 3, "default", None, false).await;
+    match exec_in_tx(
+        &mut c,
+        4,
+        tx,
+        "INSERT INTO s8a_boundary (v) VALUES (1)",
+        Vec::new(),
+        sql::FETCH_NONE,
+        false,
+    )
+    .await
+    {
+        Outcome::Ok(_) => {}
+        other => panic!("seed insert: {other:?}"),
+    }
+
+    // A DISGUISED boundary verb (mixed case, leading comment/whitespace) is still a boundary verb.
+    let mut rid = 5;
+    for boundary in [
+        "COMMIT",
+        "commit;",
+        "  RollBack  ",
+        "BEGIN",
+        "START TRANSACTION",
+        "END",
+        "ABORT",
+        "/* nested */ COMMIT",
+        "-- nested\nROLLBACK",
+        // A savepoint verb with a boundary verb riding behind it: refused as a COMPOUND savepoint,
+        // never delegated (the text protocol would run BOTH statements).
+        "SAVEPOINT X1; COMMIT",
+    ] {
+        match exec_in_tx(
+            &mut c,
+            rid,
+            tx,
+            boundary,
+            Vec::new(),
+            sql::FETCH_NONE,
+            false,
+        )
+        .await
+        {
+            Outcome::Error(ep) => {
+                assert_eq!(
+                    ep.code,
+                    errc::UNSUPPORTED,
+                    "{boundary:?} must be UNSUPPORTED, got {ep:?}"
+                );
+            }
+            other => panic!("{boundary:?} must be refused inside a transaction, got {other:?}"),
+        }
+        rid += 1;
+    }
+
+    // The transaction survived every refusal (nothing reached the backend), so a savepoint still
+    // works and the COMMIT still commits.
+    match exec_in_tx(
+        &mut c,
+        rid,
+        tx,
+        "SAVEPOINT AFTER_REFUSALS",
+        Vec::new(),
+        sql::FETCH_NONE,
+        false,
+    )
+    .await
+    {
+        Outcome::Ok(_) => {}
+        other => panic!("the tx must still be usable after the refusals, got {other:?}"),
+    }
+    rid += 1;
+    match commit(&mut c, rid, tx).await {
+        Outcome::Ok(_) => {}
+        other => panic!("COMMIT after the refusals: {other:?}"),
+    }
+    rid += 1;
+
+    let rows = exec_ok(&mut c, rid, &req("SELECT v FROM s8a_boundary ORDER BY v")).await;
+    let got: Vec<i64> = rows
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::I64(n) => *n,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![1],
+        "the refused boundary verbs neither committed nor rolled back the transaction"
+    );
+    rid += 1;
+
+    exec_ok(&mut c, rid, &ddl("DROP TABLE IF EXISTS s8a_boundary")).await;
+    assert_session_alive(&mut c, 0xC0FFEF).await;
+}
+
+/// Outside a transaction it stays refused — deliberately, because MySQL would silently ignore a
+/// bare `SAVEPOINT` under autocommit (hazard 35 as refined).
+#[tokio::test(flavor = "multi_thread")]
+async fn savepoint_sql_outside_a_transaction_is_refused() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = common::exec_server(url);
+    let mut c = server.connect().await;
+    c.hello(0).await;
+
+    let mut rid = 1;
+    for sp in [
+        "SAVEPOINT DOCTRINE_1",
+        "ROLLBACK TO SAVEPOINT DOCTRINE_1",
+        "RELEASE SAVEPOINT DOCTRINE_1",
+    ] {
+        let e = exec_err(&mut c, rid, &ddl(sp)).await;
+        assert_eq!(e.code, errc::UNSUPPORTED, "{sp:?} -> {e:?}");
+        assert!(
+            e.message.contains("outside a transaction"),
+            "{sp:?} -> {}",
+            e.message
+        );
+        rid += 1;
+    }
+
+    // ...and a boundary verb is refused whether or not a transaction is open.
+    let e2 = exec_err(&mut c, rid, &ddl("COMMIT")).await;
+    assert_eq!(e2.code, errc::UNSUPPORTED);
+    assert!(e2.message.contains("use the TX service"), "{}", e2.message);
+
+    // The session survives all of them — exactly one END each (charter rule 4).
+    assert_session_alive(&mut c, 0xC0FFEE).await;
 }
