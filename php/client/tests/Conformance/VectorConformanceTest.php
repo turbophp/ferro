@@ -333,6 +333,32 @@ final class VectorConformanceTest extends TestCase
     }
 
     /**
+     * `error_mysql_errno`: the first vector carrying a NON-NULL `errno` alongside a SQLSTATE. Locks
+     * that PHP's `ErrorPayload` moves BOTH fields, independently, in both directions — the pair a
+     * Doctrine MySQL ExceptionConverter keys on (it matches the errno EXCLUSIVELY; MySQL's `23000`
+     * covers both a duplicate key and a NOT NULL violation, so the SQLSTATE cannot substitute).
+     */
+    public function testErrorMysqlErrnoVectorByteMatchesBothDirections(): void
+    {
+        $v = self::loadVector('error_mysql_errno.json');
+        $message = is_array($v['message']) ? $v['message'] : [];
+        $errorFields = is_array($message['error'] ?? null) ? $message['error'] : [];
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $p = new PurePacker();
+
+        $encoded = Outcome::error(ErrorPayload::fromArray($errorFields))->encode($p);
+        $this->assertSame(bin2hex($payload), bin2hex($encoded),
+            'PHP Outcome::Error(ErrorPayload) encode must byte-match error_mysql_errno');
+
+        $err = Outcome::decode($payload, $p)->errorPayload();
+        $this->assertSame(1062, $err->errno, 'the vendor errno must survive the round trip');
+        $this->assertSame('23000', $err->sqlstate, 'the SQLSTATE is carried independently');
+        $this->assertEquals($errorFields, $err->toArray());
+        $this->assertSame(bin2hex($payload), bin2hex(Outcome::error($err)->encode($p)),
+            'error_mysql_errno decode->encode fixpoint');
+    }
+
+    /**
      * @param array<string,mixed> $message
      */
     private function encodeTxRequest(string $name, array $message, PurePacker $p): string
@@ -386,7 +412,12 @@ final class VectorConformanceTest extends TestCase
         }
 
         // Vectors byte-locked by a name-keyed test rather than a prefix provider.
-        $namedLocked = ['tx_begin_response', 'error_protocol'];
+        // DERIVED, not a parallel list (charter: a completeness check must be able to fail).
+        // Every byte-lock test in this class reaches its fixture through `self::loadVector('X.json')`,
+        // so the set of name-locked vectors IS the set of names that call appears with. Adding a
+        // name to a hand-written array would have made this guard certify a vector that has NO
+        // byte-lock test at all — which is precisely the failure mode it exists to catch.
+        $namedLocked = self::namesLoadedByAByteLockTest();
         foreach (self::txRequestVectors() as [$v]) { $namedLocked[] = (string) $v['name']; }
         // The core messages the client encodes (testPurePackerEncodesMessageToExactVectorBytes) —
         // read from the SAME const that test filters on, so the two can never disagree.
@@ -399,6 +430,25 @@ final class VectorConformanceTest extends TestCase
         $this->assertSame([], $unlocked,
             'these committed vectors have NO cross-language byte lock (wrong name prefix?): '
             . implode(', ', $unlocked));
+    }
+
+    /**
+     * The vector names some test in THIS file loads by name, scraped from its own source.
+     *
+     * Deliberately a source scan and not a constant: the thing being asserted is "a byte-lock test
+     * exists for this vector", and the only honest evidence of that is a call site. `__FILE__` keeps
+     * it self-referential, so the scan cannot drift from the file it is scanning.
+     *
+     * @return list<string>
+     */
+    private static function namesLoadedByAByteLockTest(): array
+    {
+        $src = (string) file_get_contents(__FILE__);
+        $m = [];
+        preg_match_all("/loadVector\\(\\s*'([A-Za-z0-9_]+)\\.json'\\s*\\)/", $src, $m);
+        /** @var list<string> $names */
+        $names = array_values(array_unique(is_array($m[1] ?? null) ? $m[1] : []));
+        return $names;
     }
 
     /** @return array<string,mixed> */

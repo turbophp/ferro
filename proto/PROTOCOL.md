@@ -283,7 +283,15 @@ the vector wins.
 
 **Core service + the cross-cutting envelopes** (§4/§5/§6): `hello`, `hello_ack` (also locks the §2
 `boot_epoch` uint64 → decimal-string rule), `ping`, `pong`, `goodbye`, `window_update`, and
-`error_protocol` (a terminal `Outcome::Error(ERROR)`).
+`error_protocol` (a terminal `Outcome::Error(ERROR)` with `sqlstate` and `errno` both `nil`).
+
+**M1-S8a:** `error_mysql_errno` — the FIRST vector locking a **non-null `errno`** (field 4, §5)
+alongside a real `sqlstate`: a MySQL duplicate key, `errno 1062` / SQLSTATE `23000`, carried in a
+terminal `Outcome::Error`. It exists because the two fields are independent on the wire and only the
+`errno` carries vendor-level identity — MySQL reuses `23000` for both a duplicate key (`1062`) and a
+NOT NULL violation (`1048`), so a consumer keyed on the SQLSTATE alone cannot tell them apart. The
+`errno` rides the §2 signed/unsigned narrowing ladder like any other integer field (`1062` ⇒
+`cd 04 26`, a `uint16`), NOT a fixed width.
 
 **Per-service indexes:** SQL `EXEC` → §8.3 · TX → §9.6 · STREAM `HEAD`/`DATA` → §10.3.
 
@@ -303,7 +311,12 @@ vector whose `message` and `frame_hex` disagree.
 cross-language byte-lock cases by prefix (`sql_exec_`, `stream_head_`, `stream_data_`); a vector
 named outside those prefixes silently receives only the generic header/unpack tests. New SQL and
 STREAM vectors MUST use those prefixes (asserted by
-`VectorConformanceTest::testEveryCommittedVectorIsByteLocked`).
+`VectorConformanceTest::testEveryCommittedVectorIsByteLocked`). A vector outside those prefixes
+(`tx_begin_response`, `error_protocol`, `error_mysql_errno`) earns its lock from a NAME-keyed test
+instead, and that accounting is **derived, not declared** (M1-S8a): the guard scrapes its own source
+for `loadVector('<name>.json')` call sites, so a name can only count as locked when a byte-lock test
+that loads it actually exists. Appending a name to a hand-written array — the shape this replaced —
+would have let a registration certify a vector with no byte-lock test at all.
 
 ## 8. SQL service messages (`EXEC`)
 

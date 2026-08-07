@@ -1038,6 +1038,7 @@ mod tests {
             code: 0,
             branch: 0,
             sqlstate: Some("57014".to_string()),
+            errno: None,
             message: "canceling statement due to statement timeout".to_string(),
         });
         let pool = Pool::new(backend, test_pool_config());
@@ -1100,6 +1101,7 @@ mod tests {
             code: 0,
             branch: 0,
             sqlstate: Some("23505".to_string()),
+            errno: None,
             message: "duplicate key value violates unique constraint".to_string(),
         });
         let pool = Pool::new(backend, test_pool_config());

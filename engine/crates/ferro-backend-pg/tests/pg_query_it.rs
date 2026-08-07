@@ -316,3 +316,42 @@ async fn query_insert_reports_affected() {
         "an INSERT without RETURNING yields no rows"
     );
 }
+
+/// PostgreSQL has no integer error code — its error identity is the five-character SQLSTATE — so
+/// `PoolError::Sql.errno` is `None` on PG **by construction**, not by omission (M1-S8a).
+///
+/// This is deliberately driven by a real server error rather than a hand-built `PoolError`: an
+/// assertion over an input the test itself constructed with `errno: None` cannot fail. Here the
+/// value comes off `error_map::map` on a genuine `42601`, so wiring any PG errno — a fabricated one,
+/// a hash of the SQLSTATE — turns this RED.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_pg_server_error_carries_no_errno() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    let err = co
+        .query("SELEKT 1", &[])
+        .await
+        .expect_err("a syntax error must fail");
+    match err {
+        PoolError::Sql {
+            ref sqlstate,
+            errno,
+            ..
+        } => {
+            assert_eq!(
+                sqlstate.as_deref(),
+                Some("42601"),
+                "PG identifies this error by SQLSTATE"
+            );
+            assert_eq!(
+                errno, None,
+                "PG has no integer errno — None by construction, off the REAL error_map path"
+            );
+        }
+        other => panic!("expected a known-fate Sql error, got {other:?}"),
+    }
+}

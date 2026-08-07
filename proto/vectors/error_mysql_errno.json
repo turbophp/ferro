@@ -1,0 +1,22 @@
+{
+  "frame_hex": "f7010200020001001500000039000000920197cd300203a53233303030cd0426d9254475706c696361746520656e7472792027312720666f72206b657920275052494d41525927c0c0",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 21,
+    "service": 2
+  },
+  "message": {
+    "error": {
+      "branch": 3,
+      "code": 12290,
+      "detail": null,
+      "errno": 1062,
+      "message": "Duplicate entry '1' for key 'PRIMARY'",
+      "retry_after_ms": null,
+      "sqlstate": "23000"
+    },
+    "status": 1
+  },
+  "name": "error_mysql_errno"
+}

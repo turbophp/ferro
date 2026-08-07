@@ -18,11 +18,12 @@ trait CarriesErrorPayload
     public function __construct(private readonly ErrorPayload $errorPayload)
     {
         parent::__construct(sprintf(
-            '%s (code=%d, branch=%d%s)',
+            '%s (code=%d, branch=%d%s%s)',
             $errorPayload->message,
             $errorPayload->code,
             $errorPayload->branch,
             $errorPayload->sqlstate !== null ? ', sqlstate=' . $errorPayload->sqlstate : '',
+            $errorPayload->errno !== null ? ', errno=' . $errorPayload->errno : '',
         ));
     }
 
@@ -37,4 +38,14 @@ trait CarriesErrorPayload
 
     /** The SQLSTATE if the backend supplied one (e.g. `42601` for a syntax error), else null. */
     public function sqlstate(): ?string { return $this->errorPayload->sqlstate; }
+
+    /**
+     * The backend's own numeric error code when it has one, else null.
+     *
+     * MySQL/MariaDB supply it (`1062` duplicate key, `1213` deadlock, `1205` lock-wait timeout, …);
+     * **PostgreSQL never does** — its error identity is the SQLSTATE, so this is `null` on every PG
+     * error by construction, not by omission. A consumer that must distinguish MySQL errors keyed on
+     * `23000` (duplicate key vs NOT NULL) has to read this, not {@see sqlstate}.
+     */
+    public function errno(): ?int { return $this->errorPayload->errno; }
 }

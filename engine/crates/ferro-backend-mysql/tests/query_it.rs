@@ -352,6 +352,76 @@ async fn duplicate_key_is_unique_nonretryable(backend: &MysqlBackend, label: &st
     conn.mysql.disconnect().await.ok();
 }
 
+/// THE reason the vendor errno has to be on the wire at all (M1-S8a): MySQL's SQLSTATE is far
+/// coarser than its errno. A duplicate key and a NOT NULL violation BOTH arrive as `23000`, so a
+/// consumer keyed on SQLSTATE alone — e.g. Doctrine DBAL's MySQL `ExceptionConverter`, which matches
+/// on the errno EXCLUSIVELY — cannot tell them apart. Driven by REAL server errors on BOTH engines,
+/// so a regression that drops the errno (or fabricates one) is RED here, not merely in a unit test
+/// over a hand-built `PoolError`.
+async fn errno_distinguishes_two_errors_that_share_sqlstate_23000(
+    backend: &MysqlBackend,
+    label: &str,
+) {
+    let mut conn = backend.connect().await.expect("connect");
+
+    // (a) duplicate key — ferro_smoke id=1 is seeded.
+    let dup = backend
+        .query(
+            &mut conn,
+            "INSERT INTO ferro_smoke (id, note) VALUES (?, ?)",
+            &[Value::I64(1), Value::Text("dup".to_string())],
+        )
+        .await
+        .unwrap_err();
+    // (b) NOT NULL violation — ferro_smoke.note is VARCHAR(255) NOT NULL.
+    let nn = backend
+        .query(
+            &mut conn,
+            "INSERT INTO ferro_smoke (id, note) VALUES (?, ?)",
+            &[Value::I64(9_001), Value::Null],
+        )
+        .await
+        .unwrap_err();
+
+    let unpack = |e: &PoolError| -> (Option<String>, Option<i32>) {
+        match e {
+            PoolError::Sql {
+                sqlstate, errno, ..
+            } => (sqlstate.clone(), *errno),
+            other => panic!("[{label}] expected a known-fate Sql error, got {other:?}"),
+        }
+    };
+    let (dup_state, dup_errno) = unpack(&dup);
+    let (nn_state, nn_errno) = unpack(&nn);
+
+    println!(
+        "[{label}] dup-key: sqlstate={dup_state:?} errno={dup_errno:?} | \
+         NOT NULL: sqlstate={nn_state:?} errno={nn_errno:?}"
+    );
+
+    assert_eq!(
+        dup_errno,
+        Some(1062),
+        "[{label}] duplicate key is errno 1062"
+    );
+    assert_eq!(
+        nn_errno,
+        Some(1048),
+        "[{label}] a NOT NULL violation is errno 1048"
+    );
+    assert_eq!(
+        dup_state, nn_state,
+        "[{label}] the two errors SHARE a SQLSTATE — this is why the errno must ride the wire"
+    );
+    assert_eq!(dup_state.as_deref(), Some("23000"));
+    assert_ne!(
+        dup_errno, nn_errno,
+        "[{label}] only the errno separates them"
+    );
+
+    conn.mysql.disconnect().await.ok();
+}
+
 /// A real deadlock (two concurrent txs each locking a row, then crossing) → `error_map` →
 /// `Sql{branch: RETRYABLE}` → `taxonomy_branch() == Retryable`. Since `classify_fate` passes a
 /// `Sql`'s branch through verbatim (proven in `fate.rs`), the pool-level `Retryable` is the
@@ -509,6 +579,7 @@ async fn run_query_suite(url: &str, label: &str) {
     last_insert_id_after_insert(&backend, label).await;
     insert_carries_last_insert_id_on_query_result(&backend, label).await;
     duplicate_key_is_unique_nonretryable(&backend, label).await;
+    errno_distinguishes_two_errors_that_share_sqlstate_23000(&backend, label).await;
     deadlock_two_txs_is_retryable(url, label).await;
     checkout_force_taint_on_query_error(url, label).await;
     println!("[{label}] Task-4 buffered data-path suite PASSED");

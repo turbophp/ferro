@@ -333,6 +333,32 @@ fn main() {
             "detail":null, "retry_after_ms":null } }),
     );
 
+    // The FIRST vector locking a NON-NULL errno + a real SQLSTATE together. Shape: a MySQL duplicate
+    // key — errno 1062, SQLSTATE 23000 — the pair a Doctrine MySQL ExceptionConverter keys on, and
+    // the pair that proves the two fields are independent on the wire (23000 alone cannot
+    // distinguish a dup key from a NOT NULL violation).
+    let err_mysql = ErrorPayload {
+        code: consts::errc::UNIQUE,
+        branch: consts::errc::UNIQUE_BRANCH,
+        sqlstate: Some("23000".into()),
+        errno: Some(1062),
+        message: "Duplicate entry '1' for key 'PRIMARY'".into(),
+        detail: None,
+        retry_after_ms: None,
+    };
+    write_case(
+        "error_mysql_errno",
+        flags::END,
+        service::SQL,
+        method_sql::EXEC,
+        21,
+        Outcome::Error(err_mysql).encode(),
+        serde_json::json!({ "status": consts::outcome::ERROR, "error": {
+            "code": consts::errc::UNIQUE, "branch": consts::errc::UNIQUE_BRANCH,
+            "sqlstate":"23000", "errno":1062, "message":"Duplicate entry '1' for key 'PRIMARY'",
+            "detail":null, "retry_after_ms":null } }),
+    );
+
     // --- SQL EXEC vectors (bespoke Value-splicing codec; /proto/PROTOCOL.md §8) ---
     // Request vectors: payload = ExecRequest.encode(), flags 0. Response vectors: the terminal
     // Outcome::Ok(ExecOk.encode()) body, flag END. The "message" JSON carries the ExecRequest fields

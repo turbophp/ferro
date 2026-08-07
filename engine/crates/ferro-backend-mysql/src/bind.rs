@@ -310,6 +310,10 @@ fn bind_error(message: String) -> PoolError {
         code: errc::UNSUPPORTED,
         branch: errc::UNSUPPORTED_BRANCH,
         sqlstate: None,
+        // `None` for the same reason `sqlstate` is: this is a PRE-SEND rejection, so there is no
+        // server error and therefore no vendor errno. A MySQL errno only exists on the `error_map`
+        // path, where a real `ServerError` answered.
+        errno: None,
         message,
     }
 }
@@ -648,6 +652,7 @@ mod tests {
                     code,
                     branch: b,
                     sqlstate,
+                    errno,
                     message,
                 }) => {
                     assert_eq!(code, errc::UNSUPPORTED, "{v:?}");
@@ -655,6 +660,11 @@ mod tests {
                     assert_eq!(
                         sqlstate, None,
                         "{v:?}: the server never saw the statement, so there is no SQLSTATE"
+                    );
+                    assert_eq!(
+                        errno, None,
+                        "{v:?}: a PRE-SEND rejection has no vendor errno either — no server \
+                         answered (M1-S8a)"
                     );
                     assert!(
                         message.starts_with("parameter 1:"),

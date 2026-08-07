@@ -640,6 +640,8 @@ impl PoolBackend for FakeBackend {
                     code: errc::CANCELLED,
                     branch: branch::NON_RETRYABLE,
                     sqlstate: Some("57014".to_string()),
+                    // The fake mimics PG's cancelled-statement shape; PG has no integer errno.
+                    errno: None,
                     message: "canceling statement due to user request (fake)".to_string(),
                 });
             }

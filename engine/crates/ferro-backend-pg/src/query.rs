@@ -142,6 +142,8 @@ fn bind_error(message: String) -> PoolError {
         code: errc::UNSUPPORTED,
         branch: errc::UNSUPPORTED_BRANCH,
         sqlstate: None,
+        // No errno for the same reason there is no SQLSTATE: the server never saw the statement.
+        errno: None,
         message,
     }
 }

@@ -34,11 +34,23 @@ pub enum PoolError {
     /// uncastable param type) rejected it BEFORE it was ever sent, so it provably never executed.
     /// Either way the service must NOT apply the §19.3 `readonly`→`Indeterminate` override to it.
     /// Only a true transport/FATAL `ConnectionLost` (no answer, fate unknown) gets that override.
-    #[error("sql error {code:#06x} (sqlstate {sqlstate:?}): {message}")]
+    #[error("sql error {code:#06x} (sqlstate {sqlstate:?}, errno {errno:?}): {message}")]
     Sql {
         code: u16,
         branch: u8,
         sqlstate: Option<String>,
+        /// The backend's own numeric error code, when it HAS one (M1-S8a).
+        ///
+        /// MySQL/MariaDB do: `mysql_async::ServerError.code` is a `u16`, widened losslessly here to
+        /// match the wire field (`ErrorPayload.errno: Option<i32>`). **PostgreSQL does not** — its
+        /// error identity is the five-character SQLSTATE, so this stays `None` there forever, and so
+        /// it does on every client-side bind pre-flight rejection (no server ever saw the statement).
+        ///
+        /// Why it must reach the wire at all: MySQL's SQLSTATEs are far coarser than its errnos —
+        /// a duplicate key and a NOT NULL violation BOTH arrive as `23000` (measured) — so a
+        /// consumer keyed on SQLSTATE alone cannot tell them apart. `classify_fate` passes it
+        /// through verbatim; nothing re-derives a classification from it.
+        errno: Option<i32>,
         message: String,
     },
 }

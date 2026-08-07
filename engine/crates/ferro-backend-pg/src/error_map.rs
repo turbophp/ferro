@@ -38,6 +38,11 @@ pub fn map(e: &tokio_postgres::Error) -> PoolError {
         code,
         branch,
         sqlstate: Some(sqlstate),
+        // PostgreSQL has NO integer error code — its error identity IS the five-character SQLSTATE
+        // (`DbError` exposes no numeric vendor code), so this is `None` on PG by construction, not
+        // by omission. Proven against a real server by `pg_query_it`'s
+        // `a_real_pg_server_error_carries_no_errno`.
+        errno: None,
         message: db.message().to_string(),
     }
 }

@@ -121,12 +121,17 @@ pub fn classify_fate(err: PoolError, ctx: OpContext) -> ErrorPayload {
             code,
             branch,
             sqlstate,
+            errno,
             message,
         } => ErrorPayload {
             code,
             branch,
             sqlstate,
-            errno: None,
+            // Verbatim. The taxonomy `code`/`branch` were already derived from it upstream
+            // (`ferro-backend-mysql`'s `classify_errno`); this carries the RAW value so a consumer
+            // that needs vendor-level identity — e.g. a Doctrine MySQL ExceptionConverter, which
+            // matches on the errno EXCLUSIVELY — has it. Nothing downstream re-classifies from it.
+            errno,
             message,
             detail: None,
             retry_after_ms: None,
@@ -227,6 +232,7 @@ mod tests {
             code: errc::CANCELLED,
             branch: errc::CANCELLED_BRANCH,
             sqlstate: Some("57014".to_string()),
+            errno: None,
             message: "canceling statement due to user request".to_string(),
         }
     }
@@ -239,6 +245,7 @@ mod tests {
             code: 0,
             branch: 0,
             sqlstate: Some("57014".to_string()),
+            errno: None,
             message: "canceling statement due to user request".to_string(),
         }
     }
@@ -248,6 +255,7 @@ mod tests {
             code,
             branch: br,
             sqlstate: Some(sqlstate.to_string()),
+            errno: None,
             message: "x".to_string(),
         }
     }
@@ -497,12 +505,72 @@ mod tests {
             code: errc::UNSUPPORTED,
             branch: errc::UNSUPPORTED_BRANCH,
             sqlstate: None,
+            errno: None,
             message: "parameter 0 type mismatch".to_string(),
         };
         let ep = classify_fate(bind, ctx(false, true, false));
         assert_eq!(ep.code, errc::UNSUPPORTED);
         assert_ne!(ep.code, errc::WRITE_UNCONFIRMED);
         assert_ne!(ep.branch, branch::INDETERMINATE);
+    }
+
+    /// `classify_fate` is the ONE place a `PoolError` becomes a wire `ErrorPayload`. A MySQL `Sql`
+    /// error's vendor errno must reach the wire VERBATIM alongside the SQLSTATE — DBAL's MySQL
+    /// `ExceptionConverter` matches on the errno EXCLUSIVELY, and MySQL's SQLSTATEs cannot
+    /// substitute (a duplicate key and a NOT NULL violation both arrive as `23000`).
+    #[test]
+    fn a_sql_errors_vendor_errno_reaches_the_wire_payload() {
+        let dup = PoolError::Sql {
+            code: errc::UNIQUE,
+            branch: errc::UNIQUE_BRANCH,
+            sqlstate: Some("23000".to_string()),
+            errno: Some(1062),
+            message: "Duplicate entry '1' for key 'PRIMARY'".to_string(),
+        };
+        let p = classify_fate(dup, ctx(false, true, false));
+        assert_eq!(
+            p.errno,
+            Some(1062),
+            "the vendor errno must pass through verbatim"
+        );
+        assert_eq!(p.sqlstate.as_deref(), Some("23000"));
+        assert_eq!(p.code, errc::UNIQUE);
+    }
+
+    /// `classify_fate` MIRRORS the errno and never invents one.
+    ///
+    /// **Why this shape and not `a_postgres_sql_error_carries_no_errno`**: that test would feed in a
+    /// `PoolError` the test itself built with `errno: None` (via the `sql()` helper) and assert
+    /// `None` came out — a TAUTOLOGY. It could not fail for any change to `fate.rs`. This one drives
+    /// BOTH arms of the mirror across a table, so hard-coding either `errno: None` or a derived
+    /// value in the `Sql` arm goes RED; and it pins that the arms which have no backend behind them
+    /// (`ConnectionLost`, `Timeout`) report `None` — the property that would break if someone
+    /// "helpfully" defaulted the field.
+    ///
+    /// The claim that *PostgreSQL* never produces one is proven where the PG `PoolError` is BUILT,
+    /// against a real server — see `ferro-backend-pg`'s `pg_query_it.rs`
+    /// `a_real_pg_server_error_carries_no_errno` — not here.
+    #[test]
+    fn classify_fate_mirrors_the_errno_and_never_invents_one() {
+        for want in [Some(1062), Some(1213), Some(1205), None] {
+            let e = PoolError::Sql {
+                code: errc::UNIQUE,
+                branch: errc::UNIQUE_BRANCH,
+                sqlstate: Some("23000".to_string()),
+                errno: want,
+                message: "x".to_string(),
+            };
+            let p = classify_fate(e, ctx(false, true, false));
+            assert_eq!(p.errno, want, "the Sql arm must mirror the errno verbatim");
+        }
+        // The arms with no backend error behind them report None — they have nothing to report.
+        for e in [PoolError::ConnectionLost, PoolError::Timeout] {
+            let p = classify_fate(e, ctx(true, false, false));
+            assert_eq!(
+                p.errno, None,
+                "a non-Sql PoolError has no vendor errno and must not fabricate one"
+            );
+        }
     }
 
     /// `Timeout` (waiting for a pooled connection) always maps to `PoolTimeout{Retryable}`,

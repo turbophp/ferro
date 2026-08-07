@@ -22,11 +22,15 @@
 //! the SQLSTATE), and its existing `is_57014` override fires on `code == errc::CANCELLED` — which is
 //! exactly why the cancel/timeout errnos below are mapped to `errc::CANCELLED` (no `fate.rs` edit).
 //!
-//! Note on `errno` reaching the wire: `PoolError::Sql` carries the proto `code`+`branch` + raw
-//! SQLSTATE + message, but has no separate `errno` slot, so the raw `errno` is used here purely as
-//! the classification KEY. Surfacing it on `ErrorPayload.errno` (for S7's DBAL `SQLSTATE`/errno
-//! pair) would touch the shared `PoolError` type and `fate.rs` — out of scope for this slice, and
-//! deferred to S7.
+//! Note on `errno` reaching the wire (M1-S8a, closing the S6 deferral): `PoolError::Sql` now carries
+//! an `errno: Option<i32>` slot alongside the proto `code`+`branch` + raw SQLSTATE + message, and
+//! THIS is the one site that fills it — `se.code` is both the classification KEY below and the raw
+//! value handed to `classify_fate`, which passes it to `ErrorPayload.errno` VERBATIM (no downstream
+//! re-derivation). It has to reach the wire because MySQL's SQLSTATEs are far coarser than its
+//! errnos: a duplicate key (`1062`) and a NOT NULL violation (`1048`) BOTH arrive as `23000`
+//! (measured live on MySQL 8 and MariaDB 11), so a consumer keyed on SQLSTATE alone — e.g. Doctrine
+//! DBAL's MySQL `ExceptionConverter`, which matches on the errno EXCLUSIVELY — cannot tell them
+//! apart. PostgreSQL has no integer errno and stays `None` there by construction.
 //!
 //! Nothing here re-runs the statement — the engine never transparently retries (charter rule 3).
 
@@ -59,6 +63,9 @@ pub(crate) fn map(e: &Error) -> PoolError {
                 code,
                 branch,
                 sqlstate: Some(sqlstate),
+                // The RAW vendor errno, carried alongside the classification rather than consumed by
+                // it (M1-S8a). `u16` -> `i32` is lossless.
+                errno: Some(i32::from(se.code)),
                 message: se.message.clone(),
             }
         }

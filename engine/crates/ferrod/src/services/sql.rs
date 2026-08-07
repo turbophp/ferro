@@ -1148,6 +1148,8 @@ fn stream_cancel_error() -> PoolError {
         code: errc::CANCELLED,
         branch: errc::CANCELLED_BRANCH,
         sqlstate: Some("57014".to_string()),
+        // Engine-minted, not a server answer: there is no vendor errno to report.
+        errno: None,
         message: "streamed statement cancelled or timed out".to_string(),
     }
 }
