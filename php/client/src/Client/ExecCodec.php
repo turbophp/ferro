@@ -137,11 +137,13 @@ final class ExecCodec
      * (`ExecOk.php:57`), so what arrives here is a decoded `['tag' => int, 'data' => mixed]` cell,
      * not a wire `[tag, payload]` pair, and calling it twice makes this method's contract a lie
      * about what it receives. It is nonetheless behaviourally invisible, so no test can lock it:
-     * a decoded cell has `count() === 2`, so `fromWire`'s arity check does NOT reject it; every tag
-     * `last_insert_id` can actually carry (`I64`/`U64`/`TEXT`) re-decodes to itself, since
-     * `TAG_BYTES` is `fromWire`'s only special case; and a `TAG_BYTES` cell throws the identical
-     * {@see CodecException} either way (double-decoded its `list<int>` becomes `[]`, undecoded it
-     * stays a `list<int>` — both are `array`, both hit the `got array` throw below). Measured: a
+     * a decoded cell has `count() === 2`, so `fromWire`'s arity check does NOT reject it; and every
+     * tag `last_insert_id` can actually carry (`I64`/`U64`/`TEXT`) re-decodes to itself, since
+     * `TAG_BYTES` is `fromWire`'s only special case. A `TAG_BYTES` cell — which `last_insert_id`
+     * never carries — still raises a {@see CodecException} on both routes, though since the M1-S8a
+     * review round they are no longer the SAME throw: undecoded it arrives here as a `list<int>` and
+     * hits the `got array` refusal below, while double-decoded it now trips `fromWire`'s own
+     * read-side `bin` refusal (the F6 fix) one level up. Measured, both before and after that fix: a
      * double decode injected here leaves the whole offline suite green. The params and rows paths
      * ARE guarded (see `ExecRequest`/`ExecOk` round-trip tests); this one rests on review.
      *

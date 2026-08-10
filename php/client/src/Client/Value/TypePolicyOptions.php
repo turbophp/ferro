@@ -16,13 +16,15 @@ use Ferro\Protocol\Generated\Constants as C;
  * back. So nothing in `ferrod` could read a `decimal=string` pool setting — an operator who set one
  * would observe exactly nothing, while a typo in that inert setting would stop `ferrod` from
  * booting: the worst of both. Pool-level defaults ADVERTISED to the client via `HELLO_ACK` pool
- * metadata are an M1-S8 carry (they are also what `naive_datetime_zone: server` waits on, below).
+ * metadata remain a later-slice carry (they are also what `naive_datetime_zone: server` waits on,
+ * below).
  *
- * **`naive_datetime_zone: server` is NOT implementable in M1** and is rejected loudly rather than
- * silently downgraded to `utc`: nothing on the wire carries the backend's session timezone.
- * M1-S8a's `HELLO_ACK` pool metadata (`HelloAck.pools` is now a list of
- * `[name, kind, server_version]` triples) advertises the backend FAMILY and VERSION — not a session
- * timezone — so this policy still waits on a further metadata field (SPEC §22.2).
+ * **`naive_datetime_zone: server` is STILL NOT implementable at M1-S8a** and is rejected loudly
+ * rather than silently downgraded to `utc`: nothing on the wire carries the backend's session
+ * timezone. `HELLO_ACK` pool metadata (`HelloAck.pools` is a list of `[name, kind, server_version]`
+ * triples as of M1-S8a) advertises the backend FAMILY and VERSION — none of the three is a session
+ * timezone — so this policy waits on a further metadata field (SPEC §22.2). The constructor's
+ * refusal message says exactly this; do not let it drift back to "HELLO_ACK has no pool metadata".
  *
  * **`naive_datetime_zone: error` has a PINNED SCOPE: `TAG_TIMESTAMP` alone** (see
  * {@see refusesNaiveTimestamp}). `TIMESTAMPTZ`, `DATE` and `TIME` decode normally under it. Its
@@ -37,7 +39,7 @@ final class TypePolicyOptions
 {
     /** @var list<string> */
     public const DECIMAL_FORMS = ['object', 'string'];
-    /** @var list<string> `server` is deliberately absent — deferred to S8, see the class doc. */
+    /** @var list<string> `server` is deliberately absent — still deferred at S8a, see the class doc. */
     public const NAIVE_DATETIME_ZONES = ['utc', 'error'];
     /** @var list<string> */
     public const U64_OVERFLOW_FORMS = ['object', 'string', 'error'];
@@ -57,10 +59,19 @@ final class TypePolicyOptions
         public readonly string $uuid = 'object',
     ) {
         if ($naiveDatetimeZone === 'server') {
+            // This REASON is operator-facing and must stay true of the release it ships in. It used
+            // to read "HELLO_ACK advertises no pool metadata yet" — a sentence the SAME release
+            // refuted (M1-S8a Tasks 11/12 filled `HelloAck.pools`), so an operator would file, or
+            // build, against a premise already dead at HEAD. The real blocker is narrower: what
+            // HELLO_ACK advertises is not a timezone. Locked by
+            // TypePolicyOptionsTest::testTheServerZoneRefusalNamesTheRealBlocker, which checks the
+            // enumeration below against {@see \Ferro\Protocol\PoolInfo}'s own fields.
             throw new \InvalidArgumentException(
-                'naive_datetime_zone=server is deferred to M1-S8: nothing on the wire carries the '
-                . "backend's session timezone (HELLO_ACK advertises no pool metadata yet), so the "
-                . 'client cannot honour it. Use "utc" (the default) or "error" (SPEC §9.1, §22.2).',
+                'naive_datetime_zone=server is deferred: nothing on the wire carries the '
+                . "backend's session timezone. HELLO_ACK DOES advertise per-pool metadata as of "
+                . 'M1-S8a — [name, kind, server_version] — but none of those three is a timezone, '
+                . 'so the client still cannot honour it; it waits on a further metadata field. '
+                . 'Use "utc" (the default) or "error" (SPEC §9.1, §22.2).',
             );
         }
         self::check('decimal', $decimal, self::DECIMAL_FORMS);

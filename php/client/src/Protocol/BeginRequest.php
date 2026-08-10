@@ -12,10 +12,22 @@ use Ferro\Protocol\Msgpack\PackerInterface;
  */
 final class BeginRequest
 {
-    /** @param array<string,mixed> $m @return string the encoded fixarray(3) payload */
+    /**
+     * `isolation` accepts an {@see Isolation} case as well as the raw `u8` the golden vectors carry.
+     *
+     * The enum form is the one callers should use, and accepting it here is what puts the enum on a
+     * BYTE-LOCKED path: `IsolationCrossLanguageTest` encodes `Isolation::Serializable` through this
+     * method and compares against the Rust-generated `tx_begin_request` frame. Before that the enum
+     * was unreachable dead code (both BEGIN sites hardcode `null`), so its 0/1/2 mapping — written
+     * out by hand in BOTH languages — was pinned by nothing spanning them.
+     *
+     * @param array<string,mixed> $m
+     * @return string the encoded fixarray(3) payload
+     */
     public static function encode(array $m, PackerInterface $p): string
     {
         $iso = $m['isolation'] ?? null;
+        if ($iso instanceof Isolation) { $iso = $iso->value; }
         return $p->packArrayLen(3)
             . $p->packStr(SqlValueCodec::toStr($m['pool'] ?? ''))
             . ($iso === null ? $p->packNil() : $p->packUint(SqlValueCodec::toInt($iso)))

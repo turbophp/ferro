@@ -11,6 +11,7 @@ use Ferro\Protocol\Header;
 use Ferro\Protocol\Message;
 use Ferro\Protocol\Msgpack\{PurePacker, ExtPacker};
 use Ferro\Protocol\Outcome;
+use Ferro\Protocol\PoolInfo;
 use Ferro\Protocol\SavepointRequest;
 use Ferro\Protocol\StreamData;
 use Ferro\Protocol\StreamHead;
@@ -88,6 +89,47 @@ final class VectorConformanceTest extends TestCase
         $expected = substr((string) hex2bin((string) $v['frame_hex']), 16);
         $this->assertSame(bin2hex($expected), bin2hex($payload),
             "PHP-encoded {$name} payload must byte-match the Rust-generated vector");
+    }
+
+    /**
+     * The `hello_ack` byte lock above feeds {@see Message::encode} the vector's DECODED JSON, whose
+     * `pools` are assoc arrays — so `Message::poolInfoArray` takes its `$entry['name']` KEY branch
+     * and {@see PoolInfo::toWire} is never called on that path. `toWire()` has no other caller in
+     * `src/`, so the OBJECT branch — the shape a real producer hands in — carried NO byte lock at
+     * all, while the docblock on `poolInfoArray` claimed the vector exercised exactly it.
+     *
+     * This runs the SAME vector through the OTHER branch: rebuild `message.pools` as {@see PoolInfo}
+     * instances and re-encode. A reorder inside `toWire()` (or a field dropped from it) now moves
+     * the bytes and fails HERE, against the Rust-generated frame rather than against another PHP
+     * assertion.
+     */
+    public function testHelloAckPoolsByteMatchTheVectorThroughThePoolInfoObjectBranch(): void
+    {
+        $v = self::loadVector('hello_ack.json');
+        $message = is_array($v['message'] ?? null) ? $v['message'] : [];
+
+        $pools = [];
+        foreach (is_array($message['pools'] ?? null) ? $message['pools'] : [] as $entry) {
+            $this->assertIsArray($entry, 'the hello_ack vector must carry assoc pool entries');
+            $version = $entry['server_version'] ?? null;
+            $pools[] = new PoolInfo(
+                (string) ($entry['name'] ?? ''),
+                (string) ($entry['kind'] ?? ''),
+                $version === null ? null : (string) $version,
+            );
+        }
+        // Without this the test would pass VACUOUSLY on an empty pool list, proving nothing about
+        // toWire(). The vector carries two triples, the second with a nil version.
+        $this->assertCount(2, $pools, 'the hello_ack vector must carry two pool triples for this lock');
+        $this->assertNull($pools[1]->serverVersion, 'the nil-version arm must ride this lock too');
+
+        $message['pools'] = $pools;
+        $expected = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $this->assertSame(
+            bin2hex($expected),
+            bin2hex(Message::encode('hello_ack', $message, new PurePacker())),
+            'hello_ack encoded through the PoolInfo OBJECT branch must byte-match the Rust vector',
+        );
     }
 
     /** @param array<string,mixed> $v */

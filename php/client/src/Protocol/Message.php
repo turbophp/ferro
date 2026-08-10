@@ -44,8 +44,26 @@ final class Message
     /**
      * `HelloAck.pools` (M1-S8a): an array of NESTED `[name, kind, server_version]` triples, not
      * bare names. The input is either a golden vector's decoded-JSON `message.pools` (a list of
-     * assoc arrays) or a list of {@see PoolInfo}; both narrow to the same positional triple, so the
-     * byte lock exercises exactly the shape {@see PoolInfo::toWire} produces.
+     * assoc arrays) or a list of {@see PoolInfo}.
+     *
+     * **Which guard covers which branch — the note that used to sit here named the wrong one.** It
+     * claimed "both narrow to the same positional triple, so the byte lock exercises exactly the
+     * shape {@see PoolInfo::toWire} produces". Measured false: `json_decode(..., true)` hands the
+     * vector's pools back as ASSOC arrays, so the generic `hello_ack` byte lock takes the
+     * `$entry['name']` KEY branch below and never calls `toWire()` at all — which left the OBJECT
+     * branch (the only one a real producer would take) byte-unlocked while the comment said it was
+     * covered. Both branches are locked now, by two DIFFERENT mechanisms:
+     *
+     *  * the KEY branch, by `VectorConformanceTest::testPurePackerEncodesMessageToExactVectorBytes`
+     *    (the generic `hello_ack` byte lock, fed the decoded-JSON message);
+     *  * the OBJECT branch, by
+     *    `VectorConformanceTest::testHelloAckPoolsByteMatchTheVectorThroughThePoolInfoObjectBranch`,
+     *    added with this correction — it rebuilds the SAME vector's pools as {@see PoolInfo}
+     *    instances and re-encodes, pinning `toWire()`'s positional ORDER to the golden bytes.
+     *
+     * Independently, `PoolInfoTest`'s `fromWire`↔`toWire` mirror also catches a reorder — but only
+     * because `testFromWireDecodesThePositionalTripleInOrder` pins `fromWire` absolutely; the mirror
+     * on its own would survive a consistently-reordered pair.
      */
     private static function poolInfoArray(PackerInterface $p, mixed $pools): string
     {

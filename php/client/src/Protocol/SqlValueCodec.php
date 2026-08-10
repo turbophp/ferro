@@ -81,8 +81,27 @@ final class SqlValueCodec
         $tag = self::toInt($vals[0]);
         $data = $vals[1];
         if ($tag === C::TAG_BYTES) {
-            // A wire `bin` decodes to a PHP string; represent it as a list of byte ints (the JSON schema).
-            $data = self::intsFromBytes(is_string($data) ? $data : '');
+            // A wire `bin` decodes to a PHP string; represent it as a list of byte ints (the JSON
+            // schema). Anything else is a wire fault and THROWS — the READ-side mirror of
+            // {@see bytesPayload}'s refusal, closed in the M1-S8a review round.
+            //
+            // This arm used to read `self::intsFromBytes(is_string($data) ? $data : '')`, so a nil,
+            // int, float, bool or array payload on a `bytea`/`BLOB` column silently decoded to an
+            // EMPTY blob: the read lost the data with no signal, and a read -> write-back round trip
+            // then PERSISTED the emptiness. S8a closed exactly this coercion on the ENCODE side
+            // ("a silently-empty blob is exactly the silent corrupt WRITE §9.1 exists to prevent")
+            // and left the READ side open; one direction of a pair is not a policy.
+            //
+            // Reachability on the happy path is low — a conformant engine always emits `bin`, and
+            // TYPE_REGISTRY_HASH blocks a coverage-skewed peer — so this is defence in depth. It is
+            // still the right shape: an empty blob and a codec fault must not look identical.
+            if (!is_string($data)) {
+                throw new CodecException(
+                    'TypedValue tag ' . C::TAG_BYTES . ': expected a bin payload (a byte string), got '
+                    . get_debug_type($data),
+                );
+            }
+            $data = self::intsFromBytes($data);
         }
         // NOTE: `TAG_BYTES` is still the ONLY special case, and that is by design. Every M1-S7 tag
         // rides the msgpack `str` family (or, for TAG_U64, the uint family), so its decoded payload

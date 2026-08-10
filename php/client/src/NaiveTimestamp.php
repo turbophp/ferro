@@ -25,8 +25,10 @@ use Ferro\Client\Value\CanonicalText;
  * explicit `UTC` `DateTimeZone`, NOT to `date_default_timezone_get()`: the wall-clock text is
  * identical either way (`format('Y-m-d H:i:s.u')` cannot tell them apart), but a locally-zoned
  * object shifts the moment anything converts it — which is precisely the class of silent bug §9.1
- * exists to eliminate. `naive_datetime_zone: server` is deferred to M1-S8 (nothing on the wire
- * carries the backend's session timezone yet).
+ * exists to eliminate. `naive_datetime_zone: server` is STILL deferred at M1-S8a: nothing on the
+ * wire carries the backend's session timezone. `HELLO_ACK` does advertise per-pool
+ * `[name, kind, server_version]` as of M1-S8a — none of the three is a timezone (see
+ * {@see \Ferro\Client\Value\TypePolicyOptions}).
  */
 final class NaiveTimestamp extends \DateTimeImmutable
 {

@@ -2,9 +2,15 @@
 declare(strict_types=1);
 namespace Ferro\Tests\Unit;
 
+use Ferro\Client\Error\ProtocolException;
+use Ferro\Client\ExecCodec;
+use Ferro\Client\Hydration\PlanCache;
+use Ferro\Client\Value\M1ValuePolicy;
+use Ferro\Client\Value\TypePolicyOptions;
 use Ferro\Protocol\CodecException;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Msgpack\PurePacker;
+use Ferro\Protocol\Outcome;
 use Ferro\Protocol\SqlValueCodec;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -121,5 +127,95 @@ final class SqlValueCodecTest extends TestCase
         $this->expectException(CodecException::class);
         $this->expectExceptionMessage('unsupported TypedValue tag ' . C::TAG_ARRAY);
         SqlValueCodec::encode(new PurePacker(), ['tag' => C::TAG_ARRAY, 'data' => []]);
+    }
+
+    // ---- F6: the READ-side mirror of the TAG_BYTES refusal -----------------------------------
+
+    /**
+     * **The decode-side mirror of {@see BytesBindTest::testANonStringNonListBytesPayloadIsRefused}.**
+     *
+     * M1-S8a closed the `TAG_BYTES` coercion on the ENCODE side (a non-string payload used to emit
+     * `c400`, an empty bin) and argued the case in that method's docblock: "a silently-empty blob is
+     * exactly the silent corrupt WRITE §9.1 exists to prevent". The READ arm was left as
+     * `is_string($data) ? $data : ''`, so ANY non-string payload on a `bytea`/`BLOB` column decoded
+     * to an empty blob with no exception — the read silently lost the data, and a read -> write-back
+     * round trip then PERSISTED the emptiness. One direction of the pair is not a policy.
+     *
+     * The positive control below is what makes this more than "some input throws": the SAME shape
+     * with a real `bin` payload still decodes to the exact bytes.
+     */
+    #[DataProvider('nonBinBytesPayloads')]
+    public function testANonBinBytesPayloadIsRefusedOnTheReadPath(mixed $payload, string $expectedType): void
+    {
+        $this->expectException(CodecException::class);
+        $this->expectExceptionMessage(
+            'TypedValue tag ' . C::TAG_BYTES . ': expected a bin payload (a byte string), got ' . $expectedType,
+        );
+        SqlValueCodec::fromWire([C::TAG_BYTES, $payload]);
+    }
+
+    /** @return array<string, array{0:mixed, 1:string}> every non-`bin` msgpack family, by decoded type */
+    public static function nonBinBytesPayloads(): array
+    {
+        return [
+            'nil'   => [null, 'null'],
+            'int'   => [7, 'int'],
+            'float' => [1.5, 'float'],
+            'bool'  => [true, 'bool'],
+            'array' => [[1, 2, 3], 'array'],
+        ];
+    }
+
+    /** POSITIVE CONTROL: a real `bin` payload still decodes, so the refusal above is not blanket. */
+    public function testARealBinBytesPayloadStillDecodesToItsBytes(): void
+    {
+        $this->assertSame(
+            ['tag' => C::TAG_BYTES, 'data' => [0x00, 0x01, 0xff]],
+            SqlValueCodec::fromWire([C::TAG_BYTES, "\x00\x01\xff"]),
+        );
+        // …and the empty bin is a LEGITIMATE empty blob, distinguishable from the fault above only
+        // because the fault now throws. This assertion is why the refusal had to be an exception
+        // rather than a sentinel.
+        $this->assertSame(
+            ['tag' => C::TAG_BYTES, 'data' => []],
+            SqlValueCodec::fromWire([C::TAG_BYTES, '']),
+        );
+    }
+
+    /**
+     * The fault must reach the CALLER as a §9.2 protocol fault on the real read path, not die inside
+     * the codec — so this drives a whole hand-built `ExecOk` terminal (one `bytea` column, one row,
+     * a `nil` where the `bin` belongs) through {@see ExecCodec::decode}, the exact route a row takes
+     * off the wire. Asserted from the user's vantage point: `ProtocolException`, never a row
+     * carrying an empty blob.
+     */
+    public function testAMalformedBytesCellSurfacesAsAProtocolExceptionFromExecCodec(): void
+    {
+        $p = new PurePacker();
+        $codec = new ExecCodec(
+            new M1ValuePolicy(new TypePolicyOptions()),
+            new PlanCache(),
+            $p,
+            $p,
+        );
+
+        // Positive control FIRST: the same terminal with a real bin decodes to the blob's bytes.
+        $ok = $codec->decode(Outcome::ok(self::oneBytesCellExecOk($p, $p->packBin("\x00\xff"))));
+        $this->assertSame([['blob' => "\x00\xff"]], $codec->assocRows($ok));
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('expected a bin payload (a byte string), got null');
+        $codec->decode(Outcome::ok(self::oneBytesCellExecOk($p, $p->packNil())));
+    }
+
+    /** A 5-field `ExecOk` body: one `blob` BYTES column, one row whose only cell carries `$payload`. */
+    private static function oneBytesCellExecOk(PurePacker $p, string $payload): string
+    {
+        $cols = $p->packArrayLen(1) . $p->packArrayLen(2) . $p->packStr('blob') . $p->packUint(C::TAG_BYTES);
+        $cell = $p->packArrayLen(2) . $p->packUint(C::TAG_BYTES) . $payload;
+        $rows = $p->packArrayLen(1) . $p->packArrayLen(1) . $cell;
+        $stats = $p->packArrayLen(4) . $p->packUint(0) . $p->packUint(0) . $p->packUint(0) . $p->packUint(0);
+
+        return $p->packArrayLen(5) . $cols . $rows . $p->packUint(0) . $p->packNil() . $stats;
     }
 }

@@ -67,6 +67,10 @@ final class TxHandle
      * Same contract as {@see Connection::lastInsertId} — it rides the statement's own terminal
      * frame (MySQL's OK packet), is `null` on PostgreSQL, and is never emulated with a follow-up
      * query, which on a transaction-mode pool would read another connection's session state.
+     *
+     * "Same contract" INCLUDES the failure rule: a statement that throws leaves this `null`, never
+     * the previous statement's key ({@see run} clears it on the way in). The two must not diverge —
+     * the imperative trio on {@see Connection} routes through this very object.
      */
     public function lastInsertId(): int|string|null
     {
@@ -207,6 +211,11 @@ final class TxHandle
      */
     private function run(string $sql, array $params, bool $readonly, int $fetch): array
     {
+        // CLEAR FIRST, exactly as `Connection::dispatch` does: {@see lastInsertId} promises the
+        // SAME contract as the Connection's, so a statement that fails here must not leave the
+        // previous statement's key readable either.
+        $this->lastInsertId = null;
+
         $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, $this->txId);
         try {
             $outcome = $this->session->sendRequest(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);

@@ -4,6 +4,7 @@ namespace Ferro\Tests\Unit;
 
 use Ferro\Client\Value\TypePolicyOptions;
 use Ferro\Protocol\Generated\Constants as C;
+use Ferro\Protocol\PoolInfo;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -40,6 +41,70 @@ final class TypePolicyOptionsTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessageMatches('/naive_datetime_zone=server .*deferred/i');
         new TypePolicyOptions(naiveDatetimeZone: 'server');
+    }
+
+    /**
+     * The refusal message is an OPERATOR-FACING factual claim, and M1-S8a shipped it FALSE: it said
+     * "HELLO_ACK advertises no pool metadata yet" in the very release whose Tasks 11/12 made
+     * `HelloAck.pools` a list of `[name, kind, server_version]` triples. An operator reads the
+     * reason, concludes the blocker is the missing metadata, and files/implements against a premise
+     * the same release refuted.
+     *
+     * So this guards the CLAIM, in two independent ways:
+     *
+     *  (a) the refuted sentence may never come back — a literal negative on the old wording; and
+     *  (b) the enumeration the new message gives ("[name, kind, server_version] … none of those
+     *      three is a timezone") is checked against {@see PoolInfo}'s OWN constructor-promoted
+     *      fields, so the message cannot quietly go stale when the wire shape moves. If a timezone
+     *      field ever lands on `PoolInfo`, this goes RED and forces the policy — not just the
+     *      sentence — to be revisited, which is exactly the moment `server` becomes implementable.
+     *
+     * (b) is the half that bites without anyone re-reading the string: it fails on a CODE change
+     * elsewhere, not on an edit to the text it describes.
+     */
+    public function testTheServerZoneRefusalNamesTheRealBlocker(): void
+    {
+        try {
+            new TypePolicyOptions(naiveDatetimeZone: 'server');
+            self::fail('naive_datetime_zone=server must be refused');
+        } catch (\InvalidArgumentException $e) {
+            $msg = $e->getMessage();
+        }
+
+        // (a) the sentence M1-S8a itself refuted must never reappear.
+        self::assertStringNotContainsStringIgnoringCase(
+            'advertises no pool metadata',
+            $msg,
+            'HELLO_ACK DOES advertise per-pool metadata at HEAD; the refusal must not claim otherwise',
+        );
+        self::assertStringNotContainsStringIgnoringCase('no pool metadata yet', $msg);
+
+        // (b) the enumeration must match what HELLO_ACK actually carries per pool.
+        $fields = array_map(
+            static fn (\ReflectionProperty $p): string => $p->getName(),
+            (new \ReflectionClass(PoolInfo::class))->getProperties(\ReflectionProperty::IS_PUBLIC),
+        );
+        sort($fields);
+        self::assertSame(
+            ['kind', 'name', 'serverVersion'],
+            $fields,
+            'PoolInfo changed shape. The naive_datetime_zone=server refusal enumerates HELLO_ACK '
+            . 'pool metadata as [name, kind, server_version] and rests on none of them being a '
+            . 'timezone. If a timezone field just landed, the policy is implementable and the '
+            . 'refusal must GO; if some other field landed, fix the enumeration in the message.',
+        );
+        foreach (['name', 'kind', 'server_version'] as $wireField) {
+            self::assertStringContainsString(
+                $wireField,
+                $msg,
+                "the refusal must enumerate the advertised pool field '{$wireField}'",
+            );
+        }
+        self::assertMatchesRegularExpression(
+            '/none of those three is a timezone/i',
+            $msg,
+            'the refusal must state the REAL blocker: what is advertised is not a timezone',
+        );
     }
 
     public function testUnknownPolicyValueIsRejectedLoudly(): void

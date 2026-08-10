@@ -198,6 +198,26 @@ final class Connection
      * (`testAnInsertInsideAnImperativeTransactionPropagatesItsKey` and
      * `testTheClosureFormStillDoesNotPropagateTheKey`).
      *
+     * **A statement that FAILS clears it — a DELIBERATE divergence from PDO.** Every statement path
+     * ({@see dispatch}) nulls this field on the way IN and rewrites it only on success, so after a
+     * failed / cancelled / Indeterminate statement this reports `null`, never the key an EARLIER
+     * insert generated. PDO does not do that (a failed statement leaves `mysql_insert_id` alone, so
+     * PDO keeps serving the stale key), and the divergence was chosen anyway:
+     *
+     *  * the alternative is handing a caller ANOTHER row's generated key for a statement that
+     *    inserted nothing — the silent-wrong-answer class this engine exists to refuse. It is worst
+     *    exactly where it matters most: an `Indeterminate` write (SPEC §19.3) has an UNKNOWN key by
+     *    definition, so a stale int there is a fabricated answer where `null` is the truth.
+     *  * it is not observable through DBAL or the ORM, which read `lastInsertId()` immediately after
+     *    a SUCCESSFUL `executeStatement()` and never after a throw. The only shape where PDO and
+     *    Ferro differ is code that catches the exception and reads the key anyway.
+     *  * the rest of this contract already diverges from PDO deliberately (PG reports `null` rather
+     *    than `lastval()`; a plain read clears the key rather than leaving it standing), so "match
+     *    PDO" was never the governing rule — "the last statement's key, or nothing" is.
+     *
+     * Pinned by `ConnectionLastInsertIdTest` (`testAFailedStatementClearsItRatherThanServingAStale…`
+     * and its in-transaction / connection-loss siblings).
+     *
      * MySQL/MariaDB report it on the OK packet of an `INSERT` into an `AUTO_INCREMENT` table.
      * **PostgreSQL always reports `null`** — it has no such protocol field; the idiomatic form is
      * `INSERT … RETURNING id`, which comes back as an ordinary row.
@@ -761,6 +781,13 @@ final class Connection
      */
     private function dispatch(string $sql, array $params, bool $readonly, int $fetch): array
     {
+        // CLEAR FIRST, on the way IN — this is what makes `lastInsertId()`'s "never a stale key"
+        // invariant true on the FAILURE path, and it is a deliberate divergence from PDO. See
+        // {@see lastInsertId} for the whole argument. Both statement paths below overwrite it on
+        // success, so the only state this can leave behind is `null`, which is the honest answer for
+        // a statement that errored, was cancelled, or whose fate is Indeterminate.
+        $this->lastInsertId = null;
+
         if ($this->tx === null) {
             return $this->dispatchAutocommit($sql, $params, $readonly, $fetch);
         }
@@ -817,8 +844,9 @@ final class Connection
             if ($outcome->isOk()) {
                 $decoded = $this->codec->decode($outcome);
                 // Record the generated key BEFORE returning: this is the ONLY moment it exists.
-                // It is overwritten by EVERY statement — including a read, which reports null — so
-                // `lastInsertId()` can never serve a stale key from an earlier INSERT.
+                // The "never a stale key" half of the contract is enforced by {@see dispatch}, which
+                // cleared the field on the way in — including for the statements that never reach
+                // this line because they threw.
                 $this->lastInsertId = $decoded['last_insert_id'];
                 return $decoded;
             }
