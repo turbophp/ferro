@@ -18,6 +18,14 @@
 //!    means a backend that comes back needs a daemon restart; a sealed success means a rolling
 //!    backend upgrade leaves `ferrod` advertising a pre-restart version that a driver converts
 //!    into a PLATFORM choice.
+//!
+//! Property 3's SUCCESS half — the TTL expiry — is guarded in `pools.rs`'s own `mod tests`, not
+//! here, along with three more properties of the same machinery: the probe task's DETACHMENT, the
+//! `in_flight` marker surviving a panicking or dropped probe, and the bounded dial. They live there
+//! because each needs the probe's timing constants shrunk to millisecond scale (`build_tuned` /
+//! `ProbeTuning`, `#[cfg(test)]` and therefore unreachable from this integration crate). See
+//! `pools::tests::{the_probe_is_detached_…, an_expired_version_…, a_panicking_probe_…,
+//! a_probe_future_dropped_…, a_black_holed_dial_…}`.
 
 mod common;
 
