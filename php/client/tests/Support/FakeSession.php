@@ -12,6 +12,7 @@ use Ferro\Protocol\ExecOk;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Msgpack\PackerFactory;
 use Ferro\Protocol\Outcome;
+use Ferro\Protocol\PoolInfo;
 
 /**
  * A scripted {@see SessionInterface} for the Task-4 unit tests: no socket, no ferrod. Each queued
@@ -112,6 +113,17 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
 
     /** @return array{0:int,1:int}|null */
     public function lastInFlight(): ?array { return $this->lastInFlight; }
+
+    /**
+     * What this fake's `HELLO_ACK` "advertised". Public so a test states the pool topology it is
+     * asserting about in one line, next to the assertion, instead of through a builder.
+     *
+     * @var list<PoolInfo>
+     */
+    public array $poolInfo = [];
+
+    /** @return list<PoolInfo> */
+    public function poolInfo(): array { return $this->poolInfo; }
 
     public function close(): void { $this->closed = true; }
 

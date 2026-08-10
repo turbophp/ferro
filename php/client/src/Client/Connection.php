@@ -22,6 +22,7 @@ use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Msgpack\PackerFactory;
 use Ferro\Protocol\Msgpack\PackerInterface;
 use Ferro\Protocol\Outcome;
+use Ferro\Protocol\PoolInfo;
 
 /**
  * The query + transaction surface a PHP app actually calls (the M0 "pool" is one session). Reads
@@ -154,6 +155,28 @@ final class Connection
     public function session(): SessionInterface
     {
         return $this->reconnect?->session() ?? $this->session;
+    }
+
+    /**
+     * This connection's OWN pool metadata from `HELLO_ACK` — or null if the engine does not
+     * advertise a pool by that name.
+     *
+     * Resolved LIVE off {@see session} on every call and deliberately NOT cached: the
+     * {@see ReconnectLoop} replaces the Session object on a reconnect, and a restarted engine can
+     * advertise a different `server_version`. That value is what the Doctrine tier turns into a
+     * PLATFORM, i.e. into which SQL dialect it emits, so a stale copy is a silently wrong dialect.
+     *
+     * Null means "this engine does not have that pool", which is a configuration error worth
+     * reporting as itself — never a reason to guess a backend family.
+     */
+    public function poolInfo(): ?PoolInfo
+    {
+        foreach ($this->session()->poolInfo() as $info) {
+            if ($info->name === $this->pool) {
+                return $info;
+            }
+        }
+        return null;
     }
 
     /** The currently cached opaque `boot_epoch` (`int|string`). */
@@ -299,6 +322,51 @@ final class Connection
     public function rows(string $sql, array $params = []): array
     {
         return $this->codec->assocRows($this->dispatch($sql, $params, true, ExecCodec::FETCH_ROWS));
+    }
+
+    /**
+     * The RAW statement entry point: positional rows, the terminal's own `affected` count, the
+     * generated key — and, uniquely on this class, a `readonly` fate flag the CALLER chooses.
+     *
+     * **Why this exists (M1-S8b).** Every other result-producing method here hard-codes
+     * `readonly = true` ({@see query}, {@see queryOne}, {@see scalar}, {@see rows}, {@see stream}),
+     * and the engine gates the §19.3 Indeterminate split on that flag ALONE — it never infers a
+     * read from the SQL. That is correct for the native API, where the method name IS the
+     * declaration. It is wrong for a driver: the Doctrine DBAL 4 SPI carries no read/write signal
+     * at all (`Connection::executeQuery('INSERT … RETURNING id')` with no parameters reaches the
+     * driver's `query()`, and the prepared path serves `executeQuery` and `executeStatement`
+     * alike), and charter rule 6 forbids inferring one from the statement text. A driver built on
+     * {@see query} would therefore hand the application `Retryable` — "provably did not apply" —
+     * for a write whose fate is genuinely unknown. Here the caller says which it is, and a caller
+     * that cannot tell says `false` and gets the conservative answer.
+     *
+     * Two secondary gaps close with it: the rows come back POSITIONAL (so a driver's
+     * `fetchNumeric()` is possible at all, and duplicate column names do not collapse the way
+     * {@see rows}' `array_combine` collapses them), and `affected` arrives ALONGSIDE the rows
+     * rather than being inferred from `count($rows)` — the two are different numbers.
+     *
+     * Inside an imperative transaction ({@see begin}) this routes through the pinned `tx_id` like
+     * every other statement method, because it shares {@see dispatch}.
+     *
+     * @param list<mixed> $params positional bind values (`?` → `$n`).
+     * @param bool $readonly the §19.3 fate declaration: `false` (the default) means a lost
+     *   statement is `Indeterminate`, `true` means it is `Retryable`. Declaring `true` for a
+     *   statement that writes is UNSAFE; declaring `false` for a read is merely conservative.
+     * @param bool $wantRows `fetch=rows` when true, `fetch=none` when false.
+     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
+     */
+    public function fetchRaw(
+        string $sql,
+        array $params = [],
+        bool $readonly = false,
+        bool $wantRows = true,
+    ): array {
+        return $this->dispatch(
+            $sql,
+            $params,
+            $readonly,
+            $wantRows ? ExecCodec::FETCH_ROWS : ExecCodec::FETCH_NONE,
+        );
     }
 
     /**

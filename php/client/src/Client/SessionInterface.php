@@ -3,6 +3,7 @@ declare(strict_types=1);
 namespace Ferro\Client;
 
 use Ferro\Protocol\Outcome;
+use Ferro\Protocol\PoolInfo;
 
 /**
  * The post-handshake surface the S7 runtime drives: send one request → read its one terminal, read
@@ -40,6 +41,24 @@ interface SessionInterface
      * @return array{0:int,1:int}|null
      */
     public function lastInFlight(): ?array;
+
+    /**
+     * The pool metadata this session's `HELLO_ACK` advertised — name, backend family, and the
+     * backend's own `version()` string VERBATIM (or null when the engine has not learned it).
+     *
+     * On the interface (M1-S8b) rather than on the concrete {@see Session} alone because the
+     * Doctrine tier chooses its SQL DIALECT from it: `Ferro\DBAL\Driver::getDatabasePlatform()`
+     * needs the backend family, and MariaDB-vs-MySQL is decided by the version string alone (both
+     * report `kind = "mysql"`). Reaching it through an `instanceof Session` narrowing would make
+     * every fake session in a driver unit test unusable.
+     *
+     * It is a SNAPSHOT taken once during the handshake — re-reading it on the same session can
+     * never yield a new value. A caller that needs a fresher answer must re-handshake (which the
+     * {@see ReconnectLoop} may already have done, replacing this object) or ask the backend.
+     *
+     * @return list<PoolInfo>
+     */
+    public function poolInfo(): array;
 
     /** Best-effort GOODBYE, then close the transport. Idempotent. */
     public function close(): void;
