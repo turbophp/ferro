@@ -32,8 +32,11 @@ use Ferro\Protocol\PoolInfo;
  * **§19.3-CRITICAL — the engine gates the Indeterminate split on the client-declared `readonly` flag
  * ALONE** (no SQL inference): a statement `sent && !readonly` whose connection dies mid-flight is
  * `WriteUnconfirmed{Indeterminate}`, which the client NEVER retries. So a read has no write-fate — a
- * lost read is `ConnectionLost{Retryable}`, safely re-issuable — and every read here sends
- * `readonly=true`; only {@see exec} defaults `readonly=false`.
+ * lost read is `ConnectionLost{Retryable}`, safely re-issuable — and every NAMED read here sends
+ * `readonly=true`, while {@see exec} defaults `readonly=false`. The two exceptions are
+ * {@see fetchRaw} and {@see streamRaw} (M1-S8b), where the flag is a CALLER-CHOSEN parameter
+ * defaulting to `false`: they exist for a driver that has no read/write signal to give and must be
+ * able to say "write" for a statement it cannot classify. Read their docblocks before calling them.
  *
  * **Resilience.** When constructed with a {@see ReconnectLoop} + {@see RetryPolicy} (as
  * {@see \Ferro\Ferro::connect} does), a `Retryable` READ that hits a lost connection transparently
@@ -479,6 +482,107 @@ final class Connection
                         : $this->codec->hydrateDto($dto, $colNames, $row);
                 }
 
+                try {
+                    $session->sendWindowUpdate($rid, 1, $frame['bytes']);
+                } catch (\Throwable $e) {
+                    $wireFailed = true;
+                    throw $e;
+                }
+            }
+        } finally {
+            if (!$reachedTerminal && !$wireFailed) {
+                $session->abandonStream($rid);
+            }
+        }
+    }
+
+    /**
+     * The RAW streamed read the Doctrine tier needs: POSITIONAL rows, a CALLER-chosen `readonly`
+     * fate flag, and the column names available BEFORE the first row.
+     *
+     * It differs from {@see stream} in exactly those three ways and shares everything else — the
+     * per-frame `WINDOW_UPDATE`, the mid-stream error terminal, the `CANCEL`+drain on abandonment.
+     * The reasons are the same three that made {@see fetchRaw} necessary: `stream()` hard-codes
+     * `readonly = true`, which would mis-fate a streamed `INSERT … RETURNING`; it yields ASSOC rows,
+     * which makes `fetchNumeric()` impossible and collapses duplicate column names; and it exposes
+     * the column names only from inside the generator, while `Doctrine\DBAL\Result::columnCount()`
+     * is callable before any fetch.
+     *
+     * The open is EAGER — see {@see RawStream} for why that makes {@see RawStream::close}
+     * mandatory rather than optional.
+     *
+     * Inside an imperative transaction ({@see begin}) the stream is tx-SCOPED exactly as
+     * {@see stream} is: it carries the open transaction's `tx_id` AND rides that transaction's own
+     * session. Either half missing is a silent wrong answer.
+     *
+     * @param list<mixed> $params positional bind values (`?` → `$n`).
+     * @param bool $readonly the §19.3 fate declaration; see {@see fetchRaw}.
+     */
+    public function streamRaw(string $sql, array $params = [], bool $readonly = false): RawStream
+    {
+        $session = $this->tx?->session() ?? $this->session();
+        if (!$session instanceof StreamingSessionInterface) {
+            throw new ProtocolException(
+                'streamRaw() requires a session implementing StreamingSessionInterface (the concrete Session)',
+            );
+        }
+        $payload = $this->codec->encode(
+            $this->pool,
+            $sql,
+            $params,
+            $readonly,
+            ExecCodec::FETCH_STREAM,
+            $this->tx?->txId(),
+        );
+        // Same contract as `stream()`: a streamed statement reports no generated key and CLEARS the
+        // previous one. Unlike `stream()`, this method is not itself a generator, so the clear
+        // happens here — the statement really has been issued by the time we return.
+        $this->lastInsertId = null;
+
+        $opened = $session->openStream(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
+        if ($opened['type'] === 'end') {
+            // A known fate decided before any HEAD/DATA went out (e.g. a checkout failure). Throws
+            // on an error terminal; otherwise there is genuinely nothing to read and — the reason
+            // the session below is `null` — nothing to abandon either.
+            $this->throwIfError($opened['outcome']);
+            return new RawStream([], (static function (): \Generator { yield from []; })(), null, 0);
+        }
+        $rid = $opened['requestId'];
+        // `list<string>`: the ColMeta TAG is dropped here ON PURPOSE, for the same reason
+        // {@see stream} drops it — the decode authority is the PER-CELL tag
+        // ({@see ExecCodec::decodeRow}), and the buffered path drops it too.
+        $cols = array_map(static fn (array $c): string => $c['name'], $opened['cols']);
+        return new RawStream($cols, $this->pumpRaw($session, $rid), $session, $rid);
+    }
+
+    /**
+     * The DATA pump behind {@see streamRaw}: one POSITIONAL row per yield, a `WINDOW_UPDATE` after
+     * each consumed frame, and the same `finally` discipline as {@see stream} — a `CANCEL`+drain
+     * iff the terminal was never reached AND no wire operation has already failed (a second wire op
+     * on a broken connection would mask or replace the real exception).
+     *
+     * @return \Generator<int, list<mixed>>
+     */
+    private function pumpRaw(StreamingSessionInterface $session, int $rid): \Generator
+    {
+        $reachedTerminal = false;
+        $wireFailed = false;
+        try {
+            while (true) {
+                try {
+                    $frame = $session->readStreamFrame($rid);
+                } catch (\Throwable $e) {
+                    $wireFailed = true;
+                    throw $e;
+                }
+                if ($frame['type'] === 'end') {
+                    $reachedTerminal = true;
+                    $this->throwIfError($frame['outcome']);
+                    return;
+                }
+                foreach ($frame['rows'] as $rawRow) {
+                    yield $this->codec->decodeRow($rawRow);
+                }
                 try {
                     $session->sendWindowUpdate($rid, 1, $frame['bytes']);
                 } catch (\Throwable $e) {

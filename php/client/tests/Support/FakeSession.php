@@ -26,12 +26,17 @@ use Ferro\Protocol\PoolInfo;
  * after a mid-tx loss naturally fails and is swallowed. `bootEpoch()` is fixed at construction (the
  * reconnect loop reads it), opaque `int|string`.
  *
- * It also implements {@see StreamingSessionInterface} (M1-S8a Task 9) — but ONLY the
- * "terminal-before-any-HEAD" stream shape, which is all the imperative-transaction tests need: they
- * assert what the streamed REQUEST carried (its `tx_id`, its `fetch` mode, which session it went out
- * on), not how rows come back. The multi-frame HEAD/DATA path is exercised by
- * `ConnectionStreamTest` against a real {@see \Ferro\Client\Session} over a {@see FakeTransport};
- * anything else queued here fails loudly rather than pretending.
+ * It also implements {@see StreamingSessionInterface} (M1-S8a Task 9), for two stream shapes and no
+ * others. {@see thenStreamEnd} is the "terminal-before-any-HEAD" shape the imperative-transaction
+ * tests need: they assert what the streamed REQUEST carried (its `tx_id`, its `fetch` mode, which
+ * session it went out on), not how rows come back. {@see thenStreamHead} (M1-S8b Task 2) adds
+ * "a HEAD and then nothing", which is what the eager-open leak guards need: they assert what the
+ * OPEN advertised and whether dropping the handle still abandons the stream.
+ *
+ * NEITHER models DATA frames. {@see readStreamFrame} and {@see sendWindowUpdate} therefore throw
+ * loudly rather than inventing an empty batch — the multi-frame path is exercised by
+ * `ConnectionStreamTest` against a real {@see \Ferro\Client\Session} over a {@see FakeTransport},
+ * and end to end by `tests/Live/{StreamLiveTest,RawStreamLiveTest}`.
  */
 final class FakeSession implements SessionInterface, StreamingSessionInterface
 {
@@ -58,6 +63,12 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
     private array $streamScript = [];
     private int $streamPos = 0;
     private int $streamRid = 100;
+
+    /** @var list<list<array{name:string,tag:int}>> queued HEAD column lists, one per {@see openStream} */
+    private array $streamHeads = [];
+
+    /** How many times {@see abandonStream} was called — the eager-open leak guard reads it. */
+    public int $abandonCount = 0;
 
     public function __construct(private readonly int|string $epoch = 1) {}
 
@@ -208,6 +219,23 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
         return $this;
     }
 
+    /**
+     * Queue a stream that opens with a HEAD carrying `$cols` and then never produces another frame
+     * unless the test drives one. Enough to pin what the OPEN advertised and what happens when the
+     * handle is dropped — the multi-frame path is exercised against a real Session over a
+     * FakeTransport by `ConnectionStreamTest`, and against a real ferrod by `RawStreamLiveTest`.
+     *
+     * Deliberately takes precedence over a queued {@see thenStreamEnd} terminal in
+     * {@see openStream}, so the two fixtures can coexist on one session without an ordering rule.
+     *
+     * @param list<array{name:string,tag:int}> $cols
+     */
+    public function thenStreamHead(array $cols): self
+    {
+        $this->streamHeads[] = $cols;
+        return $this;
+    }
+
     /** Queue a `TX/COMMIT` that dies on the wire. */
     public function thenThrowOnCommit(): self
     {
@@ -242,12 +270,16 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
         }
         $this->sent[] = [$service, $method, $payload];
         $this->lastInFlight = [$service, $method];
+        $rid = ++$this->streamRid;
+        if ($this->streamHeads !== []) {
+            return ['type' => 'head', 'requestId' => $rid, 'cols' => array_shift($this->streamHeads)];
+        }
         if ($this->streamPos >= count($this->streamScript)) {
             throw new \LogicException('FakeSession: no scripted stream for openStream()');
         }
         return [
             'type' => 'end',
-            'requestId' => ++$this->streamRid,
+            'requestId' => $rid,
             'outcome' => $this->streamScript[$this->streamPos++],
         ];
     }
@@ -255,26 +287,30 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
     /** @return array{type:'data', rows:list<list<array{tag:int,data:mixed}>>, bytes:int}|array{type:'end', outcome:Outcome} */
     public function readStreamFrame(int $requestId): array
     {
-        // Unreachable for the immediate-terminal shape this fixture models: `Connection::stream`
-        // returns at the `openStream` terminal and never asks for another frame. Loud on purpose —
-        // a silent empty frame here would let a broken stream path look green.
-        throw new \LogicException('FakeSession models only the immediate-terminal stream shape');
+        // Unreachable for both shapes this fixture models: after an immediate terminal there is
+        // nothing to read, and after a `thenStreamHead` the tests deliberately never iterate. Loud
+        // on purpose — a silent empty frame here would let a broken stream path look green.
+        throw new \LogicException('FakeSession models no DATA frames (see the class docblock)');
     }
 
     public function sendWindowUpdate(int $requestId, int $frames, int $bytes): void
     {
-        throw new \LogicException('FakeSession models only the immediate-terminal stream shape');
+        throw new \LogicException('FakeSession models no DATA frames (see the class docblock)');
     }
 
     public function sendCancel(int $requestId): void
     {
-        throw new \LogicException('FakeSession models only the immediate-terminal stream shape');
+        throw new \LogicException('FakeSession models no DATA frames (see the class docblock)');
     }
 
     public function abandonStream(int $requestId): void
     {
-        // A no-op: the immediate terminal already closed the stream, so there is nothing to drain.
-        // (`Connection::stream` calls this only when it did NOT reach a terminal.)
+        // Counted, not modelled: the real {@see \Ferro\Client\Session::abandonStream} sends a CANCEL
+        // and drains to the terminal, which needs frames this fixture does not have. The COUNT is
+        // what the eager-open leak guard reads — that a handle dropped without being iterated still
+        // tells the engine to stop. Whether the wire genuinely recovers is proven live
+        // (`tests/Live/RawStreamLiveTest.php`), not here.
+        ++$this->abandonCount;
     }
 
     // ---- Outcome builders (kept here so tests stay concise) -------------------------------------
