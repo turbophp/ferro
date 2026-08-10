@@ -597,14 +597,34 @@ async fn pg_s8a_savepoint_passthrough_does_not_taint_and_keeps_prepares_across_r
     co2.tx_control("DEALLOCATE ALL").await.expect("cleanup");
 }
 
-/// **Charter rule 6, live on PG: the F1 skip is per-statement, NOT a lexer off-switch.**
+/// **Charter rule 6, live on PG: the F1 skip is per-statement, NOT a lexer off-switch — and the
+/// taint it leaves behind really does route the recycle to the FULL profile.**
 ///
 /// The savepoint passthrough opts out of `apply_classify` by the GUARD's verdict, so anything else
 /// running on the same checkout — including inside the same transaction, immediately after a
 /// savepoint — is still lexed and still taints. Without this, F1's fix would have widened into a
-/// cross-tenant session-state leak. Proven end-to-end: the `SET` taints (`PinCause::Set`), the
-/// recycle therefore runs the FULL profile, and the next tenant on the SAME backend pid does not
-/// inherit the `search_path`.
+/// cross-tenant session-state leak.
+///
+/// **This is the exact MIRROR of
+/// `pg_s8a_savepoint_passthrough_does_not_taint_and_keeps_prepares_across_recycle`, and it has to
+/// be.** Both PG reset profiles run `RESET ALL` (`Targeted` is DEFINED as `DISCARD ALL` minus
+/// `DEALLOCATE ALL` / `DISCARD PLANS`), so "the next tenant does not inherit the `search_path`"
+/// cannot tell Full from Targeted and would stay GREEN under any taint-routing defect — it was the
+/// closing claim of an earlier version of this test and it was unearned. The ONE observable that
+/// distinguishes the two profiles at recycle is a server-side prepared statement: the sibling test
+/// proves untainted -> `zz_p` SURVIVES, this one proves tainted -> `zz_skip_p` is GONE.
+///
+/// The statement is created through `tx_control` — the raw, UNGUARDED text leaf, which never runs
+/// the assist lexer — because a `PREPARE` through `exec()` would taint as `PinCause::Prepare` all
+/// by itself and make the routing question moot. Nothing else in this test can deallocate it: the
+/// tx is COMMITted (so the pool's pre-reset `ROLLBACK` never runs) and neither `SET` nor a
+/// savepoint touches prepared statements. It is read back through the raw client's TEXT protocol,
+/// so the read cannot itself re-prepare anything.
+///
+/// **Falsifiable, and falsified.** With `ferro-pool`'s `pool.rs` profile selection mutated so a
+/// tainted conn no longer selects `Full` (`let profile = self.inner.backend.clean_reset_profile();`)
+/// the `EXECUTE zz_skip_p` below SUCCEEDS and this test goes RED — measured, `Targeted` ran and the
+/// prepare survived.
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_s8a_savepoint_skip_does_not_disable_the_lexer_for_other_statements() {
     let Some(url) = test_url() else {
@@ -614,6 +634,17 @@ async fn pg_s8a_savepoint_skip_does_not_disable_the_lexer_for_other_statements()
 
     let pid1 = {
         let mut co = pool.checkout().await.expect("checkout");
+        // Raw, unguarded, un-lexed: create the profile-distinguishing observable without tainting.
+        co.tx_control("DEALLOCATE ALL").await.expect("clean slate");
+        co.tx_control("PREPARE zz_skip_p AS SELECT 1")
+            .await
+            .expect("PREPARE zz_skip_p via the unguarded tx_control leaf");
+        assert!(
+            !co.tainted(),
+            "pre-condition: the raw tx_control PREPARE must not taint, or this test would be \
+             measuring the wrong thing"
+        );
+
         co.begin_tx(TxId(43)).await.expect("begin tx");
         co.query("SAVEPOINT DOCTRINE_1", &[])
             .await
@@ -640,7 +671,13 @@ async fn pg_s8a_savepoint_skip_does_not_disable_the_lexer_for_other_statements()
         );
 
         co.commit_tx().await.expect("commit the tx");
+        assert!(
+            co.tainted(),
+            "the taint must survive COMMIT all the way to release — it is what selects the FULL \
+             profile at the next checkout"
+        );
         backend_pid(&mut co).await
+        // `co` drops -> back to idle TAINTED -> the recycle below must run ResetProfile::Full.
     };
 
     let mut co2 = pool
@@ -650,15 +687,42 @@ async fn pg_s8a_savepoint_skip_does_not_disable_the_lexer_for_other_statements()
     let pid2 = backend_pid(&mut co2).await;
     assert_eq!(
         pid1, pid2,
-        "max_size=1 must reuse the SAME backend pid — a fresh conn also starts at the default \
-         search_path, which would be a false green"
+        "max_size=1 must reuse the SAME backend pid — on a fresh connection `zz_skip_p` would not \
+         exist either, which would make the assertion below a false GREEN"
     );
+
+    // THE PROFILE-DISTINGUISHING ASSERTION. TEXT protocol read-back: cannot itself prepare anything.
+    let err = co2
+        .conn_mut()
+        .client
+        .simple_query("EXECUTE zz_skip_p")
+        .await
+        .expect_err(
+            "the taint must have selected the FULL profile at recycle, whose DISCARD ALL runs \
+             DEALLOCATE ALL — `zz_skip_p` SURVIVING means the TARGETED profile ran instead, i.e. \
+             the tainted conn was not routed to Full",
+        );
+    // `tokio_postgres::Error`'s own `Display` is a fixed "db error" label; the SQLSTATE and the real
+    // message live on the wrapped `DbError`. Assert the SQLSTATE so a *different* failure (a dropped
+    // connection, a syntax error) cannot masquerade as the proof.
+    assert_eq!(
+        err.code().map(|c| c.code().to_string()).as_deref(),
+        Some("26000"),
+        "expected 26000 (invalid_sql_statement_name — 'prepared statement \"zz_skip_p\" does not \
+         exist'), got {err:?}"
+    );
+
+    // Secondary, and deliberately NOT the proof: both profiles run RESET ALL, so this only shows
+    // that SOME reset ran. It is kept because the leak class it names (the next tenant inheriting a
+    // `search_path`) is the reason charter rule 6 matters here.
     let search_path = query_first_text(&mut co2, "SELECT current_setting('search_path')").await;
     assert_ne!(
         search_path, "ferro_test_s8a",
-        "the taint selected DISCARD ALL at recycle, so the next tenant must NOT inherit the \
-         search_path; got {search_path:?}"
+        "a reset must have run at recycle, so the next tenant must NOT inherit the search_path; \
+         got {search_path:?}"
     );
+
+    co2.tx_control("DEALLOCATE ALL").await.expect("cleanup");
 }
 
 /// S6 live: the out-of-band `cancel_handle` cancels an in-flight `Checkout::query` (`pg_sleep`),
