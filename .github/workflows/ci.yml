@@ -104,6 +104,13 @@ jobs:
       # prerequisites this job now provides — so a skip here means the lane stopped testing.
       - run: (cd php/client && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
       - run: (cd php/client && ./vendor/bin/phpstan analyse src --level 9)
+      # M1-S8b: the Doctrine driver package. It has its OWN vendor/ (there is no composer
+      # workspace), so it needs its own install/test/stan lanes — omitting them would make the whole
+      # package a silent no-op in CI.
+      - run: (cd php/doctrine-dbal && composer install --no-interaction)
+      - run: (cd php/doctrine-dbal && ./vendor/bin/phpunit)
+      - run: (cd php/doctrine-dbal && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
+      - run: (cd php/doctrine-dbal && ./vendor/bin/phpstan analyse src --level 9)
       - if: always()
         run: docker compose -f testkit/docker-compose.yml logs --no-color --tail=80 pg mysql
 

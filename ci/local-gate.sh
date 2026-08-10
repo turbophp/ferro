@@ -58,6 +58,16 @@ if [ "$live" = 1 ]; then
   (cd php/client && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
 fi
 echo "== php: phpstan ==" ; (cd php/client && ./vendor/bin/phpstan analyse src --level 9)
+# M1-S8b: the Doctrine driver package. It has its OWN vendor/ (there is no composer workspace at the
+# repo root or under php/), so it needs its own install/test/stan lanes here AND in ci.yml —
+# omitting either makes the whole package a silent no-op that is never installed, run or analysed.
+echo "== php(dbal): install ==" ; (cd php/doctrine-dbal && composer install --no-interaction --quiet)
+echo "== php(dbal): phpunit ==" ; (cd php/doctrine-dbal && ./vendor/bin/phpunit)
+if [ "$live" = 1 ]; then
+  echo "== php(dbal): phpunit (live, skips fatal) =="
+  (cd php/doctrine-dbal && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
+fi
+echo "== php(dbal): phpstan ==" ; (cd php/doctrine-dbal && ./vendor/bin/phpstan analyse src --level 9)
 echo "== d12 gate ==" ; ./ci/check-d12-recorded.sh
 if [ "$live" = 1 ]; then echo "ALL GATES GREEN (live: pg + mysql + mariadb + php live tier)"
 else echo "ALL GATES GREEN (OFFLINE — live suites skipped; re-run with --live before pushing)"; fi
