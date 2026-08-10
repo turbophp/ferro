@@ -25,12 +25,24 @@
 //! Note on `errno` reaching the wire (M1-S8a, closing the S6 deferral): `PoolError::Sql` now carries
 //! an `errno: Option<i32>` slot alongside the proto `code`+`branch` + raw SQLSTATE + message, and
 //! THIS is the one site that fills it — `se.code` is both the classification KEY below and the raw
-//! value handed to `classify_fate`, which passes it to `ErrorPayload.errno` VERBATIM (no downstream
-//! re-derivation). It has to reach the wire because MySQL's SQLSTATEs are far coarser than its
-//! errnos: a duplicate key (`1062`) and a NOT NULL violation (`1048`) BOTH arrive as `23000`
-//! (measured live on MySQL 8 and MariaDB 11), so a consumer keyed on SQLSTATE alone — e.g. Doctrine
-//! DBAL's MySQL `ExceptionConverter`, which matches on the errno EXCLUSIVELY — cannot tell them
-//! apart. PostgreSQL has no integer errno and stays `None` there by construction.
+//! value handed to `classify_fate`, which mirrors it into `ErrorPayload.errno` verbatim on its
+//! `PoolError::Sql` arm (no downstream re-derivation). It has to reach the wire because MySQL's
+//! SQLSTATEs are far coarser than its errnos: a duplicate key (`1062`) and a NOT NULL violation
+//! (`1048`) BOTH arrive as `23000` (measured live on MySQL 8 and MariaDB 11), so a consumer keyed
+//! on SQLSTATE alone — e.g. Doctrine DBAL's MySQL `ExceptionConverter`, which matches on the errno
+//! EXCLUSIVELY — cannot tell them apart. PostgreSQL has no integer errno and stays `None` there by
+//! construction.
+//!
+//! **ONE exception, and it is exactly the three errnos this module maps to `errc::CANCELLED`**
+//! (`1317` / `3024` / `1969` — measured, M1-S8a review finding F11, recorded in SPEC §22.2 (o)):
+//! `classify_fate` runs its `is_57014` override BEFORE the `match err` that mirrors `errno`, and
+//! that override builds its payload from scratch, so a cancel/statement-timeout terminal carries
+//! `errno: None` **and** `sqlstate: None` on every one of its branches. That is deliberate — the
+//! §19.3 re-label (`WriteUnconfirmed` / `TxDeadline` / `Cancelled`) replaces the vendor's own
+//! account of what happened, and forwarding a raw errno beside a fate the vendor did not compute
+//! would invite a consumer to key on it. The consequence a DBAL tier must plan around: a
+//! statement-timeout mapping keyed on errno `3024`/`1969` will never fire; the fate `code` is the
+//! signal there.
 //!
 //! Nothing here re-runs the statement — the engine never transparently retries (charter rule 3).
 

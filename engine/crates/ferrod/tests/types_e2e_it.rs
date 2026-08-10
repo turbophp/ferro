@@ -202,6 +202,41 @@ fn retag(v: &Value, t: u8) -> Value {
     }
 }
 
+/// The one `F64` fixture, **f32-LOSSY BY CONSTRUCTION** — and that is the whole point of it.
+///
+/// Every `F64` fixture in this gate used to be `1.5`, which is EXACTLY representable in `f32`, so
+/// narrowing either the binder or the reader through `f32` — a silent corrupt write of every double
+/// a DBAL app binds — was invisible here on EVERY backend, PG included. That was measured GREEN
+/// under exactly that mutation (M1-S8a review). `0.1 + 0.2` is not f32-representable, and all three
+/// engines carry it bit-exactly.
+///
+/// The `assert_ne!` is anti-decorative armour: a future edit that swaps in a benign magnitude
+/// re-opens the blind spot, and this fails on the FIXTURE itself, naming the reason, rather than
+/// quietly certifying a narrowing engine.
+fn f64_fixture() -> f64 {
+    let v: f64 = 0.1 + 0.2;
+    assert_ne!(
+        v.to_bits(),
+        f64::from(v as f32).to_bits(),
+        "the F64 fixture must be genuinely f32-LOSSY, or this gate cannot witness a narrowing \
+         bind/read on any backend"
+    );
+    assert_eq!(
+        F64_FIXTURE_SQL.parse::<f64>().unwrap().to_bits(),
+        v.to_bits(),
+        "the SQL literal seeded into the table and the expected `Value::F64` must be the same \
+         double — they are written out independently ON PURPOSE (the server's own parser is the \
+         oracle for the read side), so they must be checked against each other"
+    );
+    v
+}
+
+/// The same double as [`f64_fixture`], written as the SQL text literal the seed INSERTs.
+/// Deliberately NOT `format!("{}", f64_fixture())`: the server parsing this text is the INDEPENDENT
+/// oracle for the produce direction, and deriving it from the fixture would collapse the two into
+/// one source.
+const F64_FIXTURE_SQL: &str = "0.30000000000000004";
+
 fn pg_cases() -> Vec<Case> {
     let c = |col, want_tag, want| Case {
         col,
@@ -213,7 +248,8 @@ fn pg_cases() -> Vec<Case> {
         c("c_bool", tag::BOOL, Some(Value::Bool(true))),
         // 2^53+1 — a value a JSON number could not carry losslessly, so this is a real i64 path.
         c("c_i64", tag::I64, Some(Value::I64(9_007_199_254_740_993))),
-        c("c_f64", tag::F64, Some(Value::F64(1.5))),
+        // f32-LOSSY on purpose — see `f64_fixture`.
+        c("c_f64", tag::F64, Some(Value::F64(f64_fixture()))),
         c("c_text", tag::TEXT, Some(Value::Text("héllo".into()))),
         c(
             "c_bytes",
@@ -266,7 +302,8 @@ fn mysql_cases(engine: Engine) -> Vec<Case> {
     vec![
         c("c_bool", tag::BOOL, Some(Value::Bool(true))),
         c("c_i64", tag::I64, Some(Value::I64(9_007_199_254_740_993))),
-        c("c_f64", tag::F64, Some(Value::F64(1.5))),
+        // f32-LOSSY on purpose — see `f64_fixture`.
+        c("c_f64", tag::F64, Some(Value::F64(f64_fixture()))),
         c("c_text", tag::TEXT, Some(Value::Text("héllo".into()))),
         c(
             "c_bytes",
@@ -568,7 +605,7 @@ async fn pg_matrix(url: String) -> Coverage {
         &mut client,
         rid,
         &format!(
-            "INSERT INTO {T} VALUES (1, true, 9007199254740993, 1.5, 'héllo', '\\xdeadbeef'::bytea,
+            "INSERT INTO {T} VALUES (1, true, 9007199254740993, {F64_FIXTURE_SQL}, 'héllo', '\\xdeadbeef'::bytea,
                '-12345.6700000000'::numeric, DATE '2026-08-05', TIME '13:45:07.250000',
                TIMESTAMP '2026-08-05 13:45:07.250000',
                TIMESTAMPTZ '2026-08-05 13:45:07.25+02',
@@ -706,7 +743,7 @@ async fn mysql_matrix(engine: Engine, url: String) -> Coverage {
         &mut client,
         rid,
         &format!(
-            "INSERT INTO {t} VALUES (1, 1, 9007199254740993, 1.5, 'héllo', X'DEADBEEF',
+            "INSERT INTO {t} VALUES (1, 1, 9007199254740993, {F64_FIXTURE_SQL}, 'héllo', X'DEADBEEF',
                18446744073709551615, '-12345.6700000000', '2026-08-05', '13:45:07.250000',
                '2026-08-05 13:45:07.250000', '2026-08-05 13:45:07.250000',
                'a1b2c3d4-0000-4fff-8000-abcdefabcdef',

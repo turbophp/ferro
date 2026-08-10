@@ -580,6 +580,71 @@ mod tests {
         }
     }
 
+    /// The §19.3 `is_57014` override DROPS the vendor `errno` and the raw SQLSTATE — deliberately,
+    /// and this is the one exception to "`classify_fate` mirrors the errno" above.
+    ///
+    /// It matters because it is not a corner: `ferro-backend-mysql::classify_errno` maps `1317`
+    /// (`KILL QUERY`), `3024` (MySQL `MAX_EXECUTION_TIME`) and `1969` (MariaDB `max_statement_time`)
+    /// to `errc::CANCELLED` **precisely so this override fires**, so those three errnos — the entire
+    /// MySQL cancel/timeout family — are exactly the ones that never reach the wire. A Doctrine
+    /// `ExceptionConverter` keyed on them would never fire; the fate `code` is the signal. SPEC
+    /// §22.2 (o) states this (M1-S8a review, finding F11 — the entry previously claimed the errno
+    /// reached the wire verbatim with only PG and the bind pre-flight as exceptions), and this test
+    /// is what stops that documented behaviour drifting silently in either direction.
+    #[test]
+    fn the_57014_override_drops_the_vendor_errno_and_sqlstate() {
+        // The three errnos ferro-backend-mysql routes into this override, in the shape it builds.
+        for errno in [1317, 3024, 1969] {
+            let mysql_cancel = PoolError::Sql {
+                code: errc::CANCELLED,
+                branch: errc::CANCELLED_BRANCH,
+                sqlstate: Some("HY000".to_string()),
+                errno: Some(errno),
+                message: "Query execution was interrupted".to_string(),
+            };
+            // Every reachable OpContext for a cancel: in-tx (TX_DEADLINE), autocommit read
+            // (CANCELLED), autocommit dispatched write (WRITE_UNCONFIRMED).
+            for c in [
+                ctx(false, true, true),
+                ctx(true, true, false),
+                ctx(false, true, false),
+            ] {
+                let p = classify_fate(mysql_cancel.clone(), c);
+                assert_eq!(
+                    p.errno, None,
+                    "the 57014 override replaces the vendor's account of what happened with the \
+                     engine's own fate, so it must not forward errno {errno} beside it"
+                );
+                assert_eq!(
+                    p.sqlstate, None,
+                    "same for the raw SQLSTATE — the override's payload is engine-authored"
+                );
+                assert!(
+                    matches!(
+                        p.code,
+                        errc::TX_DEADLINE | errc::CANCELLED | errc::WRITE_UNCONFIRMED
+                    ),
+                    "precondition: this case must actually take the override, else the assertions \
+                     above are vacuous — got code {:#x}",
+                    p.code
+                );
+            }
+        }
+
+        // CONTROL: a non-cancel MySQL error on the same axes keeps both, so the assertions above
+        // are about the override and not about `classify_fate` losing the fields generally.
+        let dup = PoolError::Sql {
+            code: errc::UNIQUE,
+            branch: errc::UNIQUE_BRANCH,
+            sqlstate: Some("23000".to_string()),
+            errno: Some(1062),
+            message: "Duplicate entry".to_string(),
+        };
+        let p = classify_fate(dup, ctx(false, true, false));
+        assert_eq!(p.errno, Some(1062));
+        assert_eq!(p.sqlstate.as_deref(), Some("23000"));
+    }
+
     /// `Timeout` (waiting for a pooled connection) always maps to `PoolTimeout{Retryable}`,
     /// regardless of context — there was never a statement in flight to have an unknown fate.
     #[test]

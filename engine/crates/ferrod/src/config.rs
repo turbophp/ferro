@@ -70,11 +70,13 @@ impl PoolKind {
     /// The backend-family token advertised in `HELLO_ACK`'s `PoolInfo.kind` (PROTOCOL.md §4) — the
     /// string a DBAL driver reads to pick a platform family before it has seen any server version.
     ///
-    /// ONE source of truth on purpose: both the config-derived fallback
-    /// (`session::handshake::pool_info_from_config`) and the registry-derived metadata
-    /// (`pools::PoolRegistry::pool_info`) call this, so the two can never drift into advertising
-    /// different strings for the same pool. The match is exhaustive with no `_` arm, so a third
-    /// backend family breaks the build here rather than silently inheriting `"postgres"`.
+    /// ONE source of truth on purpose, and now literally one CALLER:
+    /// `pools::PoolRegistry::pool_info` is the only site that renders this token. Task 11 briefly
+    /// had a second, config-derived derivation (`session::handshake::pool_info_from_config`);
+    /// Task 12 DELETED it rather than keep it as a pool-less fallback that could never fire, on
+    /// the grounds that two derivations of one wire field is how the two drift (SPEC §22.2 (v)).
+    /// The match is exhaustive with no `_` arm, so a third backend family breaks the build here
+    /// rather than silently inheriting `"postgres"`.
     pub fn wire_name(self) -> &'static str {
         match self {
             PoolKind::Postgres => "postgres",

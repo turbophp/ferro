@@ -51,7 +51,11 @@ caught deterministically at the first byte pair of the first frame, in both dire
 client's `HELLO` reaching a new engine; an old engine's frame reaching a new client). But it is a
 **codec-class** failure, not a typed handshake rejection, and the two look different in three ways
 worth knowing before you debug one. Measured end to end against a live `ferrod` at
-`protocol_version = 2`:
+`protocol_version = 2`, and — since the M1-S8a review round — pinned there by a test, so this table
+cannot go stale under a refactor: `ferrod`'s
+`handshake.rs::a_previous_version_hello_is_answered_with_the_documented_protocol_terminal` asserts
+row 1 (rid, `END`, code, branch, message, one-frame-then-EOF) and
+`ferrod`'s `handshake.rs::wrong_type_registry_hash_is_fatal_unsupported` asserts row 2's code.
 
 | what arrived | engine's terminal on `request_id=0` | message |
 |---|---|---|

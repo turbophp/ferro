@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::TestServer;
 use ferro_proto::consts::{
-    MAX_FRAME_PAYLOAD, TYPE_REGISTRY_HASH, errc, flags, method_core, service,
+    MAX_FRAME_PAYLOAD, PROTOCOL_VERSION, TYPE_REGISTRY_HASH, errc, flags, method_core, service,
 };
 use ferro_proto::header::Header;
 use ferro_proto::messages::Outcome;
@@ -145,6 +145,77 @@ async fn reserved_flag_on_hello_first_frame_is_fatal() {
         other => panic!("expected Outcome::Error, got {other:?}"),
     }
 
+    client.recv_eof().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// M1-S8a review (finding F14): the version-skew table `proto/PROTOCOL.md` §1 and SPEC §22.2 (u)
+// publish to operators was DELIVERED but never asserted — three of the slice's own artifacts
+// disagreed about whether it had been measured. This is the missing half.
+// ---------------------------------------------------------------------------------------------
+
+/// A `HELLO` frame from the PREVIOUS protocol version must be answered with exactly one
+/// `errc::PROTOCOL` terminal on `request_id = 0` carrying the codec's own skew message, and then
+/// the connection must close.
+///
+/// This is the DELIVERY half of the operator-facing table in `proto/PROTOCOL.md` §1 (also SPEC
+/// §22.2 (u)). `ferro-proto`'s `a_v1_frame_is_rejected_with_the_documented_skew_message` locks the
+/// STRING the header decoder produces and says in its own docblock that it does not prove the
+/// engine delivers it; this test is the other direction — a real session over a real socket,
+/// asserting the CODE (`PROTOCOL`, not `UNSUPPORTED` — the whole point of consequence (1) in that
+/// table), the branch, the `request_id = 0` routing, the message, and the one-frame-then-EOF shape.
+/// Without it, a refactor of `session::classify`'s Fatal arm (closing the socket with no terminal,
+/// or re-labelling it `UNSUPPORTED`) would leave every shipped test green while the published table
+/// went silently stale.
+///
+/// Every constant is DERIVED from `consts::PROTOCOL_VERSION` — a hand-written protocol constant is
+/// a charter rule 2 defect in a test too, and a literal `2` here would have to be edited (and could
+/// be edited wrongly) at the next bump.
+#[tokio::test]
+async fn a_previous_version_hello_is_answered_with_the_documented_protocol_terminal() {
+    let server = TestServer::spawn(BootEpoch(1));
+    let mut client = server.connect().await;
+
+    // A well-formed CURRENT-version HELLO, rolled back to the previous version in byte 1 only —
+    // i.e. the exact bytes an old client would put on the wire. Everything else stays valid, so
+    // nothing but the version can be what rejects it.
+    let hello = common::TestClient::hello_out_frame(1, TYPE_REGISTRY_HASH);
+    let mut bytes = hello.header.encode().to_vec();
+    bytes.extend_from_slice(&hello.payload);
+    assert_eq!(
+        bytes[1], PROTOCOL_VERSION,
+        "byte 1 must be the version before we roll it back"
+    );
+    let old = PROTOCOL_VERSION - 1;
+    bytes[1] = old;
+    client.send_raw_bytes(&bytes).await;
+
+    let fatal = client.recv().await;
+    assert_eq!(
+        fatal.header.request_id, 0,
+        "a skewed frame has no trustworthy request_id, so the terminal rides rid=0"
+    );
+    assert_eq!(fatal.header.flags, flags::END);
+    match Outcome::decode(&fatal.payload).expect("decode Outcome") {
+        Outcome::Error(ep) => {
+            assert_eq!(
+                ep.code,
+                errc::PROTOCOL,
+                "the published table says PROTOCOL, not UNSUPPORTED: anything keying on \
+                 UNSUPPORTED to mean \"we disagree\" must NOT fire on a version skew"
+            );
+            assert_eq!(ep.branch, errc::PROTOCOL_BRANCH);
+            assert_eq!(
+                ep.message,
+                format!("unsupported protocol version: expected {PROTOCOL_VERSION}, got {old}"),
+                "the engine must deliver the codec's own skew message verbatim — this string is \
+                 what PROTOCOL.md §1 publishes to operators"
+            );
+        }
+        other => panic!("expected Outcome::Error, got {other:?}"),
+    }
+
+    // Exactly one frame, then close (charter rule 4 + the table's "and then EOFs").
     client.recv_eof().await;
 }
 

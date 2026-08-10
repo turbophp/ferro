@@ -244,9 +244,12 @@ fn message_payloads_are_canonical_and_byte_stable() {
 /// this is the exact byte sequence an old client would put on the wire.
 ///
 /// SCOPE, stated honestly: this locks the STRING and the fact that the *header* decoder is what
-/// rejects an old frame. It does NOT prove the engine delivers that string in an `errc::PROTOCOL`
-/// terminal on `request_id=0` — that needs a live `ferrod` and is carried (see the task-11 report's
-/// fix-round section). The documented `errc::PROTOCOL` code half remains derived, not asserted here.
+/// rejects an old frame. It does NOT prove the engine DELIVERS that string in an `errc::PROTOCOL`
+/// terminal on `request_id=0` — that needs a live `ferrod`, and it is the other half of the same
+/// published table. That half was a carry until the M1-S8a review round; it now lives in
+/// `ferrod`'s `handshake.rs::a_previous_version_hello_is_answered_with_the_documented_protocol_terminal`
+/// (rid, END, code, branch, message, one-frame-then-EOF). Neither test is sufficient alone: this
+/// one owns the string, that one owns the delivery.
 #[test]
 fn a_v1_frame_is_rejected_with_the_documented_skew_message() {
     let v: serde_json::Value =
