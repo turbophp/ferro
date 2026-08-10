@@ -88,7 +88,7 @@ abstract class LiveTestCase extends TestCase
 
         $this->ferrodBin = $bin;
         $this->pgUrl = $pgUrl;
-        $this->launchFerrod($bin, $pgUrl);
+        $this->launchFerrod();
         $this->waitUntilReady();
     }
 
@@ -167,17 +167,38 @@ abstract class LiveTestCase extends TestCase
 
     /**
      * The `name => DSN` map this harness hands `ferrod`, in the same order as {@see launchedPools}.
-     * Both that method and {@see launchedPoolKinds} read it, so the pool set is stated ONCE.
+     * That method, {@see launchedPoolKinds} and {@see launchFerrod}'s env all read it, so the pool
+     * set is stated ONCE.
+     *
+     * A subclass adds pools by overriding {@see extraPoolDsns} — which is how the M1-S8b driver tier
+     * launches a pool whose backend is deliberately UNREACHABLE, the only way to observe the
+     * `server_version: nil` branch SPEC §14's platform decision turns on (on a healthy pool the
+     * version is learned within a second or two, and waiting for the 600 s TTL to expire is not a
+     * test).
      *
      * @return array<string, string>
      */
-    private function launchedPoolDsns(): array
+    protected function launchedPoolDsns(): array
     {
         $pools = ['default' => $this->pgUrl];
         if ($this->mysqlUrl !== '') {
             $pools[self::MYSQL_POOL] = $this->mysqlUrl;
         }
-        return $pools;
+        return $pools + $this->extraPoolDsns();
+    }
+
+    /**
+     * Extra `name => DSN` pools for a subclass. Empty by default, so every existing live test
+     * configures exactly the pools it did before.
+     *
+     * `+` (not `array_merge`) is deliberate in {@see launchedPoolDsns}: a subclass cannot silently
+     * REPLACE `default` or `mysql` with a different DSN, only add to them.
+     *
+     * @return array<string, string>
+     */
+    protected function extraPoolDsns(): array
+    {
+        return [];
     }
 
     /**
@@ -213,7 +234,7 @@ abstract class LiveTestCase extends TestCase
         if ($this->socketPath !== '' && file_exists($this->socketPath)) {
             @unlink($this->socketPath); // ferrod stale-unlinks at bind, but be explicit
         }
-        $this->launchFerrod($this->ferrodBin, $this->pgUrl);
+        $this->launchFerrod();
         $this->waitUntilReady();
     }
 
@@ -232,7 +253,14 @@ abstract class LiveTestCase extends TestCase
         return null;
     }
 
-    private function launchFerrod(string $bin, string $pgUrl): void
+    /**
+     * Launch `ferrod` on this test's socket with the pools {@see launchedPoolDsns} names.
+     *
+     * It takes NO parameters on purpose: the DSN map is the single source of truth for both
+     * `FERRO_POOLS` and every `FERRO_POOL_<NAME>_DSN`, so a subclass that adds a pool cannot end up
+     * with a name in one and no DSN in the other.
+     */
+    private function launchFerrod(): void
     {
         // Inherit the current environment, then add the ferrod config (verified recipe, D-S7-1).
         $env = getenv();
@@ -240,11 +268,13 @@ abstract class LiveTestCase extends TestCase
         // `ferrod` resolves per-pool DSNs from FERRO_POOL_<env_name(NAME)>_DSN and infers each
         // pool's KIND from the DSN scheme (there is no kind= knob) —
         // engine/crates/ferrod/src/config.rs:88-104,:332. Pools are LAZY (Pool::new dials nothing),
-        // so declaring a second one costs no connection until a request names it.
+        // so declaring a second one costs no connection until a request names it — which is also
+        // why a pool pointed at a dead backend does not stop `ferrod` from starting.
         $env['FERRO_POOLS'] = implode(',', $this->launchedPools());
-        $env['FERRO_POOL_DEFAULT_DSN'] = $pgUrl;
-        if ($this->mysqlUrl !== '') {
-            $env['FERRO_POOL_MYSQL_DSN'] = $this->mysqlUrl;
+        foreach ($this->launchedPoolDsns() as $name => $dsn) {
+            // Mirrors `ferrod`'s own env_name(): uppercase, every non-alphanumeric to `_`.
+            $envName = strtoupper((string) preg_replace('/[^A-Za-z0-9]/', '_', $name));
+            $env['FERRO_POOL_' . $envName . '_DSN'] = $dsn;
         }
 
         $descriptors = [
@@ -253,9 +283,9 @@ abstract class LiveTestCase extends TestCase
             2 => ['file', $this->stderrPath, 'w'],
         ];
         $pipes = [];
-        $proc = proc_open([$bin], $descriptors, $pipes, null, $env);
+        $proc = proc_open([$this->ferrodBin], $descriptors, $pipes, null, $env);
         if (!is_resource($proc)) {
-            $this->fail("proc_open failed to launch ferrod at {$bin}");
+            $this->fail("proc_open failed to launch ferrod at {$this->ferrodBin}");
         }
         $this->proc = $proc;
         if (isset($pipes[0]) && is_resource($pipes[0])) { fclose($pipes[0]); }

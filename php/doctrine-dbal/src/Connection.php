@@ -9,6 +9,7 @@ use Ferro\Client\Connection as FerroConnection;
 use Ferro\Client\Error\FerroException;
 use Ferro\DBAL\Exception\DriverException;
 use Ferro\DBAL\Exception\NoIdentityValue;
+use Ferro\DBAL\Exception\ServerVersionUnavailable;
 
 /**
  * The EXECUTION layer. Everything above it — Grammar, the platforms, the schema managers, the
@@ -41,6 +42,12 @@ final class Connection implements DriverConnection
         private readonly string $poolKind,
         private readonly bool $readonly,
     ) {}
+
+    /**
+     * The resolved backend version, cached for the life of THIS connection — see
+     * {@see getServerVersion} for why it is an instance field and not a static.
+     */
+    private ?string $serverVersion = null;
 
     /** The underlying Ferro client connection — also what {@see getNativeConnection} returns. */
     public function ferro(): FerroConnection
@@ -153,22 +160,67 @@ final class Connection implements DriverConnection
     }
 
     /**
-     * Walking-skeleton form. Task 6 replaces it with the §14 decision — defer, resolve once through
-     * one ordinary `SELECT version()`, then FAIL LOUDLY naming the pool — because an empty string
-     * here reaches `PlatformVersion::platformFor()` and becomes `InvalidPlatformVersion`, which is
-     * loud but says nothing about which pool could not be identified.
+     * The backend's own `version()` string, VERBATIM — normalisation is {@see PlatformVersion}'s
+     * job, and it is asymmetric (mandatory on PostgreSQL, forbidden on the MySQL family, where the
+     * `-MariaDB` suffix is the ONLY thing separating two different SQL dialects).
      *
-     * Written long-hand deliberately: the plan's `poolInfo()?->serverVersion ?? ''` is REJECTED by
-     * PHPStan level 9 (`nullsafe.neverNull` — a nullsafe fetch on the left of `??` is redundant,
-     * since `??` already suppresses the null read), and level 9 clean is a charter DoD gate.
+     * **The SPEC §14 nil-version decision, implemented: DEFER, resolve ONCE, then FAIL LOUDLY.**
+     * The return type is a non-nullable `string`, so "unknown" cannot be represented — the only
+     * honest options are to resolve it or to throw. `HELLO_ACK` carries `server_version` as
+     * `str | nil`, and `nil` is a NORMAL recurring value on a healthy system (a TTL expiry racing a
+     * re-probe, a probe failure inside its 5 s backoff, a backend that is down at connect), so it
+     * must never be treated as an error state by itself — failing at connect would turn a routine
+     * few-second window into an outage for every worker reconnecting during it (§19.1 boot_epoch
+     * storms make that concrete).
+     *
+     * Deferral is free: nothing here runs at connect. Doctrine resolves the platform lazily on
+     * first demand ({@see \Doctrine\DBAL\Connection::getDatabasePlatform}), which is typically well
+     * after connect — by which time the engine's detached probe has usually landed a value.
+     *
+     * When it has not, resolution is ONE `SELECT version()` through the ordinary SQL path. That is
+     * the same statement `ferrod`'s own probe issues (`ferrod/src/pools.rs`'s `VERSION_SQL`); it is
+     * a leading `SELECT`, so the assist lexer's safe-list leaves the connection unpinned and
+     * untainted; and it is the ONLY mechanism that can produce a NEW answer — re-reading
+     * `poolInfo()` cannot, because that is a snapshot taken once during this session's handshake.
+     * It is declared `readonly = true` because it is the DRIVER'S OWN statement: the
+     * connection-wide "declare write for everything" rule exists because the DBAL SPI hides the
+     * CALLER's intent, and here there is no caller to hide.
+     *
+     * The result is cached PER CONNECTION for the life of that connection: one round trip, ever.
+     * Per connection and not per process — two pools in one worker are two different backends, and
+     * a shared cache would hand one pool's version to the other, i.e. possibly MySQL's dialect to
+     * PostgreSQL.
+     *
+     * Note for the streaming task: this reaches the wire, so it must not be attempted while a
+     * streamed result is open (the session is strictly single-in-flight). In practice it cannot be:
+     * DBAL resolves the platform through this method before any statement runs, and the value is
+     * cached from then on.
+     *
+     * @throws ServerVersionUnavailable when the version is neither advertised nor resolvable. Never
+     *   a default platform: a wrong platform is a wrong SQL dialect for every statement that follows.
      */
     public function getServerVersion(): string
     {
-        $info = $this->ferro->poolInfo();
-        if ($info === null) {
-            return '';
+        if ($this->serverVersion !== null) {
+            return $this->serverVersion;
         }
-        return $info->serverVersion ?? '';
+
+        $advertised = $this->ferro->poolInfo()?->serverVersion;
+        if ($advertised !== null && $advertised !== '') {
+            return $this->serverVersion = $advertised;
+        }
+
+        try {
+            $raw = $this->ferro->fetchRaw('SELECT version()', [], true);
+        } catch (FerroException $e) {
+            throw ServerVersionUnavailable::forPool($this->poolName, $this->poolKind, $e);
+        }
+
+        $v = $raw['rows'][0][0] ?? null;
+        if (!is_string($v) || $v === '') {
+            throw ServerVersionUnavailable::forPool($this->poolName, $this->poolKind, null);
+        }
+        return $this->serverVersion = $v;
     }
 
     /**
