@@ -1781,3 +1781,112 @@ async fn s8a_f1_distinct_domain_oids_survive_a_user_issued_discard_all() {
         co.exec(stmt).await.expect("cleanup");
     }
 }
+
+/// **M1-S8b: the shape stock Doctrine DBAL actually sends.** Its type layer converts every
+/// `datetime`/`date`/`time`/`decimal`/`json`/`guid` value to a PHP STRING and binds it with
+/// `ParameterType::STRING`, which reaches the engine as `TAG_TEXT`. Before this task every one of
+/// these columns refused the bind pre-send, so a Doctrine application could not INSERT a dated or
+/// decimal row on PostgreSQL at all.
+///
+/// Falsifiable, and BOTH halves of the `PgText` edit are covered:
+/// * revert `PgText::accepts` to `<String as ToSql>::accepts` and the INSERT fails with
+///   `parameter 0: canonical TEXT cannot bind to PG type date`;
+/// * revert `encode_format` to the delegated (BINARY) default and the INSERT fails SERVER-side —
+///   PG reads the 10 UTF-8 bytes of `2026-08-05` as a 4-byte binary `date`.
+/// The read-back is rendered by PG ITSELF (`::text`), so it is an independent oracle for what
+/// actually landed rather than a replay of what the binder wrote.
+#[tokio::test]
+async fn s8b_a_stringified_dbal_value_binds_to_its_typed_column() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    co.exec("DROP TABLE IF EXISTS s8b_bind")
+        .await
+        .expect("drop");
+    co.exec(
+        "CREATE TABLE s8b_bind (d date, t time, ts timestamp, tz timestamptz, \
+         n numeric(12,4), u uuid, j jsonb)",
+    )
+    .await
+    .expect("create");
+
+    co.query(
+        "INSERT INTO s8b_bind (d, t, ts, tz, n, u, j) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        &[
+            Value::Text("2026-08-05".into()),
+            Value::Text("13:45:07".into()),
+            Value::Text("2026-08-05 13:45:07".into()),
+            Value::Text("2026-08-05 13:45:07+00".into()),
+            Value::Text("1.2500".into()),
+            Value::Text("0b7f0a5e-1f4a-4b7d-8f4e-2a9c1d3e5f60".into()),
+            Value::Text("{\"a\":1}".into()),
+        ],
+    )
+    .await
+    .expect("a stringified DBAL row must INSERT");
+
+    // PG's own renderer is the oracle. `tz` is read at an EXPLICIT zone so the assertion does not
+    // depend on the session `TimeZone` (this file deliberately runs some tests at America/New_York).
+    let got = co
+        .query(
+            "SELECT d::text, t::text, ts::text, (tz AT TIME ZONE 'UTC')::text, n::text, \
+             u::text, j::text FROM s8b_bind",
+            &[],
+        )
+        .await
+        .expect("read back");
+    assert_eq!(got.rows.len(), 1);
+    assert_eq!(
+        got.rows[0],
+        vec![
+            Value::Text("2026-08-05".into()),
+            Value::Text("13:45:07".into()),
+            Value::Text("2026-08-05 13:45:07".into()),
+            Value::Text("2026-08-05 13:45:07".into()),
+            // The column's display scale, not the payload's: numeric(12,4) stores 1.2500.
+            Value::Text("1.2500".into()),
+            Value::Text("0b7f0a5e-1f4a-4b7d-8f4e-2a9c1d3e5f60".into()),
+            // jsonb re-renders canonically (a space after the colon) — proof the payload really
+            // went through PG's `jsonb` input parser and not into a text column.
+            Value::Text("{\"a\": 1}".into()),
+        ],
+        "every stringified DBAL value must land in its typed column with PG's own text semantics"
+    );
+
+    // And the SENTINEL discipline still holds on the same connection: a bare string sentinel is
+    // refused with a KNOWN fate, pre-send, naming the tagged route.
+    let err = co
+        .query(
+            "INSERT INTO s8b_bind (ts) VALUES ($1)",
+            &[Value::Text("infinity".into())],
+        )
+        .await
+        .unwrap_err_or_panic("a bare TEXT sentinel must still be refused");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("SPECIAL"),
+        "the refusal must name the reason, got {msg}"
+    );
+    // Pre-send, so the server never saw it: no SQLSTATE, and the row count is unchanged.
+    match &err {
+        PoolError::Sql { code, sqlstate, .. } => {
+            assert_eq!(*code, ferro_proto::consts::errc::UNSUPPORTED);
+            assert_eq!(
+                *sqlstate, None,
+                "no SQLSTATE: the statement provably never executed"
+            );
+        }
+        other => panic!("a pre-send bind refusal must be a clean Sql error, got {other:?}"),
+    }
+    let n = scalar_i64(&mut co, "SELECT count(*)::int8 FROM s8b_bind").await;
+    assert_eq!(n, 1, "the refused sentinel INSERT stored nothing");
+
+    // …and the connection is immediately reusable, which is what "pre-send, known fate" means.
+    let ok = co.query("SELECT 1", &[]).await.expect("conn stays clean");
+    assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
+
+    co.exec("DROP TABLE s8b_bind").await.expect("cleanup");
+}

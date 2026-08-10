@@ -153,15 +153,118 @@ pg_domain_aware_param! {
 }
 
 pg_domain_aware_param! {
-    /// `TEXT` → `text`/`varchar`/`bpchar`/`name` (whatever `String`'s own `accepts` list holds),
-    /// plus a domain over any of them. The inner impl writes the bytes verbatim and ignores the
-    /// `Type`, so handing it the RESOLVED type changes nothing about the payload.
-    PgText wraps String
-}
-
-pg_domain_aware_param! {
     /// `BYTES` → `bytea`, plus a domain over it.
     PgBytes wraps Vec<u8>
+}
+
+/// The PG types a canonical `TAG_TEXT` payload may bind to IN ADDITION to the string types
+/// `String`'s own `accepts` already covers (`varchar`, `text`, `bpchar`, `name`, `unknown`, plus the
+/// name-keyed `citext`/`ltree`/`lquery`/`ltxtquery`).
+///
+/// **The membership rule is one sentence: PG's TEXT INPUT SYNTAX for this type is exactly what a
+/// canonical text payload carries** — which is the same rule the seven [`pg_canonical_text_param`]
+/// newtypes assert per tag, and the same thing `pdo_pgsql` relies on for every parameter it sends.
+/// `int2`/`int4`/`int8`, `bool`, `float4`/`float8` and `bytea` are deliberately NOT here: the
+/// canonical wire forms for those are `I64`/`Bool`/`F64`/`Bytes`, which have their own narrow
+/// binary bind paths (the S8a [`PgInt`] narrowing is what made a `serial` primary key work), and
+/// admitting text there would disable those pre-flights for no caller that exists.
+///
+/// A function rather than a `const [Type; 8]`, matching the array-literal-plus-`contains` idiom
+/// [`pg_canonical_text_param`] already uses (`[$(Type::$ty),+].contains(resolve_domain(ty))`). It
+/// takes the ALREADY-RESOLVED base: all three call sites resolve first, and each for its own
+/// reason, so resolving again in here would hide which of them forgot to.
+fn is_text_input_target(base: &Type) -> bool {
+    [
+        Type::NUMERIC,
+        Type::DATE,
+        Type::TIME,
+        Type::TIMESTAMP,
+        Type::TIMESTAMPTZ,
+        Type::UUID,
+        Type::JSON,
+        Type::JSONB,
+    ]
+    .contains(base)
+}
+
+/// `TEXT` → the string types (unchanged, delegated, BINARY) **plus** [`is_text_input_target`]'s
+/// eight, written verbatim in PG's **text** wire format.
+///
+/// **Why this is not `pg_domain_aware_param! { PgText wraps String }` any more (M1-S8b).** Two
+/// reasons, and the second is a wire bug waiting to happen:
+///
+///  1. `<String as ToSql>::accepts` admits only the string types, so a stock Doctrine DBAL insert —
+///     whose type layer stringifies every `datetime`/`date`/`time`/`decimal`/`json`/`guid` value and
+///     binds it as `ParameterType::STRING` — was refused pre-send on EVERY such column. MySQL has no
+///     equivalent pre-flight, so the same driver "worked" there and hard-failed here.
+///  2. That macro delegates `encode_format`, and `<String as ToSql>` takes the trait's
+///     `Format::Binary` default. Widening `accepts` alone would therefore hand PG the UTF-8 bytes of
+///     `2026-08-05` and tell it they are a 4-byte BINARY `date`.
+///
+/// **Both `to_sql` and `encode_format` BRANCH on the resolved base, and the branch is load-bearing
+/// in two independent ways.**
+///
+/// *Correctness:* it is NOT true that "the text-format bytes are the binary-format bytes for every
+/// string type this already accepted". `<&str as ToSql>::accepts` (postgres-types-0.2.14
+/// `src/lib.rs:1148-1153`) also admits `citext`, `ltree`, `lquery` and `ltxtquery` BY NAME, and for
+/// the last three the BINARY form is `0x01 || text` while the text form is bare text
+/// (`<&str as ToSql>::to_sql` matches on `ty.name()`). Text == binary holds for
+/// `varchar`/`text`/`bpchar`/`name`/`unknown`/`citext` and for nothing else. Keeping the delegated
+/// path for those types means this task's regression surface on everything that already worked is
+/// EMPTY, rather than "believed harmless".
+///
+/// *Falsifiability:* that same name-sensitive encoder is what makes clause (3) of
+/// `tests::s8a_every_arm_treats_a_domain_exactly_as_its_base` able to fail at all. The `ltree` entry
+/// in `tests::every_target_type` was added by S8a's review round precisely because every other entry
+/// is bound by an impl that ignores its `Type`, which left the payload-BYTES clause unfalsifiable. A
+/// type-blind `to_sql` here would make `ltree` and `dom_of_ltree` write identical bytes BY
+/// CONSTRUCTION and quietly revert that fix — measured: the mutation that is RED at HEAD goes GREEN.
+///
+/// **§19.3 is intact.** [`check_param`]'s `Value::Text` arm delegates to THIS `accepts`, so the
+/// pre-flight is bit-identical to the predicate `to_sql_checked` applies — the two cannot drift. And
+/// what the widening admits is not an unclassifiable failure: a malformed date text now fails
+/// SERVER-side with a real `22007` `DbError`, which `is_session_fatal` reads as non-fatal and
+/// `error_map` classifies `NonRetryable`. The direction the rule forbids — a pre-flight LOOSER than
+/// its impl — is not what changed; both moved together, in this edit.
+#[derive(Debug)]
+struct PgText(String);
+
+impl ToSql for PgText {
+    /// Verbatim canonical text for the widened targets (nothing is re-rendered, re-parsed or
+    /// validated — a round trip through a date/numeric type would lose a display scale or a
+    /// sentinel); the unchanged delegated path, **against the RESOLVED base**, for everything
+    /// `String` already accepted.
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        let base = resolve_domain(ty);
+        if is_text_input_target(base) {
+            out.extend_from_slice(self.0.as_bytes());
+            return Ok(IsNull::No);
+        }
+        <String as ToSql>::to_sql(&self.0, base, out)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        let base = resolve_domain(ty);
+        <String as ToSql>::accepts(base) || is_text_input_target(base)
+    }
+
+    /// Text format for THIS param only (the RESULT format stays binary, hazard 17) — and only for
+    /// the widened targets. The string types keep the `Format::Binary` they have always had, which
+    /// is what `ltree`'s `0x01 || text` payload requires.
+    fn encode_format(&self, ty: &Type) -> Format {
+        let base = resolve_domain(ty);
+        if is_text_input_target(base) {
+            Format::Text
+        } else {
+            <String as ToSql>::encode_format(&self.0, base)
+        }
+    }
+
+    to_sql_checked!();
 }
 
 /// Declares one **canonical-text** `ToSql` newtype (`proto/PROTOCOL.md` §3.2): a `String` wrapper
@@ -515,6 +618,45 @@ pub fn check_param(v: &Value, ty: &Type) -> Result<(), String> {
             value_kind(v),
         ));
     }
+    // ---- M1-S8b: the VALUE-aware half of the widened TEXT bind. --------------------------------
+    // `PgText::accepts` now admits the types whose input syntax is text, which is what makes the
+    // Doctrine tier possible. But PG's parser also turns a handful of BARE WORDS into real values —
+    // `infinity` into a timestamp sentinel, `now`/`today` into a clock reading, `NaN` into a numeric
+    // — so a string that happens to hold one must not acquire that meaning merely by landing in a
+    // temporal or numeric slot. A caller that MEANS a sentinel says so with the tag
+    // (`Ferro\Date('infinity')`, `Ferro\Decimal('NaN')`), which still binds.
+    //
+    // This is a REFUSAL keyed on the SLOT's type. It is NOT content sniffing: nothing here infers a
+    // TAG from a payload, and the identical string is accepted without comment for a text column.
+    //
+    // **Placed HERE — after the `!accepted` return, alongside the range gate below — deliberately.**
+    // The two orderings are not equivalent, and the earlier one silently costs a guard. Ahead of the
+    // `!accepted` return this refusal fires even for a slot the TEXT tag cannot bind AT ALL, so
+    // `check_param(Text("infinity"), DATE)` says SPECIAL whether or not `PgText::accepts` was
+    // widened — measured: with `accepts` reverted to `<String as ToSql>::accepts`,
+    // `s8b_a_bare_text_sentinel_is_still_refused_for_a_temporal_or_numeric_slot` stayed GREEN,
+    // i.e. it could no longer tell "refused because it is a SPECIAL literal" from "refused because
+    // the whole tag is banned" — the ONE distinction it exists to make. Behind the return it also
+    // reports the PRIMARY reason first: a slot that cannot take a string at all is a wrong-type
+    // refusal, not a sentinel one.
+    if let Value::Text(s) = v {
+        let refused = match *base {
+            Type::DATE | Type::TIME | Type::TIMESTAMP | Type::TIMESTAMPTZ => {
+                is_pg_special_datetime_literal(s)
+            }
+            Type::NUMERIC => is_pg_special_numeric_literal(s),
+            _ => false,
+        };
+        if refused {
+            return Err(format!(
+                "canonical Text {s:?} is one of PostgreSQL's SPECIAL input literals for {}, so \
+                 binding it as a bare string would silently give it that meaning; send it with its \
+                 own canonical tag instead (Ferro\\Date / Ferro\\Time / Ferro\\NaiveTimestamp / \
+                 Ferro\\Decimal), which binds it deliberately",
+                base.name()
+            ));
+        }
+    }
     // Task 4's value-aware gate, against the RESOLVED type: a domain over int4 narrows exactly as
     // int4 does.
     check_range(v, base)
@@ -587,6 +729,36 @@ fn check_range(v: &Value, ty: &Type) -> Result<(), String> {
 /// lockstep proof and every existing call site read the SAME predicate the pre-flight enforces.
 pub fn accepts(v: &Value, ty: &Type) -> bool {
     check_param(v, ty).is_ok()
+}
+
+/// PostgreSQL's special date/time input literals (`datetime.c`'s `deltatktbl`/`datetktbl` special
+/// entries), case-insensitively. Deliberately a CLOSED list rather than a parse attempt: the
+/// question is not "is this a valid date" — PG answers that itself, loudly, server-side — but "would
+/// binding this bare string silently MEAN something other than a literal date".
+fn is_pg_special_datetime_literal(s: &str) -> bool {
+    const SPECIALS: [&str; 8] = [
+        "infinity",
+        "-infinity",
+        "+infinity",
+        "now",
+        "today",
+        "tomorrow",
+        "yesterday",
+        "epoch",
+    ];
+    let t = s.trim();
+    SPECIALS.iter().any(|k| t.eq_ignore_ascii_case(k)) || t.eq_ignore_ascii_case("allballs")
+}
+
+/// PostgreSQL's special `numeric` input literals. `NaN` compares unequal to everything including
+/// itself, and `Infinity` is unbounded — either one silently acquired by a bare string is a value
+/// no application asked for.
+fn is_pg_special_numeric_literal(s: &str) -> bool {
+    const SPECIALS: [&str; 5] = ["nan", "infinity", "-infinity", "+infinity", "inf"];
+    let t = s.trim();
+    SPECIALS.iter().any(|k| t.eq_ignore_ascii_case(k))
+        || t.eq_ignore_ascii_case("-inf")
+        || t.eq_ignore_ascii_case("+inf")
 }
 
 /// The canonical-type label for a `Value`, used only to build a clear diagnostic bind-error
@@ -1580,31 +1752,158 @@ mod tests {
         );
     }
 
-    /// **Sentinel discipline, preserved from Task 8a.** A `TIMESTAMP`/`TIMESTAMPTZ` sentinel
-    /// (`infinity`, a MySQL zero datetime) reaches the engine as `TAG_TEXT` byte-verbatim — a bare
-    /// PHP string's contents are never sniffed for a temporal tag. So it lands on `Value::Text`,
-    /// whose `accepts` is `String`'s, which refuses every temporal type: a §19.3 known-fate
-    /// rejection instead of a silent miscast. Widening `Value::Text`'s accepts would break that.
+    /// **M1-S8b: a canonical TEXT payload binds where PG's own TEXT INPUT SYNTAX is what it
+    /// carries.** Stock Doctrine DBAL stringifies every temporal, decimal, JSON and UUID value in
+    /// its type layer and binds it with `ParameterType::STRING`, so on PostgreSQL every such INSERT
+    /// used to be refused pre-send. The widening is not a loosening of the §19.3 direction: the
+    /// pre-flight still delegates to the very predicate `to_sql_checked` will apply, and the
+    /// failure it now permits lands as a real server-side `22007`/`22P02` `DbError`, i.e. a KNOWN
+    /// fate, never the unclassifiable band.
+    ///
+    /// This REPLACES `s7_a_bare_text_never_binds_to_a_temporal_or_numeric_column`. That test's
+    /// PROPERTY — a bare string never silently becomes a PG sentinel — survives verbatim in
+    /// [`s8b_a_bare_text_sentinel_is_still_refused_for_a_temporal_or_numeric_slot`] below, as a
+    /// VALUE-aware gate instead of a whole-tag ban.
     #[test]
-    fn s7_a_bare_text_never_binds_to_a_temporal_or_numeric_column() {
-        for s in ["infinity", "-infinity", "0000-00-00 00:00:00", "2026-08-05"] {
-            for ty in [
-                Type::DATE,
-                Type::TIME,
-                Type::TIMESTAMP,
-                Type::TIMESTAMPTZ,
-                Type::NUMERIC,
-                Type::UUID,
-                Type::JSONB,
-            ] {
+    fn s8b_bare_text_binds_to_every_type_whose_input_syntax_is_text() {
+        for ty in [
+            Type::TEXT,
+            Type::VARCHAR,
+            Type::BPCHAR,
+            Type::NAME,
+            Type::UNKNOWN,
+            Type::NUMERIC,
+            Type::DATE,
+            Type::TIME,
+            Type::TIMESTAMP,
+            Type::TIMESTAMPTZ,
+            Type::UUID,
+            Type::JSON,
+            Type::JSONB,
+        ] {
+            assert!(
+                accepts(&Value::Text("2026-08-05".to_string()), &ty),
+                "a canonical TEXT param must bind to {ty:?} — DBAL's type layer sends every \
+                 temporal/decimal/json/uuid value as a string"
+            );
+        }
+        // Still NARROW where text is NOT the input form: an integer, a boolean and a byte array
+        // have binary-only bind paths here, and the S8a narrowing that made `serial` PKs work
+        // must not be undone by this widening.
+        for ty in [
+            Type::INT2,
+            Type::INT4,
+            Type::INT8,
+            Type::BOOL,
+            Type::BYTEA,
+            Type::FLOAT8,
+        ] {
+            assert!(
+                !accepts(&Value::Text("42".to_string()), &ty),
+                "a bare TEXT param must NOT bind to {ty:?}"
+            );
+        }
+        // The domain unwrap still applies on the widened path (S8a). Built INLINE, in the `900_0xx`
+        // synthetic band and NOT reusing an existing fixture oid, exactly as every other domain in
+        // this file is built.
+        let dom_date = Type::new(
+            "dom_date".to_string(),
+            900_020,
+            tokio_postgres::types::Kind::Domain(Type::DATE),
+            "public".to_string(),
+        );
+        assert!(accepts(&Value::Text("2026-08-05".to_string()), &dom_date));
+
+        // **The FORMAT must resolve the domain too, and it is a separate branch from `to_sql`.**
+        // `PgText::encode_format` decides whether PG reads these bytes as text or as a 4-byte binary
+        // `date`; a version that tested the UNRESOLVED type would send `Format::Binary` for
+        // `dom_date` while sending `Format::Text` for `date`, i.e. a wire bug reachable only through
+        // a domain — and `s8a_every_arm_treats_a_domain_exactly_as_its_base` compares `to_sql`
+        // BYTES, not formats, so nothing else in the tree would notice.
+        assert!(matches!(
+            PgText("2026-08-05".to_string()).encode_format(&dom_date),
+            Format::Text
+        ));
+        assert!(matches!(
+            PgText("2026-08-05".to_string()).encode_format(&Type::DATE),
+            Format::Text
+        ));
+        // …and the types that were ALREADY accepted keep the binary format they have always had, so
+        // this task's regression surface on the shipping path is empty.
+        let dom_text = Type::new(
+            "dom_text_fmt".to_string(),
+            900_021,
+            tokio_postgres::types::Kind::Domain(Type::TEXT),
+            "public".to_string(),
+        );
+        for ty in [Type::TEXT, Type::VARCHAR, dom_text] {
+            assert!(
+                matches!(PgText("x".to_string()).encode_format(&ty), Format::Binary),
+                "an already-accepted string type must keep its binary format: {ty:?}"
+            );
+        }
+    }
+
+    /// **The sentinel discipline, preserved — as a VALUE-aware gate, not a whole-tag ban.** PG's
+    /// input parser turns the bare words `infinity`, `now`, `today`, … into real values, so a
+    /// string that happens to hold one must not become a timestamp sentinel just because it landed
+    /// in a temporal slot. Same for `NaN` / `Infinity` against `numeric`. The refusal names the
+    /// canonical tag route (`Ferro\Date`, `Ferro\NaiveTimestamp`, `Ferro\Decimal`), which IS how a
+    /// caller expresses a sentinel on purpose.
+    ///
+    /// This is a REFUSAL keyed on the SLOT's type, never an inference of a TAG from content:
+    /// nothing here decides that `'2026-08-05'` "is a date".
+    #[test]
+    fn s8b_a_bare_text_sentinel_is_still_refused_for_a_temporal_or_numeric_slot() {
+        for lit in [
+            "infinity",
+            "-infinity",
+            "Infinity",
+            "NOW",
+            "today",
+            "Tomorrow",
+            "yesterday",
+            "epoch",
+            "allballs",
+        ] {
+            for ty in [Type::DATE, Type::TIME, Type::TIMESTAMP, Type::TIMESTAMPTZ] {
+                let err = check_param(&Value::Text(lit.to_string()), &ty).expect_err(
+                    "a PG special datetime literal must be refused for a temporal slot",
+                );
+                // **Case matters and the token is spelled ONCE, here and in the refusal message.**
+                // `str::contains` is case-sensitive; plan v1 asserted lowercase `"special"` against
+                // a message containing only `SPECIAL`, which fails on the first of these 36
+                // iterations against a CORRECT implementation (measured), and whose cheapest
+                // "repair" is to delete the assertion — at which point the guard stops
+                // distinguishing "refused because it is a SPECIAL literal" from "refused because
+                // the whole TEXT tag is banned", the ONE distinction this rewrite exists to make.
                 assert!(
-                    !accepts(&Value::Text(s.to_string()), &ty),
-                    "a bare TEXT param must not bind to {ty:?} — the sentinel would be miscast"
+                    err.contains("SPECIAL"),
+                    "the refusal must say WHY, got {err:?}"
+                );
+                // …and it must be ACTIONABLE: name the SLOT type and the tagged escape route.
+                // `contains("SPECIAL")` alone passes for any message containing the word.
+                assert!(
+                    err.contains(ty.name()),
+                    "the refusal must name the slot type, got {err:?}"
+                );
+                assert!(
+                    err.contains("Ferro\\Date"),
+                    "the refusal must name the tagged route that DOES bind a sentinel, got {err:?}"
                 );
             }
         }
-        // ...while a DATE sentinel that arrived tag-intact binds to a `date` column, which is
-        // exactly what PG's own parser accepts (`'infinity'::date`).
+        for lit in ["NaN", "nan", "Infinity", "-Infinity"] {
+            check_param(&Value::Text(lit.to_string()), &Type::NUMERIC)
+                .expect_err("a numeric special literal must be refused for a numeric slot");
+        }
+        // …and the SAME strings are perfectly ordinary values in a text column, which is the whole
+        // reason the gate is keyed on the slot rather than on the content.
+        for lit in ["infinity", "NaN", "today"] {
+            check_param(&Value::Text(lit.to_string()), &Type::TEXT)
+                .expect("a special literal is just a string in a text column");
+        }
+        // …and a sentinel that arrived TAG-INTACT still binds, exactly as before.
         assert!(accepts(&Value::Date("infinity".into()), &Type::DATE));
     }
 }
