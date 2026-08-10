@@ -81,13 +81,22 @@ final class ResultLiveTest extends DbalLiveTestCase
     }
 
     /**
-     * `rowCount()` after a SELECT: PostgreSQL's command tag carries the row count, MySQL's carries
-     * 0. DBAL documents `rowCount()` on a SELECT as driver-specific; this pins what OURS does per
-     * family so a silent change is caught.
+     * `rowCount()` after a SELECT: DBAL documents it as driver-specific, and ours diverges on TWO
+     * axes, both pinned here so a silent change is caught.
      *
-     * Both forms are exercised because they take different routes into the same `Result`: the
-     * zero-parameter `executeQuery()` reaches `Connection::query()`, the parameterised one reaches
-     * `Statement::execute()`.
+     * By FAMILY: PostgreSQL's command tag carries the row count, MySQL's carries 0.
+     *
+     * By ROUTE, **since Task 12**: the zero-parameter `executeQuery()` reaches
+     * `Connection::query()`, which STREAMS on PostgreSQL — and a `HEAD`/`DATA`/`END` producer has no
+     * `affected` field at all, so a streamed result reports **0**. The parameterised form reaches
+     * `Statement::execute()` → `runPrepared()`, which buffers and still reports PostgreSQL's count.
+     * That asymmetry is the price of §14's never-buffer requirement (adding `affected` to the stream
+     * terminal is a `/proto` change and is deferred), it is why the PREPARED path deliberately does
+     * NOT stream — `executeStatement()` RETURNS this number — and it is a real drop-in difference
+     * that belongs in `docs/known-incompatibilities.md`.
+     *
+     * Asserted per route rather than collapsed, so the pair also proves the streaming fork itself:
+     * a driver that stopped streaming would make the two PostgreSQL numbers equal again.
      */
     public function testRowCountAfterASelectIsTheDocumentedPerFamilyValue(): void
     {
@@ -104,9 +113,11 @@ final class ResultLiveTest extends DbalLiveTestCase
             $result = $c->executeQuery('SELECT id FROM s8b_res2');
             self::assertCount(3, $result->fetchAllNumeric(), "[$kind] the rows are all there");
             self::assertSame(
-                $kind === 'postgres' ? 3 : 0,
+                0,
                 $result->rowCount(),
-                "[$kind] rowCount() after a SELECT is the documented per-family value",
+                "[$kind] a zero-parameter SELECT streams on PostgreSQL and buffers on MySQL, and "
+                . 'BOTH report 0 — the streamed terminal carries no affected field, and MySQL never '
+                . 'reports one for a SELECT',
             );
 
             $paramd = $c->executeQuery('SELECT id FROM s8b_res2 WHERE id > ?', [1]);
@@ -114,7 +125,8 @@ final class ResultLiveTest extends DbalLiveTestCase
             self::assertSame(
                 $kind === 'postgres' ? 2 : 0,
                 $paramd->rowCount(),
-                "[$kind] and the same divergence through Statement::execute()",
+                "[$kind] the PREPARED route buffers on both families, so PostgreSQL's count comes "
+                . 'back here — the route divergence, not just the family one',
             );
 
             $c->executeStatement('DROP TABLE s8b_res2');

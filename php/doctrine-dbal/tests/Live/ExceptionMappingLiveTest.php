@@ -233,6 +233,19 @@ final class ExceptionMappingLiveTest extends DbalLiveTestCase
      * that the statement was cancelled) and the null SQLSTATE is pinned explicitly rather than
      * dropped, so a future engine change that starts carrying it is noticed here.
      *
+     * **AMENDED BY TASK 12 (streaming), and the amendment is a real behavioural fact rather than a
+     * test repair.** `executeQuery()` with ZERO parameters now takes the driver's streaming path on
+     * PostgreSQL, where the open reads only the `HEAD` frame — so the statement's FATE arrives on
+     * the first fetch, not from `executeQuery()` itself. The test therefore fetches. Nothing about
+     * the fate cells changed: both halves still assert the same classes, the same `/proto` codes and
+     * the same null SQLSTATE, MEASURED on the streamed path. What DID change is where a Doctrine
+     * application sees the exception, and that is worth knowing: on a streamed read the error
+     * surfaces mid-iteration. (The same running of this test is what exposed a real defect in Task
+     * 12's own `Result`: `Generator::valid()` — the call that STARTS the pump — was outside the
+     * wrapping, so this exception arrived as a raw `Ferro\Client\Error\IndeterminateException`
+     * that DBAL could not convert. Fixed there, guarded by
+     * `StreamedResultTest::testAnErrorTerminalBeforeTheFirstRowIsWrappedToo`.)
+     *
      * PostgreSQL only, deliberately. `fate.rs` is shared VERBATIM across backends (the S6 slice
      * reused it untouched), the 57014 override's own unit table
      * (`fate.rs::fate_57014_total_over_all_axes`) proves the cell for every `(readonly, sent,
@@ -245,7 +258,8 @@ final class ExceptionMappingLiveTest extends DbalLiveTestCase
 
         $write = $this->dbal();
         try {
-            $write->executeQuery($sql);
+            // FETCHED, not merely executed — see the "AMENDED BY TASK 12" note above.
+            $write->executeQuery($sql)->fetchOne();
             self::fail('a self-cancelled statement must raise 57014');
         } catch (DbalDriverException $e) {
             self::assertInstanceOf(
@@ -266,7 +280,7 @@ final class ExceptionMappingLiveTest extends DbalLiveTestCase
 
         $read = $this->dbal('default', ['readonly' => true]);
         try {
-            $read->executeQuery($sql);
+            $read->executeQuery($sql)->fetchOne();
             self::fail('a self-cancelled statement must raise 57014 here too');
         } catch (DbalDriverException $e) {
             self::assertNotInstanceOf(

@@ -3,6 +3,7 @@ declare(strict_types=1);
 namespace Ferro\DBAL\Tests\Unit;
 
 use Ferro\Client\Connection as FerroClientConnection;
+use Ferro\Client\ExecCodec;
 use Ferro\DBAL\Connection;
 use Ferro\DBAL\PlatformVersion;
 use Ferro\Protocol\ExecRequest;
@@ -46,12 +47,15 @@ final class ConnectionFateFlagTest extends TestCase
         return ExecRequest::mapFromWire(array_values((array) (new PurePacker())->unpack($payload, $off)));
     }
 
-    private static function driverConn(FakeSession $session, bool $readonly): Connection
-    {
+    private static function driverConn(
+        FakeSession $session,
+        bool $readonly,
+        string $kind = PlatformVersion::KIND_POSTGRES,
+    ): Connection {
         return new Connection(
             new FerroClientConnection($session, 'default'),
             'default',
-            PlatformVersion::KIND_POSTGRES,
+            $kind,
             $readonly,
         );
     }
@@ -89,21 +93,48 @@ final class ConnectionFateFlagTest extends TestCase
     }
 
     /**
-     * `query()` is the parameterless RESULT path and must still ask for rows — the mirror of the
-     * `exec()` row above. Without it, `query()` and `exec()` could share one `fetch` value and the
-     * pair would still look consistent.
+     * `query()` is the parameterless RESULT path and must never share `exec()`'s `fetch:none` —
+     * the mirror of the `exec()` row above. Without it, `query()` and `exec()` could share one
+     * `fetch` value and the pair would still look consistent.
+     *
+     * **Amended by Task 12, not weakened.** `query()` is now the ONE streaming path: on a
+     * PostgreSQL pool it asks for `fetch:stream` and on the MySQL family (where
+     * `supports_row_streaming()` is false, §22.2 (n)) it still asks for `fetch:rows`. Both are
+     * asserted here, per fate, so the fork itself is pinned alongside the declaration — and the
+     * original property survives in the `assertNotSame(FETCH_NONE)` row that closes the method.
+     *
+     * @param bool $readonly the connection-level fate declaration
+     * @param string $kind the pool family, which decides the fetch mode
+     * @param int $expectedFetch `ExecCodec::FETCH_*`
      */
-    #[DataProvider('fates')]
-    public function testQueryAsksForRowsAndCarriesTheSameDeclaration(bool $readonly): void
-    {
-        $session = (new FakeSession())->thenExecOk(null);
-        $c = self::driverConn($session, $readonly);
+    #[DataProvider('queryFetchModes')]
+    public function testQueryIsAResultPathOnBothFamiliesAndCarriesTheSameDeclaration(
+        bool $readonly,
+        string $kind,
+        int $expectedFetch,
+    ): void {
+        $session = $kind === PlatformVersion::KIND_POSTGRES
+            ? (new FakeSession())->thenStreamHead([['name' => 'c', 'tag' => C::TAG_I64]])
+            : (new FakeSession())->thenExecOk(null);
+        $c = self::driverConn($session, $readonly, $kind);
 
         $c->query('SELECT 1');
 
         $req = self::decodeExec($session->lastRequest()['payload']);
-        self::assertSame($readonly, $req['readonly']);
-        self::assertSame(0, $req['fetch']);
+        self::assertSame($readonly, $req['readonly'], 'the driver declares the fate on the streamed path too');
+        self::assertSame($expectedFetch, $req['fetch']);
+        self::assertNotSame(ExecCodec::FETCH_NONE, $req['fetch'], 'query() must be able to return rows');
+    }
+
+    /** @return array<string, array{0: bool, 1: string, 2: int}> */
+    public static function queryFetchModes(): array
+    {
+        $rows = [];
+        foreach (self::fates() as $fate => [$readonly]) {
+            $rows["postgres streams, $fate"] = [$readonly, PlatformVersion::KIND_POSTGRES, ExecCodec::FETCH_STREAM];
+            $rows["mysql buffers, $fate"] = [$readonly, PlatformVersion::KIND_MYSQL, ExecCodec::FETCH_ROWS];
+        }
+        return $rows;
     }
 
     /**

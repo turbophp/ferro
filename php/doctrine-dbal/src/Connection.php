@@ -49,6 +49,74 @@ final class Connection implements DriverConnection
      */
     private ?string $serverVersion = null;
 
+    /**
+     * A WEAK reference, and that is the entire abandonment design.
+     *
+     * A STRONG reference here would be the only thing keeping an abandoned stream alive:
+     * `Doctrine\DBAL\Connection::iterateAssociative()` returns
+     * `$this->executeQuery(…)->iterateAssociative()`, so the only other reference to the
+     * `Doctrine\DBAL\Result` — and through it to this driver `Result` — is the returned Generator's
+     * bound `$this`. `Doctrine\DBAL\Result` has no `__destruct` and DBAL never calls the driver's
+     * `free()` (hazard 80). So with a strong reference the driver can NEVER tell "the caller
+     * abandoned this" from "the caller may still fetch from this", and both end up draining the
+     * whole remainder on the next statement.
+     *
+     * Weakly: when the consumer stops iterating, the Generator dies, the DBAL `Result` dies, the
+     * driver `Result` becomes unreferenced, PHP frees it by refcount THERE AND THEN, and its
+     * `__destruct` sends the `CANCEL`. `get()` then returns null and {@see settleOpenStream} has
+     * nothing to do. When the consumer is still iterating, `get()` returns the live result and it
+     * materialises.
+     *
+     * **MEASURED LIMIT (PHP 8.4.18 + doctrine/dbal 4.4.4).** That is true when the generator is a
+     * TEMPORARY — `foreach ($conn->iterateAssociative($sql) as $row) { … break; }`, the canonical
+     * idiom — and NOT when it was bound first (`$it = $conn->iterateAssociative($sql); foreach ($it
+     * …) { break; }`), where `$it` keeps the result alive until it leaves scope or is `unset()`. A
+     * live reference is indistinguishable from a caller who may still fetch, so that shape
+     * materialises the remainder instead. It is a PHP refcount fact rather than a design choice;
+     * `StreamingLiveTest` pins BOTH shapes so nobody reads this as "abandonment always cancels".
+     *
+     * @var ?\WeakReference<Result> PHPStan level 9 will not infer the generic parameter.
+     */
+    private ?\WeakReference $openStream = null;
+
+    /** @see settledRowCount */
+    private int $settledRows = 0;
+
+    /**
+     * How many rows this connection has had to drain because a streamed result was still open when
+     * another statement was issued.
+     *
+     * **0 for pure iteration and 0 for a properly abandoned iteration**; non-zero only for the
+     * interleave idiom, where it is the size of the remainder that had to be buffered. It is what
+     * makes the two abandonment cases observable from a test — and it answers a real operator
+     * question, which is why it is a public accessor rather than test scaffolding.
+     */
+    public function settledRowCount(): int
+    {
+        return $this->settledRows;
+    }
+
+    /**
+     * Bring any open streamed `Result` into memory before this connection issues anything else.
+     *
+     * The Ferro session is strictly single-in-flight: `Session::assertNoOpenStream()` throws on any
+     * request while a stream is open. Rather than surface that as a `ProtocolException` — which
+     * would break `foreach ($conn->iterateAssociative(…)) { $conn->executeStatement(…); }`, an idiom
+     * every Doctrine codebase uses — the open result drains its remainder here. Pure iteration
+     * still never buffers; interleaving degrades to what PDO does unconditionally.
+     *
+     * A result whose caller is GONE is not drained: it has already cancelled itself on destruction.
+     */
+    private function settleOpenStream(): void
+    {
+        $ref = $this->openStream;
+        $this->openStream = null;
+        $open = $ref?->get();
+        if ($open instanceof Result) {
+            $this->settledRows += $open->materialize();
+        }
+    }
+
     /** The underlying Ferro client connection — also what {@see getNativeConnection} returns. */
     public function ferro(): FerroConnection
     {
@@ -72,9 +140,45 @@ final class Connection implements DriverConnection
         return new Statement($this, $sql);
     }
 
+    /**
+     * The ZERO-PARAMETER read path, and the ONE place this driver streams.
+     * `Doctrine\DBAL\Connection::executeQuery()` calls it directly when there are no parameters and
+     * — crucially — never asks the result for a row count, so nothing here can be made wrong by a
+     * terminal that carries no `affected`.
+     *
+     * **Why the prepared path does not stream.** `executeStatement()` with parameters is
+     * `$stmt->execute()->rowCount()`, and a streamed request's terminal carries no `affected` field
+     * (the HEAD/DATA/END producer has none), so streaming there would make every parameterized
+     * write return 0 — a silently wrong value, which is worse than buffering. Adding `affected` to
+     * the stream terminal is a `/proto` change (registry + golden vectors + both codecs) and is
+     * DEFERRED, not smuggled in here.
+     *
+     * **Why MySQL buffers.** `PoolBackend::supports_row_streaming()` is false for MySQL/MariaDB
+     * (SPEC §22.2 (n), controller decision D-S8b-2), where `streamRaw()` would come back as a clean
+     * `Unsupported` — paying a round trip to discover that on every query is not worth it when the
+     * pool kind is already known from `HELLO_ACK`.
+     *
+     * The returned result is the CALLER's alone; this connection keeps only a `\WeakReference`
+     * ({@see $openStream}). A caller that discards it — `$conn->query($sql);` in statement position —
+     * destroys it at the end of that statement and the stream is cancelled there, which is correct
+     * and is what the buffered path already does with its rows.
+     */
     public function query(string $sql): ResultInterface
     {
-        return $this->runPrepared($sql, []);
+        $this->settleOpenStream();
+        if ($this->poolKind !== PlatformVersion::KIND_POSTGRES) {
+            return $this->runPrepared($sql, []);
+        }
+        try {
+            $stream = $this->ferro->streamRaw($sql, [], $this->readonly);
+        } catch (FerroException $e) {
+            throw DriverException::fromFerro($e);
+        }
+        $result = Result::streamed($stream);
+        // WEAK on purpose — see the field's docblock. The caller's own reference (via
+        // `Doctrine\DBAL\Result`) is the one that decides whether this result is still alive.
+        $this->openStream = \WeakReference::create($result);
+        return $result;
     }
 
     /**
@@ -85,6 +189,7 @@ final class Connection implements DriverConnection
      */
     public function exec(string $sql): int
     {
+        $this->settleOpenStream();
         try {
             return $this->ferro->fetchRaw($sql, [], $this->readonly, false)['affected'];
         } catch (FerroException $e) {
@@ -118,6 +223,7 @@ final class Connection implements DriverConnection
      */
     public function runPrepared(string $sql, array $params): ResultInterface
     {
+        $this->settleOpenStream();
         try {
             $raw = $this->ferro->fetchRaw($sql, $params, $this->readonly, true);
         } catch (FerroException $e) {
@@ -176,6 +282,7 @@ final class Connection implements DriverConnection
 
     public function beginTransaction(): void
     {
+        $this->settleOpenStream();
         try {
             $this->ferro->begin($this->readonly);
         } catch (FerroException $e) {
@@ -185,6 +292,7 @@ final class Connection implements DriverConnection
 
     public function commit(): void
     {
+        $this->settleOpenStream();
         try {
             $this->ferro->commit();
         } catch (FerroException $e) {
@@ -194,6 +302,7 @@ final class Connection implements DriverConnection
 
     public function rollBack(): void
     {
+        $this->settleOpenStream();
         try {
             $this->ferro->rollBack();
         } catch (FerroException $e) {
@@ -252,6 +361,11 @@ final class Connection implements DriverConnection
             return $this->serverVersion = $advertised;
         }
 
+        // The resolution below reaches the WIRE, so an open streamed result has to be settled
+        // first — the session is single-in-flight. In practice DBAL resolves the platform before
+        // any statement runs and the answer is cached from then on, but "in practice" is not an
+        // invariant and this method is public.
+        $this->settleOpenStream();
         try {
             $raw = $this->ferro->fetchRaw('SELECT version()', [], true);
         } catch (FerroException $e) {
