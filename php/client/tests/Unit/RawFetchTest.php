@@ -122,6 +122,26 @@ final class RawFetchTest extends TestCase
     }
 
     /**
+     * `fetchRaw()` is the method the Doctrine tier will run EVERY statement through, so it must take
+     * {@see Connection::dispatch}'s one transaction fork the way `exec()`/`query()` do — DBAL nests
+     * transactions client-side and emits savepoints and plain statements alike as ordinary SQL,
+     * which has to land on the SAME pinned `tx_id`. A `fetchRaw` wired straight to the autocommit
+     * path would run OUTSIDE the caller's open transaction, and nothing would notice until a
+     * rollback failed to undo it. The `tx_id` is read back off the ENCODED request, not off a getter.
+     */
+    public function testInsideATransactionItCarriesThePinnedTxId(): void
+    {
+        $session = FakeSession::withTxBegin(txId: 41)->thenExecOk();
+        $conn = new Connection($session, 'default');
+        $conn->begin();
+
+        $conn->fetchRaw('INSERT INTO t (v) VALUES (1)', [], false, false);
+
+        $req = self::decodeExec($session->lastRequest()['payload']);
+        self::assertSame(41, $req['tx_id'], 'fetchRaw must route through the open transaction, not autocommit');
+    }
+
+    /**
      * `poolInfo()` resolves LIVE off `session()` every call. Caching it would be wrong: the
      * ReconnectLoop replaces the Session object, and a restarted engine can advertise a different
      * `server_version` — which is exactly the value the platform (i.e. the SQL dialect) is chosen
