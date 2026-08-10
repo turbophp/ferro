@@ -8,7 +8,7 @@
 
 **Tech Stack:** PHP ≥ 8.2 for `php/doctrine-dbal` (depends on `doctrine/dbal ^4.0` and, via a composer **path** repository, on `ferro/client`; `ferro/client` itself gains **no** runtime dependency — charter rule 7); PHP ≥ 8.2 dependency-free for the `ferro/client` additions; Rust (edition 2024) for the one `ferro-backend-pg` bind change; PHPUnit 11 + PHPStan level 9 as the package gates, mirroring `php/client` exactly.
 
-**Revision: v1.** Written against the code at HEAD `56ae1c2` (branch `m1-build`) and against four adversarial research probes that installed `doctrine/dbal 4.4.4` and `doctrine/orm 3` into a scratchpad, ran the stock DBAL functional suite against the live testkit containers, and built a throwaway DBAL driver over `Ferro\Client\Connection` that answered real queries through the real `DriverManager` on both a PG and a MySQL pool. Findings that changed the SHAPE of this plan, not its wording:
+**Revision: v2.** Written against the code at HEAD `56ae1c2` (branch `m1-build`) and against four adversarial research probes that installed `doctrine/dbal 4.4.4` and `doctrine/orm 3` into a scratchpad, ran the stock DBAL functional suite against the live testkit containers, and built a throwaway DBAL driver over `Ferro\Client\Connection` that answered real queries through the real `DriverManager` on both a PG and a MySQL pool. Findings that changed the SHAPE of this plan, not its wording:
 
 - **SPEC §14 was written against a DBAL-3-shaped SPI.** `ServerInfoAwareConnection` and `VersionAwarePlatformDriver` do not exist in 4.x; `getDatabasePlatform()` is handed a `ServerVersionProvider`, not the connection; `lastInsertId()` takes no sequence argument and must THROW; the driver `Result` has no iterate hook. Three §14 sentences are unimplementable as written and are amended by Task 14.
 - **The DBAL 4 SPI carries NO read/write signal** (Task 1's whole rationale). Every result-producing client method hard-codes `readonly=true`, so a driver built on `Connection::query()` would classify a lost `INSERT … RETURNING id` as **Retryable** — "provably did not apply" — for a write whose fate is genuinely unknown. That is the exact safety inversion this project exists to prevent, and it is why Task 1 exists before anything else.
@@ -16,6 +16,15 @@
 - **DBAL's stock type layer is a silently-corrupting calendar parser** (Task 9). Measured on 4.4.4: `'2026-00-05'` → `2025-12-05`, `'0000-00-00 00:00:00'` → `-0001-11-30`, PG's legal `'24:00:00'` → `00:00:00`. All three with **no exception**. A green functional suite does not catch this class.
 - **`setTransactionIsolation()` is a silent no-op under transaction-mode pooling** (Task 13), and the naive "did the next tenant inherit it" test cannot fail because hygiene masks it either way (SPEC §22.2 (s) already proved that).
 - **The upstream DBAL suite cannot select a third-party `driverClass`** (Task 14). `TestUtil::getConnectionParams()` checks only `$params['driver']` and silently returns `['driver' => 'pdo_sqlite', 'memory' => true]` — measured. A "green suite" claim would be vacuously true against in-memory SQLite with zero Ferro contact.
+
+### What changed in v2, and why
+
+v1 was verified by five adversarial agents working against live code and live databases. They produced **9 BLOCKERs and 4 MAJORs**, nearly all MEASURED rather than reasoned; their journals are in `.superpowers/sdd/2026-08-10-ferro-m1-s8b-dbal-driver/verify/`. Most of the findings were wording or symbol errors, fixed in place. **Four changed the DESIGN, and an implementer should know which parts were rebuilt rather than tweaked:**
+
+1. **Task 4's `PgText::to_sql` stays TYPE-AWARE.** v1 made it type-blind (`out.extend_from_slice(self.0.as_bytes())` ignoring `ty`), which — measured both directions — un-armed clause (3) of `s8a_every_arm_treats_a_domain_exactly_as_its_base`: `ltree` and `dom_of_ltree` would write identical bytes BY CONSTRUCTION, so the one guard S8a's review round added the `ltree` fixture to arm could no longer fail. (HEAD + the mutation = RED; v1's Task 4 + the same mutation = GREEN.) v2 branches on the resolved base: text-verbatim for the eight newly-widened targets, the existing delegated path for everything that already worked. Zero regression surface, `ltree` keeps its version byte, clause (3) stays armed — and `encode_format` branches the same way, with a new domain-format assertion so the branch condition itself is mutation-covered.
+2. **Task 12's memory guard, `materialize()` and the abandonment path were rebuilt.** The headline guard sampled `memory_get_usage()` AFTER the loop, where the buffered run has already released everything — measured 552 B streamed vs 472 B buffered, BOTH GREEN, while PEAK differed ~12 500×. It now measures PEAK **and** samples mid-loop. `materialize()`'s `foreach` over an advanced `Generator` throws `Cannot rewind a generator that was already run` on its FIRST real use; it is now an explicit `valid()/current()/next()` drain. Two of the four named mutations could not fail — one was a provable no-op, the other tested `materialize()` while calling itself the CANCEL path — so the driver now holds a **`\WeakReference`** to the open `Result` and the `Result` frees itself on destruction, which makes abandonment genuinely CANCEL, makes the difference OBSERVABLE (`settledRowCount()`), and turns both mutations into real ones.
+3. **Task 14's acceptance number is now reproducible.** With v1's no-op `initializeDatabase()` the identical command run twice gave 23 then 33 errors (restoring upstream's `TestUtil` returned it to 0/0 — causation proven); v1 also pointed the suite at the SHARED `ferro` database, which it would have silted up permanently for every other live suite in the repo. v2 adds a container-side reset before phpunit, gives PostgreSQL its own `doctrine_tests` database, makes "started from a fresh reset" part of the recorded environment manifest, and ships the three missing public `TestUtil` methods up front instead of "after the first fatal".
+4. **The `readonly = false` decision keeps its cost stated in full.** `readonly` is read in TWO places in `fate.rs`, and the second is the **57014 override**, where `!in_tx && !readonly && sent` is INDETERMINATE — so a plain `SELECT` that trips a server-side `statement_timeout` is reported to a Doctrine app as "your write may or may not have landed". The binding decision to declare write for everything is NOT re-litigated, but §22.2 (ac) now states the 57014 half explicitly, the engine docblock and `CLAUDE.md` that assert "a streamed READ never becomes `Indeterminate`" are amended in the same change set, `docs/known-incompatibilities.md` lists it as a real drop-in behaviour difference, and Task 11 gains a live guard that pins both cells — which also gives `driverOptions.readonly` its first behavioural test.
 
 ---
 
@@ -76,7 +85,7 @@ The M1-S7 review found nine guards that were structurally incapable of failing; 
 
 20. **Every result-producing client method hard-codes `readonly=true`**: `Connection::query()` (`php/client/src/Client/Connection.php:256`), `queryOne()` (`:277`), `scalar()` (`:290`), `rows()` (`:300`), `stream()` (`:357`). `exec()` hard-codes `readonly=false` **and** `FETCH_NONE`, so it can never return rows.
 21. **The engine gates the §19.3 Indeterminate split on the CLIENT-DECLARED `readonly` flag alone** (no SQL inference anywhere). So a driver built on `query()` would tell an application that a lost `INSERT … RETURNING id` **provably did not apply**. That is a safety inversion, not a nuisance.
-22. **The DBAL 4 SPI carries no read/write signal.** `Connection::executeQuery()` with **zero** params calls the driver's `query()` directly and with params calls `prepare()`+`execute()`; `executeStatement()` calls `exec()` with zero params and the **same** `prepare()`+`execute()` with params. An application may legitimately call `executeQuery('INSERT … RETURNING id')`. Charter rule 6 forbids inferring the answer from the SQL. **Therefore the driver declares `readonly = false` for EVERY statement** unless the operator explicitly opts the whole connection in with `driverOptions['readonly' => true]` (explicit configuration, not inference). Conservative by construction: a lost read is reported `Indeterminate` instead of `Retryable`, which costs retryability and never costs safety.
+22. **The DBAL 4 SPI carries no read/write signal.** `Connection::executeQuery()` with **zero** params calls the driver's `query()` directly and with params calls `prepare()`+`execute()`; `executeStatement()` calls `exec()` with zero params and the **same** `prepare()`+`execute()` with params. An application may legitimately call `executeQuery('INSERT … RETURNING id')`. Charter rule 6 forbids inferring the answer from the SQL. **Therefore the driver declares `readonly = false` for EVERY statement** unless the operator explicitly opts the whole connection in with `driverOptions['readonly' => true]` (explicit configuration, not inference). Conservative by construction: it never costs safety. **It does cost more than retryability — see hazard 83**: `readonly` is read in TWO places in `fate.rs`, and the second is the 57014 override, so a plain `SELECT` cancelled server-side or killed by `statement_timeout` surfaces as an `IndeterminateWriteException`. That is the price of the decision, it is stated in full rather than softened, and Task 11 pins it with a live guard so it cannot be silently "fixed" later.
 23. **`Connection::dispatch()` is PRIVATE** (`Connection.php:782`) and already returns exactly the shape a DBAL `Result` needs — `array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}` with POSITIONAL rows. `query()`/`rows()` `array_combine` on top of it (collapsing duplicate column names), and `scalar()` takes `$row[0]`. **There is no public positional-row fetch**, so `fetchNumeric()`/`fetchAllNumeric()`/`fetchFirstColumn()` have no route today.
 24. **`ExecOk.affected` and `count($rows)` are DIFFERENT numbers.** The research spike shipped `rowCount() === 0` for an `UPDATE` that affected 1 row because its `Result` returned `count($rows)`. `Ferro\DBAL\Result` must carry `affected` alongside the rows.
 
@@ -90,7 +99,7 @@ The M1-S7 review found nine guards that were structurally incapable of failing; 
 **The PG bind pre-flight (Task 4)**
 
 29. **`bind::check_param(v, ty)`'s `Value::Text` arm is `<PgText as ToSql>::accepts(ty)`** (`ferro-backend-pg/src/bind.rs:473`), and `PgText` is declared `pg_domain_aware_param! { PgText wraps String }` (`bind.rs:159`), so its `accepts` is `String`'s: `matches!(*ty, VARCHAR|TEXT|BPCHAR|NAME|UNKNOWN) || matches!(ty.name(), "citext"|"ltree"|"lquery"|"ltxtquery")` after the domain unwrap. **A PHP string bound into a PG `date`/`time`/`timestamp`/`timestamptz`/`numeric`/`uuid`/`json`/`jsonb` column is refused PRE-SEND.**
-30. **`PgText`'s `encode_format` is BINARY** (the `pg_domain_aware_param!` macro delegates to `<String as ToSql>::encode_format`, which takes the trait's `Format::Binary` default). **Widening `accepts` alone would be a WIRE bug**, not just a policy change: PG would read the UTF-8 bytes of `2026-08-05` as a 4-byte binary `date`. The widened `PgText` must be an explicit `impl` whose `encode_format` is `Format::Text` — which is byte-identical to binary for every string type it already accepted.
+30. **`PgText`'s `encode_format` is BINARY** (the `pg_domain_aware_param!` macro delegates to `<String as ToSql>::encode_format`, which takes the trait's `Format::Binary` default). **Widening `accepts` alone would be a WIRE bug**, not just a policy change: PG would read the UTF-8 bytes of `2026-08-05` as a 4-byte binary `date`. The widened `PgText` must be an explicit `impl` that sends `Format::Text` **for the widened targets only**. Text is NOT byte-identical to binary for everything `<&str as ToSql>` accepts: it also admits `citext`, `ltree`, `lquery` and `ltxtquery` BY NAME (postgres-types-0.2.14 `src/lib.rs:1148-1153`), and for the last three the binary form is `0x01 || text` (`buf.put_u8(1)`, postgres-protocol-0.6.12 `src/types/mod.rs:1067-1072`). The equality holds for `varchar`/`text`/`bpchar`/`name`/`unknown`/`citext` and nowhere else — which is why Task 4 branches in BOTH `to_sql` and `encode_format` rather than going type-blind.
 31. **`bind.rs::s7_a_bare_text_never_binds_to_a_temporal_or_numeric_column` (`bind.rs:1588`) EXPLICITLY pins the narrowness** with the rationale "a sentinel would be miscast", and its docblock says in as many words "Widening `Value::Text`'s accepts would break that". Task 4 must therefore **replace** it with a value-aware gate that still refuses PG's special datetime literals and the `NaN`/`Infinity` numeric literals for temporal/numeric targets — not delete it.
 32. **MySQL has NO equivalent pre-flight** (`ferro-backend-mysql/src/bind.rs`: `COM_STMT_PREPARE` exposes no inferred parameter types, so validation is arity + canonical shape only). The same driver "works" on MySQL and hard-fails on PG. **Every bind task in this plan asserts on ALL THREE engines.**
 33. **A failure that lands SERVER-SIDE is a known fate, not an `Indeterminate`.** A malformed date text bound into a `date` column produces a real `DbError` (`22007`), so `is_session_fatal` is false, `error_map` keys it, and `classify_fate` yields `NonRetryable`. This is what makes Task 4's widening safe: it moves a refusal from pre-send to server-side, never into the unclassifiable band.
@@ -154,6 +163,17 @@ The M1-S7 review found nine guards that were structurally incapable of failing; 
 76. **`TestUtil::isDriverOneOf()` keys on the driver NAME and has 60 call sites.** A `driverClass`-only connection matches nothing, so every vendor-gated test takes the "other" branch. That is the correct answer for us (claiming `pdo_pgsql` would opt us into PDO-specific expectations), and it must be a deliberate, recorded choice.
 77. **Ferro has NO SQLite backend** (`engine/crates` has `pg` + `mysql` only; `AnyPool { Pg | Mysql }`), so the SQLite third of §14's acceptance bar is unreachable in S8b.
 
+**Added in v2 — measured by the adversarial verification pass**
+
+78. **`foreach` over an advanced `Generator` THROWS.** `foreach` calls `Generator::rewind()`, which raises `Exception: Cannot rewind a generator that was already run` once the generator has moved past its first yield. MEASURED on PHP 8.4.18. Any "drain the rest of this generator" code must use an explicit `while ($g->valid()) { $out[] = $g->current(); $g->next(); }` loop — which is what Task 12's own streamed `fetchNumeric()` already does.
+79. **`memory_get_usage()` sampled AFTER a loop cannot distinguish streaming from buffering.** MEASURED over dbal 4.4.4's real code paths with 100 000 × (int, 64-char text): residual growth was **552 B streamed vs 472 B buffered** — the buffered run has already released everything by the time the loop exits, because `Doctrine\DBAL\Result` has no `__destruct` and the only live reference is the returned Generator's bound `$this`. The same run's **peak** growth was **2 728 B vs 34 109 720 B** and the **mid-loop** growth **2 040 B vs 33 302 432 B**. Any never-buffer guard must read `memory_get_peak_usage()` (with `memory_reset_peak_usage()`, PHP ≥ 8.2 — the client's floor) and/or sample INSIDE the loop.
+80. **`Doctrine\DBAL\Result` has NO `__destruct`, and DBAL never calls the driver `Result::free()` on abandonment.** The only `__destruct` under `dbal/src` are `Driver/PgSQL/{Connection,Statement,Result}`, `Driver/Mysqli/Statement` and `Logging/Connection`. So `break`-ing out of an `iterateAssociative()` frees the DBAL wrapper by REFCOUNT and nothing else — which means a driver that keeps its own STRONG reference to the open result (v1 did) is the only thing keeping the stream alive, and the abandonment path silently becomes "transfer the entire remaining result set on the next statement". Task 12 holds a `\WeakReference` for exactly this reason — which closes the CANONICAL idiom (`foreach ($conn->iterateAssociative($sql) as $row)`, where the generator is a temporary and PHP destroys the driver `Result` by refcount at the `break`) but NOT a BOUND iterator (`$it = $conn->iterateAssociative($sql); foreach ($it as $row) { break; }`), where the reference stays live and the remainder is still transferred. Measured by the controller on PHP 8.4.18 + dbal 4.4.4 after v2 was written (the containers were stopped during v2). A live reference is indistinguishable from a caller who may still fetch, so this is a PHP refcount fact, not a design choice — Task 12 tests both shapes and Task 14 documents the second.
+81. **PHP does not reject surplus arguments to a user-defined function.** A 3-parameter constructor called with 4 arguments binds the first three and DISCARDS the fourth — under `declare(strict_types=1)` that surfaces as a `TypeError` about the WRONG parameter (MEASURED: `Argument #3 ($c) must be of type bool, string given`). A constructor signature that differs between two tasks therefore fails with a message that points at neither task.
+82. **`SELECT pg_cancel_backend(pg_backend_pid())` cancels its OWN statement**, producing SQLSTATE `57014` (`query_canceled`) on an ordinary AUTOCOMMIT statement with no session state, no second connection and no timeout. That is the only self-contained way this plan has to reach the engine's 57014 override from PHP: the PHP client never sends `ExecRequest.timeout_ms` (there is no timeout parameter anywhere in `php/client/src/Client/Connection.php`), and PG's `statement_timeout` cannot be set on a transaction-mode pool by a preceding statement — a non-local `SET` TAINTS the checkout but does not PIN it, so the next statement may land on a different connection.
+83. **`readonly` is read TWICE in `fate.rs`, and the second place is the 57014 override.** `engine/crates/ferrod/src/services/fate.rs:71-114`: `in_tx → TxDeadline{Retryable}`; `!in_tx && readonly → Cancelled{NonRetryable}`; `!in_tx && !readonly && sent → WriteUnconfirmed{INDETERMINATE}`. So the driver's "declare write for everything" decision (hazard 22) does not merely cost retryability on a lost connection — it turns **every server-side-cancelled or `statement_timeout`-ed SELECT into an `IndeterminateWriteException`**. Task 11 pins both cells; §22.2 (ac), the engine docblock at `sql.rs:1053` and `CLAUDE.md`'s S5 paragraph are all amended by Task 14, because all three currently state "a streamed READ never becomes `Indeterminate`" without the client-side condition.
+84. **The upstream `TestUtil` methods the allowlisted tests actually call** (MEASURED with `grep -rhoE 'TestUtil::[a-zA-Z]+'` over the allowlisted paths of the real 4.4.4 clone): `isDriverOneOf` ×13, **`getPrivilegedConnection` ×2** (`tests/Functional/TransactionTest.php:112`, `tests/Functional/Schema/OracleSchemaManagerTest.php:113`), `getConnectionParams` ×2, `getConnection` ×1. `getPrivilegedConnectionParameters` is **private** upstream (`tests/TestUtil.php:176`) and nothing outside the class calls it. Elsewhere in `tests/`: `isPdoStringifyFetchesEnabled` ×4 and `generateResultSetQuery` ×1 (`tests/Functional/Connection/FetchTest.php:20`) — the latter is a real 14-line SQL generator, not a policy answer.
+85. **Upstream's `initializeDatabase()` is the functional suite's ONLY reset, and removing it makes the number non-reproducible.** MEASURED against a CORRECT driver (stock `PDO\PgSQL` selected by `driverClass`, i.e. zero driver defects) on live PG 17, running the plan's exact allowlist three times and changing ONLY `TestUtil`: upstream → `Errors 0, Failures 0`; v1's replacement → `Errors 23, Failures 3`; the SAME command again → `Errors 33, Failures 1`; upstream restored → `0/0`. The dominant modes are all leftover state (11× a leftover SEQUENCE reaching a name filter as a `Schema\Sequence`, 9× `TableExistsException`, 4× duplicate schema, 3× `Dependent objects still exist` because upstream's `dropTableIfExists` issues a plain `DROP TABLE`, 1× duplicate type). A reset is therefore a HARD precondition of recording a number.
+
 ### Definition of done (charter DoD, EVERY task)
 
 - `cargo fmt --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` — green **offline** (live tests skip, never fail, when the `FERRO_TEST_*_URL` vars are unset).
@@ -196,7 +216,7 @@ Build the daemon first with `cargo build -p ferrod` (the workspace target is at 
 
 - `php/client/src/Client/RawStream.php` — `Ferro\Client\RawStream`: the eagerly-opened, positional streamed read handle (`columns()` / `rows()` / `close()`). Its single responsibility is to make an open stream **explicitly closable**, because Task 2's eager open means a never-iterated generator would otherwise leak the stream (hazard 27).
 - `php/client/tests/Unit/RawFetchTest.php`, `php/client/tests/Unit/RawStreamTest.php`, `php/client/tests/Client/ConnectionBeginIsolationTest.php`.
-- `php/client/tests/Live/RawFetchLiveTest.php`, `php/client/tests/Live/RawStreamLiveTest.php`, `php/client/tests/Live/BeginIsolationLiveTest.php`.
+- `php/client/tests/Live/RawFetchLiveTest.php`, `php/client/tests/Live/RawStreamLiveTest.php`, `php/client/tests/Live/BeginIsolationLiveTest.php`, `php/client/tests/Live/ValuePolicyFacadeLiveTest.php`.
 
 **Created — `php/doctrine-dbal` (Tasks 5–13)**
 
@@ -1138,7 +1158,7 @@ Two additive client changes the driver cannot work around. **(a)** `Connection::
 **Files:**
 - Modify: `php/client/src/Client/Connection.php` (`begin()` at `:460-508`)
 - Modify: `php/client/src/Ferro.php` (`connect()`, `connectTcp()`, `assemble()`)
-- Test: `php/client/tests/Client/ConnectionBeginIsolationTest.php` (Create), `php/client/tests/Live/BeginIsolationLiveTest.php` (Create)
+- Test: `php/client/tests/Client/ConnectionBeginIsolationTest.php` (Create), `php/client/tests/Live/BeginIsolationLiveTest.php` (Create), `php/client/tests/Live/ValuePolicyFacadeLiveTest.php` (Create — the `values:` observable, which cannot be reached offline)
 
 **Interfaces:**
 - Produces:
@@ -1157,7 +1177,6 @@ namespace Ferro\Tests\Client;
 
 use Ferro\Client\Connection;
 use Ferro\Client\Value\RawStringValuePolicy;
-use Ferro\Ferro;
 use Ferro\Protocol\BeginRequest;
 use Ferro\Protocol\BeginResponse;
 use Ferro\Protocol\Generated\Constants as C;
@@ -1228,19 +1247,21 @@ final class ConnectionBeginIsolationTest extends TestCase
     }
 
     /**
-     * `Ferro::connect()` must be able to produce a connection that decodes with a CUSTOM
-     * ValuePolicy — the Doctrine tier's whole type boundary is one. Without this the facade's
-     * resilient wiring (ReconnectLoop + FateClassifier) would have to be duplicated in the driver.
+     * The mutual exclusion `Ferro::connect(values:)` has to respect. **This pins a PRE-EXISTING
+     * invariant** (`Connection::__construct` already rejects the pair at HEAD, `Connection.php:120-127`)
+     * — it passes before any Task 3 edit and is here so the facade's new `values:` parameter cannot
+     * be wired in a way that bypasses it, not as evidence that the parameter works.
      *
-     * Asserted through the observable, not the wiring: a DECIMAL cell decodes to a raw string under
-     * `RawStringValuePolicy` and to a `Ferro\Decimal` under the default.
+     * **The OBSERVABLE that `values:` is not an inert knob is the LIVE test in Step 6**, and it has
+     * to be: `Ferro::assemble()` is private, `connect()` needs a real socket, and a reflection
+     * parameter COUNT passes just as well for a `connect()` that accepts `$values` and then drops
+     * it — which is exactly what `assemble()`'s own docblock records happening once already with
+     * `$types` ("dropping $types from either assemble(...) call left PHPUnit green AND PHPStan
+     * level 9 clean while Ferro::connect(types: …) became an inert public knob"). v1 asserted the
+     * count here and called it an observable; it is not one, so it is gone.
      */
-    public function testConnectAcceptsAValuePolicyAndRefusesItAlongsideTypeOptions(): void
+    public function testConnectionRefusesAValuePolicyAlongsideTypeOptions(): void
     {
-        self::assertTrue(
-            (new \ReflectionMethod(Ferro::class, 'connect'))->getNumberOfParameters() === 7,
-            'connect() gained the values: parameter',
-        );
         $this->expectException(\InvalidArgumentException::class);
         new Connection(
             new FakeSession(),
@@ -1356,7 +1377,7 @@ In `php/client/src/Ferro.php`, add `use Ferro\Client\Value\ValuePolicy;`, then a
 ```bash
 cd /home/abdullak/projects/ferro/php/client && ./vendor/bin/phpunit tests/Client/ConnectionBeginIsolationTest.php && ./vendor/bin/phpunit && ./vendor/bin/phpstan analyse src --level 9
 ```
-Expected: PASS (5 tests in the new file), whole suite green, PHPStan clean.
+Expected: PASS — **6 tests**: `testTheIsolationByteReachesTheBeginRequest` runs 4 data rows (the absent case plus `Isolation::cases()`, which has exactly 3 — `php/client/src/Protocol/Isolation.php`), plus `testTheReadonlyOnlyCallShapeStillWorks` and `testConnectionRefusesAValuePolicyAlongsideTypeOptions`. Whole suite green, PHPStan clean.
 
 - [ ] **Step 6: Write the live test — a BEHAVIOURAL isolation proof, not a variable read-back**
 
@@ -1434,21 +1455,75 @@ final class BeginIsolationLiveTest extends LiveTestCase
 }
 ```
 
-- [ ] **Step 7: Run the live test**
+Create `php/client/tests/Live/ValuePolicyFacadeLiveTest.php` — the observable half of Task 3(b), which has no offline form:
+
+```php
+<?php // /php/client/tests/Live/ValuePolicyFacadeLiveTest.php
+declare(strict_types=1);
+namespace Ferro\Tests\Live;
+
+use Ferro\Client\RetryPolicy;
+use Ferro\Client\Value\RawStringValuePolicy;
+use Ferro\Decimal;
+use Ferro\Ferro;
+
+/**
+ * M1-S8b Task 3(b) — `Ferro::connect(values:)` is not an inert knob.
+ *
+ * Asserted through the OBSERVABLE — what a DECIMAL cell decodes to — because the failure mode this
+ * guards against is precisely a facade that accepts the argument and drops it on the floor.
+ * `Ferro::assemble()`'s own docblock records that exact thing happening once already with `$types`:
+ * "dropping $types from either assemble(...) call left PHPUnit green AND PHPStan level 9 clean while
+ * Ferro::connect(types: …) became an inert public knob". A reflection parameter COUNT — which is
+ * what plan v1 asserted here — passes over that bug.
+ *
+ * It is a LIVE test because there is no offline route: `assemble()` is private and `connect()` needs
+ * a real socket, so the only honest way to observe the wiring is to decode a real cell.
+ */
+final class ValuePolicyFacadeLiveTest extends LiveTestCase
+{
+    public function testTheFacadeForwardsAValuePolicyAllTheWayToTheDecoder(): void
+    {
+        $raw = Ferro::connect(
+            $this->socketPath,
+            'default',
+            2.0,
+            5.0,
+            RetryPolicy::none(),
+            null,
+            new RawStringValuePolicy(),
+        );
+        $got = $raw->scalar("SELECT CAST('1.50' AS numeric)");
+        self::assertIsString($got, 'RawStringValuePolicy hands up the canonical wire text verbatim');
+        self::assertSame('1.50', $got, 'the display scale survives — 1.50, not 1.5');
+
+        // …and the SAME query on a connection built WITHOUT the argument still gets the §9.1 default,
+        // which is what makes the assertion above a discriminator rather than a description of the
+        // default behaviour.
+        $def = Ferro::connect($this->socketPath, 'default', 2.0, 5.0, RetryPolicy::none());
+        $obj = $def->scalar("SELECT CAST('1.50' AS numeric)");
+        self::assertInstanceOf(Decimal::class, $obj, 'the default policy still decodes DECIMAL to an object');
+        self::assertSame('1.50', (string) $obj);
+    }
+}
+```
+
+- [ ] **Step 7: Run the live tests**
 
 ```bash
 cd /home/abdullak/projects/ferro/php/client && \
 FERRO_TEST_PG_URL="postgres://ferro:ferro@127.0.0.1:55432/ferro" \
 FERRO_TEST_MYSQL_URL="mysql://ferro:ferro@127.0.0.1:33060/ferro" \
 FERRO_FERROD_BIN=/home/abdullak/projects/ferro/target/debug/ferrod \
-./vendor/bin/phpunit tests/Live/BeginIsolationLiveTest.php --fail-on-skipped
+./vendor/bin/phpunit tests/Live/BeginIsolationLiveTest.php tests/Live/ValuePolicyFacadeLiveTest.php --fail-on-skipped
 ```
-Expected: PASS (2 tests).
+Expected: PASS (3 tests — 2 isolation, 1 value policy).
 
 - [ ] **Step 8: MUTATION-PROVE the guards**
 
-1. In `begin()`, replace `$isolation?->value` with `null`. Re-run the unit test: RED on the three enum rows. Re-run the live test: RED on both (PG reports `read committed`; MySQL's update succeeds). Restore. **Both halves must go red** — the unit test alone would not prove the engine honoured the byte.
+1. In `begin()`, replace `'isolation' => $isolation` with `'isolation' => null` in the `BeginRequest::encode(...)` payload. (Step 3 passes the ENUM CASE deliberately, so there is no `$isolation?->value` anywhere in `begin()` to mutate — v1's mutation text named code this plan never writes, and an implementer who "fixed" `begin()` to use `?->value` would be routing around the byte lock Step 3's comment exists to protect.) Re-run the unit test: RED on the three enum rows. Re-run the live test: RED on both (PG reports `read committed`; MySQL's update succeeds). Restore. **Both halves must go red** — the unit test alone would not prove the engine honoured the byte.
 2. Swap `Isolation::RepeatableRead` and `Isolation::Serializable`'s integer values in `php/client/src/Protocol/Isolation.php`. Re-run `tests/Conformance/IsolationCrossLanguageTest` (expected RED — it locks both copies) **and** the PG live test (expected RED — the level is wrong). Restore. This is the §22.2 (w) cross-language lock finally being EXERCISED by a real caller rather than merely existing.
+3. In `Ferro::assemble()`, drop `values: $values` from the `new Connection(...)` call (leave the parameter on `connect()`/`connectTcp()`/`assemble()` in place — that is the shape the bug actually takes). Re-run the OFFLINE suite and PHPStan: **both stay green**, which is the finding. Re-run `tests/Live/ValuePolicyFacadeLiveTest.php`: RED — the `numeric` cell comes back a `Ferro\Decimal` instead of `'1.50'`. Restore. This is the mutation that separates "the knob exists" from "the knob does something".
 
 - [ ] **Step 9: Commit**
 
@@ -1457,7 +1532,8 @@ cd /home/abdullak/projects/ferro
 git add php/client/src/Client/Connection.php \
         php/client/src/Ferro.php \
         php/client/tests/Client/ConnectionBeginIsolationTest.php \
-        php/client/tests/Live/BeginIsolationLiveTest.php
+        php/client/tests/Live/BeginIsolationLiveTest.php \
+        php/client/tests/Live/ValuePolicyFacadeLiveTest.php
 git commit -m "feat(m1-s8b): begin() carries an isolation level; Ferro::connect() accepts a ValuePolicy
 
 The engine half (compose_begin_sql, dialect-aware, per-transaction forms only)
@@ -1492,8 +1568,10 @@ The fix is not "turn the pre-flight off". It is: a canonical `Value::Text` paylo
 - Test: `engine/crates/ferro-backend-pg/src/bind.rs` (unit) + `engine/crates/ferro-backend-pg/tests/pg_types_it.rs` (live)
 
 **Interfaces:**
-- Produces: `PgText` becomes an explicit `ToSql` impl (no longer generated by `pg_domain_aware_param!`) whose `accepts` is `<String as ToSql>::accepts(base) || TEXT_INPUT_TARGETS.contains(base)` and whose `encode_format` is `Format::Text`. `bind::check_param` gains a value-aware refusal for PG's special temporal/numeric literals against a temporal/numeric slot.
+- Produces: `PgText` becomes an explicit `ToSql` impl (no longer generated by `pg_domain_aware_param!`) whose `accepts` is `<String as ToSql>::accepts(base) || is_text_input_target(base)`, and whose `to_sql` **and** `encode_format` BRANCH on the resolved base — verbatim text + `Format::Text` for the eight newly-widened targets, the existing delegated `<String as ToSql>` path (and therefore `Format::Binary`) for everything `String` already accepted. `bind::is_text_input_target(&Type) -> bool` is the shared predicate. `bind::check_param` gains a value-aware refusal for PG's special temporal/numeric literals against a temporal/numeric slot.
 - Consumes: `ferro_proto::value::Value`; `resolve_domain(&Type) -> &Type` (`bind.rs`, the S8a domain unwrap); `tokio_postgres::types::{Type, Format, ToSql, IsNull}`.
+
+> **v2 — why `to_sql` is TYPE-AWARE and not the one-liner it looks like it should be.** Plan v1 wrote `fn to_sql(&self, _ty: &Type, out)` as an unconditional `out.extend_from_slice(self.0.as_bytes())`. That is wire-correct for every type in the widened set, and it silently DESTROYS a guard. `s8a_every_arm_treats_a_domain_exactly_as_its_base` has three clauses, and clause (3) — the payload BYTES a domain and its base produce are identical — is falsifiable ONLY because `PgText` currently delegates to `<&str as ToSql>::to_sql`, which is the fixture's **one name-sensitive encoder**: it matches on `ty.name()` and prepends a version byte for `ltree`/`lquery`/`ltxtquery` (`postgres-protocol-0.6.12/src/types/mod.rs:1067-1072`, `buf.put_u8(1)`). `bind.rs:1130-1152` says so in its own words — the `ltree` fixture entry is "the ONLY thing standing between the payload half of §22.2 (g) and unfalsifiability", added by S8a's review round after clause (3) shipped unfalsifiable once. **MEASURED both directions:** at HEAD, mutating the macro's `to_sql` to use the unresolved `ty` gives `s8a_every_arm_treats_a_domain_exactly_as_its_base ... FAILED  left: [1, 120]  right: [120]`; with v1's Task 4 applied, the SAME mutation gives `... ok`. A future edit that drops `resolve_domain` from a `to_sql` — the exact §19.3 false-`Indeterminate` bug S8a shipped and fixed once — would pass the whole offline suite again. So the branch stays, `ltree` keeps its version byte, and Step 8 gains the re-mutation.
 
 - [ ] **Step 1: Write the failing unit test**
 
@@ -1539,9 +1617,46 @@ In `engine/crates/ferro-backend-pg/src/bind.rs`, REPLACE the whole `s7_a_bare_te
                 "a bare TEXT param must NOT bind to {ty:?}"
             );
         }
-        // The domain unwrap still applies on the widened path (S8a).
-        let dom_date = domain_over(Type::DATE);
+        // The domain unwrap still applies on the widened path (S8a). Built INLINE, in the `900_0xx`
+        // synthetic band and NOT reusing an existing fixture oid, exactly as every other domain in
+        // this file is built (`bind.rs:784, 804, 813, 880, 982, 1501`). There is no `domain_over()`
+        // helper — plan v1 said there was, and `grep -rn "fn domain_over" engine/` returns nothing.
+        let dom_date = Type::new(
+            "dom_date".to_string(),
+            900_020,
+            tokio_postgres::types::Kind::Domain(Type::DATE),
+            "public".to_string(),
+        );
         assert!(accepts(&Value::Text("2026-08-05".to_string()), &dom_date));
+
+        // **The FORMAT must resolve the domain too, and it is a separate branch from `to_sql`.**
+        // `PgText::encode_format` decides whether PG reads these bytes as text or as a 4-byte binary
+        // `date`; a version that tested the UNRESOLVED type would send `Format::Binary` for
+        // `dom_date` while sending `Format::Text` for `date`, i.e. a wire bug reachable only through
+        // a domain — and `s8a_every_arm_treats_a_domain_exactly_as_its_base` compares `to_sql`
+        // BYTES, not formats, so nothing else in the tree would notice.
+        assert!(matches!(
+            PgText("2026-08-05".to_string()).encode_format(&dom_date),
+            Format::Text
+        ));
+        assert!(matches!(
+            PgText("2026-08-05".to_string()).encode_format(&Type::DATE),
+            Format::Text
+        ));
+        // …and the types that were ALREADY accepted keep the binary format they have always had, so
+        // this task's regression surface on the shipping path is empty.
+        let dom_text = Type::new(
+            "dom_text_fmt".to_string(),
+            900_021,
+            tokio_postgres::types::Kind::Domain(Type::TEXT),
+            "public".to_string(),
+        );
+        for ty in [Type::TEXT, Type::VARCHAR, dom_text] {
+            assert!(
+                matches!(PgText("x".to_string()).encode_format(&ty), Format::Binary),
+                "an already-accepted string type must keep its binary format: {ty:?}"
+            );
+        }
     }
 
     /// **The sentinel discipline, preserved — as a VALUE-aware gate, not a whole-tag ban.** PG's
@@ -1559,9 +1674,26 @@ In `engine/crates/ferro-backend-pg/src/bind.rs`, REPLACE the whole `s7_a_bare_te
             for ty in [Type::DATE, Type::TIME, Type::TIMESTAMP, Type::TIMESTAMPTZ] {
                 let err = check_param(&Value::Text(lit.to_string()), &ty)
                     .expect_err("a PG special datetime literal must be refused for a temporal slot");
+                // **Case matters and the token is spelled ONCE, here and in Step 4's message.**
+                // `str::contains` is case-sensitive; plan v1 asserted lowercase `"special"` against
+                // a message containing only `SPECIAL`, which fails on the first of these 36
+                // iterations against a CORRECT implementation (measured), and whose cheapest
+                // "repair" is to delete the assertion — at which point the guard stops
+                // distinguishing "refused because it is a SPECIAL literal" from "refused because
+                // the whole TEXT tag is banned", the ONE distinction this rewrite exists to make.
                 assert!(
-                    err.contains("special"),
+                    err.contains("SPECIAL"),
                     "the refusal must say WHY, got {err:?}"
+                );
+                // …and it must be ACTIONABLE: name the SLOT type and the tagged escape route.
+                // `contains("SPECIAL")` alone passes for any message containing the word.
+                assert!(
+                    err.contains(ty.name()),
+                    "the refusal must name the slot type, got {err:?}"
+                );
+                assert!(
+                    err.contains("Ferro\\Date"),
+                    "the refusal must name the tagged route that DOES bind a sentinel, got {err:?}"
                 );
             }
         }
@@ -1580,7 +1712,7 @@ In `engine/crates/ferro-backend-pg/src/bind.rs`, REPLACE the whole `s7_a_bare_te
     }
 ```
 
-`domain_over(Type)` is the file's existing test helper (used by the S8a domain tests); reuse it verbatim rather than constructing a `Type` inline.
+Both tests live in the existing `mod tests` block, so they can call the private `accepts`, `check_param`, `PgText` and `is_text_input_target` directly. `Format` is already imported there (`s7_newtypes_send_text_format` matches on it).
 
 - [ ] **Step 2: Run it and watch it fail**
 
@@ -1588,14 +1720,14 @@ In `engine/crates/ferro-backend-pg/src/bind.rs`, REPLACE the whole `s7_a_bare_te
 cargo test -p ferro-backend-pg s8b_bare_text -- --nocapture
 cargo test -p ferro-backend-pg s8b_a_bare_text_sentinel -- --nocapture
 ```
-Expected: FAIL. The first with `a canonical TEXT param must bind to Numeric` (the current `accepts` is `String`'s list); the second with `expect_err` panicking because `check_param` currently returns `Ok`… no — it currently returns `Err` for the WRONG reason (the whole tag is refused), so the `err.contains("special")` assertion is what fails. Both messages are what confirm the test is measuring the new behaviour and not the old.
+Expected: FAIL. The first with `a canonical TEXT param must bind to Numeric` (the current `accepts` is `String`'s list); the second with `expect_err` panicking because `check_param` currently returns `Err` for the WRONG reason (the whole tag is refused, so the message is `canonical Text cannot bind to PG type date`), which is what makes `err.contains("SPECIAL")` fail. Both messages are what confirm the test is measuring the new behaviour and not the old.
 
 - [ ] **Step 3: Replace `PgText` with an explicit, widened impl**
 
 In `engine/crates/ferro-backend-pg/src/bind.rs`, DELETE the `pg_domain_aware_param! { … PgText wraps String }` block (`:155-163`) and put this in its place:
 
 ```rust
-/// The set of PG types a canonical `TAG_TEXT` payload may bind to IN ADDITION to the string types
+/// The PG types a canonical `TAG_TEXT` payload may bind to IN ADDITION to the string types
 /// `String`'s own `accepts` already covers (`varchar`, `text`, `bpchar`, `name`, `unknown`, plus the
 /// name-keyed `citext`/`ltree`/`lquery`/`ltxtquery`).
 ///
@@ -1606,18 +1738,27 @@ In `engine/crates/ferro-backend-pg/src/bind.rs`, DELETE the `pg_domain_aware_par
 /// canonical wire forms for those are `I64`/`Bool`/`F64`/`Bytes`, which have their own narrow
 /// binary bind paths (the S8a `PgInt` narrowing is what made a `serial` primary key work), and
 /// admitting text there would disable those pre-flights for no caller that exists.
-const TEXT_INPUT_TARGETS: [Type; 8] = [
-    Type::NUMERIC,
-    Type::DATE,
-    Type::TIME,
-    Type::TIMESTAMP,
-    Type::TIMESTAMPTZ,
-    Type::UUID,
-    Type::JSON,
-    Type::JSONB,
-];
+///
+/// A function rather than a `const [Type; 8]`, matching the array-literal-plus-`contains` idiom
+/// `pg_canonical_text_param!` already uses (`[$(Type::$ty),+].contains(resolve_domain(ty))`). It
+/// takes the ALREADY-RESOLVED base: all three call sites resolve first, and each for its own
+/// reason, so resolving again in here would hide which of them forgot to.
+fn is_text_input_target(base: &Type) -> bool {
+    [
+        Type::NUMERIC,
+        Type::DATE,
+        Type::TIME,
+        Type::TIMESTAMP,
+        Type::TIMESTAMPTZ,
+        Type::UUID,
+        Type::JSON,
+        Type::JSONB,
+    ]
+    .contains(base)
+}
 
-/// `TEXT` → the string types **plus** [`TEXT_INPUT_TARGETS`], written in PG's **text** wire format.
+/// `TEXT` → the string types (unchanged, delegated, BINARY) **plus** [`is_text_input_target`]'s
+/// eight, written verbatim in PG's **text** wire format.
 ///
 /// **Why this is not `pg_domain_aware_param! { PgText wraps String }` any more (M1-S8b).** Two
 /// reasons, and the second is a wire bug waiting to happen:
@@ -1628,8 +1769,26 @@ const TEXT_INPUT_TARGETS: [Type; 8] = [
 ///     equivalent pre-flight, so the same driver "worked" there and hard-failed here.
 ///  2. That macro delegates `encode_format`, and `<String as ToSql>` takes the trait's
 ///     `Format::Binary` default. Widening `accepts` alone would therefore hand PG the UTF-8 bytes of
-///     `2026-08-05` and tell it they are a 4-byte BINARY `date`. The format must be **text**, which
-///     is byte-identical to binary for every string type this already accepted, so nothing regresses.
+///     `2026-08-05` and tell it they are a 4-byte BINARY `date`.
+///
+/// **Both `to_sql` and `encode_format` BRANCH on the resolved base, and the branch is load-bearing
+/// in two independent ways.**
+///
+/// *Correctness:* it is NOT true that "the text-format bytes are the binary-format bytes for every
+/// string type this already accepted". `<&str as ToSql>::accepts` (postgres-types-0.2.14
+/// `src/lib.rs:1148-1153`) also admits `citext`, `ltree`, `lquery` and `ltxtquery` BY NAME, and for
+/// the last three the BINARY form is `0x01 || text` while the text form is bare text
+/// (`<&str as ToSql>::to_sql` matches on `ty.name()`). Text == binary holds for
+/// `varchar`/`text`/`bpchar`/`name`/`unknown`/`citext` and for nothing else. Keeping the delegated
+/// path for those types means this task's regression surface on everything that already worked is
+/// EMPTY, rather than "believed harmless".
+///
+/// *Falsifiability:* that same name-sensitive encoder is what makes clause (3) of
+/// [`s8a_every_arm_treats_a_domain_exactly_as_its_base`] able to fail at all. The `ltree` entry in
+/// [`every_target_type`] was added by S8a's review round precisely because every other entry is
+/// bound by an impl that ignores its `Type`, which left the payload-BYTES clause unfalsifiable. A
+/// type-blind `to_sql` here would make `ltree` and `dom_of_ltree` write identical bytes BY
+/// CONSTRUCTION and quietly revert that fix — measured: the mutation that is RED at HEAD goes GREEN.
 ///
 /// **§19.3 is intact.** [`check_param`]'s `Value::Text` arm delegates to THIS `accepts`, so the
 /// pre-flight is bit-identical to the predicate `to_sql_checked` applies — the two cannot drift. And
@@ -1641,29 +1800,38 @@ const TEXT_INPUT_TARGETS: [Type; 8] = [
 struct PgText(String);
 
 impl ToSql for PgText {
-    /// The payload verbatim. `String`'s own `to_sql` does exactly this for the string types, and
-    /// for the widened targets the verbatim text IS the input form — nothing is re-rendered,
-    /// re-parsed or validated here (a round trip through a date/numeric type would lose a display
-    /// scale or a sentinel).
+    /// Verbatim canonical text for the widened targets (nothing is re-rendered, re-parsed or
+    /// validated — a round trip through a date/numeric type would lose a display scale or a
+    /// sentinel); the unchanged delegated path, **against the RESOLVED base**, for everything
+    /// `String` already accepted.
     fn to_sql(
         &self,
-        _ty: &Type,
+        ty: &Type,
         out: &mut tokio_postgres::types::private::BytesMut,
     ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        out.extend_from_slice(self.0.as_bytes());
-        Ok(IsNull::No)
+        let base = resolve_domain(ty);
+        if is_text_input_target(base) {
+            out.extend_from_slice(self.0.as_bytes());
+            return Ok(IsNull::No);
+        }
+        <String as ToSql>::to_sql(&self.0, base, out)
     }
 
     fn accepts(ty: &Type) -> bool {
         let base = resolve_domain(ty);
-        <String as ToSql>::accepts(base) || TEXT_INPUT_TARGETS.contains(base)
+        <String as ToSql>::accepts(base) || is_text_input_target(base)
     }
 
-    /// Text format for THIS param only; the result format stays binary. Unconditional rather than
-    /// per-type: for `varchar`/`text`/`bpchar`/`name` the text-format bytes ARE the binary-format
-    /// bytes, so there is no branch worth writing and no behaviour to change.
-    fn encode_format(&self, _ty: &Type) -> Format {
-        Format::Text
+    /// Text format for THIS param only (the RESULT format stays binary, hazard 17) — and only for
+    /// the widened targets. The string types keep the `Format::Binary` they have always had, which
+    /// is what `ltree`'s `0x01 || text` payload requires.
+    fn encode_format(&self, ty: &Type) -> Format {
+        let base = resolve_domain(ty);
+        if is_text_input_target(base) {
+            Format::Text
+        } else {
+            <String as ToSql>::encode_format(&self.0, base)
+        }
     }
 
     to_sql_checked!();
@@ -1745,7 +1913,20 @@ fn is_pg_special_numeric_literal(s: &str) -> bool {
 cargo test -p ferro-backend-pg bind:: -- --nocapture
 cargo fmt --check && cargo clippy -p ferro-backend-pg --all-targets -- -D warnings
 ```
-Expected: PASS, including the pre-existing lockstep proofs (`accepts_mirrors_value_to_boxed`, the domain-nesting bound, `s7_accepts_is_narrow_per_tag`, `s8a_i64_binds_to_every_integer_width_and_f64_to_both_floats`) — none of which this change may weaken. If `s7_accepts_is_narrow_per_tag` has a `(Value::Text, …, false)` row for one of the eight widened types, UPDATE that row and record it in the test's docblock; do not silence the test.
+Expected: PASS, including the pre-existing lockstep proofs — none of which this change may weaken. The names, verified against `bind.rs` (v1 named a test that does not exist, `accepts_mirrors_value_to_boxed`, which would have reported "0 tests" as a pass):
+
+| test | line | what it pins |
+|---|---|---|
+| `accepts_mirrors_boxed_binding` | 648 | `accepts` and `value_to_boxed` were flipped together |
+| `s7_accepts_is_narrow_per_tag` | 1223 | the per-tag narrowness table |
+| `s7_accepts_is_never_looser_than_the_boxed_impl` | 1446 | the §19.3 direction, over the cross product |
+| `s8a_i64_binds_to_every_integer_width_and_f64_to_both_floats` | 673 | the S8a narrowing |
+| `s8a_domain_nesting_is_bounded_and_the_bound_refuses` | — | the resolver bound |
+| **`s8a_every_arm_treats_a_domain_exactly_as_its_base`** | **1490** | **see below — it must be RE-MUTATED, not merely re-run** |
+
+`s7_accepts_is_narrow_per_tag` currently has no `(Value::Text, …)` row at all, so nothing there needs updating; if a future edit adds one for a widened type, UPDATE it and record it in the test's docblock rather than silencing the test.
+
+**`s8a_every_arm_treats_a_domain_exactly_as_its_base` is the one that needs more than a green tick.** After this task `PgText` is no longer generated by `pg_domain_aware_param!`, so the mutation that test's own docblock records ("`pg_domain_aware_param`'s `to_sql` uses the UNRESOLVED `ty`") no longer reaches the `ltree` fixture at all — the macro then fronts only `PgBool` and `PgBytes`, whose inner impls ignore the `Type`. Re-mutating it is Step 8 item 4, and it is mandatory: without it this task silently converts a guard S8a's review round repaired into one that cannot fail.
 
 - [ ] **Step 6: Write the live PG test — a DBAL-SHAPED insert of stringified values**
 
@@ -1826,8 +2007,10 @@ Expected: PASS.
 - [ ] **Step 8: MUTATION-PROVE the guards**
 
 1. Revert `PgText::accepts` to `<String as ToSql>::accepts(resolve_domain(ty))`. Re-run both unit tests and the live test. Expected: RED everywhere (`canonical Text cannot bind to PG type date`). Restore.
-2. Change `PgText::encode_format` back to `Format::Binary`. Re-run the LIVE test only. Expected: RED with a server-side decode failure on the `date` column — and note that the UNIT tests stay green, which is exactly why the live test exists. Restore.
+2. Change `PgText::encode_format`'s widened branch to `Format::Binary` (i.e. make the whole method `<String as ToSql>::encode_format(&self.0, resolve_domain(ty))`). Re-run the unit test: RED on the two new `dom_date`/`DATE` format assertions. Re-run the LIVE test: RED with a server-side decode failure on the `date` column. Restore. Both halves matter: v1 claimed the unit tests would stay green here, which is only true without the format assertions Step 1 now carries.
 3. Delete the `if let Value::Text(s) = v` gate from `check_param`. Re-run `s8b_a_bare_text_sentinel_is_still_refused_for_a_temporal_or_numeric_slot` and the live test's sentinel half. Expected: RED in both (and the live `INSERT` would now SUCCEED, storing a real `infinity` — the silent miscast the gate exists to prevent). Restore.
+4. **Re-arm the domain byte-equality clause.** In `PgText::to_sql`, change the delegated branch to pass the UNRESOLVED type: `<String as ToSql>::to_sql(&self.0, ty, out)`. Re-run `cargo test -p ferro-backend-pg s8a_every_arm_treats_a_domain_exactly_as_its_base -- --nocapture`. Expected: **RED**, with `resolving a domain must change what the bind is CHECKED against, never what it WRITES: Text("x") against ltree  left: [1, 120]  right: [120]` — the `dom_of_ltree` domain writes no version byte because `<&str as ToSql>::to_sql` keys on `ty.name()` and `"dom_of_ltree"` is not `"ltree"`. Restore. **If this comes back GREEN, STOP**: it means `PgText::to_sql` became type-blind again and clause (3) of §22.2 (g)'s payload half is unfalsifiable — the precise state plan v1 would have shipped, and the state S8a's review round already had to repair once.
+5. In `PgText::encode_format`, change the branch condition to test the UNRESOLVED type (`is_text_input_target(ty)` instead of `is_text_input_target(base)`), leaving `to_sql` correct. Re-run `s8b_bare_text_binds_to_every_type_whose_input_syntax_is_text`. Expected: RED on the `dom_date` format assertion — a domain over `date` would be sent as BINARY while its base is sent as TEXT. Restore. This one exists because `s8a_every_arm_treats_a_domain_exactly_as_its_base` compares `to_sql` BYTES and never inspects a format, so nothing else in the tree can see this bug.
 
 - [ ] **Step 9: Full offline gate + commit**
 
@@ -1847,9 +2030,15 @@ INSERT was refused pre-send — the drop-in blocker. MySQL has no equivalent
 pre-flight, so the same driver worked there and hard-failed here.
 
 PgText is now an explicit impl: accepts = String's list + the eight types whose
-TEXT input syntax is what a canonical payload carries, and encode_format is
-Format::Text (the macro delegated to String's BINARY default, which would have
-told PG that the UTF-8 bytes of a date were a 4-byte binary date).
+TEXT input syntax is what a canonical payload carries, and both to_sql and
+encode_format BRANCH on the resolved base — verbatim text + Format::Text for the
+eight, the unchanged delegated path (and Format::Binary) for everything String
+already took. The macro delegated encode_format to String's BINARY default, which
+would have told PG that the UTF-8 bytes of a date were a 4-byte binary date; and a
+type-BLIND to_sql would have been wrong for ltree/lquery/ltxtquery (binary there
+is 0x01 || text) and would have un-armed the ltree fixture that makes the domain
+byte-equality clause of s8a_every_arm_treats_a_domain_exactly_as_its_base able to
+fail at all.
 
 SS19.3 direction is intact — check_param delegates to this same accepts, so the
 two moved in one edit — and the sentinel discipline the old narrowness protected
@@ -1878,7 +2067,7 @@ Everything after this task refines a driver that already answers real queries. T
   - `Ferro\DBAL\DriverOptions::fromParams(array $params): self` with public readonly `?string $socketPath`, `?string $host`, `int $port`, `string $pool`, `bool $readonly`, `float $connectTimeout`, `float $ioTimeout`.
   - `Ferro\DBAL\PlatformVersion::normalise(string $kind, string $raw): string` and `::platformFor(string $kind, string $rawVersion): AbstractPlatform`; constants `KIND_POSTGRES = 'postgres'`, `KIND_MYSQL = 'mysql'`.
   - `Ferro\DBAL\FixedVersion implements Doctrine\DBAL\ServerVersionProvider`.
-  - `Ferro\DBAL\Connection implements Doctrine\DBAL\Driver\Connection` — the 9 SPI methods + `ferro(): Ferro\Client\Connection` + `poolKind(): string`.
+  - `Ferro\DBAL\Connection implements Doctrine\DBAL\Driver\Connection` — `__construct(Ferro\Client\Connection $ferro, string $poolName, string $poolKind, bool $readonly)`, the 9 SPI methods, `runPrepared(string $sql, list<mixed> $params): Doctrine\DBAL\Driver\Result`, `ferro(): Ferro\Client\Connection`, `poolName(): string`, `poolKind(): string`. **This 4-parameter signature is FINAL from here on** — every later task consumes it verbatim (Task 6 needs the name for its loud failure, Tasks 7-13 all construct it).
   - `Ferro\DBAL\Statement implements Doctrine\DBAL\Driver\Statement`.
   - `Ferro\DBAL\Result implements Doctrine\DBAL\Driver\Result`; `Result::buffered(array $cols, array $rows, int $affected): self`.
   - `Ferro\DBAL\Exception\DriverException extends Doctrine\DBAL\Driver\AbstractException`; `::fromFerro(\Ferro\Client\Error\FerroException $e): self`.
@@ -2153,6 +2342,10 @@ final class DriverQuoteTest extends TestCase
         // `Ferro\Client\Connection` is FINAL (php/client/src/Client/Connection.php:43), so it is
         // constructed directly over a scripted-nothing FakeSession rather than subclassed. `quote()`
         // never sends a frame, so nothing needs queueing.
+        //
+        // Four arguments: ($ferro, $poolName, $poolKind, $readonly). The pool NAME ('p') is unused
+        // by `quote()` and is there because it is part of the constructor from this task onward —
+        // see the `__construct` docblock in Step 5 for why it is not added later.
         return new Connection(new FerroClientConnection(new FakeSession(), 'default'), 'p', $kind, false);
     }
 
@@ -2756,8 +2949,18 @@ use Ferro\DBAL\Exception\NoIdentityValue;
  */
 final class Connection implements DriverConnection
 {
+    /**
+     * **The pool NAME is here from Task 5 on, not added later.** Nothing in this task reads it, but
+     * Task 6's `ServerVersionUnavailable` message must name the pool (a driver may serve several)
+     * and Tasks 7-13 all construct this class. Threading a parameter through afterwards would mean
+     * editing every call site those tasks wrote — and a 4-argument call against a 3-argument
+     * constructor does not fail where you would expect: PHP binds the first three and DISCARDS the
+     * fourth, so under `strict_types` it surfaces as a `TypeError` naming the WRONG parameter
+     * (hazard 81).
+     */
     public function __construct(
         private readonly FerroConnection $ferro,
+        private readonly string $poolName,
         private readonly string $poolKind,
         private readonly bool $readonly,
     ) {}
@@ -2766,6 +2969,12 @@ final class Connection implements DriverConnection
     public function ferro(): FerroConnection
     {
         return $this->ferro;
+    }
+
+    /** The `driverOptions.pool` this connection was opened against. */
+    public function poolName(): string
+    {
+        return $this->poolName;
     }
 
     /** `postgres` or `mysql`, from `HELLO_ACK`. Never nil. */
@@ -2979,7 +3188,7 @@ final class Driver implements DriverInterface
             ));
         }
         $this->kind = $info->kind;
-        return new Connection($ferro, $info->kind, $o->readonly);
+        return new Connection($ferro, $o->pool, $info->kind, $o->readonly);
     }
 
     public function getDatabasePlatform(ServerVersionProvider $versionProvider): AbstractPlatform
@@ -3268,13 +3477,14 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 Deferral is FREE: `Driver::connect()` never needs the version, and `Doctrine\DBAL\Connection::getDatabasePlatform()` resolves the platform once, lazily, on first demand (hazard 15). Resolution is ONE `SELECT version()` through the ordinary SQL path — the same statement `ferrod`'s own probe uses, a leading `SELECT` (so it neither pins nor taints), and the only mechanism that can actually produce a NEW answer (re-reading `poolInfo()` cannot: it is a handshake snapshot, hazard 48).
 
 **Files:**
-- Modify: `php/doctrine-dbal/src/Connection.php` (`getServerVersion()`), `php/doctrine-dbal/src/Driver.php` (pass the pool NAME through)
+- Modify: `php/doctrine-dbal/src/Connection.php` (`getServerVersion()` only — the constructor already carries the pool name, from Task 5)
 - Create: `php/doctrine-dbal/src/Exception/ServerVersionUnavailable.php`
 - Modify: `php/client/tests/Live/LiveTestCase.php` (make the launched pool set overridable)
 - Test: `php/doctrine-dbal/tests/Unit/ServerVersionTest.php` (Create), `php/doctrine-dbal/tests/Live/ServerVersionLiveTest.php` (Create)
 
 **Interfaces:**
-- Produces: `Ferro\DBAL\Connection::__construct(FerroConnection $ferro, string $poolName, string $poolKind, bool $readonly)` (the pool NAME is new — the loud failure must name it); `Ferro\DBAL\Connection::getServerVersion(): string` resolving-then-caching; `Ferro\DBAL\Exception\ServerVersionUnavailable::forPool(string $pool, string $kind, ?\Throwable $previous): self`.
+- Produces: `Ferro\DBAL\Connection::getServerVersion(): string` resolving-then-caching; `Ferro\DBAL\Exception\ServerVersionUnavailable::forPool(string $pool, string $kind, ?\Throwable $previous): self`.
+- Consumes (UNCHANGED since Task 5, do not re-declare it): `Ferro\DBAL\Connection::__construct(FerroConnection $ferro, string $poolName, string $poolKind, bool $readonly)` and `poolName(): string`. Task 5 already threads the pool name in and `Driver::connect()` already passes `$o->pool`; this task only adds the cache field and rewrites the method body.
 - Produces (client harness): `Ferro\Tests\Live\LiveTestCase::launchedPoolDsns(): array<string,string>` becomes `protected` and overridable, and `launchFerrod()` derives every `FERRO_POOL_<NAME>_DSN` from it.
 - Consumes: Task 1's `Ferro\Client\Connection::{fetchRaw, poolInfo}`; Task 5's `PlatformVersion`, `DriverOptions`, `Exception\DriverException`.
 
@@ -3387,17 +3597,10 @@ final class ServerVersionUnavailable extends AbstractException
 
 - [ ] **Step 4: Implement the deferred resolution on `Connection`**
 
-In `php/doctrine-dbal/src/Connection.php`, add the pool name to the constructor, add a cache field, and replace `getServerVersion()`:
+In `php/doctrine-dbal/src/Connection.php`, add a cache field and replace `getServerVersion()`. **The constructor is unchanged** — Task 5 already declares `__construct(FerroConnection $ferro, string $poolName, string $poolKind, bool $readonly)` and `poolName()`, and `Driver::connect()` already passes `$o->pool`. Do not re-thread it.
 
 ```php
     private ?string $serverVersion = null;
-
-    public function __construct(
-        private readonly FerroConnection $ferro,
-        private readonly string $poolName,
-        private readonly string $poolKind,
-        private readonly bool $readonly,
-    ) {}
 ```
 
 ```php
@@ -3448,11 +3651,7 @@ In `php/doctrine-dbal/src/Connection.php`, add the pool name to the constructor,
     }
 ```
 
-Add `use Ferro\DBAL\Exception\ServerVersionUnavailable;` to the imports, and in `php/doctrine-dbal/src/Driver.php` pass the pool name:
-
-```php
-        return new Connection($ferro, $o->pool, $info->kind, $o->readonly);
-```
+Add `use Ferro\DBAL\Exception\ServerVersionUnavailable;` to the imports. `php/doctrine-dbal/src/Driver.php` needs **no** edit here: its `connect()` already reads `return new Connection($ferro, $o->pool, $info->kind, $o->readonly);` from Task 5.
 
 - [ ] **Step 5: Make the client's live harness able to launch a pool whose backend is DOWN**
 
@@ -5716,6 +5915,70 @@ final class ExceptionMappingLiveTest extends DbalLiveTestCase
         $a->executeStatement('DROP TABLE s8b_dl');
     }
 
+    /**
+     * **The COST of `readonly = false`, pinned so it cannot change silently.**
+     *
+     * `readonly` is read in TWO places in `fate.rs`, and the second is the **57014 override**
+     * (`engine/crates/ferrod/src/services/fate.rs:71-114`): with `!in_tx`, a cancelled or
+     * timed-out statement is `Cancelled{NonRetryable}` when the client declared `readonly` and
+     * `WriteUnconfirmed{INDETERMINATE}` when it did not. The driver declares WRITE for everything
+     * (hazard 22 — the DBAL 4 SPI carries no read/write signal and charter rule 6 forbids inferring
+     * one), so **a plain `SELECT` killed by a server-side cancel or an operator's
+     * `statement_timeout` surfaces as `Ferro\DBAL\IndeterminateWriteException`** — "your write may
+     * or may not have landed", for a statement that wrote nothing.
+     *
+     * That is the price of the decision, not a bug, and it is listed in
+     * `docs/known-incompatibilities.md` and in §22.2 (ac). What this test does is make it
+     * FALSIFIABLE in both directions, so it can neither be quietly "fixed" by inferring
+     * read-vs-write from SQL text nor quietly forgotten. It is also the ONLY behavioural test of
+     * `driverOptions.readonly` anywhere in the slice — every other assertion about it only proves
+     * the option is parsed.
+     *
+     * `SELECT pg_cancel_backend(pg_backend_pid())` cancels its OWN statement, producing a genuine
+     * `57014` on an ordinary autocommit statement with no session state and no second connection
+     * (hazard 82). It has to be that: the PHP client never sends `ExecRequest.timeout_ms`, and a
+     * preceding `SET statement_timeout` would land on a different pooled connection — a non-local
+     * `SET` taints the checkout but does not pin it.
+     *
+     * PostgreSQL only, deliberately. `fate.rs` is shared VERBATIM across backends (the S6 slice
+     * reused it untouched), the 57014 override's own unit table
+     * (`fate.rs::fate_57014_total_over_all_axes`) proves the cell for every `(readonly, sent,
+     * in_tx)` combination, and `mysql_chaos_it.rs` already drives the MySQL errno mapping into it.
+     * One family pins the SHAPE; duplicating it would add a second flaky path, not a second proof.
+     */
+    public function testACancelledSelectIsIndeterminateOnAWriteConnectionAndNotOnAReadonlyOne(): void
+    {
+        $sql = 'SELECT pg_cancel_backend(pg_backend_pid())';
+
+        $write = $this->dbal();
+        try {
+            $write->executeQuery($sql);
+            self::fail('a self-cancelled statement must raise 57014');
+        } catch (\Doctrine\DBAL\Exception\DriverException $e) {
+            self::assertInstanceOf(
+                IndeterminateWriteException::class,
+                $e,
+                'on the DEFAULT (write-declared) connection a 57014 is §19.3 Indeterminate — this is '
+                . 'the documented cost of declaring every DBAL statement a write',
+            );
+            self::assertSame('57014', $e->getSQLState());
+        }
+
+        $read = $this->dbal('default', ['readonly' => true]);
+        try {
+            $read->executeQuery($sql);
+            self::fail('a self-cancelled statement must raise 57014 here too');
+        } catch (\Doctrine\DBAL\Exception\DriverException $e) {
+            self::assertNotInstanceOf(
+                IndeterminateWriteException::class,
+                $e,
+                'driverOptions.readonly is what buys back the clean "statement cancelled" answer',
+            );
+            self::assertNotInstanceOf(RetryableException::class, $e, 'Cancelled is NonRetryable on the wire');
+            self::assertSame('57014', $e->getSQLState());
+        }
+    }
+
     /** @return array<string,string> */
     private function families(): array
     {
@@ -5733,7 +5996,9 @@ FERRO_TEST_MYSQL_URL="mysql://ferro:ferro@127.0.0.1:33060/ferro" \
 FERRO_FERROD_BIN=/home/abdullak/projects/ferro/target/debug/ferrod \
 ./vendor/bin/phpunit tests/Live/ExceptionMappingLiveTest.php --fail-on-skipped
 ```
-Expected: PASS (2 tests). The deadlock test is inherently racy in WHICH connection is chosen as the victim; it must assert only that one of them was, never which.
+Expected: PASS (3 tests). The deadlock test is inherently racy in WHICH connection is chosen as the victim; it must assert only that one of them was, never which.
+
+**If `testACancelledSelectIsIndeterminateOnAWriteConnectionAndNotOnAReadonlyOne` does not raise at all**, the self-cancel did not take: check the SQLSTATE the engine actually reported (`ferrod`'s log, or `$e->getSQLState()`), and if PG returned success rather than `57014`, wrap it as `SELECT pg_cancel_backend(pg_backend_pid()), pg_sleep(1)` so there is a still-running statement for the signal to interrupt. Do NOT weaken the test to "some exception was raised": the whole point is WHICH class each connection gets.
 
 - [ ] **Step 9: MUTATION-PROVE the guards**
 
@@ -5741,6 +6006,7 @@ Expected: PASS (2 tests). The deadlock test is inherently racy in WHICH connecti
 2. Move the `BRANCH_INDETERMINATE` check to AFTER the stock delegation. Re-run: RED on `testTheIndeterminateBranchWinsOverTheFamilyTable` (the `40001` comes back a `DeadlockException`, which is retryable). Restore.
 3. In `Ferro\DBAL\Exception\DriverException::fromFerro`, pass `0` instead of `$errno`. Re-run the LIVE test: RED on the MySQL half of `testRealErrorsMapToTheStockClassesOnBothFamilies` (the errno-keyed table can no longer see 1062/1146/1064) while the PostgreSQL half stays green — which is exactly the asymmetry hazard 12 describes. Restore.
 4. Change `get_class($converted) === DbalDriverException::class` to `$converted instanceof DbalDriverException`. Re-run: RED on `testPostgresDelegatesToTheStockSqlstateTable` (`40P01` would be replaced by our generic retryable, losing `DeadlockException`). Restore.
+5. In `DriverOptions::fromParams()`, hard-code `readonly` to `false` (ignore the option). Re-run the LIVE test: RED on the SECOND half of `testACancelledSelectIsIndeterminateOnAWriteConnectionAndNotOnAReadonlyOne` — the read-only connection now also gets an `IndeterminateWriteException`. Restore. Then hard-code it to `true` instead: RED on the FIRST half. Restore. **Both directions matter**: the first proves `driverOptions.readonly` actually reaches the wire's fate flag, the second proves the default really is "write", which is the safety decision the whole of Task 1 exists to serve.
 
 - [ ] **Step 10: Commit**
 
@@ -5775,13 +6041,29 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 And one hazard the design must answer rather than document away: the session is strictly **single-in-flight** (hazard 25), so an open stream makes every other statement throw — which would break the canonical Doctrine batch idiom `foreach ($conn->iterateAssociative($sql) as $row) { $conn->executeStatement($upd, …); }`. The driver settles the open stream (drains its remainder into memory) before issuing anything else: pure iteration never buffers, and interleaving degrades to buffering instead of throwing.
 
+> **v2 — the ABANDONMENT half was rebuilt, and it is the part most worth reading.** Plan v1 had `Ferro\DBAL\Connection` hold a **strong** reference to the open `Result`. Combined with hazard 80 (`Doctrine\DBAL\Result` has no `__destruct` and DBAL never calls the driver `Result::free()`), that reference was the *only* thing keeping an abandoned stream alive — so `break`-ing out of an `iterateAssociative()` did not CANCEL anything: the next statement's `settleOpenStream()` quietly transferred **the entire remaining result set** over the wire. At 100 000 rows that is invisible in a test; on a real table it is an OOM. v1's own live guard passed through that `materialize()` path while describing itself as "the `free()`/CANCEL path", and its named mutation (deleting `close()` from `free()`) could not fail, because `free()` was never called.
+>
+> v2 holds a **`\WeakReference<Result>`** instead, and gives `Result` a `__destruct` that frees itself. That single change makes the two cases genuinely different and, crucially, DISTINGUISHABLE: when the DBAL-side generator is gone the driver `Result` is unreferenced, PHP destroys it by refcount at the `break`, and its own `free()` sends the `CANCEL`; when the caller can still fetch (the interleave idiom), the reference is live and `settleOpenStream()` materialises. `settledRowCount()` makes which of the two happened observable from a test — and from production, where "how many rows did this connection have to drain because a stream was still open" is a real operator question.
+>
+> **MEASURED LIMIT of that design — it closes the canonical idiom and NOT a bound iterator, and this is a PHP refcount fact, not a choice.** v2 was written with the testkit containers stopped, so this was verified afterwards by the controller (PHP 8.4.18 + doctrine/dbal 4.4.4; repro `scratchpad/dbalchk/destruct.php`, a driver `Result` carrying a `__destruct` probe, wrapped in a real `Doctrine\DBAL\Result`, iterated through the real `iterateAssociative()` generator):
+>
+> | shape | `__destruct` at `break`? |
+> |---|---|
+> | (A) generator is a TEMPORARY — `foreach ($conn->iterateAssociative($sql) as $row) { … break; }` | **YES**, immediately, without `gc_collect_cycles()` |
+> | (B) generator BOUND first — `$it = $conn->iterateAssociative($sql); foreach ($it as $row) { … break; }` | **NO** while `$it` is in scope; yes only after `unset($it)` |
+> | (C) full drain | YES |
+>
+> Case (A) is the canonical Doctrine idiom and the one this design closes. In case (B) the `WeakReference` is still live, so `settleOpenStream()` cannot tell "the caller abandoned it" from "the caller may still fetch" — it takes the `materialize()` branch and transfers the whole remainder, i.e. the OOM trap this rebuild exists to prevent, still open for that shape. The driver **cannot** distinguish them: a live reference is a live reference. So do not write a guard that claims abandonment always cancels.
+>
+> Two consequences for this task, both mandatory: the live abandonment test must exercise **both** shapes — asserting `settledRowCount() === 0` for (A), and asserting the (B) number is the full remainder rather than pretending it is 0 — so the limit is pinned by a test instead of discovered in production; and the known-incompatibilities doc (Task 14) must state it in the operator's language: *bind an iterator to a variable, abandon it, and the rest of the result set is transferred on your next statement — iterate the call directly, or `unset()` the iterator.*
+
 **Files:**
-- Modify: `php/doctrine-dbal/src/Result.php` (the streamed mode), `php/doctrine-dbal/src/Connection.php` (`query()` streams; every other wire op settles the open stream first)
+- Modify: `php/doctrine-dbal/src/Result.php` (the streamed mode + `__destruct`), `php/doctrine-dbal/src/Connection.php` (`query()` streams; every other wire op settles the open stream first)
 - Test: `php/doctrine-dbal/tests/Unit/StreamedResultTest.php` (Create), `php/doctrine-dbal/tests/Live/StreamingLiveTest.php` (Create)
 
 **Interfaces:**
-- Produces: `Ferro\DBAL\Result::streamed(Ferro\Client\RawStream $stream): self`; `Ferro\DBAL\Result::materialize(): void` (drain the remainder into memory; idempotent); `Ferro\DBAL\Result::isStreaming(): bool`. `Ferro\DBAL\Connection::settleOpenStream(): void`.
-- Consumes: Task 2's `Ferro\Client\RawStream::{columns,rows,close}` and `Ferro\Client\Connection::streamRaw()`; Task 5's `Ferro\DBAL\Connection::poolKind()`; `Ferro\Client\Value\...` unchanged.
+- Produces: `Ferro\DBAL\Result::streamed(Ferro\Client\RawStream $stream): self`; `Ferro\DBAL\Result::materialize(): int` (drain the remainder into memory, return how many rows that cost; idempotent, returns 0 thereafter); `Ferro\DBAL\Result::isStreaming(): bool`; `Ferro\DBAL\Result::__destruct()`. `Ferro\DBAL\Connection::settleOpenStream(): void` (private) and `Ferro\DBAL\Connection::settledRowCount(): int`.
+- Consumes: Task 2's `Ferro\Client\RawStream::{columns,rows,close,isClosed}` and `Ferro\Client\Connection::streamRaw()`; Task 5's `Ferro\DBAL\Connection::poolKind()`; `Ferro\Client\Value\...` unchanged.
 
 - [ ] **Step 1: Write the failing unit test**
 
@@ -5794,6 +6076,7 @@ namespace Ferro\DBAL\Tests\Unit;
 
 use Ferro\Client\RawStream;
 use Ferro\DBAL\Result;
+use Ferro\Tests\Support\FakeSession;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -5805,8 +6088,14 @@ use PHPUnit\Framework\TestCase;
  */
 final class StreamedResultTest extends TestCase
 {
-    /** @param list<list<mixed>> $rows */
-    private function stream(array $rows, ?int &$pulled = null): RawStream
+    /**
+     * @param list<list<mixed>> $rows
+     * @param ?FakeSession $session pass one to observe the `CANCEL`; `null` builds a wire-less
+     *   stream, which is fine for the pure fetch/laziness tests and USELESS for anything asserting
+     *   that `close()` reached the engine — `RawStream::close()` is `$this->session?->abandonStream()`,
+     *   so with a null session it provably touches nothing.
+     */
+    private function stream(array $rows, ?int &$pulled = null, ?FakeSession $session = null): RawStream
     {
         $pulled = 0;
         $gen = (static function () use ($rows, &$pulled): \Generator {
@@ -5815,7 +6104,7 @@ final class StreamedResultTest extends TestCase
                 yield $r;
             }
         })();
-        return new RawStream(['id', 'note'], $gen, null, 0);
+        return new RawStream(['id', 'note'], $gen, $session, 7);
     }
 
     public function testFetchingPullsExactlyOneRowAtATime(): void
@@ -5846,7 +6135,14 @@ final class StreamedResultTest extends TestCase
     /**
      * `materialize()` drains the REMAINDER into memory and leaves the already-fetched rows
      * consumed — the interleaving escape hatch. Idempotent, and afterwards the result is an
-     * ordinary buffered one.
+     * ordinary buffered one. The RETURN value is how many rows the drain cost, which is what
+     * {@see \Ferro\DBAL\Connection::settledRowCount} surfaces.
+     *
+     * **It must NOT be written as `foreach ($this->gen as $row)`.** `foreach` calls
+     * `Generator::rewind()`, which throws `Cannot rewind a generator that was already run` once the
+     * generator has advanced past its first yield — and the streamed `fetchNumeric()` above advances
+     * it on every call (hazard 78, measured on PHP 8.4.18). That is why this test fetches a row
+     * BEFORE materialising: without the fetch, the bug is invisible.
      */
     public function testMaterializeDrainsTheRemainderAndIsIdempotent(): void
     {
@@ -5854,22 +6150,53 @@ final class StreamedResultTest extends TestCase
         $r = Result::streamed($this->stream([[1, 'a'], [2, 'b'], [3, 'c']], $pulled));
         $r->fetchNumeric();
 
-        $r->materialize();
-        $r->materialize();
+        self::assertSame(2, $r->materialize(), 'the drain cost two rows');
+        self::assertSame(0, $r->materialize(), 'idempotent: the second call drains nothing');
         self::assertSame(3, $pulled, 'everything is now in memory');
         self::assertFalse($r->isStreaming());
         self::assertSame([[2, 'b'], [3, 'c']], $r->fetchAllNumeric(), 'the UNCONSUMED rows remain, in order');
     }
 
-    /** `free()` on a streamed result closes the stream and empties it. */
-    public function testFreeClosesTheStream(): void
+    /**
+     * `free()` on a streamed result closes the stream and empties it — and the close reaches the
+     * WIRE, which is what a `FakeSession` (rather than v1's `null`) is here to witness. With a null
+     * session `RawStream::close()` is `$this->session?->abandonStream(...)`, i.e. provably a no-op,
+     * so the v1 form of this test could not tell a real `CANCEL` from no `CANCEL` at all.
+     */
+    public function testFreeClosesTheStreamOnTheWire(): void
     {
         $pulled = 0;
-        $r = Result::streamed($this->stream([[1, 'a'], [2, 'b']], $pulled));
+        $session = new FakeSession();
+        $stream = $this->stream([[1, 'a'], [2, 'b']], $pulled, $session);
+        $r = Result::streamed($stream);
         $r->fetchNumeric();
+        self::assertSame(0, $session->abandonCount, 'nothing abandoned while the result is live');
+
         $r->free();
+        self::assertSame(1, $session->abandonCount, 'free() must CANCEL + drain to the ONE terminal');
+        self::assertTrue($stream->isClosed());
         self::assertFalse($r->fetchNumeric());
         self::assertSame(0, $r->columnCount());
+    }
+
+    /**
+     * **Destruction frees.** This is the whole abandonment design in one assertion: when the caller
+     * drops the result (which is what `break`-ing out of `Doctrine\DBAL\Result::iterateAssociative()`
+     * does — the Generator holds the only reference, and `Doctrine\DBAL\Result` has no `__destruct`,
+     * hazard 80), the driver `Result` must send the `CANCEL` itself. Nothing else will: DBAL never
+     * calls the driver's `free()` on abandonment, and from Step 4 the driver `Connection` holds only
+     * a `\WeakReference`, precisely so this destruction can happen.
+     */
+    public function testDroppingAStreamedResultCancelsTheStream(): void
+    {
+        $pulled = 0;
+        $session = new FakeSession();
+        $r = Result::streamed($this->stream([[1, 'a'], [2, 'b'], [3, 'c']], $pulled, $session));
+        $r->fetchNumeric();
+
+        unset($r);            // the last reference — PHP frees it here, by refcount
+        self::assertSame(1, $session->abandonCount, 'a dropped streamed Result must abandon its stream');
+        self::assertSame(1, $pulled, 'and must NOT have drained the remainder to get there');
     }
 
     /**
@@ -5920,6 +6247,8 @@ In `php/doctrine-dbal/src/Result.php`, add the import `use Ferro\Client\RawStrea
 
     /**
      * Drain whatever is left of the stream into memory and become an ordinary buffered result.
+     * Returns the number of rows that cost — 0 when there was nothing to drain, which is also what
+     * every call after the first returns.
      *
      * The escape hatch for the canonical Doctrine batch idiom
      * `foreach ($conn->iterateAssociative($sql) as $row) { $conn->executeStatement(…); }`. The Ferro
@@ -5928,21 +6257,59 @@ In `php/doctrine-dbal/src/Result.php`, add the import `use Ferro\Client\RawStrea
      * every user would read as a driver bug. With it, pure iteration never buffers and interleaving
      * degrades to buffering, which is what PDO does unconditionally.
      *
-     * Idempotent. Already-fetched rows stay consumed; the cursor continues from where it was.
+     * **The drain is an explicit `valid()/current()/next()` loop and must stay one.** `foreach` over
+     * a `Generator` calls `Generator::rewind()`, which THROWS `Cannot rewind a generator that was
+     * already run` as soon as the generator has advanced past its first yield (hazard 78) — and
+     * {@see fetchNumeric} advances it on every call. A `foreach` here therefore dies on the FIRST
+     * real use, from the first line of `exec()`/`runPrepared()`/`beginTransaction()`, i.e. attributed
+     * to an innocent statement. (Plan v1 wrote the `foreach`; this is the measured repair, and it is
+     * the same loop shape `fetchNumeric` already uses.)
+     *
+     * Idempotent. Already-fetched rows stay consumed. `$this->rows` is invariantly `[]` for a
+     * streamed result — {@see streamed} builds it that way and the streamed branch of
+     * {@see fetchNumeric} never appends — so there is no cursor arithmetic to do here; v1's
+     * `array_slice($this->rows, $this->cursor)` was a no-op describing a mixed buffered/streamed
+     * state this class cannot reach.
      */
-    public function materialize(): void
+    public function materialize(): int
     {
         if ($this->gen === null) {
-            return;
+            return 0;
         }
         $rest = [];
-        foreach ($this->gen as $row) {
-            $rest[] = $row;
+        while ($this->gen->valid()) {
+            $rest[] = $this->gen->current();
+            $this->gen->next();
         }
-        $this->rows = array_merge(array_slice($this->rows, $this->cursor), $rest);
+        $this->rows = $rest;
         $this->cursor = 0;
         $this->gen = null;
         $this->stream = null;
+        return count($rest);
+    }
+
+    /**
+     * **The abandonment path.** When the consumer stops iterating early, the DBAL-side Generator is
+     * destroyed, `Doctrine\DBAL\Result` (which has no `__destruct`) is released with it, and this
+     * object becomes unreferenced — because {@see \Ferro\DBAL\Connection} holds only a
+     * `\WeakReference` to it. Nothing in DBAL calls `free()` on that path (hazard 80), so this is
+     * where the `CANCEL` comes from. Without it, `break`-ing out of a large `iterateAssociative()`
+     * would leave the stream open and the NEXT statement would transfer the entire remaining result
+     * set — invisible at 100 000 rows in a test, an OOM on a real table.
+     *
+     * `free()` is idempotent and `Session::abandonStream()` is idempotent by construction
+     * (`Session.php:344-353`), so this is safe after a normal drain. The `catch` is not defensive
+     * padding: at request shutdown the transport may already be gone, and an exception escaping a
+     * destructor during shutdown is a fatal error that would mask whatever actually went wrong.
+     */
+    public function __destruct()
+    {
+        try {
+            $this->free();
+        } catch (\Throwable) {
+            // nothing useful can be done from a destructor; the session's own state machine and the
+            // engine's ONE-terminal rule (charter rule 4) are what guarantee the stream is closed.
+        }
     }
 ```
 
@@ -5989,7 +6356,42 @@ and rewrite `fetchNumeric()` / `free()` to serve both modes:
 In `php/doctrine-dbal/src/Connection.php`, add the field and the settle helper, then change `query()`, `exec()`, `runPrepared()` and the transaction trio to settle first:
 
 ```php
-    private ?Result $openStream = null;
+    /**
+     * A WEAK reference, and that is the entire abandonment design.
+     *
+     * A STRONG reference here (plan v1) would be the only thing keeping an abandoned stream alive:
+     * `Doctrine\DBAL\Connection::iterateAssociative()` returns
+     * `$this->executeQuery(…)->iterateAssociative()`, so the only other reference to the
+     * `Doctrine\DBAL\Result` — and through it to this driver `Result` — is the returned Generator's
+     * bound `$this`. `Doctrine\DBAL\Result` has no `__destruct` and DBAL never calls the driver's
+     * `free()` (hazard 80). So with a strong reference the driver can NEVER tell "the caller
+     * abandoned this" from "the caller may still fetch from this", and both end up draining the
+     * whole remainder on the next statement.
+     *
+     * Weakly: when the consumer stops iterating, the Generator dies, the DBAL `Result` dies, the
+     * driver `Result` becomes unreferenced, PHP frees it by refcount THERE AND THEN, and its
+     * `__destruct` sends the `CANCEL`. `get()` then returns null and this method has nothing to do.
+     * When the consumer is still iterating, `get()` returns the live result and it materialises.
+     *
+     * @var ?\WeakReference<Result> PHPStan level 9 will not infer the generic parameter.
+     */
+    private ?\WeakReference $openStream = null;
+
+    /**
+     * How many rows this connection has had to drain because a streamed result was still open when
+     * another statement was issued.
+     *
+     * **0 for pure iteration and 0 for a properly abandoned iteration**; non-zero only for the
+     * interleave idiom, where it is the size of the remainder that had to be buffered. It is what
+     * makes the two abandonment cases observable from a test — and it answers a real operator
+     * question, which is why it is a public accessor rather than test scaffolding.
+     */
+    public function settledRowCount(): int
+    {
+        return $this->settledRows;
+    }
+
+    private int $settledRows = 0;
 
     /**
      * Bring any open streamed `Result` into memory before this connection issues anything else.
@@ -5999,12 +6401,17 @@ In `php/doctrine-dbal/src/Connection.php`, add the field and the settle helper, 
      * would break `foreach ($conn->iterateAssociative(…)) { $conn->executeStatement(…); }`, an idiom
      * every Doctrine codebase uses — the open result drains its remainder here. Pure iteration
      * still never buffers; interleaving degrades to what PDO does unconditionally.
+     *
+     * A result whose caller is GONE is not drained: it has already cancelled itself on destruction.
      */
     private function settleOpenStream(): void
     {
-        $open = $this->openStream;
+        $ref = $this->openStream;
         $this->openStream = null;
-        $open?->materialize();
+        $open = $ref?->get();
+        if ($open instanceof Result) {
+            $this->settledRows += $open->materialize();
+        }
     }
 ```
 
@@ -6037,19 +6444,23 @@ In `php/doctrine-dbal/src/Connection.php`, add the field and the settle helper, 
             throw DriverException::fromFerro($e);
         }
         $result = Result::streamed($stream);
-        $this->openStream = $result;
+        // WEAK on purpose — see the field's docblock. The caller's own reference (via
+        // `Doctrine\DBAL\Result`) is the one that decides whether this result is still alive.
+        $this->openStream = \WeakReference::create($result);
         return $result;
     }
 ```
 
 Add `$this->settleOpenStream();` as the FIRST line of `exec()`, `runPrepared()`, `beginTransaction()`, `commit()`, `rollBack()` and `getServerVersion()`'s resolution path. `PlatformVersion` needs no import — it shares the `Ferro\DBAL` namespace with `Connection`.
 
+**One consequence to be deliberate about:** `$result` is returned immediately, so the ONLY strong reference is the caller's. A caller that does `$conn->query($sql);` and discards the result (statement position, no assignment) destroys it at the end of that statement, which cancels the stream — which is correct, and identical to what the buffered path already does with its rows. What must NOT happen is the driver quietly taking a strong reference "just to be safe": that is v1's bug, and it converts every early `break` into a full transfer.
+
 - [ ] **Step 5: Run the unit test — it must now pass**
 
 ```bash
 cd /home/abdullak/projects/ferro/php/doctrine-dbal && ./vendor/bin/phpunit tests/Unit && ./vendor/bin/phpstan analyse src --level 9
 ```
-Expected: PASS.
+Expected: PASS — **6 tests** in `StreamedResultTest` (`testFetchingPullsExactlyOneRowAtATime`, `testColumnsAreAvailableWithoutPullingARow`, `testMaterializeDrainsTheRemainderAndIsIdempotent`, `testFreeClosesTheStreamOnTheWire`, `testDroppingAStreamedResultCancelsTheStream`, `testAStreamedResultReportsNoAffectedCount`) plus everything Tasks 5-11 already added. PHPStan needs `@var \WeakReference<Result>` on the `$openStream` property (level 9 will not infer the generic), and `materialize()`'s return type changed from `void` to `int`, so check that no other caller ignores it in a `void` context.
 
 - [ ] **Step 6: Write the live test — a MEASURED memory bound, and the interleave idiom**
 
@@ -6065,10 +6476,19 @@ namespace Ferro\DBAL\Tests\Live;
  * asserted structurally.
  *
  * A functional assertion ("the rows come out in order") passes just as well over a fully-buffered
- * result, so the guard here is a MEMORY DELTA: iterating 100 000 rows must not grow peak memory the
- * way materialising the same result set does. The two are compared in the same process against the
- * same query, so the threshold is a ratio rather than an absolute number and does not depend on the
- * machine.
+ * result, so the guard here is a MEMORY DELTA. **It has to be PEAK and/or MID-LOOP, never the
+ * residual after the loop** (hazard 79): `Doctrine\DBAL\Connection::iterateAssociative()` returns
+ * `$this->executeQuery(…)->iterateAssociative()`, so the only reference to the buffered rows is the
+ * Generator's bound `$this`, and PHP releases the whole array when the `foreach` ends — BEFORE a
+ * post-loop `memory_get_usage()` runs. Measured over dbal 4.4.4's real code paths at this exact row
+ * count and shape, plan v1's post-loop metric was **552 B streamed vs 472 B buffered — both green**,
+ * i.e. the headline guard for the whole task could not fail. The same run's peak was **2 728 B vs
+ * 34 109 720 B** (~12 500×) and its mid-loop sample **2 040 B vs 33 302 432 B**.
+ *
+ * The two are compared in the same process against the same query, so the threshold is a ratio
+ * rather than an absolute number and does not depend on the machine. The assertion is on
+ * `max(peak, midLoop)` for each mode so the guard is not hostage to one metric — if a future PHP
+ * changes how peak is accounted, the mid-loop sample still discriminates, and vice versa.
  */
 final class StreamingLiveTest extends DbalLiveTestCase
 {
@@ -6089,30 +6509,54 @@ final class StreamingLiveTest extends DbalLiveTestCase
         $this->seed($c);
         $sql = 'SELECT id, note FROM s8b_stream ORDER BY id';
 
+        // ---- STREAMED. Peak is reset first (PHP >= 8.2, which is this package's floor), and a
+        // sample is taken mid-loop while the rows — if they were being buffered — would still be
+        // held. Asserting on max() of the two means neither metric alone has to carry the guard.
         gc_collect_cycles();
+        memory_reset_peak_usage();
         $before = memory_get_usage();
         $seen = 0;
+        $streamedMid = 0;
         foreach ($c->iterateAssociative($sql) as $row) {
             self::assertSame($seen + 1, $row['id']);
             ++$seen;
+            if ($seen === intdiv(self::ROWS, 2)) {
+                $streamedMid = memory_get_usage() - $before;
+            }
         }
-        $streamedGrowth = memory_get_usage() - $before;
+        $streamed = max(memory_get_peak_usage() - $before, $streamedMid);
         self::assertSame(self::ROWS, $seen, 'every row arrived, in order');
 
+        // ---- BUFFERED, measured exactly the same way, in the same process, on the same query.
         gc_collect_cycles();
+        memory_reset_peak_usage();
         $before = memory_get_usage();
         $all = $c->fetchAllAssociative($sql);
-        $bufferedGrowth = memory_get_usage() - $before;
+        $bufferedMid = memory_get_usage() - $before;      // still holding $all
+        $buffered = max(memory_get_peak_usage() - $before, $bufferedMid);
         self::assertCount(self::ROWS, $all);
+        unset($all);
 
+        // The measured separation is ~12 500x (2 728 B vs 34 109 720 B peak at these dimensions), so
+        // a 1/50 threshold is two orders of magnitude of headroom below the real gap and still
+        // catches any implementation that materialises — a buffering `query()` lands at ~1x.
+        // Grounded in that measurement rather than picked: see the class docblock.
+        self::assertGreaterThan(
+            10_000_000,
+            $buffered,
+            'the BUFFERED arm must actually buffer, or the comparison below is vacuous',
+        );
         self::assertLessThan(
-            (int) ($bufferedGrowth / 10),
-            max($streamedGrowth, 1),
+            intdiv($buffered, 50),
+            max($streamed, 1),
             sprintf(
-                'iterating must not buffer: streamed grew %d bytes, fetchAll grew %d — if these are '
-                . 'comparable, iterateAssociative() is materialising and §14 is unmet',
-                $streamedGrowth,
-                $bufferedGrowth,
+                'iterating must not buffer: streamed peaked at %d bytes (mid-loop %d), fetchAll at '
+                . '%d (mid-loop %d) — if these are comparable, iterateAssociative() is materialising '
+                . 'and §14 is unmet',
+                $streamed,
+                $streamedMid,
+                $buffered,
+                $bufferedMid,
             ),
         );
 
@@ -6139,11 +6583,33 @@ final class StreamingLiveTest extends DbalLiveTestCase
         self::assertSame(200, $touched);
         self::assertSame(200, (int) $c->fetchOne('SELECT count(*) FROM s8b_inter WHERE n = 1'));
 
+        // …and it worked by MATERIALISING, which is the honest description of what interleaving
+        // costs. Asserted so the two paths are told apart: the abandonment test below asserts the
+        // opposite on the same counter, and one of them being wrong makes the other red.
+        self::assertGreaterThan(
+            0,
+            $this->driverConnection($c)->settledRowCount(),
+            'the interleave idiom degrades to buffering — that is the documented cost',
+        );
+
         $c->executeStatement('DROP TABLE s8b_inter');
     }
 
-    /** Abandoning an iteration early leaves the connection usable — the `free()`/CANCEL path. */
-    public function testAbandoningAnIterationLeavesTheConnectionUsable(): void
+    /**
+     * **Abandoning an iteration CANCELS it** — and the assertion that says so is the row counter,
+     * not "the connection still works".
+     *
+     * Plan v1's version of this test asserted only that a later statement succeeded, and it passed
+     * through `materialize()`: the driver held a STRONG reference to the open result, so `break`
+     * cancelled nothing and the next statement quietly transferred the remaining 99 975 rows. It
+     * went green while silently blessing an OOM trap, and its named mutation (deleting `close()`
+     * from `free()`) could not fail because `free()` was never reached.
+     *
+     * With the `\WeakReference` the caller's `break` destroys the driver `Result`, whose
+     * `__destruct` sends the `CANCEL`. `settledRowCount()` is how that is observed: **0** here,
+     * non-zero in the interleave test above.
+     */
+    public function testAbandoningAnIterationCancelsInsteadOfDrainingTheRemainder(): void
     {
         $c = $this->dbal();
         $this->seed($c);
@@ -6154,9 +6620,31 @@ final class StreamingLiveTest extends DbalLiveTestCase
                 break;
             }
         }
+        self::assertSame(25, $seen);
+
+        // The connection is usable — necessary, and on its own not sufficient.
         self::assertSame(self::ROWS, (int) $c->fetchOne('SELECT count(*) FROM s8b_stream'));
 
+        // THE assertion: the remainder was never transferred.
+        self::assertSame(
+            0,
+            $this->driverConnection($c)->settledRowCount(),
+            'an abandoned iteration must CANCEL, not drain 99 975 rows into memory on the next statement',
+        );
+
         $c->executeStatement('DROP TABLE s8b_stream');
+    }
+
+    /**
+     * `Doctrine\DBAL\Connection::connect()` is `protected`, but `getNativeConnection()` hands back
+     * the `Ferro\Client\Connection`, not our driver `Connection` — so reach the driver connection
+     * the way DBAL's own tests do, through the wrapper's protected accessor.
+     */
+    private function driverConnection(\Doctrine\DBAL\Connection $c): \Ferro\DBAL\Connection
+    {
+        $driver = (new \ReflectionMethod($c, 'connect'))->invoke($c);
+        self::assertInstanceOf(\Ferro\DBAL\Connection::class, $driver);
+        return $driver;
     }
 
     /**
@@ -6191,14 +6679,17 @@ FERRO_TEST_MYSQL_URL="mysql://ferro:ferro@127.0.0.1:33060/ferro" \
 FERRO_FERROD_BIN=/home/abdullak/projects/ferro/target/debug/ferrod \
 ./vendor/bin/phpunit tests/Live/StreamingLiveTest.php --fail-on-skipped
 ```
-Expected: PASS (4 tests). Record the two measured byte counts from the memory assertion in the commit message — they are the evidence the claim rests on.
+Expected: PASS (4 tests). Record the four measured byte counts from the memory assertion (streamed peak/mid, buffered peak/mid) in the commit message — they are the evidence the claim rests on, and a later reader needs them to tell a regression from a machine difference.
 
 - [ ] **Step 8: MUTATION-PROVE the guards**
 
-1. In `Connection::query()`, return `$this->runPrepared($sql, [])` unconditionally (never stream). Re-run the live test: RED on `testIteratingDoesNotBufferWhileFetchAllDoes` (the two growths become comparable). Restore. **This is the mutation that proves §14's requirement is actually met and not merely claimed.**
+Five mutations. **Every one has been checked against the code this task writes** — plan v1 shipped four, of which three could not redden anything (one was a provable no-op, one tested a path that was never taken, one asserted a metric that is ~0 in both arms).
+
+1. In `Connection::query()`, return `$this->runPrepared($sql, [])` unconditionally (never stream). Re-run the live test: RED on `testIteratingDoesNotBufferWhileFetchAllDoes` — the streamed arm now peaks at the buffered arm's ~34 MB and the `assertLessThan(buffered/50)` fails. Restore. **This is the mutation that proves §14's requirement is actually met and not merely claimed**, and it only bites because the metric is peak/mid-loop: with v1's post-loop `memory_get_usage()` this mutation left the test GREEN (measured: 552 B streamed vs 472 B buffered).
 2. Delete the `settleOpenStream()` call from `runPrepared()`. Re-run: RED on `testWritingInsideAnIterationWorks` with a `ProtocolException` about an open stream. Restore.
-3. In `Result::materialize()`, drop `array_slice($this->rows, $this->cursor)` and keep all rows. Re-run the unit test: RED on `testMaterializeDrainsTheRemainderAndIsIdempotent` (already-consumed rows reappear). Restore.
-4. Delete `$this->stream?->close()` from `free()`. Re-run: `testAbandoningAnIterationLeavesTheConnectionUsable` — expected RED. If it stays GREEN, find out why before continuing: it would mean the generator's own `finally` is covering for `free()`, which is true only while the Result still holds the sole reference, and is not a property to rely on.
+3. In `Result::materialize()`, replace the `while ($this->gen->valid())` drain with `foreach ($this->gen as $row) { $rest[] = $row; }`. Re-run the unit test: RED on `testMaterializeDrainsTheRemainderAndIsIdempotent` with `Exception: Cannot rewind a generator that was already run`, and RED on the live `testWritingInsideAnIterationWorks` for the same reason. Restore. (This replaces v1's mutation #3, which asked the implementer to drop an `array_slice($this->rows, $this->cursor)` where `$this->rows === []` and `$this->cursor === 0` invariantly — it rewrote `array_merge([], $rest)` to `array_merge([], $rest)`. That `array_slice` is gone from v2 along with the docblock sentence describing the state it implied.)
+4. Delete `$this->stream?->close()` from `free()`. Re-run the unit test: RED on `testFreeClosesTheStreamOnTheWire` and on `testDroppingAStreamedResultCancelsTheStream` (`abandonCount` stays 0). Re-run the live test: RED on `testAbandoningAnIterationCancelsInsteadOfDrainingTheRemainder` — the stream is never abandoned, so the next statement's `assertNoOpenStream()` raises a `ProtocolException`. Restore. (v1's version of this mutation could not fail: `free()` was never called on that path at all.)
+5. **The abandonment design itself.** In `Connection::query()`, change `$this->openStream = \WeakReference::create($result);` to a strong `$this->openStream = $result;` (and the `?->get()` in `settleOpenStream()` accordingly). Re-run the live test: RED on `testAbandoningAnIterationCancelsInsteadOfDrainingTheRemainder` — `settledRowCount()` comes back **99 975** instead of 0, because the strong reference kept the result alive and the next statement drained the whole remainder. Restore. This is the mutation that reproduces v1's actual behaviour, and the number it prints is the OOM trap stated in rows.
 
 - [ ] **Step 9: Commit**
 
@@ -6218,6 +6709,14 @@ The session is single-in-flight, so an open stream would make the canonical
 batch idiom (iterate + write) throw. The open result drains its remainder before
 any other statement: pure iteration never buffers, interleaving degrades to what
 PDO does unconditionally.
+
+The driver holds a WeakReference to the open Result, and the Result frees itself
+on destruction. That is what makes abandonment actually CANCEL: DBAL's Result has
+no __destruct and never calls the driver's free(), so a strong reference here
+would be the only thing keeping an abandoned stream alive and `break` out of a
+large iterateAssociative() would transfer the entire remainder on the next
+statement. settledRowCount() makes the two cases observable — 0 for pure
+iteration and for abandonment, non-zero only for interleaving.
 
 MySQL buffers (SS22.2 (n), streaming deferred) — a documented asymmetry with its
 own test, so the day MySQL streaming lands there is something that says so.
@@ -6242,7 +6741,7 @@ Two changes, in this order of preference:
 - Test: `php/doctrine-dbal/tests/Unit/IsolationRefusalTest.php` (Create), `php/doctrine-dbal/tests/Live/IsolationLiveTest.php` (Create)
 
 **Interfaces:**
-- Produces: `Ferro\DBAL\Wrapper\FerroConnection extends Doctrine\DBAL\Connection` — overrides `setTransactionIsolation(TransactionIsolationLevel): void` and `getTransactionIsolation(): TransactionIsolationLevel`. `Ferro\DBAL\Connection::setIsolation(?Ferro\Protocol\Isolation): void`. `Ferro\DBAL\Connection::isolationStatement(string $sql): bool` (static-ish predicate, `private`, exposed through the refusal). `Ferro\DBAL\Exception\UnsupportedStatement::isolation(string $sql): self`.
+- Produces: `Ferro\DBAL\Wrapper\FerroConnection extends Doctrine\DBAL\Connection` — overrides `setTransactionIsolation(TransactionIsolationLevel): void` and `getTransactionIsolation(): TransactionIsolationLevel`. `Ferro\DBAL\Connection::setIsolation(?Ferro\Protocol\Isolation): void`. `Ferro\DBAL\Wrapper\FerroConnection::isIsolationStatement(string $sql): bool` — **public static**, on the WRAPPER class, because both callers need it: the unit test asserts the closed prefix set directly, and `Ferro\DBAL\Connection::exec()`/`runPrepared()` call it to raise the refusal when no wrapper is configured. (v1's Interfaces line named it `Ferro\DBAL\Connection::isolationStatement` and called it private; the code in Steps 1, 4 and 5 and the Step-8 mutation all use the name above. This is the spelling.) `Ferro\DBAL\Exception\UnsupportedStatement::isolation(string $sql): self`.
 - Consumes: Task 3's `Ferro\Client\Connection::begin(bool $readonly, ?Isolation $isolation)`; `Ferro\Protocol\Isolation`; `Doctrine\DBAL\TransactionIsolationLevel`.
 
 - [ ] **Step 1: Write the failing unit test**
@@ -6714,32 +7213,44 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 3. **MySQL cannot run the suite at all today** (hazard 74/measured): `TestUtil::initializeDatabase()` does `dropDatabase`/`createDatabase` and the testkit `ferro` user has only `GRANT ALL ON ferro.*` — 1057 of 1077 functional tests ERROR at setup.
 4. **Even the STOCK `pdo_pgsql` driver is not green on our containers** (hazard 73/measured): 1 failure, environmental. The bar has to be "green modulo a recorded, explained list" against measured denominators (~565 executing PG functional tests), not "green".
 
+And a fifth, found by the v1 verification pass and every bit as disqualifying:
+
+5. **A suite with no reset produces a number that DEGRADES on every run** (hazard 85/measured): with v1's no-op `initializeDatabase()` and a KNOWN-GOOD driver, the identical command gave `Errors 23, Failures 3` and then `Errors 33, Failures 1`, while upstream's `TestUtil` gave `0/0` before and after — causation proven. **A recorded number that gets worse the more often you run it is worse than no number at all**, because the triage table then attributes leftover-state noise to the driver and an implementer under "fix every (a)" pressure chases phantom defects. v1 also pointed the suite at the SHARED `ferro` database, which every other live suite in this repo uses: ~40 tables, 8+ sequences, 5 schemas, a domain type and several views created and abandoned in it, permanently, with nothing ever cleaning them. Both are fixed in Steps 1, 2 and 5: PostgreSQL gets its OWN `doctrine_tests` database, the runner performs a container-side reset before phpunit, and "started from a fresh reset" is part of the recorded environment manifest.
+
 **Files:**
-- Create: `testkit/dbal-suite.sh`, `testkit/dbal/TestUtil.ferro.php`, `testkit/dbal/bootstrap.php`, `testkit/dbal/allowlist.txt`, `testkit/dbal/phpunit.ferro.xml`
+- Create: `testkit/dbal-suite.sh`, `testkit/dbal/TestUtil.ferro.php`, `testkit/dbal/bootstrap.php`, `testkit/dbal/allowlist.txt`, `testkit/dbal/phpunit.ferro.xml`, `testkit/dbal/reset-pg.sql`, `testkit/dbal/reset-mysql.sql`
 - Create: `docs/dbal-suite/2026-08-10-results.md`, `docs/known-incompatibilities.md`, `php/doctrine-dbal/README.md`
-- Modify: `testkit/mysql-init.sql`, `ferro-spec-v0.2.md` (§14 + §22.2), `CLAUDE.md`, `php/client/src/Client/Value/RawStringValuePolicy.php`
+- Modify: `testkit/mysql-init.sql`, `testkit/postgres/init.sql`, `ferro-spec-v0.2.md` (§14 + §22.2), `CLAUDE.md`, `php/client/src/Client/Value/RawStringValuePolicy.php`, `engine/crates/ferrod/src/services/sql.rs` (the `abort_stream` docblock — see Step 10)
 
 **Interfaces:**
 - Produces: `testkit/dbal-suite.sh [--pool <name>] [--dsn <url>]` — clones a PINNED `doctrine/dbal` tag, patches its `TestUtil`, launches ONE `ferrod` for the run, asserts driver identity, and executes the allowlisted `tests/Functional` paths.
 - Consumes: everything from Tasks 1–13.
 
-- [ ] **Step 1: Provision the MySQL privileges the upstream suite needs**
+- [ ] **Step 1: Give the suite its OWN database on BOTH families**
 
-`TestUtil::initializeDatabase()` drops and creates a database on every run. Under Ferro the DSN lives in the engine and PHP holds no credentials (D8), so the patched `TestUtil` (Step 3) will not do that — but the suite still needs its `doctrine_tests` database to EXIST. Add it to the fixture for fresh environments, and apply it to the running container without recreating the volume.
+`TestUtil::initializeDatabase()` drops and creates a database on every run. Under Ferro the DSN lives in the engine and PHP holds no credentials (D8), so the patched `TestUtil` (Step 2) cannot do that — but the suite still needs a database, and **it must not be the shared `ferro` one**. The upstream functional suite creates and abandons ~40 tables, 8+ sequences, 5 schemas, a domain type and several views; pointing it at `ferro` would silt up the database every other live suite in this repo uses, permanently, with no step that ever cleans it.
 
-Append to `testkit/mysql-init.sql`:
+MySQL/MariaDB — append to `testkit/mysql-init.sql`:
 
 ```sql
--- M1-S8b: the upstream Doctrine DBAL functional suite expects a dedicated database. Ferro's own
--- patched TestUtil does NOT drop/create it (PHP holds no credentials — SPEC §12 / D8), so it is
--- provisioned here instead. The grant is scoped to that database only; the `ferro` user
--- deliberately does NOT get CREATE DATABASE.
+-- M1-S8b: the upstream Doctrine DBAL functional suite gets its OWN database. Ferro's patched
+-- TestUtil does NOT drop/create it (PHP holds no credentials — SPEC §12 / D8); `testkit/dbal-suite.sh`
+-- resets it container-side before every recorded run. The grant is scoped to that database only; the
+-- `ferro` user deliberately does NOT get CREATE DATABASE.
 CREATE DATABASE IF NOT EXISTS doctrine_tests;
 GRANT ALL PRIVILEGES ON doctrine_tests.* TO 'ferro'@'%';
 FLUSH PRIVILEGES;
 ```
 
-Apply the same to the LIVE containers (the init script only runs on a fresh volume, and we must not `down -v` a shared stack):
+PostgreSQL — the `ferro` role is `Superuser, Create DB` (verified with `\du`), so it can own a second database; add it to `testkit/postgres/init.sql` alongside the existing fixtures:
+
+```sql
+-- M1-S8b: as above. NEVER point the upstream suite at the shared `ferro` database.
+SELECT 'CREATE DATABASE doctrine_tests OWNER ferro'
+ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'doctrine_tests') \gexec
+```
+
+Apply both to the LIVE containers (the init scripts only run on a fresh volume, and we must not `down -v` a shared stack):
 
 ```bash
 cd /home/abdullak/projects/ferro
@@ -6748,8 +7259,43 @@ for svc in mysql mariadb; do
     mysql -uroot -pferro -e "CREATE DATABASE IF NOT EXISTS doctrine_tests; GRANT ALL PRIVILEGES ON doctrine_tests.* TO 'ferro'@'%'; FLUSH PRIVILEGES;"
 done
 docker compose -f testkit/docker-compose.yml exec -T mysql mysql -uferro -pferro -e "SHOW GRANTS FOR CURRENT_USER();"
+
+docker compose -f testkit/docker-compose.yml exec -T pg \
+  psql -U ferro -d ferro -tAc "SELECT 1 FROM pg_database WHERE datname='doctrine_tests'" | grep -q 1 \
+  || docker compose -f testkit/docker-compose.yml exec -T pg psql -U ferro -d ferro -c 'CREATE DATABASE doctrine_tests OWNER ferro'
+docker compose -f testkit/docker-compose.yml exec -T pg psql -U ferro -d doctrine_tests -c 'SELECT current_database()'
 ```
-Expected: the grants list now includes `GRANT ALL PRIVILEGES ON \`doctrine_tests\`.* TO \`ferro\`@\`%\``. If the root password differs in `testkit/docker-compose.yml`, read it from there rather than guessing.
+Expected: the MySQL grants list now includes `GRANT ALL PRIVILEGES ON \`doctrine_tests\`.* TO \`ferro\`@\`%\``, and the PG command prints `doctrine_tests`. If the root password differs in `testkit/docker-compose.yml`, read it from there rather than guessing. If the `ferro` role turns out NOT to have `CREATEDB` on this box, run the `CREATE DATABASE` as the container's superuser instead — do NOT fall back to the shared `ferro` database.
+
+Then write the two reset scripts the runner will apply before every recorded run. `testkit/dbal/reset-pg.sql`:
+
+```sql
+-- M1-S8b: the upstream functional suite's ONLY reset. Upstream gets idempotence from
+-- TestUtil::initializeDatabase()'s dropDatabase/createDatabase, which Ferro structurally cannot do
+-- (PHP holds no credentials, SPEC §12/D8), so it happens HERE, container-side, with no PHP
+-- credentials involved — the same shape the MySQL grant in this step already uses.
+--
+-- Without it the recorded number is not reproducible: measured against a KNOWN-GOOD driver, the same
+-- command gave 23 then 33 errors on consecutive runs (hazard 85). CASCADE is required — upstream's
+-- own dropTableIfExists issues a plain DROP TABLE and leaves dependent objects behind.
+DROP SCHEMA IF EXISTS testschema CASCADE;
+DROP SCHEMA IF EXISTS nested CASCADE;
+DROP SCHEMA IF EXISTS another CASCADE;
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public AUTHORIZATION ferro;
+GRANT ALL ON SCHEMA public TO ferro;
+```
+
+`testkit/dbal/reset-mysql.sql`:
+
+```sql
+-- M1-S8b: see reset-pg.sql. MySQL has no schema/database distinction to work around, so the whole
+-- database is recreated.
+DROP DATABASE IF EXISTS doctrine_tests;
+CREATE DATABASE doctrine_tests;
+GRANT ALL PRIVILEGES ON doctrine_tests.* TO 'ferro'@'%';
+FLUSH PRIVILEGES;
+```
 
 - [ ] **Step 2: Write the patched `TestUtil`**
 
@@ -6781,12 +7327,29 @@ use Doctrine\DBAL\Schema\DefaultSchemaManagerFactory;
  *     `dropDatabase()` + `createDatabase()` on every run. Ferro cannot serve that: the DSN lives in
  *     the ENGINE and PHP has no credentials at all (SPEC §12 / D8), there is nothing for a
  *     client-side `dbname` to mean, and dropping a database a live pool holds connections to is
- *     refused anyway. `/testkit` pre-provisions the database instead, and this method is a no-op.
+ *     refused anyway.
+ *
+ *     **That method is also the functional suite's ONLY reset**, so removing it without replacing it
+ *     makes the suite non-idempotent: measured against a KNOWN-GOOD driver, the same command gave
+ *     `Errors 23` and then `Errors 33` on consecutive runs, while upstream's version gave `0/0`
+ *     before and after. The replacement is `testkit/dbal-suite.sh`'s container-side reset, which
+ *     needs no PHP credentials — the same shape the MySQL grant already uses. This method stays a
+ *     no-op, and the RUNNER is where idempotence now lives; a recorded number MUST come from a run
+ *     that performed the reset.
  *
  * `isDriverOneOf()` answers FALSE for every name, and that is a deliberate decision with 60 call
  * sites behind it: claiming `pdo_pgsql`/`pdo_mysql` would opt Ferro into PDO-specific expectations
  * and into whole vendor sub-trees written against those extensions. Answering nothing means every
  * vendor-gated test takes its "other" branch, which is the honest description of what Ferro is.
+ *
+ * **The public surface below is the MEASURED one, not a guess** (hazard 84): over the allowlisted
+ * paths of the real 4.4.4 clone, `grep -rhoE 'TestUtil::[a-zA-Z]+' tests/` gives `isDriverOneOf` ×13,
+ * `getPrivilegedConnection` ×2, `getConnectionParams` ×2, `getConnection` ×1; elsewhere in `tests/`,
+ * `isPdoStringifyFetchesEnabled` ×4 and `generateResultSetQuery` ×1. Plan v1 declared
+ * `getPrivilegedConnectionParameters` — which is PRIVATE upstream and called by nothing outside the
+ * class — and omitted `getPrivilegedConnection`, which an allowlisted test calls. Exactly backwards,
+ * and the resulting `Call to undefined method` errors would have gone into the triage table looking
+ * like driver defects.
  */
 final class TestUtil
 {
@@ -6828,7 +7391,10 @@ final class TestUtil
         return self::$connection = DriverManager::getConnection(self::getConnectionParams(), $config);
     }
 
-    /** Pre-provisioned by /testkit; see the class docblock. */
+    /**
+     * Pre-provisioned and RESET by `testkit/dbal-suite.sh`, container-side; see the class docblock.
+     * A no-op here is only sound because that reset exists — do not remove one without the other.
+     */
     public static function initializeDatabase(): void
     {
     }
@@ -6838,15 +7404,54 @@ final class TestUtil
         return false;
     }
 
-    /** @return array<string,mixed> */
-    public static function getPrivilegedConnectionParameters(): array
+    /**
+     * Upstream this is a connection with credentials that can drop and create databases. **Ferro has
+     * no such thing, and cannot**: the DSN lives in the engine and PHP holds no credentials at all
+     * (SPEC §12 / D8). So "privileged" here means exactly one thing — a SECOND, independent
+     * connection to the same pool — which is what the two allowlisted call sites actually need
+     * (`tests/Functional/TransactionTest.php:112` uses it to observe an in-progress transaction from
+     * outside it). A test that genuinely needs DDL privileges Ferro's user does not have will fail
+     * loudly on that DDL, which is the correct outcome and is triaged as category (c).
+     *
+     * Note it is deliberately NOT `getConnection()`: sharing the connection would make the
+     * cross-connection observation it exists for meaningless.
+     */
+    public static function getPrivilegedConnection(): Connection
     {
-        return self::getConnectionParams();
+        $config = new Configuration();
+        $config->setSchemaManagerFactory(new DefaultSchemaManagerFactory());
+        return DriverManager::getConnection(self::getConnectionParams(), $config);
     }
+
+    /**
+     * Whether PDO is configured to stringify fetched values. Ferro is not PDO and has no such mode:
+     * every column arrives typed from the `/proto` tag registry.
+     */
+    public static function isPdoStringifyFetchesEnabled(): bool
+    {
+        return false;
+    }
+
+    // `generateResultSetQuery(array $rows, AbstractPlatform $platform): string` goes HERE, COPIED
+    // BYTE-FOR-BYTE from the pinned clone at `<work>/dbal-4.4.4/tests/TestUtil.php` (4.4.4 lines
+    // 257-270), together with `use Doctrine\DBAL\Platforms\AbstractPlatform;`. It is platform-SQL
+    // GENERATION, not a policy answer — there is nothing Ferro-specific to decide — and a rewritten
+    // version would silently change what the tests using it assert. Transcribe it; do not
+    // reconstruct it from the signature.
 }
 ```
 
-The upstream `TestUtil` may declare methods this replacement does not. **Do not guess them**: after the first run, read the fatal errors and add exactly the missing methods, each with a one-line docblock saying what it answers and why. Do not add a method speculatively.
+The clone is what the runner (Step 5) does first, but this step comes earlier — so do the clone by hand now, once, and read the method out of it. The runner will reuse the same checkout:
+
+```bash
+cd /home/abdullak/projects/ferro
+git clone --depth 1 --branch 4.4.4 https://github.com/doctrine/dbal.git .dbal-suite/dbal-4.4.4 2>/dev/null || true
+sed -n '/function generateResultSetQuery/,/^    }/p' .dbal-suite/dbal-4.4.4/tests/TestUtil.php
+grep -n 'function getPrivilegedConnection\b' .dbal-suite/dbal-4.4.4/tests/TestUtil.php
+```
+The second command is the census check: it must find a PUBLIC `getPrivilegedConnection()`. `.dbal-suite/` is the runner's work directory and is already covered by the repo's ignore rules for build output — if it is not, add it to `.gitignore` in this step rather than committing a vendored clone.
+
+**If the first run still reports a `Call to undefined method TestUtil::…`**, add exactly that method with a one-line docblock saying what it answers and why — but the census above is measured, so treat a miss as a signal that the allowlist grew rather than as routine. Two rules for anything added: a method that GENERATES SQL is copied verbatim from upstream (like `generateResultSetQuery`), and a method that answers a POLICY question gets a Ferro answer with the reason written down. Never a speculative addition, and never a silent one.
 
 - [ ] **Step 3: Write the bootstrap with the HARD contact assertion**
 
@@ -6961,9 +7566,23 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tag="${FERRO_DBAL_TAG:-4.4.4}"
 pool="${FERRO_DBAL_POOL:-default}"
-dsn="${FERRO_DBAL_DSN:-postgres://ferro:ferro@127.0.0.1:55432/ferro}"
+# The suite gets its OWN database on every family. NEVER the shared `ferro` one: this suite creates
+# and abandons ~40 tables, 8+ sequences, 5 schemas, a domain type and several views, and nothing
+# would ever clean them out of a database every other live suite in this repo uses.
+dsn="${FERRO_DBAL_DSN:-postgres://ferro:ferro@127.0.0.1:55432/doctrine_tests}"
+# Which container to reset, and how. `--no-reset` exists for fast iteration; a RECORDED run must not
+# use it (see the results file's environment manifest).
+svc="${FERRO_DBAL_SVC:-pg}"
 work="${FERRO_DBAL_WORK:-$root/.dbal-suite}"
 src="$work/dbal-$tag"
+reset=1
+args=()
+for a in "$@"; do
+  case "$a" in
+    --no-reset) reset=0 ;;
+    *) args+=("$a") ;;
+  esac
+done
 
 mkdir -p "$work"
 
@@ -7020,22 +7639,63 @@ cfg="$work/phpunit.generated.xml"
   echo '</phpunit>'
 } > "$cfg"
 
-# 6. Run it. The bootstrap's contact assertion runs first and exits non-zero if the connection is
+# 6. THE RESET — the suite's only source of idempotence, and a hard precondition of recording a
+#    number. Upstream gets it from TestUtil::initializeDatabase()'s dropDatabase/createDatabase,
+#    which Ferro structurally cannot do (PHP holds no credentials, SPEC §12/D8), so it happens
+#    container-side with no PHP credentials at all — the same shape as the MySQL grant.
+#
+#    MEASURED, against a KNOWN-GOOD driver, with no reset: the same command gave `Errors 23,
+#    Failures 3` and then `Errors 33, Failures 1`; with upstream's TestUtil it gave 0/0 before and
+#    after. A number that degrades on every run is worse than no number, because the triage table
+#    then blames the driver for leftover state.
+if [ "$reset" = 1 ]; then
+  case "$svc" in
+    pg)
+      docker compose -f "$root/testkit/docker-compose.yml" exec -T pg \
+        psql -v ON_ERROR_STOP=1 -U ferro -d doctrine_tests < "$root/testkit/dbal/reset-pg.sql"
+      echo "[ferro] reset: pg/doctrine_tests from testkit/dbal/reset-pg.sql"
+      ;;
+    mysql|mariadb)
+      docker compose -f "$root/testkit/docker-compose.yml" exec -T "$svc" \
+        mysql -uroot -pferro < "$root/testkit/dbal/reset-mysql.sql"
+      echo "[ferro] reset: $svc/doctrine_tests from testkit/dbal/reset-mysql.sql"
+      ;;
+    *) echo "::error:: unknown FERRO_DBAL_SVC=$svc"; exit 1 ;;
+  esac
+else
+  echo "[ferro] reset: SKIPPED (--no-reset) — this run's numbers MUST NOT be recorded"
+fi
+
+# 7. Run it. The bootstrap's contact assertion runs first and exits non-zero if the connection is
 #    not a Ferro one.
-FERRO_DBAL_SRC="$src" "$src/vendor/bin/phpunit" -c "$cfg" "$@"
+FERRO_DBAL_SRC="$src" "$src/vendor/bin/phpunit" -c "$cfg" "${args[@]+"${args[@]}"}"
 ```
+
+What matters is that the reset runs **before phpunit**. Its position relative to the `ferrod` launch is not load-bearing — the pool's connections are idle at that point and idle sessions hold no locks — but if `DROP SCHEMA public CASCADE` ever fails with a lock conflict, move the whole block above step 4 rather than reaching for `--no-reset`. A reset that cannot run is a finding to report, not a step to skip: without it the recorded number is not reproducible.
 
 - [ ] **Step 6: Run it and RECORD the numbers**
 
 ```bash
 cd /home/abdullak/projects/ferro
-./testkit/dbal-suite.sh 2>&1 | tee /tmp/dbal-pg.log
-FERRO_DBAL_POOL=mysql FERRO_DBAL_DSN=mysql://ferro:ferro@127.0.0.1:33060/doctrine_tests \
+FERRO_DBAL_SVC=pg \
+  ./testkit/dbal-suite.sh 2>&1 | tee /tmp/dbal-pg.log
+FERRO_DBAL_SVC=mysql FERRO_DBAL_POOL=mysql FERRO_DBAL_DSN=mysql://ferro:ferro@127.0.0.1:33060/doctrine_tests \
   ./testkit/dbal-suite.sh 2>&1 | tee /tmp/dbal-mysql.log
-FERRO_DBAL_POOL=mariadb FERRO_DBAL_DSN=mysql://ferro:ferro@127.0.0.1:33061/doctrine_tests \
+FERRO_DBAL_SVC=mariadb FERRO_DBAL_POOL=mariadb FERRO_DBAL_DSN=mysql://ferro:ferro@127.0.0.1:33061/doctrine_tests \
   ./testkit/dbal-suite.sh 2>&1 | tee /tmp/dbal-mariadb.log
 ```
-Expected: the `[ferro] driver=… platform=… server=…` line FIRST (the contact assertion), then a real result line. **The result will not be green on the first run, and that is expected** — the job of this step is to produce the numbers, not to reach a target. Triage each failure into exactly one of: (a) a driver defect to fix now; (b) a documented Ferro semantic (pooling, `lastInsertId` on PG, a refused sentinel); (c) an upstream assumption Ferro cannot satisfy (no client-side dbname, PDO-specific expectations); (d) out of scope for M1. Fix every (a). Record every (b)/(c)/(d) with its test name.
+Expected output order, and all three lines are load-bearing: `[ferro] reset: …` (idempotence), then `[ferro] driver=… platform=… server=…` (the contact assertion), then a real result line. **A log that is missing the reset line is not a recordable run.**
+
+**REPRODUCIBILITY CHECK, before recording anything.** Run the PostgreSQL invocation TWICE and diff the two result lines:
+
+```bash
+FERRO_DBAL_SVC=pg ./testkit/dbal-suite.sh 2>&1 | tail -3 | tee /tmp/dbal-pg-run1.txt
+FERRO_DBAL_SVC=pg ./testkit/dbal-suite.sh 2>&1 | tail -3 | tee /tmp/dbal-pg-run2.txt
+diff /tmp/dbal-pg-run1.txt /tmp/dbal-pg-run2.txt && echo "REPRODUCIBLE"
+```
+Expected: identical, and `REPRODUCIBLE` printed. If they differ, the reset is incomplete — find what the suite leaves behind (`\dt`, `\ds`, `\dn` in `doctrine_tests`) and add it to `reset-pg.sql` before going further. **Do not record a number from a run whose repeat differs**: that was the state plan v1 would have shipped, where 23 errors became 33 with no code change.
+
+**The result will not be green on the first run, and that is expected** — the job of this step is to produce the numbers, not to reach a target. Triage each failure into exactly one of: (a) a driver defect to fix now; (b) a documented Ferro semantic (pooling, `lastInsertId` on PG, a refused sentinel); (c) an upstream assumption Ferro cannot satisfy (no client-side dbname, PDO-specific expectations); (d) out of scope for M1. Fix every (a). Record every (b)/(c)/(d) with its test name. **There is now no (e) "leftover state from a previous run"** — if a failure looks like one, the reset is what to fix.
 
 - [ ] **Step 7: Write the recorded results**
 
@@ -7051,6 +7711,13 @@ Create `docs/dbal-suite/2026-08-10-results.md` — the environment manifest plus
 - PHP: <fill from `php -v`> · ext-msgpack: <loaded / not loaded>
 - Engine: `ferrod` at `<git rev>` · one daemon per RUN
 - Backends: PostgreSQL 17.10 (:55432), MySQL 8.4.11 (:33060), MariaDB 11.8.8 (:33061)
+- Database: **`doctrine_tests` on every family — never the shared `ferro` database**
+- **Reset: YES.** Every run below started from a freshly reset database
+  (`testkit/dbal/reset-pg.sql` / `reset-mysql.sql`, applied container-side by the runner, which
+  prints the `[ferro] reset: …` line). `--no-reset` was NOT used.
+- **Reproducibility: verified.** The PostgreSQL invocation was run twice and the result lines were
+  identical (`<paste the two lines>`). This check is mandatory: without a reset, the same command
+  measured `Errors 23` and then `Errors 33` against a known-good driver.
 - Subset: `testkit/dbal/allowlist.txt` (exclusions and their reasons are in that file)
 
 ## Baseline for comparison (STOCK drivers, same containers, measured before this slice)
@@ -7135,9 +7802,28 @@ model, not a defect to be fixed quietly. The full per-package catalogue is budge
 - **A `LARGE_OBJECT` bind is materialised in memory** and is bounded by the 16 MiB maximum frame
   payload. A chunked bind would be a protocol change.
 
+## Errors
+- **A `SELECT` that is cancelled server-side or exceeds `statement_timeout` surfaces as
+  `Ferro\DBAL\IndeterminateWriteException`, not as a cancellation.** The DBAL 4 SPI carries no
+  read/write signal — `executeQuery('INSERT … RETURNING id')` is indistinguishable from a `SELECT`
+  at the driver boundary — and Ferro refuses to guess from SQL text, so the driver declares every
+  statement a WRITE. That is the safe direction (a lost write is never reported as "provably did not
+  apply"), and this is its cost: for an autocommit statement outside a transaction, the engine's
+  fate matrix routes a `57014` by the declared `readonly` flag alone. **Do not add a blanket retry
+  on `IndeterminateWriteException` to work around it** — that is exactly the at-most-once violation
+  the branch exists to prevent. If a connection genuinely only reads, declare it:
+  `'driverOptions' => ['readonly' => true]`, which restores the clean "statement cancelled or timed
+  out" answer. In a transaction the question does not arise: a cancelled statement rolls the
+  transaction back and is reported `Retryable`.
+
 ## Performance and shape
 - **`iterateAssociative()` streams on PostgreSQL for parameterless queries and buffers otherwise**
   (and always buffers on MySQL/MariaDB, where engine-side row streaming is deferred).
+- **Abandoning an iteration early cancels the stream**, and a statement issued *while* an iteration
+  is still open drains the remainder into memory first (the session is single-in-flight). The
+  canonical `foreach (iterate…) { executeStatement(…) }` idiom therefore works, at the cost of
+  buffering what is left — which is what PDO does unconditionally. `Ferro\DBAL\Connection::settledRowCount()`
+  reports how many rows that has cost on this connection.
 - **The first query against a backend that is DOWN can block for the OS connect timeout** (~127 s
   measured) rather than failing fast. Tracked in `docs/followups/2026-08-10-unbounded-backend-dial.md`.
 - **`Ferro\Pg\Copy`** — the first-class replacement for `pdo_pgsql` COPY hacks named in SPEC §14 —
@@ -7165,18 +7851,45 @@ Then append to §22.2, continuing the letters after **(x)**:
 
   **(z) The §14 acceptance bar is NOT reachable as written, and the reachable part is recorded rather than silently narrowed (M1-S8b).** Four measured obstacles. **(1) SQLite is impossible** — `engine/crates` has `pg` + `mysql` only, so one third of "green on PG + MySQL + SQLite" waits for `ferro-backend-sqlite`. **(2) The upstream suite cannot select a third-party driver**: `TestUtil::getConnectionParams()` checks only `$params['driver']` and otherwise returns `['driver' => 'pdo_sqlite', 'memory' => true]` — measured, with `db_driverClass` set — so the entire functional suite would run GREEN against in-memory SQLite with ZERO Ferro contact, and neither `--fail-on-skipped` nor `ci/assert-no-skips.sh` would catch it (nothing skips; everything genuinely passes, on the wrong engine). `/testkit`'s runner therefore ships a REPLACEMENT `TestUtil` and a bootstrap whose FIRST action is to assert `getNativeConnection() instanceof Ferro\Client\Connection` and to round-trip a real `SELECT 1`. **(3) MySQL could not run the suite at all**: `initializeDatabase()` does `dropDatabase`/`createDatabase` and the testkit user had only `GRANT ALL ON ferro.*` — measured as 1057 errors out of 1077 functional tests. Ferro cannot serve that shape anyway (the DSN lives in the engine, PHP holds no credentials — §12/D8), so the database is pre-provisioned in `testkit/mysql-init.sql` and the patched `initializeDatabase()` is a no-op. **(4) Even the STOCK `pdo_pgsql` driver is not green on our containers** (1 environmental failure). The bar is therefore restated as **"the curated subset in `testkit/dbal/allowlist.txt`, green modulo a recorded and triaged list"**, measured against the recorded stock denominators (whole suite 3913/556 skipped; functional-only 1077/512 skipped ⇒ ~565 executing on PG), with every exclusion carrying its reason in the allowlist and every non-passing test triaged in `docs/dbal-suite/2026-08-10-results.md`. `isDriverOneOf()` answers FALSE for every name — a deliberate choice with 60 call sites behind it: claiming `pdo_pgsql`/`pdo_mysql` would opt Ferro into PDO-specific expectations. **The ORM functional suite is DEFERRED**, and one blocker is already known: `Doctrine\ORM\Id\IdentityGenerator::generateId()` is `(int) $conn->lastInsertId()` and DBAL 4 defaults PostgreSQL to the IDENTITY strategy, which cannot work while PG reports no generated key — the remedy is configuration (the SEQUENCE strategy) and it is documented rather than engineered around.
 
-  **(aa) A canonical `TAG_TEXT` param now binds wherever PostgreSQL's own TEXT INPUT SYNTAX is what it carries — the drop-in blocker, closed without loosening §19.3 (M1-S8b Task 4).** Stock Doctrine's type layer stringifies every `datetime`/`date`/`time`/`decimal`/`json`/`guid` value and binds it as `ParameterType::STRING`, which reaches the engine as `TAG_TEXT`; `PgText`'s `accepts` was `String`'s (`varchar`/`text`/`bpchar`/`name`/`unknown` + the name-keyed `citext`/`ltree`/…), so **every such INSERT was refused pre-send on PostgreSQL** while MySQL — which has no bind pre-flight at all — accepted the identical driver. `PgText` is now an explicit impl accepting those types **plus** `numeric`, `date`, `time`, `timestamp`, `timestamptz`, `uuid`, `json` and `jsonb`, with `encode_format` = `Format::Text`. **The format change is not cosmetic:** the `pg_domain_aware_param!` macro delegated `encode_format` to `<String as ToSql>`, which takes the trait's `Format::Binary` default, so widening `accepts` ALONE would have told PostgreSQL that the UTF-8 bytes of `2026-08-05` were a 4-byte binary `date`. For every string type this already accepted, text-format bytes are byte-identical to binary, so nothing regresses. **§19.3's direction is intact:** `check_param`'s `Value::Text` arm delegates to this same `accepts`, so the pre-flight and the impl are bit-identical by construction and moved in ONE edit; and what the widening admits is not an unclassifiable failure but a real server-side `22007`/`22P02` `DbError`, which `is_session_fatal` reads as non-fatal and `error_map` classifies `NonRetryable`. **The sentinel discipline the old narrowness protected is PRESERVED as a value-aware gate**: PostgreSQL's special input literals (`infinity`, `-infinity`, `now`, `today`, `tomorrow`, `yesterday`, `epoch`, `allballs`, and `NaN`/`Infinity` for `numeric`) are still refused for a temporal or numeric slot, naming the tagged route (`Ferro\Date`, `Ferro\NaiveTimestamp`, `Ferro\Decimal`) that expresses a sentinel deliberately — while the identical string remains an ordinary value in a `text` column. That is a REFUSAL keyed on the slot's declared type, not an inference of a tag from content: nothing decides that `'2026-08-05'` "is a date".
+  **(aa) A canonical `TAG_TEXT` param now binds wherever PostgreSQL's own TEXT INPUT SYNTAX is what it carries — the drop-in blocker, closed without loosening §19.3 (M1-S8b Task 4).** Stock Doctrine's type layer stringifies every `datetime`/`date`/`time`/`decimal`/`json`/`guid` value and binds it as `ParameterType::STRING`, which reaches the engine as `TAG_TEXT`; `PgText`'s `accepts` was `String`'s (`varchar`/`text`/`bpchar`/`name`/`unknown` + the name-keyed `citext`/`ltree`/…), so **every such INSERT was refused pre-send on PostgreSQL** while MySQL — which has no bind pre-flight at all — accepted the identical driver. `PgText` is now an explicit impl accepting those types **plus** `numeric`, `date`, `time`, `timestamp`, `timestamptz`, `uuid`, `json` and `jsonb`. **The format change is not cosmetic:** the `pg_domain_aware_param!` macro delegated `encode_format` to `<String as ToSql>`, which takes the trait's `Format::Binary` default, so widening `accepts` ALONE would have told PostgreSQL that the UTF-8 bytes of `2026-08-05` were a 4-byte binary `date`. **Both `to_sql` and `encode_format` therefore BRANCH on the resolved base** — verbatim text and `Format::Text` for the eight new targets, the unchanged delegated path (and `Format::Binary`) for everything `String` already accepted — and the branch is load-bearing twice over. It is required for CORRECTNESS, because "text bytes are the binary bytes for every string type this already took" is FALSE: `<&str as ToSql>::accepts` also admits `citext`, `ltree`, `lquery` and `ltxtquery` by NAME, and for the last three the binary form is `0x01 || text`. And it is required for FALSIFIABILITY, because that same name-sensitive encoder is the only thing that makes the payload-bytes clause of `s8a_every_arm_treats_a_domain_exactly_as_its_base` able to fail — the `ltree` fixture entry S8a's review round added for exactly that purpose. A type-blind `to_sql` would make a domain and its base write identical bytes by construction and silently revert that repair: MEASURED, the mutation that is RED at HEAD goes GREEN. The regression surface on everything that already worked is consequently empty rather than believed-harmless. **§19.3's direction is intact:** `check_param`'s `Value::Text` arm delegates to this same `accepts`, so the pre-flight and the impl are bit-identical by construction and moved in ONE edit; and what the widening admits is not an unclassifiable failure but a real server-side `22007`/`22P02` `DbError`, which `is_session_fatal` reads as non-fatal and `error_map` classifies `NonRetryable`. **The sentinel discipline the old narrowness protected is PRESERVED as a value-aware gate**: PostgreSQL's special input literals (`infinity`, `-infinity`, `now`, `today`, `tomorrow`, `yesterday`, `epoch`, `allballs`, and `NaN`/`Infinity` for `numeric`) are still refused for a temporal or numeric slot, naming the tagged route (`Ferro\Date`, `Ferro\NaiveTimestamp`, `Ferro\Decimal`) that expresses a sentinel deliberately — while the identical string remains an ordinary value in a `text` column. That is a REFUSAL keyed on the slot's declared type, not an inference of a tag from content: nothing decides that `'2026-08-05'` "is a date".
 
   **(ab) Doctrine's stock type layer is a silently-corrupting calendar parser, and the driver REFUSES rather than converts (M1-S8b Task 9).** Measured on 4.4.4, with **no exception raised**: `date '2026-00-05'` → `DateTime(2025-12-05)`; `datetime '0000-00-00 00:00:00'` → `DateTime(-0001-11-30)`; `time '24:00:00'` — a value PostgreSQL genuinely stores — → `00:00:00`. `proto/PROTOCOL.md` §3.2 warned about this parser class in prose; that is the measurement. The mirror problem is `datetimetz`, which is unreadable in the other direction: `DateTimeTzType` has no fallback and accepts only `Y-m-d H:i:sO` on PostgreSQL and `Y-m-d H:i:s` on the MySQL family, so **every** canonical RFC3339 form throws on **every** platform, and every microsecond form throws too. The driver's own `ValuePolicy` handles both — `ValuePolicy::decode(int $tag, mixed $data)` is per-cell TAG-AWARE by construction, so no client API change was needed to see column tags. A whole-second `TIMESTAMPTZ` is re-rendered into the platform's own format (per family, from two literals LOCKED against the stock accessors by a unit test, so a DBAL release that changes either goes red); a sub-second one is **refused rather than truncated**, because silent precision loss is the same defect class as the corruption above; and sentinels, zero dates, negative times, sub-second times and `24:00:00` are refused with a message naming the native API as the way to read them. Charter rule 6 is untouched: this is the driver's own conversion step, which `RawStringValuePolicy`'s docblock already blessed. **One claim in that docblock was FALSIFIED and corrected in the same change set:** `AbstractPlatform::getDateTimeFormatString()` does NOT reject a canonical fractional `TIMESTAMP` — `DateTimeType::convertToPHPValue` falls back to `new DateTime($value)`, measured — so the naive-timestamp fraction survives untouched and only the two `datetimetz` claims stand.
 
-  **(ac) `iterate*()` streams on the PARAMETERLESS read path only, and every DBAL statement is fate-declared a WRITE (M1-S8b Tasks 1, 12).** Two bounded honesty statements about §14's wording. **Streaming:** `Doctrine\DBAL\Result::iterateAssociative()` is literally a loop over `fetchAssociative()`, so "never buffer" reduces to pulling one row at a time — but `Connection::executeStatement()` with parameters is `$stmt->execute()->rowCount()`, and a streamed request's terminal carries **no `affected` field**, so streaming the prepared path would make every parameterized write return 0. The driver therefore streams on `query()` — the zero-parameter `executeQuery`, where DBAL never asks for a row count — and buffers elsewhere; and MySQL/MariaDB buffer everywhere, because engine-side row streaming there is still deferred ((n)). Adding `affected` to the stream terminal is the durable fix and is a `/proto` change (registry + golden vectors + both codecs), deliberately NOT smuggled into a driver slice. Because the client session is strictly single-in-flight, an open streamed `Result` drains its remainder before the connection issues anything else — so the canonical `foreach (iterate…) { executeStatement(…) }` idiom keeps working (it degrades to what PDO does unconditionally) instead of throwing a `ProtocolException` every user would read as a driver bug. **Fate:** the DBAL 4 SPI carries NO read/write signal — `executeQuery('INSERT … RETURNING id')` with no parameters reaches the driver's `query()`, and the prepared path serves `executeQuery` and `executeStatement` alike — and charter rule 6 forbids inferring one from the SQL text. Every result-producing method on `Ferro\Client\Connection` hard-codes `readonly = true`, so a driver built on them would have reported a lost `INSERT … RETURNING` as **Retryable**, i.e. "provably did not apply", for a write whose fate is genuinely unknown. `Connection::fetchRaw()`/`streamRaw()` exist to let the CALLER declare the fate, the driver declares **write** for everything, and a read-only connection is an explicit `driverOptions['readonly' => true]` — configuration, never inference. Conservative by construction: a lost read is over-reported as `Indeterminate`, which costs retryability and never costs safety.
+  **(ac) `iterate*()` streams on the PARAMETERLESS read path only, and every DBAL statement is fate-declared a WRITE (M1-S8b Tasks 1, 12).** Two bounded honesty statements about §14's wording. **Streaming:** `Doctrine\DBAL\Result::iterateAssociative()` is literally a loop over `fetchAssociative()`, so "never buffer" reduces to pulling one row at a time — but `Connection::executeStatement()` with parameters is `$stmt->execute()->rowCount()`, and a streamed request's terminal carries **no `affected` field**, so streaming the prepared path would make every parameterized write return 0. The driver therefore streams on `query()` — the zero-parameter `executeQuery`, where DBAL never asks for a row count — and buffers elsewhere; and MySQL/MariaDB buffer everywhere, because engine-side row streaming there is still deferred ((n)). Adding `affected` to the stream terminal is the durable fix and is a `/proto` change (registry + golden vectors + both codecs), deliberately NOT smuggled into a driver slice. Because the client session is strictly single-in-flight, an open streamed `Result` drains its remainder before the connection issues anything else — so the canonical `foreach (iterate…) { executeStatement(…) }` idiom keeps working (it degrades to what PDO does unconditionally) instead of throwing a `ProtocolException` every user would read as a driver bug. **Abandonment is a different case and must not collapse into that one:** DBAL never calls a driver `Result::free()` when a consumer stops iterating (`Doctrine\DBAL\Result` has no `__destruct`; the only reference is the returned Generator's bound `$this`), so the driver holds a `\WeakReference` to the open result and the result cancels its own stream on destruction. A driver holding a STRONG reference would be the only thing keeping an abandoned stream alive, and `break`-ing out of a large `iterateAssociative()` would then transfer the ENTIRE remaining result set on the next statement — invisible in a 100 000-row test, an OOM on a real table. `Ferro\DBAL\Connection::settledRowCount()` makes the two observable: 0 for pure iteration and for abandonment, non-zero only for interleaving. **Fate:** the DBAL 4 SPI carries NO read/write signal — `executeQuery('INSERT … RETURNING id')` with no parameters reaches the driver's `query()`, and the prepared path serves `executeQuery` and `executeStatement` alike — and charter rule 6 forbids inferring one from the SQL text. Every result-producing method on `Ferro\Client\Connection` hard-codes `readonly = true`, so a driver built on them would have reported a lost `INSERT … RETURNING` as **Retryable**, i.e. "provably did not apply", for a write whose fate is genuinely unknown. `Connection::fetchRaw()`/`streamRaw()` exist to let the CALLER declare the fate, the driver declares **write** for everything, and a read-only connection is an explicit `driverOptions['readonly' => true]` — configuration, never inference. Conservative by construction: it never costs safety. **What it DOES cost is stated in full, because it is more than retryability.** `readonly` is read in TWO places in `fate.rs`, and the second is the **57014 override** (`fate.rs:71-114`): with `!in_tx`, a cancelled or timed-out statement is `Cancelled{NonRetryable}` when the client declared `readonly` and `WriteUnconfirmed{Indeterminate}` when it did not. So under this driver **a plain `SELECT` killed by an operator's `statement_timeout` — a normal production setting — surfaces as `Ferro\DBAL\IndeterminateWriteException`**, "your write may or may not have landed", for a statement that wrote nothing. That is cry-wolf on the one exception that must never be routinely retried, and it is a NEW failure shape rather than a lost one: the same statement through the native client API gets a clean "statement cancelled or timed out". Two consequences are discharged in this same change set. (1) The property `run_streamed_exec`'s docblock states — "A streamed READ never becomes `Indeterminate` (classify_fate routes it by `readonly`)" — was never unconditional, and `CLAUDE.md`'s M1-S5 paragraph restated it without the condition; **both are amended here** to say that the guarantee belongs to a client that DECLARES `readonly`, and that the M1-S8b Doctrine driver deliberately does not. (2) It is listed in `docs/known-incompatibilities.md` as a drop-in behaviour difference an operator will hit, and pinned by a live guard (`ExceptionMappingLiveTest::testACancelledSelectIsIndeterminateOnAWriteConnectionAndNotOnAReadonlyOne`) that asserts BOTH cells — with `driverOptions['readonly' => true]` a self-cancelled `SELECT` is not an `IndeterminateWriteException`, and on the default write connection it is — so the cost is falsifiable and cannot be silently "fixed" later by inferring read-vs-write from SQL text.
 
   **(ad) `setTransactionIsolation()` is captured TYPED in an optional `wrapperClass`, and the raw statement is REFUSED (M1-S8b Task 13).** Doctrine's own implementation runs `executeStatement($platform->getSetTransactionIsolationSQL($level))` — `SET SESSION TRANSACTION ISOLATION LEVEL …` on MySQL, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL …` on PostgreSQL — which are exactly the two forms (s) names as FORBIDDEN. On a transaction-mode pool the statement lands on an arbitrary pooled connection, taints it, and hygiene wipes it before the next `BEGIN`: it reports SUCCESS and changes nothing, while `getTransactionIsolation()` keeps returning the level Doctrine cached. (s) also records that the obvious cross-tenant test CANNOT FAIL, because hygiene masks the leak in both directions. `Ferro\DBAL\Wrapper\FerroConnection` overrides the method, captures the level as a typed enum ABOVE the SQL layer, emits nothing, and hands it to the driver connection to ride `BeginRequest.isolation` on the next transaction — where `compose_begin_sql` composes the correct per-transaction form for the dialect. No SQL is inspected, rewritten or generated: the wrapper simply never emits the statement. Without the wrapper the driver REFUSES the statement, prefix-anchored on the two fixed platform-generated strings (anchored specifically so a literal inside an `INSERT` cannot trip it — a false refusal on ordinary SQL would be worse than the bug), with a message naming the one-line configuration fix. `READ UNCOMMITTED` maps to `ReadCommitted`, per `Ferro\Protocol\Isolation`'s own documented mapping — a genuine tightening on MySQL, never a weakening, and listed in `docs/known-incompatibilities.md`. This slice is also the **first real caller** of the hand-duplicated `Isolation` enum that (w) describes, so its cross-language lock is finally exercised by behaviour rather than merely present.
 ```
 
-- [ ] **Step 10: Correct `CLAUDE.md` and the falsified docblock**
+- [ ] **Step 10: Correct `CLAUDE.md`, the engine docblock, and the falsified client docblock**
 
-`CLAUDE.md`'s closing "Next up" paragraph was written before S8a finished and is now doubly stale — it lists as carries several items S8a already closed (errno on the wire, pool metadata, the imperative transaction trio, the `I64` narrowing bind + `Kind::Domain` unwrap, `Ferro\Bytes`, dialect-aware isolation `BEGIN`) and it predates this slice entirely. Replace it with an M1-S8b summary in the same style as the other slice paragraphs, and make the new "Next up" list the things that are GENUINELY open: MySQL `query_stream` (§22.2 (n)), the tracker-clean hygiene `None`-skip (R2), `affected` on the stream terminal (a `/proto` change), the `TxNotFound` error code (a `/proto` change), a SQLite backend, and the ORM tier.
+**First, the claim §22.2 (ac) makes false.** Charter DoD: "the relevant SPEC section still tells the truth", and that obligation covers source docblocks that assert a property, because they are what the next reader trusts. Two places state, unconditionally, something that only holds for a client declaring `readonly`:
+
+In `engine/crates/ferrod/src/services/sql.rs` (the `abort_stream` docblock, `:1053`), replace:
+
+```rust
+/// then declare the ONE terminal via `classify_fate` under `ctx` (`sent: true` — the statement is
+/// dispatched; see [`run_streamed_exec`]'s doc). A streamed READ never becomes `Indeterminate`
+/// (classify_fate routes it by `readonly`).
+```
+
+with:
+
+```rust
+/// then declare the ONE terminal via `classify_fate` under `ctx` (`sent: true` — the statement is
+/// dispatched; see [`run_streamed_exec`]'s doc).
+///
+/// **A stream the CLIENT DECLARED `readonly` never becomes `Indeterminate`** — `classify_fate`
+/// routes it by that flag, and by nothing else: the engine performs no read/write inference (charter
+/// rule 6). The guarantee is therefore the client's to claim, not the engine's to provide. M1-S8b's
+/// Doctrine DBAL driver deliberately declares `readonly = false` for EVERY statement, because the
+/// DBAL 4 SPI carries no read/write signal at all, so under that driver a cancelled or
+/// `statement_timeout`-ed SELECT DOES classify `Indeterminate` (SPEC §22.2 (ac)). That is the
+/// documented cost of the safe default, not a defect here.
+```
+
+and in `CLAUDE.md`'s M1-S5 paragraph, change "a streamed **read** is never `Indeterminate`" to "a streamed read **whose client declared it `readonly`** is never `Indeterminate` (the engine never infers; §22.2 (ac) records what that costs the DBAL tier, which declares every statement a write)".
+
+**Then the stale "Next up" paragraph.** `CLAUDE.md`'s closing paragraph was written before S8a finished and is now doubly stale — it lists as carries several items S8a already closed (errno on the wire, pool metadata, the imperative transaction trio, the `I64` narrowing bind + `Kind::Domain` unwrap, `Ferro\Bytes`, dialect-aware isolation `BEGIN`) and it predates this slice entirely. Replace it with an M1-S8b summary in the same style as the other slice paragraphs, and make the new "Next up" list the things that are GENUINELY open: MySQL `query_stream` (§22.2 (n)), the tracker-clean hygiene `None`-skip (R2), `affected` on the stream terminal (a `/proto` change), the `TxNotFound` error code (a `/proto` change), a SQLite backend, and the ORM tier.
 
 In `php/client/src/Client/Value/RawStringValuePolicy.php`, fix the falsified claim (hazard 36): `AbstractPlatform::getDateTimeFormatString()` does **not** reject a fractional `TIMESTAMP` — `DateTimeType::convertToPHPValue` falls back to `new DateTime($value)` — so only the two `datetimetz` claims stand. Cite the measurement and point at `Ferro\DBAL\Value\DbalValuePolicy` as the tier that owns the conversion.
 
@@ -7208,6 +7921,8 @@ Expected: all green.
 1. In `testkit/dbal/bootstrap.php`, delete the `instanceof Ferro\Client\Connection` block, and in the generated phpunit config replace `db_driverClass` with `db_driver=pdo_sqlite`. Re-run `./testkit/dbal-suite.sh`. Expected: it RUNS and reports a substantial number of PASSING tests — **against in-memory SQLite, with zero Ferro contact**. That is the false-green hazard reproduced deliberately. Restore both, re-run, and confirm the contact line prints and the run is genuinely Ferro's.
 2. In `testkit/dbal-suite.sh`, remove the `grep -q 'db_driverClass is not set'` patch verification and corrupt the `cp` source path. Re-run. Expected: the runner fails loudly at the grep once restored; without it, the run silently uses the upstream `TestUtil` and falls back to SQLite. Restore.
 3. Add a `trap 'docker compose … down -v' EXIT` to the runner and run it. Expected: **the shared databases are destroyed.** Do NOT actually perform this mutation — it is recorded here as the reason the runner has no such trap, and hazard 71 is why. Verify by reading instead: `grep -n 'down' testkit/dbal-suite.sh` must return nothing.
+4. **The reset.** Run the PG invocation with `--no-reset` twice in a row after a normal run, and diff the result lines. Expected: they DIFFER, and the second is worse — the leftover-state degradation reproduced deliberately (the reviewer measured 23 → 33 errors this way against a driver with zero defects). Then run twice WITH the reset: identical. This is the mutation that proves the recorded number means something. Note the runner already prints `[ferro] reset: SKIPPED (--no-reset) — this run's numbers MUST NOT be recorded`, so a `--no-reset` log can never be mistaken for a recordable one.
+5. Point `FERRO_DBAL_DSN` at the shared `ferro` database instead of `doctrine_tests`, and run `\dt` in it afterwards. Expected: dozens of `dbal_*`/`test_*` tables now sitting in the database every other live suite uses. Do NOT actually perform this mutation either — verify by reading: `grep -n 'doctrine_tests' testkit/dbal-suite.sh` must show the default DSN, and no invocation anywhere in this plan may name `/ferro` as the suite's database.
 
 - [ ] **Step 13: Commit**
 
