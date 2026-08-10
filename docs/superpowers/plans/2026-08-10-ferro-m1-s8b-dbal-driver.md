@@ -173,6 +173,10 @@ The M1-S7 review found nine guards that were structurally incapable of failing; 
 83. **`readonly` is read TWICE in `fate.rs`, and the second place is the 57014 override.** `engine/crates/ferrod/src/services/fate.rs:71-114`: `in_tx → TxDeadline{Retryable}`; `!in_tx && readonly → Cancelled{NonRetryable}`; `!in_tx && !readonly && sent → WriteUnconfirmed{INDETERMINATE}`. So the driver's "declare write for everything" decision (hazard 22) does not merely cost retryability on a lost connection — it turns **every server-side-cancelled or `statement_timeout`-ed SELECT into an `IndeterminateWriteException`**. Task 11 pins both cells; §22.2 (ac), the engine docblock at `sql.rs:1053` and `CLAUDE.md`'s S5 paragraph are all amended by Task 14, because all three currently state "a streamed READ never becomes `Indeterminate`" without the client-side condition.
 84. **The upstream `TestUtil` methods the allowlisted tests actually call** (MEASURED with `grep -rhoE 'TestUtil::[a-zA-Z]+'` over the allowlisted paths of the real 4.4.4 clone): `isDriverOneOf` ×13, **`getPrivilegedConnection` ×2** (`tests/Functional/TransactionTest.php:112`, `tests/Functional/Schema/OracleSchemaManagerTest.php:113`), `getConnectionParams` ×2, `getConnection` ×1. `getPrivilegedConnectionParameters` is **private** upstream (`tests/TestUtil.php:176`) and nothing outside the class calls it. Elsewhere in `tests/`: `isPdoStringifyFetchesEnabled` ×4 and `generateResultSetQuery` ×1 (`tests/Functional/Connection/FetchTest.php:20`) — the latter is a real 14-line SQL generator, not a policy answer.
 85. **Upstream's `initializeDatabase()` is the functional suite's ONLY reset, and removing it makes the number non-reproducible.** MEASURED against a CORRECT driver (stock `PDO\PgSQL` selected by `driverClass`, i.e. zero driver defects) on live PG 17, running the plan's exact allowlist three times and changing ONLY `TestUtil`: upstream → `Errors 0, Failures 0`; v1's replacement → `Errors 23, Failures 3`; the SAME command again → `Errors 33, Failures 1`; upstream restored → `0/0`. The dominant modes are all leftover state (11× a leftover SEQUENCE reaching a name filter as a `Schema\Sequence`, 9× `TableExistsException`, 4× duplicate schema, 3× `Dependent objects still exist` because upstream's `dropTableIfExists` issues a plain `DROP TABLE`, 1× duplicate type). A reset is therefore a HARD precondition of recording a number.
+86. **`FakeSession::lastRequest()` returns an ASSOCIATIVE array `{service, method, payload}`, not a list** (`php/client/tests/Support/FakeSession.php`). A list-destructure `[, , $payload] = ...` binds `$payload = null` and emits three undefined-key warnings, and the ExecRequest decode then fails on an empty string — i.e. a test that fails for the WRONG REASON, which is indistinguishable from the guard working until you read the message. Use `$session->lastRequest()['payload']`. Found during M1-S8b Task 1 execution; v1 and v2 of this plan both had the wrong form in four snippets, now corrected.
+
+87. **Decode a recorded request with `PurePacker`, never `ExtPacker`.** `ExtPacker::unpack` consumes the whole buffer regardless of the offset it is handed, so an offset-based decode silently reads the wrong frame; `PurePacker` honours the offset. The established idiom is `ConnectionImperativeTxTest`'s. Found during Task 1 execution; applies to every later PHP task that asserts on an encoded request.
+
 
 ### Definition of done (charter DoD, EVERY task)
 
@@ -368,7 +372,7 @@ final class RawFetchTest extends TestCase
 
         $conn->fetchRaw('INSERT INTO t (v) VALUES (1) RETURNING id', [], $readonly);
 
-        [, , $payload] = $session->lastRequest();
+        $payload = $session->lastRequest()['payload'];
         $off = 0;
         $req = ExecRequest::mapFromWire((array) PackerFactory::forEncode()->unpack($payload, $off));
         self::assertSame($readonly, $req['readonly'], 'fetchRaw must send the caller-chosen fate flag verbatim');
@@ -410,7 +414,7 @@ final class RawFetchTest extends TestCase
 
         $conn->fetchRaw('DELETE FROM t', [], false, false);
 
-        [, , $payload] = $session->lastRequest();
+        $payload = $session->lastRequest()['payload'];
         $off = 0;
         $req = ExecRequest::mapFromWire((array) PackerFactory::forEncode()->unpack($payload, $off));
         self::assertSame(1, $req['fetch'], 'fetch:none is 1 (ExecCodec::FETCH_NONE)');
@@ -664,7 +668,9 @@ Expected: PASS (3 tests).
 
 1. In `Connection::fetchRaw`, hard-code `true` in place of `$readonly`. Re-run `tests/Unit/RawFetchTest.php`. Expected: RED on `testTheCallerChosenReadonlyFlagReachesTheWire` for the "declared write" row. Restore.
 2. In `Connection::fetchRaw`, return `$this->codec->assocRows($this->dispatch(...))`-shaped rows instead of the raw ones (i.e. `array_combine` them). Re-run. Expected: RED on `testItReturnsPositionalRowsAndTheAffectedCountSeparately` (the duplicate `x` column collapses). Restore.
-3. In `Connection::poolInfo`, cache the result in a property on first call. Re-run the whole client suite. Expected: still green — **this mutation does NOT go red, and that is the point**: the caching hazard is unobservable offline. Record it, and note that Task 6's live nil-version test is where it becomes observable. Restore.
+3. In `Connection::poolInfo`, cache the result in a property on first call. Re-run the whole client suite. Expected: **RED** on `testPoolInfoIsReReadAfterAReconnectSwapsTheSession`. Restore.
+
+   > **Corrected during execution — the earlier text here was wrong, and wrong in the dangerous direction.** v2 said this mutation "does NOT go red, and that is the point: the caching hazard is unobservable offline", and budgeted the coverage to Task 6's live test. It IS observable offline: `Connection::session()` resolves through the `ReconnectLoop`, whose `reconnect()` swaps the session object from an injected factory, so two `FakeSession`s carrying different `PoolInfo` server versions plus a `Backoff` with a no-op sleep reproduce a restarted or upgraded backend with no socket at all. A documented no-op mutation is a guard that cannot fail wearing a justification, which is species (a) with paperwork — so Task 1 added the driving test instead. **Consequence for Task 6:** do not re-budget this as "only observable live", and rely on `poolInfo()` genuinely re-reading after a reconnect — that is now mutation-proven, so no invalidation plumbing is needed.
 
 - [ ] **Step 10: Commit**
 
@@ -746,7 +752,7 @@ final class RawStreamTest extends TestCase
         $stream = $conn->streamRaw('INSERT INTO t (v) VALUES (1) RETURNING id', [], false);
         self::assertSame([], $stream->columns(), 'an immediate terminal advertises no columns');
 
-        [, , $payload] = $session->lastRequest();
+        $payload = $session->lastRequest()['payload'];
         $off = 0;
         $req = ExecRequest::mapFromWire((array) PackerFactory::forEncode()->unpack($payload, $off));
         self::assertFalse($req['readonly'], 'a streamed write must NOT be declared readonly');
@@ -1223,7 +1229,7 @@ final class ConnectionBeginIsolationTest extends TestCase
     /** @return array{pool:string,isolation:?int,readonly:bool} */
     private function sentBegin(FakeSession $session): array
     {
-        [, , $payload] = $session->lastRequest();
+        $payload = $session->lastRequest()['payload'];
         $off = 0;
         return BeginRequest::mapFromWire((array) PackerFactory::forEncode()->unpack($payload, $off));
     }
