@@ -4,6 +4,12 @@
 //! Proves — against real Dockerized MySQL 8 + MariaDB 11 — that:
 //!   * every scoped scalar round-trips `query` → `rowmap` (SIGNED bigint, double, text, blob, bool,
 //!     null), with the right `ColMeta` tags built off the prepared statement;
+//!   * **a BOUND `F64` reaches the server at full 64-bit width** — added in the M1-S8a review,
+//!     where a `Double((*f as f32) as f64)` mutation of the binder (a silent corrupt write of every
+//!     double a DBAL app binds) measured GREEN across this whole suite, because every F64 fixture in
+//!     the crate happened to be exactly f32-representable (`2.5` / `1.5`). The fixtures are now
+//!     f32-LOSSY by construction and compared on the BIT PATTERN
+//!     (`f64_bind_round_trip_is_bit_exact`);
 //!   * a still-deferred column type (`YEAR`, `BIT`, `ENUM`, `SET` — M1-S7 §22.2) is a LOUD
 //!     `Unsupported` — never a silent miscast — raised before the query runs (conn stays clean).
 //!     **REPOINTED in M1-S7:** this used to assert `BIGINT UNSIGNED` and `DECIMAL`, both of which
@@ -58,7 +64,9 @@ async fn scoped_scalars_round_trip(backend: &MysqlBackend, label: &str) {
 
     let params = [
         Value::I64(-42),
-        Value::F64(2.5),
+        // NOT `2.5`: an f32-clean double cannot witness a narrowing bind, which is exactly how this
+        // suite stayed green over one (M1-S8a review). See `f64_bind_round_trip_is_bit_exact`.
+        Value::F64(F32_LOSSY_DOUBLES[0]),
         Value::Text("héllo".to_string()),
         Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
         Value::Bool(true),
@@ -97,7 +105,7 @@ async fn scoped_scalars_round_trip(backend: &MysqlBackend, label: &str) {
         r.rows,
         vec![vec![
             Value::I64(-42),
-            Value::F64(2.5),
+            Value::F64(F32_LOSSY_DOUBLES[0]),
             Value::Text("héllo".to_string()),
             Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
             Value::Bool(true),
@@ -107,6 +115,140 @@ async fn scoped_scalars_round_trip(backend: &MysqlBackend, label: &str) {
          TINYINT(1), and a NULL)"
     );
 
+    conn.mysql.disconnect().await.ok();
+}
+
+/// Doubles whose nearest `f32` is a **different number** — the only F64 fixtures that can witness a
+/// narrowing bind (M1-S8a review). Mirrors `bind::tests::F32_LOSSY_DOUBLES`; kept in both places
+/// because an integration test cannot see a `#[cfg(test)]` const, and [`f32_lossy`] re-derives the
+/// property here rather than trusting the comment.
+const F32_LOSSY_DOUBLES: [f64; 6] = [
+    0.1 + 0.2,                // 0.30000000000000004; as f32 -> 0.30000001192092896
+    1.0 / 3.0,                // 0.3333333333333333;  as f32 -> 0.3333333432674408
+    123_456_789.123_456_79,   // as f32 -> 123456792
+    -1_234.567_890_123_456_7, // a NEGATIVE; as f32 -> -1234.5679931640625
+    f64::MAX,                 // as f32 -> inf
+    f64::MIN_POSITIVE,        // as f32 -> 0
+];
+
+/// Is `f`'s nearest `f32` a different number? The self-check that keeps [`F32_LOSSY_DOUBLES`]
+/// honest — a fixture that answers `false` proves nothing about the bind width.
+fn f32_lossy(f: f64) -> bool {
+    ((f as f32) as f64).to_bits() != f.to_bits()
+}
+
+/// A `Value` that must be exactly this double, compared on the **bit pattern** — no
+/// float-comparison slack, `-0.0` stays distinct from `0.0`, and `assert_eq!` on `Value` (which
+/// would use `f64: PartialEq`) is deliberately not what decides it.
+#[track_caller]
+fn assert_f64_bits(v: &Value, want: f64, what: &str) {
+    match v {
+        Value::F64(got) => assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{what}: expected the exact double {want:?}, got {got:?}"
+        ),
+        other => panic!("{what}: expected Value::F64({want:?}), got {other:?}"),
+    }
+}
+
+/// **The wrong-bytes bind guard for `F64` — LIVE, on both engines (M1-S8a review).**
+///
+/// Every F64 fixture in this crate was `2.5` / `1.5`, both exactly representable in `f32`, so
+/// mutating `bind::value_to_my`'s F64 arm to `MyValue::Double((*f as f32) as f64)` — a silent
+/// corrupt write of every double a DBAL app binds — measured GREEN across the entire live suite.
+/// The magnitudes in [`F32_LOSSY_DOUBLES`] cannot be narrowed invisibly, and every comparison below
+/// is on the BIT PATTERN.
+///
+/// This is the end-to-end half of a pair: `bind::tests::` pins the `MyValue` the binder builds,
+/// while this one pins what the SERVER actually stored — the only vantage point from which a width
+/// loss inside the driver's binary protocol, or in the read path, is observable at all.
+///
+/// The seed row is written as a TEXT LITERAL through `simple_query`, so the first read is an
+/// INDEPENDENT ORACLE rather than an echo of the bind path: if a magnitude fails to survive the
+/// server itself, that assertion fires first and names its own cause instead of being misattributed
+/// to the binder.
+async fn f64_bind_round_trip_is_bit_exact(backend: &MysqlBackend, label: &str) {
+    let mut conn = backend.connect().await.expect("connect");
+    backend
+        .simple_query(
+            &mut conn,
+            "CREATE TEMPORARY TABLE ferro_f64 (id BIGINT PRIMARY KEY, v DOUBLE)",
+        )
+        .await
+        .expect("create temp table");
+
+    for (i, f) in F32_LOSSY_DOUBLES.iter().copied().enumerate() {
+        assert!(
+            f32_lossy(f),
+            "[{label}] fixture {f:?} is exactly f32-representable, so it CANNOT witness a \
+             narrowing bind — replace it with one that can"
+        );
+        let seed_id = i as i64;
+        let echo_id = seed_id + 100;
+
+        // (1) ORACLE: the same double written as a text literal, never through `bind`. Rust's
+        // `{f:?}` is the shortest round-trippable decimal form, so the server parses back to the
+        // identical IEEE-754 double.
+        backend
+            .simple_query(
+                &mut conn,
+                &format!("INSERT INTO ferro_f64 (id, v) VALUES ({seed_id}, {f:?})"),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] seed literal {f:?}: {e:?}"));
+        let seeded = backend
+            .query(
+                &mut conn,
+                &format!("SELECT v FROM ferro_f64 WHERE id = {seed_id}"),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] read seed {f:?}: {e:?}"));
+        assert_f64_bits(
+            &seeded.rows[0][0],
+            f,
+            &format!(
+                "[{label}] the DOUBLE column + read path must carry {f:?} exactly BEFORE the bind \
+                 is judged (if this line fails the binder is not the cause)"
+            ),
+        );
+
+        // (2) THE CLAIM: the same double through the BIND path lands bit-identically.
+        backend
+            .query(
+                &mut conn,
+                "INSERT INTO ferro_f64 (id, v) VALUES (?, ?)",
+                &[Value::I64(echo_id), Value::F64(f)],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] bind of {f:?} failed: {e:?}"));
+        let bound_back = backend
+            .query(
+                &mut conn,
+                &format!("SELECT v FROM ferro_f64 WHERE id = {echo_id}"),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] read echo {f:?}: {e:?}"));
+        assert_f64_bits(
+            &bound_back.rows[0][0],
+            f,
+            &format!(
+                "[{label}] a BOUND double must reach the server at full 64-bit width — narrowing \
+                 it (e.g. through f32) is a silent corrupt write of every double a DBAL app binds"
+            ),
+        );
+        assert_eq!(
+            bound_back.cols[0].tag,
+            tag::F64,
+            "[{label}] a DOUBLE column stays the F64 tag"
+        );
+    }
+    println!(
+        "[{label}] {} f32-lossy doubles bind bit-exactly",
+        F32_LOSSY_DOUBLES.len()
+    );
     conn.mysql.disconnect().await.ok();
 }
 
@@ -584,6 +726,7 @@ async fn checkout_force_taint_on_query_error(url: &str, label: &str) {
 async fn run_query_suite(url: &str, label: &str) {
     let backend = MysqlBackend::new(url);
     scoped_scalars_round_trip(&backend, label).await;
+    f64_bind_round_trip_is_bit_exact(&backend, label).await;
     out_of_scope_column_is_unsupported(&backend, label).await;
     bind_arity_mismatch_is_known_fate(&backend, label).await;
     last_insert_id_after_insert(&backend, label).await;

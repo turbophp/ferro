@@ -322,6 +322,68 @@ fn bind_error(message: String) -> PoolError {
 mod tests {
     use super::*;
 
+    /// Doubles whose nearest `f32` is a **different number**. These are the only F64 fixtures that
+    /// can witness a narrowing bind (M1-S8a review).
+    ///
+    /// Every F64 fixture this crate shipped with was `2.5` / `1.5` — both exactly representable in
+    /// `f32` — so mutating [`value_to_my`]'s F64 arm to `MyValue::Double((*f as f32) as f64)`, a
+    /// silent corrupt write of every double a DBAL app binds, measured GREEN across the whole live
+    /// suite. [`f32_lossy`] is asserted on every entry before it is used, so a future edit cannot
+    /// quietly swap one for a benign magnitude and re-open the blind spot.
+    ///
+    /// The spread is deliberate: a 17-significant-digit value (the classic `0.1 + 0.2`), a
+    /// non-terminating binary fraction, a large integer plus a fraction, a negative, and the two
+    /// magnitude extremes — `f64::MAX` (which narrows to `inf`) and `f64::MIN_POSITIVE` (which
+    /// narrows to `0`). An exponent-width bug is a different bug from a mantissa bug.
+    const F32_LOSSY_DOUBLES: [f64; 6] = [
+        0.1 + 0.2,                // 0.30000000000000004; as f32 -> 0.30000001192092896
+        1.0 / 3.0,                // 0.3333333333333333;  as f32 -> 0.3333333432674408
+        123_456_789.123_456_79,   // as f32 -> 123456792
+        -1_234.567_890_123_456_7, // a NEGATIVE; as f32 -> -1234.5679931640625
+        f64::MAX,                 // as f32 -> inf
+        f64::MIN_POSITIVE,        // as f32 -> 0
+    ];
+
+    /// Is `f`'s nearest `f32` a different number? The self-check that keeps [`F32_LOSSY_DOUBLES`]
+    /// honest — a fixture that answers `false` proves nothing about the bind width, so the tests
+    /// refuse it rather than passing decoratively.
+    fn f32_lossy(f: f64) -> bool {
+        ((f as f32) as f64).to_bits() != f.to_bits()
+    }
+
+    /// The F64 bind, compared on the **bit pattern** — no float-comparison slack, and `-0.0` stays
+    /// distinguishable from `0.0`.
+    #[track_caller]
+    fn assert_binds_exact_double(f: f64, my: &MyValue) {
+        match my {
+            MyValue::Double(got) => assert_eq!(
+                got.to_bits(),
+                f.to_bits(),
+                "F64({f:?}) must bind as the EXACT double, got {got:?} — a narrowing through f32 \
+                 is a silent corrupt write of every double bound (M1-S8a review)"
+            ),
+            other => panic!("F64({f:?}) must bind as MyValue::Double, got {other:?}"),
+        }
+    }
+
+    /// **The F64 bind carries the full 64-bit double — a narrowing through `f32` is RED here.**
+    ///
+    /// See [`F32_LOSSY_DOUBLES`] for why this test has to exist: the pre-existing fixtures were
+    /// f32-clean, so the whole suite was blind to a corrupting bind. The live half of this guard
+    /// (bind -> real `DOUBLE` column -> read, bit-exact, on MySQL 8.4 AND MariaDB 11.8) is
+    /// `tests/query_it.rs::f64_bind_round_trip_is_bit_exact`; this one bites without a database.
+    #[test]
+    fn f64_binds_the_exact_double_never_narrowed_through_f32() {
+        for f in F32_LOSSY_DOUBLES {
+            assert!(
+                f32_lossy(f),
+                "{f:?} is exactly f32-representable, so it CANNOT witness a narrowing bind — \
+                 replace it with a fixture that can"
+            );
+            assert_binds_exact_double(f, &value_to_my(&Value::F64(f), 0).expect("a double binds"));
+        }
+    }
+
     #[test]
     fn arity_match_ok_mismatch_is_known_fate_unsupported() {
         assert!(validate_arity(&[Value::I64(1)], 1).is_ok());
@@ -362,7 +424,9 @@ mod tests {
             Value::Null,
             Value::Bool(true),
             Value::I64(-200),
-            Value::F64(1.5),
+            // NOT `1.5`: an f32-clean fixture here cannot witness a narrowing bind (see
+            // `F32_LOSSY_DOUBLES`), and `matches!(.., Double(_))` alone never could either.
+            Value::F64(F32_LOSSY_DOUBLES[0]),
             Value::Text("hi".to_string()),
             Value::Bytes(vec![0xde, 0xad]),
         ];
@@ -375,7 +439,7 @@ mod tests {
                     "Bool(true) binds as Int(1)"
                 );
                 assert!(matches!(vs[2], MyValue::Int(-200)));
-                assert!(matches!(vs[3], MyValue::Double(_)));
+                assert_binds_exact_double(F32_LOSSY_DOUBLES[0], &vs[3]);
                 assert!(
                     matches!(vs[4], MyValue::Bytes(_)),
                     "Text binds as a byte string"
@@ -396,7 +460,8 @@ mod tests {
             Value::Null,
             Value::Bool(true),
             Value::I64(-200),
-            Value::F64(1.5),
+            // f32-lossy on purpose — see `F32_LOSSY_DOUBLES` and the `vs[3]` assertion below.
+            Value::F64(F32_LOSSY_DOUBLES[0]),
             Value::Text("hi".to_string()),
             Value::Bytes(vec![0xde, 0xad]),
             Value::U64(u64::MAX),
@@ -421,6 +486,9 @@ mod tests {
                         "param {i} ({v:?}) NULL-ness must mirror the canonical value"
                     );
                 }
+                // F64 must survive at FULL double width — the sibling of the U64 claim below, and
+                // the one this suite used to be blind to (M1-S8a review).
+                assert_binds_exact_double(F32_LOSSY_DOUBLES[0], &vs[3]);
                 // U64 above i64::MAX must survive as an UNSIGNED driver value, not wrap to Int.
                 assert!(
                     matches!(vs[6], MyValue::UInt(u64::MAX)),

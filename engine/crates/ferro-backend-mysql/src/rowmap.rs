@@ -824,11 +824,22 @@ mod tests {
                         Value::U64(u64::MAX),
                     ),
                 ],
-                MyKind::F64 => vec![(
-                    col(ColumnType::MYSQL_TYPE_DOUBLE, NO_FLAGS, 22, BIN),
-                    MyValue::Double(2.5),
-                    Value::F64(2.5),
-                )],
+                // The second case is f32-LOSSY on purpose (M1-S8a review): `2.5` alone is exactly
+                // representable in `f32`, so it cannot witness a width loss anywhere on the F64
+                // path — the blindness that let a narrowing BIND ship green. `0.1 + 0.2` narrows
+                // to `0.30000001192092896`, so a truncating extractor is RED here.
+                MyKind::F64 => vec![
+                    (
+                        col(ColumnType::MYSQL_TYPE_DOUBLE, NO_FLAGS, 22, BIN),
+                        MyValue::Double(2.5),
+                        Value::F64(2.5),
+                    ),
+                    (
+                        col(ColumnType::MYSQL_TYPE_DOUBLE, NO_FLAGS, 22, BIN),
+                        MyValue::Double(0.1 + 0.2),
+                        Value::F64(0.1 + 0.2),
+                    ),
+                ],
                 MyKind::Text => vec![(
                     col(
                         ColumnType::MYSQL_TYPE_VAR_STRING,
