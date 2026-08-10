@@ -8,9 +8,9 @@ use Doctrine\DBAL\Driver\API\PostgreSQL\ExceptionConverter as PostgreSQLExceptio
 use Doctrine\DBAL\Platforms\AbstractPlatform;
 use Doctrine\DBAL\ServerVersionProvider;
 use Ferro\Client\RetryPolicy;
-use Ferro\Client\Value\RawStringValuePolicy;
 use Ferro\DBAL\Exception\BackendFamilyUnknown;
 use Ferro\DBAL\Exception\DriverException;
+use Ferro\DBAL\Value\DbalValuePolicy;
 use Ferro\Ferro;
 
 /**
@@ -39,11 +39,13 @@ final class Driver implements DriverInterface
         // RetryPolicy::none() is deliberate and is what `Ferro\Client\Connection::begin()`'s own
         // docblock tells a driver to use: DBAL (or the application above it) owns the retry
         // decision, and the client's autocommit read-retry must not double up with it.
-        // RawStringValuePolicy hands up the canonical wire text verbatim — the driver-native shape
-        // a DBAL type layer expects. Task 9 replaces it with the DBAL-specific policy.
+        // The value policy is the driver's TYPE BOUNDARY: canonical wire text for the tags DBAL
+        // parses correctly, a per-family re-render for TIMESTAMPTZ (which it cannot parse at all),
+        // and a loud refusal for the values it would parse into something ELSE.
+        $policy = new DbalValuePolicy();
         $ferro = $o->socketPath !== null
-            ? Ferro::connect($o->socketPath, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, new RawStringValuePolicy())
-            : Ferro::connectTcp((string) $o->host, $o->port, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, new RawStringValuePolicy());
+            ? Ferro::connect($o->socketPath, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $policy)
+            : Ferro::connectTcp((string) $o->host, $o->port, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $policy);
 
         $info = $ferro->poolInfo();
         if ($info === null) {
@@ -53,6 +55,10 @@ final class Driver implements DriverInterface
                 $o->pool,
             ));
         }
+        // The family is only knowable AFTER the handshake, and the policy is a CONSTRUCTOR argument
+        // of the connection — hence the two-step wiring. Nothing has decoded a cell yet: HELLO_ACK
+        // carries no TypedValues, and no user statement can have run.
+        $policy->bindBackend($info->kind);
         $this->kind = $info->kind;
         return new Connection($ferro, $o->pool, $info->kind, $o->readonly);
     }
