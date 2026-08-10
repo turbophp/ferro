@@ -4,7 +4,6 @@ namespace Ferro\DBAL;
 
 use Doctrine\DBAL\Driver as DriverInterface;
 use Doctrine\DBAL\Driver\API\ExceptionConverter as ExceptionConverterInterface;
-use Doctrine\DBAL\Driver\API\PostgreSQL\ExceptionConverter as PostgreSQLExceptionConverter;
 use Doctrine\DBAL\Platforms\AbstractPlatform;
 use Doctrine\DBAL\ServerVersionProvider;
 use Ferro\Client\RetryPolicy;
@@ -76,11 +75,15 @@ final class Driver implements DriverInterface
         return PlatformVersion::platformFor($kind, $version);
     }
 
+    /**
+     * The family is the one learned at the last {@see connect}. Before any connect there is nothing
+     * to convert yet — Doctrine only asks for the converter when a driver exception has already
+     * been raised, which requires a connection — so PostgreSQL's table is a harmless default here
+     * and, unlike a PLATFORM, choosing it wrongly cannot change any SQL that is emitted.
+     */
     public function getExceptionConverter(): ExceptionConverterInterface
     {
-        // Task 11 replaces this with Ferro\DBAL\ExceptionConverter, which intercepts the §9.2
-        // Indeterminate branch and then delegates to the STOCK per-family converter.
-        return new PostgreSQLExceptionConverter();
+        return new ExceptionConverter($this->kind ?? PlatformVersion::KIND_POSTGRES);
     }
 
     /** The backend family learned at the last {@see connect}, or null. */
