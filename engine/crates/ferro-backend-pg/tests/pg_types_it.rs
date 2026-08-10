@@ -1279,6 +1279,21 @@ async fn s8a_narrowing_and_domain_binds_round_trip() {
 
     const DOM_COLS: &str = "dom, dtext, dbool, dbytea, dfloat, dnested";
 
+    // M1-S8a review F3a: the `float8` column carries a magnitude that is NOT exactly representable
+    // in `f32`. Before this, the only doubles this whole live suite ever bound were `1.5` and
+    // `2.25` — both exact in `f32` — so an encoder that truncated every `float8` param through
+    // `f32` round-tripped byte-identically and the acceptance stayed green (measured). `0.1 + 0.2`
+    // is `0x3FD3333333333334`; through `f32` it comes back `0x3FD3333340000000`, which fails the
+    // read-back equality below. The offline byte fixture
+    // (`bind::tests::s8a_int_and_float_binds_write_the_exact_target_width_bytes`) pins the same
+    // property one layer down, on the exact wire bytes.
+    let non_f32 = 0.1_f64 + 0.2_f64;
+    assert_ne!(
+        non_f32,
+        f64::from(non_f32 as f32),
+        "the fixture value must genuinely survive no f32 round trip, or this test is decorative"
+    );
+
     // ---- (a) the narrowing bind + every domain base, in ONE statement.
     co.query(
         &format!(
@@ -1290,7 +1305,7 @@ async fn s8a_narrowing_and_domain_binds_round_trip() {
             Value::I64(2_147_483_647),
             Value::I64(i64::MAX),
             Value::F64(1.5),
-            Value::F64(2.25),
+            Value::F64(non_f32),
             // dom (int4), dtext, dbool, dbytea, dfloat, dnested (domain over domain over int4)
             Value::I64(11),
             Value::Text("hello".into()),
@@ -1320,7 +1335,7 @@ async fn s8a_narrowing_and_domain_binds_round_trip() {
             Value::I64(2_147_483_647),
             Value::I64(i64::MAX),
             Value::F64(1.5),
-            Value::F64(2.25),
+            Value::F64(non_f32),
             Value::I64(11),
             Value::Text("hello".into()),
             Value::Bool(true),
@@ -1500,5 +1515,269 @@ impl<T: std::fmt::Debug> UnwrapErrOrPanic<T> for Result<T, PoolError> {
             Err(e) => e,
             Ok(v) => panic!("`{what}` unexpectedly succeeded: {v:?}"),
         }
+    }
+}
+
+// =================================================================================================
+// M1-S8a whole-branch review, finding F1: the hygiene-vs-driver STATEMENT-CACHE COHERENCE gate.
+//
+// `ResetProfile::Full` runs `DISCARD ALL`, which includes `DEALLOCATE ALL`. That destroys the
+// prepared statements `tokio-postgres` caches internally for TYPEINFO lookups (the `pg_type` query
+// it issues to resolve an OID it does not know natively) — and the driver does not learn they are
+// gone, so the NEXT typeinfo lookup on that connection dies with a bare
+// `26000 prepared statement "sN" does not exist`, permanently, for that connection
+// (SPEC §22.2 (m) + `docs/followups/2026-08-06-discard-all-typeinfo-cache-poisoning.md`).
+//
+// Before M1-S8a this was a corner nobody was told to use: a DOMAIN-typed parameter was refused as
+// `Unsupported`, and every shipped type maps to a builtin OID (which never performs a typeinfo
+// lookup). S8a made a DOMAIN parameter SUPPORTED, and `stmt.params()` reports a domain's OWN oid
+// where `RowDescription` resolves it to the base — so an ORDINARY supported WRITE now performs a
+// typeinfo lookup.
+//
+// Measured on this testkit's PG 17 (`pg_prepared_statements.parameter_types`), so the trigger shape
+// below is not guesswork: `INSERT INTO t (domcol) VALUES ($1)` -> `{zz_d}`,
+// `UPDATE t SET domcol = $1` -> `{zz_d}`, `SELECT $1::zz_d` -> `{zz_d}`, but
+// `WHERE domcol = $1` -> `{integer}` (PG resolves the comparison to the base). Two writes into two
+// DIFFERENT domain columns across one recycle is all it takes — ordinary ORM traffic for any schema
+// with domain columns.
+//
+// The two tests below pin BOTH ways the server-side prepared statements can vanish under a driver
+// that still holds handles to them:
+//   * the pool's own `Full` hygiene profile (`s8a_f1_*_full_hygiene_reset`), and
+//   * a USER-issued `DISCARD ALL`, which the S2 assist lexer deliberately does NOT taint
+//     (`rules.rs`: `RESET`/`DISCARD` move session state toward default), so the connection is
+//     recycled with the `Targeted` profile and the poisoning would otherwise be invisible to the
+//     `Full` arm's fix (`s8a_f1_*_user_issued_discard_all`).
+// =================================================================================================
+
+/// Reads a single-cell `int8` result through the GUARDED `Checkout::query` (so the RFQ pin
+/// authority fires) — `SELECT count(*)::int8` / `SELECT pg_backend_pid()::int8`.
+async fn scalar_i64(co: &mut Checkout<PgBackend>, sql: &str) -> i64 {
+    let r = co
+        .query(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("Checkout::query {sql:?} failed: {e:?}"));
+    match r.rows.first().and_then(|row| row.first()) {
+        Some(Value::I64(n)) => *n,
+        other => panic!("expected one I64 cell from {sql:?}, got {other:?}"),
+    }
+}
+
+/// Counts the prepared statements OPEN on this backend session, excluding the probe itself.
+///
+/// This sees the driver's cached TYPEINFO statement (protocol-level prepares appear in
+/// `pg_prepared_statements` with `from_sql = false`), which is the thing `DEALLOCATE ALL` destroys
+/// behind the driver's back. The `NOT LIKE` clause excludes this very statement — a prepared
+/// statement is registered BEFORE it executes, so an unfiltered count would always include itself
+/// and could never reach 0.
+async fn open_prepared_statements(co: &mut Checkout<PgBackend>) -> i64 {
+    scalar_i64(
+        co,
+        "SELECT count(*)::int8 FROM pg_prepared_statements \
+         WHERE statement NOT LIKE '%pg_prepared_statements%'",
+    )
+    .await
+}
+
+/// **F1, arm 1 — the pool's own `Full` profile.** Two DISTINCT domain oids separated by a taint on
+/// ONE pooled connection.
+///
+/// Every step is observable, so this cannot pass for the wrong reason:
+/// * `max_size = 1` + an identical `pg_backend_pid()` across the two checkouts — a fresh connection
+///   would carry a fresh, unpoisoned driver cache and make round 2 a false green;
+/// * a raw `PREPARE` is both the taint (`PinTrigger::Prepare` → `ResetProfile::Full`) AND the
+///   observable that proves `DEALLOCATE ALL` really ran: checkout 2 asserts the named statement is
+///   gone. Without that assertion the test would still pass if the pool had silently stopped
+///   running the full profile at all, which is the opposite of what it claims to cover;
+/// * round 2 binds a **distinct** domain. Repeating domain A would short-circuit on the driver's
+///   own oid→`Type` cache and never re-issue the typeinfo query (measured: ROUND4 of the review
+///   repro is `Ok` even unfixed);
+/// * round 3 uses a THIRD brand-new domain with NO further taint, pinning the follow-up doc's
+///   corrected characterisation — the poisoning was PERMANENT, not order-dependent.
+#[tokio::test(flavor = "multi_thread")]
+async fn s8a_f1_distinct_domain_oids_survive_a_full_hygiene_reset() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout 1");
+        for stmt in [
+            "DROP TABLE IF EXISTS ferro_ti_t",
+            "DROP DOMAIN IF EXISTS ferro_ti_a CASCADE",
+            "DROP DOMAIN IF EXISTS ferro_ti_b CASCADE",
+            "DROP DOMAIN IF EXISTS ferro_ti_c CASCADE",
+            "CREATE DOMAIN ferro_ti_a AS int4",
+            "CREATE DOMAIN ferro_ti_b AS int4",
+            "CREATE DOMAIN ferro_ti_c AS int4",
+            "CREATE TABLE ferro_ti_t (a ferro_ti_a, b ferro_ti_b, c ferro_ti_c)",
+        ] {
+            co.exec(stmt)
+                .await
+                .unwrap_or_else(|e| panic!("setup `{stmt}`: {e:?}"));
+        }
+
+        // ROUND 1 — a param typed as domain A. `stmt.params()` reports A's OWN oid (PG resolves a
+        // domain in `RowDescription`, never in the parameter list), so `prepare` performs a
+        // typeinfo lookup and the driver CACHES the prepared typeinfo statement.
+        co.query("INSERT INTO ferro_ti_t (a) VALUES ($1)", &[Value::I64(1)])
+            .await
+            .expect("round 1: a param of domain A must bind");
+        assert!(
+            open_prepared_statements(&mut co).await >= 1,
+            "the typeinfo lookup must have left a cached prepared statement open — without it \
+             there is nothing for DEALLOCATE ALL to destroy and this test proves nothing"
+        );
+
+        co.exec("PREPARE ferro_ti_probe AS SELECT 1")
+            .await
+            .expect("PREPARE (the taint AND the DEALLOCATE ALL observable)");
+        assert!(
+            co.tainted(),
+            "a raw PREPARE must taint (PinTrigger::Prepare); that taint is what selects the FULL \
+             profile, which is this test's entire premise"
+        );
+
+        scalar_i64(&mut co, "SELECT pg_backend_pid()::int8").await
+    };
+
+    let mut co = pool.checkout().await.expect("checkout 2");
+    assert_eq!(
+        pid1,
+        scalar_i64(&mut co, "SELECT pg_backend_pid()::int8").await,
+        "max_size=1 must hand back the SAME backend pid — a fresh connection has a fresh, \
+         unpoisoned driver cache and would make round 2 below a false green"
+    );
+    assert_eq!(
+        scalar_i64(
+            &mut co,
+            "SELECT count(*)::int8 FROM pg_prepared_statements WHERE name = 'ferro_ti_probe'"
+        )
+        .await,
+        0,
+        "the FULL profile's DISCARD ALL (hence DEALLOCATE ALL) must have run on this recycled \
+         connection — otherwise this test is not exercising the poisoning path at all"
+    );
+
+    // ROUND 2 — a DISTINCT domain oid, so the driver's oid→Type cache misses and it must re-issue
+    // the typeinfo query THROUGH the statement `DEALLOCATE ALL` just destroyed. Pre-fix this was
+    // `26000 prepared statement "sN" does not exist`.
+    co.query("INSERT INTO ferro_ti_t (b) VALUES ($1)", &[Value::I64(2)])
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "round 2: a DISTINCT domain oid on a connection recycled through the FULL hygiene \
+                 profile must still bind — got {e:?}"
+            )
+        });
+    drop(co);
+
+    // ROUND 3 — a THIRD brand-new domain, with NO further taint (so the recycle runs the Targeted
+    // profile). The follow-up doc's corrected characterisation was that the poisoning is PERMANENT:
+    // rounds 3+ failed too, on a connection nobody tainted again.
+    let mut co = pool.checkout().await.expect("checkout 3");
+    assert_eq!(
+        pid1,
+        scalar_i64(&mut co, "SELECT pg_backend_pid()::int8").await,
+        "still the same pooled backend"
+    );
+    co.query("INSERT INTO ferro_ti_t (c) VALUES ($1)", &[Value::I64(3)])
+        .await
+        .unwrap_or_else(|e| panic!("round 3: the poisoning must not be permanent — got {e:?}"));
+
+    let n = scalar_i64(&mut co, "SELECT count(*)::int8 FROM ferro_ti_t").await;
+    assert_eq!(n, 3, "all three domain-typed writes applied exactly once");
+
+    for stmt in [
+        "DROP TABLE IF EXISTS ferro_ti_t",
+        "DROP DOMAIN IF EXISTS ferro_ti_a CASCADE",
+        "DROP DOMAIN IF EXISTS ferro_ti_b CASCADE",
+        "DROP DOMAIN IF EXISTS ferro_ti_c CASCADE",
+    ] {
+        co.exec(stmt).await.expect("cleanup");
+    }
+}
+
+/// **F1, arm 2 — a USER-issued `DISCARD ALL`, which does NOT taint.**
+///
+/// `ferro-classify` safe-lists `DISCARD` on purpose (it moves session state toward default), so the
+/// connection is recycled with the `Targeted` profile — a fix confined to the `Full` arm would
+/// leave this connection permanently poisoned. The `DISCARD ALL` really destroying the driver's
+/// cached typeinfo statement is asserted directly (open prepared statements: ≥1 → 0), so this test
+/// cannot pass by never having reached the hazard.
+#[tokio::test(flavor = "multi_thread")]
+async fn s8a_f1_distinct_domain_oids_survive_a_user_issued_discard_all() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+
+    let pid1 = {
+        let mut co = pool.checkout().await.expect("checkout 1");
+        for stmt in [
+            "DROP TABLE IF EXISTS ferro_tj_t",
+            "DROP DOMAIN IF EXISTS ferro_tj_a CASCADE",
+            "DROP DOMAIN IF EXISTS ferro_tj_b CASCADE",
+            "CREATE DOMAIN ferro_tj_a AS int4",
+            "CREATE DOMAIN ferro_tj_b AS int4",
+            "CREATE TABLE ferro_tj_t (a ferro_tj_a, b ferro_tj_b)",
+        ] {
+            co.exec(stmt)
+                .await
+                .unwrap_or_else(|e| panic!("setup `{stmt}`: {e:?}"));
+        }
+
+        co.query("INSERT INTO ferro_tj_t (a) VALUES ($1)", &[Value::I64(1)])
+            .await
+            .expect("a param of domain A must bind");
+        assert!(
+            open_prepared_statements(&mut co).await >= 1,
+            "the typeinfo lookup must have left a cached prepared statement open"
+        );
+
+        co.exec("DISCARD ALL")
+            .await
+            .expect("user-issued DISCARD ALL");
+        assert!(
+            !co.tainted(),
+            "ferro-classify safe-lists DISCARD by design (rules.rs) — this must NOT taint, which \
+             is exactly what makes the next checkout run the TARGETED profile"
+        );
+        assert_eq!(
+            open_prepared_statements(&mut co).await,
+            0,
+            "the user's DISCARD ALL must really have deallocated the driver's cached typeinfo \
+             statement — that is the hazard this test exists for"
+        );
+
+        scalar_i64(&mut co, "SELECT pg_backend_pid()::int8").await
+    };
+
+    let mut co = pool.checkout().await.expect("checkout 2");
+    assert_eq!(
+        pid1,
+        scalar_i64(&mut co, "SELECT pg_backend_pid()::int8").await,
+        "max_size=1 must hand back the SAME backend pid — otherwise the driver cache is fresh and \
+         the assertion below is a false green"
+    );
+    co.query("INSERT INTO ferro_tj_t (b) VALUES ($1)", &[Value::I64(2)])
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "a DISTINCT domain oid after a USER-issued DISCARD ALL + a Targeted recycle must \
+                 still bind — got {e:?}"
+            )
+        });
+
+    let n = scalar_i64(&mut co, "SELECT count(*)::int8 FROM ferro_tj_t").await;
+    assert_eq!(n, 2, "both domain-typed writes applied exactly once");
+
+    for stmt in [
+        "DROP TABLE IF EXISTS ferro_tj_t",
+        "DROP DOMAIN IF EXISTS ferro_tj_a CASCADE",
+        "DROP DOMAIN IF EXISTS ferro_tj_b CASCADE",
+    ] {
+        co.exec(stmt).await.expect("cleanup");
     }
 }

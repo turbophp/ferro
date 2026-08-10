@@ -1345,6 +1345,94 @@ mod tests {
         }
     }
 
+    /// **M1-S8a review F3a: the NARROWING binds write the EXACT bytes of the EXACT target width.**
+    ///
+    /// Every other proof around [`PgInt`]/[`PgFloat`] is blind to a wrong-BYTES encoder, which is
+    /// why this one exists as a hand-computed byte fixture rather than another property:
+    /// * [`s7_accepts_is_never_looser_than_the_boxed_impl`] only asserts `to_sql_checked(..).is_ok()`
+    ///   and never inspects the buffer;
+    /// * [`s7_newtypes_write_the_canonical_text_verbatim`] covers only the DECIMAL text newtype;
+    /// * [`s8a_every_arm_treats_a_domain_exactly_as_its_base`] compares base-vs-domain bytes TO EACH
+    ///   OTHER, so an encoder that is wrong identically on both sides passes;
+    /// * and the live acceptance bound only `F64(1.5)`/`F64(2.25)` — both EXACTLY f32-representable,
+    ///   so no value in the whole suite could tell an `f64` encoder from an `f32` one. Measured: the
+    ///   mutation `self.0.to_sql(base, out)` in `PgFloat::to_sql` was GREEN across
+    ///   the entire ferro-backend-pg + ferrod (live) suites.
+    ///
+    /// The expected vectors below are written out by hand from the IEEE-754 / two's-complement
+    /// definitions — NOT produced by calling the impl under test, and NOT by calling
+    /// `f64::to_be_bytes` on the same expression the impl uses — so they are an independent oracle:
+    /// * `-200` is `0xFF38` / `0xFFFFFF38` / `0xFFFFFFFFFFFFFF38` at widths 2/4/8 (PG sends every
+    ///   integer big-endian);
+    /// * `0.1 + 0.2` is the canonical non-`f32`-representable double `0.30000000000000004`,
+    ///   `0x3FD3333333333334` (the nearest double to 0.3 is `...3333`, one ULP below); rounded to
+    ///   `f32` it is `0x3E99999A`, whose widening back to `f64` is `0x3FD3333340000000` — a
+    ///   DIFFERENT 8-byte payload, which is precisely what an `f32`-truncating `float8` encoder
+    ///   would emit;
+    /// * `f64::MAX` is `0x7FEFFFFFFFFFFFFF`; through `f32` it saturates to `inf`
+    ///   (`0x7FF0000000000000`).
+    #[test]
+    fn s8a_int_and_float_binds_write_the_exact_target_width_bytes() {
+        fn bytes_of(v: &Value, ty: &Type) -> Vec<u8> {
+            let mut buf = tokio_postgres::types::private::BytesMut::new();
+            let is_null = value_to_boxed(v)
+                .to_sql_checked(ty, &mut buf)
+                .unwrap_or_else(|e| panic!("{v:?} against {} must bind: {e}", ty.name()));
+            assert!(matches!(is_null, IsNull::No), "{v:?} is not NULL");
+            buf.to_vec()
+        }
+
+        // ---- PgInt: the same i64 must be written at the DECLARED width, big-endian, sign-extended.
+        assert_eq!(bytes_of(&Value::I64(-200), &Type::INT2), vec![0xFF, 0x38]);
+        assert_eq!(
+            bytes_of(&Value::I64(-200), &Type::INT4),
+            vec![0xFF, 0xFF, 0xFF, 0x38]
+        );
+        assert_eq!(
+            bytes_of(&Value::I64(-200), &Type::INT8),
+            vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x38]
+        );
+        // The full-width magnitude: an `int8` bind that truncated through `i32` (or through the
+        // `int4` arm) could not represent this at all.
+        assert_eq!(
+            bytes_of(&Value::I64(i64::MAX), &Type::INT8),
+            vec![0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(
+            bytes_of(&Value::I64(i64::from(i32::MIN)), &Type::INT4),
+            vec![0x80, 0x00, 0x00, 0x00]
+        );
+
+        // ---- PgFloat: `float8` gets the FULL double; only `float4` may narrow.
+        let non_f32 = 0.1_f64 + 0.2_f64; // 0.30000000000000004
+        assert_eq!(
+            bytes_of(&Value::F64(non_f32), &Type::FLOAT8),
+            vec![0x3F, 0xD3, 0x33, 0x33, 0x33, 0x33, 0x33, 0x34],
+            "a float8 bind must send the double VERBATIM — 0x3FD3333340000000 here would mean the \
+             value had been round-tripped through f32"
+        );
+        assert_eq!(
+            bytes_of(&Value::F64(non_f32), &Type::FLOAT4),
+            vec![0x3E, 0x99, 0x99, 0x9A],
+            "a float4 bind is the ONLY arm allowed to narrow, and must produce the correctly \
+             rounded f32"
+        );
+        assert_eq!(
+            bytes_of(&Value::F64(f64::MAX), &Type::FLOAT8),
+            vec![0x7F, 0xEF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            "f64::MAX must not saturate to +inf (0x7FF0000000000000) — which is what a float8 \
+             encoder that went through f32 would write"
+        );
+        assert_eq!(
+            bytes_of(&Value::F64(1.5), &Type::FLOAT8),
+            vec![0x3F, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            bytes_of(&Value::F64(1.5), &Type::FLOAT4),
+            vec![0x3F, 0xC0, 0x00, 0x00]
+        );
+    }
+
     /// **The lockstep proof (carry C2/C3/C12).** Over the FULL cross product of every canonical
     /// variant × every plausible target type: whenever `accepts` says yes, the concrete boxed impl
     /// must actually bind. That is the directional rule mechanically — `accepts` can be stricter

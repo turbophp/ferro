@@ -158,11 +158,49 @@ impl PoolBackend for PgBackend {
     /// leak class (holdable cursors, role/session-authorization, GUCs, LISTEN channels, advisory
     /// locks, temp tables/sequences) still gets closed. One `batch_execute` per profile (simple
     /// protocol, one round trip, one trailing `ReadyForQuery`).
+    ///
+    /// **M1-S8a review F1 — the driver's typeinfo STATEMENT cache is invalidated here, on BOTH
+    /// profiles** (SPEC §22.2 (m); `docs/followups/2026-08-06-discard-all-typeinfo-cache-poisoning.md`).
+    /// `tokio-postgres` prepares and then caches, for the connection's whole life, the three
+    /// statements it uses to resolve an OID it does not know natively, and it never learns that the
+    /// SERVER dropped them. `DISCARD ALL` (the `Full` profile) includes `DEALLOCATE ALL` and does
+    /// exactly that, so without this call the next typeinfo lookup on the recycled connection dies
+    /// with a bare `26000 prepared statement "sN" does not exist` — permanently, for that
+    /// connection. That was a corner nobody was told to use until S8a made a DOMAIN-typed PARAMETER
+    /// bindable, because `stmt.params()` reports a domain's OWN oid where `RowDescription` resolves
+    /// it to the base — so an ordinary supported WRITE now performs a typeinfo lookup. Measured on
+    /// PG 17, `INSERT INTO t (domcol) VALUES ($1)` and `UPDATE t SET domcol = $1` both report the
+    /// DOMAIN (as does an explicit `$1::domain` cast), while `WHERE domcol = $1` resolves to the
+    /// base and does not. Two writes into two DIFFERENT domain columns across one recycle is
+    /// therefore all it takes, and that is ordinary ORM traffic for any schema with domain
+    /// columns.
+    ///
+    /// `Targeted` is cleared too even though it never itself deallocates, because the pool is not
+    /// the only party that can: `ferro-classify` safe-lists a USER-issued `DISCARD ALL` by design
+    /// (`RESET`/`DISCARD` move session state toward default), so a connection whose own SQL ran one
+    /// is recycled NON-tainted, through this exact profile, carrying the same dead handles. (A user
+    /// `DEALLOCATE ALL` DOES taint — `PinTrigger::Prepare` — so that one lands on `Full`; and
+    /// `DISCARD PLANS` deallocates nothing at all, verified on PG 17.) The cost is one re-prepare
+    /// on the first custom OID a
+    /// checkout resolves that its oid→`Type` map has not already cached — the `types` map is
+    /// deliberately NOT cleared, since `DEALLOCATE ALL` destroys statements, not type definitions.
+    ///
+    /// Cleared BEFORE the batch runs: each dropped handle sends its usual `Close`, which is a real
+    /// deallocation while the statement still exists and an accepted no-op once it does not ("It is
+    /// not an error to issue Close against a nonexistent statement or portal name"), so the driver
+    /// can never be left holding a handle to a statement the server dropped — not even if the batch
+    /// below fails partway.
+    ///
+    /// RESIDUAL (documented, not fixed here): a user statement that deallocates and a custom-OID
+    /// lookup within the SAME checkout still poisons that checkout — there is no reset between
+    /// them. That needs a per-statement hook rather than a reset-time one; the pool-caused and
+    /// recycle-visible cases, which are the ones a drop-in tier actually meets, are closed.
     async fn reset(&self, conn: &mut Self::Conn, profile: ResetProfile) -> Result<(), PoolError> {
         let sql = match profile {
             ResetProfile::Full => FULL_RESET_SQL,
             ResetProfile::Targeted => TARGETED_RESET_SQL,
         };
+        conn.client.clear_typeinfo_statement_cache();
         conn.client.batch_execute(sql).await.map_err(|e| {
             tracing::warn!(error = %e, profile = ?profile, "ferro-backend-pg: reset failed");
             PoolError::ConnectionLost

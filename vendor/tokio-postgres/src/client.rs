@@ -157,6 +157,20 @@ impl InnerClient {
         self.cached_typeinfo.lock().types.clear();
     }
 
+    /// FERRO M1-S8a fork (see `/UPSTREAM_PR.md`, drop when upstream merges): drops the three
+    /// cached typeinfo `Statement` handles, so the next typeinfo lookup RE-PREPARES instead of
+    /// binding a server-side statement that may no longer exist.
+    ///
+    /// The `types` map is deliberately left alone: `DEALLOCATE ALL` destroys prepared statements,
+    /// not type definitions, and an already-resolved oid→`Type` entry stays correct. Callers that
+    /// also want that invalidated have `clear_type_cache`.
+    pub fn clear_typeinfo_statement_cache(&self) {
+        let mut cache = self.cached_typeinfo.lock();
+        cache.typeinfo = None;
+        cache.typeinfo_composite = None;
+        cache.typeinfo_enum = None;
+    }
+
     /// Call the given function with a buffer to be used when writing out
     /// postgres commands.
     pub fn with_buf<F, R>(&self, f: F) -> R
@@ -811,6 +825,33 @@ impl Client {
     /// to flush the local cache and allow the new, updated definitions to be loaded.
     pub fn clear_type_cache(&self) {
         self.inner().clear_type_cache();
+    }
+
+    /// FERRO M1-S8a fork (see `/UPSTREAM_PR.md`, drop when upstream merges): invalidates the
+    /// PREPARED-STATEMENT half of the typeinfo cache.
+    ///
+    /// `tokio-postgres` prepares (and then caches, for the lifetime of the connection) three
+    /// statements it uses to resolve an OID it does not know natively — the `pg_type`, `pg_enum`
+    /// and `pg_attribute` lookups in the `prepare` module. It holds those `Statement` handles
+    /// forever and has no way to learn that the SERVER dropped the underlying statements, which
+    /// `DEALLOCATE ALL` — and therefore `DISCARD ALL`, which includes it — does. (`DISCARD PLANS`
+    /// does NOT: it drops cached PLANS and leaves the statements in place. Verified on PG 17.)
+    /// Once that happens the next
+    /// typeinfo lookup fails with `26000 prepared statement "sN" does not exist` — permanently, for
+    /// that connection.
+    ///
+    /// A connection POOL is the party that knows a deallocating statement was run (its hygiene/
+    /// reset step issues one), so it needs a way to tell the driver. This is that way: after
+    /// clearing, the next lookup re-prepares. Dropping the handles also sends the usual `Close`
+    /// for each, which Postgres accepts against an already-gone statement ("It is not an error to
+    /// issue Close against a nonexistent statement or portal name" — protocol docs), so this is
+    /// safe both before and after the deallocating statement runs.
+    ///
+    /// Note this is NOT the same as [`Client::clear_type_cache`], which clears the resolved
+    /// oid→`Type` map and leaves the statements in place. The two are independent: type
+    /// definitions survive `DEALLOCATE ALL`, prepared statements do not.
+    pub fn clear_typeinfo_statement_cache(&self) {
+        self.inner().clear_typeinfo_statement_cache();
     }
 
     /// Determines if the connection to the server has already closed.

@@ -121,6 +121,61 @@ Rust-native poolers would want the same thing), not something Ferro-specific.
 
 ---
 
+## Addendum (M1-S8a) — a THIRD fork addition: `Client::clear_typeinfo_statement_cache()`
+
+**Same status: drafted, not filed.** Added `2026-08-10` while fixing the S8a whole-branch review's
+PG finding F1. It is a separate, self-contained upstream-worthy change and would be its own commit
+on the PR branch (or its own PR — it is independent of the two accessors above).
+
+### What
+
+One synchronous accessor on `Client` (plus its `InnerClient` counterpart):
+
+- `Client::clear_typeinfo_statement_cache(&self)` — drops the three cached typeinfo `Statement`
+  handles (`typeinfo`, `typeinfo_composite`, `typeinfo_enum`), so the next typeinfo lookup
+  re-prepares. It deliberately does **not** touch the `types` oid→`Type` map.
+
+### Why
+
+`tokio-postgres` already ships `Client::clear_type_cache()`, which clears the resolved oid→`Type`
+map and leaves the prepared statements in place. There is no way to invalidate the other half —
+and that is the half a connection pool needs.
+
+The three typeinfo statements are prepared once and cached for the connection's whole life.
+`DEALLOCATE ALL` — and therefore `DISCARD ALL`, which includes it — destroys them server-side, and
+the driver never learns; the next typeinfo lookup fails with `26000 prepared statement "sN" does not
+exist` —
+permanently, for that connection. `DISCARD ALL` is the standard connection-recycling statement for
+transaction-mode poolers (PgBouncer's `server_reset_query` default is literally `DISCARD ALL`), so
+*any* pool built on `tokio-postgres` that recycles connections and ever resolves a non-builtin OID
+hits this. An enum or composite column is enough; so is a plain `INSERT INTO t (domcol) VALUES ($1)`,
+since `Statement::params()` reports a domain's own oid where `RowDescription` resolves it to the base
+(measured on PG 17). It is not Ferro-specific.
+
+The pool is the party that knows a deallocating statement ran, so the fix belongs at the boundary:
+give it a way to tell the driver. Purely additive, no wire behaviour, no new dependencies, one
+`Mutex` lock.
+
+Dropping the handles also sends the usual per-`Statement` `Close`, which Postgres accepts against an
+already-gone statement ("It is not an error to issue Close against a nonexistent statement or portal
+name" — protocol docs), so the call is safe both before and after the deallocating statement runs.
+
+### Proposed PR title
+
+> Add `Client::clear_typeinfo_statement_cache()` so poolers can invalidate cached typeinfo
+> statements after `DISCARD ALL`
+
+### Ferro-side consumer
+
+`ferro-backend-pg/src/conn.rs`'s `PoolBackend::reset` calls it before **both** reset profiles.
+Live regression: `ferro-backend-pg`'s `pg_types_it.rs`
+`s8a_f1_distinct_domain_oids_survive_a_full_hygiene_reset` and
+`s8a_f1_distinct_domain_oids_survive_a_user_issued_discard_all` (both RED with `26000` before the
+accessor existed). SPEC §22.2 (m);
+`docs/followups/2026-08-06-discard-all-typeinfo-cache-poisoning.md`.
+
+---
+
 ## Status and next step
 
 **DRAFT.** This PR has not been opened. Filing it against `github.com/sfackler/rust-postgres` is a
@@ -143,12 +198,16 @@ entry:**
   root `Cargo.toml` (currently lines ~28–33).
 - Remove the `exclude = ["vendor/tokio-postgres"]` workspace entry (root `Cargo.toml`).
 - Bump `ferro-backend-pg`'s `tokio-postgres` dependency to the released version that carries
-  `transaction_status()`/`parameter()`.
+  `transaction_status()`/`parameter()`/`clear_typeinfo_statement_cache()`. **All three** must be
+  present before the fork can be dropped — if only the first two land, the fork stays for the third
+  (or `PgBackend::reset` must retire the connection instead, which is a throughput regression on a
+  hot path).
 - Remove this file's cross-references from `deny.toml`'s rationale comment and from the fork's own
   doc-comments (moot once the fork itself is deleted).
 - Re-run the M1-S1 live suites (`ferro-backend-pg`'s `pg_rfq_status_it.rs`, `pg_tx_status_it.rs`,
   `pg_parameter_status_it.rs`, `pg_pool_it.rs`, and `ferrod`'s `tx_it.rs`) unchanged against the
-  released crate to confirm the accessors behave identically.
+  released crate to confirm the accessors behave identically — plus the M1-S8a typeinfo-coherence
+  pair in `pg_types_it.rs` (`s8a_f1_*`) for the third accessor.
 
 Until then, the fork stays: it is the only way `ferro-pool`'s RFQ-driven pin authority
 (`PoolBackend::tx_status`, wired in `ferro-backend-pg/src/conn.rs`, consumed by
