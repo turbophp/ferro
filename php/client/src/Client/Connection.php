@@ -19,6 +19,7 @@ use Ferro\Protocol\BeginRequest;
 use Ferro\Protocol\BeginResponse;
 use Ferro\Protocol\CodecException;
 use Ferro\Protocol\Generated\Constants as C;
+use Ferro\Protocol\Isolation;
 use Ferro\Protocol\Msgpack\PackerFactory;
 use Ferro\Protocol\Msgpack\PackerInterface;
 use Ferro\Protocol\Outcome;
@@ -625,11 +626,20 @@ final class Connection
      * transaction (M1-S8a Task 7). Attempting to nest, or to {@see transaction} while one is open,
      * throws {@see InvalidTransactionStateException}.
      *
-     * Isolation is deliberately NOT a parameter: named isolation constants would mean hand-written
-     * protocol numbers on the PHP side (charter rule 2), and Doctrine sets isolation with a
-     * `SET SESSION TRANSACTION ISOLATION LEVEL …` statement, not a driver flag.
+     * **Isolation (M1-S8b).** `$isolation` is the SPEC §9.1-style "policies over guesses" answer to
+     * a problem that has no other fix on a transaction-mode pool: Doctrine sets isolation with a
+     * `SET SESSION TRANSACTION ISOLATION LEVEL …` statement, which lands on whichever pooled
+     * connection the checkout hands out, TAINTS it (the S2 assist lexer classifies a non-local
+     * `SET`), and is then WIPED by S3 hygiene before the next `BEGIN` — so the application asks for
+     * SERIALIZABLE, gets READ COMMITTED, and nothing anywhere reports an error (SPEC §22.2 (s),
+     * which also records that the obvious "did the next tenant inherit it" test cannot fail,
+     * because hygiene masks the leak either way). Carried HERE, the level rides
+     * `BeginRequest.isolation` and the engine composes the correct per-transaction form for the
+     * dialect — `BEGIN ISOLATION LEVEL …` on PostgreSQL, the batched
+     * `SET TRANSACTION …; START TRANSACTION …` on MySQL/MariaDB, which deliberately does NOT use
+     * the connection-persisting `SESSION` form. `null` means the pool default.
      */
-    public function begin(bool $readonly = false): void
+    public function begin(bool $readonly = false, ?Isolation $isolation = null): void
     {
         if ($this->tx !== null) {
             throw new InvalidTransactionStateException(
@@ -638,8 +648,12 @@ final class Connection
             );
         }
         $session = $this->session();
+        // The ENUM CASE, not `$isolation?->value`. `BeginRequest::encode` has an
+        // `$iso instanceof Isolation` arm precisely so the enum rides a byte-locked path
+        // (`IsolationCrossLanguageTest`, SPEC §22.2 (w)); unwrapping it here would route around the
+        // one lock that pins the PHP mapping to the Rust one.
         $payload = BeginRequest::encode(
-            ['pool' => $this->pool, 'isolation' => null, 'readonly' => $readonly],
+            ['pool' => $this->pool, 'isolation' => $isolation, 'readonly' => $readonly],
             $this->encodePacker,
         );
         try {

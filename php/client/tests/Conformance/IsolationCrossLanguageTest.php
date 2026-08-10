@@ -18,11 +18,16 @@ use PHPUnit\Framework\TestCase;
  * Measured at review: swapping the PHP values (ReadCommitted=2, Serializable=0) left the full PHP
  * suite green (541 tests) and PHPStan level 9 [OK].
  *
- * Live impact at HEAD is nil — both BEGIN sites hardcode `'isolation' => null`, so the enum is
- * unreachable — but S8b's `setTransactionIsolation(SERIALIZABLE)` is the first caller, and a drift
- * there degrades SERIALIZABLE to READ COMMITTED silently. A silent isolation downgrade is the exact
- * failure class §9.1 "policies over guesses" exists to prevent, so it is locked before the caller
- * lands, not after.
+ * Live impact was nil when this file landed — both BEGIN sites hardcoded `'isolation' => null`, so
+ * the enum was unreachable — and a drift degrades SERIALIZABLE to READ COMMITTED silently, the exact
+ * failure class §9.1 "policies over guesses" exists to prevent, so it was locked before the caller
+ * landed rather than after. **The caller has now landed (M1-S8b Task 3):
+ * {@see \Ferro\Client\Connection::begin} takes an `?Isolation` and passes the ENUM CASE to
+ * {@see BeginRequest::encode}, so this lock now guards a live path.** Its behavioural half is
+ * `tests/Live/BeginIsolationLiveTest`: with the two values below swapped, PostgreSQL reports
+ * `repeatable read` inside a transaction that asked for `serializable` — measured (M1-S8b Task 3
+ * Step 8 mutation 2), not assumed. The closure form ({@see \Ferro\Client\Connection::transaction})
+ * still hardcodes `null`, i.e. the pool default.
  *
  * **Why not generate it from `/proto`, which is the RIGHT answer (charter rule 2).** Promoting
  * `isolation` into the registry touches `proto/methods.toml`, `ferro-proto`'s `registry.rs` /
