@@ -51,10 +51,16 @@ pub struct PgBackend {
 /// The exact `Targeted` reset batch (M1-S3, SPEC §7.2 + the plan's verification-fix addenda) — a
 /// named constant (rather than an inline literal) so a unit test can assert the exact string
 /// verbatim without depending on Rust's string-literal line-continuation whitespace-stripping
-/// behavior being read correctly by eye. This is Postgres's own `DISCARD ALL` MINUS the two
-/// prepare-destroying statements (`DEALLOCATE ALL`, `DISCARD PLANS`) — do NOT add them back; that
+/// behavior being read correctly by eye. This is Postgres's own `DISCARD ALL` MINUS its two
+/// prepare-affecting statements (`DEALLOCATE ALL`, `DISCARD PLANS`) — do NOT add them back; that
 /// would defeat the entire point of the `Targeted` profile (preserving the engine's future
 /// namespaced prepared statements across a checkout recycle).
+///
+/// Only `DEALLOCATE ALL` destroys the statements themselves; `DISCARD PLANS` drops CACHED PLANS and
+/// deallocates nothing (measured on PG 17: `PREPARE zzp` → `pg_prepared_statements` has 1 row;
+/// `DISCARD PLANS` → still 1; `DEALLOCATE ALL` → 0). Both stay omitted anyway — the second because
+/// discarding the plans of the prepares we are deliberately preserving would throw away exactly the
+/// work that makes preserving them worth doing.
 const TARGETED_RESET_SQL: &str = "CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES;";
 
 /// The `Full` reset batch — Postgres's own `DISCARD ALL`, unmodified.
@@ -152,8 +158,9 @@ impl PoolBackend for PgBackend {
     }
 
     /// M1-S3 (SPEC §7.2): `Full` runs Postgres's own `DISCARD ALL` (used for a `tainted` conn);
-    /// `Targeted` runs a narrower batch — exactly `DISCARD ALL` minus the two prepare-destroying
-    /// statements (`DEALLOCATE ALL`, `DISCARD PLANS`) — for a non-tainted recycled conn, so the
+    /// `Targeted` runs a narrower batch — exactly `DISCARD ALL` minus its two prepare-affecting
+    /// statements (`DEALLOCATE ALL`, which destroys them, and `DISCARD PLANS`, which drops their
+    /// cached plans and deallocates nothing) — for a non-tainted recycled conn, so the
     /// engine's future namespaced prepared statements survive while every other §7.4 blind-spot
     /// leak class (holdable cursors, role/session-authorization, GUCs, LISTEN channels, advisory
     /// locks, temp tables/sequences) still gets closed. One `batch_execute` per profile (simple
@@ -315,7 +322,7 @@ mod tests {
     }
 
     /// The exact targeted batch string, verbatim (task brief + SPEC §7.2 + the plan's
-    /// verification-fix addenda): `DISCARD ALL` minus the two prepare-destroying statements, plus
+    /// verification-fix addenda): `DISCARD ALL` minus its two prepare-affecting statements, plus
     /// `CLOSE ALL` (holdable-cursor leak fix) and `SET SESSION AUTHORIZATION DEFAULT`
     /// (role/session-authorization coverage).
     #[test]
@@ -325,7 +332,8 @@ mod tests {
         // line-continuation whitespace-stripping the production constant's definition relies on.
         let expected = "CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES;";
         assert_eq!(TARGETED_RESET_SQL, expected);
-        // Never regains the prepare-destroying statements `Targeted` exists to omit.
+        // Never regains the two prepare-affecting statements `Targeted` exists to omit (only
+        // `DEALLOCATE ALL` destroys them; `DISCARD PLANS` drops their cached plans).
         assert!(!TARGETED_RESET_SQL.contains("DEALLOCATE ALL"));
         assert!(!TARGETED_RESET_SQL.contains("DISCARD PLANS"));
     }

@@ -501,7 +501,8 @@ async fn pg_tx_control_savepoint_roundtrip() {
 /// essentially every pooled PG connection that has ever served one.
 ///
 /// **Why a prepared statement is the right instrument.** `ResetProfile::Targeted` is DEFINED as
-/// `DISCARD ALL` minus the two prepare-destroying statements (`DEALLOCATE ALL`, `DISCARD PLANS`), so
+/// `DISCARD ALL` minus its two prepare-affecting statements (`DEALLOCATE ALL`, which destroys them,
+/// and `DISCARD PLANS`, which only drops their cached plans — measured on PG 17), so
 /// a server-side prepared statement is the one observable that distinguishes the two profiles at
 /// recycle. It is created through `tx_control` — the raw, UNGUARDED text leaf, which never runs the
 /// assist lexer — because a `PREPARE` through `exec()` would taint as `PinCause::Prepare` all by
