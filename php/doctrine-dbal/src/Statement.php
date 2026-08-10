@@ -16,8 +16,12 @@ use Ferro\DBAL\Exception\DriverException;
  * stock `Driver\Mysqli\Statement::bindValue` simply `assert(is_int($param))`; refusing them loudly
  * here is exactly as capable as the stock mysqli driver, and a silent misbind would be worse.
  *
- * Walking-skeleton form: Task 7 replaces `bindValue`'s body with the full
- * `(ParameterType, PHP type)` → canonical-tag mapping.
+ * **Every bound value passes through {@see ParameterBinder}**, which keys on the PAIR
+ * `(ParameterType, PHP type)` — see that class for why the `ParameterType` alone is not enough.
+ * Binding happens HERE rather than in `execute()` so a value DBAL cannot represent is refused at
+ * the call site that supplied it, while `Doctrine\DBAL\Connection::executeQuery()`'s
+ * `catch (Driver\Exception)` is still on the stack (it wraps `bindParameters()` as well as
+ * `execute()`), which is what keeps the failure inside DBAL's conversion path.
  */
 final class Statement implements StatementInterface
 {
@@ -38,7 +42,7 @@ final class Statement implements StatementInterface
                 . 'executeQuery()/executeStatement()).',
             );
         }
-        $this->values[$param] = $value;
+        $this->values[$param] = ParameterBinder::toCanonical($value, $type);
     }
 
     public function execute(): ResultInterface
