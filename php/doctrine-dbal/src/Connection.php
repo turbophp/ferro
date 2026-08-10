@@ -77,6 +77,12 @@ final class Connection implements DriverConnection
         return $this->runPrepared($sql, []);
     }
 
+    /**
+     * The parameterless statement path — and, measured rather than assumed, **the one Doctrine's
+     * savepoints actually take**: `Doctrine\DBAL\Connection::executeStatement()` calls the driver's
+     * `exec()` whenever `count($params) === 0`, and `createSavepoint()`/`rollbackSavepoint()` pass
+     * no parameters. So the invariant documented on {@see runPrepared} is load-bearing HERE first.
+     */
     public function exec(string $sql): int
     {
         try {
@@ -87,9 +93,26 @@ final class Connection implements DriverConnection
     }
 
     /**
-     * The ONE place a statement with parameters reaches the engine. `Statement::execute()` and
-     * {@see query} both land here, which is what keeps the fate declaration and (from Task 10) the
+     * The ONE place a statement WITH PARAMETERS reaches the engine (`Statement::execute()` and
+     * {@see query} both land here; {@see exec} is the parameterless twin). Both call
+     * `Ferro\Client\Connection::fetchRaw()`, which is what keeps the fate declaration and the
      * pinned-transaction routing in a single place.
+     *
+     * **THE INVARIANT: while a transaction is open, this rides its pinned `tx_id`.** It does so
+     * because `Ferro\Client\Connection::dispatch()` — which `fetchRaw()` shares with every other
+     * statement method — forks on its own open transaction handle. That is not an optimisation
+     * detail: Doctrine nests transactions CLIENT-SIDE, so a nested `beginTransaction()` is an
+     * ordinary `executeStatement($platform->createSavePoint($name))` arriving right here — at
+     * {@see exec}, since it carries no parameters. A statement that did not carry the `tx_id` would
+     * be checked out onto a DIFFERENT backend connection, and Doctrine would hold a rollback point
+     * that exists in no session.
+     *
+     * Two guards at two vantage points, so neither can rot into decoration:
+     * `TransactionLiveTest::testDbalNestedTransactionsUseSavepointsOnThePinnedTransaction` drives
+     * Doctrine's REAL nesting API against both live backends and proves the CONSEQUENCE (the inner
+     * rollback undoes only the inner write); `TransactionRoutingTest` proves the MECHANISM by
+     * reading the `tx_id` back off the ENCODED `ExecRequest` that carried the stock platform's own
+     * `SAVEPOINT …` text.
      *
      * @param list<mixed> $params
      */
@@ -123,6 +146,25 @@ final class Connection implements DriverConnection
         return "'" . str_replace("'", "''", $value) . "'";
     }
 
+    /**
+     * The generated key of the MOST RECENT statement — never a stale one.
+     *
+     * DBAL 4's SPI is `lastInsertId(): int|string` with **no sequence-name argument** (that overload
+     * was removed in 4.0, which is why SPEC §14's "sequence-name argument supported for PG" is
+     * unimplementable), and it must THROW when there is no identity value rather than return a
+     * falsy placeholder — a caller cannot tell `0`/`''` from a key.
+     *
+     * On **PostgreSQL it always throws**: the wire carries no such field, and the client refuses to
+     * emulate it with a follow-up `lastval()` because on a transaction-mode pool that lands on a
+     * DIFFERENT connection and returns a silently wrong key. {@see NoIdentityValue} names both
+     * working answers (`INSERT … RETURNING`, or the ORM's SEQUENCE identity strategy — D-S8b-5).
+     *
+     * It is read from the CONNECTION, not from a `Result`, and it survives a statement run inside a
+     * transaction because `Ferro\Client\Connection::dispatch()` propagates the tx path's
+     * `last_insert_id` up to the connection (M1-S8a) — which is where nearly every real INSERT
+     * happens. `LastInsertIdLiveTest` pins all three: the MySQL key, the PG throw with its message,
+     * and the in-transaction read.
+     */
     public function lastInsertId(): int|string
     {
         $id = $this->ferro->lastInsertId();
