@@ -19,7 +19,7 @@ use Ferro\Protocol\Isolation;
  * ]],
  * ```
  *
- * It carries TWO independent overrides, and the first is not a convenience:
+ * It carries THREE independent overrides, and only the last is a convenience:
  *
  *  1. {@see IndeterminateSafeTransactional}. Without it, an indeterminate write inside
  *     `Doctrine\DBAL\Connection::transactional()` — the canonical Doctrine transaction idiom —
@@ -27,7 +27,13 @@ use Ferro\Protocol\Isolation;
  *     `Ferro\DBAL\IndeterminateWriteException`. That is the spec's defining safety property being
  *     thrown away by DBAL's own cleanup; read that trait's docblock for the measured mechanism and
  *     for why the exception's ANCESTRY cannot be changed instead.
- *  2. `setTransactionIsolation()`, below.
+ *  2. {@see ResyncsNestingOnARejectedBegin}. Without it, a beginTransaction() that Ferro REJECTS —
+ *     a pool checkout timeout, an unavailable replica, a BEGIN that never reached the backend, all
+ *     routine on a healthy client session — leaves Doctrine's nesting counter incremented for good:
+ *     `isTransactionActive()` reports true with no transaction anywhere, every later transaction
+ *     becomes a `SAVEPOINT` the engine refuses, and the connection never recovers. The driver marks
+ *     that failure retryable, so this is what makes the retry able to succeed.
+ *  3. `setTransactionIsolation()`, below.
  *
  * **Why the isolation override exists.** Doctrine's own `setTransactionIsolation()` runs
  * `executeStatement($platform->getSetTransactionIsolationSQL($level))` — the SESSION form. On a
@@ -46,6 +52,7 @@ use Ferro\Protocol\Isolation;
 class FerroConnection extends DbalConnection
 {
     use IndeterminateSafeTransactional;
+    use ResyncsNestingOnARejectedBegin;
 
     private ?TransactionIsolationLevel $ferroLevel = null;
 

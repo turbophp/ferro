@@ -8,12 +8,14 @@ use Doctrine\DBAL\Driver\Result as ResultInterface;
 use Doctrine\DBAL\Driver\Statement as StatementInterface;
 use Ferro\Client\Connection as FerroConnection;
 use Ferro\Client\Error\FerroException;
+use Ferro\Client\Error\RetryableException;
 use Ferro\DBAL\Exception\DriverException;
 use Ferro\DBAL\Exception\ServerVersionUnavailable;
 use Ferro\DBAL\Exception\UnsupportedStatement;
 // Aliased: `FerroConnection` is already taken above by the CLIENT connection this class wraps.
 // The plan's Task 13 snippet imports the wrapper under its bare name, which would collide.
 use Ferro\DBAL\Wrapper\FerroConnection as FerroWrapper;
+use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Isolation;
 
 /**
@@ -243,13 +245,14 @@ final class Connection implements DriverConnection
     {
         $this->settleOpenStream();
         $this->refuseIsolationStatement($sql);
+        $this->refuseWhileNestingIsDesynced($sql);
         if ($this->poolKind !== PlatformVersion::KIND_POSTGRES) {
             return $this->runPrepared($sql, []);
         }
         try {
             $stream = $this->ferro->streamRaw($sql, [], $this->readonly);
         } catch (FerroException $e) {
-            throw DriverException::fromFerro($e);
+            throw $this->statementException($e);
         }
         $result = Result::streamed(
             $stream,
@@ -267,16 +270,111 @@ final class Connection implements DriverConnection
      * savepoints actually take**: `Doctrine\DBAL\Connection::executeStatement()` calls the driver's
      * `exec()` whenever `count($params) === 0`, and `createSavepoint()`/`rollbackSavepoint()` pass
      * no parameters. So the invariant documented on {@see runPrepared} is load-bearing HERE first.
+     *
+     * **It is also the ONE write intent the DBAL 4 SPI makes visible**, which is why
+     * {@see refuseAutocommitWriteEntryPoint} lives here — see that method for the exact scope of
+     * what `driverOptions.readonly` does and does not refuse.
      */
     public function exec(string $sql): int
     {
         $this->settleOpenStream();
         $this->refuseIsolationStatement($sql);
+        $this->refuseWhileNestingIsDesynced($sql);
+        $this->refuseAutocommitWriteEntryPoint($sql);
         try {
             return $this->ferro->fetchRaw($sql, [], $this->readonly, false)['affected'];
         } catch (FerroException $e) {
-            throw DriverException::fromFerro($e);
+            throw $this->statementException($e);
         }
+    }
+
+    /**
+     * `driverOptions.readonly`, ENFORCED on the autocommit path — as far as the SPI allows, and no
+     * further than that.
+     *
+     * **The defect this closes.** Inside a transaction the engine really does enforce the flag
+     * (`BEGIN READ ONLY` / `START TRANSACTION READ ONLY`, and the server then refuses the write with
+     * `25006`). On the autocommit path NOTHING enforced it: MEASURED live on PG 17, an `INSERT`
+     * through a `['readonly' => true]` connection returned `affected = 1` and the row was there. So
+     * an operator who validated the flag the way anyone would — by trying a write INSIDE a
+     * transaction, watching the server refuse it, and concluding "enforced" — had a connection on
+     * which `executeStatement('UPDATE …')` ran and committed, while every §19.3 fate on it was being
+     * computed from the claim that it only reads.
+     *
+     * **Why THIS entry point and not "all writes".** Charter rule 6 forbids inferring read-vs-write
+     * from SQL text, and the DBAL 4 SPI carries no read/write signal — `executeQuery('INSERT …
+     * RETURNING id')` is indistinguishable from a `SELECT`. What the SPI DOES carry is which method
+     * the application called: `Doctrine\DBAL\Connection::executeStatement()` is the write API (it
+     * returns affected rows and is never used for a read), and with no parameters it lands exactly
+     * here. That is a fact about the CALLER's declared intent, not about the SQL, so refusing it is
+     * charter-legal and free.
+     *
+     * **The limit, stated so this cannot be read as completeness.** A PARAMETERIZED
+     * `executeStatement('UPDATE … WHERE id = ?', [1])` reaches {@see runPrepared}, which
+     * `executeQuery()` reaches too — the driver cannot tell them apart and does NOT refuse there,
+     * because refusing would break every parameterized READ. Those writes still execute. What
+     * protects at-most-once for them is the second half of this fix,
+     * {@see statementException}: the readonly declaration can no longer turn a LOST autocommit
+     * statement into a "safe to retry" verdict. Real enforcement for the remaining shapes needs the
+     * engine to run a `readonly` autocommit statement inside a server-enforced read-only transaction
+     * (no client round trips, but a `ferrod` change) — recorded as a follow-up, not smuggled in here.
+     *
+     * Inside a transaction this passes through untouched: the server is already enforcing, and
+     * Doctrine's own `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` statements arrive at `exec()` (they carry no
+     * parameters). Refusing them would break nested transactions on every readonly connection.
+     */
+    private function refuseAutocommitWriteEntryPoint(string $sql): void
+    {
+        if ($this->readonly && !$this->ferro->inTransaction()) {
+            throw UnsupportedStatement::readonlyAutocommitWrite($sql);
+        }
+    }
+
+    /**
+     * The ONE place a statement's `FerroException` becomes a driver exception — and the ONE place the
+     * unverifiable half of `driverOptions.readonly` is taken back.
+     *
+     * **The cell.** `fate.rs` reads `readonly` twice. In the 57014 override it buys the honest
+     * `Cancelled{NonRetryable}` answer instead of `WriteUnconfirmed{Indeterminate}` — that is the
+     * §22.2 (ac) relief, it is NOT retryable, and it is left exactly as it is. In the
+     * `PoolError::ConnectionLost` arm it does something else entirely: `sent && !readonly && !in_tx`
+     * is `Indeterminate`, and the same event with `readonly = true` is
+     * `ConnectionLost{Retryable}` — which this driver's converter turns into
+     * `RetryableDriverException implements Doctrine\DBAL\Exception\RetryableException`, i.e. the
+     * marker Symfony Messenger and every hand-rolled retry loop key on. On a connection wrongly
+     * marked readonly that is an invitation to replay a write that may already have landed: the
+     * at-most-once violation the branch exists to prevent, reachable through one boolean in config.
+     *
+     * **The rule.** For an AUTOCOMMIT statement on a `readonly` connection, a `Retryable` verdict
+     * whose code is `ERR_CONNECTION_LOST` — the one cell whose retryability is contingent on the
+     * declaration — is re-minted as §19.3 `Indeterminate`, which is precisely what the same event
+     * yields on the default write-declared connection. Nothing else is touched: a pool checkout
+     * timeout, a deadlock, a serialization failure and a cancel are all classified without reference
+     * to `readonly`, so they keep their verdicts.
+     *
+     * **Two deliberate limits.**
+     *  * It is scoped to STATEMENTS. `beginTransaction()`/`commit()`/`rollBack()` keep
+     *    {@see \Ferro\DBAL\Exception\DriverException::fromFerro} — a lost BEGIN opened nothing and a
+     *    lost ROLLBACK changes nothing whatever the connection declared, and `fate.rs` treats those
+     *    control boundaries as `in_tx: false` for the same reason. Re-minting there would destroy
+     *    true information.
+     *  * The engine emits ONE `ERR_CONNECTION_LOST` for two situations — "never transmitted" (a
+     *    known did-not-apply) and "transmitted but declared a read" — and the wire does not separate
+     *    them. So on a readonly connection a checkout-time loss is over-reported as `Indeterminate`.
+     *    That is the safe direction of an unavoidable approximation, and it is the reason the fix is
+     *    an upgrade of the FATE rather than a silent strip of the retry marker: an application that
+     *    audits indeterminate writes must still see this one.
+     */
+    private function statementException(FerroException $e): DriverException
+    {
+        if ($this->readonly
+            && !$this->ferro->inTransaction()
+            && $e instanceof RetryableException
+            && $e->errorCode() === C::ERR_CONNECTION_LOST
+        ) {
+            return DriverException::unbackedReadonlyLoss($e);
+        }
+        return DriverException::fromFerro($e);
     }
 
     /**
@@ -307,10 +405,11 @@ final class Connection implements DriverConnection
     {
         $this->settleOpenStream();
         $this->refuseIsolationStatement($sql);
+        $this->refuseWhileNestingIsDesynced($sql);
         try {
             $raw = $this->ferro->fetchRaw($sql, $params, $this->readonly, true);
         } catch (FerroException $e) {
-            throw DriverException::fromFerro($e);
+            throw $this->statementException($e);
         }
         return Result::buffered($raw['cols'], $raw['rows'], $raw['affected']);
     }
@@ -379,19 +478,82 @@ final class Connection implements DriverConnection
         return $id;
     }
 
+    /**
+     * True while `Doctrine\DBAL\Connection`'s nesting counter is KNOWN to be out of step with this
+     * connection: a `beginTransaction()` was REJECTED, and DBAL does not undo the increment it made
+     * before calling us.
+     *
+     * **Why this state exists at all, i.e. why a PDO driver never needs it.**
+     * `Doctrine\DBAL\Connection::beginTransaction()` is `++$this->transactionNestingLevel;` and only
+     * THEN `$connection->beginTransaction()`, with no decrement on failure
+     * (`vendor/doctrine/dbal/src/Connection.php:1047-1062`). Under PDO that is nearly harmless,
+     * because a failed BEGIN there means a dead connection. Ferro rejects a BEGIN **retryably on a
+     * perfectly healthy client session** — `PoolTimeout` under load, a `ConnectionLost` that was
+     * never sent, a replica that is unavailable — so the shape is ROUTINE here. After it, DBAL
+     * reports `isTransactionActive() === true` at nesting 1 while this connection has no transaction
+     * at all, and the review MEASURED what follows: ordinary statements run AUTOCOMMIT (a durability
+     * lie — the caller believes they are transactional), the next `beginTransaction()` becomes
+     * `SAVEPOINT DOCTRINE_2` which the engine correctly refuses ("savepoint statement outside a
+     * transaction"), naming a savepoint the application never wrote, and the counter never comes
+     * back down. A worker was wedged for the rest of its life.
+     *
+     * The counter itself can only be repaired ABOVE the SPI, which is what
+     * {@see \Ferro\DBAL\Wrapper\ResyncsNestingOnARejectedBegin} does. What THIS flag does is make the
+     * un-wrapped case honest and recoverable rather than silent and terminal:
+     * {@see refuseWhileNestingIsDesynced} refuses statements in the window (so nothing can be written
+     * outside the transaction the caller believes in — which is also what makes the rollBack below
+     * TRUE rather than a lie), and {@see rollBack} is the resync.
+     */
+    private bool $rejectedBegin = false;
+
+    /**
+     * Refuse a statement while the nesting counter is desynced ({@see $rejectedBegin}).
+     *
+     * Two things are wrong with running it, and they are different: it would execute in AUTOCOMMIT
+     * while the caller believes a transaction is open (durable writes that no rollback can undo), and
+     * if it is one of Doctrine's savepoint statements it would fail against the engine's own guard
+     * with a message about a savepoint the application never wrote. The refusal names the real cause
+     * and both ways out.
+     *
+     * `inTransaction()` is asked every time rather than trusted from the flag: the flag only says a
+     * BEGIN was rejected, and a later successful one clears it.
+     */
+    private function refuseWhileNestingIsDesynced(string $sql): void
+    {
+        if ($this->rejectedBegin && !$this->ferro->inTransaction()) {
+            throw UnsupportedStatement::afterARejectedBegin($sql);
+        }
+    }
+
     public function beginTransaction(): void
     {
         $this->settleOpenStream();
         try {
             $this->ferro->begin($this->readonly, $this->pendingIsolation);
         } catch (FerroException $e) {
+            // DBAL has ALREADY counted this transaction as open and will not uncount it. Record
+            // that, so the statements that follow are refused instead of silently running in
+            // autocommit — see {@see $rejectedBegin}.
+            $this->rejectedBegin = true;
             throw DriverException::fromFerro($e);
         }
+        $this->rejectedBegin = false;
     }
 
     public function commit(): void
     {
         $this->settleOpenStream();
+        if ($this->rejectedBegin && !$this->ferro->inTransaction()) {
+            // DBAL's own `finally` decrements its counter around this call, so clearing the flag
+            // here leaves both sides consistent — but the caller must NOT be told this committed:
+            // the transaction it is committing was never opened.
+            $this->rejectedBegin = false;
+            throw DriverException::local(
+                'Ferro: commit() with no open transaction — this connection\'s beginTransaction() '
+                . 'was REJECTED and Doctrine kept counting the transaction as open. Nothing was '
+                . 'committed because nothing ran: every statement since was refused.',
+            );
+        }
         try {
             $this->ferro->commit();
         } catch (FerroException $e) {
@@ -399,9 +561,26 @@ final class Connection implements DriverConnection
         }
     }
 
+    /**
+     * **THE RESYNC.** A `rollBack()` while the nesting counter is desynced
+     * ({@see $rejectedBegin}) is a no-op that clears the flag, and that is honest rather than
+     * convenient: the transaction being rolled back was never opened, and every statement since was
+     * REFUSED ({@see refuseWhileNestingIsDesynced}), so there is provably nothing to undo. It is also
+     * the only recovery an un-wrapped `Doctrine\DBAL\Connection` has — DBAL zeroes its own counter
+     * before calling us here (`rollBack()` at level 1 sets `transactionNestingLevel = 0` FIRST), so
+     * after this call both sides agree again and the connection is usable.
+     *
+     * Without it the client raises `InvalidTransactionStateException` ("rollBack() with no open
+     * transaction") and the connection stays wedged: the counter is only reset on the path that just
+     * threw.
+     */
     public function rollBack(): void
     {
         $this->settleOpenStream();
+        if ($this->rejectedBegin && !$this->ferro->inTransaction()) {
+            $this->rejectedBegin = false;
+            return;
+        }
         try {
             $this->ferro->rollBack();
         } catch (FerroException $e) {

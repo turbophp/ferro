@@ -79,11 +79,28 @@ final class ConnectionFateFlagTest extends TestCase
         self::assertSame(0, $req['fetch'], 'a statement that may return rows asks for fetch:rows (0)');
     }
 
+    /**
+     * **AMENDED by the readonly-enforcement fix, and the amendment is a behavioural fact rather than
+     * a test repair.** `exec()` is `executeStatement()`'s parameterless path — DBAL's WRITE entry
+     * point — so on a `driverOptions.readonly` connection it is now REFUSED outside a transaction
+     * (`Connection::refuseAutocommitWriteEntryPoint()`; the refusal itself is pinned by
+     * `ReadonlyEnforcementTest` and live by `ReadonlyEnforcementLiveTest`). The readonly row
+     * therefore opens a transaction first, which is the only place that path still reaches the wire —
+     * and where the server enforces the declaration for real.
+     *
+     * The mirror property is intact: a hard-coded `readonly = false` in `exec()` reddens the readonly
+     * row, a hard-coded `true` reddens the write row.
+     */
     #[DataProvider('fates')]
     public function testTheSameDeclarationReachesTheWireOnTheParameterlessExecPath(bool $readonly): void
     {
-        $session = (new FakeSession())->thenExecOk(null);
+        $session = $readonly
+            ? FakeSession::withTxBegin(txId: 31)->thenExecOk(null)
+            : (new FakeSession())->thenExecOk(null);
         $c = self::driverConn($session, $readonly);
+        if ($readonly) {
+            $c->beginTransaction();
+        }
 
         $c->exec('DELETE FROM t');
 

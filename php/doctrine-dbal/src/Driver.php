@@ -6,6 +6,7 @@ use Doctrine\DBAL\Driver as DriverInterface;
 use Doctrine\DBAL\Driver\API\ExceptionConverter as ExceptionConverterInterface;
 use Doctrine\DBAL\Platforms\AbstractPlatform;
 use Doctrine\DBAL\ServerVersionProvider;
+use Ferro\Client\Error\FerroException;
 use Ferro\Client\RetryPolicy;
 use Ferro\DBAL\Exception\BackendFamilyUnknown;
 use Ferro\DBAL\Exception\DriverException;
@@ -31,10 +32,38 @@ final class Driver implements DriverInterface
     /** The backend family of the LAST pool this driver connected to, or null before any connect. */
     private ?string $kind = null;
 
-    /** @param array<string,mixed> $params */
+    /**
+     * **EVERY failure below leaves as a `Doctrine\DBAL\Driver\Exception`**, which is what the two
+     * `catch` arms are for and is not tidiness. `Doctrine\DBAL\Connection::connect()` catches exactly
+     * `Driver\Exception` (`vendor/doctrine/dbal/src/Connection.php:222`) and converts it; anything
+     * else escapes DBAL's conversion entirely and reaches the application past every
+     * `catch (Doctrine\DBAL\Exception)` it, its framework bundle, its ORM, its Messenger transport,
+     * its health check and `doctrine:migrations` have. The whole-branch review MEASURED the escape:
+     * with no ferrod on the socket, `Ferro\Client\Error\TransportException` —
+     * `instanceof Doctrine\DBAL\Driver\Exception: NO`. A drop-in replacement whose failure mode is
+     * uncatchable is not drop-in during exactly the window that matters (SPEC §18 socket activation,
+     * §19.1 boot_epoch storms — a restart is an EXPECTED event, not an exceptional one).
+     *
+     * The two arms carry different fates, deliberately:
+     *  * `FerroException` → {@see DriverException::connectFailed}, which classifies a transport
+     *    failure `Retryable` (nothing can have been applied on a session that never opened) and a
+     *    handshake rejection as fatal-and-branchless.
+     *  * `\InvalidArgumentException` → a LOCAL driver exception. `DriverOptions` throws it for a
+     *    malformed `driverOptions` value, and a configuration mistake is deterministic: it carries no
+     *    §9.2 branch precisely so no retry helper picks it up. It is converted HERE rather than
+     *    inside `DriverOptions` so that class stays a pure typed read of `$params` — the DBAL
+     *    contract applies at the boundary, which is this method.
+     *
+     * @param array<string,mixed> $params
+     */
     public function connect(#[\SensitiveParameter] array $params): Connection
     {
-        $o = DriverOptions::fromParams($params);
+        try {
+            $o = DriverOptions::fromParams($params);
+        } catch (\InvalidArgumentException $e) {
+            throw DriverException::local($e->getMessage(), $e);
+        }
+
         // RetryPolicy::none() is deliberate and is what `Ferro\Client\Connection::begin()`'s own
         // docblock tells a driver to use: DBAL (or the application above it) owns the retry
         // decision, and the client's autocommit read-retry must not double up with it.
@@ -42,9 +71,19 @@ final class Driver implements DriverInterface
         // parses correctly, a per-family re-render for TIMESTAMPTZ (which it cannot parse at all),
         // and a loud refusal for the values it would parse into something ELSE.
         $policy = new DbalValuePolicy();
-        $ferro = $o->socketPath !== null
-            ? Ferro::connect($o->socketPath, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $policy)
-            : Ferro::connectTcp((string) $o->host, $o->port, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $policy);
+        try {
+            $ferro = $o->socketPath !== null
+                ? Ferro::connect($o->socketPath, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $policy)
+                : Ferro::connectTcp((string) $o->host, $o->port, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $policy);
+        } catch (FerroException $e) {
+            // The transport TARGET, never `$params`: §12 keeps every credential in the engine, and
+            // the socket path (or host:port) plus the pool name is exactly what an operator needs.
+            throw DriverException::connectFailed($e, sprintf(
+                'Ferro: could not connect to the engine at %s (pool "%s")',
+                $o->socketPath ?? ((string) $o->host . ':' . $o->port),
+                $o->pool,
+            ));
+        }
 
         $info = $ferro->poolInfo();
         if ($info === null) {

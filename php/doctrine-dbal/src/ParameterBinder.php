@@ -106,8 +106,53 @@ final class ParameterBinder
     }
 
     /**
+     * The SPEC §9 canonical value objects, which cross this tier UNTOUCHED so their TAG survives.
+     * All eight are the client's own classes, so the driver may name them.
+     *
+     * Six of them ({@see \Ferro\Decimal}, {@see \Ferro\Date}, {@see \Ferro\Time}, {@see \Ferro\Uuid},
+     * {@see \Ferro\Json}, {@see \Ferro\U64}) implement `\Stringable`, and DBAL binds every untyped
+     * parameter as `ParameterType::STRING` — so before this arm existed they hit the `(string) $v`
+     * cast below and reached the engine as a bare `TAG_TEXT`, silently, with the canonical tag
+     * dropped. That defeated the S7 pre-send guarantee, which is TAG-KEYED: `ferro-backend-mysql`'s
+     * bind refuses `Value::Decimal("NaN")` and `Value::Time("839:00:00")` before they can be sent,
+     * while `Value::Text` has no pre-flight at all — so under a permissive `sql_mode` (which Doctrine
+     * never sets) the server COERCED instead. MEASURED through this tier, live, MySQL 8.4:
+     * `Ferro\Decimal('NaN')` stored `0.00`, `Ferro\Time('839:00:00')` stored `838:59:59`
+     * (`review/wb-xslice.md`).
+     *
+     * It also made the ENGINE's own advice impossible to follow: PostgreSQL's sentinel gate refuses a
+     * bare `'infinity'` string into a `date` slot and says *"send it with its own canonical tag
+     * instead (Ferro\Date / Ferro\Time / Ferro\NaiveTimestamp / Ferro\Decimal), which binds it
+     * deliberately"* — and passing exactly that object is what produced the bare string.
+     *
+     * The other two ({@see \Ferro\NaiveTimestamp}, {@see Bytes}) are NOT `\Stringable` and used to
+     * throw here, which is the asymmetry that gave the defect away: six tags degraded silently and
+     * two failed loudly. They are on the list so the rule reads "the canonical value objects
+     * survive", not "the ones that happened to be Stringable survive".
+     *
+     * A plain `\DateTimeInterface` is deliberately NOT on this list. `NaiveTimestamp` EXTENDS
+     * `\DateTimeImmutable`, and keeping the naive (wall-clock) and instant (UTC) forms apart is
+     * exactly what the two `ExecCodec::bindOne()` arms exist for (F14); stock DBAL stringifies every
+     * date/time before it reaches a driver, so a raw `\DateTimeImmutable` arriving here means the
+     * type layer was bypassed, and the refusal below says so rather than picking a zone.
+     *
+     * @var list<class-string>
+     */
+    private const CANONICAL = [
+        \Ferro\Decimal::class,
+        \Ferro\Date::class,
+        \Ferro\Time::class,
+        \Ferro\Uuid::class,
+        \Ferro\Json::class,
+        \Ferro\U64::class,
+        \Ferro\NaiveTimestamp::class,
+        Bytes::class,
+    ];
+
+    /**
      * Under `STRING`/`ASCII` the PHP type decides, because DBAL routes floats, ints and even bools
-     * through `STRING`. A stream is materialised rather than stringified into "Resource id #7".
+     * through `STRING`. A stream is materialised rather than stringified into "Resource id #7", and
+     * a SPEC §9 canonical value object passes through with its tag intact ({@see CANONICAL}).
      */
     private static function natural(mixed $v): mixed
     {
@@ -116,6 +161,13 @@ final class ParameterBinder
         }
         if (is_resource($v)) {
             return new Bytes(self::asBinary($v));
+        }
+        // BEFORE the `\Stringable` arm — six of the eight implement it, and that cast IS the
+        // downgrade. The ordering is the whole fix.
+        foreach (self::CANONICAL as $canonical) {
+            if ($v instanceof $canonical) {
+                return $v;
+            }
         }
         if ($v instanceof \Stringable) {
             return (string) $v;

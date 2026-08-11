@@ -22,6 +22,23 @@ namespace Ferro\DBAL;
  *      signal and charter rule 6 forbids inferring one, so the safe default is "write". This is the
  *      charter-compliant shape of §14's `read_pool` idea — a second, explicitly-configured
  *      connection, never inference.
+ *
+ *      **What it actually does, BOTH halves — believing only one of them was a shipped defect.**
+ *       1. **In a transaction the SERVER enforces it.** `beginTransaction()` carries the flag, the
+ *          engine composes `BEGIN READ ONLY` / `START TRANSACTION READ ONLY`, and a write is refused
+ *          (PostgreSQL `25006`, "cannot execute INSERT in a read-only transaction").
+ *       2. **In autocommit nothing on the server CAN enforce it** — an autocommit statement has no
+ *          transaction to carry the attribute. So the driver refuses what the SPI lets it see:
+ *          `executeStatement()` without parameters (`Connection::exec()`, Doctrine's WRITE entry
+ *          point) is rejected pre-send. A PARAMETERIZED `executeStatement('UPDATE … WHERE id = ?')`
+ *          is indistinguishable from an `executeQuery()` at the SPI and still executes; what keeps
+ *          THAT safe is that the declaration can no longer weaken a lost statement's fate
+ *          ({@see \Ferro\DBAL\Connection::statementException}, which re-mints that one cell to §19.3
+ *          `Indeterminate`).
+ *
+ *      Set it because the connection genuinely only reads. It buys the honest "statement cancelled"
+ *      answer for a read killed by a server-side `statement_timeout` (§22.2 (ac)); it can no longer
+ *      buy "safe to retry" for a statement that was lost in flight.
  *   `driverOptions.connect_timeout` / `driverOptions.io_timeout` — seconds, floats.
  */
 final class DriverOptions
