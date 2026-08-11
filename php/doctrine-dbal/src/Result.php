@@ -56,6 +56,48 @@ final class Result implements ResultInterface
     private bool $pendingAdvance = false;
 
     /**
+     * Whether abandoning this stream with a `CANCEL` would destroy the caller's open transaction —
+     * asked at the moment {@see free} decides, not captured at open.
+     *
+     * **The cancel is not a local operation.** `RawStream::close()` sends an out-of-band `CANCEL`,
+     * and `ferrod`'s S5 abort path (`run_streamed_exec`, `StreamStep::Cancelled`) turns that into a
+     * REAL backend `CancelRequest` — a PostgreSQL `CancelRequest`, not a bookkeeping flag. The
+     * server aborts the running statement with `57014`, and a statement error inside a `BEGIN` block
+     * puts the whole transaction into PG's ABORTED state, so the engine (correctly, §19.3) rolls it
+     * back and tombstones the `tx_id`. Every write the caller had already made is gone, and the
+     * §9.2 fate is `Retryable`, which invites a framework retry loop that reproduces it exactly.
+     *
+     * The review measured that from three ordinary lines — `beginTransaction()`,
+     * `executeStatement('INSERT …')`, `fetchAssociative('SELECT …')` — because the temporary
+     * `Doctrine\DBAL\Result` dies at the end of the statement and {@see __destruct} cancels.
+     *
+     * So inside a transaction this result DRAINS to the stream's one terminal instead. Same charter
+     * rule 4 (exactly one END), same released stream, no `CancelRequest` — and therefore an
+     * untouched transaction. It costs the remainder transfer at constant memory, which is the
+     * honest price and is documented in `docs/known-incompatibilities.md`.
+     *
+     * Null on a buffered result and on the unit fixtures that build a wire-less stream: then
+     * {@see free} cancels, which is the autocommit behaviour `StreamingLiveTest` pins.
+     *
+     * @var ?\Closure(): bool
+     */
+    private ?\Closure $cancelWouldPoisonTheTransaction = null;
+
+    /**
+     * Reports the rows a drain discarded, so the choice between "drained" and "cancelled" is
+     * OBSERVABLE from outside a destructor ({@see \Ferro\DBAL\Connection::abandonDrainedRowCount}).
+     *
+     * Without it the in-transaction guards would be functional-only, and a functional guard cannot
+     * fail below the measured threshold: at a `LIMIT` of one `StreamBatch::DEFAULT` frame or less the
+     * producer has already finished, the `CANCEL` lands on an idle backend and the transaction
+     * survives the bug. That is species (b) — passing for the wrong reason — on the exact input a
+     * fixture is most likely to use.
+     *
+     * @var ?\Closure(int): void
+     */
+    private ?\Closure $reportDrained = null;
+
+    /**
      * @param list<string> $cols
      * @param list<list<mixed>> $rows
      */
@@ -82,12 +124,20 @@ final class Result implements ResultInterface
      *
      * `affected` is `0`: the HEAD/DATA/END producer carries no such field, which is exactly why the
      * PREPARED path does not stream ({@see \Ferro\DBAL\Connection::query}).
+     *
+     * @param ?\Closure(): bool $cancelWouldPoisonTheTransaction {@see $cancelWouldPoisonTheTransaction}
+     * @param ?\Closure(int): void $reportDrained {@see $reportDrained}
      */
-    public static function streamed(RawStream $stream): self
-    {
+    public static function streamed(
+        RawStream $stream,
+        ?\Closure $cancelWouldPoisonTheTransaction = null,
+        ?\Closure $reportDrained = null,
+    ): self {
         $r = new self($stream->columns(), [], 0);
         $r->stream = $stream;
         $r->gen = $stream->rows();
+        $r->cancelWouldPoisonTheTransaction = $cancelWouldPoisonTheTransaction;
+        $r->reportDrained = $reportDrained;
         return $r;
     }
 
@@ -349,26 +399,102 @@ final class Result implements ResultInterface
      * afterwards, because it reads `pg_affected_rows()` off the very handle it just released. Both
      * shapes exist upstream; ours is the one that cannot lose a number it was already told.
      *
-     * On a STREAMED result it ALSO abandons the open stream (`CANCEL` + drain to the ONE terminal,
-     * charter rule 4), without which the next request on this session would read the leftover DATA
-     * frames as its own reply. A stream that already reached its terminal is no longer held here
-     * ({@see fetchNumeric} releases it), so a completed iteration sends no needless `CANCEL`.
+     * On a STREAMED result it ALSO abandons the open stream, in one of two ways — see
+     * {@see releaseStream}. Either way the stream reaches its ONE terminal (charter rule 4), without
+     * which the next request on this session would read the leftover DATA frames as its own reply. A
+     * stream that already reached its terminal is no longer held here ({@see fetchNumeric} releases
+     * it), so a completed iteration abandons nothing.
      */
     public function free(): void
     {
         try {
-            $this->stream?->close();
+            $this->releaseStream();
         } catch (FerroException $e) {
-            // Same boundary rule as {@see advance}: `close()` is a wire operation (CANCEL + drain)
-            // and DBAL's `Result::free()` has no idea what a `Ferro\Client\Error\*` is. Clear the
-            // state FIRST so a failed close cannot leave this result half-open.
-            $this->stream = null;
-            $this->gen = null;
-            $this->rows = [];
-            $this->cols = [];
-            $this->cursor = 0;
+            // Same boundary rule as {@see advance}: releasing is a WIRE operation (a CANCEL + drain,
+            // or a drain) and DBAL's `Result::free()` has no idea what a `Ferro\Client\Error\*` is.
+            // Clear the state FIRST so a failed release cannot leave this result half-open.
+            $this->clear();
             throw DriverException::fromFerro($e);
         }
+        $this->clear();
+    }
+
+    /**
+     * Abandon the open stream — **`CANCEL` outside a transaction, DRAIN inside one**.
+     *
+     * The asymmetry is not a policy preference, it is the only place the choice can be made. The
+     * `CANCEL` becomes a real PostgreSQL `CancelRequest` at the backend, which aborts the running
+     * statement and therefore poisons an open `BEGIN` block at the DATABASE level — by the time the
+     * engine classifies anything, the transaction is already unrecoverable, so there is no
+     * engine-side fate change that could rescue it ({@see $cancelWouldPoisonTheTransaction}). Inside
+     * a transaction the remainder is drained instead: the same one terminal, no `CancelRequest`, an
+     * untouched transaction, at the cost of transferring the rows nobody will read.
+     *
+     * `close()` still runs on the drain path, and that is not belt-and-braces: if the drain THROWS
+     * before reaching the terminal (a session-fatal, a lost link) the wire would otherwise be left
+     * mid-stream. After a drain that completed, `close()` is a no-op —
+     * `Session::abandonStream()` returns immediately once the stream is no longer open.
+     */
+    private function releaseStream(): void
+    {
+        $stream = $this->stream;
+        if ($stream === null) {
+            return;
+        }
+        $poisons = $this->cancelWouldPoisonTheTransaction;
+        if ($poisons === null || !$poisons()) {
+            $stream->close();
+            return;
+        }
+        try {
+            $this->discardRemainder();
+        } finally {
+            $stream->close();
+        }
+    }
+
+    /**
+     * Pull the rest of the stream to its terminal and THROW THE ROWS AWAY — the drain half of
+     * {@see releaseStream}.
+     *
+     * Deliberately not `materialize()`: that one keeps every remaining row, because its caller
+     * ({@see \Ferro\DBAL\Connection::settleOpenStream}) still has to serve them. Here nobody will
+     * ever read them, so holding 50 000 rows in memory on the way to freeing them would turn a
+     * bounded-memory abandonment into an OOM — the very failure the streamed path exists to avoid.
+     *
+     * The count is reported through {@see $reportDrained} from a `finally`, so a drain interrupted
+     * by a mid-stream error terminal still reports what it moved.
+     */
+    private function discardRemainder(): void
+    {
+        $gen = $this->gen;
+        if ($gen === null) {
+            return;
+        }
+        $drained = 0;
+        try {
+            if ($this->pendingAdvance) {
+                $this->pendingAdvance = false;
+                $this->advance($gen);
+            }
+            while ($this->hasRow($gen)) {
+                ++$drained;
+                $this->advance($gen);
+            }
+        } finally {
+            if ($drained > 0 && $this->reportDrained !== null) {
+                ($this->reportDrained)($drained);
+            }
+        }
+    }
+
+    /**
+     * The post-release state, shared by both arms of {@see free} so they cannot drift — the
+     * throwing arm previously left {@see $pendingAdvance} set, which was harmless only because the
+     * generator was already gone.
+     */
+    private function clear(): void
+    {
         $this->stream = null;
         $this->gen = null;
         $this->pendingAdvance = false;

@@ -242,6 +242,16 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   (measured: 99 975 of 100 000 rows). A live reference is indistinguishable from a caller who may
   still fetch, so this is a PHP refcount fact, not a design choice. **Iterate the call directly, or
   `unset()` the iterator.**
+- **Inside an open transaction, abandoning an iteration DRAINS the remainder instead of cancelling
+  it.** Same result for your code, different cost: the rows you did not read still cross the wire
+  (at constant memory — they are discarded as they arrive), where in autocommit the query would have
+  been cancelled outright. `Ferro\DBAL\Connection::abandonDrainedRowCount()` reports what that has
+  cost on this connection: `0` outside a transaction, the size of the abandoned remainder inside one.
+  It is not tunable, because the alternative is not "slower", it is *wrong*: the cancel becomes a
+  real backend `CancelRequest`, which aborts the running statement, which puts an open `BEGIN` block
+  into PostgreSQL's ABORTED state — so the transaction would be rolled back and every write you had
+  already made in it silently lost. If the remainder is large enough for the transfer to matter,
+  `LIMIT` the query.
 - **A statement issued *while* an iteration is open drains the remainder into memory first** — the
   session is strictly single-in-flight. The canonical
   `foreach (iterate…) { executeStatement(…) }` idiom therefore keeps working, at the cost of

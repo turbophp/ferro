@@ -341,6 +341,69 @@ final class StreamedResultTest extends TestCase
     }
 
     /**
+     * **Inside a transaction, abandonment DRAINS to the terminal instead of CANCELling** — the
+     * mechanism half of `StreamInTransactionLiveTest`, at a vantage point where it is a pure
+     * property of this class.
+     *
+     * That `CANCEL` is not a local operation: `ferrod` turns it into a real backend `CancelRequest`,
+     * which aborts the running statement, which puts an open `BEGIN` block into PostgreSQL's ABORTED
+     * state — so the engine rolls the caller's transaction back and tombstones it. The whole-branch
+     * review measured a plain `fetchAssociative()` inside a transaction silently discarding a prior
+     * `INSERT` that way.
+     *
+     * `$pulled` is the assertion that matters: it counts how far the PRODUCER was driven, so it
+     * tells a drain (3) from a cancel (1). `FakeSession::abandonCount` cannot make that distinction
+     * — the fixture counts `abandonStream()` calls unconditionally, while the real
+     * `Session::abandonStream()` returns immediately once the stream has reached its terminal, so
+     * the post-drain call is a no-op on the wire and a `1` here either way.
+     */
+    public function testInsideATransactionAbandonmentDrainsInsteadOfCancelling(): void
+    {
+        $pulled = 0;
+        $session = new FakeSession();
+        $drained = 0;
+        $r = Result::streamed(
+            $this->stream([[1, 'a'], [2, 'b'], [3, 'c']], $pulled, $session),
+            static fn (): bool => true,
+            static function (int $n) use (&$drained): void { $drained += $n; },
+        );
+        self::assertSame([1, 'a'], $r->fetchNumeric());
+        self::assertSame(1, $pulled, 'one fetch, one row — the drain has not happened yet');
+
+        unset($r); // the caller drops it: `break`, or the end of a `fetchAssociative()` statement
+
+        self::assertSame(3, $pulled, 'the remainder must have been pulled to the terminal, not cancelled');
+        self::assertSame(2, $drained, 'and the rows it threw away must be reported, not silently paid');
+    }
+
+    /**
+     * THE MIRROR, at the same vantage point: OUTSIDE a transaction there is nothing to protect, so
+     * abandonment still CANCELS and the remainder is never transferred.
+     *
+     * Without this the "fix" could be "always drain", which passes every in-transaction guard while
+     * reintroducing the OOM trap the `\WeakReference` design exists to close — a `break` at row 25
+     * of 100 000 quietly moving 99 975 rows.
+     */
+    public function testOutsideATransactionAbandonmentStillCancels(): void
+    {
+        $pulled = 0;
+        $session = new FakeSession();
+        $drained = 0;
+        $r = Result::streamed(
+            $this->stream([[1, 'a'], [2, 'b'], [3, 'c']], $pulled, $session),
+            static fn (): bool => false,
+            static function (int $n) use (&$drained): void { $drained += $n; },
+        );
+        self::assertSame([1, 'a'], $r->fetchNumeric());
+
+        unset($r);
+
+        self::assertSame(1, $pulled, 'an autocommit abandonment must NOT drain the remainder');
+        self::assertSame(0, $drained);
+        self::assertSame(1, $session->abandonCount, 'it must CANCEL instead');
+    }
+
+    /**
      * A streamed read reports `rowCount() === 0`, because the HEAD/DATA/END producer carries no
      * `affected` field at all. This is the reason the PREPARED path does not stream:
      * `Doctrine\DBAL\Connection::executeStatement()` RETURNS this number.

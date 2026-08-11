@@ -87,6 +87,29 @@ final class Connection implements DriverConnection
     /** @see settledRowCount */
     private int $settledRows = 0;
 
+    /** @see abandonDrainedRowCount */
+    private int $abandonDrainedRows = 0;
+
+    /**
+     * How many rows an ABANDONED streamed result has had to drain because cancelling it would have
+     * destroyed an open transaction ({@see \Ferro\DBAL\Result::releaseStream}).
+     *
+     * **0 outside a transaction** — there the abandonment is a `CANCEL` and nothing is transferred —
+     * and non-zero inside one, where it is the remainder the caller never read. It is the counterpart
+     * to {@see settledRowCount} (which counts the OTHER drain, the one an interleaved statement
+     * forces), and the two must not be conflated: they are different paths with different costs, and
+     * a guard that could not tell them apart would bless either one silently replacing the other.
+     *
+     * It exists because the alternative — asserting only that the transaction survived — CANNOT FAIL
+     * below one `StreamBatch::DEFAULT` frame (1024 rows / 256 KiB): at that size the producer has
+     * already finished, so even the destructive `CANCEL` lands on an idle backend and the transaction
+     * lives. That is exactly the size a test fixture reaches for.
+     */
+    public function abandonDrainedRowCount(): int
+    {
+        return $this->abandonDrainedRows;
+    }
+
     /**
      * How many rows this connection has had to drain because a streamed result was still open when
      * another statement was issued.
@@ -204,8 +227,17 @@ final class Connection implements DriverConnection
      *
      * The returned result is the CALLER's alone; this connection keeps only a `\WeakReference`
      * ({@see $openStream}). A caller that discards it — `$conn->query($sql);` in statement position —
-     * destroys it at the end of that statement and the stream is cancelled there, which is correct
+     * destroys it at the end of that statement and the stream is abandoned there, which is correct
      * and is what the buffered path already does with its rows.
+     *
+     * **Streaming is safe INSIDE a transaction only because abandonment is told what it is inside.**
+     * The two closures below are that: abandoning a stream normally sends a `CANCEL`, which `ferrod`
+     * turns into a real backend `CancelRequest`, which aborts the statement, which puts an open
+     * `BEGIN` block into PG's ABORTED state — so the engine rolls the transaction back and tombstones
+     * it, and the caller's earlier writes are lost (`review/wb-xslice.md`, BLOCKER: three ordinary
+     * lines, a silently discarded `INSERT`). Inside a transaction the result drains to its terminal
+     * instead. `inTransaction()` is asked at ABANDONMENT time rather than captured here: it is the
+     * state at the moment the decision is made, and it is free to ask.
      */
     public function query(string $sql): ResultInterface
     {
@@ -219,7 +251,11 @@ final class Connection implements DriverConnection
         } catch (FerroException $e) {
             throw DriverException::fromFerro($e);
         }
-        $result = Result::streamed($stream);
+        $result = Result::streamed(
+            $stream,
+            fn (): bool => $this->ferro->inTransaction(),
+            function (int $rows): void { $this->abandonDrainedRows += $rows; },
+        );
         // WEAK on purpose — see the field's docblock. The caller's own reference (via
         // `Doctrine\DBAL\Result`) is the one that decides whether this result is still alive.
         $this->openStream = \WeakReference::create($result);
