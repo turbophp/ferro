@@ -82,16 +82,36 @@ That co-design — engine daemon *and* client library from the same protocol reg
 
 The drop-in tiers change the **execution layer only**. Doctrine's platforms and Laravel's Grammar/Processor stay completely stock — Ferro never generates or rewrites SQL.
 
-**Doctrine DBAL / Symfony** (SPEC §14):
+**Doctrine DBAL / Symfony** (SPEC §14) — this tier exists today, and this is its shipped shape:
 
 ```php
-'connections' => ['default' => [
-    'driverClass' => Ferro\DBAL\Driver::class,
-    'ferro' => ['pool' => 'main', 'read_pool' => 'main_ro'],
-]],
+'connections' => [
+    'default' => [
+        'driverClass'   => Ferro\DBAL\Driver::class,
+        // Required, not optional: without it an indeterminate write inside transactional()
+        // reaches your application as "There is no active transaction."
+        'wrapperClass'  => Ferro\DBAL\Wrapper\FerroConnection::class,
+        'unix_socket'   => '/run/ferro/app.sock',
+        'driverOptions' => ['pool' => 'main'],
+        // no user/password/host — the DSN lives in ferrod (SPEC §12 / D8)
+    ],
+    // A read/write split is a SECOND, explicitly configured connection, never an inference from
+    // SQL text (charter rule 6). `readonly` DECLARES the fate of every statement on it — read
+    // what that costs in docs/known-incompatibilities.md before you set it.
+    'reporting' => [
+        'driverClass'   => Ferro\DBAL\Driver::class,
+        'wrapperClass'  => Ferro\DBAL\Wrapper\FerroConnection::class,
+        'unix_socket'   => '/run/ferro/app.sock',
+        'driverOptions' => ['pool' => 'main_ro', 'readonly' => true],
+    ],
+],
 ```
 
-**Laravel / Eloquent** (SPEC §15):
+There is **no top-level `ferro` key and no `read_pool` key.** An earlier draft of this README showed
+both; a connection configured that way silently used the pool named `default` — a different DSN, and
+possibly a different database. The driver now refuses either key by name instead of ignoring it.
+
+**Laravel / Eloquent** (SPEC §15) — M2, **not shipped**; the shape below is the target:
 
 ```php
 'connections' => [
@@ -104,7 +124,7 @@ The drop-in tiers change the **execution layer only**. Doctrine's platforms and 
 ],
 ```
 
-Acceptance for both tiers is the **upstream test suites** — DBAL 4's functional suite and `illuminate/database`'s integration suite — running green over Ferro connections.
+**Acceptance, as measured rather than as hoped.** The bar for the Doctrine tier is a **curated subset of DBAL 4's own functional suite**, run through a real `DriverManager` against real PostgreSQL/MySQL/MariaDB with driver identity asserted, green modulo a recorded and triaged list — the numbers, the triage and the runner are in [docs/dbal-suite/](docs/dbal-suite/). Running the *whole* upstream tree is not the bar and cannot be: Ferro has no SQLite backend (one third of DBAL's own matrix), upstream's `TestUtil` cannot select a third-party `driverClass` at all — with no patch it silently falls back to in-memory SQLite and reports green with **zero** Ferro contact — and the stock PDO drivers are not green on these containers either. The Eloquent tier (M2) will state its own measured bar the same way; `illuminate/database`'s harness has the same driver-injection problem.
 
 The native client is where the new capabilities live. This is the **target API** (SPEC §10) — today's shipped surface is `Ferro::connect()` plus `query`/`queryOne`/`rows`/`scalar`/`exec`, typed DTO hydration into value objects, the lazy `stream()` generator, the transaction closure with a retry policy, and imperative `begin`/`commit`/`rollBack`; `Ferro::pool()` and the async/Fibers surface come later:
 

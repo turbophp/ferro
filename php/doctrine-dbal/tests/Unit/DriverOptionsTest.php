@@ -106,6 +106,123 @@ final class DriverOptionsTest extends TestCase
     }
 
     /**
+     * WHOLE-BRANCH REVIEW, BLOCKER (`review/wb-docs.md`): this repository's own README shipped
+     * `'ferro' => ['pool' => 'main', 'read_pool' => 'main_ro']`, a shape SPEC §14 documented and
+     * this slice REMOVED. Measured before the fix: `fromParams()` returned `pool = "default"` —
+     * a different pool, therefore a different DSN, therefore possibly a different database — with
+     * no exception, no warning and no PHPStan error (it is the operator's array, not the driver's).
+     *
+     * The refusal has to fire on the exact params an operator copies, i.e. WITH a working
+     * `unix_socket` next to it: that is the case that would otherwise connect successfully to the
+     * wrong place. It also has to fire BEFORE the "no transport configured" check, or the diagnosis
+     * for a straight copy-paste (no socket added yet) names the wrong mistake.
+     */
+    public function testATopLevelFerroKeyIsRefusedRatherThanSilentlyRoutingToTheDefaultPool(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessageMatches('/`ferro`.+driverOptions/s');
+        DriverOptions::fromParams([
+            'unix_socket' => '/run/ferro/app.sock',
+            'ferro' => ['pool' => 'main', 'read_pool' => 'main_ro'],
+        ]);
+    }
+
+    /** The same block with no transport beside it still names the `ferro` key, not the transport. */
+    public function testTheFerroKeyRefusalPrecedesTheTransportCheck(): void
+    {
+        try {
+            DriverOptions::fromParams(['ferro' => ['pool' => 'main']]);
+            self::fail('expected a refusal');
+        } catch (\InvalidArgumentException $e) {
+            self::assertStringContainsString('`ferro`', $e->getMessage());
+            self::assertStringNotContainsString('no engine transport', $e->getMessage());
+        }
+    }
+
+    /**
+     * `read_pool` gets its own answer at BOTH levels, because the mistake arrives from both: the
+     * removed README example put it at the top level, and the natural retry is to move it into
+     * `driverOptions` — where a generic "unrecognised key" message would be true but would not say
+     * that the feature does not exist and why (charter rule 6).
+     *
+     * @return array<string, array{0: array<string, mixed>}>
+     */
+    public static function readPoolShapes(): array
+    {
+        return [
+            'top level' => [['unix_socket' => '/s', 'read_pool' => 'main_ro']],
+            'inside driverOptions' => [['unix_socket' => '/s', 'driverOptions' => ['read_pool' => 'main_ro']]],
+        ];
+    }
+
+    /** @param array<string, mixed> $params */
+    #[\PHPUnit\Framework\Attributes\DataProvider('readPoolShapes')]
+    public function testReadPoolIsRefusedAtEveryLevelAndNamesTheSecondConnection(array $params): void
+    {
+        try {
+            DriverOptions::fromParams($params);
+            self::fail('expected a refusal');
+        } catch (\InvalidArgumentException $e) {
+            self::assertStringContainsString('read_pool', $e->getMessage());
+            self::assertStringContainsString("'readonly' => true", $e->getMessage());
+        }
+    }
+
+    /**
+     * `driverOptions` is Ferro's OWN namespace, so the check there is exhaustive — a typo and a
+     * leftover PDO attribute are the same defect as `read_pool`, and each of these rows is a
+     * different reachable shape rather than a restatement of one.
+     *
+     * @return array<string, array{0: array<string, mixed>}>
+     */
+    public static function unrecognisedOptions(): array
+    {
+        return [
+            'a typo in a real key' => [['pooll' => 'main']],
+            'the client facade spelling' => [['read_only' => true]],
+            'a leftover PDO attribute' => [[\PDO::ATTR_EMULATE_PREPARES => false]],
+        ];
+    }
+
+    /** @param array<string, mixed> $driverOptions */
+    #[\PHPUnit\Framework\Attributes\DataProvider('unrecognisedOptions')]
+    public function testAnUnrecognisedDriverOptionsKeyIsRefused(array $driverOptions): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessageMatches('/unrecognised driverOptions key/');
+        DriverOptions::fromParams(['unix_socket' => '/s', 'driverOptions' => $driverOptions]);
+    }
+
+    /**
+     * The counterweight, and the reason the refusal can be trusted not to be over-broad: every
+     * recognised key together still parses, and the top-level params DBAL itself owns
+     * (`driverClass`, `wrapperClass`, `serverVersion`, `user`, `password`, `dbname`, `charset` —
+     * the last four inert under Ferro but routinely present in a real config) are NOT refused.
+     * A blanket top-level unknown-key check would fail this test.
+     */
+    public function testEveryRecognisedKeyTogetherParsesAndDbalsOwnParamsAreNotRefused(): void
+    {
+        $o = DriverOptions::fromParams([
+            'driverClass' => 'Ferro\DBAL\Driver',
+            'wrapperClass' => 'Ferro\DBAL\Wrapper\FerroConnection',
+            'serverVersion' => '17.10',
+            'user' => 'app', 'password' => 'x', 'dbname' => 'app', 'charset' => 'utf8',
+            'unix_socket' => '/run/ferro/app.sock',
+            'driverOptions' => [
+                'socket' => '/run/ferro/app.sock',
+                'pool' => 'main',
+                'readonly' => true,
+                'connect_timeout' => 1.5,
+                'io_timeout' => 9.0,
+            ],
+        ]);
+        self::assertSame('main', $o->pool);
+        self::assertTrue($o->readonly);
+        self::assertSame(1.5, $o->connectTimeout);
+        self::assertSame(9.0, $o->ioTimeout);
+    }
+
+    /**
      * ADDED (beyond the plan) — `driverOptions` itself being the wrong type. The plan's error
      * message for it exists but nothing reached it, and `$params['driverOptions']` is operator-typed
      * configuration: a scalar there (a DSN string pasted into the wrong key) must be a loud refusal

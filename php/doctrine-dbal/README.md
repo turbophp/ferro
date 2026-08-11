@@ -8,8 +8,10 @@ Requires PHP ≥ 8.2 and `doctrine/dbal ^4.0`. Backends: **PostgreSQL** and **My
 There is no SQLite backend.
 
 > Read [`docs/known-incompatibilities.md`](../../docs/known-incompatibilities.md) before you adopt
-> this. It is short, every entry is measured, and two of them (a cancelled `SELECT` reported as an
-> indeterminate write; the PostgreSQL schema manager) will change how you plan the migration.
+> this. It is short, every entry is measured, and two of them will change how you write code: a
+> cancelled `SELECT` is reported as an indeterminate write, and on PostgreSQL a parameterless
+> `executeQuery()` streams — so DML sent through it reports `rowCount() === 0` and, if you discard
+> the result, swallows its error. Use `executeStatement()` for anything that writes.
 
 ## Install
 
@@ -48,9 +50,16 @@ $conn = DriverManager::getConnection([
 ```
 
 **There are no database credentials here, and that is the point.** The DSN lives in the engine's
-configuration (SPEC §12 / decision D8), so the DBAL `user`, `password`, `host`, `dbname` and
-`charset` parameters are inert. Ops configures the pool once, per host; the application only names
-it.
+configuration (SPEC §12 / decision D8), so the DBAL `user`, `password`, `dbname` and `charset`
+parameters are inert. Ops configures the pool once, per host; the application only names it.
+(`host`/`port` are read, but they address the ferrod **daemon** — the TCP fallback when no socket is
+configured — never a database server. A configured socket takes precedence over a host, silently.)
+
+**Unrecognised configuration is refused, not ignored.** A top-level `ferro` key, `read_pool` at any
+level, and any unknown key inside `driverOptions` raise an `InvalidArgumentException` naming the
+replacement. Earlier drafts of this project's docs showed `'ferro' => ['pool' => 'main']`, which
+parsed to the pool named `default` — a different DSN, possibly a different database — without a
+word.
 
 Symfony, in `config/packages/doctrine.yaml`:
 
@@ -97,7 +106,25 @@ If a connection genuinely only reads, declare it:
 ```
 
 That is also the charter-compliant shape of a read/write split: a **second, explicitly configured
-connection**, never an inference from the statement.
+connection**, never an inference from the statement. There is no `read_pool` option, and the driver
+refuses that key by name rather than ignoring it.
+
+**Two consequences, both measured, neither obvious.**
+
+1. **It is a declaration, not an enforcement — for autocommit statements.** An `INSERT` on a
+   readonly-declared connection succeeds and the row lands. What changes is the answer when that
+   statement *fails*: a connection lost mid-write reports `Ferro\DBAL\RetryableDriverException` —
+   carrying `Doctrine\DBAL\Exception\RetryableException`, the marker framework retry loops key on —
+   where the same write on a normal connection reports `IndeterminateWriteException`. A
+   readonly-declared connection that can reach *any* write (the realistic case is a rarely-taken
+   audit `INSERT` in an error path) has the at-most-once guarantee turned off for it. Judge the flag
+   by proof, not by intent.
+2. **It IS enforced inside an explicit transaction, by changing the `BEGIN`.** The engine composes
+   `BEGIN … READ ONLY` (PostgreSQL) / `START TRANSACTION READ ONLY` (MySQL family), so a write
+   inside `transactional()` on such a connection fails with SQLSTATE `25006` — both families.
+
+Both are in [`docs/known-incompatibilities.md`](../../docs/known-incompatibilities.md) with the
+measurements.
 
 ### Isolation levels
 
@@ -163,12 +190,25 @@ final class MyConnection extends PrimaryReadReplicaConnection
 
 ## Streaming
 
-`iterateAssociative()` and its siblings stream row-by-row on **PostgreSQL** for parameterless queries
-and buffer otherwise; on MySQL/MariaDB they buffer, because engine-side row streaming there is still
-deferred. Interleaving a statement into an open iteration works (the remainder is drained first);
-abandoning the canonical `foreach ($conn->iterateAssociative($sql) as $row) { … break; }` cancels the
-stream. A **bound** iterator does not — `unset()` it or iterate the call directly. See the
-known-incompatibilities page for the measurement.
+`iterateAssociative()` and its siblings stream row-by-row on **PostgreSQL** for parameterless
+queries and buffer otherwise; on MySQL/MariaDB they buffer, because engine-side row streaming there
+is still deferred. Interleaving a statement into an open iteration works (the remainder is drained
+first); abandoning the canonical `foreach ($conn->iterateAssociative($sql) as $row) { … break; }`
+cancels the stream. A **bound** iterator does not — `unset()` it or iterate the call directly.
+
+**The streamed route is the parameterless route, not the read route**, and it cannot be otherwise:
+`Doctrine\DBAL\Connection::executeQuery($sql)` with no parameters reaches the driver's `query()`
+whatever the verb, and charter rule 6 forbids inferring read-vs-write from SQL text. Two
+consequences on PostgreSQL, both measured:
+
+```php
+$conn->executeQuery('UPDATE t SET x = 1')->rowCount();   // 0 — the stream terminal has no `affected`
+$conn->executeQuery('INSERT INTO t VALUES (1)');         // duplicate key: NO exception, ever
+$conn->executeStatement('UPDATE t SET x = 1');           // 10 — correct, on both families
+```
+
+Use `executeStatement()` for statements that write. The known-incompatibilities page has the full
+route x family x verb table and the measurements.
 
 ## Native access
 
@@ -195,11 +235,17 @@ numbers and their triage are in [`docs/dbal-suite/2026-08-11-results.md`](../../
 
 ## Known gaps
 
-- The stock **PostgreSQL schema manager** (and therefore `doctrine/migrations` on PG) does not work
-  yet: one unsupported catalog type blocks index introspection.
-- A **`bigint` at or above 2^32 cannot be read** through `ferro/client` today.
-- **`lastInsertId()` throws on PostgreSQL** by design; use `INSERT … RETURNING id`.
+- On PostgreSQL, a **parameterless `executeQuery()` streams**, so DML sent through it reports
+  `rowCount() === 0` and — if the result is discarded — swallows its error. `executeStatement()` is
+  correct on every route and family.
+- **`lastInsertId()` throws on PostgreSQL** by design; use `INSERT … RETURNING id`, and configure
+  Doctrine ORM's SEQUENCE identity strategy there (drop-in is config-only for DBAL, and explicitly
+  **not** config-only for ORM on PostgreSQL).
+- A PostgreSQL type outside Ferro's 14 canonical tags (arrays, ranges, `inet`, `interval`, `timetz`,
+  PostGIS, `hstore`, enums…) reads as **PostgreSQL's own text**, exactly as `pdo_pgsql` hands it
+  back — so an array does not arrive as a PHP array.
+- **MySQL/MariaDB do not stream**; `iterate*()` buffers there.
 - The first query against a backend that is **down** can block for the OS connect timeout rather than
   failing fast.
 
-All four, with measurements and follow-up links, are on the known-incompatibilities page.
+All of them, with measurements and follow-up links, are on the known-incompatibilities page.

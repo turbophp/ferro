@@ -42,7 +42,8 @@ out".
   `Doctrine\DBAL\Exception\RetryableException`.
 - **If a connection genuinely only reads, say so:** `'driverOptions' => ['readonly' => true]`
   restores the clean cancellation answer for that connection. Explicit configuration, never
-  inference.
+  inference. **It is a fate DECLARATION and it has two consequences, one of them an at-most-once
+  hazard — read *Read-only connections* below before you set it.**
 - **Inside a transaction the question does not arise.** A cancelled statement rolls the transaction
   back, the `tx_id` is tombstoned, and the fate is *known*: `Retryable`.
 
@@ -74,6 +75,24 @@ and friends kill the backend session and expect `ConnectionLost`; under Ferro th
 answer instead. **If your application catches `ConnectionLost`, catch `Doctrine\DBAL\Exception\DriverException`
 instead and branch on the two Ferro classes.**
 
+**That remedy is necessary and not sufficient, and here is the case it does not cover.** DBAL's
+`Connection::handleDriverException()` calls `$this->close()` — which resets the transaction nesting
+level to 0 — only when the converted exception `instanceof ConnectionLost`. Ferro's classes
+deliberately are not, so the wrapper's bookkeeping takes a different path than any stock driver's,
+and inside `$conn->transactional(…)` the exception your application actually receives is
+`Doctrine\DBAL\Exception\NoActiveTransaction` — *"There is no active transaction."* —
+which extends `Doctrine\DBAL\ConnectionException` and **not** `DriverException`, so a `catch
+(DriverException)` sees nothing. Measured on **PostgreSQL, MySQL and MariaDB**, through upstream's
+own `TransactionTest::testTransactionalFailureDuringCommit` run on the stock connection class. With
+the wrapper configured, the same test reports the driver's real verdict
+(`IndeterminateWriteException`) instead — equal counts, opposite meanings, which is why the
+acceptance runner now ASSERTS the wrapper rather than trusting a number to notice.
+
+**Configure `'wrapperClass' => Ferro\DBAL\Wrapper\FerroConnection::class`** — it restores the
+driver's verdict, and it is what makes the `DriverException` remedy above true inside
+`transactional()`. The full mechanism, and what to do if you need a different wrapper class, is
+under *Transactions and session state* below; it is the entry to read if you read only one.
+
 ### A type-policy refusal arrives as a plain `DriverException`, with no fate
 
 A value the client's §9.1 policy refuses (`Ferro\Client\Error\TypePolicyException`) carries **no fate
@@ -84,6 +103,48 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
 (`Ferro\DBAL\Exception\NonRepresentableValue`, `UnsupportedStatement`, `ServerVersionUnavailable`,
 `BackendFamilyUnknown`) take the same branch-less path. A malformed payload remains a
 `ProtocolException`.
+
+---
+
+## Read-only connections
+
+`'driverOptions' => ['readonly' => true]` is offered twice above as the answer to the indeterminate
+`SELECT`, and it is. It is also the only option in this driver that can make an error message
+**less** true, so both of its consequences are stated here rather than left to be discovered.
+
+### It is a DECLARATION, not an enforcement — and that is an at-most-once hazard
+
+Nothing gates execution on the flag: an autocommit `INSERT` on a readonly-declared connection
+**succeeds and the row lands** (measured on PostgreSQL and MySQL). What the flag changes is the
+answer the §19.3 fate matrix gives when that statement fails. The same writing statement, on two
+connections differing only in the flag:
+
+| what happened | `readonly` unset (default) | `readonly => true` |
+|---|---|---|
+| cancelled / `statement_timeout` (`57014`) | `Ferro\DBAL\IndeterminateWriteException` — *may or may not have applied* | plain `DriverException`, *"statement cancelled or timed out"* |
+| connection lost mid-statement | `Ferro\DBAL\IndeterminateWriteException` | **`Ferro\DBAL\RetryableDriverException`** — carries `Doctrine\DBAL\Exception\RetryableException` |
+
+That last cell is the hazard, and it is the exact inversion of the guarantee the rest of this page
+is about: a write whose fate is genuinely unknown is handed to your framework's retry loop with the
+marker that says *"this provably did not apply, replaying it is safe"*. The declaration decides the
+answer, because the SPI gives the engine nothing else to go on — which is precisely why the flag
+must be judged by proof, not by intent. **A connection carrying `readonly => true` must not be able
+to reach a write, including a rarely-taken audit `INSERT` in an error path.**
+
+### It DOES change the SQL the engine emits for `BEGIN`
+
+Inside an explicit transaction the flag is enforced, by the backend, because the engine composes the
+`BEGIN` with it: `BEGIN … READ ONLY` on PostgreSQL, `START TRANSACTION READ ONLY` on the MySQL
+family. Measured, both families:
+
+```
+pg     SQLSTATE 25006  cannot execute INSERT in a read-only transaction
+mysql  SQLSTATE 25006  Cannot execute statement in a READ ONLY transaction.   (errno 1792)
+```
+
+So a write path that happens to be wrapped in `transactional()` fails loudly the first time it runs,
+while the same write outside a transaction succeeds silently — the two halves of the flag disagree,
+and that is worth knowing before an incident rather than during one.
 
 ---
 
@@ -98,11 +159,20 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   `M1ValuePolicy`, or `RawStringValuePolicy` for the raw canonical text). The refusal is a
   **driver-tier policy**, not an engine limitation.
 - **No database credentials exist in PHP.** The DSN lives in the engine (SPEC §12 / D8). The DBAL
-  `user`, `password`, `host`, `dbname` and `charset` parameters are therefore inert — measured at the
+  `user`, `password`, `dbname` and `charset` parameters are therefore inert — measured at the
   acceptance gate, where upstream's `testInvalidUserName` / `testInvalidPassword` / `testInvalidHost`
   cannot fail and `testInheritCharsetFromPrimary` reports the engine's `utf8mb4` rather than the
   requested `latin1`. Tooling that shells out to `pg_dump`/`mysqldump` with the application's config
   cannot work; ops provisions separate dump credentials.
+  **`host`/`port` are the exception: they are read, and they select the FERRO daemon's TCP endpoint**
+  (the `FERRO_ADDR` fallback) when no `unix_socket`/`driverOptions.socket` is configured. They never
+  name a database server. If you set both a socket and a host, the socket wins and the host is
+  ignored without a diagnostic — which is what upstream's `testInvalidHost` actually measures.
+- **A misconfigured key is refused, not ignored.** The top-level `ferro` key and `read_pool` at any
+  level (both shipped in earlier drafts of this project's own README and SPEC §14) raise an
+  `InvalidArgumentException` naming the replacement, as does any unrecognised key inside
+  `driverOptions`. Ignoring one is how a connection ends up on the pool named `default` — a different
+  DSN, possibly a different database — with no diagnostic at all.
 - **A pool whose BACKEND is unreachable fails at `getDatabasePlatform()`, not at connect.**
   Connecting succeeds because the Ferro handshake never depends on backend availability; the platform
   needs the server version, which does. The failure is a loud
@@ -232,11 +302,14 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
 - **An integer parameter above `PHP_INT_MAX` is refused client-side**, not silently saturated
   (a PHP `(int)` cast saturates rather than wrapping). Bind it as a string against a `numeric`
   column, or keep it in `bigint` range.
-- **A `bigint` at or above 2^32 currently cannot be READ.** `SELECT 4294967296::bigint` raises
-  `ProtocolException: value tag 2: expected a int payload, got string` — on every backend, on every
-  value policy, with or without `ext-msgpack`. This is a **defect**, not a policy: it affects any
-  `bigint` PK past 4.29e9 and every epoch-milliseconds column. Tracked in
-  `docs/followups/2026-08-11-i64-above-2e32-unreadable-in-php-client.md`.
+- **The whole signed 64-bit range reads as a PHP `int`.** Measured through the driver:
+  `4294967295`, `4294967296`, `9223372036854775806` and `9223372036854775807` all arrive as `int`.
+  (An earlier build of `php/client` threw `ProtocolException: value tag 2: expected a int payload,
+  got string` at 2^32; fixed — the turnover is `PHP_INT_MAX`, where it belongs.)
+- **A MySQL `BIGINT UNSIGNED` above `PHP_INT_MAX` arrives as a decimal STRING**, because PHP has no
+  wider integer: `SELECT CAST(18446744073709551615 AS UNSIGNED)` → `string('18446744073709551615')`.
+  That is the `u64_overflow` policy answer, not a defect. PostgreSQL has no unsigned integer type,
+  so the case cannot arise there.
 - **A `LARGE_OBJECT` bind is materialised in memory** and is bounded by the 16 MiB maximum frame
   payload. A chunked bind would be a protocol change.
 - **`BINARY` / `LARGE_OBJECT` are the only route to binary.** Every bare PHP string binds as text;
@@ -249,21 +322,31 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
 
 ## Schema, migrations and introspection
 
-- **The stock PostgreSQL schema manager does not work yet.** DBAL's
-  `PostgreSQLSchemaManager::selectIndexColumns()` selects `pg_index.indkey`, an `int2vector`, and the
-  engine's PG read path has no mapping for that type — so `introspectTable()`, `listTableIndexes()`,
-  schema diffing and `doctrine/migrations` all fail on PostgreSQL with a loud
-  *"unsupported type for column \"indkey\""*. It is a single missing catalog type amplified across
-  every introspection path (50 of the 78 non-passing PostgreSQL tests at the acceptance gate).
-  The MySQL family is unaffected. Tracked in
-  `docs/followups/2026-08-11-pg-int2vector-blocks-the-schema-manager.md`.
-- **Two stock-Doctrine bind shapes are refused on PostgreSQL** and work on MySQL:
-  a bound interval in the platform's date-arithmetic SQL (`? || ' SECOND'` makes PostgreSQL infer
-  `text` for an `INTEGER` bind), and a boolean written through `Connection::insert()` **without** a
-  `$types` entry (Doctrine's `BooleanType` hands the driver `int(1)`, and PostgreSQL's `bool` slot
-  refuses an integer). The workaround for the second is to declare the type:
-  `$conn->insert('t', ['flag' => true], ['flag' => Types::BOOLEAN])`. Tracked in
-  `docs/followups/2026-08-11-pg-bind-matrix-narrower-than-libpq.md`.
+- **A PostgreSQL type outside Ferro's 14 canonical tags reads as PostgreSQL's own TEXT**, not as a
+  typed value and not as a loud refusal (decision D-S8b-6). Measured through the driver:
+
+  ```
+  '{1,2,3}'::int[]      -> string('{1,2,3}')      '[1,10)'::int4range  -> string('[1,10)')
+  inet '192.168.0.1'    -> string('192.168.0.1')  '1 day'::interval    -> string('1 day')
+  '12:34:56+02'::timetz -> string('12:34:56+02')  point '(1,2)'        -> string('(1,2)')
+  ```
+
+  This is exactly what `pdo_pgsql`/libpq hand back, so PostGIS (`geometry`/`geography` as EWKB hex),
+  `hstore`, `ltree`, `citext`, native enums and every future extension type work unmodified — and it
+  is what makes the stock schema manager work (below). The consequence to know: **an array does not
+  arrive as a PHP array.** Parse it, or cast it in SQL. The 14 canonical types keep their typed,
+  policy-aware path.
+- **The stock PostgreSQL schema manager works.** Directly measured: `introspectTable()` (columns
+  typed through `Integer`/`Text`/`Decimal`), `listTableIndexes()` with multi-column ordering, and
+  `listTableNames()`; the wider surface — sequences, schemas, views, foreign keys, comparison — is
+  covered by upstream's own `Schema\*` classes, all green in the acceptance run. It was blocked
+  until this branch by one catalog type (`pg_index.indkey`, an `int2vector`); the text fallback above
+  is what unblocked it, together with widening the PG bind matrix so a stock `BooleanType`
+  `int(1)` and the platform's `? || ' SECOND'` date arithmetic bind. Both former workarounds
+  (`$conn->insert('t', ['flag' => true], ['flag' => Types::BOOLEAN])`, a `?::int` cast) are no longer
+  needed. **`doctrine/migrations` is separately measured** — `testkit/migrations-e2e.sh` drives the
+  real `doctrine-migrations` CLI (3.9.7, unpatched) through diff → migrate → empty diff → rollback,
+  with every existence check made by `psql` inside the container.
 - **The application user has no `CREATE DATABASE` privilege** in the testkit, deliberately. Anything
   that provisions databases needs its own credentials.
 
@@ -271,11 +354,16 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
 
 ## Performance and shape
 
-- **`iterateAssociative()` streams on PostgreSQL for parameterless queries and buffers otherwise**,
-  and **always buffers on MySQL/MariaDB**, where engine-side row streaming is still deferred. The
-  parameterised path buffers by necessity: a streamed request's terminal carries no `affected`
-  field, so streaming it would make every parameterised write return `0` from
-  `executeStatement()`.
+- **The streamed route is the PARAMETERLESS route, not the "read" route.** On PostgreSQL, every
+  zero-parameter statement reaching `Doctrine\DBAL\Connection::executeQuery()` is streamed —
+  `UPDATE`, `DELETE`, `INSERT … RETURNING`, `CREATE TABLE`, exactly as much as `SELECT`. The driver
+  never looks at the verb, because charter rule 6 forbids inferring read-vs-write from SQL text, so
+  it *cannot* be bounded to reads. The **ERROR** and **`rowCount()`** entries below are the
+  consequences of that, and they are why the distinction is worth stating precisely rather than as
+  "the read path". Everything with parameters, and everything on
+  MySQL/MariaDB (where engine-side row streaming is still deferred), buffers: a streamed request's
+  terminal carries no `affected` field, so streaming the parameterised path would make every
+  parameterised write return `0` from `executeStatement()`.
 - **Abandoning an iteration cancels the stream — for the canonical idiom.**
   `foreach ($conn->iterateAssociative($sql) as $row) { break; }` cancels: the driver `Result` is
   destroyed by refcount and frees itself. `$it = $conn->iterateAssociative($sql); foreach ($it as $row) { break; }`
@@ -299,14 +387,41 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   buffering what is left, which is what PDO does unconditionally.
   `Ferro\DBAL\Connection::settledRowCount()` reports how many rows that has cost on this connection:
   `0` for pure iteration and for a properly abandoned one, non-zero only for interleaving.
-- **On a streamed read, a statement's ERROR surfaces mid-iteration, not from `executeQuery()`.** The
-  open reads only the column header. The fate classification is unchanged; the vantage point is.
-- **`rowCount()` after a `SELECT` diverges by family AND by route.** PostgreSQL through the
-  parameterised (buffered) route reports the row count; PostgreSQL through the zero-parameter
-  (streamed) route reports `0`, because a stream terminal carries no `affected`; MySQL reports `0`
-  either way. It is not normalised, because normalising means counting rows — the exact conflation
-  §14 warns about — and DBAL itself documents `rowCount()`-on-a-`SELECT` as driver-specific.
-  `rowCount()` after an `INSERT`/`UPDATE`/`DELETE` is always correct.
+- **On the streamed route, a statement's ERROR is not raised by `executeQuery()` — and if you
+  discard the result it is not raised AT ALL.** The open reads only the column header, so the
+  failure arrives when the rows do. Measured on PostgreSQL:
+
+  ```php
+  $c->executeQuery('INSERT INTO t VALUES (1)');   // duplicate key, result discarded
+  // -> returns a Doctrine\DBAL\Result. NO exception, ever. The row is not inserted, the
+  //    connection stays healthy, and nothing in the application learns the write failed.
+  $c->executeQuery('INSERT INTO t VALUES (1)')->fetchAllAssociative();
+  // -> UniqueConstraintViolationException, as you would expect.
+  ```
+
+  A `CREATE TABLE` that already exists behaves the same way. `executeStatement()` throws
+  immediately on both families, and on **MySQL** `executeQuery()` throws immediately too (nothing
+  streams there) — so this is PostgreSQL-only and route-only, i.e. invisible to a MySQL-first
+  reader. **Do not issue DML or DDL through `executeQuery()` on PostgreSQL:** use
+  `executeStatement()`, which is what DBAL's own API intends, or consume the result.
+- **`rowCount()` diverges by ROUTE, family and verb.** The one wrong cell is PostgreSQL's streamed
+  route, whose terminal carries no `affected`:
+
+  | | PostgreSQL | MySQL/MariaDB |
+  |---|---|---|
+  | `executeStatement(...)`, with or without params | correct | correct |
+  | `executeQuery(sql, [params])->rowCount()` on DML | correct | correct |
+  | **`executeQuery(sql)->rowCount()` on DML, no params** | **`0`, always** | correct |
+  | `executeQuery(...)->rowCount()` on a `SELECT` | row count buffered, `0` streamed | `0` |
+
+  Measured: a 10-row `executeQuery('UPDATE t SET x = 1')` reports `0` on PostgreSQL and `10` on
+  MySQL, having updated 10 rows on both. So a guard like
+  `if ($conn->executeQuery('UPDATE … WHERE id = 7')->rowCount() === 0) { throw new NotFound(); }`
+  fires on **every successful update** on PostgreSQL. This compounds with the `lastInsertId()` entry
+  above, which sends PostgreSQL users to `INSERT … RETURNING id` — exactly the parameterless shape.
+  Use `executeStatement()` for anything whose count you read. The `SELECT` row is not normalised
+  because normalising means counting rows — the conflation §14 warns about — and DBAL itself
+  documents `rowCount()`-on-a-`SELECT` as driver-specific.
 - **`free()` keeps `rowCount()`** while emptying rows and columns. Upstream is split on this
   (SQLite3 keeps its count, PgSQL answers `0`); ours is a choice.
 - **`Ferro\Pg\Copy`** — the first-class replacement for `pdo_pgsql` COPY hacks named in SPEC §14 —
@@ -320,6 +435,10 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
 - **Named parameters at the driver:** positional `?` only. DBAL expands named parameters above the
   driver for `executeQuery()`/`executeStatement()`, so this is only visible if you call
   `prepare()->bindValue(':name', …)` yourself — exactly as capable as the stock mysqli driver.
-- **`read_pool` as a config key:** it does not exist. Charter rule 6 forbids inferring read-vs-write,
-  so the charter-compliant shape is a **second, explicitly configured connection** carrying
-  `'driverOptions' => ['readonly' => true]`.
+- **`read_pool` as a config key:** it does not exist, at any level, and is **refused by name** rather
+  than ignored. Charter rule 6 forbids inferring read-vs-write, so the charter-compliant shape is a
+  **second, explicitly configured connection** carrying `'driverOptions' => ['readonly' => true]` —
+  whose two consequences are documented under *Read-only connections* above.
+- **A top-level `ferro` config key:** it does not exist either, and is likewise refused. Everything
+  Ferro reads lives in `driverOptions` (`socket`, `pool`, `readonly`, `connect_timeout`,
+  `io_timeout`) plus the top-level `unix_socket`/`host`/`port`.
