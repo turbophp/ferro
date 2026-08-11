@@ -140,4 +140,33 @@ final class RawStreamTest extends TestCase
         $this->expectException(ProtocolException::class);
         $stream->rows();
     }
+
+    /**
+     * The OFFLINE half of the in-transaction abandonment fix (its live twin is
+     * `tests/Live/StreamInTransactionLiveTest.php`): inside an open transaction `close()` must
+     * release by DRAINING, never by cancelling, because the `CANCEL` becomes a real backend
+     * `CancelRequest` that rolls the caller's transaction back and tombstones its `tx_id`.
+     *
+     * It exists so the DB-less lane can still fail if {@see RawStream::close} is ever unwired from
+     * {@see \Ferro\Client\Connection::releaseStream} and goes back to calling `abandonStream()`
+     * directly. Without it that revert leaves every offline test green and only the live lane
+     * notices — and the live lane is exactly what is unavailable without Docker.
+     *
+     * The two counters are read as a PAIR on purpose: asserting only `drainCount === 1` would pass
+     * a `close()` that drained AND cancelled, which is still fatal to the transaction.
+     */
+    public function testClosingAStreamInsideATransactionDrainsInsteadOfCancelling(): void
+    {
+        $session = (new FakeSession())
+            ->push(FakeSession::beginOk(1), [C::SERVICE_TX, C::METHOD_TX_BEGIN])
+            ->thenStreamHead([['name' => 'id', 'tag' => C::TAG_I64]]);
+        $conn = new Connection($session, 'default');
+        $conn->begin();
+
+        $stream = $conn->streamRaw('SELECT id FROM t', [], true);
+        $stream->close();
+
+        self::assertSame(0, $session->abandonCount, 'an in-transaction close() must NOT cancel');
+        self::assertSame(1, $session->drainCount, 'it must release by draining to the one terminal');
+    }
 }

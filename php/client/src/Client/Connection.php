@@ -88,6 +88,29 @@ final class Connection
      */
     private ?TxHandle $tx = null;
 
+    /** @see abandonDrainedRowCount */
+    private int $abandonDrainedRows = 0;
+
+    /**
+     * How many rows an ABANDONED stream has had to drain because CANCELLING it would have destroyed
+     * an open transaction ({@see releaseStream}).
+     *
+     * **0 outside a transaction** — there abandonment is a `CANCEL` and the rows still in flight are
+     * discarded by {@see Session::abandonStream} without ever being counted — and non-zero inside
+     * one, where it is the remainder the caller never read.
+     *
+     * It exists because the alternative — asserting only that the transaction survived — CANNOT
+     * FAIL below one `StreamBatch::DEFAULT` frame (1024 rows / 256 KiB): at that size the producer
+     * has already finished, so even the destructive `CANCEL` lands on an idle backend and the
+     * transaction lives. MEASURED on this tree against live PG 17: the pre-fix data loss reproduces
+     * at `LIMIT 50000` and NOT at 1, 1024 or 2000. That is exactly the size a fixture reaches for,
+     * so a functional-only guard would have passed for the wrong reason.
+     */
+    public function abandonDrainedRowCount(): int
+    {
+        return $this->abandonDrainedRows;
+    }
+
     /**
      * `codec:` and the `values:`/`plans:`/`types:` PARTS are mutually exclusive, and so are
      * `values:` and `types:` — see the constructor body for why (each combination used to, or would,
@@ -462,6 +485,10 @@ final class Connection
         // arity, etc.) does NOT set this — the wire is fine, so draining the still-unread
         // DATA/END frames is exactly the right cleanup for the NEXT request's sake.
         $wireFailed = false;
+        // The exception already on its way out, if any — see {@see releaseStream}'s
+        // `$surfaceTerminalError`. A `finally` that throws DISCARDS whatever was propagating
+        // (measured on PHP 8.4), and the in-transaction release legitimately can throw.
+        $pending = null;
         try {
             while (true) {
                 try {
@@ -490,10 +517,61 @@ final class Connection
                     throw $e;
                 }
             }
+        } catch (\Throwable $e) {
+            $pending = $e;
+            throw $e;
         } finally {
             if (!$reachedTerminal && !$wireFailed) {
-                $session->abandonStream($rid);
+                $this->releaseStream($session, $rid, $pending === null);
             }
+        }
+    }
+
+    /**
+     * Abandon an open stream — **`CANCEL` outside a transaction, DRAIN inside one.**
+     *
+     * The asymmetry is not a preference, it is the only place the choice can be made. The `CANCEL`
+     * becomes a REAL backend `CancelRequest` (`ferrod`'s S5 abort path); PostgreSQL aborts the
+     * running statement with `57014`; a statement error inside a `BEGIN` block puts the whole
+     * transaction into PG's ABORTED state; so the engine (correctly, §19.3) rolls it back and
+     * TOMBSTONES the `tx_id`. Every write the caller had already made is gone, reported `Retryable`
+     * — which invites a framework retry loop that reproduces it identically. MEASURED live on PG 17
+     * from four ordinary lines: `begin()`, an `INSERT`, a `foreach (stream(...)) { break; }`, and a
+     * `commit()` that throws `RetryableException: transaction deadline exceeded` (no deadline was
+     * exceeded) with the `INSERT` lost. The damage is done at the DATABASE level, so there is no
+     * engine-side fate that could rescue it — the fix has to be on this side of the wire.
+     *
+     * Inside a transaction the remainder is DRAINED instead: the same one terminal (charter rule 4),
+     * the same released stream, no `CancelRequest`, an untouched transaction — at the cost of
+     * transferring rows nobody will read, at CONSTANT memory (they are discarded as they arrive,
+     * which is why it is a drain and not a buffer).
+     *
+     * Autocommit is untouched and still cancels, because there the `CANCEL` is the whole point: it
+     * is what keeps a `break` at row 25 of 100 000 from moving the other 99 975.
+     *
+     * `inTransaction()` is asked HERE, at abandonment time, rather than captured when the stream
+     * opened: it is the state at the moment the decision is made, and asking is free.
+     *
+     * @param bool $surfaceTerminalError whether the drained terminal's error may be thrown. False
+     *   when an exception is ALREADY propagating through the caller's `finally` — a `finally` that
+     *   throws discards what it interrupts, and burying a hydration failure under the stream's
+     *   terminal would trade a precise error for a vague one. Same discipline as `$wireFailed`,
+     *   different failure. The `CANCEL` arm never surfaces anything: see {@see Session::drainStream}
+     *   for why only the UNSOLICITED terminal is news.
+     */
+    private function releaseStream(
+        StreamingSessionInterface $session,
+        int $rid,
+        bool $surfaceTerminalError = true,
+    ): void {
+        if (!$this->inTransaction()) {
+            $session->abandonStream($rid);
+            return;
+        }
+        $drained = $session->drainStream($rid);
+        $this->abandonDrainedRows += $drained['rows'];
+        if ($surfaceTerminalError && $drained['outcome'] !== null) {
+            $this->throwIfError($drained['outcome']);
         }
     }
 
@@ -553,14 +631,25 @@ final class Connection
         // {@see stream} drops it — the decode authority is the PER-CELL tag
         // ({@see ExecCodec::decodeRow}), and the buffered path drops it too.
         $cols = array_map(static fn (array $c): string => $c['name'], $opened['cols']);
-        return new RawStream($cols, $this->pumpRaw($session, $rid), $session, $rid);
+        // {@see RawStream::close} is the THIRD abandonment site (the other two are the `finally`s in
+        // `stream()` and `pumpRaw()`), and it is the one a `foreach { break; }` actually reaches:
+        // while `$stream` still holds the pump generator, breaking runs no `finally` at all. It
+        // therefore needs the same in-transaction branch, so it is handed the same decision
+        // ({@see releaseStream}) rather than the raw `abandonStream` it used to call.
+        return new RawStream(
+            $cols,
+            $this->pumpRaw($session, $rid),
+            $session,
+            $rid,
+            function () use ($session, $rid): void { $this->releaseStream($session, $rid); },
+        );
     }
 
     /**
      * The DATA pump behind {@see streamRaw}: one POSITIONAL row per yield, a `WINDOW_UPDATE` after
-     * each consumed frame, and the same `finally` discipline as {@see stream} — a `CANCEL`+drain
-     * iff the terminal was never reached AND no wire operation has already failed (a second wire op
-     * on a broken connection would mask or replace the real exception).
+     * each consumed frame, and the same `finally` discipline as {@see stream} — a
+     * {@see releaseStream} iff the terminal was never reached AND no wire operation has already
+     * failed (a second wire op on a broken connection would mask or replace the real exception).
      *
      * @return \Generator<int, list<mixed>>
      */
@@ -568,6 +657,7 @@ final class Connection
     {
         $reachedTerminal = false;
         $wireFailed = false;
+        $pending = null;
         try {
             while (true) {
                 try {
@@ -591,9 +681,12 @@ final class Connection
                     throw $e;
                 }
             }
+        } catch (\Throwable $e) {
+            $pending = $e;
+            throw $e;
         } finally {
             if (!$reachedTerminal && !$wireFailed) {
-                $session->abandonStream($rid);
+                $this->releaseStream($session, $rid, $pending === null);
             }
         }
     }

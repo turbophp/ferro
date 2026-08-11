@@ -348,8 +348,60 @@ final class Session implements SessionInterface, StreamingSessionInterface
         }
         $this->sendCancel($requestId);
         while ($this->streamOpen) {
-            $this->readStreamFrame($requestId); // discards DATA batches; clears the guard on 'end'.
+            // Discards DATA batches; clears the guard on 'end'. The terminal is discarded ON PURPOSE
+            // here and NOT on {@see drainStream} — see that method's docblock for the asymmetry.
+            // No `WINDOW_UPDATE` either: the producer is being torn down, so replenishing its credit
+            // would only ask a dying stream for more frames.
+            $this->readStreamFrame($requestId);
         }
+    }
+
+    /**
+     * Abandon a stream WITHOUT cancelling it: pull every remaining frame to the ONE terminal
+     * (charter rule 4), discarding the rows, and hand back what it cost and what the engine said.
+     *
+     * **Why a second abandonment path exists at all.** {@see abandonStream}'s `CANCEL` is not a
+     * local operation: `ferrod` turns it into a REAL backend `CancelRequest`, PostgreSQL aborts the
+     * running statement with `57014`, and a statement error inside a `BEGIN` block puts the whole
+     * transaction into PG's ABORTED state — so the engine (correctly, §19.3) rolls it back and
+     * TOMBSTONES the `tx_id`, destroying writes the caller made before the stream ever opened. That
+     * damage is done at the DATABASE level, so no engine-side fate could rescue it; the choice has
+     * to be made here, before the `CANCEL` is written. {@see Connection::releaseStream} makes it.
+     *
+     * It replenishes the credit window per consumed frame, exactly as a real consumer does. Without
+     * that the producer parks on backpressure after `DEFAULT_CREDIT_FRAMES` (64) frames — roughly
+     * 65 536 rows — and the drain hangs forever on a stream nobody cancelled.
+     *
+     * **The terminal is RETURNED, not discarded** — the one behavioural difference from
+     * {@see abandonStream} beyond the missing `CANCEL`, and it is deliberate. That terminal is
+     * UNSOLICITED: nothing was sent, so an error in it is the engine declaring a real fate (a
+     * mid-stream statement error, a `statement_timeout`, a lost link) about a transaction the caller
+     * still holds and is about to commit. Dropping it is exactly the silence the whole-branch review
+     * indicted — the failure then resurfaces two statements later wearing a false label.
+     * {@see abandonStream}'s terminal is the opposite: it is the ANSWER to a `CANCEL` we just sent,
+     * so surfacing it would turn every ordinary `foreach (...) { break; }` into an exception
+     * reporting news the caller already has.
+     *
+     * @return array{rows:int, outcome:?Outcome} `rows` is what the drain discarded (0 when there was
+     *   nothing open); `outcome` is the stream's one terminal, or null when nothing was drained.
+     */
+    public function drainStream(int $requestId): array
+    {
+        if (!$this->streamOpen || $this->streamRequestId !== $requestId) {
+            return ['rows' => 0, 'outcome' => null];
+        }
+        $rows = 0;
+        $outcome = null;
+        while ($this->streamOpen) {
+            $frame = $this->readStreamFrame($requestId);
+            if ($frame['type'] === 'end') {
+                $outcome = $frame['outcome'];
+                break;
+            }
+            $rows += count($frame['rows']);
+            $this->sendWindowUpdate($requestId, 1, $frame['bytes']);
+        }
+        return ['rows' => $rows, 'outcome' => $outcome];
     }
 
     private function writeFrame(int $flags, int $service, int $method, string $payload, int $requestId = 0): void

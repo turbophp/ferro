@@ -70,6 +70,13 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
     /** How many times {@see abandonStream} was called — the eager-open leak guard reads it. */
     public int $abandonCount = 0;
 
+    /** How many times {@see drainStream} was called — the in-transaction release guard reads it. */
+    public int $drainCount = 0;
+    /** What {@see drainStream} reports as discarded, so a guard can watch the count travel. */
+    public int $drainRows = 0;
+    /** The terminal {@see drainStream} hands back; null models "nothing was open". */
+    public ?Outcome $drainOutcome = null;
+
     public function __construct(private readonly int|string $epoch = 1) {}
 
     /**
@@ -311,6 +318,20 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
         // tells the engine to stop. Whether the wire genuinely recovers is proven live
         // (`tests/Live/RawStreamLiveTest.php`), not here.
         ++$this->abandonCount;
+    }
+
+    /**
+     * The DRAIN half of abandonment, counted SEPARATELY from {@see abandonStream} on purpose: the
+     * whole point of the in-transaction branch is that the two are different wire operations (one
+     * sends a backend-reaching `CANCEL`, one deliberately does not), so a fixture that conflated
+     * them could not tell a correct release from the data-losing one.
+     *
+     * @return array{rows:int, outcome:?Outcome}
+     */
+    public function drainStream(int $requestId): array
+    {
+        ++$this->drainCount;
+        return ['rows' => $this->drainRows, 'outcome' => $this->drainOutcome];
     }
 
     // ---- Outcome builders (kept here so tests stay concise) -------------------------------------

@@ -55,6 +55,23 @@ interface StreamingSessionInterface
      * every remaining frame until (and including) the terminal `END`, discarding them — leaving the
      * socket cleanly framed for the next request. A no-op if the stream already reached its
      * terminal (or was never this request) — safe to call unconditionally from a `finally`.
+     *
+     * **Only outside a transaction.** The `CANCEL` reaches the BACKEND, so inside an open
+     * transaction it destroys that transaction; {@see drainStream} is the abandonment path there.
      */
     public function abandonStream(int $requestId): void;
+
+    /**
+     * The other abandonment path: drain to the ONE terminal WITHOUT cancelling, replenishing the
+     * credit window as a real consumer would, and report the rows discarded plus the terminal
+     * itself. Same no-op contract as {@see abandonStream} when nothing is open.
+     *
+     * Used inside an open transaction, where {@see abandonStream}'s `CANCEL` would become a real
+     * backend `CancelRequest` and roll the caller's transaction back. See
+     * {@see \Ferro\Client\Session::drainStream} for the full mechanism and for why this one hands
+     * back the terminal instead of discarding it.
+     *
+     * @return array{rows:int, outcome:?Outcome}
+     */
+    public function drainStream(int $requestId): array;
 }

@@ -78,6 +78,14 @@ final class ConnectionStreamingTest extends TestCase
      * this fixture refuses loudly. So the mutation turns this green test into an error with a
      * message naming the drain — while `testAResultTheCallerStillHoldsIsDrainedFirst` below is
      * the mirror that stops "never settle anything" from passing both.
+     *
+     * **Which release, not just that one happened.** `Ferro\Client\RawStream::close()` abandons
+     * through `Ferro\Client\Connection::releaseStream()`, which CANCELS outside a transaction and
+     * DRAINS inside one — because the `CANCEL` becomes a real backend `CancelRequest` and would roll
+     * the caller's transaction back (the client-tier twin of this tier's own 416e6fd fix). So the
+     * two data sets that hold a transaction open (`commit`, `rollBack`) must release WITHOUT
+     * cancelling, and the three that do not must cancel. Asserting only "something was released"
+     * would bless a client that cancelled inside a transaction, which is the data-loss bug itself.
      */
     #[DataProvider('wireOps')]
     public function testAnAbandonedStreamedResultIsNotDrainedByTheNextStatement(string $op): void
@@ -85,9 +93,23 @@ final class ConnectionStreamingTest extends TestCase
         $session = self::scriptFor($op);
         $c = self::pgConn($session);
         self::openTransactionIfNeeded($c, $op);
+        $inTx = $op === 'commit' || $op === 'rollBack';
 
         $c->query('SELECT id, note FROM t');   // discarded in statement position: destroyed here
-        self::assertSame(1, $session->abandonCount, 'dropping the result must CANCEL the stream');
+        self::assertSame(
+            $inTx ? 0 : 1,
+            $session->abandonCount,
+            $inTx
+                ? 'an abandoned stream inside a transaction must NOT cancel — that kills the transaction'
+                : 'dropping the result must CANCEL the stream',
+        );
+        self::assertSame(
+            $inTx ? 1 : 0,
+            $session->drainCount,
+            $inTx
+                ? 'it must release by DRAINING to the one terminal instead'
+                : 'and outside a transaction it must not pay for a drain',
+        );
 
         self::runOp($c, $op);
 

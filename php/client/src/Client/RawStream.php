@@ -34,12 +34,19 @@ final class RawStream
      * @param ?StreamingSessionInterface $session null when the stream reached its terminal during
      *   the open (a known fate decided before any HEAD/DATA went out) — nothing to abandon, and
      *   {@see close} must NOT invent a wire operation for a request id that was never a stream.
+     * @param ?\Closure(): void $release HOW to abandon this stream, injected by
+     *   {@see Connection::streamRaw} because the choice is not this class's to make: outside a
+     *   transaction abandonment is a `CANCEL`, inside one it MUST be a drain, and only the
+     *   Connection knows which ({@see Connection::releaseStream}). Null falls back to the bare
+     *   `CANCEL` — the wire-less unit fixtures, and the terminal-at-open case where `$session` is
+     *   null and there is nothing to abandon either way.
      */
     public function __construct(
         private readonly array $cols,
         private readonly \Generator $rows,
         private readonly ?StreamingSessionInterface $session,
         private readonly int $requestId,
+        private readonly ?\Closure $release = null,
     ) {}
 
     /** @return list<string> */
@@ -74,8 +81,13 @@ final class RawStream
     }
 
     /**
-     * Abandon whatever is left: `CANCEL` + drain to the ONE terminal (charter rule 4). Idempotent,
-     * and a no-op when the stream already finished normally.
+     * Abandon whatever is left, reaching the ONE terminal (charter rule 4) either way: a `CANCEL` +
+     * drain outside a transaction, a plain drain inside one — see {@see $release} and
+     * {@see Connection::releaseStream} for why cancelling inside a transaction destroys it.
+     * Idempotent, and a no-op when the stream already finished normally.
+     *
+     * This is the abandonment site a `foreach ($s->rows() as $r) { break; }` actually reaches:
+     * while this handle is alive it holds the pump generator, so breaking runs no `finally`.
      */
     public function close(): void
     {
@@ -83,6 +95,10 @@ final class RawStream
             return;
         }
         $this->closed = true;
+        if ($this->release !== null) {
+            ($this->release)();
+            return;
+        }
         $this->session?->abandonStream($this->requestId);
     }
 }
