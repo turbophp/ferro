@@ -10,6 +10,11 @@ use Ferro\Client\Error\FerroException;
 use Ferro\DBAL\Exception\DriverException;
 use Ferro\DBAL\Exception\NoIdentityValue;
 use Ferro\DBAL\Exception\ServerVersionUnavailable;
+use Ferro\DBAL\Exception\UnsupportedStatement;
+// Aliased: `FerroConnection` is already taken above by the CLIENT connection this class wraps.
+// The plan's Task 13 snippet imports the wrapper under its bare name, which would collide.
+use Ferro\DBAL\Wrapper\FerroConnection as FerroWrapper;
+use Ferro\Protocol\Isolation;
 
 /**
  * The EXECUTION layer. Everything above it — Grammar, the platforms, the schema managers, the
@@ -117,6 +122,45 @@ final class Connection implements DriverConnection
         }
     }
 
+    private ?Isolation $pendingIsolation = null;
+
+    /**
+     * The isolation level the NEXT {@see beginTransaction} will carry, set by
+     * {@see \Ferro\DBAL\Wrapper\FerroConnection::setTransactionIsolation}. Null means the pool
+     * default.
+     *
+     * It is sticky, matching Doctrine's own semantics: `setTransactionIsolation()` applies to every
+     * subsequent transaction, not just the next one.
+     */
+    public function setIsolation(?Isolation $isolation): void
+    {
+        $this->pendingIsolation = $isolation;
+    }
+
+    /**
+     * The refusal, raised from every statement entry point.
+     *
+     * Refused, not ignored and not rewritten. Left alone this statement SUCCEEDS and does nothing:
+     * it lands on an arbitrary pooled connection, taints it, and hygiene wipes the level before the
+     * next BEGIN — so the application asks for SERIALIZABLE and silently gets the pool default
+     * (SPEC §22.2 (s), which also records that the obvious "did the next tenant inherit it" test
+     * cannot fail, because hygiene masks it either way). The message names the one-line
+     * configuration fix.
+     *
+     * It sits in a helper called from THREE places rather than inline in two, because
+     * {@see query}'s PostgreSQL branch reaches the wire through `streamRaw()` and never touches
+     * {@see runPrepared} — so a guard on `exec()`/`runPrepared()` alone leaves
+     * `executeQuery('SET SESSION CHARACTERISTICS AS …')` unrefused on exactly one of the two
+     * families. Measured, not assumed: `IsolationLiveTest`'s
+     * `testTheRefusalAlsoCoversTheZeroParameterQueryPath` is RED against the two-site form.
+     */
+    private function refuseIsolationStatement(string $sql): void
+    {
+        if (FerroWrapper::isIsolationStatement($sql)) {
+            throw UnsupportedStatement::isolation($sql);
+        }
+    }
+
     /** The underlying Ferro client connection — also what {@see getNativeConnection} returns. */
     public function ferro(): FerroConnection
     {
@@ -166,6 +210,7 @@ final class Connection implements DriverConnection
     public function query(string $sql): ResultInterface
     {
         $this->settleOpenStream();
+        $this->refuseIsolationStatement($sql);
         if ($this->poolKind !== PlatformVersion::KIND_POSTGRES) {
             return $this->runPrepared($sql, []);
         }
@@ -190,6 +235,7 @@ final class Connection implements DriverConnection
     public function exec(string $sql): int
     {
         $this->settleOpenStream();
+        $this->refuseIsolationStatement($sql);
         try {
             return $this->ferro->fetchRaw($sql, [], $this->readonly, false)['affected'];
         } catch (FerroException $e) {
@@ -224,6 +270,7 @@ final class Connection implements DriverConnection
     public function runPrepared(string $sql, array $params): ResultInterface
     {
         $this->settleOpenStream();
+        $this->refuseIsolationStatement($sql);
         try {
             $raw = $this->ferro->fetchRaw($sql, $params, $this->readonly, true);
         } catch (FerroException $e) {
@@ -284,7 +331,7 @@ final class Connection implements DriverConnection
     {
         $this->settleOpenStream();
         try {
-            $this->ferro->begin($this->readonly);
+            $this->ferro->begin($this->readonly, $this->pendingIsolation);
         } catch (FerroException $e) {
             throw DriverException::fromFerro($e);
         }
