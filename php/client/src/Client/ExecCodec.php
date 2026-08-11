@@ -83,12 +83,18 @@ final class ExecCodec
      *
      * `last_insert_id` is returned RAW (`int|string|null`), deliberately NOT through the
      * {@see \Ferro\Client\Value\ValuePolicy}: it is a scalar terminal field, not a column, and the
-     * DBAL contract for `lastInsertId()` is `int|string`. A key that needs a msgpack **uint64**
-     * (>= 2^32) arrives as its canonical decimal STRING, not an int — `PurePacker`, the
-     * spec-authoritative decoder `PackerFactory::forDecode()` always returns, never narrows a `0xcf`
-     * payload (measured: 2^32-1 -> int, 2^32 -> `'4294967296'`). That is why `int|string` is the
-     * honest return type, and why the turnover is at 2^32 rather than at `PHP_INT_MAX`; the engine's
-     * `I64`/`U64` tag choice (`ferrod`'s `last_insert_id_value`) is a separate, higher boundary.
+     * DBAL contract for `lastInsertId()` is `int|string`. It is an `int` for every key this PHP
+     * build can hold EXACTLY, and the canonical decimal STRING only above `PHP_INT_MAX` — the
+     * turnover of `PurePacker`, the spec-authoritative decoder `PackerFactory::forDecode()` always
+     * returns (measured: `PHP_INT_MAX` -> int, `PHP_INT_MAX + 1` -> `'9223372036854775808'`).
+     *
+     * **That turnover sat at 2^32 until S8c, and it was a defect rather than a design.** The
+     * canonical narrowing ladder sends every non-negative integer out under an UNSIGNED marker, so
+     * a `bigint` key of 2^32 rides a `0xcf` limb exactly like a `u64` of 2^64-1 does, and `be()`
+     * handed the whole family back as a string: an `AUTO_INCREMENT` key changed PHP TYPE partway up
+     * its own range, and the same limb on the ROW path threw outright. `int|string` is still the
+     * honest return type, because the engine's `I64`/`U64` tag choice (`ferrod`'s
+     * `last_insert_id_value`) can legitimately carry a key above `PHP_INT_MAX`.
      *
      * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
      */
@@ -147,10 +153,9 @@ final class ExecCodec
      * double decode injected here leaves the whole offline suite green. The params and rows paths
      * ARE guarded (see `ExecRequest`/`ExecOk` round-trip tests); this one rests on review.
      *
-     * `null` (no id) stays null; otherwise the payload is an `int` (anything the decoder narrowed)
-     * or a canonical decimal `string` (any key in the msgpack uint64 band, >= 2^32 — see
-     * {@see decode}). Deliberately no coercion: a malformed payload is a wire fault, not a
-     * silently-zeroed key.
+     * `null` (no id) stays null; otherwise the payload is an `int` (every key this build can hold)
+     * or a canonical decimal `string` (a key above `PHP_INT_MAX` — see {@see decode}).
+     * Deliberately no coercion: a malformed payload is a wire fault, not a silently-zeroed key.
      *
      * @param array<array-key, mixed>|null $cell the decoded `{tag, data}` cell from
      *   {@see ExecOk::mapFromWire}, or null when the terminal carried a bare nil

@@ -68,13 +68,44 @@ final class CanonicalText
         return $data;
     }
 
-    /** @throws ProtocolException */
+    /**
+     * An `I64` payload → a PHP `int`. **Still `is_int()`-strict: nothing here coerces** (the M0
+     * `(int) '7' === 7` idiom is exactly what this class exists to refuse, and
+     * `M1ValuePolicyTest::testM0ScalarArmsAreStrictAsWell` pins `[TAG_I64, '7']` as a refusal).
+     *
+     * What changed in S8c is the DIAGNOSIS of the one string that a conformant decoder can actually
+     * hand us, not the verdict. {@see \Ferro\Protocol\Msgpack\PurePacker::be} returns an `int|string`
+     * whose branch is a function of the VALUE, not of the wire family: the exact decimal string for
+     * whatever this PHP build's `int` cannot hold, an `int` otherwise. Before S8c that turnover was
+     * at 2^32 (every `0xcf` limb became a string), so this guard's generic "expected a int payload,
+     * got string" was the visible face of the real defect — every `bigint` at or above 2^32 was
+     * unreadable. `be()` now turns over at `PHP_INT_MAX`, so on a 64-bit build the whole `I64` range
+     * arrives as an `int` and a string here means either an out-of-`int64` value (impossible for
+     * this tag from a conformant engine) or a peer that sent the wrong family.
+     *
+     * **On a 32-bit build** it means neither: the value is perfectly legal and the PLATFORM cannot
+     * hold it. That case gets its own named refusal below — never a `(int)` cast, which SATURATES at
+     * `PHP_INT_MAX` and would turn an unreadable row into a silently WRONG one. §12: the message
+     * names the build, never the cell's contents.
+     *
+     * @throws ProtocolException
+     */
     public static function requireInt(mixed $data, int $tag = C::TAG_I64): int
     {
-        if (!is_int($data)) {
-            throw self::wrongFamily($tag, 'int', $data);
+        if (is_int($data)) {
+            return $data;
         }
-        return $data;
+        if (is_string($data) && preg_match(self::RE_DIGITS, $data) === 1 && !self::fitsPhpInt(self::stripZeros($data))) {
+            throw new ProtocolException(sprintf(
+                'value tag %d: the integer payload is a legal wire value that does not fit this PHP '
+                . 'build\'s int (PHP_INT_SIZE=%d, PHP_INT_MAX=%s) — refused rather than truncated. '
+                . 'A 64-bit PHP build reads the whole int64 range.',
+                $tag,
+                PHP_INT_SIZE,
+                (string) PHP_INT_MAX,
+            ));
+        }
+        throw self::wrongFamily($tag, 'int', $data);
     }
 
     /**
@@ -276,12 +307,15 @@ final class CanonicalText
     /**
      * `U64` → its canonical DECIMAL STRING, from EITHER wire form (hazard 28).
      *
-     * The value's PHP type follows its MAGNITUDE, not its tag: `PurePacker::be()` hands back a
-     * decimal STRING for every `0xcf`-marked `uint64`, while the canonical narrowing ladder emits
-     * `0xcc`/`0xcd`/`0xce` (→ a PHP `int`) for anything at or below `0xffffffff`. So `5` arrives as
-     * `int 5` and `2^33` arrives as `'8589934592'`. A branch on `is_int($data)` mishandles the whole
-     * 2^32..2^64 range — both forms normalize here, and the `PHP_INT_MAX` comparison is done on the
+     * The value's PHP type follows its MAGNITUDE, not its tag: `PurePacker::be()` hands back an
+     * `int` for every value this PHP build holds exactly and the decimal STRING only above
+     * `PHP_INT_MAX`. So `5` and `2^33` both arrive as `int`, while `2^63` arrives as
+     * `'9223372036854775808'`. A branch on `is_int($data)` therefore mishandles the top of the
+     * `u64` range — both forms normalize here, and the `PHP_INT_MAX` comparison is done on the
      * decimal string (see {@see fitsPhpInt}) so nothing ever rides through a lossy `(int)` cast.
+     *
+     * (Until S8c the turnover was at 2^32, and this method's both-forms handling is why `U64` kept
+     * working across it while `I64` — whose guard is rightly `is_int()`-strict — did not.)
      *
      * @throws ProtocolException
      */
@@ -296,10 +330,7 @@ final class CanonicalText
         if (!is_string($data) || preg_match(self::RE_DIGITS, $data) !== 1) {
             throw self::wrongFamily($tag, 'uint (an int or a decimal string)', $data);
         }
-        $n = ltrim($data, '0');
-        if ($n === '') {
-            $n = '0';
-        }
+        $n = self::stripZeros($data);
         if (self::compareDecimals($n, self::U64_MAX) > 0) {
             throw self::malformed($tag, 'U64', 'a value at or below u64::MAX (' . self::U64_MAX . ')');
         }
@@ -369,6 +400,13 @@ final class CanonicalText
         if ($h > 23 || $mi > 59 || $s > 59) {
             throw self::malformed($tag, $what, 'a time of day in 00:00:00..23:59:59');
         }
+    }
+
+    /** A `^\d+$` payload → its canonical, leading-zero-free form (`'007'` → `'7'`, `'000'` → `'0'`). */
+    private static function stripZeros(string $digits): string
+    {
+        $n = ltrim($digits, '0');
+        return $n === '' ? '0' : $n;
     }
 
     /** Compare two canonical (leading-zero-free) decimal strings. */

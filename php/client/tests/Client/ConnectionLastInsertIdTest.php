@@ -58,14 +58,18 @@ final class ConnectionLastInsertIdTest extends TestCase
             'absent (PG, or any non-INSERT)' => [null, null],
             'zero is a real key, not absent' => [['tag' => C::TAG_I64, 'data' => 0], 0],
             'the golden vector shape'        => [['tag' => C::TAG_I64, 'data' => 200], 200],
-            // 2^32-1 is the last value msgpack packs as a `uint32` (0xce), which PurePacker narrows
-            // to a PHP int; 2^32 needs a `uint64` (0xcf), which it hands back as the canonical
-            // decimal string. THAT — not PHP_INT_MAX — is where `int|string` actually turns over.
+            // WHERE `int|string` TURNS OVER, and why the row below it is the S8c regression guard.
+            // 2^32-1 is the last value msgpack packs as a `uint32` (0xce); 2^32 needs a `uint64`
+            // (0xcf) — and until S8c `PurePacker::be` handed the WHOLE 0xcf family back as a decimal
+            // string, so an `AUTO_INCREMENT` key changed PHP type partway up its own range (and the
+            // identical limb on the ROW path threw outright). The turnover is now `PHP_INT_MAX`:
+            // every key this build can hold EXACTLY is an int, and only a genuinely unrepresentable
+            // one stays a string. These four rows straddle both the old boundary and the real one.
             'uint32 ceiling stays an int'    => [['tag' => C::TAG_I64, 'data' => 4294967295], 4294967295],
-            'uint64 band -> decimal string'  => [['tag' => C::TAG_I64, 'data' => 4294967296], '4294967296'],
-            'i64::MAX -> decimal string'     => [
+            '2^32 is an int, not a string'   => [['tag' => C::TAG_I64, 'data' => 4294967296], 4294967296],
+            'i64::MAX is an int'             => [
                 ['tag' => C::TAG_I64, 'data' => PHP_INT_MAX],
-                '9223372036854775807',
+                PHP_INT_MAX,
             ],
             'above i64::MAX (the U64 tag)'   => [
                 ['tag' => C::TAG_U64, 'data' => '18446744073709551615'],

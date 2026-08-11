@@ -150,7 +150,28 @@ final class PurePacker implements PackerInterface
         self::need($buf, $offset, 1);
         $v = ord($buf[$offset++]); return $v < 128 ? $v : $v - 256;
     }
-    /** Big-endian integer of $bytes width; returns int, or decimal string for uint64 > PHP_INT_MAX. */
+    /**
+     * Big-endian integer of `$bytes` width: an `int` whenever the value fits this PHP build's
+     * native int EXACTLY, else its exact non-negative decimal STRING.
+     *
+     * **The turnover is `PHP_INT_MAX`, not 2^32 — and getting that wrong made every `bigint` at or
+     * above 2^32 unreadable.** The canonical narrowing ladder ({@see packInt}, mirroring `rmp`'s
+     * `write_sint`) sends every NON-NEGATIVE integer out under an UNSIGNED marker, so an ordinary
+     * `I64` of 2^32 arrives here as `0xcf` — an 8-byte *unsigned* limb — exactly like a `U64` of
+     * 2^64-1 does. This method used to hand back a decimal string for the whole `0xcf` family, and
+     * `CanonicalText::requireInt` is (rightly) family-strict, so `4294967295` decoded to an `int`
+     * while `4294967296` THREW: every `bigint` PK past 4.29e9 and every epoch-millis column was
+     * unreadable, on every backend and every value policy (measured live, S8b acceptance run).
+     * The string is only ever needed for what PHP genuinely cannot hold, i.e. `> PHP_INT_MAX`.
+     *
+     * **32-BIT PHP (a deliberate decision, not an oversight).** `int|string` is keyed off
+     * `PHP_INT_MAX`, so on a 32-bit build every value outside ±2^31 comes back as its EXACT decimal
+     * string and is REFUSED, loudly, by {@see \Ferro\Client\Value\CanonicalText::requireInt} — never
+     * truncated, never wrapped, never coerced to a float. A negative `int64` (`0xd3`) is the one
+     * shape that fails earlier and differently: `unpack('J')` does not exist on a 32-bit build, so
+     * it raises a {@see CodecException} rather than a `ProtocolException`. Both are loud; neither
+     * invents a value. 64-bit is the supported platform, and the `I64` range is fully readable there.
+     */
     private function be(string $buf, int &$offset, int $bytes, bool $signed): int|string
     {
         self::need($buf, $offset, $bytes);
@@ -158,11 +179,28 @@ final class PurePacker implements PackerInterface
         if ($bytes < 8) {
             $v = 0; foreach (str_split($slice) as $b) { $v = ($v << 8) | ord($b); }
             if ($signed) { $bits = $bytes * 8; if ($v >= (1 << ($bits - 1))) { $v -= (1 << $bits); } }
+            elseif ($v < 0) {
+                // UNREACHABLE on a 64-bit build (a 4-byte unsigned is at most 0xffffffff), and the
+                // whole reason this arm exists: on a 32-bit build the `<< 8` ladder WRAPS, so a
+                // `uint32` in [2^31, 2^32) would otherwise be handed back as a NEGATIVE row value —
+                // a silent corruption. Fall through to the exact decimal string instead.
+                return self::be64ToDec(str_pad($slice, 8, "\x00", STR_PAD_LEFT));
+            }
             return $v;
         }
-        // 8 bytes
+        // 8 bytes.
         if ($signed) { return self::unpackInt('J', $slice); } // PHP int is 64-bit signed
-        return self::be64ToDec($slice); // unsigned 64: return decimal string to preserve > PHP_INT_MAX
+        if (PHP_INT_SIZE >= 8) {
+            // `J` is unsigned-BE but PHP's int is signed, so a value above PHP_INT_MAX comes back as
+            // its negative two's complement: `$v >= 0` is EXACTLY "the value fits, and $v is it".
+            // 40x cheaper than the string ladder below (measured: 0.047 us vs 1.909 us per limb),
+            // which matters because this is the per-cell hot path for every bigint column.
+            $v = self::unpackInt('J', $slice);
+            if ($v >= 0) { return $v; }
+        }
+        // > PHP_INT_MAX (any build), or any 8-byte unsigned on a 32-bit build: the exact decimal
+        // string, so nothing rides through a lossy cast. See the 32-bit note above.
+        return self::be64ToDec($slice);
     }
     private function unpackF32(string $buf, int &$offset): float
     { self::need($buf, $offset, 4); $s = substr($buf, $offset, 4); $offset += 4; return self::unpackFloat('G', $s); }
