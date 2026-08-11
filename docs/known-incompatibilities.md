@@ -1,12 +1,27 @@
 # Ferro drop-in: known incompatibilities
 
-Ferro is a drop-in for **Doctrine DBAL 4** by CONFIGURATION: `driverClass` + `driverOptions`, with
+Ferro is a drop-in for **Doctrine DBAL 4** by CONFIGURATION — `driverClass` + **`wrapperClass`** +
+`driverOptions` — with
 Grammar/Processor, the DBAL platforms and the stock schema managers untouched. These are the places
 where a real application can still notice the difference. Each one is a deliberate consequence of the
 engine's model — a per-host daemon that pools upstream connections in **transaction mode** and holds
 the only database credentials — not a defect waiting to be fixed quietly. Every entry below was
 MEASURED during M1-S8b; the acceptance numbers behind them are in
-[`docs/dbal-suite/2026-08-11-results.md`](dbal-suite/2026-08-11-results.md).
+[`docs/dbal-suite/2026-08-11-results.md`](dbal-suite/2026-08-11-results.md), re-measured after the
+compatibility pass in [`2026-08-11-s8c-results.md`](dbal-suite/2026-08-11-s8c-results.md).
+
+> **`wrapperClass` is in that list on purpose: it is REQUIRED, not a refinement.** Omit
+> `'wrapperClass' => Ferro\DBAL\Wrapper\FerroConnection::class` and an indeterminate write inside
+> `$conn->transactional(…)` does not merely get a worse message — its **fate is destroyed**.
+> Measured on PostgreSQL 17.10, killing the session so the failure lands on `COMMIT`:
+>
+> | configuration | what your application catches |
+> |---|---|
+> | without the wrapper | `Doctrine\DBAL\Exception\NoActiveTransaction` — *"There is no active transaction."* Not a `DriverException`, not retryable, no fate |
+> | with the wrapper | `Ferro\DBAL\IndeterminateWriteException` — *"the write may or may not have applied"* |
+>
+> So the *"catch `DriverException` instead"* remedy given below is only true with the wrapper
+> installed. See **A lost connection is not `ConnectionLost`** and **Transactions and session state**.
 
 SPEC §14 budgets the full per-package catalogue for M2. This is the page it grows from.
 

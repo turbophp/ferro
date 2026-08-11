@@ -1,0 +1,10 @@
+Doctrine\DBAL\Tests\Functional\ExceptionTest::testInvalidHost
+Doctrine\DBAL\Tests\Functional\ExceptionTest::testInvalidPassword
+Doctrine\DBAL\Tests\Functional\ExceptionTest::testInvalidUserName
+Doctrine\DBAL\Tests\Functional\TransactionTest::testBeginTransactionFailure
+Doctrine\DBAL\Tests\Functional\TransactionTest::testCommitFailure
+Doctrine\DBAL\Tests\Functional\TransactionTest::testRollbackFailure
+Doctrine\DBAL\Tests\Functional\TransactionTest::testTransactionalFailureDuringCallback
+Doctrine\DBAL\Tests\Functional\TransactionTest::testTransactionalFailureDuringCommit
+Doctrine\DBAL\Tests\Functional\WriteTest::testEmptyIdentityInsert
+Doctrine\DBAL\Tests\Functional\WriteTest::testLastInsertId

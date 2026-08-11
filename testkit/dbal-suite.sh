@@ -259,4 +259,90 @@ echo "[ferro] tree: $repo_sha$repo_dirty · dbal tests: $tag @ ${src_sha:0:12} �
 # 7. Run it, with the DRIVER package's phpunit (see step 1 — one vendor tree, no version collision).
 #    The bootstrap's contact assertion runs first and exits non-zero if the connection is not a
 #    Ferro one.
-FERRO_DBAL_SRC="$src" "$root/php/doctrine-dbal/vendor/bin/phpunit" -c "$cfg" "${args[@]+"${args[@]}"}"
+#
+#    `--log-junit` is always on: the run's own machine-readable record is what step 8 diffs against
+#    the committed baseline. It is written into $work (gitignored), never next to the sources.
+junit="$work/junit-$svc.xml"
+set +e
+FERRO_DBAL_SRC="$src" "$root/php/doctrine-dbal/vendor/bin/phpunit" -c "$cfg" \
+  --log-junit "$junit" "${args[@]+"${args[@]}"}"
+phpunit_status=$?
+set -e
+
+# 8. THE BASELINE DIFF — the artefact that makes the reproducibility claim checkable by someone who
+#    was not in the room.
+#
+#    Until this existed, a good run of this suite EXITED NON-ZERO (the recorded state is 3 errors /
+#    7 failures on PostgreSQL), so it could not be a pass/fail gate at all, and the exact non-passing
+#    set lived only in prose in the results file — with CLASS names and counts but no method names,
+#    so a later run could not be diffed against the recorded one. A regression that moved PostgreSQL
+#    from 364 passed to 320 while keeping the same headline shape would have been caught only by
+#    someone re-reading paragraphs.
+#
+#    So: the observed non-passing set is compared to `docs/dbal-suite/baseline/<svc>.txt`, and the
+#    run's exit status becomes "does this match what we recorded", not "did anything fail". Drift in
+#    EITHER direction is reported — a test that starts passing is just as much a change to the
+#    recorded bar as one that starts failing, and it is the direction that would otherwise be
+#    silently absorbed.
+#
+#    Only a RECORDABLE run may compare or update: a narrowed run observes a subset by construction,
+#    and comparing it would report every unrun test as "now passing".
+baseline_dir="$root/docs/dbal-suite/baseline"
+baseline="$baseline_dir/$svc.txt"
+observed="$work/nonpassing-$svc.txt"
+
+# The extractor is generated here rather than committed so `testkit/dbal-suite.sh` stays the single
+# file this harness is reviewed as. JUnit XML is parsed instead of PHPUnit's human output because
+# the human output's "N) Class::method" blocks are also produced for skipped/incomplete tests in
+# other verbosity modes — a text scan is exactly the species of guard this repository keeps having
+# to delete.
+cat > "$work/nonpassing.php" <<'EXTRACTOR'
+<?php
+// Emit "Class::method" for every JUnit <testcase> carrying a <failure> or <error>, sorted, unique.
+// A data-set variant keeps its suffix, so `testSelectBigInt with data set "..."` is its own entry.
+$xml = simplexml_load_file($argv[1]);
+if ($xml === false) { fwrite(STDERR, "unreadable junit xml: {$argv[1]}\n"); exit(1); }
+$out = [];
+foreach ($xml->xpath('//testcase[failure or error]') as $tc) {
+    $cls = (string) $tc['class'];
+    $name = (string) $tc['name'];
+    $out[] = $cls !== '' ? "$cls::$name" : $name;
+}
+$out = array_values(array_unique($out));
+sort($out, SORT_STRING);
+echo implode("\n", $out), $out === [] ? '' : "\n";
+EXTRACTOR
+
+if [ ${#narrowing[@]} -eq 0 ] && [ "$reset" = 1 ] && [ -f "$junit" ]; then
+  php "$work/nonpassing.php" "$junit" > "$observed"
+  observed_n=$(grep -c . "$observed" || true)
+  if [ "${FERRO_DBAL_BASELINE:-}" = "update" ]; then
+    mkdir -p "$baseline_dir"
+    cp "$observed" "$baseline"
+    echo "[ferro] baseline: UPDATED $svc.txt ($observed_n non-passing) — commit it with the results file"
+    # Re-recording is an explicit "this state is the new bar", so the run succeeds: the baseline now
+    # matches by construction, and exiting non-zero here would train the next person to ignore it.
+    phpunit_status=0
+  elif [ ! -f "$baseline" ]; then
+    echo "::error:: no baseline for '$svc' at docs/dbal-suite/baseline/$svc.txt ($observed_n non-passing observed)."
+    echo "          Record one with: FERRO_DBAL_BASELINE=update FERRO_DBAL_SVC=$svc $0"
+    exit 1
+  elif diff -u "$baseline" "$observed" > "$work/baseline-$svc.diff" 2>&1; then
+    echo "[ferro] baseline: MATCHES docs/dbal-suite/baseline/$svc.txt ($observed_n non-passing, exactly as recorded)"
+    # The recorded non-passing set IS the expected state, so a run that reproduces it exactly is a
+    # PASS. This is the only place this script converts PHPUnit's non-zero into success, and it is
+    # deliberate: without it the suite can never gate anything.
+    phpunit_status=0
+  else
+    echo "::error:: the non-passing set DRIFTED from docs/dbal-suite/baseline/$svc.txt"
+    echo "          '-' lines now PASS (or no longer run); '+' lines are newly non-passing."
+    sed -n '3,$p' "$work/baseline-$svc.diff"
+    echo "          If this change is intended, re-record with:"
+    echo "          FERRO_DBAL_BASELINE=update FERRO_DBAL_SVC=$svc $0"
+    phpunit_status=1
+  fi
+else
+  echo "[ferro] baseline: not compared (this run is not recordable)"
+fi
+
+exit "$phpunit_status"

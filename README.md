@@ -2,9 +2,13 @@
 
 **A per-host database access engine for PHP.**
 
-One Rust daemon (`ferrod`) owns every upstream database connection on the host, pools them in transaction mode, and multiplexes all of your PHP-FPM workers over a local Unix socket — while staying a **drop-in** replacement for Doctrine DBAL and Laravel Eloquent, adopted by changing configuration only.
+One Rust daemon (`ferrod`) owns every upstream database connection on the host, pools them in transaction mode, and multiplexes all of your PHP-FPM workers over a local Unix socket — while staying a **drop-in** replacement for Doctrine DBAL and Laravel Eloquent. Adoption is by configuration for DBAL; Doctrine **ORM on PostgreSQL** additionally needs its identity strategy set to SEQUENCE ([why](docs/known-incompatibilities.md)).
 
-> **Status: pre-release, under active development.** The M0 vertical (wire protocol, daemon, PG pool, SQL + TX services, sync PHP client, benchmark harness) is complete and works end-to-end against real Postgres. M1 is in progress: the pin engine, conditional connection hygiene, the full error taxonomy + write-fate matrix (with live chaos suites), credit-based result streaming, the MySQL/MariaDB backend, and canonical type coverage across PG 17 / MySQL 8.4 / MariaDB 11.8 have landed; the Doctrine DBAL driver is in progress. Nothing here is production-ready yet; the full design lives in [ferro-spec-v0.2.md](ferro-spec-v0.2.md). The name "Ferro" is a placeholder.
+> **Status: pre-release, under active development.** The M0 vertical (wire protocol, daemon, PG pool, SQL + TX services, sync PHP client, benchmark harness) is complete and works end-to-end against real Postgres. M1 has landed the pin engine, conditional connection hygiene, the full error taxonomy + write-fate matrix (with live chaos suites), credit-based result streaming, the MySQL/MariaDB backend, canonical type coverage across PG 17 / MySQL 8.4 / MariaDB 11.8, **and the Doctrine DBAL driver**.
+>
+> **What "the Doctrine driver landed" is measured to mean** — the phrase is worth nothing unmeasured: a curated subset of DBAL 4.4.4's own functional suite runs through a real `DriverManager` against real PostgreSQL/MySQL/MariaDB with driver identity asserted, and a compatibility pass took **PostgreSQL from 296 to 364 passed of 374 executed — errors 71 → 3** (MySQL 374/385, MariaDB 373/384, 2 errors each). Real `doctrine/migrations` runs unpatched on PostgreSQL. Every remaining non-passing test is triaged as a documented Ferro semantic or an upstream assumption Ferro structurally cannot satisfy — numbers, triage and runner in [docs/dbal-suite/](docs/dbal-suite/), and the differences an application can actually notice in [docs/known-incompatibilities.md](docs/known-incompatibilities.md).
+>
+> **And what it does not mean.** The **ORM suite has never been run** — not once, on any backend — so no ORM claim anywhere in this repository is a measured one. Ferro has **no SQLite backend**, so a third of DBAL's own matrix is not merely unrun but impossible, and that is why the acceptance bar is a curated subset rather than the upstream tree. Nothing here is production-ready yet; the full design lives in [ferro-spec-v0.2.md](ferro-spec-v0.2.md). The name "Ferro" is a placeholder.
 
 ---
 
@@ -78,7 +82,7 @@ That co-design — engine daemon *and* client library from the same protocol reg
 
 ## Drop-in adoption
 
-> The Doctrine driver (M1) is under active development — not yet released; the Eloquent package (M2) does not exist yet. The config below shows what adoption will look like (SPEC §14, §15).
+> The Doctrine driver **exists and is measured** (M1) but is not released to Packagist; the Eloquent package (M2) does not exist at all. So the first block below is the driver's **shipped** shape, copyable today, and the second is a **target** shape for code that has not been written. They are labelled individually rather than under one blanket disclaimer, because an earlier draft of this section published a config block that parsed to the wrong pool in silence.
 
 The drop-in tiers change the **execution layer only**. Doctrine's platforms and Laravel's Grammar/Processor stay completely stock — Ferro never generates or rewrites SQL.
 
@@ -158,7 +162,7 @@ Scope discipline is a design feature (SPEC §3):
 | Milestone | Scope | State |
 |---|---|---|
 | **M0** | `/proto` registry + golden vectors, frame codec + fuzzing, `ferrod` core (sessions, epochs), hand-rolled PG pool, EXEC/TX happy paths, sync PHP client, bench harness vs PDO baseline | ✅ complete — provisional D12 boundary measurement recorded in [bench/results/](bench/results/) (WSL2 environment; the §16.1 latency targets await a bare-metal reference re-run — see [bench/README.md](bench/README.md)) |
-| **M1** | Pin engine (protocol signals + assist lexer + conditional hygiene), full error taxonomy incl. `Indeterminate` + write-fate matrix, result streaming (deferred from M0), MySQL backend, canonical type coverage, Doctrine driver | 🔨 in progress — pinning, assist lexer, conditional hygiene, error taxonomy + write-fate matrix (live chaos suites on PG and MySQL/MariaDB), credit-based result streaming (PG; MySQL streaming deferred, SPEC §22.2), MySQL/MariaDB backend, and 14-type canonical coverage landed; Doctrine driver in progress |
+| **M1** | Pin engine (protocol signals + assist lexer + conditional hygiene), full error taxonomy incl. `Indeterminate` + write-fate matrix, result streaming (deferred from M0), MySQL backend, canonical type coverage, Doctrine driver | 🔨 in progress — pinning, assist lexer, conditional hygiene, error taxonomy + write-fate matrix (live chaos suites on PG and MySQL/MariaDB), credit-based result streaming (PG; MySQL streaming deferred, SPEC §22.2), MySQL/MariaDB backend, 14-type canonical coverage, **and the Doctrine DBAL driver** have landed. The driver is measured against a curated subset of DBAL 4.4.4's functional suite (PG **364**/374, MySQL 374/385, MariaDB 373/384 — [docs/dbal-suite/](docs/dbal-suite/)) with `doctrine/migrations` running unpatched on PostgreSQL; the **ORM suite has never been run**, and SQLite has no backend to run on. The M1 exit gate is what remains |
 | M2 | Eloquent tier + PDO shim, observability (OTLP/Prometheus/slow log), SQLite engine-owned mode | planned |
 | M3 | Fibers multiplexing, `ferro check`/`gen` (build-time checked SQL, sqlx-style), manifest handshake, memfd large payloads, COPY API | planned |
 | M4 | MSSQL, manifest-only hardening mode, replica routing + lag gating, `ferro top` TUI | planned |
@@ -179,7 +183,7 @@ Everything in this README describes the **contract being built** — [the spec](
   ferro-e2e                 live end-to-end tests against the testkit backends
   ferrod                    daemon binary (session layer, services, admin)
 /php/client        ferro/client — pure PHP ≥ 8.2, zero required extensions
-/php/doctrine-dbal ferro/doctrine-dbal-driver — in progress
+/php/doctrine-dbal ferro/doctrine-dbal-driver — shipped, not yet released to Packagist
 /proto             methods.toml, errors.toml, types.toml, golden vectors
 /bench             harness (ferro-bench) + committed results with environment manifests
 /testkit           docker-compose backends, fixtures, suite runners
