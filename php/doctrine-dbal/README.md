@@ -109,21 +109,29 @@ That is also the charter-compliant shape of a read/write split: a **second, expl
 connection**, never an inference from the statement. There is no `read_pool` option, and the driver
 refuses that key by name rather than ignoring it.
 
-**Two consequences, both measured, neither obvious.**
+**Three consequences, all measured, none obvious.**
 
-1. **It is a declaration, not an enforcement — for autocommit statements.** An `INSERT` on a
-   readonly-declared connection succeeds and the row lands. What changes is the answer when that
-   statement *fails*: a connection lost mid-write reports `Ferro\DBAL\RetryableDriverException` —
-   carrying `Doctrine\DBAL\Exception\RetryableException`, the marker framework retry loops key on —
-   where the same write on a normal connection reports `IndeterminateWriteException`. A
-   readonly-declared connection that can reach *any* write (the realistic case is a rarely-taken
-   audit `INSERT` in an error path) has the at-most-once guarantee turned off for it. Judge the flag
-   by proof, not by intent.
-2. **It IS enforced inside an explicit transaction, by changing the `BEGIN`.** The engine composes
+1. **It refuses ONE autocommit write route, not all of them.** `executeStatement($sql)` with no
+   parameters — DBAL's write API, and a fact about the caller rather than the SQL, so refusing it
+   does not violate charter rule 6 — is refused before it is sent. A *parameterised*
+   `executeStatement($sql, [$p])`, either `executeQuery()` form, and `prepare()->executeStatement()`
+   all share a code path with parameterised **reads**, so they are not refused and the write lands.
+   Measured on PostgreSQL: 1 of 5 routes refused, 4 write.
+2. **It can no longer make a failed write look retryable.** This is the half that matters. A lost
+   autocommit statement on a readonly connection used to report
+   `Ferro\DBAL\RetryableDriverException` — the marker framework retry loops key on — for a write
+   that may well have landed. The driver now re-mints that to `IndeterminateWriteException`, so the
+   declaration cannot invite a replay. In-transaction losses, pool timeouts and deadlocks keep their
+   true verdicts.
+3. **It IS enforced inside an explicit transaction, by changing the `BEGIN`.** The engine composes
    `BEGIN … READ ONLY` (PostgreSQL) / `START TRANSACTION READ ONLY` (MySQL family), so a write
    inside `transactional()` on such a connection fails with SQLSTATE `25006` — both families.
 
-Both are in [`docs/known-incompatibilities.md`](../../docs/known-incompatibilities.md) with the
+Because of (1), `readonly` is still a declaration you must be able to **defend**: a connection
+carrying it must not be able to reach a write, including a rarely-taken audit `INSERT` in an error
+path. What protects at-most-once when one slips through is (2), not the refusal.
+
+All three are in [`docs/known-incompatibilities.md`](../../docs/known-incompatibilities.md) with the
 measurements.
 
 ### Isolation levels

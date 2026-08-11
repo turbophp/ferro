@@ -100,8 +100,9 @@ The drop-in tiers change the **execution layer only**. Doctrine's platforms and 
         // no user/password/host — the DSN lives in ferrod (SPEC §12 / D8)
     ],
     // A read/write split is a SECOND, explicitly configured connection, never an inference from
-    // SQL text (charter rule 6). `readonly` DECLARES the fate of every statement on it — read
-    // what that costs in docs/known-incompatibilities.md before you set it.
+    // SQL text (charter rule 6). `readonly` refuses ONE write route and stops a failed write from
+    // ever looking retryable — but it does not stop every write. Read what it does and does not
+    // enforce in docs/known-incompatibilities.md before you set it.
     'reporting' => [
         'driverClass'   => Ferro\DBAL\Driver::class,
         'wrapperClass'  => Ferro\DBAL\Wrapper\FerroConnection::class,

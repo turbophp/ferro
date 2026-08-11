@@ -57,8 +57,8 @@ out".
   `Doctrine\DBAL\Exception\RetryableException`.
 - **If a connection genuinely only reads, say so:** `'driverOptions' => ['readonly' => true]`
   restores the clean cancellation answer for that connection. Explicit configuration, never
-  inference. **It is a fate DECLARATION and it has two consequences, one of them an at-most-once
-  hazard — read *Read-only connections* below before you set it.**
+  inference. **It refuses only one of the five autocommit write routes, and it changes the `BEGIN`
+  the engine emits — read *Read-only connections* below before you set it.**
 - **Inside a transaction the question does not arise.** A cancelled statement rolls the transaction
   back, the `tx_id` is tombstoned, and the fate is *known*: `Retryable`.
 
@@ -124,27 +124,50 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
 ## Read-only connections
 
 `'driverOptions' => ['readonly' => true]` is offered twice above as the answer to the indeterminate
-`SELECT`, and it is. It is also the only option in this driver that can make an error message
-**less** true, so both of its consequences are stated here rather than left to be discovered.
+`SELECT`, and it is. It also changes behaviour in two ways an operator will not guess from that
+sentence — it refuses one write route outright, and it changes the SQL the engine emits for `BEGIN`
+— so both are stated here rather than left to be discovered during an incident.
 
-### It is a DECLARATION, not an enforcement — and that is an at-most-once hazard
+### It is enforced only PARTLY — but it can no longer weaken a fate
 
-Nothing gates execution on the flag: an autocommit `INSERT` on a readonly-declared connection
-**succeeds and the row lands** (measured on PostgreSQL and MySQL). What the flag changes is the
-answer the §19.3 fate matrix gives when that statement fails. The same writing statement, on two
-connections differing only in the flag:
+Two separate questions, and it matters that they have different answers: *does the flag stop a
+write?* (partly) and *can the flag make a failed write look safe to retry?* (**no longer**).
+
+**The fate half is closed.** A `readonly` declaration can no longer turn a lost autocommit statement
+into a "provably did not apply" verdict. Measured on PostgreSQL 17, the same parameterised writing
+statement destroying its own session, on two connections differing only in the flag:
 
 | what happened | `readonly` unset (default) | `readonly => true` |
 |---|---|---|
-| cancelled / `statement_timeout` (`57014`) | `Ferro\DBAL\IndeterminateWriteException` — *may or may not have applied* | plain `DriverException`, *"statement cancelled or timed out"* |
-| connection lost mid-statement | `Ferro\DBAL\IndeterminateWriteException` | **`Ferro\DBAL\RetryableDriverException`** — carries `Doctrine\DBAL\Exception\RetryableException` |
+| connection lost mid-statement, autocommit | `Ferro\DBAL\IndeterminateWriteException` | `Ferro\DBAL\IndeterminateWriteException` |
 
-That last cell is the hazard, and it is the exact inversion of the guarantee the rest of this page
-is about: a write whose fate is genuinely unknown is handed to your framework's retry loop with the
-marker that says *"this provably did not apply, replaying it is safe"*. The declaration decides the
-answer, because the SPI gives the engine nothing else to go on — which is precisely why the flag
-must be judged by proof, not by intent. **A connection carrying `readonly => true` must not be able
-to reach a write, including a rarely-taken audit `INSERT` in an error path.**
+Earlier builds answered `RetryableDriverException` in the right-hand cell — a write whose fate was
+genuinely unknown handed to a framework retry loop with the marker meaning *"replaying this is
+safe"*. That was the exact inversion of the guarantee this page is about, and the driver now
+**re-mints** it: for an autocommit statement on a `readonly` connection, a retryable verdict is
+downgraded to indeterminate, because the declaration is unverifiable and the write may have landed.
+In-transaction losses, pool timeouts and deadlocks keep their true verdicts.
+
+**The enforcement half is deliberately incomplete, and here is exactly where the line is.** Charter
+rule 6 forbids inferring read-vs-write from SQL text, and the DBAL 4 SPI carries no read/write
+signal — `executeQuery('INSERT … RETURNING id')` is indistinguishable from a `SELECT`. What the SPI
+*does* carry is which method the application called. So exactly one entry point is refused pre-send:
+`Doctrine\DBAL\Connection::executeStatement($sql)` **with no parameters**, which is DBAL's write API
+and a fact about the caller, not the SQL. Measured, autocommit, on a `readonly => true` connection:
+
+| route | result |
+|---|---|
+| `executeStatement($sql)` — no parameters | **refused** before it is sent |
+| `executeStatement($sql, [$params])` | the write **lands** |
+| `executeQuery($sql)` / `executeQuery($sql, [$params])` | the write **lands** |
+| `prepare($sql)->executeStatement()` | the write **lands** |
+
+Four of the five still write, because they share a code path with parameterised *reads* that
+refusing would break. **So `readonly` is a declaration you must still be able to defend:** a
+connection carrying it must not be able to reach a write — including a rarely-taken audit `INSERT`
+in an error path — and what protects at-most-once when one slips through is the fate half above, not
+the refusal. Full enforcement needs the engine to run readonly autocommit statements inside a
+server-enforced read-only transaction, which is a `ferrod` change and is not done.
 
 ### It DOES change the SQL the engine emits for `BEGIN`
 
