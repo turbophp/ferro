@@ -143,6 +143,55 @@ final class IsolationLiveTest extends DbalLiveTestCase
         }
     }
 
+    /**
+     * …and the PREPARED-STATEMENT path, which is the THIRD guard site and the one the review found
+     * unguarded (`review/wb-guards.md`: deleting `refuseIsolationStatement($sql)` from
+     * `runPrepared()` alone left the whole slice green, and the statement then SILENTLY SUCCEEDED
+     * against a real backend on both families).
+     *
+     * `$conn->prepare($sql)->executeStatement()` is `Doctrine\DBAL\Statement::executeStatement()` →
+     * our `Statement::execute()` → `Connection::runPrepared($sql, [])`. Neither of the other two
+     * sites is on that route: `exec()` is reached only from `executeStatement()` with no parameters,
+     * and `query()`'s own guard fires before it delegates. So this is the only leg that can see the
+     * third site — including on MySQL, where `query()` refuses BEFORE delegating to `runPrepared`
+     * and therefore hides it in {@see testTheRefusalAlsoCoversTheZeroParameterQueryPath}.
+     *
+     * The read-back is what makes the refusal mean something rather than merely being an exception:
+     * the level a refused `SET SESSION` never applied is still the pool default INSIDE the next
+     * transaction. (§22.2 (s) records why the session-variable read-back is NOT the assertion — it
+     * reports the session default either way; `current_setting`/`@@transaction_isolation` inside an
+     * open transaction is the observable vantage point, the same one this file's first test uses.)
+     */
+    public function testTheRefusalAlsoCoversThePreparedStatementPath(): void
+    {
+        $mysqlPool = $this->requireMysqlPool();
+        foreach ([
+            'postgres' => ['default', 'SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE'],
+            'mysql' => [$mysqlPool, 'SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE'],
+        ] as $family => [$pool, $sql]) {
+            $c = $this->dbal($pool);
+            try {
+                $c->prepare($sql)->executeStatement();
+                self::fail("[$family] prepare()->executeStatement() must refuse the isolation statement");
+            } catch (DbalDriverException $e) {
+                self::assertInstanceOf(UnsupportedStatement::class, $e->getPrevious(), "[$family]");
+                self::assertStringContainsString('wrapperClass', $e->getMessage(), "[$family]");
+            }
+
+            $c->beginTransaction();
+            self::assertSame(
+                $family === 'postgres' ? 'read committed' : 'REPEATABLE-READ',
+                $family === 'postgres'
+                    ? $c->fetchOne("SELECT current_setting('transaction_isolation')")
+                    : $c->fetchOne('SELECT @@transaction_isolation'),
+                "[$family] the refused statement must not have taken effect",
+            );
+            $c->commit();
+
+            self::assertSame(1, (int) $c->fetchOne('SELECT 1'), "[$family] still usable");
+        }
+    }
+
     /** The same, on MySQL, where the statement text differs and the level genuinely differs too. */
     public function testTheWrapperAlsoWorksOnMysql(): void
     {

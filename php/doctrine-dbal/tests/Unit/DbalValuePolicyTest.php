@@ -119,11 +119,29 @@ final class DbalValuePolicyTest extends TestCase
      * A sub-second TIMESTAMPTZ has NO representation DBAL can parse (measured: every microsecond
      * form throws on every platform), so it is refused rather than TRUNCATED. Truncating would be a
      * silent precision loss, which is the same class of defect as the corruption above.
+     *
+     * **The MESSAGE is the assertion, not merely the exception class** — the review found this test
+     * passing for the wrong reason (`review/wb-guards.md`, MINOR): disabling the dedicated
+     * `str_contains($t, '.')` refusal left it GREEN, because
+     * `DateTimeImmutable::createFromFormat('!Y-m-d\TH:i:s\Z', '…07.250000Z', UTC)` returns FALSE
+     * ("Trailing data") and the GENERIC "it is not canonical RFC3339 UTC text" refusal fires two
+     * lines below. Both are `NonRepresentableValue`, so only the text tells them apart — and the
+     * difference is exactly what makes the failure actionable for the operator who hits it.
      */
     public function testASubSecondTimestampTzIsRefusedRatherThanTruncated(): void
     {
-        $this->expectException(NonRepresentableValue::class);
-        $this->pg()->decode(C::TAG_TIMESTAMPTZ, '2026-08-05T13:45:07.250000Z');
+        try {
+            $this->pg()->decode(C::TAG_TIMESTAMPTZ, '2026-08-05T13:45:07.250000Z');
+            self::fail('a sub-second TIMESTAMPTZ must be refused');
+        } catch (NonRepresentableValue $e) {
+            self::assertStringContainsString(
+                'parses only whole seconds',
+                $e->getMessage(),
+                'the SUB-SECOND branch must be the one that fired, not the generic '
+                . '"not canonical RFC3339 UTC text" fallback below it',
+            );
+            self::assertStringContainsString('2026-08-05T13:45:07.250000Z', $e->getMessage(), 'names the value');
+        }
     }
 
     /**
@@ -131,11 +149,23 @@ final class DbalValuePolicyTest extends TestCase
      * `InvalidFormat` on all three platforms, so it is the one member of the refused set that DBAL
      * would report rather than corrupt. It is still refused here so the failure names the VALUE and
      * the native escape route instead of DBAL's generic "could not convert database value".
+     *
+     * Asserted on the message for the same reason as the TIMESTAMPTZ case above: `time()` has three
+     * refusals in a row (negative, sub-second, beyond-24h) and a bare `expectException` cannot say
+     * which one answered.
      */
     public function testASubSecondTimeIsRefused(): void
     {
-        $this->expectException(NonRepresentableValue::class);
-        $this->pg()->decode(C::TAG_TIME, '13:45:07.250000');
+        try {
+            $this->pg()->decode(C::TAG_TIME, '13:45:07.250000');
+            self::fail('a sub-second TIME must be refused');
+        } catch (NonRepresentableValue $e) {
+            self::assertStringContainsString(
+                'has no fallback, so the fraction',
+                $e->getMessage(),
+                'the SUB-SECOND branch must be the one that fired',
+            );
+        }
     }
 
     /** A MySQL negative TIME interval has no Doctrine representation at all. */

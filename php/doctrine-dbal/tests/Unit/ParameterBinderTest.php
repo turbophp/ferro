@@ -89,16 +89,78 @@ final class ParameterBinderTest extends TestCase
         }
     }
 
-    /** A stream (what `BlobType` may hand us) is materialised, not stringified into "Resource id #N". */
-    public function testALargeObjectStreamIsMaterialised(): void
+    /**
+     * A stream is materialised under **every** `ParameterType` that can carry one — not only
+     * `LARGE_OBJECT`.
+     *
+     * The review found the old single-case version blind exactly where it matters
+     * (`review/wb-guards.md`, MAJOR): `LARGE_OBJECT` takes the `BINARY, LARGE_OBJECT` arm and
+     * `asBinary()`, so the OTHER resource branch — `natural()`'s, reached under `STRING`/`ASCII` —
+     * had no test at all. `STRING` is the SPI DEFAULT (`bindValue(…, ParameterType $type =
+     * ParameterType::STRING)`, and what `executeStatement($sql, [$fh])` with no `$types` uses), and
+     * replacing that branch with `return (string) $v;` left the whole slice green while writing the
+     * literal string `Resource id #537` to the database — a silent corrupt write, measured live.
+     *
+     * The provider is DERIVED from `ParameterType::cases()`, so the matrix cannot go stale: a new
+     * DBAL case with no row here fails the provider rather than silently going unexercised.
+     *
+     * @return array<string, array{0: ParameterType, 1: bool}> `true` ⇒ the stream must materialise
+     */
+    public static function streamBindings(): array
     {
+        // false ⇒ a resource has no meaning under this type and must be REFUSED, never coerced.
+        $materialises = [
+            'NULL' => false,
+            'BOOLEAN' => false,
+            'INTEGER' => false,
+            'STRING' => true,
+            'ASCII' => true,
+            'BINARY' => true,
+            'LARGE_OBJECT' => true,
+        ];
+        $out = [];
+        foreach (ParameterType::cases() as $case) {
+            self::assertArrayHasKey($case->name, $materialises, "unmapped ParameterType::{$case->name}");
+            $out[$case->name] = [$case, $materialises[$case->name]];
+        }
+        return $out;
+    }
+
+    #[DataProvider('streamBindings')]
+    public function testAStreamIsMaterialisedUnderEveryTypeThatCanCarryOne(ParameterType $type, bool $materialises): void
+    {
+        $payload = "\x01\x02\x03the real payload";
         $h = fopen('php://memory', 'r+');
         self::assertNotFalse($h);
-        fwrite($h, "\x01\x02\x03");
+        fwrite($h, $payload);
         rewind($h);
-        $out = ParameterBinder::toCanonical($h, ParameterType::LARGE_OBJECT);
-        self::assertInstanceOf(Bytes::class, $out);
-        self::assertSame("\x01\x02\x03", $out->value);
+
+        if (!$materialises) {
+            // `NULL` is the one non-materialising case that is not an error: the match maps it to
+            // null whatever the value was.
+            if ($type === ParameterType::NULL) {
+                self::assertNull(ParameterBinder::toCanonical($h, $type));
+                return;
+            }
+            $this->expectException(DriverException::class);
+            ParameterBinder::toCanonical($h, $type);
+            return;
+        }
+
+        $out = ParameterBinder::toCanonical($h, $type);
+        self::assertInstanceOf(
+            Bytes::class,
+            $out,
+            "a stream under {$type->name} must become Bytes, not " . get_debug_type($out),
+        );
+        self::assertSame($payload, $out->value, "the stream's BYTES, verbatim, under {$type->name}");
+        // The stringification this branch exists to prevent, named explicitly so the failure
+        // message says what went wrong rather than only that two values differ.
+        self::assertStringNotContainsString(
+            'Resource id',
+            $out->value,
+            "under {$type->name} the stream was stringified instead of read",
+        );
     }
 
     /** An object with no canonical shape is a LOUD driver error, never a silent cast. */

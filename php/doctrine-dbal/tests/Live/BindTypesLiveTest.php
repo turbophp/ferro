@@ -156,4 +156,70 @@ final class BindTypesLiveTest extends DbalLiveTestCase
         self::assertSame($blob, $my->fetchOne('SELECT b FROM s8b_blob WHERE id = ?', [1]));
         $my->executeStatement('DROP TABLE s8b_blob');
     }
+
+    /**
+     * **A stream bound with NO `$types` array** — i.e. under `ParameterType::STRING`, the SPI
+     * default — reaches the column as its BYTES, never as the literal text `Resource id #N`.
+     *
+     * This is the CONSEQUENCE half of `ParameterBinderTest::
+     * testAStreamIsMaterialisedUnderEveryTypeThatCanCarryOne`. The review measured the defect end to
+     * end (`review/wb-guards.md`, MAJOR): with `ParameterBinder::natural()`'s resource branch
+     * replaced by `return (string) $v;`, this exact statement stored `Resource id #537` into a
+     * `text` column — a silent corrupt write, with the entire slice green.
+     *
+     * Both column types are exercised, and the `text` one deliberately accepts EITHER outcome — a
+     * loud pre-send refusal (what HEAD does: canonical BYTES cannot bind to PG `text`) or a
+     * successful write — while refusing the one thing that must never happen, a stored
+     * `Resource id #…`. Written that way on purpose: the bind matrix is being widened by a
+     * concurrent slice, so pinning the refusal ITSELF would quietly turn this into a guard about
+     * the matrix instead of about the stringification it exists to catch.
+     */
+    public function testAStreamBoundWithNoTypesArrayIsWrittenAsItsBytes(): void
+    {
+        $payload = "the real payload\x00\xff";
+        $c = $this->dbal();
+        $c->executeStatement('DROP TABLE IF EXISTS s8b_stream_default');
+        $c->executeStatement('CREATE TABLE s8b_stream_default (id int primary key, t text, b bytea)');
+
+        // No $types, so DBAL hands the resource to the driver under ParameterType::STRING.
+        $c->executeStatement(
+            'INSERT INTO s8b_stream_default (id, b) VALUES (?, ?)',
+            [1, self::streamOf($payload)],
+        );
+        self::assertSame(
+            $payload,
+            $c->fetchOne('SELECT b FROM s8b_stream_default WHERE id = ?', [1]),
+            'a stream bound under the DEFAULT ParameterType must reach bytea as its bytes',
+        );
+
+        // The text column: whatever happens, the forbidden outcome is a stringified resource.
+        try {
+            $c->executeStatement(
+                'INSERT INTO s8b_stream_default (id, t) VALUES (?, ?)',
+                [2, self::streamOf($payload)],
+            );
+        } catch (DbalDriverException) {
+            // HEAD's answer: refused pre-send, which is loud and therefore acceptable.
+        }
+        $stored = $c->fetchOne('SELECT t FROM s8b_stream_default WHERE id = ?', [2]);
+        if (is_string($stored)) {
+            self::assertStringNotContainsString(
+                'Resource id',
+                $stored,
+                'the stream was stringified into the column — a silent corrupt write',
+            );
+        }
+
+        $c->executeStatement('DROP TABLE s8b_stream_default');
+    }
+
+    /** @return resource */
+    private static function streamOf(string $payload)
+    {
+        $h = fopen('php://memory', 'r+');
+        self::assertNotFalse($h);
+        fwrite($h, $payload);
+        rewind($h);
+        return $h;
+    }
 }

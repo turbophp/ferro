@@ -5,9 +5,14 @@ namespace Ferro\DBAL\Tests\Unit;
 use Doctrine\DBAL\Platforms\MySQL84Platform;
 use Doctrine\DBAL\Platforms\PostgreSQL120Platform;
 use Doctrine\DBAL\TransactionIsolationLevel;
+use Ferro\Client\Connection as FerroClientConnection;
+use Ferro\DBAL\Connection as DriverConnection;
 use Ferro\DBAL\Exception\UnsupportedStatement;
+use Ferro\DBAL\PlatformVersion;
+use Ferro\DBAL\Statement;
 use Ferro\DBAL\Wrapper\FerroConnection;
 use Ferro\Protocol\Isolation;
+use Ferro\Tests\Support\FakeSession;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -39,6 +44,41 @@ final class IsolationRefusalTest extends TestCase
         );
     }
 
+    /**
+     * The two NORMALISATION steps in `isIsolationStatement`, each of which only a NON-stock input
+     * can exercise — and the provider above is stock by design, so neither was proven
+     * (`review/wb-guards.md`, MINOR: `ltrim($sql)` → `$sql` and `strncasecmp` → `strncmp` both
+     * survived the whole slice).
+     *
+     * The inputs are an application's own SQL rather than a platform-generated string: DBAL passes
+     * `executeStatement()` text through untouched, so a leading newline from a heredoc or a
+     * lowercase spelling is an ordinary thing to meet, and either one defeating the refusal
+     * restores the silent no-op in full.
+     *
+     * @return array<string, array{0: string}>
+     */
+    public static function nonStockSpellings(): array
+    {
+        $cases = [
+            'lowercase' => 'set session transaction isolation level serializable',
+            'mixed case' => 'Set Session Transaction Isolation Level Serializable',
+            'leading spaces' => '   SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE',
+            'leading newline + indent' => "\n  set session transaction isolation level serializable",
+            'leading tab' => "\tSET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            'lowercase pg characteristics' => 'set session characteristics as transaction isolation level read committed',
+        ];
+        return array_map(static fn (string $s): array => [$s], $cases);
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('nonStockSpellings')]
+    public function testTheRefusalSurvivesLeadingWhitespaceAndCase(string $sql): void
+    {
+        self::assertTrue(
+            FerroConnection::isIsolationStatement($sql),
+            "an application's own spelling must be recognised too: " . var_export($sql, true),
+        );
+    }
+
     /** …and nothing else is. A refusal that fired on ordinary SQL would be far worse than the bug. */
     public function testOrdinarySqlIsNotMistakenForIt(): void
     {
@@ -49,6 +89,48 @@ final class IsolationRefusalTest extends TestCase
             "INSERT INTO log (msg) VALUES ('SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED')",
         ] as $sql) {
             self::assertFalse(FerroConnection::isIsolationStatement($sql), "must NOT match: $sql");
+        }
+    }
+
+    /**
+     * **The THIRD guard site, `Connection::runPrepared()`** — which had no reachable failing input
+     * anywhere in the suite until this test (`review/wb-guards.md`, MAJOR: deleting
+     * `refuseIsolationStatement($sql)` from `runPrepared()` ONLY left every offline and live test
+     * green, on both families).
+     *
+     * The entry point ONLY it protects is the DBAL prepared-statement SPI:
+     * `$conn->prepare($sql)->executeStatement()` is `Statement::execute()` →
+     * `Connection::runPrepared($sql, [])`, which touches neither `exec()` (DBAL routes there only
+     * from `executeStatement()` with no parameters) nor `query()`. Without the guard the statement
+     * SILENTLY SUCCEEDS, taints an arbitrary pooled connection, is wiped by hygiene, and every
+     * later transaction runs at the pool default — the exact silent wrong-isolation failure Task 13
+     * exists to eliminate.
+     *
+     * Driven through the REAL `Statement`, so the route (and `ksort`+`array_values` on the way) is
+     * the application's, not a paraphrase. The fixture queues a successful EXEC precisely so that a
+     * missing guard cannot masquerade as a fixture failure: without the refusal this call RETURNS a
+     * result, and `sendCount()` — asserted to be 0 — becomes 1, i.e. the statement reached the wire.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('stockIsolationSql')]
+    public function testThePreparedStatementPathIsRefusedBeforeAnythingReachesTheWire(string $sql): void
+    {
+        foreach ([PlatformVersion::KIND_POSTGRES, PlatformVersion::KIND_MYSQL] as $kind) {
+            $session = (new FakeSession())->thenExecOk();
+            $conn = new DriverConnection(new FerroClientConnection($session, 'default'), 'default', $kind, false);
+
+            $caught = null;
+            try {
+                (new Statement($conn, $sql))->execute();
+            } catch (\Throwable $e) {
+                $caught = $e;
+            }
+
+            self::assertInstanceOf(
+                UnsupportedStatement::class,
+                $caught,
+                "[$kind] prepare()->executeStatement() must refuse the isolation statement: $sql",
+            );
+            self::assertSame(0, $session->sendCount(), "[$kind] the refusal must be PRE-SEND: $sql");
         }
     }
 

@@ -127,6 +127,52 @@ final class ConnectionStreamingTest extends TestCase
         }
     }
 
+    /**
+     * **A wire operation that FAILS mid-stream is not followed by a second one.**
+     *
+     * `Ferro\Client\Connection::pumpRaw()`'s `finally` reads
+     * `if (!$reachedTerminal && !$wireFailed)` before it abandons, and the `!$wireFailed` half —
+     * whose inline comment says a second wire op on a broken connection "would mask or replace the
+     * real exception" — had no reachable failing input anywhere (`review/wb-guards.md`, MINOR:
+     * relaxing it to `if (!$reachedTerminal)` left both suites green; only the coarser `if (false)`
+     * was killed).
+     *
+     * It is observable from here because `FakeSession::readStreamFrame()` refuses loudly and
+     * `pumpRaw` catches `\Throwable`, so the fixture's refusal IS a failed wire read: at HEAD the
+     * exception comes out untouched and NOTHING further is sent (`abandonCount === 0`); with the
+     * refinement relaxed, the generator's unwind issues a CANCEL on the same broken session — the
+     * count goes to 1 — and on a real connection that is the second wire op the comment forbids.
+     *
+     * The mirror that stops this passing for the wrong reason is
+     * {@see testAnAbandonedStreamedResultIsNotDrainedByTheNextStatement}: an abandonment WITHOUT a
+     * wire failure must still count exactly 1. A "never abandon" regression fails that one, so the
+     * pair distinguishes the refinement from the whole branch.
+     */
+    public function testAWireFailureMidStreamIsNotFollowedByASecondWireOperation(): void
+    {
+        $session = self::head();
+        $result = self::pgConn($session)->query('SELECT id, note FROM t');
+        self::assertInstanceOf(Result::class, $result);
+
+        try {
+            $result->fetchNumeric();
+            self::fail('the fixture must fail the DATA read — otherwise nothing here is a wire failure');
+        } catch (\LogicException $e) {
+            self::assertStringContainsString(
+                'FakeSession models no DATA frames',
+                $e->getMessage(),
+                'the READ must be what failed; any other exception means this is not the case under test',
+            );
+        }
+
+        self::assertSame(
+            0,
+            $session->abandonCount,
+            'after a failed wire read the stream must NOT be abandoned — a CANCEL+drain on a broken '
+            . 'connection masks or replaces the real exception',
+        );
+    }
+
     /** @return array<string, array{0: string}> */
     public static function wireOps(): array
     {

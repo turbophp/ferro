@@ -5,6 +5,7 @@ namespace Ferro\DBAL\Tests\Unit;
 use Doctrine\DBAL\ParameterType;
 use Ferro\Client\Connection as FerroClientConnection;
 use Ferro\DBAL\Connection;
+use Ferro\DBAL\Exception\DriverException;
 use Ferro\DBAL\PlatformVersion;
 use Ferro\Protocol\ExecRequest;
 use Ferro\Protocol\Generated\Constants as C;
@@ -170,5 +171,42 @@ final class StatementBindWireTest extends TestCase
         /** @var list<array{tag: int, data: mixed}> $params */
         $params = $req['params'];
         self::assertSame(['first', 'second', 'third'], array_column($params, 'data'));
+    }
+
+    /**
+     * A NAMED parameter is refused at the bind, loudly and actionably — the review found this
+     * untested (`review/wb-guards.md`, MINOR: replacing `if (!is_int($param))` with `false` left
+     * the whole slice green).
+     *
+     * `$conn->prepare('… VALUES (:x, :y)')->bindValue('x', 3)` is a reachable DBAL SPI shape: DBAL
+     * expands named parameters only when they are passed to `executeQuery()`/`executeStatement()`,
+     * and hands a hand-written `bindValue('x', …)` straight to the driver. Without the refusal the
+     * name is stored as an ARRAY KEY, `execute()`'s `array_values` ships the value positionally,
+     * and the engine sends `:x` to PostgreSQL verbatim — a `SyntaxErrorException` from the server,
+     * which is loud but says nothing about named parameters.
+     *
+     * Both halves are asserted, and the second is the one with teeth: the refusal must happen
+     * BEFORE anything reaches the wire (`sendCount() === 0`), so a version that "refused" by
+     * letting the server complain cannot pass.
+     */
+    public function testANamedParameterIsRefusedAtTheBindAndNeverReachesTheWire(): void
+    {
+        $session = (new FakeSession())->thenExecOk(null);
+        $conn = new Connection(
+            new FerroClientConnection($session, 'default'),
+            'default',
+            PlatformVersion::KIND_POSTGRES,
+            false,
+        );
+        $stmt = $conn->prepare('INSERT INTO t (a, b) VALUES (:x, :y)');
+
+        try {
+            $stmt->bindValue('x', 3, ParameterType::INTEGER);
+            self::fail('a named parameter must be refused at bindValue()');
+        } catch (DriverException $e) {
+            self::assertStringContainsString('named parameters are not supported', $e->getMessage());
+            self::assertStringContainsString('?', $e->getMessage(), 'the message must name the fix');
+        }
+        self::assertSame(0, $session->sendCount(), 'nothing may reach the wire');
     }
 }
