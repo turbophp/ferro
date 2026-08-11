@@ -40,8 +40,10 @@ $conn = DriverManager::getConnection([
     // Optional, and recommended if you already know it — see "Platform selection".
     // 'serverVersion' => '17.10',
 
-    // Required ONLY if you call setTransactionIsolation() — see "Isolation levels".
-    // 'wrapperClass'  => Ferro\DBAL\Wrapper\FerroConnection::class,
+    // REQUIRED — not optional. Without it, an indeterminate write inside transactional() is
+    // reported to your application as "There is no active transaction." See "transactional()"
+    // below. It is also what makes setTransactionIsolation() work.
+    'wrapperClass'  => Ferro\DBAL\Wrapper\FerroConnection::class,
 ]);
 ```
 
@@ -56,6 +58,7 @@ Symfony, in `config/packages/doctrine.yaml`:
 doctrine:
     dbal:
         driver_class: Ferro\DBAL\Driver
+        wrapper_class: Ferro\DBAL\Wrapper\FerroConnection
         options:                       # DoctrineBundle's `options` IS DBAL's `driverOptions`
             socket: /run/ferro/app.sock
             pool: main
@@ -127,6 +130,36 @@ their job. Two Ferro classes are added:
 The engine never transparently retries a user statement; retry is your policy. Do not add a blanket
 retry on `IndeterminateWriteException` — that is the at-most-once violation the class exists to
 prevent.
+
+### `transactional()` — why the wrapper is required
+
+`Doctrine\DBAL\Connection::transactional()` exempts five specific exception classes from the
+rollback it performs after a failed commit; everything else triggers a `rollBack()` at nesting level
+0, which throws `Doctrine\DBAL\Exception\NoActiveTransaction` **and replaces the exception in
+flight**. So on the stock connection class:
+
+```php
+$conn->transactional(fn ($c) => $c->executeStatement('INSERT …'));
+// link dies during COMMIT
+//   → Doctrine\DBAL\Exception\NoActiveTransaction: "There is no active transaction."
+//   the real fate survives only as getPrevious(); catch (IndeterminateWriteException) never fires
+```
+
+`Ferro\DBAL\Wrapper\FerroConnection` restores the driver's verdict, so the same code raises
+`Ferro\DBAL\IndeterminateWriteException` as it should. Re-parenting the exception onto DBAL's exempt
+list was not an option: `ConnectionLost` — the only honest fit, and what `pdo_pgsql` reports for this
+event — is `final`, `DeadlockException` carries the retryable marker, and the remaining three each
+assert a fate we do not know.
+
+If your application must configure a **different** `wrapperClass` (for example
+`Doctrine\DBAL\Connections\PrimaryReadReplicaConnection`), compose the trait instead:
+
+```php
+final class MyConnection extends PrimaryReadReplicaConnection
+{
+    use Ferro\DBAL\Wrapper\IndeterminateSafeTransactional;
+}
+```
 
 ## Streaming
 

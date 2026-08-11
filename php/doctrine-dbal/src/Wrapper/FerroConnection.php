@@ -8,7 +8,8 @@ use Ferro\DBAL\Connection as FerroDriverConnection;
 use Ferro\Protocol\Isolation;
 
 /**
- * The optional `wrapperClass` that makes `setTransactionIsolation()` actually work.
+ * The `wrapperClass` this driver expects — **required for correct SPEC §9.2 reporting**, and
+ * additionally what makes `setTransactionIsolation()` work.
  *
  * ```php
  * 'connections' => ['default' => [
@@ -18,7 +19,17 @@ use Ferro\Protocol\Isolation;
  * ]],
  * ```
  *
- * **Why it exists.** Doctrine's own `setTransactionIsolation()` runs
+ * It carries TWO independent overrides, and the first is not a convenience:
+ *
+ *  1. {@see IndeterminateSafeTransactional}. Without it, an indeterminate write inside
+ *     `Doctrine\DBAL\Connection::transactional()` — the canonical Doctrine transaction idiom —
+ *     reaches the application as `Doctrine\DBAL\Exception\NoActiveTransaction` instead of
+ *     `Ferro\DBAL\IndeterminateWriteException`. That is the spec's defining safety property being
+ *     thrown away by DBAL's own cleanup; read that trait's docblock for the measured mechanism and
+ *     for why the exception's ANCESTRY cannot be changed instead.
+ *  2. `setTransactionIsolation()`, below.
+ *
+ * **Why the isolation override exists.** Doctrine's own `setTransactionIsolation()` runs
  * `executeStatement($platform->getSetTransactionIsolationSQL($level))` — the SESSION form. On a
  * transaction-mode pool that statement lands on an arbitrary pooled connection, taints it, and is
  * wiped by hygiene before the next `BEGIN`: it reports success and changes nothing, while
@@ -34,6 +45,8 @@ use Ferro\Protocol\Isolation;
  */
 class FerroConnection extends DbalConnection
 {
+    use IndeterminateSafeTransactional;
+
     private ?TransactionIsolationLevel $ferroLevel = null;
 
     public function setTransactionIsolation(TransactionIsolationLevel $level): void

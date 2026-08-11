@@ -5,6 +5,7 @@ namespace Ferro\DBAL\Tests\Live;
 use Doctrine\DBAL\Connection as DbalConnection;
 use Doctrine\DBAL\DriverManager;
 use Ferro\Client\Connection as FerroClientConnection;
+use Ferro\DBAL\Wrapper\FerroConnection as FerroWrapper;
 use Ferro\Tests\Live\LiveTestCase;
 
 /**
@@ -33,6 +34,36 @@ abstract class DbalLiveTestCase extends LiveTestCase
             'unix_socket' => $this->socketPath,
             'driverOptions' => ['pool' => $pool] + $extraOptions,
         ]);
+        return $this->assertIsFerro($conn);
+    }
+
+    /**
+     * The same connection with this package's documented `wrapperClass`, which is what an
+     * application is told to configure — and what SPEC §9.2's `Indeterminate` branch needs in order
+     * to survive `Doctrine\DBAL\Connection::transactional()`
+     * ({@see \Ferro\DBAL\Wrapper\IndeterminateSafeTransactional}).
+     *
+     * It is a SEPARATE helper rather than a default so that {@see dbal} keeps measuring the
+     * stock-wrapper configuration: the two differ, and a live suite in which every connection was
+     * silently wrapped could no longer tell them apart.
+     *
+     * @param array<string,mixed> $extraOptions
+     */
+    protected function dbalWrapped(string $pool = 'default', array $extraOptions = []): FerroWrapper
+    {
+        $conn = DriverManager::getConnection([
+            'driverClass' => \Ferro\DBAL\Driver::class,
+            'wrapperClass' => FerroWrapper::class,
+            'unix_socket' => $this->socketPath,
+            'driverOptions' => ['pool' => $pool] + $extraOptions,
+        ]);
+        self::assertInstanceOf(FerroWrapper::class, $conn, 'wrapperClass did not take effect');
+        $this->assertIsFerro($conn);
+        return $conn;
+    }
+
+    private function assertIsFerro(DbalConnection $conn): DbalConnection
+    {
         // THE CONTACT ASSERTION. Without it, a driver that quietly fell back to something else
         // would still make every assertion below pass.
         self::assertInstanceOf(

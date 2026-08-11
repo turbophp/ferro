@@ -23,6 +23,31 @@ use Doctrine\DBAL\Exception\DriverException;
  * against the retryable set DERIVED from the installed DBAL, so a future release that changes it
  * goes red here rather than silently.
  *
+ * **THE PARENT THAT WAS CONSIDERED AND REJECTED, and why this class did NOT move.**
+ * `Doctrine\DBAL\Connection::transactional()` exempts five classes from its post-commit rollback,
+ * and an exception on none of them is REPLACED by `NoActiveTransaction` before it reaches the
+ * caller (see {@see \Ferro\DBAL\Wrapper\IndeterminateSafeTransactional} for the measured
+ * mechanism). Re-parenting onto that list would have fixed the masking with no wrapper at all.
+ * Measured against the installed doctrine/dbal, none of the five is available:
+ *
+ * | exempt class                            | why not                                            |
+ * |-----------------------------------------|----------------------------------------------------|
+ * | `ConnectionLost`                        | declared **`final`** — cannot be extended. It is    |
+ * |                                         | also the only semantically honest one, and the one  |
+ * |                                         | `pdo_pgsql` produces for this same event.           |
+ * | `DeadlockException`                     | carries `RetryableException`. Forbidden: it would   |
+ * |                                         | turn the at-most-once guarantee into at-least-once. |
+ * | `TransactionRolledBack`                 | asserts the write did NOT apply — the exact claim   |
+ * |                                         | that makes a retry look safe.                       |
+ * | `UniqueConstraintViolationException`    | asserts a duplicate exists; applications swallow it.|
+ * | `ForeignKeyConstraintViolationException`| same shape of false claim.                          |
+ *
+ * An indeterminate write is the ABSENCE of a claim about the fate, so the three extendable classes
+ * are all lies and the one truthful class is sealed. The ancestry therefore stays exactly as it is,
+ * and the masking is repaired in the wrapper instead.
+ * `ExceptionAncestryTest` re-derives this whole table from the installed DBAL — including the exact
+ * transitive ancestry of this class and which `catch` blocks fire on it — so none of it can rot.
+ *
  * The honest application responses are: report it, reconcile it (look for the row), or fail. There
  * is no fourth option, and that is the point of the branch existing at all.
  */

@@ -148,6 +148,47 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
 
 ## Transactions and session state
 
+- **`'wrapperClass' => Ferro\DBAL\Wrapper\FerroConnection::class` is REQUIRED, because
+  `transactional()` otherwise throws the write's fate away.** This is the entry to read if you read
+  only one.
+
+  `Doctrine\DBAL\Connection::transactional()` exempts exactly five classes — `TransactionRolledBack`,
+  `UniqueConstraintViolationException`, `ForeignKeyConstraintViolationException`,
+  `DeadlockException`, `ConnectionLost` — from the rollback it runs after a failed commit. Anything
+  else reaches a `rollBack()` at nesting level 0 (the commit's own `finally` already decremented it),
+  which raises `Doctrine\DBAL\Exception\NoActiveTransaction` **from a `finally`, replacing the
+  exception in flight**. MEASURED, on the stock connection class: a lost COMMIT inside
+  `$conn->transactional(fn ($c) => $c->executeStatement('INSERT …'))` reaches the application as
+  **"There is no active transaction."** — a message that reads like a programming error and is
+  routinely logged and ignored — while `Ferro\DBAL\IndeterminateWriteException` survives only as
+  `getPrevious()`, where no `catch` block keys on it. The write may have landed.
+
+  This is worse than what Ferro replaces: `pdo_pgsql` reports the same event as `ConnectionLost`,
+  which IS exempt, so it propagates cleanly there.
+
+  **The fix is the wrapper**, which restores the driver's verdict after DBAL's cleanup has
+  substituted its own. The exception's ANCESTRY was not changed instead, and the reason is worth
+  stating because it looks like the shorter fix: `ConnectionLost` is the only one of the five that
+  tells the truth about an indeterminate write, and it is declared `final`; `DeadlockException`
+  carries `Doctrine\DBAL\Exception\RetryableException`, which would invite a framework to replay the
+  write; and the remaining three each assert a fate ("it did not apply", "a duplicate exists") that
+  the engine did not report. `Ferro\DBAL\IndeterminateWriteException` therefore stays a plain
+  `Doctrine\DBAL\Exception\DriverException`, catchable as `Doctrine\DBAL\Exception` and **never** as
+  `RetryableException`.
+
+  An application that must configure a different `wrapperClass` (`PrimaryReadReplicaConnection`, or
+  its own) recovers the guarantee by composing `Ferro\DBAL\Wrapper\IndeterminateSafeTransactional`
+  into it. An application that keeps the stock `Doctrine\DBAL\Connection` gets the masked behaviour;
+  that is the incompatibility, and it is not silent — it is this entry.
+
+  **Residual, stated rather than buried:** a driver exception raised INSIDE the closure is masked by
+  a second route — the rollback DBAL issues from its first `finally` runs at nesting level 1, reaches
+  the driver, and a LOUD failure there replaces the original. That route is not repaired, because
+  telling it apart from an application deliberately wrapping the exception needs a chain walk, and a
+  chain walk would let the wrapper overrule an application that had already handled the write. In
+  practice the client swallows both reachable rollback failures (a lost frame, a tombstoned `tx_id`),
+  and §19.3 classifies an in-transaction statement `Retryable`, never `Indeterminate`, so the commit
+  boundary is where the branch actually arrives.
 - **`setTransactionIsolation()` requires the wrapper.** Configure
   `'wrapperClass' => Ferro\DBAL\Wrapper\FerroConnection::class`. Without it the raw
   `SET SESSION TRANSACTION ISOLATION LEVEL …` / `SET SESSION CHARACTERISTICS AS …` statement is
