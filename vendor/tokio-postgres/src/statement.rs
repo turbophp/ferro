@@ -92,9 +92,34 @@ pub struct Column {
     pub(crate) column_id: Option<i16>,
     pub(crate) type_modifier: i32,
     pub(crate) r#type: Type,
+    /// FERRO M1-S8c fork (see `/UPSTREAM_PR.md`, drop when upstream merges): the `Bind`
+    /// result-format code this column's values are returned in — `1` = binary (the crate's only
+    /// behaviour before the fork), `0` = PostgreSQL's own TEXT output.
+    ///
+    /// Decided ONCE, at prepare time, by the `Client`'s result-format policy
+    /// (`Client::set_result_format_policy`), and read from exactly two places: the `Bind` encoder,
+    /// which puts it on the wire, and [`Column::result_format`], which tells a decoder what the
+    /// bytes it is looking at actually ARE. One field feeding both, so the wire format and the
+    /// decoder cannot drift apart.
+    pub(crate) result_format: i16,
 }
 
+/// The `Bind` result-format code for BINARY output — `tokio-postgres`' default for every column.
+pub const RESULT_FORMAT_BINARY: i16 = 1;
+
+/// The `Bind` result-format code for PostgreSQL's own TEXT output (its `typoutput` function) —
+/// what libpq/`pdo_pgsql` request, and what a caller with no `FromSql` for a type needs.
+pub const RESULT_FORMAT_TEXT: i16 = 0;
+
 impl Column {
+    /// FERRO M1-S8c fork (see `/UPSTREAM_PR.md`): the `Bind` result-format code the server is
+    /// returning this column in — [`RESULT_FORMAT_BINARY`] unless the `Client`'s result-format
+    /// policy asked for [`RESULT_FORMAT_TEXT`]. A decoder reading raw cell bytes MUST consult this
+    /// before interpreting them.
+    pub fn result_format(&self) -> i16 {
+        self.result_format
+    }
+
     /// Returns the name of the column.
     pub fn name(&self) -> &str {
         &self.name

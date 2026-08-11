@@ -176,6 +176,82 @@ accessor existed). SPEC §22.2 (m);
 
 ---
 
+## Addendum (M1-S8c) — a FOURTH fork addition: per-column `Bind` result formats
+
+**Same status: drafted, not filed.** Added `2026-08-11` implementing the user decision D-S8b-6 (the
+PG read path's TEXT FALLBACK). Self-contained and independent of the three above; it would be its
+own commit on the PR branch, or its own PR.
+
+### What
+
+The PostgreSQL wire protocol lets a `Bind` message carry **one result-format code per result
+column** (0 codes ⇒ all text, 1 code ⇒ that code for every column, N codes ⇒ one per column).
+`tokio-postgres` has only ever sent the single-code form `[1]` — binary, for everything.
+
+Three additive pieces:
+
+- `pub type ResultFormatPolicy = Arc<dyn Fn(Oid) -> bool + Send + Sync>` and
+  `Client::set_result_format_policy(policy) -> bool` (`client.rs`): `true` ⇒ that OID is returned
+  BINARY, `false` ⇒ PostgreSQL's own TEXT output. Stored in a `OnceLock` on `InnerClient`, so it is
+  installed once and then sealed.
+- `Column::result_format() -> i16` plus the public consts `RESULT_FORMAT_BINARY` / `RESULT_FORMAT_TEXT`
+  (`statement.rs`). `prepare.rs` resolves each column's code ONCE, from the policy, when it builds
+  the `Column` out of the `RowDescription`.
+- `query.rs`'s `encode_bind` projects those per-column codes into the `Bind`. It **collapses to the
+  single-code `[1]` form whenever every column is binary**, which is every statement on a client
+  with no policy — so the wire bytes are unchanged for every existing caller.
+
+### Why
+
+`tokio-postgres` can only read a type it has a `FromSql` for, and for everything else the binary
+payload is undecodable *in principle*: an extension's `typsend` is arbitrary C. That is not a long
+tail of missing impls, it is a closed door — `int2vector` (`pg_index.indkey`, which Doctrine's stock
+PostgreSQL schema manager selects on every introspection), `oidvector`, `pg_node_tree`, `anyarray`,
+`_aclitem`, every native enum, every composite, `hstore`, `ltree`, `citext`, and PostGIS
+`geometry`/`geography`.
+
+libpq's answer has always been available and is what `pdo_pgsql` (and therefore every PHP/Doctrine
+application) already relies on: ask the server for the TEXT format and let its own output function
+render the value. A driver that cannot request per-column text formats simply cannot offer that
+fallback, and neither can anything built on it.
+
+The API is a per-`Client` policy rather than a per-call `result_formats` argument on purpose, and the
+reason is a safety property rather than taste: a decoder that reads raw bytes needs to know which
+format they are in, and a per-call argument leaves every present and future call site free to forget.
+Resolving the code once at prepare time and hanging it on the `Column` means the `Bind` encoder and
+any decoder read ONE field, so they cannot disagree — a consumer can (and Ferro does) refuse to
+render a payload whose `Column::result_format()` is not `RESULT_FORMAT_TEXT`, rather than silently
+producing garbage.
+
+### Diff surface
+
+Five files, all additive, no behaviour change without a policy installed:
+
+- `src/statement.rs` — `Column` gains `result_format: i16` + its accessor; two new consts.
+- `src/client.rs` — `InnerClient` gains `result_format_policy: OnceLock<ResultFormatPolicy>` and
+  `result_format_for(oid)`; `Client` gains `set_result_format_policy`.
+- `src/prepare.rs` — resolve the code per column when building `Column`.
+- `src/query.rs` — `encode_bind` projects the codes; `encode_bind_raw` takes them as a parameter
+  (`query_typed`/`execute_typed` pass `[1]`: they `Bind` before any RowDescription exists).
+- `src/lib.rs`, `src/row.rs` — re-exports and one test-helper constructor.
+
+### Proposed PR title
+
+> Allow per-column `Bind` result formats via a `Client` result-format policy
+
+### Ferro-side consumer
+
+`ferro-backend-pg/src/conn.rs`'s `PoolBackend::connect` installs
+`Arc::new(rowmap::wants_binary_result)` — which is `rowmap::oid_extract_type(oid).is_some()`, so the
+wire format and the decoder are decided by one table. `rowmap::extract_value`'s fallback arm reads
+`Column::result_format()` back and refuses anything that is not `RESULT_FORMAT_TEXT`.
+Live: `ferro-backend-pg`'s `pg_text_fallback_it.rs` (8 tests) and
+`php/doctrine-dbal`'s `TextFallbackLiveTest` (byte-compared against a real `pdo_pgsql`).
+SPEC §22.2 / SPEC-DELTA S8c-1..3 in
+`.superpowers/sdd/2026-08-10-ferro-m1-s8b-dbal-driver/s8c-task-1-text-fallback.md`.
+
+---
+
 ## Status and next step
 
 **DRAFT.** This PR has not been opened. Filing it against `github.com/sfackler/rust-postgres` is a
@@ -198,16 +274,20 @@ entry:**
   root `Cargo.toml` (currently lines ~28–33).
 - Remove the `exclude = ["vendor/tokio-postgres"]` workspace entry (root `Cargo.toml`).
 - Bump `ferro-backend-pg`'s `tokio-postgres` dependency to the released version that carries
-  `transaction_status()`/`parameter()`/`clear_typeinfo_statement_cache()`. **All three** must be
-  present before the fork can be dropped — if only the first two land, the fork stays for the third
-  (or `PgBackend::reset` must retire the connection instead, which is a throughput regression on a
-  hot path).
+  `transaction_status()`/`parameter()`/`clear_typeinfo_statement_cache()`/per-column `Bind` result
+  formats (`set_result_format_policy` + `Column::result_format`). **All four** must be present
+  before the fork can be dropped — if only some land, the fork stays for the rest. Losing the third
+  would mean `PgBackend::reset` has to retire the connection instead (a throughput regression on a
+  hot path); losing the FOURTH would mean losing the M1-S8c TEXT FALLBACK entirely, i.e. the stock
+  PostgreSQL schema manager, `doctrine/migrations`, PostGIS, `hstore`/`ltree`/`citext` and every
+  native enum stop working — so that one is not optional in any form.
 - Remove this file's cross-references from `deny.toml`'s rationale comment and from the fork's own
   doc-comments (moot once the fork itself is deleted).
 - Re-run the M1-S1 live suites (`ferro-backend-pg`'s `pg_rfq_status_it.rs`, `pg_tx_status_it.rs`,
   `pg_parameter_status_it.rs`, `pg_pool_it.rs`, and `ferrod`'s `tx_it.rs`) unchanged against the
   released crate to confirm the accessors behave identically — plus the M1-S8a typeinfo-coherence
-  pair in `pg_types_it.rs` (`s8a_f1_*`) for the third accessor.
+  pair in `pg_types_it.rs` (`s8a_f1_*`) for the third accessor, and the whole of
+  `pg_text_fallback_it.rs` for the fourth.
 
 Until then, the fork stays: it is the only way `ferro-pool`'s RFQ-driven pin authority
 (`PoolBackend::tx_status`, wired in `ferro-backend-pg/src/conn.rs`, consumed by

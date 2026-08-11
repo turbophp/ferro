@@ -101,6 +101,12 @@ pub async fn prepare(
                 column_id: Some(field.column_id()).filter(|n| *n != 0),
                 type_modifier: field.type_modifier(),
                 r#type: type_,
+                // FERRO M1-S8c fork (see `/UPSTREAM_PR.md`): resolve this column's `Bind`
+                // result-format code ONCE, here, from the client's policy. The `Bind` encoder
+                // reads it back off the `Column` and so does any decoder, so the format on the
+                // wire and the format a decoder assumes cannot disagree. With no policy installed
+                // it is always `RESULT_FORMAT_BINARY` — the unforked crate's behaviour.
+                result_format: client.result_format_for(field.type_oid()),
             };
             columns.push(column);
         }

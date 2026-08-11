@@ -872,10 +872,15 @@ async fn mysql_matrix(engine: Engine, url: String) -> Coverage {
 }
 
 // -------------------------------------------------------------------------------------------------
-// The deferrals are STILL LOUD through the daemon (charter rule 6 — never a silent miscast).
+// The NON-CANONICAL PG types reach the client through the M1-S8c TEXT FALLBACK (D-S8b-6) — as
+// `TAG_TEXT` carrying PostgreSQL's own text rendering, never a silent miscast (charter rule 6).
 // -------------------------------------------------------------------------------------------------
 
 /// Assert an EXEC terminates as a `NonRetryable{Unsupported}` naming the column and its type.
+///
+/// **MySQL/MariaDB ONLY since M1-S8c.** The PG read path no longer refuses an unmapped type at all
+/// (D-S8b-6, the TEXT FALLBACK); MySQL's classifier still does, and `YEAR`/`BIT`/`SET` are its
+/// remaining loud cases. The PG half of this file moved to [`assert_text_fallback`].
 async fn assert_unsupported(client: &mut TestClient, rid: u32, sql: &str, col: &str, native: &str) {
     let ep = exec_err(client, rid, &req(sql)).await;
     assert_eq!(
@@ -896,8 +901,49 @@ async fn assert_unsupported(client: &mut TestClient, rid: u32, sql: &str, col: &
     );
 }
 
+/// Assert an EXEC returns ONE row / ONE column tagged `TAG_TEXT` whose value is exactly `want`, and
+/// that the `HEAD` tag and the producer's tag agree (hazard 18).
+async fn assert_text_fallback(client: &mut TestClient, rid: u32, sql: &str, want: &str) {
+    let r = exec_ok(client, rid, &req(sql)).await;
+    assert_eq!(r.cols.len(), 1, "`{sql}` must return one column");
+    assert_eq!(r.rows.len(), 1, "`{sql}` must return one row");
+    assert_eq!(
+        r.cols[0].tag,
+        tag::TEXT,
+        "`{sql}` must reach the client as TAG_TEXT (the M1-S8c fallback)"
+    );
+    assert_eq!(
+        r.rows[0][0],
+        Value::Text(want.to_string()),
+        "`{sql}` must carry PostgreSQL's own text rendering"
+    );
+    assert_eq!(
+        r.cols[0].tag,
+        r.rows[0][0].tag(),
+        "`{sql}`: HEAD-vs-producer must agree on a fallback column"
+    );
+}
+
+/// **M1-S8c (D-S8b-6), REPOINTED from `pg_deferrals_are_still_loud_through_the_daemon`.**
+///
+/// That test asserted a `NonRetryable{Unsupported}` terminal for each of these. The read-path
+/// refusal is GONE by decision: an OID outside the canonical set is now PG's own text under
+/// `TAG_TEXT`. The assertion therefore moves to the property that replaced it — the exact bytes —
+/// rather than being deleted, and it is asserted THROUGH THE DAEMON, which is the only place the
+/// wire tag and the wire value can both be observed.
+///
+/// The expected strings are PostgreSQL's TEXT-protocol output, measured with psql (libpq). NOTE
+/// `inet` is `127.0.0.1`, NOT `127.0.0.1/32`: PG's explicit `inet`→`text` CAST appends the netmask
+/// and disagrees with `inet_out`, so a `::text` oracle would bless the wrong bytes here. The
+/// systematic simple-query oracle for all of this lives in `ferro-backend-pg`'s
+/// `pg_text_fallback_it.rs`.
+///
+/// `timetz` still carries the real trap and is why the list survives at all: its BINARY payload is
+/// 12 bytes (i64 µs + i32 zone) against `time`'s 8, so folding it into the `TIME` arm would render
+/// a plausible WRONG time-of-day from the first 8 bytes. Its expected value carries the OFFSET,
+/// which such a miscast could not produce.
 #[tokio::test(flavor = "multi_thread")]
-async fn pg_deferrals_are_still_loud_through_the_daemon() {
+async fn pg_non_canonical_types_take_the_text_fallback_through_the_daemon() {
     let Some(url) = pg_url() else {
         return;
     };
@@ -919,40 +965,28 @@ async fn pg_deferrals_are_still_loud_through_the_daemon() {
         ddl(&mut client, rid, stmt).await;
     }
 
-    for (sql, col, native) in [
-        (
-            "SELECT '1 day'::interval AS c_interval",
-            "c_interval",
-            "interval",
-        ),
-        ("SELECT '127.0.0.1'::inet AS c_inet", "c_inet", "inet"),
-        ("SELECT ARRAY[1,2]::int4[] AS c_array", "c_array", "_int4"),
-        // timetz must NEVER fall into the TIME arm: its payload is 12 bytes (i64 us + i32 zone),
-        // so admitting it would fail mid-decode, after HEAD is already on the wire.
-        (
-            "SELECT '12:00:00+02'::timetz AS c_timetz",
-            "c_timetz",
-            "timetz",
-        ),
-        (
-            "SELECT 'ok'::ferro_s7_e2e_mood AS c_enum",
-            "c_enum",
-            "ferro_s7_e2e_mood",
-        ),
-        // A DOMAIN over an UNSUPPORTED base: PG reports the BASE type (timetz), so this is refused
-        // by the base OID — the domain itself never reaches the wire.
+    for (sql, want) in [
+        ("SELECT '1 day'::interval AS c_interval", "1 day"),
+        ("SELECT '127.0.0.1'::inet AS c_inet", "127.0.0.1"),
+        ("SELECT ARRAY[1,2]::int4[] AS c_array", "{1,2}"),
+        ("SELECT '12:00:00+02'::timetz AS c_timetz", "12:00:00+02"),
+        // A CUSTOM, database-local oid: the enum reads as its LABEL.
+        ("SELECT 'ok'::ferro_s7_e2e_mood AS c_enum", "ok"),
+        // A DOMAIN over a non-canonical base: PG reports the BASE type (timetz) in the
+        // RowDescription, so the base decides. (Under the fallback both would be TEXT, so this
+        // arm no longer DISCRIMINATES base-from-domain on its own; the domain-over-`numeric` case
+        // in `pg_domain_reads_and_binds` still does, and does it by reporting DECIMAL.)
         (
             "SELECT '12:00:00+02'::ferro_s7_e2e_ttz AS c_domain",
-            "c_domain",
-            "timetz",
+            "12:00:00+02",
         ),
     ] {
         rid += 1;
-        assert_unsupported(&mut client, rid, sql, col, native).await;
+        assert_text_fallback(&mut client, rid, sql, want).await;
     }
 
     assert_session_alive(&mut client, 7).await;
-    println!("  [pg] interval/inet/array/timetz/enum/domain-over-timetz still loud");
+    println!("  [pg] interval/inet/array/timetz/enum/domain-over-timetz -> TEXT fallback");
 }
 
 /// **A PG DOMAIN now READS *and* BINDS** — SPEC §22.2 (g) closed, live through the daemon.

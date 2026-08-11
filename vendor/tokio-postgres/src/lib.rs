@@ -125,7 +125,9 @@
 #![warn(rust_2018_idioms, clippy::all, missing_docs)]
 
 pub use crate::cancel_token::CancelToken;
-pub use crate::client::Client;
+// FERRO M1-S8c fork (see `/UPSTREAM_PR.md`): `ResultFormatPolicy` is the per-column `Bind`
+// result-format selector installed with `Client::set_result_format_policy`.
+pub use crate::client::{Client, ResultFormatPolicy};
 pub use crate::config::Config;
 pub use crate::connection::Connection;
 pub use crate::copy_in::CopyInSink;
@@ -139,7 +141,10 @@ pub use crate::row::{Row, SimpleQueryRow};
 pub use crate::simple_query::{SimpleColumn, SimpleQueryStream};
 #[cfg(feature = "runtime")]
 pub use crate::socket::Socket;
-pub use crate::statement::{Column, Statement};
+// FERRO M1-S8c fork (see `/UPSTREAM_PR.md`): `RESULT_FORMAT_{BINARY,TEXT}` are the two `Bind`
+// result-format codes a `Column` can carry — re-exported so a consumer can check what the bytes
+// it is decoding actually are.
+pub use crate::statement::{Column, RESULT_FORMAT_BINARY, RESULT_FORMAT_TEXT, Statement};
 #[cfg(feature = "runtime")]
 use crate::tls::MakeTlsConnect;
 pub use crate::tls::NoTls;

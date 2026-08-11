@@ -333,6 +333,7 @@ mod test {
             column_id: None,
             type_modifier: 0,
             r#type: Type::TEXT,
+            result_format: crate::statement::RESULT_FORMAT_BINARY,
         }
     }
 

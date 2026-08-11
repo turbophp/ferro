@@ -74,7 +74,16 @@ where
 
         client.with_buf(|buf| {
             frontend::parse("", query, param_oids, buf).map_err(Error::parse)?;
-            encode_bind_raw("", params, "", buf)?;
+            // FERRO M1-S8c fork: `query_typed`/`execute_typed` send `Bind` before any
+            // RowDescription exists, so there is no per-column policy to apply — the unforked
+            // single-code "all binary" form, unchanged.
+            encode_bind_raw(
+                "",
+                params,
+                "",
+                vec![crate::statement::RESULT_FORMAT_BINARY],
+                buf,
+            )?;
             frontend::describe(b'S', "", buf).map_err(Error::encode)?;
             frontend::execute("", 0, buf).map_err(Error::encode)?;
             frontend::sync(buf);
@@ -106,6 +115,12 @@ where
                         column_id: Some(field.column_id()).filter(|n| *n != 0),
                         type_modifier: field.type_modifier(),
                         r#type: type_,
+                        // FERRO M1-S8c fork (see `/UPSTREAM_PR.md`): `query_typed` sends its
+                        // `Bind` BEFORE it has any RowDescription to consult, so it necessarily
+                        // asks for all-binary (`encode_bind_raw` below) and this column really IS
+                        // binary. Hard-coded rather than policy-derived so the field keeps telling
+                        // the truth about the bytes on this path too.
+                        result_format: crate::statement::RESULT_FORMAT_BINARY,
                     };
                     columns.push(column);
                 }
@@ -135,7 +150,16 @@ where
 
         client.with_buf(|buf| {
             frontend::parse("", query, param_oids, buf).map_err(Error::parse)?;
-            encode_bind_raw("", params, "", buf)?;
+            // FERRO M1-S8c fork: `query_typed`/`execute_typed` send `Bind` before any
+            // RowDescription exists, so there is no per-column policy to apply — the unforked
+            // single-code "all binary" form, unchanged.
+            encode_bind_raw(
+                "",
+                params,
+                "",
+                vec![crate::statement::RESULT_FORMAT_BINARY],
+                buf,
+            )?;
             frontend::describe(b'S', "", buf).map_err(Error::encode)?;
             frontend::execute("", 0, buf).map_err(Error::encode)?;
             frontend::sync(buf);
@@ -287,14 +311,44 @@ where
         statement.name(),
         params.zip(statement.params().iter().cloned()),
         portal,
+        result_format_codes(statement),
         buf,
     )
+}
+
+/// FERRO M1-S8c fork (see `/UPSTREAM_PR.md`, drop when upstream merges): the `Bind` message's
+/// result-format-codes field for `statement`.
+///
+/// The PostgreSQL protocol allows this field to be per-column (`N` codes, one per result column);
+/// `tokio-postgres` has always sent the single-code form `[1]` ("binary, for every column"). Each
+/// `Column` now carries the code it was described with (resolved from the `Client`'s
+/// [`crate::client::ResultFormatPolicy`] at prepare time), so this is just a projection.
+///
+/// **Emits the single-code form `[1]` whenever every column is binary**, which is EVERY statement
+/// on a client with no policy installed and every statement whose columns are all natively
+/// readable. So the bytes on the wire are unchanged unless a text column is actually present —
+/// the fork cannot perturb an existing caller's `Bind`.
+fn result_format_codes(statement: &Statement) -> Vec<i16> {
+    let codes: Vec<i16> = statement
+        .columns()
+        .iter()
+        .map(|c| c.result_format())
+        .collect();
+    if codes
+        .iter()
+        .all(|&f| f == crate::statement::RESULT_FORMAT_BINARY)
+    {
+        vec![crate::statement::RESULT_FORMAT_BINARY]
+    } else {
+        codes
+    }
 }
 
 fn encode_bind_raw<P, I>(
     statement_name: &str,
     params: I,
     portal: &str,
+    result_formats: Vec<i16>,
     buf: &mut BytesMut,
 ) -> Result<(), Error>
 where
@@ -321,7 +375,7 @@ where
                 Err(e)
             }
         },
-        Some(1),
+        result_formats,
         buf,
     );
     match r {

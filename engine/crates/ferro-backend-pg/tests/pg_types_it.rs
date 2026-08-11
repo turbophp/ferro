@@ -755,51 +755,87 @@ async fn head_tag_equals_emitted_tag_on_both_paths() {
     assert!(!co.tx_open(), "no transaction was opened");
 }
 
-/// The live DEFERRAL guard. Each of these must be a loud `Unsupported` raised at cols-build —
-/// BEFORE the query runs, so the connection stays clean and usable — paired, since M1-S8a, with
-/// the ADMISSION guard for the catalog scalars that left this list (`"char"`, `name`, `oid`,
-/// `regtype`, `regclass`). Keeping both halves in one test on one connection is what makes the
-/// boundary visible: `oidvector` is a catalog type too and stays refused, so the family was
-/// admitted by OID, not by association.
+/// The live NON-CANONICAL guard, REPOINTED at M1-S8c (D-S8b-6). Each of these used to be a loud
+/// `Unsupported` raised at cols-build; the read path now renders them with PostgreSQL's own
+/// `typoutput` as `TAG_TEXT`. Paired, since M1-S8a, with the ADMISSION guard for the catalog
+/// scalars (`"char"`, `name`, `oid`, `regtype`, `regclass`) below — keeping both halves on one
+/// connection is what makes the boundary visible.
 ///
-/// `timetz` carries the real trap: its payload is 12 bytes (i64 µs + i32 zone) against `time`'s 8,
-/// so admitting it into the `TIME` arm would fail MID-DECODE, after `HEAD` is already on the wire.
+/// **The assertion that replaced the refusal, and why it is stronger rather than weaker.** The
+/// value is compared to PG's OWN `::text` rendering of the same expression, evaluated in the SAME
+/// query — so "it returned a string" is not enough; it has to be the RIGHT string, byte for byte.
+///
+/// `timetz` carries the real trap and is the reason this list still exists: its BINARY payload is
+/// 12 bytes (i64 µs + i32 zone) against `time`'s 8, so folding it into the `TIME` arm would render
+/// a plausible-looking WRONG time-of-day out of the first 8 bytes — a silent miscast, not an error.
+/// Under the fallback it is PG's `12:34:56+02`, offset included, which the oracle pins exactly.
 #[tokio::test(flavor = "multi_thread")]
-async fn deferred_column_types_are_refused_before_execution() {
+async fn non_canonical_column_types_take_the_text_fallback() {
     let Some(url) = test_url() else {
         return;
     };
     let pool = Pool::new(PgBackend::new(url), config(1));
     let mut co = pool.checkout().await.expect("checkout");
 
-    for expr in [
-        "'12:34:56+02'::timetz",
-        "ARRAY[1,2]::int4[]",
-        "'1 day'::interval",
-        "'10.0.0.1'::inet",
+    // The expected strings are PG's own TEXT-protocol output, MEASURED with psql (i.e. through
+    // libpq, in exactly the mode the fallback puts these columns in). They are literals here rather
+    // than an in-query `(expr)::text` oracle because **`::text` is NOT faithful for every type**:
+    // measured on PG 17, `'10.0.0.1'::inet` outputs `10.0.0.1` while `('10.0.0.1'::inet)::text` is
+    // `10.0.0.1/32` — PG has an explicit inet→text cast that appends the netmask, so the cast and
+    // the type's own output function DISAGREE. The systematic oracle that cannot have that bug —
+    // the SIMPLE QUERY protocol, which is libpq's text mode by construction — drives
+    // `pg_text_fallback_it.rs`; this list is the in-place repointing of the old refusal assertion.
+    for (expr, want) in [
+        ("'12:34:56+02'::timetz", "12:34:56+02"),
+        ("ARRAY[1,2]::int4[]", "{1,2}"),
+        ("'1 day'::interval", "1 day"),
+        ("'10.0.0.1'::inet", "10.0.0.1"),
         // M1-S8a (§22.2 (q)): `'a'::"char"` LEFT this list — PG's internal 1-byte `"char"` (OID 18)
-        // is now admitted as TEXT, together with `name`/`oid`/`regtype`/`regclass`. The coverage
-        // MOVED to the positive assertion after the loop, so it is relocated, not dropped.
-        // (`oidvector` takes its place here: an array-shaped catalog type that stays deferred, so
-        // admitting the catalog family did not quietly widen the array class.)
-        "'1 2'::oidvector",
+        // is CANONICAL now (TEXT via the typed `CharByte` arm), together with
+        // `name`/`oid`/`regtype`/`regclass`. The coverage MOVED to the positive assertion after
+        // the loop. `oidvector` took its place: it is a catalog type that is still non-canonical,
+        // so admitting the catalog family did not quietly widen the array class — which the
+        // `wants_binary_result` half of the rowmap unit tests now also pins.
+        ("'1 2'::oidvector", "1 2"),
     ] {
-        let err = co
-            .query(&format!("SELECT {expr}"), &[])
+        let r = co
+            .query(&format!("SELECT {expr} AS v"), &[])
             .await
-            .unwrap_err_or_panic(expr);
-        assert!(
-            matches!(err, PoolError::Unsupported(_)),
-            "`{expr}` must be a loud Unsupported, got {err:?}"
+            .unwrap_or_else(|e| panic!("`{expr}` must read through the TEXT fallback: {e:?}"));
+        assert_eq!(
+            r.cols[0].tag,
+            tag::TEXT,
+            "`{expr}` must reach the client as TAG_TEXT"
         );
-        // Raised at cols-build, before execution: the conn is untouched and immediately reusable.
+        assert_eq!(
+            r.cols[0].tag,
+            r.rows[0][0].tag(),
+            "HEAD-vs-producer must agree on a fallback column too"
+        );
+        assert_eq!(
+            r.rows[0][0],
+            Value::Text(want.to_string()),
+            "`{expr}`: the fallback value must be PG's own text output, byte for byte"
+        );
+        // The conn is untouched and immediately reusable.
         let ok = co
             .query("SELECT 1", &[])
             .await
-            .unwrap_or_else(|e| panic!("conn must survive the refusal of `{expr}`: {e:?}"));
+            .unwrap_or_else(|e| panic!("conn must survive `{expr}`: {e:?}"));
         assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
-        println!("  deferred {expr:<28} -> Unsupported, conn clean");
+        println!("  fallback {expr:<28} -> {:?}, conn clean", r.rows[0][0]);
     }
+
+    // The trap, spelled out: `timetz` renders its ZONE. A `time`-arm miscast would produce a bare
+    // `HH:MM:SS[.ffffff]` with no offset, which this equality rejects.
+    let (t, v) = one(&mut co, "'12:34:56+02'::timetz").await;
+    assert_eq!(t, tag::TEXT);
+    assert_eq!(
+        v,
+        Value::Text("12:34:56+02".to_string()),
+        "a timetz must render WITH its offset — a bare time-of-day here would mean the 12-byte \
+         payload was decoded by the 8-byte `time` arm"
+    );
 
     // M1-S8a: the catalog scalars are ADMITTED, on the same live connection. `"char"` is the one
     // that needs a value assertion rather than a bare tag: it is a single BYTE, and `'\0'` — what
@@ -893,34 +929,31 @@ async fn domains_resolve_to_their_base_type_in_both_directions() {
         "HEAD-vs-producer must agree on a domain column"
     );
 
-    // (2) a domain over an UNSUPPORTED base is refused BY THAT BASE, at cols-build.
-    let err = co
+    // (2) a domain over a NON-CANONICAL base takes the TEXT fallback of THAT BASE — M1-S8c
+    // (D-S8b-6) replaced the loud `Unsupported` this used to assert. It is still the base type
+    // that decides, and the proof of that is (1) above: a domain over `numeric` reports DECIMAL,
+    // which is only reachable if PG put base OID 1700 in the RowDescription. Under the fallback,
+    // the domain's own OID and OID 1266 would both be TEXT, so this half can no longer
+    // DISCRIMINATE base-vs-domain on its own — say so rather than let the docblock overstate it.
+    let r = co
         .query(
             "SELECT '12:34:56+02'::pg_temp.ferro_dom_ttz AS clock_in",
             &[],
         )
         .await
-        .unwrap_err_or_panic("a domain over timetz");
-    let msg = match &err {
-        PoolError::Unsupported(m) => m.clone(),
-        other => panic!("a domain over timetz must be a loud Unsupported, got {other:?}"),
-    };
-    // The refusal names the BASE type and the BASE oid — proof PG never sent the domain's own OID.
-    assert!(
-        msg.contains("timetz") && msg.contains("1266"),
-        "the refusal must name the resolved BASE type/oid (timetz, 1266): {msg}"
+        .expect("a domain over timetz reads through the TEXT fallback");
+    assert_eq!(r.cols[0].tag, tag::TEXT);
+    assert_eq!(
+        r.rows[0][0],
+        Value::Text("12:34:56+02".to_string()),
+        "the domain's base rendering is PG's own timetz text — WITH the offset, so an 8-byte \
+         `time`-arm miscast could not produce it"
     );
-    // F2: and it names the column, so an operator knows WHICH column to change.
-    assert!(
-        msg.contains("clock_in"),
-        "the refusal must name the offending column: {msg}"
-    );
-    // Raised at cols-build, before execution — the conn is clean and immediately reusable.
     let ok = co.query("SELECT 1", &[]).await.expect("conn survives");
     assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
 
     println!("  domain over numeric(10,2) -> DECIMAL \"1.50\" (expr AND column)");
-    println!("  domain over timetz        -> Unsupported: {msg}");
+    println!("  domain over timetz        -> TEXT fallback \"12:34:56+02\"");
 }
 
 /// **Task 8b — the BIND path: read → bind straight back → read again is BYTE-IDENTICAL.**

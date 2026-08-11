@@ -162,39 +162,50 @@ async fn query_syntax_error_classifies_and_conn_survives() {
     assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
 }
 
-/// A still-deferred column type (`interval`) is a loud `Unsupported`, raised before the query runs,
-/// and the connection stays clean.
+/// A non-canonical column type (`interval`) reads through the M1-S8c TEXT FALLBACK — PG's own
+/// text rendering, as `TAG_TEXT` — and the connection stays clean.
 ///
-/// Was `query_out_of_m0_column_is_unsupported` / `SELECT now()` until M1-S7 implemented
-/// `timestamptz` — the assertion is REPOINTED at a genuinely-deferred type, not deleted, because
-/// the property under test (a column type outside the supported set is a pre-flight `Unsupported`,
-/// never a silent miscast) is unchanged; only its witness moved.
+/// **History, so the repointing is legible rather than a silently-weakened assertion.** This was
+/// `query_out_of_m0_column_is_unsupported` / `SELECT now()`, repointed at `interval` in M1-S7 when
+/// `timestamptz` became canonical, and asserted `PoolError::Unsupported` until M1-S8c. D-S8b-6
+/// abolished that refusal on the READ path, so the assertion moves to the property that replaced
+/// it: the value is PG's own rendering, byte-for-byte (oracled here against `::text` in the SAME
+/// query, so a wrong rendering cannot pass), and it is NOT some silently miscast binary payload.
 #[tokio::test(flavor = "multi_thread")]
-async fn query_deferred_column_type_is_unsupported() {
+async fn query_non_canonical_column_type_takes_the_text_fallback() {
     let Some(url) = test_url() else {
         return;
     };
     let pool = Pool::new(PgBackend::new(url), config(1));
     let mut co = pool.checkout().await.expect("checkout");
 
-    let err = co
-        .query("SELECT '1 day'::interval", &[])
+    let r = co
+        .query(
+            "SELECT '1 day'::interval AS v, ('1 day'::interval)::text AS oracle",
+            &[],
+        )
         .await
-        .expect_err("interval is deferred past M1-S7");
-    assert!(
-        matches!(err, PoolError::Unsupported(_)),
-        "a deferred column type must be Unsupported, got {err:?}"
+        .expect("M1-S8c: interval reads through the TEXT fallback");
+    assert_eq!(r.cols[0].tag, tag::TEXT, "the fallback tag is TAG_TEXT");
+    assert_eq!(
+        r.rows[0][0],
+        Value::Text("1 day".to_string()),
+        "the fallback value is PG's own interval text output"
+    );
+    assert_eq!(
+        r.rows[0][0], r.rows[0][1],
+        "the fallback must be byte-identical to PG's own `::text` rendering of the same value"
     );
 
-    // `timestamptz` — this test's PREVIOUS witness — is now genuinely supported, so the repointing
-    // above is a real coverage move rather than a silently-weakened assertion.
+    // `timestamptz` is CANONICAL and must NOT take the fallback — otherwise the fallback would be
+    // swallowing the typed path wholesale and this file would still look green.
     let now = co
         .query("SELECT now()", &[])
         .await
         .expect("timestamptz is supported as of M1-S7");
     assert_eq!(now.cols[0].tag, tag::TIMESTAMPTZ);
 
-    // Conn stays clean/usable (we errored during cols-build, before running the query).
+    // Conn stays clean/usable.
     let ok = co.query("SELECT 1", &[]).await.expect("conn still usable");
     assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
 }

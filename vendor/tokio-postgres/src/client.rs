@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU8;
 use std::task::{Context, Poll, ready};
 #[cfg(feature = "runtime")]
@@ -105,9 +106,36 @@ pub struct InnerClient {
     /// (SPEC §7.1): never a pin-state authority, unlike `tx_status` above; consumed by a later
     /// M1-S1 slice (the assist lexer).
     parameters: Arc<StdMutex<HashMap<String, String>>>,
+
+    /// FERRO M1-S8c fork (see `/UPSTREAM_PR.md`, drop when upstream merges): the per-column
+    /// `Bind` result-format selector — see [`ResultFormatPolicy`].
+    ///
+    /// A `OnceLock` on purpose. The policy is a pure function of the OID, installed once right
+    /// after connect, and sealing it IS the point: a policy that could change mid-connection would
+    /// let a `Statement` prepared under one policy be `Bind`-ed under another, i.e. exactly the
+    /// format-vs-decoder disagreement this mechanism exists to make impossible.
+    result_format_policy: OnceLock<ResultFormatPolicy>,
 }
 
+/// FERRO M1-S8c fork (see `/UPSTREAM_PR.md`, drop when upstream merges): decides, per column OID,
+/// whether the server returns that column in the BINARY format (`true` — what `tokio-postgres` has
+/// always requested for every column) or in PostgreSQL's own TEXT format (`false` — what
+/// libpq/`pdo_pgsql` request, and the only thing a caller with no `FromSql` for a type can read).
+///
+/// Installed with [`Client::set_result_format_policy`]. Consulted ONCE per column, at prepare time,
+/// and stored on that `Column` — so the `Bind` message and every decoder read one field.
+pub type ResultFormatPolicy = Arc<dyn Fn(Oid) -> bool + Send + Sync>;
+
 impl InnerClient {
+    /// FERRO M1-S8c fork: the `Bind` result-format code for `oid` under this client's policy.
+    /// [`RESULT_FORMAT_BINARY`] when no policy is installed — byte-identical to the unforked crate.
+    pub fn result_format_for(&self, oid: Oid) -> i16 {
+        match self.result_format_policy.get() {
+            Some(policy) if !policy(oid) => crate::statement::RESULT_FORMAT_TEXT,
+            _ => crate::statement::RESULT_FORMAT_BINARY,
+        }
+    }
+
     pub fn send(&self, messages: RequestMessages) -> Result<Responses, Error> {
         let (sender, receiver) = mpsc::channel(1);
         let request = Request { messages, sender };
@@ -234,6 +262,7 @@ impl Client {
                 buffer: Default::default(),
                 tx_status,
                 parameters,
+                result_format_policy: OnceLock::new(),
             }),
             #[cfg(feature = "runtime")]
             socket_config: None,
@@ -276,6 +305,22 @@ impl Client {
     /// read path is not hot.
     pub fn parameter(&self, name: &str) -> Option<String> {
         self.inner.parameters.lock().unwrap().get(name).cloned()
+    }
+
+    /// FERRO M1-S8c fork (see `/UPSTREAM_PR.md`, drop when upstream merges): install this
+    /// connection's per-column `Bind` result-format policy — see [`ResultFormatPolicy`].
+    ///
+    /// `tokio-postgres` asks for BINARY for every result column, which is unreadable for any type
+    /// it has no `FromSql` for (`int2vector`, `pg_node_tree`, an extension's `geometry`, a native
+    /// enum, …). A policy returning `false` for such an OID makes the server send that column
+    /// through its own `typoutput` instead — the exact bytes libpq/`pdo_pgsql` hand back.
+    ///
+    /// Call it BEFORE preparing anything: the code is resolved per column at prepare time and
+    /// stored on the `Column`, so a statement prepared earlier keeps the format it was described
+    /// with. Returns `false` if a policy was already installed (the first one stands — the lock is
+    /// deliberate, see the field docs).
+    pub fn set_result_format_policy(&self, policy: ResultFormatPolicy) -> bool {
+        self.inner.result_format_policy.set(policy).is_ok()
     }
 
     #[cfg(feature = "runtime")]

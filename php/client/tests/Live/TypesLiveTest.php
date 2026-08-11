@@ -223,16 +223,40 @@ final class TypesLiveTest extends LiveTestCase
         }
     }
 
-    /** The deferred tags stay loud all the way to PHP: a NonRetryable `Unsupported` naming the column. */
-    public function testDeferredPgTypesStayLoudThroughTheClient(): void
+    /**
+     * A non-canonical PG type reaches PHP as a plain STRING carrying PostgreSQL's own text output —
+     * the M1-S8c TEXT FALLBACK (D-S8b-6).
+     *
+     * REPOINTED from `testDeferredPgTypesStayLoudThroughTheClient`, which asserted a
+     * `NonRetryableException` naming the column. That refusal is gone from the PG read path by
+     * decision, so the assertion moves to the property that replaced it — the exact bytes — rather
+     * than being deleted. The engine-side byte oracle (the simple-query protocol) is in
+     * `ferro-backend-pg`'s `pg_text_fallback_it.rs`; the `pdo_pgsql` comparison is in
+     * `php/doctrine-dbal`'s `TextFallbackLiveTest`.
+     *
+     * `timetz` is included because it is the case where a miscast would be SILENT: its binary
+     * payload is 12 bytes against `time`'s 8, so a `TIME`-arm decode would yield a plausible wrong
+     * time-of-day. The offset in the expected value is what a `Time` value object could not carry.
+     */
+    public function testNonCanonicalPgTypesReachPhpAsPgsOwnText(): void
     {
         $conn = $this->connection();
         try {
-            $conn->query("SELECT '1 day'::interval AS c_interval");
-            $this->fail('expected a NonRetryableException for a deferred PG type');
-        } catch (NonRetryableException $e) {
-            $this->assertStringContainsString('c_interval', $e->getMessage());
-            $this->assertStringContainsString('interval', $e->getMessage());
+            $row = $conn->queryOne(
+                "SELECT '1 day'::interval AS c_interval,
+                        '12:34:56+02'::timetz AS c_timetz,
+                        ARRAY[1,2]::int4[] AS c_array,
+                        '10.0.0.1'::inet AS c_inet,
+                        NULL::interval AS c_null",
+            );
+            $this->assertIsArray($row);
+            $this->assertSame('1 day', $row['c_interval']);
+            $this->assertSame('12:34:56+02', $row['c_timetz']);
+            $this->assertSame('{1,2}', $row['c_array']);
+            // NOT `10.0.0.1/32`: PG's explicit inet->text CAST appends the netmask and disagrees
+            // with `inet_out`, which is what the wire carries (measured on PG 17.10).
+            $this->assertSame('10.0.0.1', $row['c_inet']);
+            $this->assertNull($row['c_null']);
         } finally {
             $conn->session()->close();
         }

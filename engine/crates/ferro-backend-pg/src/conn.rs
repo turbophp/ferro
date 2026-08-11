@@ -114,6 +114,28 @@ impl PoolBackend for PgBackend {
                 PoolError::ConnectionLost
             })?;
 
+        // M1-S8c (D-S8b-6) — install the `Bind` RESULT-FORMAT POLICY before anything is prepared.
+        //
+        // `tokio-postgres` asks the server for BINARY for every result column and has a `FromSql`
+        // for only the canonical set, so an `int2vector` (`pg_index.indkey`, which the stock DBAL
+        // schema manager selects), an `oidvector`, a `pg_node_tree`, a PostGIS `geometry`, an
+        // `hstore` or a native enum used to be a loud `Unsupported`. Their BINARY payload is
+        // undecodable in principle — an extension's `typsend` is arbitrary C — so the fix is to ask
+        // PostgreSQL for the TEXT format for exactly those columns and pass its own `typoutput`
+        // bytes through as `TAG_TEXT`. That is byte-for-byte what libpq/`pdo_pgsql` return, because
+        // libpq requests the same format.
+        //
+        // The predicate IS `rowmap::oid_extract_type` (via `wants_binary_result`), so the wire
+        // format and the decoder are decided by ONE table. The fork resolves it per column at
+        // PREPARE time and stores the code on the `Column`; `rowmap::extract_value`'s fallback arm
+        // reads that same field back and REFUSES to render anything that is not text. Hence: if
+        // this call were ever removed, the fallback would raise a loud `Backend` error rather than
+        // decode binary bytes as a string. See `/UPSTREAM_PR.md` for the fork addition.
+        //
+        // Installed BEFORE the driver task is spawned only for tidiness; what matters is that it is
+        // before the first `prepare`, since the code is resolved from the RowDescription.
+        client.set_result_format_policy(Arc::new(crate::rowmap::wants_binary_result));
+
         let closed = Arc::new(AtomicBool::new(false));
         let closed_for_driver = Arc::clone(&closed);
         tokio::spawn(async move {

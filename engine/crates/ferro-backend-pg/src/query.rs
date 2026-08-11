@@ -4,11 +4,14 @@
 //! 1. `?`→`$n` normalize the SQL (cached).
 //! 2. `prepare` it — one round trip that yields the column OIDs (so `cols` is correct even for a
 //!    zero-row result) and lets PG infer the `$n` param types.
-//! 3. Build `Vec<ColMeta>` from the prepared statement's columns via `rowmap::oid_to_tag` — a loud
-//!    `Unsupported` for any column type outside the supported set, raised BEFORE the query runs
-//!    (the connection stays clean and usable). This is the cols-build half of the two-gate pair —
-//!    `rowmap::extract_value` (step 5) is the mid-stream half, and both read the one
-//!    `oid_extract_type` table so `HEAD` can never promise a tag the producer cannot fill.
+//! 3. Build `Vec<ColMeta>` from the prepared statement's columns via `rowmap::oid_to_tag`. Since
+//!    **M1-S8c** (D-S8b-6) that call is INFALLIBLE: a column type outside the canonical set is the
+//!    TEXT FALLBACK (`TAG_TEXT` carrying PostgreSQL's own `typoutput`), not a refusal. This is the
+//!    cols-build half of the two-gate pair — `rowmap::extract_value` (step 5) is the mid-stream
+//!    half, and both read the one `oid_extract_type` table so `HEAD` can never promise a tag the
+//!    producer cannot fill. Nothing here selects the wire format: the fallback's TEXT result
+//!    format is chosen per column at PREPARE time by the connection's result-format policy
+//!    (installed once in `conn.rs`), so this path cannot get it wrong or forget it.
 //! 4. **Pre-validate the bind (S5 review fix — §19.3 safety).** BEFORE sending anything, check the
 //!    param arity (`params.len() == stmt.params().len()`) and that each param's `ToSql` impl
 //!    `accepts` the statement's inferred parameter type. A failure here is a client-side BIND error
@@ -68,12 +71,12 @@ pub async fn run(client: &Client, sql: &str, params: &[Value]) -> Result<QueryRe
         .map_err(|e| error_map::map(&e))?;
 
     // Build cols from the prepared statement's columns — correct even for a zero-row result, and
-    // detects an unsupported column type before running the query (Unsupported, conn stays clean).
+    // and (since M1-S8c) never refuses a column type — an unmapped OID is the TEXT FALLBACK.
     let mut cols = Vec::with_capacity(stmt.columns().len());
     for col in stmt.columns() {
-        // The column name + resolved `Type` (not a bare OID) so an `Unsupported` refusal names the
-        // column and PG's own type name — a custom OID alone is database-local and unactionable.
-        let tag = rowmap::oid_to_tag(col.name(), col.type_())?;
+        // M1-S8c: infallible. An OID outside the canonical set is the TEXT FALLBACK (`TAG_TEXT`
+        // carrying PG's own `typoutput`), not a refusal — see `rowmap`'s module docs (D-S8b-6).
+        let tag = rowmap::oid_to_tag(col.type_().oid());
         cols.push(ferro_proto::messages::sql::ColMeta {
             name: col.name().to_string(),
             tag,
@@ -153,8 +156,8 @@ fn bind_error(message: String) -> PoolError {
 /// [`run`] (S5 Task 3, the `fetch:stream` producer path).
 ///
 /// Steps 1-4 are IDENTICAL to [`run`] (see this module's flow docs): `?`→`$n` normalize; `prepare`
-/// for OID-strict `cols` + PG-inferred `$n` param types (an unsupported column type is a loud
-/// `Unsupported` raised BEFORE the query runs, conn stays clean); and the §19.3 bind pre-validation
+/// for OID-strict `cols` + PG-inferred `$n` param types (a column type outside the canonical set is
+/// the M1-S8c TEXT FALLBACK, not a refusal); and the §19.3 bind pre-validation
 /// that keeps a client-side bind fault KNOWN-FATE (`Sql{Unsupported}`) rather than the fate-unknown
 /// `ConnectionLost` a post-send transport failure produces (which would mint a false
 /// `WriteUnconfirmed{Indeterminate}`). The difference is step 5: the `RowStream` is BOX-PINNED
@@ -177,12 +180,12 @@ pub async fn stream(
         .map_err(|e| error_map::map(&e))?;
 
     // cols + per-column OIDs, driven off the prepared statement — correct even for a zero-row
-    // result, and an unsupported column type errors here (Unsupported) before the query runs.
+    // result; a non-canonical column type takes the M1-S8c TEXT fallback rather than erroring.
     let mut cols = Vec::with_capacity(stmt.columns().len());
     let mut oids = Vec::with_capacity(stmt.columns().len());
     for col in stmt.columns() {
-        // Same as `run`: name + resolved `Type`, so the refusal is diagnosable (see `run`).
-        let tag = rowmap::oid_to_tag(col.name(), col.type_())?;
+        // Same as `run`: infallible since M1-S8c (the TEXT FALLBACK, D-S8b-6).
+        let tag = rowmap::oid_to_tag(col.type_().oid());
         cols.push(ColMeta {
             name: col.name().to_string(),
             tag,
