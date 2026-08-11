@@ -187,8 +187,103 @@ fn is_text_input_target(base: &Type) -> bool {
     .contains(base)
 }
 
+/// **M1-S8c: the WRITE half of D-S8b-6's text fallback.** True for a PG type Ferro has no canonical
+/// mapping for at all — a PostGIS `geometry`, `hstore`, a native enum, a composite, `interval`,
+/// `inet`, an ARRAY, a catalog vector like `int2vector`.
+///
+/// **The predicate is the READ path's own table, complemented — not a second hand-written list.**
+/// D-S8b-6 decided that any OID outside the canonical set is READ as `TAG_TEXT` carrying PG's own
+/// text rendering, and it stated the mirror as a hard requirement: *a value read as text must be
+/// writable BACK as text, or a read → write-back round trip breaks*. The set the read path maps is
+/// exactly the `Some(..)` arm of [`crate::rowmap::oid_extract_type`], so keying the bind on
+/// `is_none()` makes the two halves the SAME set by construction. A parallel list here would be a
+/// second source of truth free to drift in either direction — and drifting NARROWER than the read
+/// path is precisely the broken round trip.
+///
+/// **A DOMAIN is excluded.** Callers pass the ALREADY-RESOLVED base, so a `Kind::Domain` still
+/// showing up here means [`resolve_domain`] gave up at [`MAX_DOMAIN_DEPTH`]. A domain's own oid is
+/// user-assigned, so `oid_extract_type` reports `None` for it and the fallback would ACCEPT a chain
+/// nested past the bound — turning the documented "past the bound the resolver gives up, and giving
+/// up means REFUSE" into a yes. (It would not be *looser than the impl* — `to_sql` branches on the
+/// same predicate — but it would bind a value into a slot whose real base type was never
+/// established, which is the thing the bound exists to prevent.)
+///
+/// **What this does NOT widen.** Every type the canonical tags own keeps its narrow, typed path:
+/// `int2`/`int4`/`int8`, `bool`, `float4`/`float8`, `bytea`, `numeric`, the four temporals, `uuid`,
+/// `json`/`jsonb` and the string types all return `Some(..)` from `oid_extract_type`, so a bare
+/// `TAG_TEXT` still cannot reach them through this door. The S7 sentinel gate in [`check_param`] is
+/// likewise untouched: it keys on the four temporal types plus `numeric`, all of them mapped.
+///
+/// **The one sentinel this deliberately does not gate.** PG 17 has infinite `interval`s, so
+/// `Text("infinity")` bound to an `interval` slot really does mean infinity. The S7/S8b sentinel
+/// refusal is NOT extended to cover it, because that refusal is justified by the existence of a
+/// canonical TAG as the deliberate route (`Ferro\Date`, `Ferro\Time`, `Ferro\NaiveTimestamp`,
+/// `Ferro\Decimal`) — and a type with no canonical tag has TEXT as its ONLY route, so refusing
+/// there would make the value unwritable and break the round trip D-S8b-6 exists to guarantee.
+/// Measured live on PG 17 (`tests/pg_bind_widening_it.rs`): across every widened slot each
+/// dangerous literal either lands as exactly the value its text denotes or is refused by PG's own
+/// input function with a real SQLSTATE — there is no silent coercion, which is the failure mode S7
+/// measured on MySQL and this pass went hunting for.
+fn is_unmapped_text_fallback_target(base: &Type) -> bool {
+    !matches!(base.kind(), tokio_postgres::types::Kind::Domain(_))
+        && crate::rowmap::oid_extract_type(base.oid()).is_none()
+}
+
+/// The ONE branch predicate behind [`PgText`]. `accepts`, `to_sql` and `encode_format` each need to
+/// answer "does this param go out as VERBATIM canonical text, or through `postgres-types`' own
+/// string encoder?", and three copies of that question are three chances to drift —
+/// `encode_format` disagreeing with `to_sql` is a wire bug (PG reading UTF-8 date text as a 4-byte
+/// binary `date`), and `accepts` disagreeing with `to_sql` is §19.3's false `Indeterminate`.
+///
+/// The leading `!<String as ToSql>::accepts(base)` keeps the DELEGATED path first, and it is
+/// load-bearing rather than cosmetic: `ltree`/`lquery`/`ltxtquery` are extension types (so
+/// [`is_unmapped_text_fallback_target`] is true for them) whose BINARY form is `0x01 || text` while
+/// their text form is bare text, and `citext` is an extension type `<&str as ToSql>::accepts`
+/// admits by NAME. Letting the fallback win for those would flip four types from binary to text
+/// mid-slice for no caller that asked — and would specifically stop `PgText::to_sql` switching on
+/// `ty.name()`, which is the ONLY reason clause (3) of
+/// [`tests::s8a_every_arm_treats_a_domain_exactly_as_its_base`] can fail at all.
+fn pg_text_writes_verbatim(base: &Type) -> bool {
+    !<String as ToSql>::accepts(base)
+        && (is_text_input_target(base) || is_unmapped_text_fallback_target(base))
+}
+
+/// The PG types a canonical `I64` may bind to as DECIMAL TEXT, on top of the three integer widths
+/// and `bool` (M1-S8c).
+///
+/// **Why it exists:** stock DBAL date arithmetic emits `? || ' SECOND'`, and PG resolves that
+/// parameter to `text` (measured on PG 17.10 via `pg_prepared_statements.parameter_types`:
+/// `PREPARE pa AS SELECT $1 || ' SECOND'` → `{text}`), while `IntegerType` hands the driver a PHP
+/// `int`. Before this, that ordinary stock shape was a pre-send refusal.
+///
+/// **Deliberately NARROWER than `<String as ToSql>::accepts`**, which also admits the name-keyed
+/// `citext`/`ltree`/`lquery`/`ltxtquery`. Stricter is the permitted direction of the §19.3 rule, and
+/// a bare decimal integer is not the input syntax any DBAL-emitted shape aims at a label tree.
+/// It is also NOT extended to [`is_unmapped_text_fallback_target`]: the round-trip mirror that
+/// motivates the fallback is about values Ferro READ as `TAG_TEXT`, and an unmapped OID is never
+/// read back as an `I64`.
+fn is_int_text_target(base: &Type) -> bool {
+    [
+        Type::TEXT,
+        Type::VARCHAR,
+        Type::BPCHAR,
+        Type::NAME,
+        Type::UNKNOWN,
+    ]
+    .contains(base)
+}
+
 /// `TEXT` → the string types (unchanged, delegated, BINARY) **plus** [`is_text_input_target`]'s
-/// eight, written verbatim in PG's **text** wire format.
+/// eight and, since M1-S8c, every [`is_unmapped_text_fallback_target`] slot — all of the widened
+/// ones written verbatim in PG's **text** wire format.
+///
+/// **M1-S8c (D-S8b-6's mirror).** An OID outside the canonical set is READ as `TAG_TEXT` carrying
+/// PG's own rendering, so it must be WRITABLE back the same way or a read → write-back round trip
+/// breaks. That is one more disjunct in the SAME predicate, not a parallel mechanism: the existing
+/// [`resolve_domain`] unwrap runs first, and the three branch points share
+/// [`pg_text_writes_verbatim`]. It is what makes a PostGIS `geometry`, `hstore`, a native enum, an
+/// `interval` and an ARRAY column writable from PHP — the server parses the text with the type's
+/// own input function, exactly as libpq/`pdo_pgsql` do for every parameter they send.
 ///
 /// **Why this is not `pg_domain_aware_param! { PgText wraps String }` any more (M1-S8b).** Two
 /// reasons, and the second is a wire bug waiting to happen:
@@ -240,7 +335,7 @@ impl ToSql for PgText {
         out: &mut tokio_postgres::types::private::BytesMut,
     ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
         let base = resolve_domain(ty);
-        if is_text_input_target(base) {
+        if pg_text_writes_verbatim(base) {
             out.extend_from_slice(self.0.as_bytes());
             return Ok(IsNull::No);
         }
@@ -249,7 +344,7 @@ impl ToSql for PgText {
 
     fn accepts(ty: &Type) -> bool {
         let base = resolve_domain(ty);
-        <String as ToSql>::accepts(base) || is_text_input_target(base)
+        <String as ToSql>::accepts(base) || pg_text_writes_verbatim(base)
     }
 
     /// Text format for THIS param only (the RESULT format stays binary, hazard 17) — and only for
@@ -257,7 +352,7 @@ impl ToSql for PgText {
     /// is what `ltree`'s `0x01 || text` payload requires.
     fn encode_format(&self, ty: &Type) -> Format {
         let base = resolve_domain(ty);
-        if is_text_input_target(base) {
+        if pg_text_writes_verbatim(base) {
             Format::Text
         } else {
             <String as ToSql>::encode_format(&self.0, base)
@@ -372,9 +467,25 @@ pg_canonical_text_param! {
 /// `serial`/`int4` PK — and every `$qb->setParameter('id', 5)` against one — was a hard, pre-send
 /// `NonRetryable` refusal.
 ///
-/// **Format is BINARY**, not text: PG's param format IS per-param selectable (`encode_format`), but
-/// there is nothing to gain here — `<i16/i32/i64 as ToSql>` already writes the exact native binary
-/// form, so this delegates rather than re-rendering a decimal string PG would have to re-parse.
+/// **Format is BINARY for the integer widths and for `bool`**, not text: PG's param format IS
+/// per-param selectable (`encode_format`), but there is nothing to gain there — `<i16/i32/i64 as
+/// ToSql>` and `<bool as ToSql>` already write the exact native binary form, so those arms delegate
+/// rather than re-rendering a decimal string PG would have to re-parse. The
+/// [`is_int_text_target`] arm is the one exception and necessarily so: a `text` slot's wire form IS
+/// the decimal rendering.
+///
+/// ## M1-S8c: `bool` and `text`, the two shapes stock Doctrine DBAL actually emits
+///
+/// * **`bool`** — `Types\BooleanType::convertToDatabaseValue` returns `(int) $value`, and any DBAL
+///   call site that does not carry an explicit `ParameterType` (`executeStatement($sql, [1])`,
+///   `insert($t, ['flag' => 1])`) sends that int under `ParameterType::STRING`, where the PHP type
+///   decides — so a PHP `int` lands in a PG `bool` slot. Only **0 and 1** bind, and the refusal of
+///   everything else lives in [`check_range`], VALUE-side, where a pre-send rejection is
+///   known-fate. `2` must never silently become `true`; PG's own parser agrees, refusing
+///   `'2'::bool` with `22P02`. The `Err` arm below is the totality backstop for a caller that
+///   skipped the pre-flight, exactly like the `try_from`s above it.
+/// * **`text`** — stock date arithmetic emits `? || ' SECOND'`, whose parameter PG resolves to
+///   `text` (measured, PG 17.10). See [`is_int_text_target`].
 ///
 /// **The range check is NOT here.** It lives in [`check_param`], which sees the VALUE (unlike
 /// `ToSql::accepts`, which sees only the `Type`), one step earlier. The reason is **misclassification**,
@@ -408,13 +519,42 @@ impl ToSql for PgInt {
             i32::try_from(self.0)?.to_sql(base, out)
         } else if *base == Type::INT8 {
             self.0.to_sql(base, out)
+        } else if *base == Type::BOOL {
+            // Totality backstop only — `check_range` refuses everything but 0/1 one step earlier,
+            // pre-send. Delegated rather than hand-writing `0x00`/`0x01` so the payload is whatever
+            // `postgres-types` writes for a `bool`, by construction.
+            match self.0 {
+                0 => false.to_sql(base, out),
+                1 => true.to_sql(base, out),
+                n => Err(format!(
+                    "PgInt cannot bind {n} to PG type bool (only 0 and 1 are boolean)"
+                )
+                .into()),
+            }
+        } else if is_int_text_target(base) {
+            out.extend_from_slice(self.0.to_string().as_bytes());
+            Ok(IsNull::No)
         } else {
             Err(format!("PgInt cannot bind PG type {}", ty.name()).into())
         }
     }
 
     fn accepts(ty: &Type) -> bool {
-        [Type::INT2, Type::INT4, Type::INT8].contains(resolve_domain(ty))
+        let base = resolve_domain(ty);
+        [Type::INT2, Type::INT4, Type::INT8, Type::BOOL].contains(base) || is_int_text_target(base)
+    }
+
+    /// Text format for the [`is_int_text_target`] arm ONLY — the integer widths and `bool` keep the
+    /// native binary payload they have always sent. The branch must mirror `to_sql`'s exactly: a
+    /// decimal string announced as `Format::Binary` would be read by PG as raw `text` bytes (which
+    /// happens to work for `text`) but as a wrong-width integer anywhere else, and the whole point
+    /// of pinning it here is that the pair cannot drift.
+    fn encode_format(&self, ty: &Type) -> Format {
+        if is_int_text_target(resolve_domain(ty)) {
+            Format::Text
+        } else {
+            Format::Binary
+        }
     }
 
     to_sql_checked!();
@@ -688,6 +828,23 @@ fn check_range(v: &Value, ty: &Type) -> Result<(), String> {
                      (pre-send rejection: the statement was never executed)"
                 ));
             }
+            // ---- M1-S8c: the VALUE-aware half of the `I64` → `bool` bind. --------------------
+            // `PgInt::accepts` admits `bool` because stock DBAL sends `BooleanType`'s `(int) $value`
+            // through the untyped `ParameterType::STRING` path. Only 0 and 1 are booleans; `2` must
+            // NOT silently become `true`, which is what an `n != 0` mapping would do. PG's own
+            // parser draws the same line — measured on PG 17: `'2'::bool` is
+            // `22P02 invalid input syntax for type boolean: "2"` — so this is the engine being
+            // early and known-fate, never stricter than the database it fronts.
+            //
+            // STRICTER than `<PgInt as ToSql>::accepts`, which sees only the `Type`. That is the
+            // permitted direction (§19.3), and it is the same seam the int2/int4 range arms above
+            // already live in.
+            if *ty == Type::BOOL && *n != 0 && *n != 1 {
+                return Err(format!(
+                    "canonical I64 value {n} is not a PG bool: only 0 and 1 bind to a bool slot \
+                     (pre-send rejection: the statement was never executed)"
+                ));
+            }
             Ok(())
         }
         Value::F64(f) => {
@@ -850,17 +1007,26 @@ mod tests {
             assert!(accepts(&Value::F64(1.5), &ty), "F64 must bind {ty:?}");
         }
         // Still NARROW: widening the integer arms must not make an int bindable anywhere else.
-        for ty in [
-            Type::TEXT,
-            Type::NUMERIC,
-            Type::DATE,
-            Type::TIMESTAMP,
-            Type::UUID,
-            Type::BOOL,
-        ] {
+        //
+        // **M1-S8c moved `TEXT` and `BOOL` out of this list, and the move had to be explicit.**
+        // `I64` now binds both (see `s8c_i64_binds_a_bool_slot_only_as_zero_or_one` /
+        // `s8c_i64_binds_a_text_slot_as_its_decimal_rendering`). Leaving `BOOL` here would have
+        // stayed GREEN — `42` is refused by the new VALUE gate, not by the type gate — i.e. an
+        // assertion passing for a reason it does not state, which is this project's dominant defect
+        // class. The types below are refused on TYPE alone, for every value.
+        for ty in [Type::NUMERIC, Type::DATE, Type::TIMESTAMP, Type::UUID] {
             assert!(!accepts(&Value::I64(42), &ty), "I64 must not bind {ty:?}");
             assert!(!accepts(&Value::F64(1.5), &ty), "F64 must not bind {ty:?}");
         }
+        // `F64` was NOT widened by S8c: text and bool remain refused for it, on type alone.
+        for ty in [Type::TEXT, Type::BOOL] {
+            assert!(!accepts(&Value::F64(1.5), &ty), "F64 must not bind {ty:?}");
+        }
+        // ...and the S8c widening is TYPE-gated, not value-gated, on the `I64` side: an
+        // out-of-range-for-bool integer is refused for `bool` yet still binds `text`, so neither
+        // gate can be mistaken for the other.
+        assert!(!accepts(&Value::I64(42), &Type::BOOL));
+        assert!(accepts(&Value::I64(42), &Type::TEXT));
     }
 
     /// The range check is a PRE-SEND, known-fate rejection — NOT a `to_sql` failure. A value outside
@@ -1206,6 +1372,13 @@ mod tests {
             Value::I64(i64::MAX),
             Value::I64(i64::from(i32::MAX) + 1),
             Value::I64(i64::from(i16::MAX) + 1),
+            // M1-S8c: the ONLY two integers a `bool` slot accepts. Without them the cross-product
+            // proofs never exercise the `bool` arm at all — every other `I64` in this fixture is
+            // refused by the VALUE gate, so the byte witness would have seen zero bool binds and
+            // the arm would be covered only by the hand-written test. Same reasoning as the
+            // out-of-range magnitudes above.
+            Value::I64(0),
+            Value::I64(1),
             Value::F64(1.5),
             Value::F64(1e39),
             // The UNDERFLOW magnitude (Task 4 review). NB it cannot catch the semantic hole it was
@@ -1296,9 +1469,68 @@ mod tests {
             Type::UUID,
             Type::JSON,
             Type::JSONB,
+            Type::NAME,
+            Type::UNKNOWN,
             Type::INTERVAL,
             Type::INET,
             Type::INT4_ARRAY,
+            // M1-S8c: BUILTIN types the READ path has no canonical mapping for, which D-S8b-6's
+            // fallback therefore renders as `TAG_TEXT` — so the bind must accept them back. These
+            // are exactly the shapes the decision names: catalog vectors the stock PG schema
+            // manager selects (`int2vector`, `oidvector`), and ordinary user column types (`xml`,
+            // `money`, and `interval` above) whose round trip would otherwise be one-way.
+            Type::INT2_VECTOR,
+            Type::OID_VECTOR,
+            Type::XML,
+            Type::MONEY,
+            // M1-S8c: EXTENSION / user-defined types — the other half of D-S8b-6. `geometry` and
+            // `hstore` are `Kind::Simple`, a native enum is `Kind::Enum`, and an array of a custom
+            // type is `Kind::Array`; all four take the verbatim-text fallback, and having all four
+            // KINDS present is what stops the fallback being proven for one shape only.
+            //
+            // `citext` is the counter-fixture: it is equally extension-assigned, but
+            // `<&str as ToSql>::accepts` admits it BY NAME, so it must keep the DELEGATED binary
+            // path. It and `ltree` above are what the leading `!String::accepts(..)` in
+            // `pg_text_writes_verbatim` exists for — swap the branch order and both change format.
+            //
+            // The oids sit in the `16_4xx` band, not the `900_0xx` synthetic band: these are types
+            // PG really does assign user-space oids to (hazard 11 — a fixture must not lie about
+            // what PG would have sent).
+            Type::new(
+                "geometry".to_string(),
+                16_400,
+                Kind::Simple,
+                "public".to_string(),
+            ),
+            Type::new(
+                "hstore".to_string(),
+                16_401,
+                Kind::Simple,
+                "public".to_string(),
+            ),
+            Type::new(
+                "mood".to_string(),
+                16_402,
+                Kind::Enum(vec!["sad".into(), "ok".into(), "happy".into()]),
+                "public".to_string(),
+            ),
+            Type::new(
+                "_geometry".to_string(),
+                16_403,
+                Kind::Array(Type::new(
+                    "geometry".to_string(),
+                    16_400,
+                    Kind::Simple,
+                    "public".to_string(),
+                )),
+                "public".to_string(),
+            ),
+            Type::new(
+                "citext".to_string(),
+                16_404,
+                Kind::Simple,
+                "public".to_string(),
+            ),
             // **The one NAME-SENSITIVE encoder in the fixture** (Task 5 fix round 1, F1). Every
             // other entry above is bound by an impl whose `to_sql` IGNORES the `Type` it is handed,
             // which made the payload-BYTES clause of
@@ -1905,5 +2137,685 @@ mod tests {
         }
         // …and a sentinel that arrived TAG-INTACT still binds, exactly as before.
         assert!(accepts(&Value::Date("infinity".into()), &Type::DATE));
+    }
+
+    // =============================================================================================
+    // M1-S8c
+    // =============================================================================================
+
+    /// `Format` has no `PartialEq`, so the witnesses below compare this label instead. A `match`
+    /// with no `_` arm, so a third wire format could not silently be reported as binary.
+    fn fmt_label(f: Format) -> &'static str {
+        match f {
+            Format::Text => "text",
+            Format::Binary => "binary",
+        }
+    }
+
+    /// The exact wire payload one `(Value, Type)` pair produces through the boxed impl — the FORMAT
+    /// and the BYTES together — or the refusal reason. Used by every S8c witness below, so no S8c
+    /// assertion can be satisfied by an impl that merely *returns `Ok`*.
+    ///
+    /// The format is read from the SAME boxed trait object that wrote the bytes, which is what
+    /// `query_raw` does (`vendor/tokio-postgres/src/query.rs:305-308` builds the per-param format
+    /// array from `ToSql::encode_format`) — so a `to_sql` / `encode_format` disagreement is visible
+    /// here exactly as PG would see it.
+    fn wire_of(v: &Value, ty: &Type) -> Result<(&'static str, Vec<u8>), String> {
+        let boxed = value_to_boxed(v);
+        let mut buf = tokio_postgres::types::private::BytesMut::new();
+        match boxed.to_sql_checked(ty, &mut buf) {
+            Ok(IsNull::No) => Ok((fmt_label(boxed.encode_format(ty)), buf.to_vec())),
+            Ok(IsNull::Yes) => Err(format!("{v:?} bound {} as NULL", ty.name())),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// **`I64` → `bool`, the shape stock `Doctrine\DBAL\Types\BooleanType` emits.**
+    ///
+    /// `convertToDatabaseValue` returns `(int) $value`, and every DBAL call site that carries no
+    /// explicit `ParameterType` sends that int under `ParameterType::STRING`, where the PHP type
+    /// decides — so an `int(1)` lands in a PG `bool` slot. Measured on PG 17.10:
+    /// `PREPARE pc AS INSERT INTO bt(b) VALUES ($1)` reports `parameter_types = {boolean}`, so the
+    /// slot really is `bool` and not `int4`.
+    ///
+    /// Three things are asserted, and the third is the one that matters: **`2` is REFUSED.** An
+    /// `n != 0` mapping (C's rule, and PHP's) would silently make it `true`. PG's own parser draws
+    /// the same line — `'2'::bool` is `22P02 invalid input syntax for type boolean: "2"` — so the
+    /// refusal is the engine being EARLY and known-fate, never stricter than the database it fronts.
+    #[test]
+    fn s8c_i64_binds_a_bool_slot_only_as_zero_or_one() {
+        assert!(accepts(&Value::I64(1), &Type::BOOL));
+        assert!(accepts(&Value::I64(0), &Type::BOOL));
+
+        // The BYTES, not merely `Ok`. PG's binary `bool` is one byte, 0x01 true / 0x00 false — an
+        // independent fact from PG's `boolsend`, not read off the impl under test. A swapped
+        // mapping (`0 => true`) is invisible to an `is_ok()` assertion and is a silent corrupt
+        // write of every boolean column in an application.
+        assert_eq!(
+            wire_of(&Value::I64(1), &Type::BOOL).expect("1 binds bool"),
+            ("binary", vec![0x01])
+        );
+        assert_eq!(
+            wire_of(&Value::I64(0), &Type::BOOL).expect("0 binds bool"),
+            ("binary", vec![0x00])
+        );
+
+        // ...and everything else is a PRE-SEND refusal naming the value and the rule.
+        for n in [2_i64, -1, 42, i64::MAX, i64::MIN] {
+            let why = check_param(&Value::I64(n), &Type::BOOL)
+                .err()
+                .unwrap_or_else(|| panic!("I64({n}) must not bind a bool slot"));
+            assert!(
+                why.contains(&n.to_string()),
+                "the refusal must name the offending value: {why}"
+            );
+            assert!(
+                why.contains("only 0 and 1"),
+                "the refusal must say WHY, so `2 => true` is never mistaken for a bug: {why}"
+            );
+            assert!(
+                why.contains("pre-send"),
+                "and that it is known-fate, never a possibly-applied write: {why}"
+            );
+        }
+
+        // **The TOTALITY BACKSTOP, exercised DIRECTLY** — found missing by mutation testing.
+        // `check_param` refuses `2` one step earlier, so `PgInt::to_sql`'s non-boolean arm is
+        // unreachable through `query.rs`, and that is precisely why it needs its own assertion:
+        // with no test calling the boxed impl directly, replacing the whole `match` with PHP's
+        // `n != 0` rule left the ENTIRE suite green (measured). `<PgInt as ToSql>::accepts` is
+        // TYPE-only, so a caller that skipped the pre-flight really does reach `to_sql` here, and
+        // it must get a typed error rather than a silently coerced `true`.
+        for n in [2_i64, -1, i64::MIN] {
+            let e = wire_of(&Value::I64(n), &Type::BOOL).expect_err(
+                "the boxed impl must REFUSE a non-boolean integer, never coerce it to true",
+            );
+            assert!(
+                e.contains("only 0 and 1 are boolean"),
+                "the backstop must say why, got {e}"
+            );
+        }
+
+        // A DOMAIN over bool behaves identically, on both sides (the S8a rule, unchanged).
+        let dom_bool = Type::new(
+            "dom_flag".to_string(),
+            900_030,
+            tokio_postgres::types::Kind::Domain(Type::BOOL),
+            "public".to_string(),
+        );
+        assert!(accepts(&Value::I64(1), &dom_bool));
+        assert!(!accepts(&Value::I64(2), &dom_bool));
+        assert_eq!(
+            wire_of(&Value::I64(1), &dom_bool).expect("1 binds a domain over bool"),
+            ("binary", vec![0x01])
+        );
+
+        // The canonical `Bool` tag is untouched by this widening, and a bare TEXT still cannot
+        // reach a bool slot (`'t'`/`'true'` are PG's input syntax, but the canonical wire form for
+        // a boolean is `TAG_BOOL`).
+        assert!(accepts(&Value::Bool(true), &Type::BOOL));
+        assert!(!accepts(&Value::Text("t".into()), &Type::BOOL));
+        assert!(!accepts(&Value::Text("1".into()), &Type::BOOL));
+    }
+
+    /// **`I64` → `text`, the shape stock DBAL date arithmetic emits.**
+    ///
+    /// `AbstractPlatform::getDateAddSecondsExpression` builds `? || ' SECOND'`, and PG resolves that
+    /// parameter to `text`, not to an integer width — measured on PG 17.10:
+    /// `PREPARE pa AS SELECT $1 || ' SECOND'` reports `parameter_types = {text}`.
+    ///
+    /// The payload must be the DECIMAL RENDERING, in `Format::Text`. Announcing a decimal string as
+    /// `Format::Binary`, or sending the 8-byte big-endian integer in `Format::Text`, both bind
+    /// "successfully" and both put garbage in the column — neither is visible to an `is_ok()` check,
+    /// which is why this asserts the pair.
+    #[test]
+    fn s8c_i64_binds_a_text_slot_as_its_decimal_rendering() {
+        for ty in [
+            Type::TEXT,
+            Type::VARCHAR,
+            Type::BPCHAR,
+            Type::NAME,
+            Type::UNKNOWN,
+        ] {
+            assert!(
+                accepts(&Value::I64(-200), &ty),
+                "an I64 must bind {ty:?} — `? || ' SECOND'` resolves its parameter to text"
+            );
+            assert_eq!(
+                wire_of(&Value::I64(-200), &ty).expect("binds"),
+                ("text", b"-200".to_vec()),
+                "an I64 in a string slot is its decimal rendering, sent as TEXT: {ty:?}"
+            );
+        }
+        // The magnitudes: full 64-bit range, rendered exactly, never truncated through i32.
+        assert_eq!(
+            wire_of(&Value::I64(i64::MAX), &Type::TEXT).expect("binds"),
+            ("text", b"9223372036854775807".to_vec())
+        );
+        assert_eq!(
+            wire_of(&Value::I64(i64::MIN), &Type::TEXT).expect("binds"),
+            ("text", b"-9223372036854775808".to_vec())
+        );
+        // ...and the int-width arms KEEP their binary payload, so this widening did not leak into
+        // the S8a narrowing that made `serial` primary keys work.
+        assert_eq!(
+            wire_of(&Value::I64(-200), &Type::INT4).expect("binds"),
+            ("binary", vec![0xFF, 0xFF, 0xFF, 0x38])
+        );
+        assert_eq!(
+            wire_of(&Value::I64(1), &Type::BOOL).expect("binds"),
+            ("binary", vec![0x01])
+        );
+
+        // A DOMAIN over text resolves on all THREE sides — `accepts`, `to_sql` and `encode_format`.
+        // The format branch is the one nothing else here would catch: a version testing the
+        // UNRESOLVED type sends `Format::Binary` for the domain and `Format::Text` for bare `text`.
+        let dom_text = Type::new(
+            "dom_label".to_string(),
+            900_031,
+            tokio_postgres::types::Kind::Domain(Type::TEXT),
+            "public".to_string(),
+        );
+        assert_eq!(
+            wire_of(&Value::I64(7), &dom_text).expect("binds a domain over text"),
+            ("text", b"7".to_vec())
+        );
+
+        // Deliberately NARROWER than `<String as ToSql>::accepts`: the name-keyed extension string
+        // types are NOT integer targets. Stricter is the permitted direction.
+        let ltree = Type::new(
+            "ltree".to_string(),
+            16_385,
+            tokio_postgres::types::Kind::Simple,
+            "public".to_string(),
+        );
+        assert!(!accepts(&Value::I64(5), &ltree), "I64 must not bind ltree");
+        // ...and an unmapped/custom OID is a TEXT-tag target, never an I64 one: an unmapped column
+        // is never READ back as an I64, so the round-trip mirror does not reach here.
+        let geometry = Type::new(
+            "geometry".to_string(),
+            16_400,
+            tokio_postgres::types::Kind::Simple,
+            "public".to_string(),
+        );
+        assert!(!accepts(&Value::I64(5), &geometry));
+        assert!(accepts(&Value::Text("POINT(1 2)".into()), &geometry));
+    }
+
+    /// **D-S8b-6's MIRROR: a canonical `Text` binds into an UNMAPPED / custom-OID slot.**
+    ///
+    /// The read path renders any OID outside the canonical set as `TAG_TEXT` carrying PG's own text,
+    /// so the same value has to be writable BACK as text or the round trip is one-way. This asserts
+    /// the property across all four `Kind`s an unmapped type can arrive as (`Simple`, `Enum`,
+    /// `Array`, and a `Domain` over a custom base), plus the builtin-but-unmapped types D-S8b-6
+    /// names, and it asserts the BYTES and the FORMAT — a widened `accepts` over a `to_sql` that
+    /// still delegated to `postgres-types` would write the same bytes for `geometry` but announce
+    /// them `Format::Binary`, which PG reads with the type's `recv` function instead of its `in`
+    /// function.
+    #[test]
+    fn s8c_text_binds_an_unmapped_or_custom_oid_slot_verbatim_as_text() {
+        use tokio_postgres::types::Kind;
+        let ewkb = "SRID=4326;POINT(30 10)";
+        let custom: &[(&str, Type)] = &[
+            (
+                "PostGIS geometry (Kind::Simple)",
+                Type::new("geometry".into(), 16_400, Kind::Simple, "public".into()),
+            ),
+            (
+                "hstore (Kind::Simple)",
+                Type::new("hstore".into(), 16_401, Kind::Simple, "public".into()),
+            ),
+            (
+                "a native enum (Kind::Enum)",
+                Type::new(
+                    "mood".into(),
+                    16_402,
+                    Kind::Enum(vec!["sad".into(), "ok".into()]),
+                    "public".into(),
+                ),
+            ),
+            (
+                "an array of a custom type (Kind::Array)",
+                Type::new(
+                    "_geometry".into(),
+                    16_403,
+                    Kind::Array(Type::new(
+                        "geometry".into(),
+                        16_400,
+                        Kind::Simple,
+                        "public".into(),
+                    )),
+                    "public".into(),
+                ),
+            ),
+            (
+                "a DOMAIN over a custom type — the EXISTING resolution, not a parallel one",
+                Type::new(
+                    "dom_geometry".into(),
+                    16_405,
+                    Kind::Domain(Type::new(
+                        "geometry".into(),
+                        16_400,
+                        Kind::Simple,
+                        "public".into(),
+                    )),
+                    "public".into(),
+                ),
+            ),
+            // BUILTIN-but-unmapped: the catalog vectors the stock PG schema manager selects, and
+            // four ordinary user column types. All are `oid < 16384`, so a fallback keyed on
+            // PG's `FirstNormalObjectId` instead of on the read path's own table would leave every
+            // one of these a one-way trip.
+            ("int2vector (a catalog vector)", Type::INT2_VECTOR),
+            ("oidvector (a catalog vector)", Type::OID_VECTOR),
+            ("interval", Type::INTERVAL),
+            ("inet", Type::INET),
+            ("xml", Type::XML),
+            ("money", Type::MONEY),
+            ("int4[]", Type::INT4_ARRAY),
+            ("timetz", Type::TIMETZ),
+        ];
+        for (what, ty) in custom {
+            assert!(
+                accepts(&Value::Text(ewkb.to_string()), ty),
+                "a canonical TEXT must bind {what}: D-S8b-6 reads it back as TAG_TEXT, so it must \
+                 be writable as TEXT"
+            );
+            assert_eq!(
+                wire_of(&Value::Text(ewkb.to_string()), ty).expect("binds"),
+                ("text", ewkb.as_bytes().to_vec()),
+                "{what} must receive the payload VERBATIM, in PG's TEXT format so the type's own \
+                 input function parses it"
+            );
+        }
+
+        // ---- The set stays NARROW where a DIFFERENT canonical tag owns the slot. Each of these is
+        // read back as `BOOL`/`I64`/`F64`/`BYTES`, so a bare `TAG_TEXT` has no business in it and
+        // the S8a narrowing that made `serial` primary keys work must survive the widening.
+        for ty in [
+            Type::INT2,
+            Type::INT4,
+            Type::INT8,
+            Type::BOOL,
+            Type::FLOAT4,
+            Type::FLOAT8,
+            Type::BYTEA,
+        ] {
+            assert!(
+                !accepts(&Value::Text("42".to_string()), &ty),
+                "the unmapped fallback must not reach {ty:?} — the read path maps it to a \
+                 different canonical tag, which owns the slot"
+            );
+        }
+
+        // ---- **A PRE-EXISTING one-way trip, pinned as a KNOWN RESIDUAL rather than silently
+        // widened.** These four are MAPPED by the read path (S8a §22.2 (q) admitted the catalog
+        // scalars), so the fallback does not reach them — but `"char"` is read back as `TAG_TEXT`
+        // and `oid`/`regtype`/`regclass` as `TAG_I64`, and neither tag can be BOUND into them. So
+        // `SELECT attidentity FROM pg_attribute` round-trips out but not back.
+        //
+        // NOT fixed here, deliberately, and the reason is not scope alone: `oid` is UNSIGNED, so
+        // `I64(-1)` would reach `oidin` and wrap to `4294967295` — a silent corrupt write that
+        // needs its own value gate, exactly like the `bool` 0/1 rule this task DID add. Widening it
+        // as a side effect of a text-fallback slice would ship that gate untested. Recorded in the
+        // task journal as a SPEC-DELTA for the slice that closes the catalog write path (nothing
+        // WRITES to `pg_attribute`, which is why it has not bitten).
+        for ty in [Type::CHAR, Type::OID, Type::REGTYPE, Type::REGCLASS] {
+            assert!(
+                !accepts(&Value::Text("4".to_string()), &ty),
+                "{ty:?} is a KNOWN one-way trip, unchanged by S8c — if this starts accepting, the \
+                 unsigned/width gate it needs must land in the same commit"
+            );
+            assert!(
+                !accepts(&Value::I64(4), &ty),
+                "...and likewise for I64: {ty:?}"
+            );
+        }
+
+        // ---- The two extension types `<&str as ToSql>::accepts` admits BY NAME keep the DELEGATED
+        // BINARY path, unchanged by this task. `ltree` is the load-bearing one: its binary form is
+        // `0x01 || text`, and that name-sensitivity is the ONLY reason clause (3) of
+        // `s8a_every_arm_treats_a_domain_exactly_as_its_base` can fail at all. If the fallback
+        // branch ever wins for it, that guard silently stops guarding.
+        let ltree = Type::new("ltree".into(), 16_385, Kind::Simple, "public".into());
+        assert_eq!(
+            wire_of(&Value::Text("x".to_string()), &ltree).expect("binds"),
+            ("binary", vec![0x01, b'x']),
+            "ltree must keep the postgres-types BINARY encoder and its 0x01 version byte"
+        );
+        let citext = Type::new("citext".into(), 16_404, Kind::Simple, "public".into());
+        assert_eq!(
+            wire_of(&Value::Text("x".to_string()), &citext).expect("binds"),
+            ("binary", vec![b'x']),
+            "citext is String-accepted by NAME and must keep its delegated binary path"
+        );
+
+        // ---- Past the domain-nesting bound, the fallback must NOT rescue the bind. A domain's own
+        // oid is user-assigned, so `oid_extract_type` reports None for it; without the explicit
+        // `Kind::Domain` exclusion the fallback would ACCEPT a chain whose real base type was never
+        // established, turning `s8a_domain_nesting_is_bounded_and_the_bound_refuses`'s documented
+        // refusal into a yes.
+        let past_bound = nested_domain(MAX_DOMAIN_DEPTH + 1, 900_400, Type::INT4);
+        assert!(
+            !accepts(&Value::Text("x".to_string()), &past_bound),
+            "past MAX_DOMAIN_DEPTH the resolver gives up, and giving up must still mean REFUSE"
+        );
+        // ...and the same chain over a CUSTOM base is refused for the same reason, so the exclusion
+        // is not accidentally relying on the base being a mapped type.
+        let past_bound_custom = nested_domain(
+            MAX_DOMAIN_DEPTH + 1,
+            900_500,
+            Type::new("geometry".into(), 16_400, Kind::Simple, "public".into()),
+        );
+        assert!(!accepts(&Value::Text("x".to_string()), &past_bound_custom));
+        // ...while EXACTLY at the bound it still resolves to the custom base and binds.
+        let at_bound_custom = nested_domain(
+            MAX_DOMAIN_DEPTH,
+            900_600,
+            Type::new("geometry".into(), 16_400, Kind::Simple, "public".into()),
+        );
+        assert!(accepts(&Value::Text("x".to_string()), &at_bound_custom));
+    }
+
+    /// **The fallback is the READ path's table, complemented — pinned as an OBSERVABLE.**
+    ///
+    /// `is_unmapped_text_fallback_target` is *defined* as `oid_extract_type(..).is_none()`, so
+    /// re-asserting that would be a tautology. What is NOT a tautology is the end-to-end
+    /// implication across the OID space, and the fixture is built to ISOLATE it: each `Type` is a
+    /// synthetic `Kind::Simple` with a NON-canonical name (`t25`), which is never structurally
+    /// equal to a `Type::*` constant and matches none of the four names
+    /// `<&str as ToSql>::accepts` keys on — so both of the other disjuncts in
+    /// [`pg_text_writes_verbatim`] are dead and the FALLBACK is the only thing that can say yes.
+    /// Under that isolation the equality is exact: **the bind accepts a canonical `Text` for an OID
+    /// exactly when the read path has no canonical mapping for it.**
+    ///
+    /// The complementary half — that the REAL string constants are additionally accepted through
+    /// the delegated `String` path — is
+    /// [`tests::s8b_bare_text_binds_to_every_type_whose_input_syntax_is_text`]'s, not this test's.
+    ///
+    /// A second hand-written list in this module (say `oid >= FirstNormalObjectId`) satisfies every
+    /// other test in this file and fails here on `interval`, `inet`, `xml`, `money` and every
+    /// catalog vector.
+    #[test]
+    fn s8c_the_text_fallback_is_exactly_the_complement_of_the_read_paths_mapping() {
+        use tokio_postgres::types::Kind;
+        let mut unmapped = 0usize;
+        let mut mapped = 0usize;
+        for oid in 1..=20_000u32 {
+            let ty = Type::new(format!("t{oid}"), oid, Kind::Simple, "public".to_string());
+            let read_maps_it = crate::rowmap::oid_extract_type(oid).is_some();
+            // A synthetic `Type` is never structurally equal to a `Type::*` constant, so
+            // `<String as ToSql>::accepts` and `is_text_input_target` are both false here and the
+            // fallback is the ONLY thing that can accept. That makes the equality exact.
+            assert_eq!(
+                accepts(&Value::Text("x".to_string()), &ty),
+                !read_maps_it,
+                "oid {oid}: the bind must accept a canonical TEXT exactly when the read path has \
+                 no canonical mapping for the type — that IS D-S8b-6's round trip"
+            );
+            if read_maps_it {
+                mapped += 1;
+            } else {
+                unmapped += 1;
+            }
+        }
+        // Neither branch may be empty, or the equality above is satisfied vacuously.
+        assert!(
+            mapped >= 20,
+            "the sweep must cover mapped OIDs too: {mapped}"
+        );
+        assert!(unmapped > 19_000, "and unmapped ones: {unmapped}");
+    }
+
+    /// The canonical TEXT a `Value` carries, projected from the VALUE alone — never from the
+    /// encoder under test. This is the independent oracle the byte witness below compares against.
+    ///
+    /// No `_` arm: a new `Value` variant breaks this file's build rather than silently falling into
+    /// "carries no text", which would make the witness skip it.
+    fn canonical_text_of(v: &Value) -> Option<String> {
+        match v {
+            Value::I64(n) => Some(n.to_string()),
+            Value::U64(n) => Some(n.to_string()),
+            Value::Text(s)
+            | Value::Decimal(s)
+            | Value::Date(s)
+            | Value::Time(s)
+            | Value::Timestamp(s)
+            | Value::TimestampTz(s)
+            | Value::Uuid(s)
+            | Value::Json(s) => Some(s.clone()),
+            // These four never send `Format::Text` — asserted, not assumed, by the witness.
+            Value::Null | Value::Bool(_) | Value::F64(_) | Value::Bytes(_) => None,
+        }
+    }
+
+    /// PG's fixed binary payload width for the types that have one, from PG's own `*send`
+    /// functions — an independent fact, not read off any impl in this module.
+    fn fixed_binary_width(base: &Type) -> Option<usize> {
+        if *base == Type::BOOL {
+            Some(1)
+        } else if *base == Type::INT2 {
+            Some(2)
+        } else if *base == Type::INT4 || *base == Type::FLOAT4 || *base == Type::DATE {
+            Some(4)
+        } else if *base == Type::INT8
+            || *base == Type::FLOAT8
+            || *base == Type::TIME
+            || *base == Type::TIMESTAMP
+            || *base == Type::TIMESTAMPTZ
+        {
+            Some(8)
+        } else if *base == Type::UUID {
+            Some(16)
+        } else {
+            None
+        }
+    }
+
+    /// **THE LOCKSTEP PROOF, WITNESSING BYTES (S8a review carry, extended by S8c).**
+    ///
+    /// `s7_accepts_is_never_looser_than_the_boxed_impl` asserts only `to_sql_checked(..).is_ok()`.
+    /// S8a's review found that structurally blind twice over: both sides agreeing to TRUNCATE
+    /// satisfies the directional rule, and the proof never inspected a payload byte at all. This is
+    /// the same full cross product with the payload examined, and every clause is a property of the
+    /// VALUE and the TYPE — never of the encoder:
+    ///
+    /// 0. a canonical `NULL` writes NO value bytes, for every type it accepts;
+    /// 1. `accepts` ⇒ the boxed impl binds (the directional rule itself, unchanged);
+    /// 2. `Format::Text` ⇒ the payload is EXACTLY [`canonical_text_of`] — nothing re-rendered,
+    ///    re-parsed, trimmed, prefixed or truncated. This is what makes the S8c widenings
+    ///    falsifiable: an `I64` in a `text` slot that wrote the 8-byte big-endian integer, or a
+    ///    `Text` in a `geometry` slot that wrote a length prefix, both bind `Ok` and both corrupt;
+    /// 3. `Format::Text` ⇒ the value CARRIES text at all. `Bool`/`F64`/`Bytes` have no canonical
+    ///    text form, so a text-format payload for one of them is a bug by construction;
+    /// 4. `Format::Binary` ⇒ where PG's type has a FIXED width, the payload is exactly that many
+    ///    bytes. This is the class that let a `float8` be silently truncated to `f32` across the
+    ///    whole suite (S8a review F3a), and it now fails on width alone, for every pair.
+    #[test]
+    fn s8c_every_accepted_pair_witnesses_its_wire_bytes() {
+        let mut text_witnessed = 0usize;
+        let mut binary_witnessed = 0usize;
+        let mut null_witnessed = 0usize;
+        for v in every_variant() {
+            for ty in every_target_type() {
+                if !accepts(&v, &ty) {
+                    continue;
+                }
+                // (0) A typed NULL slot writes NO value bytes, for every type it accepts — the one
+                // legitimate universally-true `accepts` in this module. Witnessed here rather than
+                // skipped, because `PgNull` is exactly the shape that would hide a stray payload.
+                if matches!(v, Value::Null) {
+                    let boxed = value_to_boxed(&v);
+                    let mut buf = tokio_postgres::types::private::BytesMut::new();
+                    let is_null = boxed
+                        .to_sql_checked(&ty, &mut buf)
+                        .unwrap_or_else(|e| panic!("NULL must bind {}: {e}", ty.name()));
+                    assert!(
+                        matches!(is_null, IsNull::Yes),
+                        "a canonical NULL must bind as SQL NULL against {}",
+                        ty.name()
+                    );
+                    assert!(
+                        buf.is_empty(),
+                        "a NULL writes no value bytes, got {:?} against {}",
+                        buf.to_vec(),
+                        ty.name()
+                    );
+                    null_witnessed += 1;
+                    continue;
+                }
+                // (1)
+                let (fmt, bytes) = wire_of(&v, &ty).unwrap_or_else(|e| {
+                    panic!(
+                        "accepts({v:?}, {}) said yes but the boxed impl refuses it ({e}) — a \
+                         LOOSER pre-flight lets to_sql_checked fail instead, and a to_sql failure \
+                         carries no DbError, so it is misclassified as ConnectionLost (false \
+                         Indeterminate, §19.3)",
+                        ty.name()
+                    )
+                });
+                match fmt {
+                    "text" => {
+                        // (3)
+                        let want = canonical_text_of(&v).unwrap_or_else(|| {
+                            panic!(
+                                "{v:?} carries no canonical text yet was sent to {} in \
+                                 Format::Text",
+                                ty.name()
+                            )
+                        });
+                        // (2)
+                        assert_eq!(
+                            bytes,
+                            want.as_bytes(),
+                            "a TEXT-format param must be the canonical text VERBATIM: {v:?} \
+                             against {}",
+                            ty.name()
+                        );
+                        text_witnessed += 1;
+                    }
+                    "binary" => {
+                        // (4)
+                        if let Some(w) = fixed_binary_width(&ty) {
+                            assert_eq!(
+                                bytes.len(),
+                                w,
+                                "a BINARY param for {} must be exactly {w} bytes, got {bytes:?} — \
+                                 a wrong width is how an f64 gets silently truncated through f32",
+                                ty.name()
+                            );
+                        }
+                        binary_witnessed += 1;
+                    }
+                    other => panic!(
+                        "unknown wire format {other} for {v:?} against {}",
+                        ty.name()
+                    ),
+                }
+            }
+        }
+        // No arm may be empty, or a clause above is vacuous.
+        assert!(text_witnessed > 0 && binary_witnessed > 0 && null_witnessed > 0);
+        println!(
+            "  s8c byte witness: {text_witnessed} text-format + {binary_witnessed} binary-format \
+             + {null_witnessed} NULL accepted pairs"
+        );
+    }
+
+    /// **"There is NO pair where `accepts` says yes and the impl errs" — MEASURED, not reasoned.**
+    ///
+    /// [`every_target_type`] is a hand-grown list, so a cross product over it can only ever say
+    /// "none of the pairs I thought of". `Type` is an OPEN type — any OID constructs one — and S8c
+    /// widened two arms with predicates that are *complements* rather than allowlists, which is
+    /// exactly the shape where an unconsidered OID could slip through. So this sweeps the OID space
+    /// the fallback can actually see, in all four `Kind`s a parameter can arrive as, against every
+    /// canonical variant, and asserts the directional rule on all of them.
+    ///
+    /// A `to_sql` failure carries no `DbError`, so `is_session_fatal` reads it as `ConnectionLost`
+    /// and §19.3 mints a false `Indeterminate` for a write that never left the process. That is the
+    /// one direction this proves impossible.
+    #[test]
+    fn s8c_accepts_is_never_looser_than_the_impl_over_an_oid_sweep() {
+        use tokio_postgres::types::Kind;
+        let values = every_variant();
+        let mut accepted = 0usize;
+        let mut refused = 0usize;
+        for oid in 1..=20_000u32 {
+            for kind in [
+                Kind::Simple,
+                Kind::Enum(vec!["a".into()]),
+                Kind::Array(Type::INT4),
+                Kind::Domain(Type::INT4),
+            ] {
+                let ty = Type::new(format!("t{oid}"), oid, kind, "public".to_string());
+                for v in &values {
+                    if !accepts(v, &ty) {
+                        refused += 1;
+                        continue;
+                    }
+                    let boxed = value_to_boxed(v);
+                    let mut buf = tokio_postgres::types::private::BytesMut::new();
+                    assert!(
+                        boxed.to_sql_checked(&ty, &mut buf).is_ok(),
+                        "oid {oid} ({:?}): accepts({v:?}) said yes but the boxed impl refuses — \
+                         the false-Indeterminate direction (§19.3)",
+                        ty.kind()
+                    );
+                    accepted += 1;
+                }
+            }
+        }
+        // Both counters must be non-trivial, or the loop proved nothing.
+        assert!(accepted > 10_000, "accepted pairs: {accepted}");
+        assert!(refused > 10_000, "refused pairs: {refused}");
+        println!("  s8c oid sweep: {accepted} accepted / {refused} refused pairs checked");
+    }
+
+    /// **The S7/S8b sentinel discipline is UNCHANGED by S8c** — a REGRESSION guard, asserted rather
+    /// than assumed because both widened predicates sit in the same two functions the gate reads.
+    ///
+    /// It is deliberately NOT the primary proof of the gate: that is
+    /// [`tests::s8b_a_bare_text_sentinel_is_still_refused_for_a_temporal_or_numeric_slot`], which
+    /// checks the message is actionable and that the same strings are ordinary values in a text
+    /// column. Reverting S8c alone would leave the first two loops here GREEN (the four temporals
+    /// and `numeric` are still `is_text_input_target` members from S8b), so the clause that carries
+    /// this test's own weight is the LAST one — that the newly widened `I64` arm opened no second
+    /// door into the gated set.
+    ///
+    /// The gate keys on the SLOT type (the four temporals plus `numeric`), and every one of those is
+    /// mapped by the read path, so neither the `I64` widening nor the unmapped-OID fallback can
+    /// reach it. What DOES change is what happens in an UNMAPPED slot, and the answer is
+    /// deliberate: there is no gate there, because there is no canonical tag to redirect a caller
+    /// to — TEXT is the only route a `geometry`/`hstore`/`interval` value has, so refusing would
+    /// break the round trip D-S8b-6 mandates. Live PG's own behaviour for each of those is recorded
+    /// in `tests/pg_bind_widening_it.rs`.
+    #[test]
+    fn s8c_the_sentinel_gate_is_unchanged_by_the_widening() {
+        for lit in ["infinity", "-infinity", "now", "today", "epoch", "allballs"] {
+            for ty in [Type::DATE, Type::TIME, Type::TIMESTAMP, Type::TIMESTAMPTZ] {
+                let why = check_param(&Value::Text(lit.to_string()), &ty)
+                    .expect_err("still refused after S8c");
+                assert!(why.contains("SPECIAL"), "{why}");
+            }
+        }
+        for lit in ["NaN", "Infinity", "-Infinity"] {
+            check_param(&Value::Text(lit.to_string()), &Type::NUMERIC)
+                .expect_err("still refused after S8c");
+        }
+        // ...and the tagged route still binds them deliberately.
+        assert!(accepts(&Value::Date("infinity".into()), &Type::DATE));
+        assert!(accepts(&Value::Decimal("NaN".into()), &Type::NUMERIC));
+        // ...and an `I64` cannot reach a temporal or numeric slot at all, so the widening opened no
+        // second door into the gated set.
+        for ty in [
+            Type::DATE,
+            Type::TIME,
+            Type::TIMESTAMP,
+            Type::TIMESTAMPTZ,
+            Type::NUMERIC,
+        ] {
+            assert!(!accepts(&Value::I64(0), &ty));
+            assert!(!accepts(&Value::I64(1), &ty));
+        }
     }
 }
