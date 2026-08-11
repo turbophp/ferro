@@ -1,0 +1,19 @@
+{
+    "name": "ferro/migrations-acceptance",
+    "description": "M1-S8c acceptance: doctrine/migrations running for real against Ferro on PostgreSQL",
+    "type": "project",
+    "license": "Apache-2.0",
+    "repositories": [
+        { "type": "path", "url": "../../php/doctrine-dbal" },
+        { "type": "path", "url": "../../php/client" }
+    ],
+    "require": {
+        "php": ">=8.2",
+        "doctrine/dbal": "4.4.4",
+        "doctrine/migrations": "^3.8",
+        "ferro/doctrine-dbal-driver": "@dev",
+        "ferro/client": "@dev"
+    },
+    "autoload": { "psr-4": { "Ferro\\MigrationsAcceptance\\": "src/" } },
+    "config": { "sort-packages": true }
+}
