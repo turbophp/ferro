@@ -2,7 +2,7 @@
 declare(strict_types=1);
 namespace Ferro\DBAL\Tests\Live;
 
-use Ferro\DBAL\Exception\NoIdentityValue;
+use Doctrine\DBAL\Driver\Exception\NoIdentityValue;
 
 /**
  * M1-S8b Task 10 — `lastInsertId()`, and the honest answer on PostgreSQL.

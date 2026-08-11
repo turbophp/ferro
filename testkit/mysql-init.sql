@@ -40,3 +40,13 @@ BEGIN
     SET SESSION sort_buffer_size = 262144;
 END $$
 DELIMITER ;
+
+-- 4. M1-S8b: the upstream Doctrine DBAL functional suite gets its OWN database. Ferro's patched
+--    TestUtil does NOT drop/create it (PHP holds no credentials — SPEC §12 / D8);
+--    `testkit/dbal-suite.sh` resets it container-side before every recorded run. The grant is scoped
+--    to that database only; the `ferro` user deliberately does NOT get CREATE DATABASE. Measured
+--    reason this exists: with only `GRANT ALL ON ferro.*`, upstream's own `initializeDatabase()`
+--    errored 1057 of 1077 functional tests with `1044 Access denied … to database 'doctrine_tests'`.
+CREATE DATABASE IF NOT EXISTS doctrine_tests;
+GRANT ALL PRIVILEGES ON doctrine_tests.* TO 'ferro'@'%';
+FLUSH PRIVILEGES;

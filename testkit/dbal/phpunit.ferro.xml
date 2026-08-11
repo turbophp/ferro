@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  M1-S8b reference config. The RUN uses a generated copy (see testkit/dbal-suite.sh step 5), which
+  expands testkit/dbal/allowlist.txt into <file>/<directory> entries and fills in the per-run socket.
+  This file is committed with an EMPTY testsuite so it can never become a second, drifting copy of
+  the allowlist; it documents the shape and nothing else.
+-->
+<phpunit bootstrap="bootstrap.php" colors="true" cacheDirectory=".phpunit.cache" failOnWarning="false">
+    <testsuites>
+        <testsuite name="ferro-dbal-subset">
+            <!-- Filled in by testkit/dbal-suite.sh from allowlist.txt. -->
+        </testsuite>
+    </testsuites>
+    <php>
+        <var name="db_driverClass" value="Ferro\DBAL\Driver"/>
+    </php>
+</phpunit>

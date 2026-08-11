@@ -18,16 +18,28 @@ use Ferro\Protocol\Generated\Constants as C;
  * a scale-preserving decimal, the raw JSON document, the lowercase hyphenated UUID, `Y-m-d H:i:s[.u]`
  * for `TIMESTAMP` and RFC3339 `Y-m-d\TH:i:s[.u]Z` for `TIMESTAMPTZ`.
  *
- * **S8 WARNING — DBAL's stock platform format strings do NOT match the canonical datetime text, and
- * the S8 tier must supply its own conversion rather than lean on the stock type layer for those two
- * tags.** `AbstractPlatform::getDateTimeFormatString()` is `Y-m-d H:i:s`, which `createFromFormat`
- * rejects the moment a `TIMESTAMP` carries its canonical `.250000` fraction; and
- * `PostgreSQLPlatform::getDateTimeTzFormatString()` is `Y-m-d H:i:sO`, which matches neither the `T`
- * separator, the literal `Z`, nor the microseconds of a canonical `TIMESTAMPTZ`. The remaining tags
- * (`DECIMAL`, `JSON`, `UUID`, `DATE`, `TIME`, and a whole-second `TIMESTAMP`) do land in the shape the
- * stock converters expect. Charter rule 6 is unaffected: this is the DRIVER's own conversion step,
- * not a change to Grammar/Processor or platform SQL generation. The native
- * `Ferro\Client\Connection` API keeps {@see M1ValuePolicy}.
+ * **S8 WARNING — some of DBAL's stock platform format strings do NOT match the canonical datetime
+ * text, so the DBAL tier supplies its own conversion (`Ferro\DBAL\Value\DbalValuePolicy`) instead of
+ * leaning on the stock type layer.** Which ones, MEASURED against `doctrine/dbal 4.4.4` during
+ * M1-S8b — twice, independently (plan hazard 36 and Task 9) — because the sentence that used to
+ * stand here named the WRONG tag:
+ *
+ *  - **`TIMESTAMPTZ` is broken in both directions on every platform; that claim STANDS.**
+ *    `DateTimeTzType::convertToPHPValue` has NO fallback, and the format strings are `Y-m-d H:i:sO`
+ *    on PostgreSQL and `Y-m-d H:i:s` (no offset at all) on the MySQL family — so a canonical RFC3339
+ *    `Y-m-d\TH:i:s[.u]Z` matches neither the `T` separator, nor the literal `Z`, nor the
+ *    microseconds, and every canonical form throws on every platform.
+ *  - **`TIME` has no fallback either:** `13:45:07` parses everywhere, `13:45:07.250000` throws
+ *    everywhere.
+ *  - **`TIMESTAMP` was named here FALSELY, and is fine.** `AbstractPlatform::getDateTimeFormatString()`
+ *    is indeed `Y-m-d H:i:s`, but `DateTimeType::convertToPHPValue` falls back to
+ *    `new DateTime($value)` when `createFromFormat` fails — measured, the canonical `.250000`
+ *    fraction survives untouched on PostgreSQL, MySQL and MariaDB.
+ *
+ * The remaining tags (`DECIMAL`, `JSON`, `UUID`, `DATE`, and `TIMESTAMP` whole-second OR fractional)
+ * land in the shape the stock converters expect. Charter rule 6 is unaffected: the conversion is the
+ * DRIVER's own step, not a change to Grammar/Processor or platform SQL generation. The native
+ * `Ferro\Client\Connection` API keeps {@see M1ValuePolicy}. See SPEC §22.2 (ab).
  *
  * **Verbatim, but never coercing.** A payload that is not in the right msgpack family still throws
  * (hazard 30) — `SqlValueCodec::toStr`'s `''` fallback would hand DBAL an empty string for a

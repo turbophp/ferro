@@ -3,12 +3,12 @@ declare(strict_types=1);
 namespace Ferro\DBAL;
 
 use Doctrine\DBAL\Driver\Connection as DriverConnection;
+use Doctrine\DBAL\Driver\Exception\NoIdentityValue;
 use Doctrine\DBAL\Driver\Result as ResultInterface;
 use Doctrine\DBAL\Driver\Statement as StatementInterface;
 use Ferro\Client\Connection as FerroConnection;
 use Ferro\Client\Error\FerroException;
 use Ferro\DBAL\Exception\DriverException;
-use Ferro\DBAL\Exception\NoIdentityValue;
 use Ferro\DBAL\Exception\ServerVersionUnavailable;
 use Ferro\DBAL\Exception\UnsupportedStatement;
 // Aliased: `FerroConnection` is already taken above by the CLIENT connection this class wraps.
@@ -309,8 +309,16 @@ final class Connection implements DriverConnection
      *
      * On **PostgreSQL it always throws**: the wire carries no such field, and the client refuses to
      * emulate it with a follow-up `lastval()` because on a transaction-mode pool that lands on a
-     * DIFFERENT connection and returns a silently wrong key. {@see NoIdentityValue} names both
-     * working answers (`INSERT … RETURNING`, or the ORM's SEQUENCE identity strategy — D-S8b-5).
+     * DIFFERENT connection and returns a silently wrong key. The message names both working answers
+     * (`INSERT … RETURNING`, or the ORM's SEQUENCE identity strategy — D-S8b-5).
+     *
+     * The thrown class is `Doctrine\DBAL\Driver\Exception\NoIdentityValue` — the SPI's own signal,
+     * which all six bundled drivers (PDO, PgSQL, Mysqli, SQLite3, SQLSrv, IBMDB2) throw here. S8b
+     * originally shipped a Ferro-owned class instead, and the upstream acceptance run measured the
+     * cost: `tests/Functional/WriteTest::testLastInsertIdNewConnection` asserts on the class of
+     * `getPrevious()`. Nothing in DBAL's `src/` CATCHES it, so the application-visible behaviour is
+     * identical either way — but there is no reason to invent a second class for a signal the SPI
+     * already defines, and the message (the part that is actually ours) is preserved verbatim.
      *
      * It is read from the CONNECTION, not from a `Result`, and it survives a statement run inside a
      * transaction because `Ferro\Client\Connection::dispatch()` propagates the tx path's
@@ -322,7 +330,15 @@ final class Connection implements DriverConnection
     {
         $id = $this->ferro->lastInsertId();
         if ($id === null) {
-            throw NoIdentityValue::forKind($this->poolKind);
+            throw new NoIdentityValue($this->poolKind === PlatformVersion::KIND_POSTGRES
+                ? 'Ferro: PostgreSQL reports no generated key on the wire, and Ferro will not '
+                    . 'emulate lastInsertId() with a follow-up query — on a transaction-mode pool '
+                    . 'that runs on a different connection and returns a wrong key. Use '
+                    . '`INSERT … RETURNING id`, or configure Doctrine ORM to use the SEQUENCE '
+                    . 'identity strategy on PostgreSQL.'
+                : 'Ferro: the last statement reported no generated key. lastInsertId() reflects the '
+                    . 'MOST RECENT statement and is cleared by a statement that fails, so read it '
+                    . 'immediately after a successful INSERT into an AUTO_INCREMENT column.');
         }
         return $id;
     }

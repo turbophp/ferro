@@ -16,6 +16,11 @@ php/**/vendor
 
 # Bench outputs are COMMITTED (bench/results/*.json) per SPEC §16 — do not ignore them.
 
+# M1-S8b: testkit/dbal-suite.sh's work directory — a PINNED git clone of doctrine/dbal plus its
+# vendor/ and the generated phpunit config. Never commit a vendored clone; the tag in the runner is
+# the single source of truth for which suite the recorded numbers came from.
+/.dbal-suite
+
 # Editors / OS
 .idea/
 .vscode/
