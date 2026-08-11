@@ -3,16 +3,32 @@
     "description": "M1-S8c acceptance: doctrine/migrations running for real against Ferro on PostgreSQL",
     "type": "project",
     "license": "Apache-2.0",
+    "_comment": [
+        "`options.versions` pins the two path packages to a FIXED label instead of letting Composer",
+        "derive `dev-<current git branch>`. Without it the committed composer.lock records the branch",
+        "the harness happened to be installed from — a throwaway worktree name that means nothing on",
+        "any other checkout. The path repositories still symlink the LIVE ../../php trees, so the",
+        "label changes nothing about what is tested; it only stops the lock from carrying a stale",
+        "branch name forward."
+    ],
     "repositories": [
-        { "type": "path", "url": "../../php/doctrine-dbal" },
-        { "type": "path", "url": "../../php/client" }
+        {
+            "type": "path",
+            "url": "../../php/doctrine-dbal",
+            "options": { "versions": { "ferro/doctrine-dbal-driver": "1.0.0" } }
+        },
+        {
+            "type": "path",
+            "url": "../../php/client",
+            "options": { "versions": { "ferro/client": "1.0.0" } }
+        }
     ],
     "require": {
         "php": ">=8.2",
         "doctrine/dbal": "4.4.4",
         "doctrine/migrations": "^3.8",
-        "ferro/doctrine-dbal-driver": "@dev",
-        "ferro/client": "@dev"
+        "ferro/doctrine-dbal-driver": "1.0.0",
+        "ferro/client": "1.0.0"
     },
     "autoload": { "psr-4": { "Ferro\\MigrationsAcceptance\\": "src/" } },
     "config": { "sort-packages": true }

@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "8382a11a32f2b70b2c872bc2fcbc2e59",
+    "content-hash": "a7e25ba8d452c3ba2e023a93b80cd5a8",
     "packages": [
         {
             "name": "doctrine/dbal",
@@ -356,11 +356,11 @@
         },
         {
             "name": "ferro/client",
-            "version": "dev-s8c-accept",
+            "version": "1.0.0",
             "dist": {
                 "type": "path",
                 "url": "../../php/client",
-                "reference": "8e0f913102a513de99f367b08acfc7a296d676a3"
+                "reference": "948cd6806bcdc902b7ac6feeb1e655de5cbefa5c"
             },
             "require": {
                 "php": ">=8.2"
@@ -402,11 +402,11 @@
         },
         {
             "name": "ferro/doctrine-dbal-driver",
-            "version": "dev-s8c-accept",
+            "version": "1.0.0",
             "dist": {
                 "type": "path",
                 "url": "../../php/doctrine-dbal",
-                "reference": "9ef08d15a7e085dbe74a65c157417af718911415"
+                "reference": "180a9f855222e0f96c27be962aefdb30402e3d66"
             },
             "require": {
                 "doctrine/dbal": "^4.0",
@@ -1600,10 +1600,7 @@
     "packages-dev": [],
     "aliases": [],
     "minimum-stability": "stable",
-    "stability-flags": {
-        "ferro/client": 20,
-        "ferro/doctrine-dbal-driver": 20
-    },
+    "stability-flags": {},
     "prefer-stable": false,
     "prefer-lowest": false,
     "platform": {
