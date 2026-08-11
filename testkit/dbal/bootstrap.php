@@ -43,6 +43,30 @@ if (! $native instanceof Ferro\Client\Connection) {
     exit(1);
 }
 
+// -------------------------------------------------------------------------------------------------
+// THE WRAPPER ASSERTION (M1-S8c Task 4). `Ferro\DBAL\Wrapper\FerroConnection` is documented as
+// REQUIRED for correct SPEC §9.2 reporting: without it, an indeterminate write inside
+// `Doctrine\DBAL\Connection::transactional()` reaches the application as `NoActiveTransaction`
+// instead of `IndeterminateWriteException`.
+//
+// It gets its own hard assertion because the failure is INVISIBLE IN THE NUMBERS. Measured twice on
+// each backend: dropping `db_wrapperClass` leaves every count identical (PG 3 errors / 7 failures,
+// MySQL and MariaDB 2 / 9) and changes only the exception the one masked test reports. A silent
+// change in WHAT IS BEING MEASURED, with the result line unmoved, is precisely the false-green
+// shape the contact assertion above exists to prevent — so the same treatment applies here.
+// -------------------------------------------------------------------------------------------------
+if (! $conn instanceof Ferro\DBAL\Wrapper\FerroConnection) {
+    fwrite(STDERR, sprintf(
+        "FERRO WRAPPER ASSERTION FAILED: the suite's connection is a %s, not a %s.\n"
+        . "Refusing to run: the counts would look identical while an indeterminate write inside\n"
+        . "transactional() silently degrades to NoActiveTransaction (SPEC §9.2 / §19.3).\n"
+        . "Set <var name=\"db_wrapperClass\" value=\"Ferro\\DBAL\\Wrapper\\FerroConnection\"/>.\n",
+        get_debug_type($conn),
+        Ferro\DBAL\Wrapper\FerroConnection::class,
+    ));
+    exit(1);
+}
+
 $version  = $conn->getServerVersion();
 $platform = get_class($conn->getDatabasePlatform());
 

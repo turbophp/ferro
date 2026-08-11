@@ -90,6 +90,20 @@ cfg="$work/phpunit.generated.xml"
   echo '  </testsuite></testsuites>'
   echo '  <php>'
   echo '    <var name="db_driverClass" value="Ferro\DBAL\Driver"/>'
+  # M1-S8c Task 4: the suite must measure the configuration the driver's own docs call REQUIRED.
+  # `FerroConnection` is not a convenience wrapper — without it an indeterminate write inside
+  # `Doctrine\DBAL\Connection::transactional()` reaches the application as `NoActiveTransaction`
+  # instead of `IndeterminateWriteException`, i.e. the spec's defining safety property thrown away
+  # by DBAL's own cleanup.
+  #
+  # MEASURED, both ways, twice each, before this line was added: the recorded COUNTS are identical
+  # with and without it on all three backends (PG stays 3/7, MySQL and MariaDB 2/9), so it does not
+  # move any number in this file's comparison with S8b. What it moves is what
+  # `TransactionTest::testTransactionalFailureDuringCommit` reports — "There is no active
+  # transaction." without it, the driver's real `IndeterminateWriteException` with it. Equal counts,
+  # opposite meanings, which is exactly why the bootstrap ASSERTS the wrapper rather than trusting
+  # this line to stay here.
+  echo '    <var name="db_wrapperClass" value="Ferro\DBAL\Wrapper\FerroConnection"/>'
   echo '    <var name="db_unix_socket" value="'"$sock"'"/>'
   echo '    <var name="db_driver_options" value="{&quot;pool&quot;:&quot;'"$pool"'&quot;}"/>'
   echo '  </php>'
