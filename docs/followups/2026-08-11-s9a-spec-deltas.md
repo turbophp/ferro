@@ -48,3 +48,34 @@ the S8a §22.2 (u)/(v) contradiction.
   statement text the client sent. It cannot see inside a stored program, which is why `CALL`/`DO`
   are hazards unconditionally (same reasoning as S6's unconditional CALL/DO pin), and it says
   nothing about whether a statement mutates session state (that stays `classify`'s question).
+
+### Task 5
+
+- **§5.2** — note that a partial inbound frame buffers only the bytes actually RECEIVED (plus at
+  most one 64 KiB reserve step ahead of them), never the declared `payload_len`. A header may
+  declare up to `MAX_FRAME_PAYLOAD` (16 MiB); before this change the decoder reserved that in full
+  the instant the header landed, so one local connection pinned **16 777 233 bytes for a 17-byte
+  send** (measured, both directions of the mutation). It now pins **65 553** for the same send — a
+  256x reduction — and grows geometrically only as real bytes arrive. Reassembly of a legitimate
+  large frame is unchanged (`reserve` is an allocation hint, not a correctness input).
+
+- **§22.2 (availability, finding 5)** — record that this closes the codec half of the M0-review
+  availability finding. The remaining halves (`max_connections`, `frame_read_timeout`,
+  `idle_timeout`) are Task 11; without them a slow-trickle client still holds a session open
+  indefinitely, it simply can no longer amplify 17 bytes into 16 MiB while doing so. Peercred still
+  bounds the whole class to local allow-listed uids.
+
+- **No `/proto` change, and none implied**: `MAX_FRAME_PAYLOAD` is untouched, the declared-length
+  field keeps its meaning, and the wire is byte-identical in both directions. This is purely how the
+  decoder's own buffer is grown.
+
+- **CROSS-TASK CORRECTION for Task 11 (hazard 19 is wrong as written — please fix it in the batch).**
+  Hazard 19 says giving `FrameCodec` "a `Default`-preserving optional progress handle keeps both
+  call sites and the golden-vector tests compiling." It does not. Both cited sites are
+  `Framed::new(stream, FrameCodec)` — the unit-struct **value** expression, not a `Default` call —
+  so adding ANY field breaks them regardless of the derive. The enumeration is also short: there is
+  a third pre-existing site at `session/classify.rs:221`, plus the three added by this task, for
+  **six** construction sites after this commit. (Related, measured here: the plan's Task 5 test body
+  used `FrameCodec::default()`, which compiles but FAILS `cargo clippy -D warnings` under
+  `clippy::default_constructed_unit_structs` while the struct is still a unit; this task uses the
+  bare `FrameCodec` literal, matching all three pre-existing in-tree sites.)
