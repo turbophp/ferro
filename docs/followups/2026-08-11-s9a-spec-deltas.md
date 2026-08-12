@@ -1,5 +1,20 @@
 # M1-S9a — the spec-delta ledger (append-only; Task 13 is the single author who applies these)
 
+> **APPLIED 2026-08-12 by Task 13.** All twelve blocks below are in `ferro-spec-v0.2.md` (§5.2, §7,
+> §7.1, §7.7, §9.2, §12, §18, §19.3, §20.3, §21 open item 1, and §22.2 (ai)–(an) plus in-place
+> corrections to (ac) and the M1-S4 teardown entry) and in `CLAUDE.md`. **No `proto/PROTOCOL.md`
+> edit: this slice made no `/proto` change.** Three ledger claims were NOT restated verbatim, because
+> the artifact does not carry them — recorded here so a later reader is not surprised:
+> **(1)** Task 5's "pins **65 553** bytes" is a journalled measurement, not an assertion; the shipped
+> guards bound the capacity at `< 256 KiB` / `<= 512 KiB`, so the spec states the RULE and the
+> before-figure instead of a number no test pins. **(2)** Task 4 filed the reaper under "§7.6/§16";
+> §7.6 is SQLite and §16 is performance targets, so it went to §7.7 (Health & lifecycle).
+> **(3)** Task 1's "36 pre-existing live tests stay green under the mutation" is true of its own run
+> but the suite has since grown to 855, so the spec states the property without the stale count.
+> One MUTUAL CONTRADICTION was found and repaired: Task 12's teardown-race note versus §22.2's
+> M1-S4 entry, which record opposite arms of the same `biased` select winning — both true at
+> different instants; the earlier entry is corrected in place per §22.2's own rules.
+
 Tasks 1–12 make NO edit to `ferro-spec-v0.2.md`, `proto/PROTOCOL.md` or `CLAUDE.md`. Each records
 here, in its own `### Task N` block, the spec delta its change forces. Task 13's single author
 applies the whole batch at the end. This is a hard rule: parallel spec authorship is what produced

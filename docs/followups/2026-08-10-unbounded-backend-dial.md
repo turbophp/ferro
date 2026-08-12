@@ -1,5 +1,14 @@
 # Follow-up: the backend DIAL is unbounded — `checkout_timeout` does not cover it
 
+> **RESOLVED 2026-08-12 by M1-S9a Task 3 (commit `c6512cc`).** `Pool::checkout` now runs the
+> semaphore acquire, any recycle cleanup and the fresh dial under ONE `tokio::time::timeout_at`
+> deadline, so the ~127 s OS-TCP black-hole case below is bounded by `checkout_timeout` and a wedged
+> dial returns its permit. Two deliberate consequences are recorded in SPEC §7 and §22.2 (ak): the
+> checkout-time cleanup no longer gets a fresh full budget per popped connection, and a checkout
+> whose budget the cleanup consumes ends in `POOL_TIMEOUT{Retryable}` rather than silently spending a
+> second budget. The eviction rule is unchanged. Guards: `ferro-pool/tests/checkout_bound.rs`.
+> The text below is kept as the original diagnosis.
+
 **Found:** M1-S8a Task 12 (the server-version probe) self-declared it as a carry; the S8a
 whole-branch review verified it against the code and promoted it out of the task report.
 **Belongs to:** M0 / M1-S3 (`ferro-pool`'s checkout path) — **not an S8a regression.** S8a is only

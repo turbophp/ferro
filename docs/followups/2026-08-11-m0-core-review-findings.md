@@ -1,5 +1,15 @@
 # M0 core review (Fable, 2026-08-11) — findings and the adjusted path
 
+> **STATUS 2026-08-12 — every ENGINEERING finding below is CLOSED by M1-S9a** (plan:
+> `docs/superpowers/plans/2026-08-11-ferro-m1-s9a-core-hardening.md`; commits `625dba7`…`ba72c89`;
+> spec: §5.2, §7, §7.1, §7.7, §9.2, §12, §18, §19.3, §20.3 and §22.2 (ai)–(an); delta ledger:
+> `2026-08-11-s9a-spec-deltas.md`). Three residuals are recorded rather than closed and are named in
+> the §22.2 entries: the streaming abort path's unbounded drain (ak), the hazard latch's cry-wolf on
+> an in-transaction statement that errored without running (ai), and the accept loop's hot retry
+> under `EMFILE` (al). **The ROADMAP findings below are NOT closed** — they are the M1-S9 exit
+> gate's business (the bar renegotiation, the ORM suite, the kill-`ferrod` chaos harness, D12, TLS,
+> the fork CVE-lag ledger, D7) and none of them was in S9a's scope.
+
 The M1 slices each had an adversarial whole-branch review. **M0 never did.** This is that review,
 run with a different model on the code every request crosses. Journals:
 `.superpowers/sdd/2026-08-11-m0-core-review/`.

@@ -1017,7 +1017,11 @@ async fn open_streamed_raced<'a, B: PoolBackend>(
 /// **A stream the CLIENT DECLARED `readonly` never becomes `Indeterminate`** — `classify_fate`
 /// routes it by that flag, and by nothing else: the engine performs no read/write inference (charter
 /// rule 6). The guarantee is therefore the client's to CLAIM, not the engine's to provide. See
-/// [`abort_stream`] for what that costs a client which cannot claim it.
+/// [`abort_stream`] for what that costs a client which cannot claim it. **ONE exception since
+/// M1-S9a (SPEC §19.3):** an IN-TRANSACTION stream in a transaction whose earlier writes have
+/// already persisted (a MySQL/MariaDB implicit commit — `OpContext.tx_writes_persisted`) is
+/// `Indeterminate` regardless of `readonly`, because the terminal then describes the TRANSACTION's
+/// durable writes and not the read. Unreachable on PostgreSQL, where the flag can never be set.
 ///
 /// **`ctx.sent` is `true` for the whole loop** and NEVER re-derived from "how many DATA frames went
 /// out". Reaching this function at all means `query_stream` returned Ok, i.e. `query_raw` already
@@ -1209,7 +1213,10 @@ async fn run_streamed_exec<B: PoolBackend>(
 /// Doctrine DBAL driver deliberately declares `readonly = false` for EVERY statement, because the
 /// DBAL 4 SPI carries no read/write signal at all, so under that driver a cancelled or
 /// `statement_timeout`-ed SELECT DOES classify `Indeterminate` (SPEC §22.2 (ac)). That is the
-/// documented cost of the safe default, not a defect here.
+/// documented cost of the safe default, not a defect here. **A second, narrower exception since
+/// M1-S9a (SPEC §19.3):** even a DECLARING client's in-transaction stream is `Indeterminate` when
+/// the transaction's earlier writes have already persisted via a MySQL/MariaDB implicit commit
+/// (`OpContext.tx_writes_persisted`) — the terminal describes the transaction, not the read.
 ///
 /// `fire_cancel` (item 2): `true` for an interruption abort (cancel/deadline/backpressure-unwind —
 /// the server is still producing rows we will never read, so the out-of-band `CancelRequest` stops
