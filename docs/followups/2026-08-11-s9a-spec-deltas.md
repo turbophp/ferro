@@ -79,3 +79,32 @@ the S8a §22.2 (u)/(v) contradiction.
   used `FrameCodec::default()`, which compiles but FAILS `cargo clippy -D warnings` under
   `clippy::default_constructed_unit_structs` while the struct is still a unit; this task uses the
   bare `FrameCodec` literal, matching all three pre-existing in-tree sites.)
+
+### Task 6
+
+- **§12** — scheme logging is **allow-list-only**. The daemon echoes a DSN scheme into a log line
+  only when it is one of `{postgres, postgresql, mysql, mariadb}` (matched ASCII-case-insensitively,
+  and what is echoed is the daemon's own constant, so `MariaDB://…` logs `mariadb`). Every other
+  shape logs a fixed placeholder: `<no scheme>` when the DSN has no `://` at all,
+  `<unrecognized scheme>` otherwise. Nothing derived from the operator's string is ever logged.
+- **§12 / §22.2** — record WHY it is an allow-list and not a third slicing rule. M1-S6 fixed the
+  schemeless leak by slicing ("everything before the first `://` is the scheme, and a scheme cannot
+  carry credentials"); the M0-core review then measured the second member of the same class —
+  `loggable_scheme("adminuser:s3cretPW://tcp/host")` returned `"adminuser:s3cretPW"` straight into
+  `infer_pool_kind`'s WARN, because a malformed DSN can put the credentials BEFORE the first `://`
+  where no real scheme exists. Two occurrences of one class in one call path is the signal that the
+  rule was wrong, not that it needed another case. The guarantee is now carried by the TYPE:
+  `loggable_scheme` returns `&'static str`, which cannot borrow from the DSN, so "log a slice of the
+  operator's string" is a compile error rather than a defect someone can reintroduce.
+- **§22.2 (behaviour change worth one line)** — an unrecognized-but-harmless-looking scheme
+  (`redis://…`, `sqlite://…`) is no longer echoed either. We cannot distinguish a typo'd scheme from
+  credential text without parsing, so the allow-list decides, not a character class. The M1-S6 test
+  that asserted `redis` passed through is INVERTED, not deleted. Operationally the two placeholders
+  stay distinguishable, so a misconfiguration is still diagnosable from the log: "you gave me no
+  `://`" and "you gave me a scheme I do not know" remain different messages.
+- **No §22.2 claim beyond this function.** Measured while here, so the next reviewer need not:
+  `loggable_scheme` is the ONLY DSN-derived value that reaches a log line in `ferrod`/`ferro-pool`/
+  either backend (`PoolSpec`'s manual `Debug` already redacts `dsn`). The two adjacent WARNs that
+  format a library error built from the DSN — `ferro-backend-mysql/src/conn.rs:193` (`UrlError`) and
+  `ferro-backend-pg/src/conn.rs:110-115` (connection-string parse) — echo a scheme, a query-parameter
+  name/value, or an option name, never the userinfo component.

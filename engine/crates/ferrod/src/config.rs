@@ -85,34 +85,73 @@ impl PoolKind {
     }
 }
 
-/// The ONLY portion of a DSN that is safe to log (SPEC §12): the scheme token — the substring
-/// strictly BEFORE a real `://` separator. In a URL-form DSN the credentials always follow `://`
-/// (`scheme://user:pass@host`), so the scheme itself can never carry them. When the DSN has no
-/// `://` at all there is no scheme to isolate and the WHOLE string is potentially credential-
-/// bearing, so we return a fixed placeholder rather than any slice of it. This is what closes the
-/// schemeless-DSN leak: `split("://").next()` returns the whole string when the delimiter is
-/// absent, which would emit the credentials — `split_once` returns `None` and we log nothing of it.
-fn loggable_scheme(dsn: &str) -> &str {
-    dsn.split_once("://")
-        .map_or("<no scheme>", |(scheme, _)| scheme)
+/// The DSN schemes the daemon recognizes, and the backend each selects — the ONE allow-list behind
+/// both [`infer_pool_kind`] (which scheme means which [`PoolKind`]) and [`loggable_scheme`] (which
+/// scheme tokens are safe to echo into a log line). Two derivations of one list is how the two
+/// drift, so there is exactly one (the same reasoning that deleted the second `PoolKind::wire_name`
+/// derivation in M1-S8a Task 12); the coupling is pinned by
+/// `config::tests::every_allow_listed_scheme_is_both_recognized_and_echoed`.
+///
+/// Matching is ASCII-case-insensitive, and what is ECHOED is always the entry's own `&'static str`,
+/// never the operator's bytes: `MariaDB://…` logs `mariadb`.
+const KNOWN_SCHEMES: [(&str, PoolKind); 4] = [
+    ("postgres", PoolKind::Postgres),
+    ("postgresql", PoolKind::Postgres),
+    ("mysql", PoolKind::Mysql),
+    ("mariadb", PoolKind::Mysql),
+];
+
+/// Look a candidate scheme token up in [`KNOWN_SCHEMES`], ASCII-case-insensitively. Returns the
+/// ALLOW-LIST's own `&'static str` (not the caller's slice) so a matched scheme can be logged
+/// without any operator-supplied byte reaching the log line.
+fn allow_listed_scheme(candidate: &str) -> Option<(&'static str, PoolKind)> {
+    KNOWN_SCHEMES
+        .iter()
+        .copied()
+        .find(|(name, _)| candidate.eq_ignore_ascii_case(name))
 }
 
-/// Infer a pool's [`PoolKind`] from its DSN scheme (the substring before `://`, ASCII-lowercased):
-/// `postgres`/`postgresql` → [`PoolKind::Postgres`]; `mysql`/`mariadb` → [`PoolKind::Mysql`]. An
-/// unrecognized or missing scheme is `tracing::warn!`-ed and defaults to [`PoolKind::Postgres`]
-/// (the M0 backend) — a conservative default that keeps a typo'd scheme from silently disabling a
-/// pool. Pure over its `dsn` input (the warn is a side channel), so it is directly unit-testable.
-/// The DSN VALUE is never logged here (§12) — only the scheme token via [`loggable_scheme`], which
-/// yields `<no scheme>` (never any slice of the DSN) for a schemeless/typo'd credential-bearing DSN.
+/// The ONLY part of a DSN that is safe to log (SPEC §12) — and, since M1-S9a, not a part of the DSN
+/// at all: one of the daemon's own constants, chosen by looking the candidate scheme up in
+/// [`KNOWN_SCHEMES`]. An unrecognized prefix, or no `://` at all, logs a fixed placeholder.
+///
+/// **Why an allow-list and not a better slice.** The M0 rule was "everything before the first
+/// `://` is the scheme, and a scheme cannot carry credentials". That is false for a malformed DSN:
+/// `user:pass://tcp/host` puts the credentials before the first `://` where no real scheme exists,
+/// and the M0-core review measured `loggable_scheme("adminuser:s3cretPW://tcp/host")` returning
+/// `"adminuser:s3cretPW"` straight into `infer_pool_kind`'s WARN. That was the SECOND member of the
+/// class (M1-S6 fixed the no-`://` case by the same string surgery), so the fix is not a third
+/// special case: nothing that is not already one of our constants is ever echoed.
+///
+/// The return type carries the guarantee: `&'static str` cannot borrow from `dsn`, so "log a slice
+/// of the operator's string" is a compile error rather than a bug someone can reintroduce. The
+/// `split_once` that remains only *locates* a candidate to match — its bytes never reach the output.
+fn loggable_scheme(dsn: &str) -> &'static str {
+    match dsn.split_once("://") {
+        None => "<no scheme>",
+        Some((candidate, _)) => {
+            allow_listed_scheme(candidate).map_or("<unrecognized scheme>", |(name, _)| name)
+        }
+    }
+}
+
+/// Infer a pool's [`PoolKind`] from its DSN scheme (the token before `://`, matched
+/// ASCII-case-insensitively against [`KNOWN_SCHEMES`]): `postgres`/`postgresql` →
+/// [`PoolKind::Postgres`]; `mysql`/`mariadb` → [`PoolKind::Mysql`]. An unrecognized or missing
+/// scheme is `tracing::warn!`-ed and defaults to [`PoolKind::Postgres`] (the M0 backend) — a
+/// conservative default that keeps a typo'd scheme from silently disabling a pool. Pure over its
+/// `dsn` input (the warn is a side channel), so it is directly unit-testable.
+///
+/// The DSN VALUE is never logged here (§12): the warn carries [`loggable_scheme`]'s output, which
+/// is always one of the daemon's own constants — an allow-listed scheme name, `<no scheme>`, or
+/// `<unrecognized scheme>` — and never a slice of the DSN, whatever shape the operator supplied.
 pub fn infer_pool_kind(dsn: &str) -> PoolKind {
     match dsn
         .split_once("://")
-        .map(|(scheme, _)| scheme.to_ascii_lowercase())
-        .as_deref()
+        .and_then(|(candidate, _)| allow_listed_scheme(candidate))
     {
-        Some("mysql") | Some("mariadb") => PoolKind::Mysql,
-        Some("postgres") | Some("postgresql") => PoolKind::Postgres,
-        _ => {
+        Some((_, kind)) => kind,
+        None => {
             tracing::warn!(
                 scheme = loggable_scheme(dsn),
                 "FERRO_POOLS: unrecognized DSN scheme; defaulting pool kind to Postgres"
@@ -551,30 +590,150 @@ mod tests {
         assert_eq!(infer_pool_kind(""), PoolKind::Postgres);
     }
 
-    /// §12 secret hygiene: the value handed to `tracing::warn!` for an unrecognized/missing scheme
-    /// must NEVER be a slice of a credential-bearing DSN. `loggable_scheme` is that exact value.
-    /// A schemeless/typo'd DSN (no `://`) — the case an operator misconfiguration lands in — must
-    /// resolve to the fixed `<no scheme>` placeholder, not the whole password-bearing string.
+    /// §12 secret hygiene, second round (M1-S9a Task 6, M0-core-review finding 7a): the value
+    /// handed to `tracing::warn!` for an unrecognized/missing scheme must NEVER be a slice of a
+    /// credential-bearing DSN.
+    ///
+    /// The S6 fix covered no-`://` strings only, and it did so by SLICING — "everything before the
+    /// first `://` is the scheme". The review then found the second member of the same class:
+    /// `user:pass://…` puts the credentials BEFORE the first `://`, where there is no real scheme
+    /// at all, so the slice IS the secret (measured: `loggable_scheme("adminuser:s3cretPW://tcp/host")`
+    /// returned `"adminuser:s3cretPW"`, WARN-logged by `infer_pool_kind`). Slicing was never going
+    /// to be right; only an ALLOW-LIST is.
+    ///
+    /// So the property asserted here is not "the output does not contain the word `secret`" — that
+    /// is a containment scan and it passes for every password not literally spelled `secret`. It is
+    /// **the output is always one of our own fixed constants**, for every input shape, which is
+    /// exactly what makes "no operator bytes ever reach a log line" checkable rather than argued.
+    /// Every value [`loggable_scheme`] is permitted to return: the allow-listed scheme names plus
+    /// the two placeholders. All of them are compile-time constants of OURS — none is derived from
+    /// the operator's string.
+    const PERMITTED_LOG_VALUES: [&str; 6] = [
+        "postgres",
+        "postgresql",
+        "mysql",
+        "mariadb",
+        "<no scheme>",
+        "<unrecognized scheme>",
+    ];
+
+    /// The adversarial DSN corpus: schemeless, malformed, credentials-BEFORE-`://`, `@` in the
+    /// password, a NEWLINE/CRLF in the password (a log-injection vector as well as a leak),
+    /// non-ASCII, an embedded NUL, and degenerate separators. Every one of these is a shape an
+    /// operator's misconfiguration can actually take, and every one carries credential text.
+    ///
+    /// Shared by the two tests below on purpose: the leak guard proves nothing here is ever
+    /// echoed, and the totality guard proves the production caller (`infer_pool_kind`) survives
+    /// all of it — one corpus, so a shape added to it is checked from both vantage points.
+    const ADVERSARIAL_DSNS: [&str; 15] = [
+        // No `://` at all (the S6 shapes: one-slash typo + Go-form MySQL DSN).
+        "mysql:/user:secret@db.internal/app",
+        "admin:s3cret@tcp(10.0.0.5:3306)/prod",
+        "not-a-dsn",
+        "",
+        // Credentials BEFORE the first `://` — the M0-core-review shape.
+        "adminuser:s3cretPW://tcp/host",
+        "user:secret@host://whatever",
+        // A password containing `@`, and ones containing a newline / CRLF.
+        "user:p@ssw0rd://tcp/host",
+        "user:pa\nss://tcp/host",
+        "user:pa\r\nFAKE-LOG-LINE://tcp/host",
+        // Non-ASCII userinfo, and a scheme-lookalike that ASCII-lowercasing cannot fold
+        // (fullwidth latin) — the allow-list must reject both without echoing either.
+        "üser:sécret://host",
+        "ＭＹＳＱＬ://user:secret@h/db",
+        "mysql\u{0000}://user:secret@h/db",
+        // Degenerate separators.
+        "://",
+        "://user:secret@h",
+        "a://b://c",
+    ];
+
     #[test]
     fn loggable_scheme_never_leaks_credentials() {
-        // No `://` at all: the whole string is potentially credential-bearing → placeholder only.
-        // These are the exact leak shapes the review flagged (one-slash typo + Go-form MySQL DSN).
+        for dsn in ADVERSARIAL_DSNS {
+            let logged = loggable_scheme(dsn);
+            assert!(
+                PERMITTED_LOG_VALUES.contains(&logged),
+                "loggable_scheme({dsn:?}) returned {logged:?} — not one of our own constants, \
+                 so it is a slice of the operator's DSN (§12)"
+            );
+        }
+
+        // ---- and the shape-by-shape expectations, so the placeholders stay distinguishable ----
         for dsn in [
             "mysql:/user:secret@db.internal/app",
             "admin:s3cret@tcp(10.0.0.5:3306)/prod",
             "not-a-dsn",
             "",
         ] {
-            assert_eq!(loggable_scheme(dsn), "<no scheme>");
-            // Belt-and-suspenders: whatever we log for these must not contain any credential text.
-            let logged = loggable_scheme(dsn);
-            assert!(!logged.contains("secret"), "leaked credential via {dsn:?}");
-            assert!(!logged.contains("s3cret"), "leaked credential via {dsn:?}");
+            assert_eq!(loggable_scheme(dsn), "<no scheme>", "for {dsn:?}");
         }
-        // A real scheme (before `://`) is credential-free by construction and IS safe to log —
-        // even an unrecognized one, and even when the authority after `://` carries a password.
+        for dsn in [
+            "adminuser:s3cretPW://tcp/host",
+            "user:secret@host://whatever",
+            "user:p@ssw0rd://tcp/host",
+            "user:pa\nss://tcp/host",
+            "üser:sécret://host",
+            "ＭＹＳＱＬ://user:secret@h/db",
+        ] {
+            assert_eq!(loggable_scheme(dsn), "<unrecognized scheme>", "for {dsn:?}");
+        }
+        // An unrecognized-but-harmless-LOOKING scheme is STILL not echoed — we cannot tell it from
+        // credential text without parsing, so the allow-list decides, not a character class. This
+        // expectation is the S6 test's inverted: it used to assert `redis` passed through.
+        assert_eq!(
+            loggable_scheme("redis://user:secret@h:6379"),
+            "<unrecognized scheme>"
+        );
+
+        // The four recognized schemes pass through — and what is echoed is OUR constant, not the
+        // operator's bytes: mixed case in, canonical lowercase out.
+        assert_eq!(loggable_scheme("postgres://ferro:pw@h/db"), "postgres");
+        assert_eq!(loggable_scheme("postgresql://h/db"), "postgresql");
         assert_eq!(loggable_scheme("mysql://ferro:pw@h/db"), "mysql");
-        assert_eq!(loggable_scheme("redis://user:secret@h:6379"), "redis");
+        assert_eq!(loggable_scheme("MariaDB://h/db"), "mariadb");
+        // A `@` or a second `://` inside the authority of a RECOGNIZED scheme changes nothing.
+        assert_eq!(loggable_scheme("mysql://user:p@ss@h/db"), "mysql");
+    }
+
+    /// The allow-list is the ONE list behind both consumers, so neither can drift from it — the
+    /// failure this pins is "someone adds a scheme to `infer_pool_kind` and the log line then says
+    /// `<unrecognized scheme>` for a pool the daemon does recognize", and its mirror. Derived from
+    /// `KNOWN_SCHEMES` rather than restating it, so an entry added to the table is checked from
+    /// both sides for free.
+    #[test]
+    fn every_allow_listed_scheme_is_both_recognized_and_echoed() {
+        for (name, kind) in KNOWN_SCHEMES {
+            let dsn = format!("{name}://ferro:hunter2@db.internal/app");
+            assert_eq!(infer_pool_kind(&dsn), kind, "kind for {name:?}");
+            assert_eq!(loggable_scheme(&dsn), name, "echo for {name:?}");
+            // Matching is ASCII-case-insensitive, and what is echoed is the TABLE's constant —
+            // never the operator's casing, which is still operator-supplied bytes.
+            let shouty = format!("{}://ferro:hunter2@db.internal/app", name.to_uppercase());
+            assert_eq!(infer_pool_kind(&shouty), kind, "kind for shouty {name:?}");
+            assert_eq!(loggable_scheme(&shouty), name, "echo for shouty {name:?}");
+        }
+        // The negative direction: a scheme that is NOT on the list is neither recognized (it falls
+        // to the conservative Postgres default) nor echoed.
+        assert_eq!(infer_pool_kind("sqlite://x"), PoolKind::Postgres);
+        assert_eq!(loggable_scheme("sqlite://x"), "<unrecognized scheme>");
+    }
+
+    /// `infer_pool_kind` is the ONLY production caller of `loggable_scheme` (it is what hands the
+    /// value to `tracing::warn!`), so the leak guard is asserted from the vantage point the leak
+    /// actually happens at too: over the same adversarial corpus it must be total — no panic on a
+    /// NUL, a lone `://`, an empty string or non-ASCII — and it must fall to the conservative
+    /// Postgres default rather than silently disabling a misconfigured pool.
+    #[test]
+    fn infer_pool_kind_is_total_over_the_adversarial_corpus() {
+        for dsn in ADVERSARIAL_DSNS {
+            assert_eq!(
+                infer_pool_kind(dsn),
+                PoolKind::Postgres,
+                "unrecognized DSN {dsn:?} must default to Postgres, never panic"
+            );
+        }
     }
 
     #[test]
