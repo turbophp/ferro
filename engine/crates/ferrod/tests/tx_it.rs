@@ -36,6 +36,7 @@ use ferrod::config::{Config, PoolSpec};
 use ferrod::epoch::BootEpoch;
 use ferrod::pools::PoolRegistry;
 use ferrod::services::sql;
+use ferrod::shutdown::Drain;
 use ferrod::tx::TxRegistry;
 
 // -------------------------------------------------------------------------------------------------
@@ -68,6 +69,9 @@ fn exec_server_with_deadlines(url: String, idle_in_tx: Duration, max_tx: Duratio
         config.idle_in_tx,
         config.max_tx,
         config.tx_teardown_timeout,
+        // Never triggered here: these helpers have no daemon lifecycle. A test whose subject IS
+        // the drain (`drain_it.rs`) assembles `serve` itself so it can hold the handle.
+        Drain::new(),
     );
     TestServer::spawn_with_factory(BootEpoch(1), registry, tx_registry, factory)
 }

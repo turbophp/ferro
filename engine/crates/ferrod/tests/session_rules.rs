@@ -26,6 +26,7 @@ use ferro_proto::header::Header;
 use ferro_proto::messages::{Outcome, Pong};
 use ferrod::config::Config;
 use ferrod::epoch::BootEpoch;
+use ferrod::serve::SESSION_DRAIN_GRACE;
 use ferrod::session::HandlerFn;
 use ferrod::session::codec::{ControlMsg, InFrame, OutFrame};
 use ferrod::session::flow::Credit;
@@ -910,9 +911,16 @@ async fn disconnect_with_stuck_handler_hard_closes() {
     drain.trigger();
 
     // Even with a stuck handler AND a client that already vanished mid-request, `serve` must
-    // still return within its (short) `drain_deadline` rather than hang forever.
-    tokio::time::timeout(Duration::from_secs(2), served)
-        .await
-        .expect("serve must return even after a mid-request disconnect with a stuck handler")
-        .expect("serve's task must not panic");
+    // still return rather than hang forever. Bounded by the CONTRACT: since M1-S9a the sessions
+    // own the `drain_deadline` (100ms here) wind-down and `serve`'s hard-abort is the backstop one
+    // `SESSION_DRAIN_GRACE` later (see `serve::SESSION_DRAIN_GRACE` — that grace is what keeps the
+    // abort from racing a session's own cleanup and destroying its terminals). Only the BOUND
+    // moved; the assertion is unchanged.
+    tokio::time::timeout(
+        Duration::from_millis(100) + SESSION_DRAIN_GRACE + Duration::from_secs(2),
+        served,
+    )
+    .await
+    .expect("serve must return even after a mid-request disconnect with a stuck handler")
+    .expect("serve's task must not panic");
 }

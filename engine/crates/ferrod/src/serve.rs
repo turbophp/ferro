@@ -41,6 +41,18 @@
 //! `serve` waits for that same `JoinSet` to drain up to `config.drain_deadline`, then — if
 //! anything is still outstanding — hard-closes by aborting whatever remains (`JoinSet::drop`
 //! aborts every task still in the set) rather than waiting indefinitely.
+//!
+//! **The drain now reaches the sessions themselves (M1-S9a, finding 6).** `drain` is handed to
+//! every spawned session, so stopping `accept()` is no longer all that happens on SIGTERM: each
+//! session refuses new checkout-acquiring work, lets its pinned transactions finish, and winds
+//! ITSELF down at `config.drain_deadline` through its own cleanup path (terminals delivered,
+//! transactions rolled back, pooled connections released, writer flushed — see `session`'s top doc
+//! comment). This function's `abort_all` therefore stops being the shutdown MECHANISM and becomes
+//! a backstop: it fires only [`SESSION_DRAIN_GRACE`] AFTER the sessions' own deadline, for a
+//! session whose cleanup overruns (e.g. a handler that ignores cancellation). The grace is what
+//! keeps the abort from racing the very cleanup it is backstopping — without it, `serve` would
+//! abort a session at the same instant that session starts flushing its last terminals, which is
+//! exactly the charter-rule-4 break this slice exists to close.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +71,28 @@ use crate::session::error::SessionError;
 use crate::session::{HandlerFactory, Session};
 use crate::shutdown::Drain;
 use crate::tx::TxRegistry;
+
+/// How long past their OWN `config.drain_deadline` wind-down the sessions get before `serve`
+/// hard-aborts whatever is left (M1-S9a finding 6).
+///
+/// A session that observed the drain stops reading at `drain_deadline` and then runs its cleanup:
+/// cancel in-flight requests, roll back and release every pinned transaction, flush the terminals
+/// those produce, drain the writer. That work takes real time — a `ROLLBACK` and an out-of-band
+/// statement cancel are network round trips. Aborting at bare `drain_deadline` would cut it off
+/// mid-flush and drop terminals the client is owed (charter rule 4), so the backstop sits a grace
+/// period later. 3s is the same order as the pool's own bounded drains
+/// (`services::sql::CANCEL_DRAIN_BUDGET`, 5s) and well under the systemd `TimeoutStopSec` an
+/// operator would set for §18's unit.
+///
+/// It is a BACKSTOP, not a proof of completion: a session whose cleanup exceeds it is still
+/// hard-aborted — exactly the pre-S9a behaviour, now the exception rather than the mechanism.
+///
+/// OPERATOR-VISIBLE: it extends the daemon's worst-case stop time to
+/// `drain_deadline + SESSION_DRAIN_GRACE`, which is why [`crate::config::Config::drain_deadline`]'s
+/// own doc now says so. `pub` so an acceptance test states its bound in terms of the contract
+/// instead of duplicating the number — the two hard-close tests (`tests/shutdown.rs`,
+/// `tests/session_rules.rs`) do exactly that.
+pub const SESSION_DRAIN_GRACE: Duration = Duration::from_secs(3);
 
 /// Drive `listener`'s peercred-gated accept loop until `drain` is triggered, then let already-
 /// spawned session tasks finish (up to `config.drain_deadline`) before returning. Every accepted
@@ -136,6 +170,10 @@ pub async fn serve(
                         let session_factory = factory.clone();
                         let session_pool_registry = pool_registry.clone();
                         let session_tx_registry = tx_registry.clone();
+                        // The SAME drain this loop watches (M1-S9a finding 6): the session's own
+                        // wind-down is now the shutdown mechanism, and `drain_sessions` below is
+                        // only its backstop.
+                        let session_drain = drain.clone();
                         sessions.spawn(async move {
                             Session::run_with_handler(
                                 stream,
@@ -144,6 +182,7 @@ pub async fn serve(
                                 session_pool_registry,
                                 session_tx_registry,
                                 session_factory,
+                                session_drain,
                             )
                             .await;
                         });
@@ -166,7 +205,9 @@ pub async fn serve(
         }
     }
 
-    drain_sessions(sessions, config.drain_deadline).await;
+    // The sessions own the `drain_deadline` wind-down themselves now; this wait is the backstop,
+    // one `SESSION_DRAIN_GRACE` later, for a session whose cleanup overruns.
+    drain_sessions(sessions, config.drain_deadline + SESSION_DRAIN_GRACE).await;
 }
 
 /// Send one session-fatal Auth frame on a just-accepted, not-yet-a-`Session` stream, then close

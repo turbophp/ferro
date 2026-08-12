@@ -278,7 +278,20 @@ pub struct Config {
     pub session_cap_bytes: usize,
     /// Max concurrently in-flight requests per session.
     pub max_inflight: usize,
-    /// Deadline for a graceful drain (SIGTERM) before hard-closing remaining sessions.
+    /// How long a graceful drain (SIGTERM) lets EXISTING work continue before the daemon stops
+    /// reading and winds down.
+    ///
+    /// M1-S9a (finding 6) made this reach the sessions themselves, so it is now the window in which
+    /// a session refuses new checkout-acquiring work but keeps serving its already-PINNED
+    /// transactions (§18 "let pins finish"). At the deadline each session exits through its own
+    /// cleanup — in-flight requests get their one terminal, pinned transactions are rolled back and
+    /// their pooled connections released, the writer flushes — and only then closes the socket.
+    ///
+    /// It is therefore NOT the daemon's total stop time any more: `serve` hard-aborts whatever is
+    /// still outstanding one [`crate::serve::SESSION_DRAIN_GRACE`] LATER, so the worst case is
+    /// `drain_deadline + SESSION_DRAIN_GRACE`. That grace is not slack — aborting at bare
+    /// `drain_deadline` would cut a session off mid-cleanup and destroy terminals the client is
+    /// owed (measured; charter rule 4). Size §18's `TimeoutStopSec` against the SUM.
     pub drain_deadline: Duration,
     /// Deadline for the mandatory first frame (`core/HELLO`) to arrive before the connection is
     /// dropped silently (no reply — there was never a valid session to fail).

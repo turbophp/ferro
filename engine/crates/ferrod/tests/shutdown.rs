@@ -17,6 +17,7 @@ use ferro_proto::consts::{TYPE_REGISTRY_HASH, flags, service};
 use ferro_proto::messages::Outcome;
 use ferrod::config::Config;
 use ferrod::epoch::BootEpoch;
+use ferrod::serve::SESSION_DRAIN_GRACE;
 use ferrod::session::HandlerFn;
 use ferrod::session::codec::InFrame;
 use ferrod::session::responder::Responder;
@@ -30,6 +31,9 @@ const SOME_METHOD: u16 = 1;
 /// accept loop never got around to spawning a session for. Short, because the point is proving
 /// the accept loop already stopped -- not timing anything precisely.
 const REFUSED_WAIT: Duration = Duration::from_millis(300);
+
+/// The short drain window the hard-close test configures.
+const DRAIN_DEADLINE: Duration = Duration::from_millis(100);
 
 #[tokio::test]
 async fn drain_refuses_new_but_finishes_inflight() {
@@ -112,7 +116,7 @@ async fn drain_deadline_hard_closes() {
 
     let drain = Drain::new();
     let config = Config {
-        drain_deadline: Duration::from_millis(100),
+        drain_deadline: DRAIN_DEADLINE,
         ..Config::default()
     };
     let (socket_path, served) =
@@ -126,10 +130,17 @@ async fn drain_deadline_hard_closes() {
 
     drain.trigger();
 
-    // The in-flight request never finishes, so `serve` must give up at its `drain_deadline`
-    // (~100ms) rather than hang forever -- give it generous slack over that to stay non-flaky.
-    tokio::time::timeout(Duration::from_secs(2), served)
-        .await
-        .expect("serve must return within its drain_deadline, not hang forever")
-        .expect("serve's task must not panic");
+    // The in-flight request never finishes, so `serve` must give up rather than hang forever. The
+    // bound is the CONTRACT, not a magic number: since M1-S9a the sessions own the
+    // `drain_deadline` (~100ms) wind-down themselves and `serve`'s hard-abort is the backstop one
+    // `SESSION_DRAIN_GRACE` later (that grace is what stops the abort racing — and destroying — a
+    // session's own cleanup; see `serve::SESSION_DRAIN_GRACE`). Plus slack to stay non-flaky. The
+    // ASSERTION is unchanged: `serve` returns, it does not hang.
+    tokio::time::timeout(
+        DRAIN_DEADLINE + SESSION_DRAIN_GRACE + Duration::from_secs(2),
+        served,
+    )
+    .await
+    .expect("serve must return within drain_deadline + SESSION_DRAIN_GRACE, not hang forever")
+    .expect("serve's task must not panic");
 }

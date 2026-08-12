@@ -152,6 +152,38 @@
 //! Both exits `break` into the SAME cleanup path every other exit uses, so exactly-one-`END` is
 //! untouched (charter rule 4): the stall exit declares its one `rid=0` terminal first, and the idle
 //! exit has no request to declare anything for (that is what its in-flight veto guarantees).
+//!
+//! **Graceful drain (M1-S9a, M0-core-review finding 6).** Until this slice the `shutdown::Drain`
+//! token stopped `accept()` and nothing else: a live session kept dispatching new work for the
+//! whole window and was then `abort_all()`ed by `serve` — no terminals, no engine-side rollback,
+//! the writer droppable mid-frame, on EVERY restart. §18's systemd socket activation assumes the
+//! opposite. The reader loop therefore observes the drain itself, in two arms:
+//! - **drain observed** — the session does NOT stop reading. It must keep serving `CANCEL`,
+//!   `WINDOW_UPDATE` and, above all, the statements/savepoints/COMMIT of transactions ALREADY
+//!   PINNED to a connection (§18's "let pins finish"). Refusing NEW checkout-acquiring work
+//!   (autocommit EXEC, BEGIN) is a SERVICE-layer decision, made where `tx_id` is parsed
+//!   (`services::sql`), because only there is "new" distinguishable from "already pinned".
+//!   All this arm does is start the window clock.
+//! - **the window expired** — `break`, into the SAME cleanup path every other exit uses, which is
+//!   the entire point: `registry.cancel_all()` → `tx_registry.abort_session()` →
+//!   `drain_supervisors()` → writer flush. So a statement still in flight at the deadline gets its
+//!   ONE terminal BEFORE the socket closes, a transaction pinned by a client that never comes back
+//!   is ROLLED BACK rather than held, and its pooled connection is released. Nothing here can hang
+//!   forever: the window is `config.drain_deadline` and the cleanup itself is bounded
+//!   (`abort_session`'s teardown wait, then `drain_supervisors`).
+//!   WHICH terminal it is, is the `cancel_all`-then-`abort_session` race the M1-S4 NOTE further
+//!   down already records: MEASURED live (M1-S9a Task 12), the actor's `biased` `abort` arm wins,
+//!   so the client sees `PROTOCOL{NonRetryable}` ("transaction is no longer active") rather than
+//!   the `TxDeadline{Retryable}` the `cancel` arm would mint — safe in the §19.3 direction (a
+//!   NonRetryable never licenses a replay, and it is never `Indeterminate`), and deliberately not
+//!   arbitrated here.
+//!   `serve`'s `abort_all` past `drain_deadline + SESSION_DRAIN_GRACE` survives ONLY as a backstop
+//!   for a session whose own cleanup overruns — it is no longer the mechanism.
+//!
+//! The window deadline is its own `sleep_until` arm rather than a check inside the 1s liveness
+//! tick: the tick's granularity would smear the close over `[deadline, deadline + LIVENESS_TICK]`,
+//! which is both sloppier than the knob promises and (measured, M1-S9a Task 12) enough to make the
+//! difference between "wound itself down" and "was aborted by `serve`" unobservable to a test.
 
 pub mod classify;
 pub mod codec;
@@ -184,6 +216,7 @@ use crate::config::Config;
 use crate::dispatch::{self, CoreMethod, Route};
 use crate::epoch::BootEpoch;
 use crate::pools::PoolRegistry;
+use crate::shutdown::Drain;
 use crate::tx::TxRegistry;
 use classify::Classification;
 use codec::{ControlMsg, FrameCodec, InFrame, OutFrame, ReadProgress};
@@ -233,6 +266,8 @@ impl Session {
     /// trivial factory whose default handler creates no transactions (so the `abort_session` at
     /// cleanup is a guaranteed no-op). This keeps every pure-session test path (`common::spawn` /
     /// `Session::run`) untouched by the S6 seam.
+    /// (M1-S9a: a standalone session also mints its OWN, never-triggered [`Drain`] — this entry
+    /// point has no daemon lifecycle around it to be draining.)
     pub async fn run(stream: UnixStream, config: Config, epoch: BootEpoch) {
         let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
         // Its own pool registry, exactly as it already mints its own throwaway `TxRegistry`
@@ -241,7 +276,16 @@ impl Session {
         // still dials nothing until a checkout asks.
         let pool_registry = PoolRegistry::build(&config);
         let factory: HandlerFactory = Arc::new(|_session_id| default_handler_fn());
-        Self::run_with_handler(stream, config, epoch, pool_registry, tx_registry, factory).await;
+        Self::run_with_handler(
+            stream,
+            config,
+            epoch,
+            pool_registry,
+            tx_registry,
+            factory,
+            Drain::new(),
+        )
+        .await;
     }
 
     /// Drive one accepted connection end to end: split the framed stream, spawn the writer task,
@@ -263,6 +307,12 @@ impl Session {
     /// every connection served by this running instance observes the identical `boot_epoch`
     /// (SPEC §19.1) — the caller (`main`, or a test harness) is responsible for drawing it once
     /// via an `EpochSource` and handing the same `BootEpoch` to every `Session::run*` call.
+    ///
+    /// `drain` is the process-wide graceful-shutdown level (M1-S9a finding 6) — the SAME handle
+    /// `serve`'s accept loop and `services::sql`'s refusal read. This session observes it to start
+    /// its own `config.drain_deadline` window and to wind itself down through the ordinary cleanup
+    /// path when the window expires; see this module's top doc comment.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_with_handler(
         stream: UnixStream,
         config: Config,
@@ -270,6 +320,7 @@ impl Session {
         pool_registry: Arc<PoolRegistry>,
         tx_registry: Arc<TxRegistry>,
         factory: HandlerFactory,
+        drain: Drain,
     ) {
         // Draw this connection's SessionId once (S6 seam) and build its handler. `session_id` is
         // used both to key tx ownership (inside the handler) and to abort this session's
@@ -431,7 +482,18 @@ impl Session {
         // Last time a COMPLETE inbound frame was classified — the idle clock's zero point.
         let mut last_frame_at = tokio::time::Instant::now();
 
+        // The graceful-drain window (M1-S9a finding 6). `None` until this session observes the
+        // drain; then the absolute instant at which it must wind ITSELF down. `draining` exists
+        // because `Drain::wait()` is a LEVEL, not an edge — an unguarded arm would win every
+        // select iteration forever once triggered, starving the reader.
+        let mut draining = false;
+        let mut drain_deadline_at: Option<tokio::time::Instant> = None;
+
         loop {
+            // Copied per iteration so the deadline arm's future owns it: no borrow of
+            // `drain_deadline_at` survives into the arm bodies that assign to it.
+            let deadline_at = drain_deadline_at;
+
             let classification = tokio::select! {
                 biased;
 
@@ -440,6 +502,42 @@ impl Session {
                 // control channel independently of when this JoinSet gets around to reaping it.
                 Some(_res) = supervisors.join_next(), if !supervisors.is_empty() => {
                     continue;
+                }
+
+                // The process is draining (SIGTERM, or an injected `Drain` in a test). Do NOT
+                // break: the reader must keep serving CANCEL/WINDOW_UPDATE for in-flight streams
+                // and the statements/savepoints/COMMIT of already-PINNED transactions through the
+                // whole window (§18 "let pins finish"). New checkout-ACQUIRING work is refused one
+                // layer up, in `services::sql`, where `tx_id` makes "new" distinguishable from
+                // "already pinned". All this arm does is start the clock.
+                () = drain.wait(), if !draining => {
+                    tracing::info!(
+                        window = ?config.drain_deadline,
+                        "session observed the drain: refusing new checkouts, letting pins finish"
+                    );
+                    draining = true;
+                    drain_deadline_at =
+                        Some(tokio::time::Instant::now() + config.drain_deadline);
+                    continue;
+                }
+
+                // The drain window expired. `break` into the SAME cleanup path every other exit
+                // uses — that is the whole fix: cancel_all (in-flight handlers declare their one
+                // terminal), abort_session (actors roll back + release the pooled conn),
+                // drain_supervisors (those terminals flush), writer drained. The pre-S9a code
+                // reached NONE of that: `serve` simply `abort_all()`ed the task.
+                //
+                // Its own arm rather than a check inside the 1s liveness tick, so the close lands
+                // at the deadline instead of somewhere in the following second. A `None` deadline
+                // parks forever (the arm is inert until the drain arm above sets one).
+                () = async move {
+                    match deadline_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    tracing::info!("drain window expired: winding this session down");
+                    break;
                 }
 
                 // Liveness (M1-S9a finding 5c). Ahead of the read arm so a saturated peer cannot

@@ -38,19 +38,25 @@ async fn main() -> anyhow::Result<()> {
     // One process-global transaction registry, shared by every connection `serve` spawns (S6
     // seam). Its `abort_session` teardown wait mirrors the graceful-drain deadline.
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+
+    // Minted BEFORE the handler (M1-S9a finding 6): ONE `Drain` is shared by the signal watchers,
+    // `serve`'s accept loop, every session, and the SQL/TX service's new-work refusal. It used to
+    // be created after `make_handler`, when only the accept loop consumed it.
+    let drain = Drain::new();
+
     let factory = sql::make_handler(
         registry.clone(),
         tx_registry.clone(),
         config.idle_in_tx,
         config.max_tx,
         config.tx_teardown_timeout,
+        drain.clone(),
     );
 
     // Drawn once per running instance and handed to every connection `serve` spawns (SPEC
     // §19.1: every connection served by this instance observes the identical `boot_epoch`).
     let epoch = RandomEpoch.epoch();
 
-    let drain = Drain::new();
     spawn_signal_watchers(drain.clone())?;
 
     serve(

@@ -444,3 +444,47 @@ the S8a §22.2 (u)/(v) contradiction.
   `warn + continue`. `EMFILE`/`ENFILE` are level-triggered — the connection stays in the backlog —
   so that is a hot retry loop under fd exhaustion. The default cap is chosen to keep us off that
   cliff, but the loop's own behaviour wants a bounded backoff and is out of this task's scope.
+
+### Task 12 — SIGTERM's graceful drain reaches sessions, pools and tx actors (finding 6)
+
+- **§18: the drain contract is now implemented as specified.** Accept stops (unchanged); NEW
+  checkout-ACQUIRING work — an autocommit `EXEC` and `BEGIN`, the only two entries that acquire a
+  connection — is refused `POOL_TIMEOUT{Retryable}` with a real terminal; already-PINNED
+  transactions keep running (statements, savepoints, COMMIT) for the whole `drain_deadline` window;
+  at the deadline each session exits through its OWN cleanup path (`registry.cancel_all()` →
+  `tx_registry.abort_session()` → `drain_supervisors()` → writer flush) instead of being
+  `abort_all()`ed. Before this, `Drain` had exactly two consumers, both in the accept loop: every
+  restart was a delayed hard kill with in-flight transactions and open streams cut mid-wire.
+
+- **`Config::drain_deadline` CHANGED MEANING and its doc was rewritten.** It was documented as
+  "deadline for a graceful drain before hard-closing remaining sessions", i.e. the daemon's TOTAL
+  stop budget. It is now the window in which EXISTING work continues; `serve`'s hard abort is a
+  backstop one `SESSION_DRAIN_GRACE` (3s) later, so **the worst-case stop time is
+  `drain_deadline + SESSION_DRAIN_GRACE`** — §18's `TimeoutStopSec` must be sized against the SUM.
+  The grace is load-bearing, not slack: MEASURED, aborting at bare `drain_deadline` destroys the
+  terminal an in-flight statement is owed (charter rule 4), because the session's cleanup at that
+  instant is doing network work (an out-of-band statement cancel + `ROLLBACK`).
+
+- **What the client sees when the window expires** (the §18/§19.3 question, measured live): an
+  in-flight statement receives exactly ONE terminal BEFORE the EOF — never a truncated stream; a
+  transaction pinned by a client that never came back is ROLLED BACK and its pooled connection
+  released, never held. It cannot hang forever: the window is `drain_deadline` and the cleanup
+  after it is itself bounded.
+
+- **Recorded, NOT fixed here (a pre-existing teardown race, `tx/actor.rs` + the session cleanup
+  order — Wave B's files):** the cleanup fires `registry.cancel_all()` then
+  `tx_registry.abort_session()`, and the actor's inner select is `biased` with `abort` ahead of the
+  per-request `cancel`, so the abort arm wins in practice and the in-flight statement's terminal is
+  `PROTOCOL{NonRetryable}` ("transaction is no longer active") rather than the
+  `TX_DEADLINE{Retryable}` the cancel arm would mint. SAFE in the §19.3 direction — NonRetryable
+  never licenses a replay and it is never `Indeterminate` — but less informative than it could be.
+  The acceptance test pins the invariants (one terminal, before EOF, never `Indeterminate`) rather
+  than the incidental code. Worth an owner.
+
+- **No `/proto` change.** The refusal reuses the existing `POOL_TIMEOUT`/`Retryable` pairing, whose
+  registry-pinned meaning ("resource momentarily unavailable; retry per your policy") is exactly
+  right under socket activation. A dedicated **`ERR_SHUTTING_DOWN` remains the recorded, DEFERRED
+  /proto candidate** (charter rule 2), alongside Task 11's `ERR_OVERLOADED`.
+
+- **Charter rule 3 untouched:** nothing is re-dispatched at any point of the drain; the refusal is a
+  classification the client's own resilience loop acts on.

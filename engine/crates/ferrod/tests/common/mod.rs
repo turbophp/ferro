@@ -131,6 +131,10 @@ impl TestServer {
                     pool_registry.clone(),
                     tx_registry.clone(),
                     factory.clone(),
+                    // These harnesses have no daemon lifecycle around them: a fresh, never-
+                    // triggered `Drain` per session (M1-S9a Task 12). The drain-aware harness is
+                    // `spawn_serve*`, which threads the caller's real one through `serve`.
+                    Drain::new(),
                 ));
             }
         });
@@ -168,6 +172,10 @@ impl TestServer {
                     pool_registry.clone(),
                     tx_registry.clone(),
                     factory.clone(),
+                    // These harnesses have no daemon lifecycle around them: a fresh, never-
+                    // triggered `Drain` per session (M1-S9a Task 12). The drain-aware harness is
+                    // `spawn_serve*`, which threads the caller's real one through `serve`.
+                    Drain::new(),
                 ));
             }
         });
@@ -207,6 +215,10 @@ impl TestServer {
                     pool_registry.clone(),
                     tx_registry.clone(),
                     factory.clone(),
+                    // These harnesses have no daemon lifecycle around them: a fresh, never-
+                    // triggered `Drain` per session (M1-S9a Task 12). The drain-aware harness is
+                    // `spawn_serve*`, which threads the caller's real one through `serve`.
+                    Drain::new(),
                 ));
             }
         });
@@ -267,7 +279,17 @@ pub fn spawn_one_session_with_config(
             .accept()
             .await
             .expect("accept the one test connection");
-        Session::run_with_handler(stream, config, epoch, pool_registry, tx_registry, factory).await;
+        // Never-triggered: `spawn_one_session*` drives one session with no daemon around it.
+        Session::run_with_handler(
+            stream,
+            config,
+            epoch,
+            pool_registry,
+            tx_registry,
+            factory,
+            Drain::new(),
+        )
+        .await;
     });
     (socket_path, handle)
 }
@@ -365,11 +387,33 @@ impl TestClient {
 
     /// Assert the connection closes (next read is EOF) within `RECV_TIMEOUT`.
     pub async fn recv_eof(&mut self) {
-        match tokio::time::timeout(RECV_TIMEOUT, self.framed.next()).await {
+        self.recv_eof_within(RECV_TIMEOUT).await
+    }
+
+    /// [`recv_eof`](Self::recv_eof) with a CALLER-chosen bound (M1-S9a Task 12). A test whose whole
+    /// subject is *when* a close lands — the graceful-drain window is `drain_deadline`-scale, i.e.
+    /// longer than `RECV_TIMEOUT` — must set that bound itself; wrapping `recv_eof` in an outer
+    /// `tokio::time::timeout` does NOT work, because the inner 2s deadline panics first and the
+    /// outer bound is dead code (measured: it makes the guard unable to pass at all, not merely
+    /// flaky). The bound stays a real deadline, so a session that never closes still fails fast.
+    pub async fn recv_eof_within(&mut self, bound: Duration) {
+        match tokio::time::timeout(bound, self.framed.next()).await {
             Ok(None) => {}
             Ok(Some(Ok(frame))) => panic!("expected EOF, got a frame: {:?}", frame.header),
             Ok(Some(Err(e))) => panic!("expected EOF, got a codec error: {e}"),
-            Err(_) => panic!("timed out after {RECV_TIMEOUT:?} waiting for EOF"),
+            Err(_) => panic!("timed out after {bound:?} waiting for EOF"),
+        }
+    }
+
+    /// [`recv`](Self::recv) with a CALLER-chosen bound — same reason as
+    /// [`recv_eof_within`](Self::recv_eof_within): a frame whose arrival is gated on a
+    /// `drain_deadline` cannot be waited for under the harness's fixed 2s.
+    pub async fn recv_within(&mut self, bound: Duration) -> InFrame {
+        match tokio::time::timeout(bound, self.framed.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(e))) => panic!("client recv: codec error: {e}"),
+            Ok(None) => panic!("client recv: connection closed with no frame"),
+            Err(_) => panic!("client recv: timed out after {bound:?} waiting for a frame"),
         }
     }
 
@@ -593,6 +637,9 @@ pub fn exec_server(url: String) -> TestServer {
         config.idle_in_tx,
         config.max_tx,
         config.tx_teardown_timeout,
+        // Never triggered here: these helpers have no daemon lifecycle. A test whose subject IS
+        // the drain (`drain_it.rs`) assembles `serve` itself so it can hold the handle.
+        Drain::new(),
     );
     TestServer::spawn_with_factory(BootEpoch(1), registry, tx_registry, factory)
 }
@@ -628,6 +675,9 @@ pub fn pools_server(pools: &[(&str, &str)]) -> (TestServer, Arc<PoolRegistry>) {
         config.idle_in_tx,
         config.max_tx,
         config.tx_teardown_timeout,
+        // Never triggered here: these helpers have no daemon lifecycle. A test whose subject IS
+        // the drain (`drain_it.rs`) assembles `serve` itself so it can hold the handle.
+        Drain::new(),
     );
     let server = TestServer::spawn_with_factory_and_config(
         BootEpoch(1),
@@ -667,6 +717,9 @@ pub fn stream_server(url: String, credit_frames: u32) -> TestServer {
         config.idle_in_tx,
         config.max_tx,
         config.tx_teardown_timeout,
+        // Never triggered here: these helpers have no daemon lifecycle. A test whose subject IS
+        // the drain (`drain_it.rs`) assembles `serve` itself so it can hold the handle.
+        Drain::new(),
     );
     TestServer::spawn_with_factory_and_config(BootEpoch(1), config, registry, tx_registry, factory)
 }

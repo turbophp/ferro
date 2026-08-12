@@ -62,16 +62,19 @@ async fn main() -> Result<(), BoxErr> {
     };
     let registry = PoolRegistry::build(&config);
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    // ONE `Drain`, minted BEFORE the handler and shared by `serve`, every session, and the SQL/TX
+    // service's new-work refusal — exactly as `main` wires it (M1-S9a finding 6).
+    let drain = Drain::new();
     let handler = sql::make_handler(
         registry.clone(),
         tx_registry.clone(),
         config.idle_in_tx,
         config.max_tx,
         config.tx_teardown_timeout,
+        drain.clone(),
     );
     let listener = ferrod::listener::bind_uds(&config)?;
     let epoch = RandomEpoch.epoch();
-    let drain = Drain::new();
     let serve_handle = tokio::spawn(serve(
         listener,
         config,

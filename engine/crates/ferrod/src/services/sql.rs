@@ -62,6 +62,7 @@ use crate::services::fate::{self, OpContext};
 use crate::session::codec::InFrame;
 use crate::session::responder::{Responder, StreamSendError};
 use crate::session::{HandlerFactory, HandlerFn, SessionId};
+use crate::shutdown::Drain;
 use crate::tx::{
     CtlReply, ExecReply, TxCommand, TxHandle, TxLookupErr, TxRegistry, actor, next_tx_id,
 };
@@ -117,19 +118,26 @@ pub(crate) const CANCEL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 /// byte-for-byte unchanged; with `tx_id.is_some()` it is forwarded to that tx's actor. `service=TX`
 /// BEGIN opens a tx (spawns the actor); COMMIT/ROLLBACK/SAVEPOINT/RELEASE/ROLLBACK_TO are forwarded
 /// to the owning actor. Anything else declares `Unsupported`.
+///
+/// `drain` (M1-S9a finding 6) is the process-wide graceful-shutdown level. It is read at exactly
+/// the two entries that ACQUIRE a connection — the autocommit EXEC arm and BEGIN — see
+/// [`draining_refusal`].
 pub fn make_handler(
     registry: Arc<PoolRegistry>,
     tx_registry: Arc<TxRegistry>,
     idle_in_tx: Duration,
     max_tx: Duration,
     teardown_timeout: Duration,
+    drain: Drain,
 ) -> HandlerFactory {
     Arc::new(move |session_id| -> HandlerFn {
         let registry = registry.clone();
         let tx_registry = tx_registry.clone();
+        let drain = drain.clone();
         Arc::new(move |frame, responder, cancel| {
             let registry = registry.clone();
             let tx_registry = tx_registry.clone();
+            let drain = drain.clone();
             async move {
                 handle(
                     frame,
@@ -141,12 +149,41 @@ pub fn make_handler(
                     max_tx,
                     teardown_timeout,
                     cancel,
+                    &drain,
                 )
                 .await;
             }
             .boxed()
         })
     })
+}
+
+/// M1-S9a finding 6: the drain-window refusal for NEW checkout-ACQUIRING work (an autocommit EXEC,
+/// a BEGIN). Work on an ALREADY-PINNED transaction is never refused — that connection is already
+/// held, and §18's contract is "refuse new checkouts, let pins finish"; refusing a pinned tx's
+/// COMMIT would strand it until the window expired and then roll it back, which is strictly worse
+/// for the client than letting it commit.
+///
+/// `POOL_TIMEOUT{Retryable}` is an EXISTING registry pairing whose pinned meaning is exactly right
+/// ("resource momentarily unavailable; retry per your policy"): the client's resilience loop
+/// reconnects, and under §18's socket activation the successor process is already listening on the
+/// same socket. A dedicated `ERR_SHUTTING_DOWN` would be a `/proto` registry + golden-vectors +
+/// BOTH-codecs change (charter rule 2) — deferred, recorded as a candidate, deliberately NOT
+/// hand-rolled here.
+///
+/// This is a declared terminal like any other: exactly one END, and nothing is re-dispatched
+/// anywhere (charter rule 3 — the engine classifies and reports; retry is the client's policy).
+fn draining_refusal() -> ErrorPayload {
+    ErrorPayload {
+        code: errc::POOL_TIMEOUT,
+        branch: errc::POOL_TIMEOUT_BRANCH,
+        sqlstate: None,
+        errno: None,
+        message: "engine is draining for shutdown; new work refused — reconnect and retry"
+            .to_string(),
+        detail: None,
+        retry_after_ms: None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -160,10 +197,20 @@ async fn handle(
     max_tx: Duration,
     teardown_timeout: Duration,
     cancel: CancellationToken,
+    drain: &Drain,
 ) {
     match (frame.header.service, frame.header.method) {
         (service::SQL, method_sql::EXEC) => {
-            handle_exec(frame, responder, registry, tx_registry, session_id, cancel).await
+            handle_exec(
+                frame,
+                responder,
+                registry,
+                tx_registry,
+                session_id,
+                cancel,
+                drain,
+            )
+            .await
         }
         (service::TX, method_tx::BEGIN) => {
             handle_begin(
@@ -175,6 +222,7 @@ async fn handle(
                 idle_in_tx,
                 max_tx,
                 teardown_timeout,
+                drain,
             )
             .await
         }
@@ -207,6 +255,7 @@ async fn handle(
 
 /// `service=SQL, method=EXEC`. Validates the request shape (shared by both paths), then branches on
 /// `tx_id`: `None` → the S5 autocommit path (unchanged); `Some` → forward to the owning tx actor.
+#[allow(clippy::too_many_arguments)]
 async fn handle_exec(
     frame: InFrame,
     responder: Responder,
@@ -214,6 +263,7 @@ async fn handle_exec(
     tx_registry: &TxRegistry,
     session_id: SessionId,
     cancel: CancellationToken,
+    drain: &Drain,
 ) {
     // (1) decode the per-request payload.
     let req = match ExecRequest::decode(&frame.payload) {
@@ -377,6 +427,16 @@ async fn handle_exec(
         // ---- autocommit EXEC: the S5 path (M1-S4 timeout_ms + CANCEL), dispatched over the
         //      heterogeneous pool registry (M1-S6) ----
         None => {
+            // M1-S9a finding 6: an autocommit EXEC ACQUIRES a connection, so it is exactly the
+            // "new work" §18's drain refuses — checked before the pool lookup and before any
+            // checkout, so a draining daemon never dials, never queues, and never holds a permit
+            // for work it is about to stop doing. A tx-scoped EXEC (the arm above) is untouched:
+            // its connection is already pinned.
+            if drain.is_draining() {
+                responder.end_error(draining_refusal());
+                return;
+            }
+
             let Some(pool) = registry.get(&req.pool) else {
                 responder.end_error(unsupported(format!("unknown pool {:?}", req.pool)));
                 return;
@@ -1292,7 +1352,17 @@ async fn handle_begin(
     idle_in_tx: Duration,
     max_tx: Duration,
     teardown_timeout: Duration,
+    drain: &Drain,
 ) {
+    // M1-S9a finding 6: BEGIN is the OTHER checkout-acquiring entry (`begin_on_pool` checks out and
+    // PINS a connection for the transaction's whole life) — refusing it is what stops the drain
+    // window filling back up with fresh pins that then have to be rolled back at the deadline.
+    // Checked before the decode is even used, so no transaction state is touched.
+    if drain.is_draining() {
+        responder.end_error(draining_refusal());
+        return;
+    }
+
     let req = match BeginRequest::decode(&frame.payload) {
         Ok(r) => r,
         Err(e) => {
