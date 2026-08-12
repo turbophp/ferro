@@ -330,6 +330,11 @@ async fn handle_exec(
                             readonly: req.readonly,
                             sent: true,
                             in_tx: true,
+                            // M1-S9a Task 7: the field lands inert here (`false` = the pre-S9a
+                            // behavior, verbatim). Task 8 threads the LIVE value off the actor's
+                            // persisted latch — this is one of exactly two sites where it can ever
+                            // be `true`.
+                            tx_writes_persisted: false,
                         },
                     )),
                 },
@@ -424,6 +429,8 @@ async fn run_exec_on_pool<B: PoolBackend>(
                     readonly: req.readonly,
                     sent: false,
                     in_tx: false,
+                    // Autocommit: there is no transaction, so nothing of one can have persisted.
+                    tx_writes_persisted: false,
                 },
             ));
             return;
@@ -553,6 +560,8 @@ fn declare_autocommit_exec(
                 readonly,
                 sent: true,
                 in_tx: false,
+                // Autocommit: no transaction, nothing to have partially committed.
+                tx_writes_persisted: false,
             },
         )),
     }
@@ -639,6 +648,8 @@ async fn run_autocommit_streamed<B: PoolBackend>(
                     readonly,
                     sent: false,
                     in_tx: false,
+                    // Autocommit stream: no transaction (see the buffered path).
+                    tx_writes_persisted: false,
                 },
             ));
             return;
@@ -665,6 +676,8 @@ async fn run_autocommit_streamed<B: PoolBackend>(
         // error. See `run_streamed_exec`'s doc for the §19.3 safety argument.
         sent: true,
         in_tx: false,
+        // Autocommit stream: no transaction, so the M1-S9a persisted-tx filter is inert here.
+        tx_writes_persisted: false,
     };
 
     // M7: exec_us times ONLY backend-pull awaits — the `query_stream` OPEN (prepare + query_raw
@@ -756,6 +769,9 @@ pub(crate) async fn run_tx_streamed<B: PoolBackend>(
         readonly,
         sent: true,
         in_tx: true,
+        // M1-S9a Task 7: inert here (`false` = the pre-S9a behavior, verbatim). Task 8 threads the
+        // actor's live persisted latch into this ctx — the second of the two in-tx statement sites.
+        tx_writes_persisted: false,
     };
 
     // The open-race + loop live in a block confining every co-BORROWING value (the raced handle), so
@@ -1291,6 +1307,8 @@ async fn begin_on_pool<B: PoolBackend>(
                     readonly: req.readonly,
                     sent: false,
                     in_tx: false,
+                    // BEGIN precedes any transaction: nothing of one can have persisted.
+                    tx_writes_persisted: false,
                 },
             ));
             return;
@@ -1310,6 +1328,8 @@ async fn begin_on_pool<B: PoolBackend>(
                 readonly: req.readonly,
                 sent: false,
                 in_tx: false,
+                // The BEGIN itself failed: the transaction never opened, so it persisted nothing.
+                tx_writes_persisted: false,
             },
         ));
         return;
@@ -1488,6 +1508,10 @@ fn declare_ctl(responder: Responder, reply: CtlReply, readonly: bool) {
                 readonly,
                 sent: true,
                 in_tx: false,
+                // A tx CONTROL boundary (COMMIT/ROLLBACK/SAVEPOINT family), never an in-tx
+                // statement — `in_tx: false` already makes the M1-S9a filter inert, and a lost
+                // COMMIT must keep its own `Indeterminate` fate rather than the persisted-tx one.
+                tx_writes_persisted: false,
             },
         )),
         CtlReply::UnknownSavepoint => {

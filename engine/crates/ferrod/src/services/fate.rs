@@ -22,7 +22,7 @@ use ferro_pool::error::PoolError;
 use ferro_proto::consts::errc;
 use ferro_proto::messages::ErrorPayload;
 
-/// Per-call-site fate context. All three fields are load-bearing and MUST be set honestly by the
+/// Per-call-site fate context. All four fields are load-bearing and MUST be set honestly by the
 /// caller — `classify_fate` trusts them completely (it has no way to independently verify
 /// `sent`/`in_tx`; get one wrong at a call site and the branch is wrong, silently).
 ///
@@ -41,6 +41,19 @@ pub struct OpContext {
     pub readonly: bool,
     pub sent: bool,
     pub in_tx: bool,
+    /// M1-S9a (finding 1): set by an in-tx call site when statements EARLIER in this transaction
+    /// have already PERSISTED — either OBSERVED (the live pin state `Checkout::tx_open()` read
+    /// false after a completed statement: a MySQL implicit commit ended the tx behind the client's
+    /// back) or MUST-ASSUME (the in-flight statement itself was implicit-commit-shaped, whose
+    /// pre-commit may have fired before the loss — `ferro_classify::implicit_commit_hazard`).
+    /// Meaningful only alongside `in_tx: true`; every autocommit and control site passes `false`.
+    /// Effect: `branch::RETRYABLE` becomes unmintable (see [`classify_fate`]) — a partially
+    /// committed transaction must never be replayed.
+    ///
+    /// Directional rule (SPEC §19.3): a MISSED `true` yields a false `Retryable` — at-least-once,
+    /// the blocker. A spurious `true` yields a false `Indeterminate` — cry-wolf, never a
+    /// double-apply. When a call site cannot tell, `true` is the safe answer.
+    pub tx_writes_persisted: bool,
 }
 
 /// Map a `PoolError` to a wire `ErrorPayload`. NEVER retries (charter rule 3); the branch only
@@ -68,7 +81,59 @@ pub struct OpContext {
 /// BEFORE the query is ever dispatched (T2/T3 territory) — it is included here for totality and to
 /// document the intended fate (`ConnectionLost{Retryable}` — an unsent write has no unknown fate),
 /// not because this task's call sites can produce it.
+///
+/// 3. **The M1-S9a persisted-transaction post-filter runs LAST, over the finished payload** — it is
+///    BRANCH-shaped, not errc-shaped, and that is the whole point: three distinct terminals license
+///    a client to replay an in-tx failure (`TxDeadline` via the 57014 override, `ConnectionLost`,
+///    and a retryable `Sql` passthrough such as a 1213 deadlock / 40001 on the post-DDL statement),
+///    so filtering one errc at a time would leave the others licensing the replay. Applying it to
+///    the OUTPUT branch catches all three, plus any future arm, by construction.
 pub fn classify_fate(err: PoolError, ctx: OpContext) -> ErrorPayload {
+    let ep = classify_fate_unfiltered(err, ctx);
+    // M1-S9a (finding 1): the post-filter. Once earlier statements of this transaction have
+    // persisted, NO outcome may carry the Retryable branch — a Retryable in-tx terminal is read by
+    // clients as "replaying the whole transaction is safe" (Doctrine-style wrappers replay the
+    // WHOLE closure), and here it demonstrably is not: measured live on MySQL 8.4,
+    // `START TRANSACTION; INSERT; CREATE TABLE; <link loss>` leaves the INSERT durably committed
+    // with no COMMIT ever sent, because MySQL's implicit commit fires BEFORE the DDL executes.
+    //
+    // Not gated on the engine family, and deliberately so: the flag is only ever SET by a call
+    // site that has evidence (the protocol latch or the pre-dispatch lexical hazard), so PostgreSQL
+    // — which has no implicit commit — never reaches this branch, while a future family with the
+    // same hazard inherits the rule without a new special case here.
+    if ctx.in_tx && ctx.tx_writes_persisted && ep.branch == ferro_proto::consts::branch::RETRYABLE {
+        return persisted_tx_payload();
+    }
+    ep
+}
+
+/// The ONE mint of the partially-committed-transaction terminal (M1-S9a finding 1) — reused by the
+/// `ExecReply::Deadline` handler and the tombstone mapping (Task 8) so the wording and the
+/// (code, branch) pair can never fork. Rides `WRITE_UNCONFIRMED{Indeterminate}` — the branch whose
+/// contract is "do not replay" — because at the unit the client acts on (the transaction), part has
+/// provably applied and the rest is unknown or refused. Deliberately NOT a new /proto code (charter
+/// rule 2); a dedicated `TX_PARTIALLY_COMMITTED` is a recorded deferred candidate.
+///
+/// It carries NO `sqlstate` and NO `errno`, and that is load-bearing rather than collateral: the
+/// dominant filtered case is a MySQL 1213, which DBAL's converter turns into a `DeadlockException`
+/// — a class carrying Doctrine's `RetryableException` marker, i.e. exactly the replay license this
+/// cell exists to withdraw. Same precedent as the 57014 override dropping the vendor errno
+/// (SPEC §22.2 (o)).
+pub(crate) fn persisted_tx_payload() -> ErrorPayload {
+    payload(
+        errc::WRITE_UNCONFIRMED,
+        errc::WRITE_UNCONFIRMED_BRANCH,
+        "an earlier statement in this transaction caused an implicit commit (MySQL DDL, LOCK \
+         TABLES, SET autocommit, ...): statements before it HAVE PERSISTED, so the transaction \
+         must not be replayed; the failed statement's own outcome is unconfirmed (§19.3 \
+         indeterminate — the engine never retries; retry only via an idempotent manifest)",
+    )
+}
+
+/// The §9.2/§19.3 matrix itself, without the M1-S9a persisted-transaction post-filter. Private on
+/// purpose: every caller must go through [`classify_fate`], or it would be possible to mint a
+/// `Retryable` terminal for a transaction that has already persisted writes.
+fn classify_fate_unfiltered(err: PoolError, ctx: OpContext) -> ErrorPayload {
     if is_57014(&err) {
         return if ctx.in_tx {
             // In a transaction, ANY statement cancel/timeout means the whole tx is dead (the actor
@@ -265,6 +330,18 @@ mod tests {
             readonly,
             sent,
             in_tx,
+            tx_writes_persisted: false,
+        }
+    }
+
+    /// An in-tx context whose transaction has (or may have) already persisted earlier writes —
+    /// the M1-S9a implicit-commit cell.
+    fn ctx_p(readonly: bool, sent: bool) -> OpContext {
+        OpContext {
+            readonly,
+            sent,
+            in_tx: true,
+            tx_writes_persisted: true,
         }
     }
 
@@ -647,6 +724,11 @@ mod tests {
 
     /// `Timeout` (waiting for a pooled connection) always maps to `PoolTimeout{Retryable}`,
     /// regardless of context — there was never a statement in flight to have an unknown fate.
+    ///
+    /// M1-S9a: "regardless of context" is scoped to the three ORIGINAL axes. The
+    /// `tx_writes_persisted` axis DOES move this cell (see
+    /// `the_retryable_branch_is_unmintable_once_tx_writes_persisted`), which is why the loop below
+    /// runs over `ctx(..)` (persisted=false) only.
     #[test]
     fn timeout_is_always_pool_timeout_retryable() {
         for readonly in [true, false] {
@@ -658,5 +740,232 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- M1-S9a finding 1: the persisted-transaction post-filter ------------------------------
+
+    /// THE finding-1 rule: once earlier tx writes persisted, `branch::RETRYABLE` is unmintable —
+    /// whatever errc it would have ridden (TxDeadline via the 57014 override, ConnectionLost,
+    /// a retryable Sql passthrough like a 1213 deadlock / 40001, even the unreachable-in-tx
+    /// PoolTimeout). Every such outcome becomes WriteUnconfirmed{Indeterminate}; every already-
+    /// non-retryable outcome is untouched. Exhaustive over (err × readonly × sent).
+    ///
+    /// The `readonly = true` rows are deliberate, not incidental: they are the documented exception
+    /// to "a client-declared-readonly statement never becomes Indeterminate" (SPEC §19.3 delta,
+    /// Task 13). The terminal describes the TRANSACTION — whose earlier writes HAVE persisted —
+    /// not the read.
+    #[test]
+    fn the_retryable_branch_is_unmintable_once_tx_writes_persisted() {
+        let retryable_shaped: Vec<PoolError> = vec![
+            PoolError::ConnectionLost,
+            sql_57014(),
+            sql(errc::DEADLOCK, branch::RETRYABLE, "40001"),
+            PoolError::Timeout,
+        ];
+        for err in &retryable_shaped {
+            for readonly in [false, true] {
+                for sent in [false, true] {
+                    // Precondition: without the flag this cell really IS Retryable, so the
+                    // assertions below are about the filter and not vacuously true of the arm.
+                    let base = classify_fate(err.clone(), ctx(readonly, sent, true));
+                    assert_eq!(
+                        base.branch,
+                        branch::RETRYABLE,
+                        "precondition [{err:?} readonly={readonly} sent={sent}]: the unfiltered \
+                         in-tx cell must be Retryable, else this row proves nothing"
+                    );
+
+                    let ep = classify_fate(err.clone(), ctx_p(readonly, sent));
+                    assert_ne!(
+                        ep.branch,
+                        branch::RETRYABLE,
+                        "{err:?} readonly={readonly} sent={sent}: a persisted tx must never \
+                         license replay"
+                    );
+                    assert_eq!(ep.code, errc::WRITE_UNCONFIRMED, "{err:?}");
+                    assert_eq!(ep.branch, branch::INDETERMINATE, "{err:?}");
+                    assert!(
+                        ep.message.contains("implicit commit"),
+                        "the message must name the mechanism, got: {}",
+                        ep.message
+                    );
+                }
+            }
+        }
+    }
+
+    /// Known-fate NonRetryable outcomes pass through VERBATIM even when persisted — they license
+    /// nothing, and their statement-level fate is honestly known (a 23505 is a 23505).
+    #[test]
+    fn known_fate_nonretryable_passes_through_even_when_persisted() {
+        let dup = PoolError::Sql {
+            code: errc::UNIQUE,
+            branch: errc::UNIQUE_BRANCH,
+            sqlstate: Some("23000".to_string()),
+            errno: Some(1062),
+            message: "Duplicate entry".to_string(),
+        };
+        let ep = classify_fate(dup, ctx_p(false, true));
+        assert_eq!(ep.code, errc::UNIQUE);
+        assert_eq!(ep.branch, branch::NON_RETRYABLE);
+        assert_eq!(
+            ep.errno,
+            Some(1062),
+            "the passthrough keeps its vendor identity"
+        );
+    }
+
+    /// The flag is inert outside a transaction: an autocommit call site that wrongly sets it
+    /// changes NOTHING (`in_tx` gates the filter), so no autocommit fate can regress.
+    #[test]
+    fn persisted_without_in_tx_is_inert() {
+        for readonly in [false, true] {
+            for sent in [false, true] {
+                let with = classify_fate(
+                    PoolError::ConnectionLost,
+                    OpContext {
+                        readonly,
+                        sent,
+                        in_tx: false,
+                        tx_writes_persisted: true,
+                    },
+                );
+                let without = classify_fate(PoolError::ConnectionLost, ctx(readonly, sent, false));
+                assert_eq!((with.code, with.branch), (without.code, without.branch));
+            }
+        }
+    }
+
+    /// **The truth table as a test — "no cell gets WORSE", asserted in BOTH directions.**
+    ///
+    /// This is the whole-matrix totality gate for the new axis: over every `PoolError` shape ×
+    /// `readonly` × `sent` × `in_tx`, the set of cells the flag moves is asserted EXACTLY, so it
+    /// fails from either side:
+    ///
+    /// - a cell that SHOULD move and does not (deleting the post-filter, or narrowing it to one
+    ///   errc instead of the branch — the hazard-3 hole where a retryable `Sql` passthrough keeps
+    ///   licensing the replay);
+    /// - a cell that moves and should NOT (dropping `ctx.in_tx &&`, or touching the NonRetryable
+    ///   passthroughs, which would cost the vendor errno DBAL keys on).
+    ///
+    /// What it deliberately does NOT pin (measured, not assumed — mutation 3 below left this test
+    /// GREEN): the ABSOLUTE `(code, branch)` of the moved cells. It compares them against
+    /// `persisted_tx_payload()` itself, so swapping the constructor's errc moves both sides
+    /// together. That literal is pinned by
+    /// `the_retryable_branch_is_unmintable_once_tx_writes_persisted`, which asserts
+    /// `errc::WRITE_UNCONFIRMED` / `branch::INDETERMINATE` directly. Stated here so nobody reads
+    /// this test as covering more than it does.
+    ///
+    /// The two directional invariants are named explicitly:
+    /// **no promotion** — the filter never mints `RETRYABLE` and never disturbs a cell that was
+    /// already `INDETERMINATE` (promoting an indeterminate write to retryable is the very bug this
+    /// slice exists to fix); **demotion only where the license is false** — the only moved cells
+    /// are in-tx Retryable ones, whose Retryable means "replaying this transaction is safe", which
+    /// is precisely what `tx_writes_persisted` denies.
+    #[test]
+    fn persisted_never_promotes_and_only_demotes_the_retryable_cells() {
+        let corpus: Vec<(&str, PoolError)> = vec![
+            ("57014 (classified)", sql_57014()),
+            ("57014 (raw sqlstate)", sql_57014_raw_sqlstate_only()),
+            (
+                "Sql 40001 serialization",
+                sql(errc::SERIALIZATION_FAILURE, branch::RETRYABLE, "40001"),
+            ),
+            (
+                "Sql 40P01 deadlock",
+                sql(errc::DEADLOCK, branch::RETRYABLE, "40P01"),
+            ),
+            (
+                "Sql 1213 deadlock (MySQL, with errno)",
+                PoolError::Sql {
+                    code: errc::DEADLOCK,
+                    branch: errc::DEADLOCK_BRANCH,
+                    sqlstate: Some("40001".to_string()),
+                    errno: Some(1213),
+                    message: "Deadlock found when trying to get lock".to_string(),
+                },
+            ),
+            (
+                "Sql 23505 unique",
+                sql(errc::UNIQUE, branch::NON_RETRYABLE, "23505"),
+            ),
+            (
+                "Sql 42601 syntax",
+                sql(errc::SYNTAX, branch::NON_RETRYABLE, "42601"),
+            ),
+            ("ConnectionLost", PoolError::ConnectionLost),
+            ("Timeout", PoolError::Timeout),
+            ("Closed", PoolError::Closed),
+            ("Backend", PoolError::Backend("backend blew up".to_string())),
+            (
+                "Unsupported",
+                PoolError::Unsupported("no such type".to_string()),
+            ),
+        ];
+
+        let mut moved = 0usize;
+        for (name, err) in &corpus {
+            for readonly in [false, true] {
+                for sent in [false, true] {
+                    for in_tx in [false, true] {
+                        let base = classify_fate(err.clone(), ctx(readonly, sent, in_tx));
+                        let with = classify_fate(
+                            err.clone(),
+                            OpContext {
+                                readonly,
+                                sent,
+                                in_tx,
+                                tx_writes_persisted: true,
+                            },
+                        );
+                        let cell =
+                            format!("[{name}] readonly={readonly} sent={sent} in_tx={in_tx}");
+
+                        if in_tx && base.branch == branch::RETRYABLE {
+                            moved += 1;
+                            assert_eq!(
+                                with,
+                                persisted_tx_payload(),
+                                "{cell}: an in-tx Retryable cell in a partially committed tx must \
+                                 become EXACTLY the one persisted terminal"
+                            );
+                        } else {
+                            assert_eq!(
+                                with, base,
+                                "{cell}: the flag must not move this cell at all"
+                            );
+                        }
+
+                        // Directional invariant 1 — NO PROMOTION. Nothing ever gains the replay
+                        // license, and an already-Indeterminate cell is never turned Retryable.
+                        assert!(
+                            !(in_tx && with.branch == branch::RETRYABLE),
+                            "{cell}: a partially committed transaction may never carry Retryable"
+                        );
+                        if base.branch == branch::INDETERMINATE {
+                            assert_eq!(
+                                with.branch,
+                                branch::INDETERMINATE,
+                                "{cell}: an Indeterminate cell must never be promoted"
+                            );
+                        }
+                        // Directional invariant 2 — a known-fate NonRetryable is untouched on
+                        // every axis, so no vendor identity (errno/sqlstate) is ever lost from a
+                        // cell that licenses nothing.
+                        if base.branch == branch::NON_RETRYABLE {
+                            assert_eq!(with, base, "{cell}: NonRetryable passes through verbatim");
+                        }
+                    }
+                }
+            }
+        }
+        // The moved set is non-empty, so the "else" arm above cannot be carrying the whole test.
+        assert_eq!(
+            moved, 28,
+            "expected exactly the in-tx Retryable cells to move: the SEVEN retryable-shaped \
+             corpus entries (57014 classified, 57014 raw, 40001, 40P01, 1213, ConnectionLost, \
+             Timeout) × readonly × sent = 28. A different number means the corpus or an arm moved \
+             — re-derive the table before touching this literal."
+        );
     }
 }

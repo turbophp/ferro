@@ -108,3 +108,42 @@ the S8a §22.2 (u)/(v) contradiction.
   format a library error built from the DSN — `ferro-backend-mysql/src/conn.rs:193` (`UrlError`) and
   `ferro-backend-pg/src/conn.rs:110-115` (connection-string parse) — echo a scheme, a query-parameter
   name/value, or an option name, never the userinfo component.
+
+### Task 7
+
+- **§19.3 — NEW RULE (the finding-1 fate cell).** `OpContext` gains `tx_writes_persisted`. Once a
+  transaction's earlier statements have PERSISTED (a MySQL/MariaDB implicit commit, observed by the
+  protocol latch or assumed from the pre-dispatch hazard), the **`Retryable` branch is unmintable**
+  for that transaction's failures: any outcome that would carry `branch::RETRYABLE` is replaced by
+  `WriteUnconfirmed{Indeterminate}`. The rule is **BRANCH-shaped, not errc-shaped** — three distinct
+  terminals license a client to replay an in-tx failure (`TxDeadline` via the 57014 override,
+  `ConnectionLost`, and a retryable `Sql` passthrough such as 1213/40001 on the post-DDL statement),
+  and an errc-shaped rule would leave the third one licensing the replay (mutation-proven: the
+  errc-shaped variant turns the 40001 and 1213 rows RED). Known-fate NonRetryable outcomes (23505,
+  42601, a bind `Unsupported`) pass through VERBATIM — they license nothing and their statement-level
+  fate is honestly known.
+
+- **§19.3 — the readonly invariant gains a stated exception.** "A client-declared-readonly statement
+  never becomes `Indeterminate`" (§22.2 (ac)) no longer holds in one cell: an in-tx statement loss in
+  a partially-committed transaction is `Indeterminate` regardless of `readonly`, because the terminal
+  describes the TRANSACTION — whose earlier writes have persisted — not the read. Deliberate, and
+  stated rather than silently changed.
+
+- **§9.2 / §22.2 — the persisted terminal carries no `sqlstate` and no `errno`.** Same species as
+  the 57014 override's documented field-dropping (§22.2 (o)) and load-bearing for the same reason:
+  the dominant filtered case is a MySQL 1213, which DBAL converts to `DeadlockException` — a class
+  carrying Doctrine's `RetryableException` marker, i.e. exactly the replay license this cell exists
+  to withdraw.
+
+- **§22.2 — deferred `/proto` candidate recorded, not hand-rolled (charter rule 2):** a dedicated
+  `TX_PARTIALLY_COMMITTED` code would say what happened more precisely than `WRITE_UNCONFIRMED`
+  does. It is a registry + golden-vectors + BOTH-codecs change set, so this slice reuses
+  `WRITE_UNCONFIRMED{Indeterminate}` — whose branch contract ("do not replay") is already exactly
+  right — and defers the code.
+
+- **Scope note (no behaviour change in Task 7 itself):** all nine `OpContext` literals in
+  `services/sql.rs` pass `tx_writes_persisted: false`, so no cell on any engine family moves in this
+  commit; the offline suite and the full live fate surface — including Task 1's armed in-tx guard —
+  are green and unchanged. Task 8 threads the live value into the two in-tx statement sites
+  (`sql.rs:329`, `sql.rs:755`). PostgreSQL has no implicit commit, so the flag stays `false` there
+  forever and no PG cell can ever move.
