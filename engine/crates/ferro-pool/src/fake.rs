@@ -346,6 +346,11 @@ pub struct FakeBackend {
     stream_pull_gate: Arc<Mutex<Option<Arc<Notify>>>>,
     /// Number of `FakeRowStream::next()` pulls currently parked on `stream_pull_gate`.
     stream_pulls_waiting: Arc<AtomicU64>,
+    /// M1-S9a Task 8: one-shot [`TxStatus`] applied to the conn AFTER the next successful `query()`
+    /// (see `arm_tx_status_after_next_query`) — the fake's model of a MySQL implicit commit's OK
+    /// packet dropping `SERVER_STATUS_IN_TRANS`. `None` (the default) leaves every existing test's
+    /// behaviour byte-identical.
+    tx_status_after_query: Mutex<Option<TxStatus>>,
 }
 
 impl FakeBackend {
@@ -371,6 +376,7 @@ impl FakeBackend {
             stream_opens_waiting: Arc::new(AtomicU64::new(0)),
             stream_pull_gate: Arc::new(Mutex::new(None)),
             stream_pulls_waiting: Arc::new(AtomicU64::new(0)),
+            tx_status_after_query: Mutex::new(None),
         }
     }
 
@@ -539,6 +545,19 @@ impl FakeBackend {
     /// `Some(ResetProfile::Targeted)`, matching `PgBackend`).
     pub fn set_clean_reset_profile(&self, profile: Option<ResetProfile>) {
         *self.clean_reset_profile.lock().unwrap() = profile;
+    }
+
+    /// ONE-SHOT (M1-S9a Task 8): after the NEXT **successful** `query()`, the connection reports
+    /// `st` from `tx_status()`. Models a MySQL/MariaDB implicit-commit statement — a DDL, `LOCK
+    /// TABLES`, `SET autocommit = 1` — whose OK packet comes back with `SERVER_STATUS_IN_TRANS`
+    /// DROPPED while the pool still believes a transaction is open: the exact protocol signal the
+    /// tx actor's persisted LATCH reads through `Checkout::tx_open()`.
+    ///
+    /// Deliberately only the SUCCESS path: on an `Err` the RFQ/OK-packet status is
+    /// stale-untrustworthy and `Checkout`'s Rule-A fail-safe force-sets `tx_open`/`tainted`
+    /// regardless, so an error-path arming could not model anything a real backend produces.
+    pub fn arm_tx_status_after_next_query(&self, st: TxStatus) {
+        *self.tx_status_after_query.lock().unwrap() = Some(st);
     }
 }
 
@@ -716,6 +735,13 @@ impl PoolBackend for FakeBackend {
                     message: "canceling statement due to user request (fake)".to_string(),
                 });
             }
+        }
+        // One-shot armed post-statement status (see `arm_tx_status_after_next_query`): applied on
+        // the SUCCESS path only, immediately before returning, so the `tx_status()` read that
+        // `Checkout::query` performs right after this call observes it — modelling an implicit
+        // commit's OK packet with SERVER_STATUS_IN_TRANS dropped.
+        if let Some(st) = self.tx_status_after_query.lock().unwrap().take() {
+            conn.tx_status = st;
         }
         Ok(self.canned_query.lock().unwrap().clone())
     }

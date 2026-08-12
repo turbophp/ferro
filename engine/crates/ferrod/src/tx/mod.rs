@@ -158,12 +158,31 @@ pub enum ExecReply {
     Completed {
         result: Result<QueryResult, PoolError>,
         exec_us: u64,
+        /// M1-S9a (finding 1): earlier statements of THIS transaction have already persisted — the
+        /// actor either OBSERVED it (the authority `Checkout::tx_open()` read false after a
+        /// completed statement: a MySQL implicit commit ended the tx behind the client's back) or
+        /// must ASSUME it (the in-flight statement was itself implicit-commit-shaped, whose
+        /// pre-commit fires BEFORE execution, so no protocol signal can ever arrive for a loss).
+        /// The handler threads it into `OpContext.tx_writes_persisted`, which makes
+        /// `branch::RETRYABLE` unmintable — a partially committed tx must never be replayed.
+        ///
+        /// It is the value as of DISPATCH of this statement, deliberately: the post-statement
+        /// authority read is meaningless on the `Err` arm (the Rule-A fail-safe force-sets
+        /// `tx_open = true` on ANY error), so what a FAILING statement must be classified against
+        /// is what was known before it ran.
+        tx_writes_persisted: bool,
     },
     /// A transaction deadline fired mid-statement: the actor cancelled the server statement
     /// out-of-band, drained the query future to its erroring completion, and is rolling back +
     /// tombstoning. The handler declares ONE `TxDeadline{Retryable}` terminal — the statement is
     /// NEVER re-run (charter rule 3).
-    Deadline,
+    Deadline {
+        /// Same flag, same meaning as on [`ExecReply::Completed`]. This exit BYPASSES
+        /// `classify_fate` entirely (the handler builds its payload directly), so the Task-7
+        /// post-filter cannot cover it: the handler answers `fate::persisted_tx_payload()` instead
+        /// of `TxDeadline{Retryable}` when this is set.
+        tx_writes_persisted: bool,
+    },
 }
 
 /// The actor's reply to a tx-control [`TxCommand`] (`Commit`/`Rollback`/`Savepoint`/`Release`/
@@ -220,7 +239,13 @@ pub enum TxLookupErr {
     /// The caller's OWN transaction was torn down by a deadline (`TxDeadline`). Distinct from
     /// `NotFoundOrForbidden` so a timed-out tx is reported to its owner as a retryable
     /// `TxDeadline`, not an opaque `Protocol`.
-    Tombstoned,
+    Tombstoned {
+        /// M1-S9a (finding 1): the torn-down transaction had already persisted earlier writes (a
+        /// MySQL implicit commit). A tombstone answers every LATER op on the dead `tx_id`, so it
+        /// is a replay license exactly as much as the in-flight terminal is: when set, the mapping
+        /// sites answer `fate::persisted_tx_payload()` rather than `TxDeadline{Retryable}`.
+        tx_writes_persisted: bool,
+    },
 }
 
 /// A registry entry: either a live actor's control surface, or a tombstone left by a deadline.
@@ -231,6 +256,9 @@ enum TxEntry {
     /// `NotFoundOrForbidden` an unknown id yields).
     Tombstoned {
         owner: SessionId,
+        /// M1-S9a: carried from the actor's persisted latch at teardown, so a LATER op on this dead
+        /// `tx_id` is answered with the same non-replayable terminal the in-flight statement got.
+        tx_writes_persisted: bool,
     },
 }
 
@@ -238,7 +266,7 @@ impl TxEntry {
     fn owner(&self) -> SessionId {
         match self {
             TxEntry::Active(h) => h.owner,
-            TxEntry::Tombstoned { owner } => *owner,
+            TxEntry::Tombstoned { owner, .. } => *owner,
         }
     }
 }
@@ -316,10 +344,20 @@ impl TxRegistry {
     /// OLDEST one (a very old timed-out id then degrades from `Tombstoned` → `NotFoundOrForbidden`
     /// on its owner's next touch — acceptable, see the const's doc), so a long-lived session that
     /// times out many transactions can never accumulate tombstones without bound.
-    pub fn tombstone(&self, tx_id: u64) {
+    /// `tx_writes_persisted` (M1-S9a) travels from the actor's latch into the tombstone, so every
+    /// later touch of the dead id is answered with the same non-replayable terminal the in-flight
+    /// statement received. Passing `false` for a transaction that HAD persisted would re-open the
+    /// blocker one lookup later.
+    pub fn tombstone(&self, tx_id: u64, tx_writes_persisted: bool) {
         let t = &mut *self.inner.txs.lock().unwrap();
         if let Some(owner) = t.map.get(&tx_id).map(TxEntry::owner) {
-            t.map.insert(tx_id, TxEntry::Tombstoned { owner });
+            t.map.insert(
+                tx_id,
+                TxEntry::Tombstoned {
+                    owner,
+                    tx_writes_persisted,
+                },
+            );
             t.tombstone_order.push_back(tx_id);
             // Evict oldest-first until back within the cap. Skip (but still drop from the order
             // deque) any id that is no longer a live tombstone — already purged by a session abort,
@@ -343,7 +381,12 @@ impl TxRegistry {
         let txs = self.inner.txs.lock().unwrap();
         match txs.map.get(&tx_id) {
             Some(TxEntry::Active(h)) if h.owner == caller => Ok(h.clone()),
-            Some(TxEntry::Tombstoned { owner }) if *owner == caller => Err(TxLookupErr::Tombstoned),
+            Some(TxEntry::Tombstoned {
+                owner,
+                tx_writes_persisted,
+            }) if *owner == caller => Err(TxLookupErr::Tombstoned {
+                tx_writes_persisted: *tx_writes_persisted,
+            }),
             _ => Err(TxLookupErr::NotFoundOrForbidden),
         }
     }
@@ -492,11 +535,16 @@ mod tests {
         let other = reg.next_session_id();
 
         reg.register(7, dummy_handle(owner));
-        reg.tombstone(7);
+        reg.tombstone(7, false);
 
         // The owner sees Tombstoned (→ TxDeadline); anyone else sees NotFoundOrForbidden (→
         // Protocol), indistinguishable from an unknown id — a tombstone never leaks across sessions.
-        assert_eq!(reg.lookup(7, owner).unwrap_err(), TxLookupErr::Tombstoned);
+        assert_eq!(
+            reg.lookup(7, owner).unwrap_err(),
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
+        );
         assert_eq!(
             reg.lookup(7, other).unwrap_err(),
             TxLookupErr::NotFoundOrForbidden
@@ -504,7 +552,7 @@ mod tests {
 
         // Deregister then a re-tombstone of a gone id is a no-op (stays gone, not resurrected).
         reg.deregister(7);
-        reg.tombstone(7);
+        reg.tombstone(7, false);
         assert_eq!(
             reg.lookup(7, owner).unwrap_err(),
             TxLookupErr::NotFoundOrForbidden
@@ -516,8 +564,13 @@ mod tests {
         let reg = TxRegistry::new(Duration::from_secs(5));
         let owner = reg.next_session_id();
         reg.register(1, dummy_handle(owner));
-        reg.tombstone(1); // a timed-out tx this session left behind
-        assert_eq!(reg.lookup(1, owner).unwrap_err(), TxLookupErr::Tombstoned);
+        reg.tombstone(1, false); // a timed-out tx this session left behind
+        assert_eq!(
+            reg.lookup(1, owner).unwrap_err(),
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
+        );
 
         reg.abort_session(owner).await;
         // The tombstone is purged with the session (no per-session leak).
@@ -535,20 +588,25 @@ mod tests {
         // Fill exactly to the cap: all CAP tombstones are retained.
         for id in 1..=TOMBSTONE_CAP as u64 {
             reg.register(id, dummy_handle(owner));
-            reg.tombstone(id);
+            reg.tombstone(id, false);
         }
         assert_eq!(
             reg.inner.txs.lock().unwrap().map.len(),
             TOMBSTONE_CAP,
             "the map holds exactly CAP tombstones at the cap"
         );
-        assert_eq!(reg.lookup(1, owner).unwrap_err(), TxLookupErr::Tombstoned);
+        assert_eq!(
+            reg.lookup(1, owner).unwrap_err(),
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
+        );
 
         // One more tombstone pushes over the cap → the OLDEST (id 1) is evicted; the map stays
         // bounded at CAP (a long-lived session that times out many txs cannot grow it unboundedly).
         let extra = TOMBSTONE_CAP as u64 + 1;
         reg.register(extra, dummy_handle(owner));
-        reg.tombstone(extra);
+        reg.tombstone(extra, false);
         assert_eq!(
             reg.inner.txs.lock().unwrap().map.len(),
             TOMBSTONE_CAP,
@@ -562,10 +620,17 @@ mod tests {
             TxLookupErr::NotFoundOrForbidden,
             "the oldest tombstone is evicted"
         );
-        assert_eq!(reg.lookup(2, owner).unwrap_err(), TxLookupErr::Tombstoned);
+        assert_eq!(
+            reg.lookup(2, owner).unwrap_err(),
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
+        );
         assert_eq!(
             reg.lookup(extra, owner).unwrap_err(),
-            TxLookupErr::Tombstoned
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
         );
     }
 }

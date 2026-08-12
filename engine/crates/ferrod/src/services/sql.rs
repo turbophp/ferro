@@ -311,7 +311,11 @@ async fn handle_exec(
                 return;
             }
             match reply_rx.await {
-                Ok(ExecReply::Completed { result, exec_us }) => match result {
+                Ok(ExecReply::Completed {
+                    result,
+                    exec_us,
+                    tx_writes_persisted,
+                }) => match result {
                     // queue_us is 0: a pinned conn is never queued for.
                     Ok(qr) => match build_terminal_body(qr, req.fetch, 0, exec_us) {
                         Ok(body) => responder.end_ok(Bytes::from(body)),
@@ -330,20 +334,22 @@ async fn handle_exec(
                             readonly: req.readonly,
                             sent: true,
                             in_tx: true,
-                            // M1-S9a Task 7: the field lands inert here (`false` = the pre-S9a
-                            // behavior, verbatim). Task 8 threads the LIVE value off the actor's
-                            // persisted latch — this is one of exactly two sites where it can ever
-                            // be `true`.
-                            tx_writes_persisted: false,
+                            // M1-S9a Task 8: the LIVE value off the actor's persisted latch (the
+                            // protocol authority `Checkout::tx_open()` read after a completed
+                            // statement) or its pre-dispatch implicit-commit hazard. When set, the
+                            // Task-7 post-filter makes `branch::RETRYABLE` unmintable for this
+                            // terminal — "the whole tx is dead, so replaying it is safe" is a LIE
+                            // once earlier statements of the transaction have durably committed.
+                            tx_writes_persisted,
                         },
                     )),
                 },
-                // A deadline cancelled the statement mid-flight → the ONE TxDeadline terminal. The
-                // statement is never re-run (charter rule 3).
-                Ok(ExecReply::Deadline) => responder.end_error(tx_deadline(
-                    "transaction deadline exceeded mid-statement; the statement was cancelled and \
-                     the transaction rolled back (retryable — the engine never re-runs)",
-                )),
+                // A deadline cancelled the statement mid-flight → the ONE terminal. The statement
+                // is never re-run (charter rule 3). `deadline_terminal` picks between the classic
+                // `TxDeadline{Retryable}` and the M1-S9a persisted-tx payload.
+                Ok(ExecReply::Deadline {
+                    tx_writes_persisted,
+                }) => responder.end_error(deadline_terminal(tx_writes_persisted)),
                 Err(_recv) => {
                     responder.end_error(actor_gone_terminal(tx_registry, tx_id, session_id))
                 }
@@ -749,6 +755,7 @@ async fn run_autocommit_streamed<B: PoolBackend>(
 /// NATURAL non-`57014` open error (a syntax/bind fault) leaves the tx OPEN — `query_stream`'s Err arm
 /// already finalized+tainted it, and the client may `ROLLBACK` itself, mirroring the buffered
 /// non-cancel statement-error path — so it is NOT forced to `Broken`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tx_streamed<B: PoolBackend>(
     co: &mut Checkout<B>,
     sql: &str,
@@ -757,6 +764,7 @@ pub(crate) async fn run_tx_streamed<B: PoolBackend>(
     cancel: &CancellationToken,
     deadline: Option<tokio::time::Instant>,
     readonly: bool,
+    tx_writes_persisted: bool,
 ) -> StreamEnded {
     // Two out-of-band cancel handles captured BEFORE the stream borrows `co` (each owned, firing the
     // SAME connection's cancel): one for the OPEN race, one for the pull→send loop. Identical
@@ -769,9 +777,11 @@ pub(crate) async fn run_tx_streamed<B: PoolBackend>(
         readonly,
         sent: true,
         in_tx: true,
-        // M1-S9a Task 7: inert here (`false` = the pre-S9a behavior, verbatim). Task 8 threads the
-        // actor's live persisted latch into this ctx — the second of the two in-tx statement sites.
-        tx_writes_persisted: false,
+        // M1-S9a Task 8: the actor's pre-dispatch view (its latched persisted state OR this
+        // statement's own implicit-commit hazard) — the second of the two in-tx statement sites
+        // where the flag can be `true`. Fixed at OPEN, deliberately: a streamed statement lost
+        // mid-flight has no trustworthy post-statement authority read to fall back on.
+        tx_writes_persisted,
     };
 
     // The open-race + loop live in a block confining every co-BORROWING value (the raced handle), so
@@ -1481,7 +1491,15 @@ fn resolve_active(
         Err(TxLookupErr::NotFoundOrForbidden) => Err(protocol(
             "unknown or forbidden tx_id (committed, rolled back, aborted, or another session's)",
         )),
-        Err(TxLookupErr::Tombstoned) => Err(tx_deadline(
+        // M1-S9a: a tombstone answers every LATER op on the dead id, so it is a replay license
+        // exactly as much as the in-flight terminal is — the partially-committed case must answer
+        // the same non-replayable terminal, never `Retryable`.
+        Err(TxLookupErr::Tombstoned {
+            tx_writes_persisted: true,
+        }) => Err(fate::persisted_tx_payload()),
+        Err(TxLookupErr::Tombstoned {
+            tx_writes_persisted: false,
+        }) => Err(tx_deadline(
             "transaction deadline exceeded; the pinned connection was rolled back and released \
              (retryable — the engine never re-runs)",
         )),
@@ -1529,7 +1547,14 @@ fn actor_gone_terminal(
     session_id: SessionId,
 ) -> ErrorPayload {
     match tx_registry.lookup(tx_id, session_id) {
-        Err(TxLookupErr::Tombstoned) => tx_deadline(
+        // M1-S9a: same split as `resolve_active` — a partially committed transaction's tombstone
+        // may never hand back a replay license on this recovery path either.
+        Err(TxLookupErr::Tombstoned {
+            tx_writes_persisted: true,
+        }) => fate::persisted_tx_payload(),
+        Err(TxLookupErr::Tombstoned {
+            tx_writes_persisted: false,
+        }) => tx_deadline(
             "transaction deadline exceeded; the pinned connection was rolled back and released \
              (retryable — the engine never re-runs)",
         ),
@@ -1667,6 +1692,25 @@ pub(crate) fn tx_deadline(message: impl Into<String>) -> ErrorPayload {
         message: message.into(),
         detail: None,
         retry_after_ms: None,
+    }
+}
+
+/// The terminal for an in-tx deadline/cancel exit ([`ExecReply::Deadline`]) — the ONE in-tx path
+/// that BYPASSES `fate::classify_fate` (it never sees a `PoolError`: the actor already cancelled and
+/// drained the statement), so the M1-S9a Task-7 post-filter cannot cover it and the choice is made
+/// here instead.
+///
+/// Persisted ⇒ `fate::persisted_tx_payload()` — the SAME single mint the filter uses, so the wording
+/// and the (code, branch) pair can never fork; otherwise the classic `TxDeadline{Retryable}`. A pure
+/// fn precisely so the choice is falsifiable without a `Responder`.
+fn deadline_terminal(tx_writes_persisted: bool) -> ErrorPayload {
+    if tx_writes_persisted {
+        fate::persisted_tx_payload()
+    } else {
+        tx_deadline(
+            "transaction deadline exceeded mid-statement; the statement was cancelled and the \
+             transaction rolled back (retryable — the engine never re-runs)",
+        )
     }
 }
 
@@ -1843,6 +1887,26 @@ mod tests {
         }
     }
 
+    /// M1-S9a Task 8: the `ExecReply::Deadline` terminal choice. This is the ONE in-tx exit that
+    /// bypasses `classify_fate` entirely (it builds its payload directly), so the Task-7 post-filter
+    /// cannot cover it and it needs its own pin: persisted ⇒ the persisted payload (never
+    /// Retryable); otherwise the classic `TxDeadline{Retryable}`.
+    ///
+    /// Why a pure fn rather than an assertion through a `Responder`: the live acceptance's loss is a
+    /// KILL, i.e. `Completed(Err)` via `classify_fate`, so it can never exercise this arm, and the
+    /// actor-side hazard test asserts the REPLY, not the wire choice made from it.
+    #[test]
+    fn persisted_deadline_reply_maps_to_the_persisted_payload() {
+        let p = deadline_terminal(true);
+        assert_eq!(p.code, errc::WRITE_UNCONFIRMED);
+        assert_eq!(p.branch, branch::INDETERMINATE);
+        assert!(p.message.contains("implicit commit"), "got: {}", p.message);
+
+        let d = deadline_terminal(false);
+        assert_eq!(d.code, errc::TX_DEADLINE);
+        assert_eq!(d.branch, branch::RETRYABLE);
+    }
+
     /// A `TxDeadline` terminal is `0x1003 / Retryable` — the retry is client policy; the engine
     /// never re-runs (charter rule 3).
     #[test]
@@ -1876,10 +1940,25 @@ mod tests {
         );
 
         // The owner's tombstone → TxDeadline{Retryable}.
-        reg.tombstone(1);
+        reg.tombstone(1, false);
         let ep = resolve_active(&reg, 1, owner).unwrap_err();
         assert_eq!(ep.code, errc::TX_DEADLINE);
         assert_eq!(ep.branch, branch::RETRYABLE);
+
+        // M1-S9a Task 8: a tombstone left by a PARTIALLY COMMITTED transaction answers every later
+        // op with the persisted payload instead — the tombstone is a replay license just as much as
+        // the in-flight terminal is, and `Retryable` there would re-open the blocker one lookup
+        // later.
+        reg.register(2, dummy_handle(owner));
+        reg.tombstone(2, true);
+        let ep = resolve_active(&reg, 2, owner).unwrap_err();
+        assert_eq!(ep.code, errc::WRITE_UNCONFIRMED);
+        assert_eq!(ep.branch, branch::INDETERMINATE);
+        assert!(
+            ep.message.contains("implicit commit"),
+            "got: {}",
+            ep.message
+        );
     }
 
     /// `actor_gone_terminal` (send-Err / recv-Err mid-teardown): a now-tombstoned id → `TxDeadline`,
@@ -1894,10 +1973,18 @@ mod tests {
 
         // Actor gone + id tombstoned (deadline raced the send) → TxDeadline.
         reg.register(7, dummy_handle(owner));
-        reg.tombstone(7);
+        reg.tombstone(7, false);
         let ep = actor_gone_terminal(&reg, 7, owner);
         assert_eq!(ep.code, errc::TX_DEADLINE);
         assert_eq!(ep.branch, branch::RETRYABLE);
+
+        // M1-S9a Task 8: same recovery path, but the tx had already persisted earlier writes — the
+        // prompt terminal must be the persisted payload, never a replay license.
+        reg.register(8, dummy_handle(owner));
+        reg.tombstone(8, true);
+        let ep = actor_gone_terminal(&reg, 8, owner);
+        assert_eq!(ep.code, errc::WRITE_UNCONFIRMED);
+        assert_eq!(ep.branch, branch::INDETERMINATE);
     }
 
     /// `declare_ctl` reply → terminal mapping, including the COMMIT-loss §19.3 case. Exercises the

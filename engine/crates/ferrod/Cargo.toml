@@ -13,6 +13,12 @@ workspace = true
 [dependencies]
 ferro-proto = { path = "../ferro-proto" }
 ferro-pool = { path = "../ferro-pool" }
+# M1-S9a Task 8: `tx/actor.rs` calls `ferro_classify::implicit_commit_hazard` directly — the
+# PRE-dispatch assist for the one case no protocol signal can ever report (MySQL's implicit commit
+# fires BEFORE the statement executes, so a statement lost mid-flight may already be past the commit
+# point). The crate is already in the build graph via `ferro-pool` (which re-exports its `Dialect`);
+# this edge only makes the function nameable here.
+ferro-classify = { path = "../ferro-classify" }
 ferro-backend-pg = { path = "../ferro-backend-pg" }
 ferro-backend-mysql = { path = "../ferro-backend-mysql" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "signal", "macros", "io-util", "time"] }

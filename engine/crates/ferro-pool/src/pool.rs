@@ -386,6 +386,16 @@ impl<B: PoolBackend> Checkout<B> {
         self.tx_open
     }
 
+    /// The backend's SQL dialect (the assist lexer's [`crate::backend::Dialect`]) — exposed so a
+    /// caller that owns this `Checkout` can consult dialect-scoped PRE-dispatch assists before it
+    /// dispatches a statement (M1-S9a: `ferro_classify::implicit_commit_hazard`, the tx actor's
+    /// hazard mark for a statement whose MySQL implicit commit may fire before any loss the
+    /// protocol could report). Exactly the expression [`Checkout::apply_classify`] already uses
+    /// internally; it reads a per-backend constant and touches no connection state.
+    pub fn dialect(&self) -> crate::backend::Dialect {
+        self.pool.backend.dialect()
+    }
+
     /// Whether this connection needs a hygiene reset before reuse (an aborted tx `E`, or ANY error
     /// on an instrumented statement). Set by `apply_tx_status(Failed)` and — as the Rule-A
     /// fail-safe — UNCONDITIONALLY on any `Err` arm (alongside `tx_open`), since the Err-arm RFQ

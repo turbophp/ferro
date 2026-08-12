@@ -346,3 +346,121 @@ async fn mysql_in_tx_link_loss_is_connection_lost_retryable_never_indeterminate(
         );
     }
 }
+
+/// M1-S9a Task 8 — THE measured at-least-once shape, now honestly reported. `BEGIN → INSERT →
+/// CREATE TABLE` (the implicit commit: the INSERT persists, with no COMMIT ever sent) `→ a later
+/// statement killed mid-flight`. The OLD engine answered `CONNECTION_LOST{Retryable}` — "the
+/// transaction was rolled back, replaying it is safe" — licensing a replay that double-applies the
+/// INSERT that is already durably there. The terminal must now be `WRITE_UNCONFIRMED{Indeterminate}`
+/// naming the implicit commit, and the read-back over a FRESH checkout proves WHY.
+///
+/// The sibling above is the control that keeps this honest: the SAME kill on a plain-DML
+/// transaction still answers `CONNECTION_LOST{Retryable}`, because nothing persisted there. The
+/// latch/hazard fire only on implicit-commit shapes; they do not swallow the §19.3 in-tx branch.
+///
+/// Runs against MySQL 8 AND MariaDB 11 — the implicit commit is a family behaviour, and so is the
+/// blocker.
+#[tokio::test]
+async fn mysql_in_tx_loss_after_an_implicit_commit_is_indeterminate_never_retryable() {
+    let targets = mysql_targets();
+    if targets.is_empty() {
+        return;
+    }
+    for (label, url) in targets {
+        eprintln!("--- in-tx loss after an implicit commit: {label} ---");
+        let mut side = raw_mysql(&url).await;
+        let server = exec_server(url);
+        let mut c = server.connect().await;
+        c.hello(1).await;
+
+        exec_ok(
+            &mut c,
+            2,
+            &write_req(&format!(
+                "CREATE TABLE IF NOT EXISTS {TABLE} (k VARCHAR(128) PRIMARY KEY, n INT NOT NULL)"
+            )),
+        )
+        .await;
+        let key = unique_key("my_ic");
+        let ddl_table = unique_key("ferro_s9a_ic");
+
+        let tx_id = begin(&mut c, 3, "default", None, false).await;
+        exec_ok(
+            &mut c,
+            4,
+            &tx_req(&format!("INSERT INTO {TABLE} VALUES ('{key}', 1)"), tx_id),
+        )
+        .await;
+        // The implicit commit: a real DDL inside the explicit transaction. MySQL/MariaDB commit the
+        // open transaction BEFORE executing it, and the OK packet comes back with
+        // SERVER_STATUS_IN_TRANS dropped — the signal the actor's latch reads.
+        exec_ok(
+            &mut c,
+            5,
+            &tx_req(&format!("CREATE TABLE {ddl_table} (x INT)"), tx_id),
+        )
+        .await;
+
+        // Kill the pinned conn while a LATER statement is provably EXECUTING (the Task-1 machinery:
+        // string-literal marker + COMMAND filter). This statement is NOT itself hazard-shaped, so
+        // the ONLY thing that can mark the tx persisted is the latch the DDL armed.
+        let marker = unique_key("my_ic_kill");
+        let victim = tx_req(
+            &format!("SELECT SLEEP(20) FROM DUAL WHERE '{marker}' <> ''"),
+            tx_id,
+        );
+        c.send_request(6, service::SQL, method_sql::EXEC, victim.encode())
+            .await;
+        let id = wait_for_active_conn(&mut side, &marker).await;
+        {
+            use mysql_async::prelude::Queryable;
+            side.query_drop(format!("KILL {id}")).await.expect("KILL");
+        }
+
+        let t = c.recv().await;
+        assert_eq!(t.header.request_id, 6);
+        assert_eq!(t.header.flags & flags::END, flags::END);
+        let ep = match Outcome::decode(&t.payload).expect("decode Outcome") {
+            Outcome::Error(ep) => ep,
+            other => panic!("[{label}] expected Outcome::Error, got {other:?}"),
+        };
+        assert_eq!(
+            ep.code,
+            errc::WRITE_UNCONFIRMED,
+            "[{label}] a loss after an implicit commit must be Indeterminate — Retryable here \
+             licenses the measured double-apply. got {:#06x}: {}",
+            ep.code,
+            ep.message
+        );
+        assert_eq!(ep.branch, branch::INDETERMINATE, "[{label}]");
+        assert!(
+            ep.message.contains("implicit commit"),
+            "[{label}] the terminal must name the mechanism, got: {}",
+            ep.message
+        );
+
+        // WHY Retryable would have been a lie: the pre-DDL INSERT persisted, no COMMIT ever sent.
+        let ok = exec_ok(
+            &mut c,
+            7,
+            &req(&format!(
+                "SELECT CAST(count(*) AS SIGNED) FROM {TABLE} WHERE k = '{key}'"
+            )),
+        )
+        .await;
+        assert_eq!(
+            ok.rows[0][0],
+            Value::I64(1),
+            "[{label}] the implicit commit durably applied the pre-DDL INSERT — this is the \
+             at-least-once mechanism the terminal above must confess to"
+        );
+
+        // Cleanup the per-run DDL table (autocommit).
+        exec_ok(
+            &mut c,
+            8,
+            &write_req(&format!("DROP TABLE IF EXISTS {ddl_table}")),
+        )
+        .await;
+    }
+}

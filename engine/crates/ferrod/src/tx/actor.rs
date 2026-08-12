@@ -245,6 +245,19 @@ pub async fn run<B: PoolBackend>(
 
     let mut sp = SavepointStack::new();
 
+    // M1-S9a (finding 1): has THIS transaction already persisted anything?
+    //
+    // Latched from the protocol AUTHORITY — `co.tx_open()` reading false after a statement
+    // COMPLETED SUCCESSFULLY means the transaction ended behind the client's back, which inside an
+    // actor-owned tx can only be a MySQL/MariaDB implicit commit (DDL, LOCK TABLES, SET autocommit,
+    // …, which commit BEFORE they execute). On PostgreSQL this can never happen (DDL is
+    // transactional), so the flag stays false there for the tx's whole life.
+    //
+    // MONOTONIC: once true it never goes back to false. A later `START TRANSACTION`-less statement
+    // runs on a de-facto autocommit connection, and everything before the implicit commit is
+    // durable no matter what happens next — so no subsequent observation can withdraw the fact.
+    let mut tx_writes_persisted = false;
+
     let end: TxEnd = 'actor: loop {
         let cmd = tokio::select! {
             biased;
@@ -329,6 +342,28 @@ pub async fn run<B: PoolBackend>(
                 // primitive that actually interrupts the SERVER statement; `cancel` below is the
                 // per-request SIGNAL that we should do so.
                 let cancel_handle = co.cancel_handle();
+                // M1-S9a (finding 1) — the PRE-DISPATCH hazard, and the ONE value every terminal
+                // of this statement is classified against.
+                //
+                // WHICH VALUE A FAILING STATEMENT OBSERVES is the whole subtlety here. The pin
+                // state is written AFTER a statement completes, and on the Err arm `Checkout`'s
+                // Rule-A fail-safe force-sets `tx_open = true` unconditionally — so reading the
+                // authority after a failure can only ever say "still in a transaction", which is
+                // exactly the wrong answer for the case this fix exists for. What a failing
+                // statement must be judged against is therefore the PRE-DISPATCH view captured
+                // here: what was already known to have persisted, OR the assumption forced by this
+                // statement's own shape.
+                //
+                // The shape assist (`ferro_classify::implicit_commit_hazard`, MySQL-dialect only)
+                // covers the case no protocol signal can ever reach us: MySQL's implicit commit
+                // fires BEFORE the statement executes, so a statement LOST mid-flight may already
+                // be past the commit point with no OK packet ever arriving. It is
+                // assist-not-authority in the S2 sense — it can only make a loss MORE conservative
+                // (Retryable → Indeterminate), never less — and the authority below corrects a
+                // false positive the moment the statement COMPLETES, so a lexical false positive
+                // costs exactly one conservative Indeterminate, and only if the statement is lost.
+                let hazard = tx_writes_persisted
+                    || ferro_classify::implicit_commit_hazard(&sql, co.dialect());
                 let exec_start = std::time::Instant::now();
                 // M1-S1: `co.query` (`ferro-pool`'s `Checkout::query`) reads the real RFQ status byte
                 // after this statement drains and calls `apply_tx_status`, so a clean success/failure
@@ -341,75 +376,134 @@ pub async fn run<B: PoolBackend>(
                 // `ferro-backend-pg/tests/pg_pool_it.rs`'s `pg_rfq_failed_stmt_holds_pin_until_rollback`
                 // states the same caveat). `teardown`'s own `set_tainted(true)` (below) stays
                 // belt-and-braces on top of that fail-safe, not the sole mechanism.
-                let query_fut = co.query(&sql, &params);
-                tokio::pin!(query_fut);
+                //
+                // M1-S9a: the pinned query future's `&mut co` borrow lives until its DESTRUCTOR
+                // runs, so it is confined to this block — the post-statement AUTHORITY read
+                // (`co.tx_open()`, an immutable borrow) is taken after the block, on the one path
+                // where it is trustworthy. The block's value is "did the statement complete
+                // cleanly"; every other path leaves the actor loop from inside it.
+                let completed_ok = {
+                    let query_fut = co.query(&sql, &params);
+                    tokio::pin!(query_fut);
 
-                let step = tokio::select! {
-                    biased;
+                    let step = tokio::select! {
+                        biased;
 
-                    // Prefer completion over interruption if both are ready in the same poll, so a
-                    // statement that just finished is never spuriously reported as a deadline.
-                    r = &mut query_fut => {
-                        ExecStep::Completed(r, exec_start.elapsed().as_micros() as u64)
-                    }
-                    () = &mut max_deadline => ExecStep::Deadline,
-                    () = abort.cancelled() => ExecStep::Abort,
-                    // M1-S4 Task 3: the per-STATEMENT `ExecRequest.timeout_ms` deadline and the
-                    // per-REQUEST CANCEL token. Both resolve to the SAME `ExecStep::Deadline` the
-                    // actor's own absolute `max_tx` timer uses below — a client cancel/timeout
-                    // in-tx gets the identical cancel -> drain -> ROLLBACK -> tombstone ->
-                    // `TxDeadline{Retryable}` treatment (§19.3: the safe uniform in-tx action is
-                    // roll back; the client restarts), never the `Abort` (drop-reply, no fate)
-                    // path — that stays reserved for the session-level `abort` above.
-                    () = sleep_opt(timeout_ms) => ExecStep::Deadline,
-                    () = cancel.cancelled() => ExecStep::Deadline,
-                };
+                        // Prefer completion over interruption if both are ready in the same poll, so a
+                        // statement that just finished is never spuriously reported as a deadline.
+                        r = &mut query_fut => {
+                            ExecStep::Completed(r, exec_start.elapsed().as_micros() as u64)
+                        }
+                        () = &mut max_deadline => ExecStep::Deadline,
+                        () = abort.cancelled() => ExecStep::Abort,
+                        // M1-S4 Task 3: the per-STATEMENT `ExecRequest.timeout_ms` deadline and the
+                        // per-REQUEST CANCEL token. Both resolve to the SAME `ExecStep::Deadline` the
+                        // actor's own absolute `max_tx` timer uses below — a client cancel/timeout
+                        // in-tx gets the identical cancel -> drain -> ROLLBACK -> tombstone ->
+                        // `TxDeadline{Retryable}` treatment (§19.3: the safe uniform in-tx action is
+                        // roll back; the client restarts), never the `Abort` (drop-reply, no fate)
+                        // path — that stays reserved for the session-level `abort` above.
+                        () = sleep_opt(timeout_ms) => ExecStep::Deadline,
+                        () = cancel.cancelled() => ExecStep::Deadline,
+                    };
 
-                match step {
-                    ExecStep::Completed(result, exec_us) => {
-                        // An app-set `statement_timeout` (or any other bare 57014) can resolve
-                        // through the query's OWN completion rather than any select arm above —
-                        // PG has already aborted the tx block on this error exactly like a
-                        // mid-statement deadline would (the next statement would see 25P02), so it
-                        // MUST take the SAME rollback+tombstone+TxDeadline exit, not be forwarded
-                        // as a statement error the client might mistake for retry-in-place-able.
-                        // No cancel_handle fire / drain needed: the query already resolved on its
-                        // own. A NON-cancel statement error (e.g. 23505) is NOT touched here and
-                        // falls through to the ordinary `Completed` reply below, unchanged from
-                        // pre-M1-S4 behavior (no auto-rollback).
-                        if let Err(e) = &result
-                            && fate::is_57014(e)
-                        {
-                            let _ = reply.send(ExecReply::Deadline);
+                    match step {
+                        ExecStep::Completed(result, exec_us) => {
+                            // An app-set `statement_timeout` (or any other bare 57014) can resolve
+                            // through the query's OWN completion rather than any select arm above —
+                            // PG has already aborted the tx block on this error exactly like a
+                            // mid-statement deadline would (the next statement would see 25P02), so it
+                            // MUST take the SAME rollback+tombstone+TxDeadline exit, not be forwarded
+                            // as a statement error the client might mistake for retry-in-place-able.
+                            // No cancel_handle fire / drain needed: the query already resolved on its
+                            // own. A NON-cancel statement error (e.g. 23505) is NOT touched here and
+                            // falls through to the ordinary `Completed` reply below, unchanged from
+                            // pre-M1-S4 behavior (no auto-rollback).
+                            if let Err(e) = &result
+                                && fate::is_57014(e)
+                            {
+                                // M1-S9a: this statement never confirmed, so the hazard stands; latch
+                                // it for the tombstone the teardown is about to write.
+                                if hazard {
+                                    tx_writes_persisted = true;
+                                }
+                                let _ = reply.send(ExecReply::Deadline {
+                                    tx_writes_persisted: hazard,
+                                });
+                                break 'actor TxEnd::Deadline;
+                            }
+                            // M1-S9a: an implicit-commit-shaped statement that ERRORED server-side had
+                            // its pre-commit fire BEFORE it ran, so the tx's earlier writes persisted
+                            // regardless — and the post-statement authority cannot say so (the Rule-A
+                            // fail-safe forces `tx_open = true` on ANY Err). The clean-completion case
+                            // is latched from the authority AFTER this block, where `co` is free again.
+                            let ok = result.is_ok();
+                            if !ok && hazard {
+                                tx_writes_persisted = true;
+                            }
+                            let _ = reply.send(ExecReply::Completed {
+                                result,
+                                exec_us,
+                                // The PRE-DISPATCH view (see `hazard` above): on the `Err` arm this is
+                                // what the fate call site must classify against; on `Ok` the handler
+                                // never consults it.
+                                tx_writes_persisted: hazard,
+                            });
+                            ok
+                        }
+                        ExecStep::Deadline => {
+                            // (1) fire the out-of-band cancel; (2) DRAIN the pinned future to its
+                            // now-erroring completion (do NOT drop it) so the conn is back at
+                            // ReadyForQuery; (3) reply the ONE TxDeadline terminal; teardown rolls back.
+                            //
+                            // This same exit now also serves the per-statement `timeout_ms` and
+                            // per-request `cancel` arms above: whichever of the three fired, the query
+                            // has definitely been dispatched (biased query-first), so draining before
+                            // replying is correct for all of them, including the raced-`Ok` case (the
+                            // cancel/timeout LOST the race to completion) — §19.3 says the client asked
+                            // to stop, so the safe uniform in-tx action is still roll back regardless of
+                            // whether the drained value is `Ok` or `Err`.
+                            cancel_handle.cancel().await;
+                            let _ = query_fut.await;
+                            // M1-S9a: an interrupted statement is by definition unconfirmed, so the
+                            // pre-dispatch hazard stands (the drained value is discarded and the
+                            // post-drain authority read would be the Err-arm forced `true` anyway).
+                            // Latch it so the tombstone this teardown writes carries the same answer.
+                            if hazard {
+                                tx_writes_persisted = true;
+                            }
+                            let _ = reply.send(ExecReply::Deadline {
+                                tx_writes_persisted: hazard,
+                            });
                             break 'actor TxEnd::Deadline;
                         }
-                        let _ = reply.send(ExecReply::Completed { result, exec_us });
+                        ExecStep::Abort => {
+                            cancel_handle.cancel().await;
+                            let _ = query_fut.await;
+                            // Same latch as the Deadline arm — this path declares no fate of its own
+                            // (the reply is dropped), but the teardown/drain below still answers any
+                            // queued statement, and must not license a replay either.
+                            if hazard {
+                                tx_writes_persisted = true;
+                            }
+                            // Drop the reply sender: the forwarding handler's recv returns `Err` and it
+                            // declares its one prompt terminal — the request still ends in exactly one END.
+                            drop(reply);
+                            break 'actor TxEnd::Abort;
+                        }
                     }
-                    ExecStep::Deadline => {
-                        // (1) fire the out-of-band cancel; (2) DRAIN the pinned future to its
-                        // now-erroring completion (do NOT drop it) so the conn is back at
-                        // ReadyForQuery; (3) reply the ONE TxDeadline terminal; teardown rolls back.
-                        //
-                        // This same exit now also serves the per-statement `timeout_ms` and
-                        // per-request `cancel` arms above: whichever of the three fired, the query
-                        // has definitely been dispatched (biased query-first), so draining before
-                        // replying is correct for all of them, including the raced-`Ok` case (the
-                        // cancel/timeout LOST the race to completion) — §19.3 says the client asked
-                        // to stop, so the safe uniform in-tx action is still roll back regardless of
-                        // whether the drained value is `Ok` or `Err`.
-                        cancel_handle.cancel().await;
-                        let _ = query_fut.await;
-                        let _ = reply.send(ExecReply::Deadline);
-                        break 'actor TxEnd::Deadline;
-                    }
-                    ExecStep::Abort => {
-                        cancel_handle.cancel().await;
-                        let _ = query_fut.await;
-                        // Drop the reply sender: the forwarding handler's recv returns `Err` and it
-                        // declares its one prompt terminal — the request still ends in exactly one END.
-                        drop(reply);
-                        break 'actor TxEnd::Abort;
-                    }
+                };
+
+                // M1-S9a (finding 1) — THE AUTHORITY, read at the one point it is trustworthy: a
+                // statement that COMPLETED CLEANLY, with its response fully drained, so
+                // `apply_tx_status` holds this statement's own terminating RFQ/OK-packet status. A
+                // `tx_open == false` here, inside an actor-owned transaction, means the transaction
+                // ended with no COMMIT ever sent — a MySQL/MariaDB implicit commit — and everything
+                // written before it is durable. Never read on the Err/interrupted paths: there the
+                // Rule-A fail-safe has forced `tx_open = true`, so the read would say "still in a
+                // transaction" for exactly the case this fix exists for; those paths use `hazard`.
+                if completed_ok && !co.tx_open() {
+                    tx_writes_persisted = true;
                 }
             }
             TxCommand::ExecStreamed {
@@ -447,11 +541,17 @@ pub async fn run<B: PoolBackend>(
                     None => max_instant,
                 });
 
+                // M1-S9a: the same pre-dispatch view the buffered arm computes, for the same
+                // reason — the producer's fate context is fixed at OPEN, and a streamed statement
+                // lost mid-flight has no post-statement authority read to fall back on.
+                let hazard = tx_writes_persisted
+                    || ferro_classify::implicit_commit_hazard(&sql, co.dialect());
+
                 // Stream off the pinned `co` via the SHARED producer (`in_tx: true`). It declares the
                 // ONE terminal itself (through the moved `responder`); we only learn whether the tx
                 // survives.
                 let ended = crate::services::sql::run_tx_streamed(
-                    &mut co, &sql, &params, responder, &child, deadline, readonly,
+                    &mut co, &sql, &params, responder, &child, deadline, readonly, hazard,
                 )
                 .await;
 
@@ -465,7 +565,14 @@ pub async fn run<B: PoolBackend>(
                     // The statement reached its own conclusion (clean drain, or a non-cancel error the
                     // client may still `ROLLBACK`): keep the tx OPEN, exactly like the buffered 23505
                     // path. Fall through to reset the idle deadline and process the next command.
-                    StreamEnded::Intact => {}
+                    StreamEnded::Intact => {
+                        // M1-S9a: the stream reached its own end, so the post-statement authority
+                        // is trustworthy here exactly as on the buffered Ok arm
+                        // (`RowStreamHandle::finish` ran the same post-drain `apply_tx_status`).
+                        if !co.tx_open() {
+                            tx_writes_persisted = true;
+                        }
+                    }
                     // §19.3 uniform in-tx action: the tx is dead. Preserve the S4 abort-vs-deadline
                     // DISTINCTION — a session `abort` deregisters (no fate: `TxEnd::Abort`), a request
                     // cancel / per-statement timeout / max-deadline TOMBSTONEs (`TxEnd::Deadline` →
@@ -475,6 +582,11 @@ pub async fn run<B: PoolBackend>(
                     // dying either way — `abort_session`'s final purge cleans a deregistered OR
                     // tombstoned entry identically).
                     StreamEnded::Broken => {
+                        // M1-S9a: interrupted/lost — the pre-dispatch hazard stands, and the
+                        // tombstone this teardown writes must carry it.
+                        if hazard {
+                            tx_writes_persisted = true;
+                        }
                         if abort.is_cancelled() {
                             break 'actor TxEnd::Abort;
                         }
@@ -491,14 +603,22 @@ pub async fn run<B: PoolBackend>(
             .reset(tokio::time::Instant::now() + idle_timeout);
     };
 
-    teardown(tx_id, co, end, &registry, teardown_timeout).await;
+    teardown(
+        tx_id,
+        co,
+        end,
+        &registry,
+        teardown_timeout,
+        tx_writes_persisted,
+    )
+    .await;
     // Drain any commands still BUFFERED in `cmd_rx` at teardown (the outer `select!` can `break` on a
     // teardown signal with commands received-but-not-yet-pulled). A buffered `ExecStreamed` MOVED its
     // `Responder` into the command, so dropping `cmd_rx` would drop that `Responder` UNDECLARED — the
     // supervisor would then synthesize a generic `Protocol{NonRetryable}`, diverging from the buffered
     // `Exec` sibling (whose handler recovers `actor_gone_terminal` = `TxDeadline{Retryable}` for the
     // torn-down tx). So declare the PRECISE tear-down terminal on each such `Responder` here.
-    drain_buffered_on_teardown(&mut cmd_rx, end);
+    drain_buffered_on_teardown(&mut cmd_rx, end, tx_writes_persisted);
     // Signal LAST — after the conn is back in the pool — so an `abort_session` awaiter that sees
     // `done` can rely on the connection already being released.
     let _ = done_tx.send(true);
@@ -521,7 +641,11 @@ pub async fn run<B: PoolBackend>(
 ///
 /// Buffered `Exec`/control commands are simply dropped: their handlers recover the correct fate
 /// themselves via their own reply-channel `Err` (`actor_gone_terminal`), unchanged.
-fn drain_buffered_on_teardown(cmd_rx: &mut mpsc::Receiver<TxCommand>, end: TxEnd) {
+fn drain_buffered_on_teardown(
+    cmd_rx: &mut mpsc::Receiver<TxCommand>,
+    end: TxEnd,
+    tx_writes_persisted: bool,
+) {
     cmd_rx.close();
     while let Ok(cmd) = cmd_rx.try_recv() {
         if let TxCommand::ExecStreamed {
@@ -529,6 +653,13 @@ fn drain_buffered_on_teardown(cmd_rx: &mut mpsc::Receiver<TxCommand>, end: TxEnd
         } = cmd
         {
             let ep = match end {
+                // M1-S9a: "the tx will never commit, so replaying it is safe" is FALSE once earlier
+                // statements of this transaction have persisted — the queued statement's own fate
+                // is still known (it never ran), but the terminal a client acts on describes the
+                // TRANSACTION, and that one must not be replayed.
+                TxEnd::Deadline | TxEnd::Abort if tx_writes_persisted => {
+                    crate::services::fate::persisted_tx_payload()
+                }
                 TxEnd::Deadline | TxEnd::Abort => crate::services::sql::tx_deadline(
                     "transaction torn down before this queued streamed statement ran \
                      (retryable — the engine never re-runs)",
@@ -578,6 +709,7 @@ async fn teardown<B: PoolBackend>(
     end: TxEnd,
     registry: &TxRegistry,
     teardown_timeout: Duration,
+    tx_writes_persisted: bool,
 ) {
     match end {
         // COMMIT/ROLLBACK already ran; nothing more to do to the conn.
@@ -605,7 +737,9 @@ async fn teardown<B: PoolBackend>(
     drop(co);
 
     match end {
-        TxEnd::Deadline => registry.tombstone(tx_id),
+        // M1-S9a: the tombstone carries the persisted latch, so every LATER op on this dead `tx_id`
+        // is answered with the same non-replayable terminal the in-flight statement received.
+        TxEnd::Deadline => registry.tombstone(tx_id, tx_writes_persisted),
         TxEnd::Ended | TxEnd::Abort => registry.deregister(tx_id),
     }
 }
@@ -908,7 +1042,12 @@ mod tests {
             .await
             .expect("the actor replies, never drops silently");
         assert!(
-            matches!(reply, ExecReply::Deadline),
+            matches!(
+                reply,
+                ExecReply::Deadline {
+                    tx_writes_persisted: false
+                }
+            ),
             "a mid-statement deadline yields exactly one TxDeadline terminal, got {reply:?}"
         );
 
@@ -916,7 +1055,9 @@ mod tests {
         done_rx.wait_for(|t| *t).await.expect("actor tears down");
         assert_eq!(
             registry.lookup(tx_id, owner).unwrap_err(),
-            TxLookupErr::Tombstoned
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
         );
 
         // The pinned conn was rolled back + released (permit freed → a fresh checkout succeeds), and
@@ -976,14 +1117,21 @@ mod tests {
             .await
             .expect("the actor replies, never drops silently");
         assert!(
-            matches!(reply, ExecReply::Deadline),
+            matches!(
+                reply,
+                ExecReply::Deadline {
+                    tx_writes_persisted: false
+                }
+            ),
             "a per-statement timeout_ms yields exactly one TxDeadline terminal, got {reply:?}"
         );
 
         done_rx.wait_for(|t| *t).await.expect("actor tears down");
         assert_eq!(
             registry.lookup(tx_id, owner).unwrap_err(),
-            TxLookupErr::Tombstoned
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
         );
 
         let co2 = pool
@@ -1048,14 +1196,21 @@ mod tests {
             .await
             .expect("the actor replies, never drops silently");
         assert!(
-            matches!(reply, ExecReply::Deadline),
+            matches!(
+                reply,
+                ExecReply::Deadline {
+                    tx_writes_persisted: false
+                }
+            ),
             "a per-request CANCEL of an in-flight tx statement yields TxDeadline, got {reply:?}"
         );
 
         done_rx.wait_for(|t| *t).await.expect("actor tears down");
         assert_eq!(
             registry.lookup(tx_id, owner).unwrap_err(),
-            TxLookupErr::Tombstoned
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
         );
 
         let co2 = pool.checkout().await.expect("conn released");
@@ -1163,7 +1318,12 @@ mod tests {
         // `Err(_)` (the abort arm won: reply sender dropped) needs no further assertion here.
         if let Ok(reply) = reply_outcome {
             assert!(
-                matches!(reply, ExecReply::Deadline),
+                matches!(
+                    reply,
+                    ExecReply::Deadline {
+                        tx_writes_persisted: false
+                    }
+                ),
                 "if the cancel arm won, the ONLY legitimate reply is Deadline, got {reply:?}"
             );
         }
@@ -1237,7 +1397,12 @@ mod tests {
             .await
             .expect("the actor replies, never drops silently");
         assert!(
-            matches!(reply, ExecReply::Deadline),
+            matches!(
+                reply,
+                ExecReply::Deadline {
+                    tx_writes_persisted: false
+                }
+            ),
             "a bare 57014 resolving via ExecStep::Completed must STILL yield TxDeadline \
              (rolled back), never a bare Completed error, got {reply:?}"
         );
@@ -1245,7 +1410,9 @@ mod tests {
         done_rx.wait_for(|t| *t).await.expect("actor tears down");
         assert_eq!(
             registry.lookup(tx_id, owner).unwrap_err(),
-            TxLookupErr::Tombstoned
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
         );
 
         let co2 = pool.checkout().await.expect("conn released");
@@ -1357,7 +1524,9 @@ mod tests {
             .expect("idle deadline tears the tx down");
         assert_eq!(
             registry.lookup(tx_id, owner).unwrap_err(),
-            TxLookupErr::Tombstoned
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
         );
         let co2 = pool.checkout().await.expect("conn released");
         assert!(co2.conn().recorded.contains(&"ROLLBACK".to_string()));
@@ -1835,7 +2004,9 @@ mod tests {
         done_rx.wait_for(|t| *t).await.expect("actor tears down");
         assert_eq!(
             registry.lookup(tx_id, owner).unwrap_err(),
-            TxLookupErr::Tombstoned
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
         );
         assert!(
             pool.backend().cancel_calls() >= 1,
@@ -1913,7 +2084,9 @@ mod tests {
         done_rx.wait_for(|t| *t).await.expect("actor tears down");
         assert_eq!(
             registry.lookup(tx_id, owner).unwrap_err(),
-            TxLookupErr::Tombstoned
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
         );
         let co2 = pool.checkout().await.expect("conn released");
         assert!(
@@ -2082,7 +2255,9 @@ mod tests {
         done_rx.wait_for(|t| *t).await.expect("actor tears down");
         assert_eq!(
             registry.lookup(tx_id, owner).unwrap_err(),
-            TxLookupErr::Tombstoned
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
         );
         assert!(
             pool.backend().cancel_calls() >= 1,
@@ -2301,7 +2476,9 @@ mod tests {
         done_rx.wait_for(|t| *t).await.expect("actor tears down");
         assert_eq!(
             registry.lookup(tx_id, owner).unwrap_err(),
-            TxLookupErr::Tombstoned,
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            },
             "the actor max_tx path tombstones the tx_id, exactly like a per-statement timeout"
         );
         let co2 = pool.checkout().await.expect("conn released");
@@ -2310,5 +2487,209 @@ mod tests {
             "the tx was rolled back on the max_tx deadline: {:?}",
             co2.conn().recorded
         );
+    }
+
+    // ---- M1-S9a Task 8: the implicit-commit latch + the pre-dispatch hazard ------------------
+
+    /// M1-S9a finding 1, the LATCH: after a statement completes with the AUTHORITY reading
+    /// `tx_open == false` (an implicit commit ended the tx behind the pool's back), every later
+    /// in-flight loss must carry `tx_writes_persisted = true` to the fate call site.
+    ///
+    /// The signal is deliberately the protocol one, not the lexer's: statement 2 is a plain
+    /// `INSERT` (never an implicit-commit shape), and the ONLY thing that can mark the transaction
+    /// persisted is the post-statement `Checkout::tx_open()` read.
+    #[tokio::test]
+    async fn an_implicit_commit_latches_persisted_for_every_later_loss() {
+        let backend = FakeBackend::new();
+        backend.set_dialect(ferro_pool::backend::Dialect::MySql);
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let (_tx_id, cmd_tx, _done) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        // Statement 1: plain DML, tx stays open — the reply must NOT be persisted-marked.
+        let (r1_tx, r1_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "INSERT INTO t VALUES (1)".into(),
+                params: vec![],
+                timeout_ms: None,
+                cancel: CancellationToken::new(),
+                reply: r1_tx,
+            })
+            .await
+            .expect("send");
+        match r1_rx.await.expect("reply 1") {
+            ExecReply::Completed {
+                tx_writes_persisted,
+                result,
+                ..
+            } => {
+                assert!(result.is_ok());
+                assert!(!tx_writes_persisted, "no implicit commit has happened yet");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        // Statement 2: completes OK but the authority reads Idle afterwards — the fake models a
+        // MySQL DDL's OK packet with SERVER_STATUS_IN_TRANS dropped.
+        pool.backend()
+            .arm_tx_status_after_next_query(ferro_pool::backend::TxStatus::Idle);
+        let (r2_tx, r2_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "INSERT INTO t VALUES (2)".into(), // deliberately NOT hazard-shaped: the
+                params: vec![],                         // LATCH must come from the authority,
+                timeout_ms: None,                       // not the lexer
+                cancel: CancellationToken::new(),
+                reply: r2_tx,
+            })
+            .await
+            .expect("send");
+        assert!(matches!(
+            r2_rx.await.expect("reply 2"),
+            ExecReply::Completed { result: Ok(_), .. }
+        ));
+
+        // Statement 3: lost mid-flight (armed ConnectionLost) — the reply MUST be persisted-marked.
+        pool.backend().arm_next_query_err(PoolError::ConnectionLost);
+        let (r3_tx, r3_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "INSERT INTO t VALUES (3)".into(),
+                params: vec![],
+                timeout_ms: None,
+                cancel: CancellationToken::new(),
+                reply: r3_tx,
+            })
+            .await
+            .expect("send");
+        match r3_rx.await.expect("reply 3") {
+            ExecReply::Completed {
+                tx_writes_persisted,
+                result,
+                ..
+            } => {
+                assert!(result.is_err());
+                assert!(
+                    tx_writes_persisted,
+                    "the latch must mark every loss after the observed implicit commit"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// M1-S9a finding 1, the HAZARD: a statement that is ITSELF implicit-commit-shaped and is
+    /// interrupted mid-flight must be persisted-marked even though the latch never observed
+    /// anything (MySQL's pre-commit fires BEFORE execution, so no protocol signal ever arrives).
+    /// Control: the same interruption on plain DML stays unmarked (Retryable survives).
+    ///
+    /// Both halves are asserted TWICE — on the `ExecReply` the in-flight request maps, and on the
+    /// TOMBSTONE every LATER op on this `tx_id` reads.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_implicit_commit_statement_is_hazard_marked_and_plain_dml_is_not() {
+        for (sql, want_persisted) in [
+            ("CREATE TABLE ferro_ic (x INT)", true),
+            ("INSERT INTO t VALUES (1)", false),
+        ] {
+            let backend = FakeBackend::new();
+            backend.set_dialect(ferro_pool::backend::Dialect::MySql);
+            backend.block_query(); // freeze the statement mid-flight
+            let pool = Pool::new(backend, test_pool_config());
+            let registry = TxRegistry::new(Duration::from_secs(5));
+            let owner = registry.next_session_id();
+            let (tx_id, cmd_tx, mut done_rx) = spawn_actor(
+                &pool,
+                &registry,
+                owner,
+                Duration::from_secs(600),
+                Duration::from_secs(600),
+            )
+            .await;
+
+            let (r_tx, r_rx) = oneshot::channel();
+            cmd_tx
+                .send(TxCommand::Exec {
+                    sql: sql.into(),
+                    params: vec![],
+                    timeout_ms: Some(10), // the per-statement deadline interrupts the frozen query
+                    cancel: CancellationToken::new(),
+                    reply: r_tx,
+                })
+                .await
+                .expect("send");
+            match r_rx.await.expect("reply") {
+                ExecReply::Deadline {
+                    tx_writes_persisted,
+                } => {
+                    assert_eq!(
+                        tx_writes_persisted, want_persisted,
+                        "{sql:?}: hazard marking wrong"
+                    );
+                }
+                other => panic!("{sql:?}: expected Deadline, got {other:?}"),
+            }
+            // And the tombstone carries the same answer for every LATER op on this tx_id. Await the
+            // teardown first: the reply is sent BEFORE the actor breaks out and tombstones, so
+            // looking up immediately would race the write (and could pass for the wrong reason).
+            done_rx.wait_for(|t| *t).await.expect("actor tears down");
+            match registry.lookup(tx_id, owner) {
+                Err(TxLookupErr::Tombstoned {
+                    tx_writes_persisted,
+                }) => {
+                    assert_eq!(
+                        tx_writes_persisted, want_persisted,
+                        "{sql:?}: tombstone wrong"
+                    );
+                }
+                other => panic!("{sql:?}: expected Tombstoned, got {other:?}"),
+            }
+        }
+    }
+
+    /// PG stays byte-identical: the hazard never fires on `Dialect::Postgres` (PG DDL is
+    /// transactional — there is no implicit commit to assume), so a Postgres-dialect interruption
+    /// of the very statement text that IS a hazard on MySQL is never persisted-marked.
+    #[tokio::test(start_paused = true)]
+    async fn postgres_dialect_never_marks_persisted() {
+        let backend = FakeBackend::new(); // Dialect::Postgres is the default
+        backend.block_query();
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let (_tx_id, cmd_tx, _done) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        let (r_tx, r_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "CREATE TABLE t (x INT)".into(), // hazard-shaped ON MYSQL; inert on PG
+                params: vec![],
+                timeout_ms: Some(10),
+                cancel: CancellationToken::new(),
+                reply: r_tx,
+            })
+            .await
+            .expect("send");
+        assert!(matches!(
+            r_rx.await.expect("reply"),
+            ExecReply::Deadline {
+                tx_writes_persisted: false
+            }
+        ));
     }
 }

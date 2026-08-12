@@ -210,3 +210,76 @@ the S8a §22.2 (u)/(v) contradiction.
 
 - **No `/proto` change, no wire-visible change, no new configuration.** Charter rule 3 is untouched:
   the reaper classifies and evicts, it never retries or replays anything.
+
+### Task 8
+
+- **§19.3 / §7.1 — the tx actor now CONSULTS the live pin state, and that closes the finding-1
+  blocker.** Two mechanisms, both assist-not-authority, both feeding Task 7's
+  `OpContext.tx_writes_persisted`:
+  1. **The LATCH (protocol authority).** After a statement that COMPLETED SUCCESSFULLY, the actor
+     reads `Checkout::tx_open()` — the bit `apply_tx_status` writes from the RFQ byte /
+     `SERVER_STATUS_IN_TRANS`. `false` inside an actor-owned transaction means the transaction ended
+     with no COMMIT ever sent: a MySQL/MariaDB implicit commit. Latched MONOTONICALLY (once true,
+     forever true).
+  2. **The PRE-DISPATCH HAZARD (Task 2's lexical assist).** For the case no protocol signal can ever
+     report — MySQL's implicit commit fires BEFORE the statement executes, so a statement LOST
+     mid-flight may already be past the commit point — `ferro_classify::implicit_commit_hazard(sql,
+     dialect)` is evaluated before dispatch and carries every terminal of THAT statement.
+
+- **§19.3 — WHICH VALUE A FAILING STATEMENT IS CLASSIFIED AGAINST is part of the contract, not an
+  implementation detail.** The pin state is written AFTER a statement completes, and on the Err arm
+  `Checkout::query`'s Rule-A fail-safe force-sets `tx_open = true` UNCONDITIONALLY (the RFQ atomic is
+  stale-untrustworthy there). So the authority can never report an implicit commit on a failure — it
+  would answer "still in a transaction" for exactly the case the fix exists for. Every FAILING or
+  INTERRUPTED path is therefore classified against the PRE-DISPATCH view (already-latched state OR
+  this statement's own shape); the authority is read ONLY after a clean completion. Both halves are
+  separately mutation-proven.
+
+- **§19.3 — the flag reaches EVERY in-tx terminal path**, because the replay license is branch-shaped
+  and shows up at five distinct exits: the `Completed(Err)` classification, the `Deadline` reply (the
+  ONE in-tx exit that bypasses `classify_fate` — it now routes through a pure `deadline_terminal`),
+  the streamed producer's `OpContext`, the teardown drain of queued streamed statements, and the
+  **TOMBSTONE** (`TxEntry::Tombstoned`/`TxLookupErr::Tombstoned` carry it, and BOTH mapping sites in
+  `services/sql.rs` — `resolve_active` and `actor_gone_terminal` — answer `persisted_tx_payload()`).
+  A tombstone is a replay license for every LATER op on the dead `tx_id`; leaving it `Retryable`
+  would have re-opened the blocker one lookup later.
+
+- **Drop-in consequence worth stating plainly for CLAUDE.md:** on MySQL/MariaDB, once a transaction
+  has run a statement that implicitly commits (DDL, `LOCK TABLES`, `SET autocommit`, `CALL`, …),
+  every later failure in that transaction is reported `WRITE_UNCONFIRMED{Indeterminate}` — never
+  `Retryable`. A Doctrine-style "retry the whole closure" wrapper therefore stops retrying such a
+  transaction, which is the point: the measured shape `START TRANSACTION; INSERT; CREATE TABLE;
+  <link loss>` leaves the INSERT **durably committed**, so a replay double-applies it. PostgreSQL is
+  byte-identical (no implicit commit; the flag can never become true there).
+
+- **Live acceptance, recorded:** `ferrod`'s `in_tx_fate_it.rs` now proves BOTH cells on **MySQL 8.4
+  AND MariaDB 11.8**: `BEGIN → INSERT → CREATE TABLE → KILL mid-flight` answers
+  `0x2001 WRITE_UNCONFIRMED{Indeterminate}` naming the implicit commit, with the pre-DDL INSERT read
+  back as PERSISTED over a fresh connection; the plain-DML sibling (Task 1's guard) still answers
+  `0x1001 CONNECTION_LOST{Retryable}` with nothing persisted. Deleting the latch read turns the new
+  test RED with exactly the pre-fix answer (`left: 4097, right: 8193`) — the blocker, reproduced on
+  demand.
+
+- **KNOWN RESIDUAL, recorded not buried (directionally safe).** The hazard latch fires on an in-tx
+  statement that ERRORED, and a statement can error WITHOUT having run: a `guard_tx_control`
+  rejection (a bare `BEGIN` through tx-scoped EXEC) or a server-side syntax error on an
+  unknown-leading-keyword statement. Both are hazard-shaped by the unknown → HAZARD default, so such
+  a transaction is marked persisted although nothing committed, and its later failures report
+  `Indeterminate` instead of `Retryable`. That is cry-wolf, never at-least-once (SPEC §19.3's
+  directional rule), and the alternative — inferring "never dispatched" from a `PoolError` shape —
+  is exactly the guess this project refuses. A FAILING DDL, by contrast, is a TRUE positive: MySQL
+  commits before it executes, so `CREATE TABLE t` erroring 1050 still persisted the tx's earlier
+  writes.
+
+- **NOT closed by this task (scope, stated):** a `ROLLBACK` issued after an implicit commit still
+  returns `Ok` while the pre-DDL writes remain durable — no error exists to classify, so no fate
+  branch is involved. It is the same semantic `pdo_mysql` exposes; a §7 note is the most that is
+  warranted.
+
+- **No `/proto` change.** The persisted cell reuses `WRITE_UNCONFIRMED{Indeterminate}` (Task 7's
+  single mint, `fate::persisted_tx_payload()`); the deferred `TX_PARTIALLY_COMMITTED` candidate
+  stands as Task 7 recorded it.
+
+- **Build-graph note for Task 13's accuracy:** `ferrod` gained a `ferro-classify` path dependency
+  (the actor calls `implicit_commit_hazard` directly). The crate was already in the graph via
+  `ferro-pool`; no new external dependency, no vendor change.
