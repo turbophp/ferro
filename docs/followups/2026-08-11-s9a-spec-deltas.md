@@ -147,3 +147,30 @@ the S8a §22.2 (u)/(v) contradiction.
   are green and unchanged. Task 8 threads the live value into the two in-tx statement sites
   (`sql.rs:329`, `sql.rs:755`). PostgreSQL has no implicit commit, so the flag stays `false` there
   forever and no PG cell can ever move.
+
+### Task 4
+
+- **§7.6/§16 (the liveness reaper): the ping is BOUNDED by `checkout_timeout`.** A backend that
+  cannot answer a liveness ping inside a checkout budget is dead for every purpose the reaper has.
+  No new knob — the same bound the checkout-time recycle already uses. Before this, `reap_once`
+  awaited `backend.ping()` unbounded **while holding an owned semaphore permit**, so one half-dead
+  backend killed the reaper for the pool's lifetime AND leaked that permit permanently (finding 4b,
+  confirmed by execution: `max_size=1` + a frozen ping → two successive checkouts both
+  `Err(Timeout)`, no idle conn ever evicted again).
+
+- **On expiry the connection is EVICTED, never returned to `idle`.** A ping whose budget expires had
+  its future DROPPED mid-round-trip, so the connection's protocol state is unknown; recycling it
+  would trade a wedged reaper for handing a half-pinged connection to the next tenant (the hazard-15
+  shape, and a cross-tenant-leak class). Pinned by a connection-IDENTITY assertion, not by absence
+  of an error.
+
+- **§12/hygiene: the reaper's three `idle` locks recover from poisoning** (`len`, `pop`, `push` →
+  one `lock_idle()` helper carrying `unwrap_or_else(PoisonError::into_inner)`, the in-tree
+  `ferrod::PoolEntry::lock` idiom). Recovery rather than pool-eviction is correct because the mutex
+  only ever guards trivial `Vec` pop/push of whole `IdleConn` values — no multi-step invariant can
+  be left half-applied. A `.lock().unwrap()` at ANY of the three sites kills the reaper task on the
+  first tick after a poison, which is the same outage the ping bound exists to prevent, reached by a
+  different door.
+
+- **No `/proto` change, no wire-visible change, no new configuration.** Charter rule 3 is untouched:
+  the reaper classifies and evicts, it never retries or replays anything.

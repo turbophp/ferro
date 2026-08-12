@@ -48,6 +48,30 @@ pub fn backoff_delay(attempt: u32) -> Duration {
     exp.mul_f64(fastrand::f64())
 }
 
+/// Locks the pool's idle stack, **recovering from poisoning** instead of panicking (M1-S9a,
+/// finding 7).
+///
+/// The three call sites in [`reap_once`] used `.lock().unwrap()`. That is an availability bug with
+/// a very large blast radius: a single panic anywhere while the `idle` guard is held marks the
+/// mutex poisoned FOREVER, after which the very next reaper tick panics — the reaper task dies and
+/// nothing is ever evicted again for the pool's lifetime — and, worse, the same poison reaches
+/// `Checkout::drop`, where a panic during unwind is `std::process::abort()`, taking every worker's
+/// connections with it.
+///
+/// Recovery (rather than treating the pool as dead) is the right call because this mutex only ever
+/// guards trivial, allocation-free `Vec` pop/push of whole `IdleConn` values: there is no
+/// multi-step invariant a panicking holder could have left half-applied. The worst a poisoned
+/// guard can hide is one connection that was mid-move — and a connection that goes missing is
+/// simply reconnected by the next checkout. Same idiom as `ferrod`'s `PoolEntry::lock`.
+fn lock_idle<B: PoolBackend>(
+    inner: &Arc<PoolInner<B>>,
+) -> std::sync::MutexGuard<'_, Vec<crate::pool::IdleConn<B>>> {
+    inner
+        .idle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Spawns the background reaper for `inner`, ticking every `interval`. Called from `Pool::new`
 /// only when `config.reap_interval` is `Some` — a `None` config never calls this, leaving the
 /// pool exactly as reaper-less as Task 2 left it.
@@ -96,7 +120,7 @@ pub(crate) fn spawn_reaper<B: PoolBackend>(inner: &Arc<PoolInner<B>>, interval: 
 /// on which connection that happens to be. A connection that isn't reached this tick simply waits
 /// for the next one.
 async fn reap_once<B: PoolBackend>(inner: &Arc<PoolInner<B>>) {
-    let budget = { inner.idle.lock().unwrap().len() };
+    let budget = { lock_idle(inner).len() };
 
     for _ in 0..budget {
         // No permit available means every slot up to `max_size` is already spoken for by
@@ -109,7 +133,7 @@ async fn reap_once<B: PoolBackend>(inner: &Arc<PoolInner<B>>) {
         };
 
         let popped = {
-            let mut idle = inner.idle.lock().unwrap();
+            let mut idle = lock_idle(inner);
             idle.pop()
         };
         let Some(mut idle_conn) = popped else {
@@ -119,17 +143,32 @@ async fn reap_once<B: PoolBackend>(inner: &Arc<PoolInner<B>>) {
 
         let stale = idle_conn.created_at.elapsed() > inner.config.max_lifetime;
         // Short-circuited exactly like the previous implementation: a connection already past
-        // `max_lifetime` is evicted without spending a round trip on it.
+        // `max_lifetime` is evicted without spending a round trip on it. The ping itself is
+        // BOUNDED by `checkout_timeout` (M1-S9a, finding 4b — the same bound the checkout-time
+        // recycle at `pool.rs` already uses): a backend that cannot answer a ping inside a
+        // checkout budget is dead for every purpose the reaper has, and an UNBOUNDED ping here
+        // parks the reaper forever WHILE IT HOLDS AN OWNED PERMIT — the M0 review confirmed by
+        // execution that one half-dead backend then leaks that permit for the pool's lifetime and
+        // nothing is ever evicted again. On expiry the ping future is DROPPED and the conn is
+        // treated as dead: it is evicted here (never pushed back into `idle`), so no half-pinged
+        // connection can reach a later tenant.
         let dead = !stale
             && (inner.backend.is_closed(&idle_conn.conn)
-                || inner.backend.ping(&mut idle_conn.conn).await.is_err());
+                || !matches!(
+                    tokio::time::timeout(
+                        inner.config.checkout_timeout,
+                        inner.backend.ping(&mut idle_conn.conn),
+                    )
+                    .await,
+                    Ok(Ok(()))
+                ));
 
         if stale || dead {
             // Evicted: `idle_conn` drops here, releasing its connection resources. `permit`
             // releases right after, so the vacated capacity is available to the next checkout (or
             // the next reap iteration) only once this connection is truly gone.
         } else {
-            let mut idle = inner.idle.lock().unwrap();
+            let mut idle = lock_idle(inner);
             idle.push(idle_conn);
         }
         drop(permit);
