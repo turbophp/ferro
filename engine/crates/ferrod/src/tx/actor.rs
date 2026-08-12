@@ -258,6 +258,11 @@ pub async fn run<B: PoolBackend>(
     // durable no matter what happens next — so no subsequent observation can withdraw the fact.
     let mut tx_writes_persisted = false;
 
+    // M1-S9a (finding 4c): did a post-cancel drain EXPIRE, leaving a statement future dropped
+    // mid-flight? Set inside the `TxCommand::Exec` block (a plain local — it touches nothing `co`
+    // borrows) and consumed just before `teardown`, where `co` is free again.
+    let mut drain_wedged = false;
+
     let end: TxEnd = 'actor: loop {
         let cmd = tokio::select! {
             biased;
@@ -463,8 +468,25 @@ pub async fn run<B: PoolBackend>(
                             // cancel/timeout LOST the race to completion) — §19.3 says the client asked
                             // to stop, so the safe uniform in-tx action is still roll back regardless of
                             // whether the drained value is `Ok` or `Err`.
-                            cancel_handle.cancel().await;
-                            let _ = query_fut.await;
+                            //
+                            // M1-S9a (finding 4c): the drain is BOUNDED. A wedged backend must not
+                            // park the actor here forever holding the pinned conn while this
+                            // request never receives a terminal — the reply below is sent
+                            // REGARDLESS of whether the backend ever answered (charter rule 4). On
+                            // expiry the future is dropped mid-statement and `drain_wedged` taints
+                            // the conn before teardown (charter rule 6).
+                            if tokio::time::timeout(
+                                crate::services::sql::CANCEL_DRAIN_BUDGET,
+                                async {
+                                    cancel_handle.cancel().await;
+                                    let _ = (&mut query_fut).await;
+                                },
+                            )
+                            .await
+                            .is_err()
+                            {
+                                drain_wedged = true;
+                            }
                             // M1-S9a: an interrupted statement is by definition unconfirmed, so the
                             // pre-dispatch hazard stands (the drained value is discarded and the
                             // post-drain authority read would be the Err-arm forced `true` anyway).
@@ -478,8 +500,21 @@ pub async fn run<B: PoolBackend>(
                             break 'actor TxEnd::Deadline;
                         }
                         ExecStep::Abort => {
-                            cancel_handle.cancel().await;
-                            let _ = query_fut.await;
+                            // BOUNDED for the same reason as the Deadline arm (M1-S9a finding 4c):
+                            // a session teardown must not be held hostage by a wedged backend, and
+                            // the queued/forwarding handlers still get their terminals below.
+                            if tokio::time::timeout(
+                                crate::services::sql::CANCEL_DRAIN_BUDGET,
+                                async {
+                                    cancel_handle.cancel().await;
+                                    let _ = (&mut query_fut).await;
+                                },
+                            )
+                            .await
+                            .is_err()
+                            {
+                                drain_wedged = true;
+                            }
                             // Same latch as the Deadline arm — this path declares no fate of its own
                             // (the reply is dropped), but the teardown/drain below still answers any
                             // queued statement, and must not license a replay either.
@@ -603,6 +638,17 @@ pub async fn run<B: PoolBackend>(
             .reset(tokio::time::Instant::now() + idle_timeout);
     };
 
+    // M1-S9a (finding 4c): a drain that hit its budget left the statement future DROPPED
+    // mid-flight, so `Checkout::query`'s instrumented Err-arm fail-safe never ran and the server
+    // session may still be executing that statement. Taint BEFORE teardown, unconditionally: relying
+    // on the teardown ROLLBACK to fail is NOT a mechanism — a backend that wedges the statement but
+    // still answers control traffic rolls back cleanly, and the conn would recycle on the CLEAN
+    // profile straight into the next tenant (charter rule 6; the S8a Task-12 hazard). A taint set
+    // here survives a successful `rollback_tx` by design (`ferro-pool`: "any pre-existing `tainted`
+    // deliberately survives"), costing one extra full reset in the worst case.
+    if drain_wedged {
+        co.set_tainted(true);
+    }
     teardown(
         tx_id,
         co,
@@ -1217,6 +1263,205 @@ mod tests {
         assert!(
             co2.conn().recorded.contains(&"ROLLBACK".to_string()),
             "the tx was rolled back on the per-request cancel: {:?}",
+            co2.conn().recorded
+        );
+    }
+
+    // ---- M1-S9a Task 10 (finding 4c): the tx-side post-cancel drain is BOUNDED -----------------
+
+    /// A WEDGED backend (`wedge_queries`: accepts the statement, never answers, ignores the
+    /// out-of-band `CancelRequest`) must not park the actor forever on its post-cancel drain. The
+    /// handler's ONE terminal (charter rule 4) must not depend on a wedged backend answering, and
+    /// the conn must never reach the next tenant un-reset: here the teardown ROLLBACK wedges too
+    /// (`block_simple_query`, as a genuinely wedged backend's would), so the next checkout's bounded
+    /// recycle EVICTS it and dials fresh — observable as `total_connected == 2`.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_tx_drain_replies_within_budget_and_the_conn_never_reaches_a_tenant() {
+        let backend = FakeBackend::new();
+        backend.wedge_queries();
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        // `spawn_actor` passes a 600s teardown bound — fine: it is BOUNDED, and paused time
+        // auto-advances through it.
+        let (_tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+        // ARMED ONLY NOW, never before `spawn_actor`: `Checkout::begin_tx_with` runs its `BEGIN`
+        // through `simple_query`, so arming this earlier parks the BEGIN itself — and with no timer
+        // registered anywhere, paused time never auto-advances and the test HANGS instead of
+        // failing (measured: 18 min, no output). From here on the gate only reaches the teardown
+        // ROLLBACK, which is the one thing this test wants wedged.
+        pool.backend().block_simple_query();
+
+        let (r_tx, r_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "UPDATE t SET x = 1".into(),
+                params: vec![],
+                timeout_ms: Some(10),
+                cancel: CancellationToken::new(),
+                reply: r_tx,
+            })
+            .await
+            .expect("send");
+
+        let reply = tokio::time::timeout(Duration::from_secs(600), r_rx)
+            .await
+            .expect("BOUND EXCEEDED: the tx post-cancel drain is unbounded (finding 4c)")
+            .expect("reply arrives");
+        assert!(
+            matches!(reply, ExecReply::Deadline { .. }),
+            "the handler's one terminal must not wait on a wedged backend, got {reply:?}"
+        );
+
+        // Wait for teardown to finish (done flips true), then prove the wedged conn is EVICTED,
+        // never handed to a tenant.
+        done_rx.changed().await.expect("done");
+        assert!(*done_rx.borrow());
+
+        // The FIRST post-teardown checkout is consumed by that conn's own recycle: its ROLLBACK is
+        // still wedged, so the cleanup eats the whole SHARED checkout budget (M1-S9a Task 3: one
+        // `checkout_timeout` covers acquire+cleanup+dial) and the checkout ends in `Timeout` — with
+        // the conn dropped. Bounded, and crucially NOT a handout of a mid-protocol connection.
+        let first = tokio::time::timeout(Duration::from_secs(600), pool.checkout())
+            .await
+            .expect("BOUND EXCEEDED: the wedged conn's recycle is unbounded");
+        assert!(
+            matches!(first, Err(PoolError::Timeout)),
+            "the poisoned conn must be evicted by the bounded recycle, never handed out: {:?}",
+            first.map(|_| "handed out a Checkout")
+        );
+
+        // The eviction is what makes the pool usable again: the NEXT checkout dials a SECOND conn.
+        let co2 = tokio::time::timeout(Duration::from_secs(600), pool.checkout())
+            .await
+            .expect("BOUND EXCEEDED: the wedged drain leaked the pinned conn's permit")
+            .expect("a fresh dial after the eviction");
+        assert_eq!(
+            pool.backend().total_connected(),
+            2,
+            "the mid-statement conn is gone and a FRESH one was dialed for the next tenant"
+        );
+        drop(co2);
+    }
+
+    /// The taint on a drain-budget expiry is the ACTOR's, not a side effect of the teardown ROLLBACK
+    /// failing. This is the case the plan's comment got wrong and the one that actually endangers a
+    /// tenant: the backend wedges the STATEMENT but still answers control traffic, so
+    /// `teardown`'s ROLLBACK succeeds and clears nothing-was-wrong — yet the dropped statement may
+    /// still be running on that server session (the S8a Task-12 hazard). The conn must re-enter the
+    /// pool TAINTED, so the next checkout gives it the FULL reset (`RESET:Full`) rather than the
+    /// clean-profile `RESET:Targeted`.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_expiry_taints_even_when_the_teardown_rollback_succeeds() {
+        let backend = FakeBackend::new();
+        backend.wedge_queries(); // ONLY `query()` wedges; simple_query (ROLLBACK/reset) is healthy
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let (_tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        let (r_tx, r_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "UPDATE t SET x = 1".into(),
+                params: vec![],
+                timeout_ms: Some(10),
+                cancel: CancellationToken::new(),
+                reply: r_tx,
+            })
+            .await
+            .expect("send");
+        let reply = tokio::time::timeout(Duration::from_secs(600), r_rx)
+            .await
+            .expect("BOUND EXCEEDED: the tx post-cancel drain is unbounded (finding 4c)")
+            .expect("reply arrives");
+        assert!(matches!(reply, ExecReply::Deadline { .. }));
+
+        done_rx.changed().await.expect("done");
+        let co2 = tokio::time::timeout(Duration::from_secs(600), pool.checkout())
+            .await
+            .expect("bounded")
+            .expect("checkout after teardown");
+        let recorded = co2.conn().recorded.clone();
+        assert!(
+            recorded.contains(&"ROLLBACK".to_string()),
+            "the teardown ROLLBACK genuinely SUCCEEDED here — that is the point of this test: \
+             {recorded:?}"
+        );
+        assert!(
+            recorded.contains(&"RESET:Full".to_string()),
+            "a conn whose statement future was dropped mid-flight must recycle TAINTED (Full \
+             reset), never on the clean profile: {recorded:?}"
+        );
+    }
+
+    /// The `ExecStep::Abort` arm (session teardown, NOT a deadline) drains too, and it must be
+    /// bounded by the same budget: otherwise ONE wedged backend keeps a torn-down session's actor —
+    /// and its pinned conn — alive forever, and `abort_session`'s `done` never flips. The abort is
+    /// fired only once the statement is PROVABLY parked in the backend, so this cannot pass on a
+    /// pre-dispatch race. It also pins the Abort arm's TAINT: teardown's ROLLBACK succeeds here
+    /// (only `query()` is wedged), so the conn would otherwise recycle on the clean profile.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_abort_drain_is_bounded_and_taints() {
+        let backend = FakeBackend::new();
+        backend.wedge_queries();
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let (_tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        let (r_tx, _r_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "UPDATE t SET x = 1".into(),
+                params: vec![],
+                timeout_ms: None, // no timer: only the session abort may end this statement
+                cancel: CancellationToken::new(),
+                reply: r_tx,
+            })
+            .await
+            .expect("send");
+
+        // The statement is genuinely in flight (parked in the backend) before the abort fires.
+        while pool.backend().wedged_queries_waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        registry.abort_session(owner).await;
+
+        tokio::time::timeout(Duration::from_secs(600), done_rx.wait_for(|t| *t))
+            .await
+            .expect("BOUND EXCEEDED: the tx ABORT-path drain is unbounded (finding 4c)")
+            .expect("the actor tears down");
+
+        let co2 = tokio::time::timeout(Duration::from_secs(600), pool.checkout())
+            .await
+            .expect("bounded")
+            .expect("the pinned conn's permit came back");
+        assert!(
+            co2.conn().recorded.contains(&"RESET:Full".to_string()),
+            "an abort whose drain expired leaves a dropped statement future — the conn must \
+             recycle TAINTED: {:?}",
             co2.conn().recorded
         );
     }

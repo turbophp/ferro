@@ -346,6 +346,18 @@ pub struct FakeBackend {
     stream_pull_gate: Arc<Mutex<Option<Arc<Notify>>>>,
     /// Number of `FakeRowStream::next()` pulls currently parked on `stream_pull_gate`.
     stream_pulls_waiting: Arc<AtomicU64>,
+    /// M1-S9a Task 10: when `Some`, every `query()` call parks on this `Notify` and NOTHING a
+    /// caller can do from the request path releases it — in particular [`FakeCancelHandle::cancel`]
+    /// deliberately does NOT touch it. That is the whole point: `query_gate`/`block_query` model a
+    /// HEALTHY backend that honours a `CancelRequest` (the cancel releases the park into a 57014),
+    /// while this models a WEDGED one (accepts TCP, never answers, ignores the cancel) — the
+    /// finding-4c shape, against which the post-cancel drain parked forever holding its permit and
+    /// never declared a terminal. Armed via `wedge_queries`, cleared by `release_wedged_queries`.
+    wedge_gate: Mutex<Option<Arc<Notify>>>,
+    /// Number of `query()` calls currently (or last observed) parked on `wedge_gate`. As with
+    /// `connects_waiting`, a parked future that is DROPPED — exactly what a drain-budget expiry
+    /// does — never reaches the decrement, so tests must treat this as a high-water mark.
+    wedged_queries_waiting: AtomicU64,
     /// M1-S9a Task 8: one-shot [`TxStatus`] applied to the conn AFTER the next successful `query()`
     /// (see `arm_tx_status_after_next_query`) — the fake's model of a MySQL implicit commit's OK
     /// packet dropping `SERVER_STATUS_IN_TRANS`. `None` (the default) leaves every existing test's
@@ -376,6 +388,8 @@ impl FakeBackend {
             stream_opens_waiting: Arc::new(AtomicU64::new(0)),
             stream_pull_gate: Arc::new(Mutex::new(None)),
             stream_pulls_waiting: Arc::new(AtomicU64::new(0)),
+            wedge_gate: Mutex::new(None),
+            wedged_queries_waiting: AtomicU64::new(0),
             tx_status_after_query: Mutex::new(None),
         }
     }
@@ -529,6 +543,29 @@ impl FakeBackend {
     /// Number of `query()` calls currently parked on the gate armed by `block_query()`.
     pub fn queries_waiting(&self) -> u64 {
         self.queries_waiting.load(Ordering::SeqCst)
+    }
+
+    /// Arms every subsequent `query()` call to park on a gate the fake CANCEL does NOT release
+    /// (M1-S9a Task 10) — the WEDGED-backend model: accepts the statement, never answers, ignores
+    /// the out-of-band `CancelRequest`. Use this — not `block_query`, whose gate IS released by
+    /// [`FakeCancelHandle::cancel`] — to drive the finding-4c post-cancel drain, where the caller's
+    /// drain budget (not the backend) is what must end the wait.
+    pub fn wedge_queries(&self) {
+        *self.wedge_gate.lock().unwrap() = Some(Arc::new(Notify::new()));
+    }
+
+    /// Releases every `query()` call currently parked by `wedge_queries()` and clears the gate so
+    /// later calls are unaffected — the "backend recovers" half of a wedge scenario.
+    pub fn release_wedged_queries(&self) {
+        if let Some(notify) = self.wedge_gate.lock().unwrap().take() {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Number of `query()` calls currently parked on the gate armed by `wedge_queries()` (see the
+    /// field note: a dropped parked future skips the decrement, so treat it as a high-water mark).
+    pub fn wedged_queries_waiting(&self) -> u64 {
+        self.wedged_queries_waiting.load(Ordering::SeqCst)
     }
 
     /// Test hook: force the [`Dialect`] this backend reports from `dialect()`. `&self` (not
@@ -718,6 +755,17 @@ impl PoolBackend for FakeBackend {
         // server-side error, distinct from the out-of-band-cancel path `block_query` models.
         if let Some(err) = self.canned_query_err.lock().unwrap().take() {
             return Err(err);
+        }
+
+        // WEDGE gate (M1-S9a Task 10, see `wedge_queries`): checked BEFORE `query_gate` and
+        // released by NOTHING the request path can reach — a fired `FakeCancelHandle` does not
+        // touch it. Models a backend that swallows the statement AND the CancelRequest, so the only
+        // thing that can end a caller's post-cancel drain is the caller's own budget.
+        let wedge = self.wedge_gate.lock().unwrap().clone();
+        if let Some(notify) = wedge {
+            self.wedged_queries_waiting.fetch_add(1, Ordering::SeqCst);
+            notify.notified().await;
+            self.wedged_queries_waiting.fetch_sub(1, Ordering::SeqCst);
         }
 
         // Test-only gate (see `block_query`): if armed, park until a `FakeCancelHandle` for this

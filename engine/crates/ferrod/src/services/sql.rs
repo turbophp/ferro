@@ -90,6 +90,24 @@ pub const FETCH_STREAM: u8 = 2;
 /// AND every other in-flight terminal). Locked against the codec by `outcome_ok_overhead_is_two`.
 const OUTCOME_OK_OVERHEAD: usize = 2;
 
+/// M1-S9a (finding 4c): the bound on the post-cancel DRAIN — the fire-the-out-of-band-cancel +
+/// await-the-query sequence — on BOTH EXEC paths (autocommit here, tx-scoped in [`crate::tx::actor`]).
+///
+/// Before this bound, a WEDGED backend (accepts TCP, never answers, ignores the `CancelRequest`)
+/// parked the handler in that drain FOREVER while holding its checkout permit, and the request
+/// received NO terminal at all — charter rule 4 broken, not merely a hang. 5s mirrors the team's own
+/// fix for the identical shape on the version probe (`pools.rs`'s `VERSION_DRAIN_BUDGET`): long
+/// enough for any healthy backend to answer its own cancel (every existing live cancel/timeout test
+/// drains in milliseconds), while freeing the permit ~25x sooner than the OS TCP timeout a wedged
+/// backend otherwise imposes (~127s, measured — `docs/followups/2026-08-10-unbounded-backend-dial.md`).
+///
+/// On expiry the query future is DROPPED mid-statement: the conn is TAINTED at the call site (the
+/// pool's bounded recycle then resets or evicts it) and the drained result is the engine-minted
+/// 57014 cancel shape, which `fate::classify_fate`'s override routes exactly like a completed drain
+/// — write → `Indeterminate`, read → `Cancelled`. That is honest: the outcome is genuinely
+/// unobserved. Nothing here re-dispatches anything (charter rule 3).
+pub(crate) const CANCEL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
+
 /// Build the real SQL/TX `HandlerFactory`, capturing the pool registry, the shared
 /// `Arc<TxRegistry>` (S6 seam), and the transaction deadlines. The factory mints one `HandlerFn`
 /// per connection given its `SessionId` — which is load-bearing: it is the OWNER key every
@@ -495,6 +513,14 @@ async fn run_exec_on_pool<B: PoolBackend>(
 /// - `Err(e)` — the statement's real outcome. A cancelled/timed-out statement surfaces PG's
 ///   `57014`, which `fate::classify_fate`'s override then routes by `readonly`/`in_tx`.
 ///
+/// **The drain is BOUNDED** by [`CANCEL_DRAIN_BUDGET`] (M1-S9a, finding 4c): a WEDGED backend — one
+/// that accepts the statement, never answers, and ignores the `CancelRequest` — must not be able to
+/// park this handler forever holding its checkout permit while the request never receives a
+/// terminal (charter rule 4). On expiry the query future is DROPPED mid-statement, which means
+/// `Checkout::query`'s own Err-arm fail-safe never ran, so this function TAINTS the checkout
+/// itself — otherwise the next tenant inherits a connection whose server session may still be
+/// running this statement (charter rule 6).
+///
 /// Returns `(drained result, exec_us)`; `exec_us` measures only this call, matching the
 /// pre-existing `build_terminal_body` stats contract.
 async fn run_autocommit_exec<B: PoolBackend>(
@@ -509,27 +535,62 @@ async fn run_autocommit_exec<B: PoolBackend>(
     // query future then holds (mirrors `tx/actor.rs`'s `co.cancel_handle()` at ~247).
     let cancel_handle = co.cancel_handle();
     let exec_start = Instant::now();
-    let query_fut = co.query(sql, params);
-    tokio::pin!(query_fut);
+    // The pinned query future holds `&mut co` until its DESTRUCTOR runs, so it is confined to this
+    // block — which is what lets the wedged-drain taint below borrow `co` again inside this fn.
+    let (result, drain_wedged) = {
+        let query_fut = co.query(sql, params);
+        tokio::pin!(query_fut);
 
-    let result = tokio::select! {
-        biased;
+        let raced = tokio::select! {
+            biased;
 
-        // Polled FIRST every round: a statement that completes is never spuriously reported as
-        // interrupted, even against an already-fired timer/cancel — this is both what makes `sent`
-        // honest (see the doc above) and what makes the Ok-lost-race case possible at all.
-        r = &mut query_fut => r,
+            // Polled FIRST every round: a statement that completes is never spuriously reported as
+            // interrupted, even against an already-fired timer/cancel — this is both what makes
+            // `sent` honest (see the doc above) and what makes the Ok-lost-race case possible.
+            r = &mut query_fut => Race::Completed(r),
 
-        () = sleep_opt(timeout_ms) => {
-            cancel_handle.cancel().await;
-            (&mut query_fut).await
-        }
-        () = cancel.cancelled() => {
-            cancel_handle.cancel().await;
-            (&mut query_fut).await
+            // BOTH interruption arms take the SAME exit (they always did — the two arm bodies were
+            // byte-identical): fire the out-of-band cancel, then drain. Sharing one drain is what
+            // guarantees a future edit cannot bound one arm and leave the other parked forever.
+            () = sleep_opt(timeout_ms) => Race::Interrupted,
+            () = cancel.cancelled() => Race::Interrupted,
+        };
+
+        match raced {
+            Race::Completed(r) => (r, false),
+            Race::Interrupted => {
+                match tokio::time::timeout(CANCEL_DRAIN_BUDGET, async {
+                    cancel_handle.cancel().await;
+                    (&mut query_fut).await
+                })
+                .await
+                {
+                    Ok(r) => (r, false),
+                    // The budget expired: the statement's outcome is genuinely UNOBSERVED, so the
+                    // engine mints the cancel shape and `classify_fate`'s 57014 override routes it
+                    // exactly like a completed drain (write → Indeterminate, read → Cancelled). The
+                    // minted message never reaches the wire — the override rebuilds the payload.
+                    Err(_elapsed) => (Err(stream_cancel_error()), true),
+                }
+            }
         }
     };
+    if drain_wedged {
+        // The query future was DROPPED mid-statement, so `Checkout::query`'s instrumented Err-arm
+        // fail-safe never ran and NOTHING else taints this conn. Without this line the next tenant
+        // inherits a mid-protocol connection whose server session may still be running the previous
+        // tenant's statement (charter rule 6; the S8a Task-12 hazard, live-observed there).
+        co.set_tainted(true);
+    }
     (result, exec_start.elapsed().as_micros() as u64)
+}
+
+/// Which arm of [`run_autocommit_exec`]'s `biased` select won. Both interruption arms collapse to
+/// ONE variant on purpose: they perform the identical cancel+drain, and a single shared exit is what
+/// keeps the drain bound from being applied to only one of them.
+enum Race {
+    Completed(Result<QueryResult, PoolError>),
+    Interrupted,
 }
 
 /// `Some(ms)` → a real `tokio::time::sleep` deadline; `None` → a future that NEVER resolves (NOT a
@@ -2257,6 +2318,100 @@ mod tests {
             "a cancelled statement taints the conn -> Full reset at the next checkout: {:?}",
             co2.conn().recorded
         );
+    }
+
+    // ---- M1-S9a Task 10 (finding 4c): the post-cancel drain is BOUNDED --------------------------
+
+    /// A WEDGED backend (accepts the statement, never answers, ignores the out-of-band
+    /// `CancelRequest` — `FakeBackend::wedge_queries`) must not be able to park the handler forever
+    /// on the post-cancel drain. Three properties, all of which were broken before M1-S9a:
+    ///
+    ///  1. **Bounded** — `run_autocommit_exec` returns within `CANCEL_DRAIN_BUDGET`, never parks
+    ///     until an OS TCP timeout. (The outer 600s guard is what fails if the bound is gone.)
+    ///  2. **Exactly one terminal** (charter rule 4) — the drained value is the engine-minted 57014
+    ///     shape, so the REAL `declare_autocommit_exec` declares the same
+    ///     `WriteUnconfirmed{Indeterminate}` a completed drain would: honest, the write's fate is
+    ///     genuinely unobserved. Before the fix no terminal was declared AT ALL.
+    ///  3. **Tainted + capacity returned** — the query future was DROPPED mid-statement, so
+    ///     `Checkout::query`'s own Err-arm fail-safe never ran and NOTHING else taints this conn;
+    ///     without the explicit taint the next tenant inherits a connection whose server session may
+    ///     still be running the previous tenant's statement (charter rule 6). The permit still
+    ///     releases, so a later checkout succeeds and recycles it with the FULL reset.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_post_cancel_drain_is_bounded_and_taints_the_conn() {
+        let backend = FakeBackend::new();
+        backend.wedge_queries(); // the cancel will NOT release this — only our own budget can
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+        let mut co = pool.checkout().await.expect("checkout");
+        assert!(!co.tainted(), "a fresh checkout starts clean");
+
+        let cancel = CancellationToken::new();
+        let (result, _exec_us) = tokio::time::timeout(
+            Duration::from_secs(600),
+            run_autocommit_exec(&mut co, "UPDATE t SET n = n + 1", &[], Some(10), &cancel),
+        )
+        .await
+        .expect("BOUND EXCEEDED: the post-cancel drain is unbounded (finding 4c)");
+
+        assert!(
+            matches!(&result, Err(PoolError::Sql { sqlstate, .. })
+                if sqlstate.as_deref() == Some("57014")),
+            "a wedged drain reports the cancel shape, got {result:?}"
+        );
+        assert!(
+            co.tainted(),
+            "the conn was dropped mid-statement — it MUST re-enter the pool tainted"
+        );
+
+        // (2) the ONE terminal, via the REAL declare path — a write whose fate is unobserved.
+        let (r, cell) = Responder::new_pair();
+        declare_autocommit_exec(r, result, FETCH_ROWS, 0, 0, /* readonly */ false);
+        match cell.lock().unwrap().clone() {
+            Some(Terminal::Error(ep)) => {
+                assert_eq!(ep.code, errc::WRITE_UNCONFIRMED);
+                assert_eq!(ep.branch, branch::INDETERMINATE);
+            }
+            other => panic!("expected exactly one WriteUnconfirmed terminal, got {other:?}"),
+        }
+
+        // (3) the permit came back: a later checkout succeeds and the tainted conn is FULL-reset.
+        drop(co);
+        let co2 = tokio::time::timeout(Duration::from_secs(600), pool.checkout())
+            .await
+            .expect("BOUND EXCEEDED: the wedged drain leaked its permit")
+            .expect("permit released despite the wedge");
+        assert!(
+            co2.conn().recorded.contains(&"RESET:Full".to_string()),
+            "a drain-expired conn is tainted -> Full reset before the next tenant: {:?}",
+            co2.conn().recorded
+        );
+    }
+
+    /// The same wedge on the per-request CANCEL arm (not the timer): the drain is bounded there too.
+    /// Both interruption arms share one drain in the implementation — this pins that they share the
+    /// BOUND as well, so a future edit cannot bound one and leave the other parked forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_drain_after_a_cancel_token_is_bounded_too() {
+        let backend = FakeBackend::new();
+        backend.wedge_queries();
+        let pool = Pool::new(backend, autocommit_test_pool_config());
+        let mut co = pool.checkout().await.expect("checkout");
+
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // the CANCEL arm, with no timeout_ms at all
+        let (result, _exec_us) = tokio::time::timeout(
+            Duration::from_secs(600),
+            run_autocommit_exec(&mut co, "UPDATE t SET n = n + 1", &[], None, &cancel),
+        )
+        .await
+        .expect("BOUND EXCEEDED: the cancel-arm drain is unbounded (finding 4c)");
+
+        assert!(
+            matches!(&result, Err(PoolError::Sql { sqlstate, .. })
+                if sqlstate.as_deref() == Some("57014")),
+            "a wedged drain reports the cancel shape, got {result:?}"
+        );
+        assert!(co.tainted(), "dropped mid-statement -> tainted");
     }
 
     // ---- M1-S5 Task 4b: the streaming producer (run_autocommit_streamed / run_streamed_exec) -----

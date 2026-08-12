@@ -342,3 +342,46 @@ the S8a §22.2 (u)/(v) contradiction.
   latch marking a transaction persisted when the in-tx statement errored WITHOUT running — is a
   neighbouring problem this task does NOT close. `dispatched` is a plausible future input to it, but
   the two signals are produced at different layers and nothing here changes Task 8's behaviour.
+
+### Task 10 — the post-cancel drain is bounded
+
+- **§5.2 / charter rule 4 — the terminal no longer depends on the backend answering.** The
+  post-cancel DRAIN on both EXEC paths (`services/sql.rs`'s `run_autocommit_exec`, `tx/actor.rs`'s
+  `ExecStep::Deadline` and `ExecStep::Abort`) is bounded by `CANCEL_DRAIN_BUDGET = 5s` — the
+  `pools.rs::VERSION_DRAIN_BUDGET` precedent, same shape and same number. Before this, a wedged
+  backend (accepts TCP, never answers, ignores the `CancelRequest`) parked the handler in that drain
+  forever while holding its checkout permit and the request received NO terminal at all. §5.2's
+  exactly-one-END invariant should say explicitly that it holds on the wedged-backend path too.
+
+- **§19.3 — the wedged-drain cell is the SAME cell as a completed drain, deliberately.** On expiry
+  the engine mints its own `57014`-shaped error and `classify_fate`'s existing override routes it:
+  autocommit write → `WRITE_UNCONFIRMED{Indeterminate}`, autocommit read (client-declared
+  `readonly`) → `CANCELLED{NonRetryable}`, in-tx → the rollback+tombstone `TX_DEADLINE` exit
+  (carrying Task 7's `tx_writes_persisted`). That is honest: the statement's outcome is genuinely
+  unobserved. **No `/proto` change** — no new code, no new branch, and the minted message never
+  reaches the wire because the override rebuilds the payload.
+
+- **§7 (hygiene) — a drain-budget expiry TAINTS the connection, unconditionally.** The expiry DROPS
+  the query future mid-statement, so `Checkout::query`'s instrumented Err-arm fail-safe never runs
+  and nothing else marks the conn. Both paths now call `co.set_tainted(true)` themselves. On the tx
+  path this is explicitly NOT delegated to teardown's ROLLBACK failing: a backend that wedges the
+  STATEMENT but still answers control traffic rolls back cleanly, and the conn would re-enter the
+  pool on the CLEAN reset profile (measured under mutation: `["BEGIN", "UPDATE …", "ROLLBACK",
+  "RESET:Targeted"]`) while its server session may still be running the previous tenant's statement
+  — the S8a Task-12 hazard. A taint set here survives a successful `rollback_tx` by `ferro-pool`'s
+  documented rule, costing at most one extra full reset.
+
+- **Charter rule 3 is untouched:** nothing re-dispatches after an expired drain; the engine
+  classifies and reports.
+
+- **KNOWN, UNFIXED, same class (for §22.2 / a follow-up, NOT closed here):** the STREAMING abort
+  path has the identical unbounded shape — `services/sql.rs`'s `abort_stream` awaits
+  `handle.finish()` (which drains the remainder: `while self.next().await.is_some() {}`) BEFORE
+  declaring its terminal, with no bound. Against a wedged backend that is the same
+  no-terminal-ever violation of charter rule 4 that this task closed for the buffered paths. The fix
+  looks small and safe by construction — `RowStreamHandle`'s `Drop` already force-taints an
+  unfinished handle (`ferro-pool/src/pool.rs:1154-1166`), so a `timeout(CANCEL_DRAIN_BUDGET,
+  handle.finish())` whose future is dropped leaves the conn tainted exactly as intended — but it was
+  NOT in Task 10's scope (the plan's finding 4c enumerates only the two buffered EXEC paths) and it
+  touches the measured-sound exactly-one-END/B4 ordering machinery, so it wants a plan entry, not an
+  implementer's discretion.
