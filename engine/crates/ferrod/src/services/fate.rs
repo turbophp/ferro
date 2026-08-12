@@ -28,9 +28,15 @@ use ferro_proto::messages::ErrorPayload;
 ///
 /// - `readonly`: the client-declared read/write flag (SPEC charter rule 6: no SQL read/write
 ///   inference — this is the ONLY signal used, ever).
-/// - `sent`: whether the statement was actually TRANSMITTED to the backend. `false` means a
-///   provable "did-not-apply" (e.g. a checkout-time connect failure before any query ran) — such
-///   a loss is always known-fate, never `Indeterminate`, even on a write.
+/// - `sent`: whether the CALL SITE had got as far as handing the statement to the backend. `false`
+///   means a provable "did-not-apply" (e.g. a checkout-time connect failure before any query ran) —
+///   such a loss is always known-fate, never `Indeterminate`, even on a write.
+///   **This is a call-site claim, not a wire fact** (M1-S9a finding 3): the buffered and
+///   stream-OPEN paths pre-build `sent: true` the moment a checkout succeeds, which is honest about
+///   the site but says nothing about the PHASE the loss happened in. The second, independent signal
+///   is `PoolError::ConnectionLost { dispatched }`, carried by the error itself — a PREPARE-phase
+///   loss is `dispatched: false` and stays `Retryable` under a `sent: true` ctx. Both must hold for
+///   `Indeterminate`; neither subsumes the other.
 /// - `in_tx`: whether this call site is an in-transaction user STATEMENT (as opposed to an
 ///   autocommit statement, or a tx CONTROL boundary — BEGIN/COMMIT/ROLLBACK/SAVEPOINT family,
 ///   which are always `in_tx: false`). A lost in-tx statement means the whole transaction is dead
@@ -201,16 +207,29 @@ fn classify_fate_unfiltered(err: PoolError, ctx: OpContext) -> ErrorPayload {
             detail: None,
             retry_after_ms: None,
         },
-        // A connection loss. Indeterminate ONLY if the statement was transmitted, non-readonly,
-        // AND not an in-tx statement:
+        // A connection loss. Indeterminate ONLY if the statement was transmitted, ACTUALLY
+        // DISPATCHED, non-readonly, AND not an in-tx statement:
         //  - !sent (checkout failed, never transmitted) -> known did-not-apply -> Retryable.
-        //  - sent & readonly=false & !in_tx -> a possibly-applied autocommit write, fate UNKNOWN
-        //    -> §19.3 Indeterminate.
+        //  - !dispatched (M1-S9a finding 3) -> the ERROR itself proves the statement never left the
+        //    process even though the CALL SITE's `sent` said otherwise: a connect failure, or a
+        //    PREPARE-phase loss (Parse/Describe only; the Execute never reached the wire). The two
+        //    signals answer different questions and BOTH must hold — `ctx.sent` is honest about the
+        //    CALL SITE (a checkout succeeded, so the buffered and stream-OPEN paths pre-build
+        //    `true`), while `dispatched` carries what the BACKEND knows about the phase. Reproduced
+        //    live on PG 17 with the write provably unapplied and yet reported
+        //    `WriteUnconfirmed{Indeterminate}`; §19.3 reads `Retryable` when nothing was sent.
+        //  - sent & dispatched & readonly=false & !in_tx -> a possibly-applied autocommit write,
+        //    fate UNKNOWN -> §19.3 Indeterminate.
         //  - sent & readonly=true -> a read that observed no result -> Retryable (client policy).
         //  - in_tx=true -> an in-tx statement link-loss means the WHOLE TX is dead (known outcome:
         //    it will never commit) -> Retryable, never Indeterminate for the statement itself.
-        PoolError::ConnectionLost => {
-            if ctx.sent && !ctx.readonly && !ctx.in_tx {
+        //
+        // Direction: `dispatched` can only ever SHRINK the Indeterminate set, and only on evidence
+        // a construction site had to opt into — the variant is struct-shaped precisely so every
+        // site CHOSE at compile time, and the choice everywhere but a provable pre-dispatch is
+        // `true`.
+        PoolError::ConnectionLost { dispatched } => {
+            if ctx.sent && dispatched && !ctx.readonly && !ctx.in_tx {
                 payload(
                     errc::WRITE_UNCONFIRMED,
                     errc::WRITE_UNCONFIRMED_BRANCH,
@@ -222,9 +241,9 @@ fn classify_fate_unfiltered(err: PoolError, ctx: OpContext) -> ErrorPayload {
                 payload(
                     errc::CONNECTION_LOST,
                     errc::CONNECTION_LOST_BRANCH,
-                    "connection lost with a known-fate outcome (statement not transmitted, a \
-                     readonly read, or an in-tx statement whose transaction is now dead) — \
-                     retryable; the engine never retries",
+                    "connection lost with a known-fate outcome (statement not transmitted, the \
+                     loss preceded dispatch, a readonly read, or an in-tx statement whose \
+                     transaction is now dead) — retryable; the engine never retries",
                 )
             }
         }
@@ -406,28 +425,28 @@ mod tests {
             // ---- ConnectionLost (the pre-existing rule, now gated by in_tx too) ----
             Case {
                 name: "ConnectionLost: sent write, not in tx -> Indeterminate",
-                err: PoolError::ConnectionLost,
+                err: PoolError::ConnectionLost { dispatched: true },
                 ctx: ctx(false, true, false),
                 code: errc::WRITE_UNCONFIRMED,
                 branch: branch::INDETERMINATE,
             },
             Case {
                 name: "ConnectionLost: sent read -> Retryable",
-                err: PoolError::ConnectionLost,
+                err: PoolError::ConnectionLost { dispatched: true },
                 ctx: ctx(true, true, false),
                 code: errc::CONNECTION_LOST,
                 branch: branch::RETRYABLE,
             },
             Case {
                 name: "ConnectionLost: not sent (checkout failure) -> Retryable",
-                err: PoolError::ConnectionLost,
+                err: PoolError::ConnectionLost { dispatched: false },
                 ctx: ctx(false, false, false),
                 code: errc::CONNECTION_LOST,
                 branch: branch::RETRYABLE,
             },
             Case {
                 name: "ConnectionLost: in_tx statement -> Retryable, not Indeterminate (whole tx is dead)",
-                err: PoolError::ConnectionLost,
+                err: PoolError::ConnectionLost { dispatched: true },
                 ctx: ctx(false, true, true),
                 code: errc::CONNECTION_LOST,
                 branch: branch::RETRYABLE,
@@ -436,7 +455,7 @@ mod tests {
             // ConnectionLost (readonly:false, sent:true, in_tx:false) MUST stay Indeterminate ----
             Case {
                 name: "lost COMMIT (in_tx:false, readonly:false, sent:true) -> Indeterminate",
-                err: PoolError::ConnectionLost,
+                err: PoolError::ConnectionLost { dispatched: true },
                 ctx: ctx(false, true, false),
                 code: errc::WRITE_UNCONFIRMED,
                 branch: branch::INDETERMINATE,
@@ -523,18 +542,27 @@ mod tests {
     #[test]
     fn connection_lost_indeterminate_only_when_sent_and_write_and_not_in_tx() {
         // sent + write + not in tx -> the ONE Indeterminate case.
-        let sent_write = classify_fate(PoolError::ConnectionLost, ctx(false, true, false));
+        let sent_write = classify_fate(
+            PoolError::ConnectionLost { dispatched: true },
+            ctx(false, true, false),
+        );
         assert_eq!(sent_write.code, errc::WRITE_UNCONFIRMED);
         assert_eq!(sent_write.branch, branch::INDETERMINATE);
 
         // sent + readonly -> Retryable.
-        let sent_read = classify_fate(PoolError::ConnectionLost, ctx(true, true, false));
+        let sent_read = classify_fate(
+            PoolError::ConnectionLost { dispatched: true },
+            ctx(true, true, false),
+        );
         assert_eq!(sent_read.code, errc::CONNECTION_LOST);
         assert_eq!(sent_read.branch, branch::RETRYABLE);
 
         // NOT sent (checkout failure) + write -> Retryable, NOT Indeterminate (a write that
         // provably never left the client is known-fate, not fate-unknown).
-        let unsent_write = classify_fate(PoolError::ConnectionLost, ctx(false, false, false));
+        let unsent_write = classify_fate(
+            PoolError::ConnectionLost { dispatched: false },
+            ctx(false, false, false),
+        );
         assert_eq!(
             unsent_write.code,
             errc::CONNECTION_LOST,
@@ -545,13 +573,19 @@ mod tests {
         assert_ne!(unsent_write.branch, branch::INDETERMINATE);
 
         // NOT sent + readonly -> Retryable.
-        let unsent_read = classify_fate(PoolError::ConnectionLost, ctx(true, false, false));
+        let unsent_read = classify_fate(
+            PoolError::ConnectionLost { dispatched: false },
+            ctx(true, false, false),
+        );
         assert_eq!(unsent_read.code, errc::CONNECTION_LOST);
         assert_eq!(unsent_read.branch, branch::RETRYABLE);
 
         // sent + write + IN TX -> Retryable, NOT Indeterminate: an in-tx statement link-loss means
         // the whole transaction is dead (known outcome), never a lost-write-of-unknown-fate.
-        let sent_write_in_tx = classify_fate(PoolError::ConnectionLost, ctx(false, true, true));
+        let sent_write_in_tx = classify_fate(
+            PoolError::ConnectionLost { dispatched: true },
+            ctx(false, true, true),
+        );
         assert_eq!(sent_write_in_tx.code, errc::CONNECTION_LOST);
         assert_eq!(sent_write_in_tx.branch, branch::RETRYABLE);
         assert_ne!(sent_write_in_tx.branch, branch::INDETERMINATE);
@@ -648,7 +682,10 @@ mod tests {
             assert_eq!(p.errno, want, "the Sql arm must mirror the errno verbatim");
         }
         // The arms with no backend error behind them report None — they have nothing to report.
-        for e in [PoolError::ConnectionLost, PoolError::Timeout] {
+        for e in [
+            PoolError::ConnectionLost { dispatched: true },
+            PoolError::Timeout,
+        ] {
             let p = classify_fate(e, ctx(true, false, false));
             assert_eq!(
                 p.errno, None,
@@ -742,6 +779,91 @@ mod tests {
         }
     }
 
+    // ---- M1-S9a finding 3: the dispatch-phase refinement --------------------------------------
+
+    /// M1-S9a finding 3: the stream-OPEN and buffered paths PRE-BUILD `ctx.sent = true`, but a
+    /// PREPARE-phase loss (Parse/Describe only — the Execute never sent) is a provable
+    /// did-not-apply. The error now carries the phase; a `dispatched: false` loss is Retryable
+    /// even under a sent-true ctx. This is the reproduced-live false-Indeterminate (and the
+    /// mechanism behind M1-S8b's unreproduced pre-HEAD sighting).
+    #[test]
+    fn a_pre_dispatch_loss_is_retryable_even_when_ctx_says_sent() {
+        let ep = classify_fate(
+            PoolError::ConnectionLost { dispatched: false },
+            ctx(false, true, false),
+        );
+        assert_eq!(ep.code, errc::CONNECTION_LOST);
+        assert_eq!(ep.branch, branch::RETRYABLE);
+        assert_ne!(ep.branch, branch::INDETERMINATE);
+    }
+
+    /// The conservative default direction: a dispatched (or unattributed) loss on a sent write
+    /// stays Indeterminate — the refinement may only ever SHRINK the Indeterminate set.
+    #[test]
+    fn a_dispatched_loss_on_a_sent_write_stays_indeterminate() {
+        let ep = classify_fate(
+            PoolError::ConnectionLost { dispatched: true },
+            ctx(false, true, false),
+        );
+        assert_eq!(ep.code, errc::WRITE_UNCONFIRMED);
+        assert_eq!(ep.branch, branch::INDETERMINATE);
+    }
+
+    /// Totality over the FOURTH axis: `dispatched` moves EXACTLY one cell of the sixteen
+    /// `(readonly, sent, in_tx, dispatched)` combinations — the dispatched-autocommit-write one —
+    /// and it may only ever move it OUT of `Indeterminate`, never into it.
+    ///
+    /// Asserted in both directions so it fails from either side: dropping `dispatched &&` from the
+    /// condition makes the `dispatched: false` half stop matching (the moved cell disappears);
+    /// replacing the condition with `!dispatched` (or ignoring `sent`) makes a cell move that must
+    /// not. The `moved` count stops the loop passing vacuously.
+    #[test]
+    fn dispatched_moves_exactly_the_one_indeterminate_cell_and_only_outward() {
+        let mut moved = 0usize;
+        for readonly in [false, true] {
+            for sent in [false, true] {
+                for in_tx in [false, true] {
+                    let c = ctx(readonly, sent, in_tx);
+                    let dispatched =
+                        classify_fate(PoolError::ConnectionLost { dispatched: true }, c);
+                    let undispatched =
+                        classify_fate(PoolError::ConnectionLost { dispatched: false }, c);
+                    let cell = format!("readonly={readonly} sent={sent} in_tx={in_tx}");
+
+                    // An undispatched loss is NEVER Indeterminate, on any axis combination.
+                    assert_ne!(
+                        undispatched.branch,
+                        branch::INDETERMINATE,
+                        "{cell}: a statement that provably never left the process has a KNOWN fate"
+                    );
+                    assert_eq!(undispatched.code, errc::CONNECTION_LOST, "{cell}");
+                    assert_eq!(undispatched.branch, branch::RETRYABLE, "{cell}");
+
+                    if dispatched.branch == branch::INDETERMINATE {
+                        moved += 1;
+                        assert_eq!(
+                            (sent, readonly, in_tx),
+                            (true, false, false),
+                            "{cell}: only the dispatched-autocommit-write cell is Indeterminate"
+                        );
+                    } else {
+                        // Every other cell was already known-fate; the phase must not perturb it.
+                        assert_eq!(
+                            (undispatched.code, undispatched.branch),
+                            (dispatched.code, dispatched.branch),
+                            "{cell}: the dispatch phase may only ever move the Indeterminate cell"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            moved, 1,
+            "exactly one of the eight (readonly, sent, in_tx) cells is Indeterminate for a \
+             dispatched ConnectionLost — a different number means an arm moved"
+        );
+    }
+
     // ---- M1-S9a finding 1: the persisted-transaction post-filter ------------------------------
 
     /// THE finding-1 rule: once earlier tx writes persisted, `branch::RETRYABLE` is unmintable —
@@ -757,7 +879,7 @@ mod tests {
     #[test]
     fn the_retryable_branch_is_unmintable_once_tx_writes_persisted() {
         let retryable_shaped: Vec<PoolError> = vec![
-            PoolError::ConnectionLost,
+            PoolError::ConnectionLost { dispatched: true },
             sql_57014(),
             sql(errc::DEADLOCK, branch::RETRYABLE, "40001"),
             PoolError::Timeout,
@@ -822,7 +944,7 @@ mod tests {
         for readonly in [false, true] {
             for sent in [false, true] {
                 let with = classify_fate(
-                    PoolError::ConnectionLost,
+                    PoolError::ConnectionLost { dispatched: true },
                     OpContext {
                         readonly,
                         sent,
@@ -830,7 +952,10 @@ mod tests {
                         tx_writes_persisted: true,
                     },
                 );
-                let without = classify_fate(PoolError::ConnectionLost, ctx(readonly, sent, false));
+                let without = classify_fate(
+                    PoolError::ConnectionLost { dispatched: true },
+                    ctx(readonly, sent, false),
+                );
                 assert_eq!((with.code, with.branch), (without.code, without.branch));
             }
         }
@@ -893,7 +1018,10 @@ mod tests {
                 "Sql 42601 syntax",
                 sql(errc::SYNTAX, branch::NON_RETRYABLE, "42601"),
             ),
-            ("ConnectionLost", PoolError::ConnectionLost),
+            (
+                "ConnectionLost",
+                PoolError::ConnectionLost { dispatched: true },
+            ),
             ("Timeout", PoolError::Timeout),
             ("Closed", PoolError::Closed),
             ("Backend", PoolError::Backend("backend blew up".to_string())),

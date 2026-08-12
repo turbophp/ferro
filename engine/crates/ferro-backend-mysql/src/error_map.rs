@@ -63,7 +63,11 @@ pub(crate) fn is_session_fatal(e: &Error) -> bool {
 pub(crate) fn map(e: &Error) -> PoolError {
     // (1) transport/driver failure → the distinct, Indeterminate-eligible ConnectionLost variant.
     if is_session_fatal(e) {
-        return PoolError::ConnectionLost;
+        // M1-S9a finding 3 — the CONSERVATIVE default, identical in spirit to the PG mapper: this
+        // function sees only the error, never the phase, so it must assume the statement was in
+        // flight and keep a possibly-applied write Indeterminate (§19.3). `query.rs`'s prepare
+        // step is the one caller that knows better and composes `.undispatched()`.
+        return PoolError::ConnectionLost { dispatched: true };
     }
     // (2) a server error — is_fatal() is false ONLY for `Error::Server`, so this always matches; the
     // fallback is a safety net that never fires (a non-fatal non-Server error is unreachable).
@@ -81,7 +85,8 @@ pub(crate) fn map(e: &Error) -> PoolError {
                 message: se.message.clone(),
             }
         }
-        _ => PoolError::ConnectionLost,
+        // Unreachable safety net (a non-fatal non-`Server` error): same conservative default.
+        _ => PoolError::ConnectionLost { dispatched: true },
     }
 }
 

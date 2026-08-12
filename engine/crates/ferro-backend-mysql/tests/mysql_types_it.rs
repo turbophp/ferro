@@ -1267,7 +1267,7 @@ async fn bind_round_trip_is_byte_identical(url: &str, label: &str) {
             .await;
         match r {
             Err(PoolError::Sql { .. }) => {}
-            Err(PoolError::ConnectionLost) => panic!(
+            Err(PoolError::ConnectionLost { .. }) => panic!(
                 "[{label}] {v:?} -> {col}: a non-representable payload must NEVER be \
                  ConnectionLost — that would mint a false §19.3 Indeterminate"
             ),
@@ -1396,7 +1396,7 @@ async fn non_canonical_payloads_are_rejected_pre_send_under_permissive_sql_mode(
                      SQLSTATE to report"
                 );
             }
-            Err(PoolError::ConnectionLost) => panic!(
+            Err(PoolError::ConnectionLost { .. }) => panic!(
                 "[{label}] {v:?} -> {col}: a rejected bind must NEVER be ConnectionLost — that \
                  would mint a false §19.3 Indeterminate for a write that never left the engine"
             ),

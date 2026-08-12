@@ -25,7 +25,13 @@ use crate::conn::is_session_fatal;
 pub fn map(e: &tokio_postgres::Error) -> PoolError {
     // (1) transport failure or FATAL/PANIC → connection lost (distinct, detectable variant).
     if is_session_fatal(e) {
-        return PoolError::ConnectionLost;
+        // M1-S9a finding 3 — the CONSERVATIVE default. This mapper sees a `tokio_postgres::Error`
+        // and nothing about WHEN in the statement's life it arrived, so it must assume the
+        // statement was in flight: `dispatched: true` keeps a possibly-applied write Indeterminate
+        // (§19.3). The one caller that knows better is `query.rs`'s PREPARE step, which composes
+        // `.undispatched()` on top because its control flow proves the Execute was never reached.
+        // Flipping this default to `false` would license replay of every lost in-flight write.
+        return PoolError::ConnectionLost { dispatched: true };
     }
     // (2) a present, non-fatal DbError → SQLSTATE table. `is_session_fatal` already established
     // `as_db_error()` is `Some` and non-fatal here.
@@ -139,8 +145,10 @@ mod tests {
         );
         assert_eq!(
             map(&err),
-            PoolError::ConnectionLost,
-            "a no-SQLSTATE transport failure must be the distinct ConnectionLost variant"
+            PoolError::ConnectionLost { dispatched: true },
+            "a no-SQLSTATE transport failure must be the distinct ConnectionLost variant, and \
+             this mapper's default phase is the conservative `dispatched: true` (M1-S9a): only a \
+             caller whose control flow PROVES pre-dispatch may compose `.undispatched()` on top"
         );
     }
 }

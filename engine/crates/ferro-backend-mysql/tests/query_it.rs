@@ -342,7 +342,7 @@ async fn bind_arity_mismatch_is_known_fate(backend: &MysqlBackend, label: &str) 
             );
             assert_eq!(b, branch::NON_RETRYABLE);
         }
-        PoolError::ConnectionLost => panic!(
+        PoolError::ConnectionLost { .. } => panic!(
             "[{label}] REGRESSION: an arity mismatch classified ConnectionLost (fate-unknown) — \
              the false-Indeterminate defect"
         ),

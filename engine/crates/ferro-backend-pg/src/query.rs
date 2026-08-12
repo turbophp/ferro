@@ -65,10 +65,17 @@ use crate::{bind, error_map, placeholder, rowmap};
 pub async fn run(client: &Client, sql: &str, params: &[Value]) -> Result<QueryResult, PoolError> {
     let normalized = placeholder::normalize(sql);
 
+    // M1-S9a finding 3 — `.undispatched()`: this await is Parse/Describe/Sync ONLY. `query_raw`
+    // (step 5) is what sends Bind/Execute, and it is not reached unless this returns `Ok`, so a
+    // loss HERE provably did not apply the statement. Without the mark, a conn that died before
+    // this round trip reports `WriteUnconfirmed{Indeterminate}` for a write that could not have
+    // happened — reproduced live on PG 17 (`tests/pre_dispatch_fate_it.rs`). `error_map::map`
+    // still decides WHAT the error is; this only records WHEN, and it is identity on every
+    // non-`ConnectionLost` outcome (a syntax error stays a `Sql` error).
     let stmt = client
         .prepare(&normalized)
         .await
-        .map_err(|e| error_map::map(&e))?;
+        .map_err(|e| error_map::map(&e).undispatched())?;
 
     // Build cols from the prepared statement's columns — correct even for a zero-row result, and
     // and (since M1-S8c) never refuses a column type — an unmapped OID is the TEXT FALLBACK.
@@ -174,10 +181,15 @@ pub async fn stream(
 ) -> Result<(Vec<ColMeta>, PgRowStream), PoolError> {
     let normalized = placeholder::normalize(sql);
 
+    // M1-S9a finding 3 — the SAME pre-dispatch mark as `run`'s prepare, and it is this path that
+    // M1-S8b filed as an unreproduced sighting ("a stream OPEN whose terminal arrives before any
+    // HEAD mapped to Indeterminate where §19.3 reads Retryable"): the stream OPEN error path
+    // pre-builds `sent: true`, so a checkout failure structurally cannot produce it — a
+    // prepare-phase loss on an already-checked-out conn can, and did.
     let stmt = client
         .prepare(&normalized)
         .await
-        .map_err(|e| error_map::map(&e))?;
+        .map_err(|e| error_map::map(&e).undispatched())?;
 
     // cols + per-column OIDs, driven off the prepared statement — correct even for a zero-row
     // result; a non-canonical column type takes the M1-S8c TEXT fallback rather than erroring.

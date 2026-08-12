@@ -192,7 +192,9 @@ impl PoolBackend for MysqlBackend {
     async fn connect(&self) -> Result<Self::Conn, PoolError> {
         let base = Opts::from_url(&self.url).map_err(|e| {
             tracing::warn!(error = %e, "ferro-backend-mysql: invalid DSN");
-            PoolError::ConnectionLost
+            // Inside `connect()`, and before even a socket exists: nothing was transmitted
+            // (M1-S9a finding 3).
+            PoolError::ConnectionLost { dispatched: false }
         })?;
 
         // Ensure the curated session trackers are in force as SETUP commands (the fork negotiates
@@ -230,7 +232,8 @@ impl PoolBackend for MysqlBackend {
 
         let mysql = Conn::new(opts.clone()).await.map_err(|e| {
             tracing::warn!(error = %e, "ferro-backend-mysql: connect failed");
-            PoolError::ConnectionLost
+            // A dial/handshake that never completed carried no user statement (M1-S9a finding 3).
+            PoolError::ConnectionLost { dispatched: false }
         })?;
 
         // BASELINE (SPEC §7.1): the connect/handshake/setup SETs (incl. anything the driver applies
@@ -253,7 +256,9 @@ impl PoolBackend for MysqlBackend {
             Err(e) => {
                 conn.closed.store(true, Ordering::SeqCst);
                 tracing::debug!(error = %e, "ferro-backend-mysql: ping (round trip) failed");
-                Err(PoolError::ConnectionLost)
+                // Not a connect-path site and not a user statement's fate (it drives eviction):
+                // the conservative `dispatched: true` (M1-S9a finding 3).
+                Err(PoolError::ConnectionLost { dispatched: true })
             }
         }
     }
@@ -314,7 +319,9 @@ impl PoolBackend for MysqlBackend {
             Err(e) => {
                 conn.closed.store(true, Ordering::SeqCst);
                 tracing::warn!(error = %e, profile = ?profile, "ferro-backend-mysql: reset failed");
-                Err(PoolError::ConnectionLost)
+                // Same as `ping`: a recycle-path signal that DID reach the wire — conservative
+                // `dispatched: true` (M1-S9a finding 3).
+                Err(PoolError::ConnectionLost { dispatched: true })
             }
         }
     }

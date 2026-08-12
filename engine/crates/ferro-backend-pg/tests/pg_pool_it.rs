@@ -259,7 +259,9 @@ async fn pg_killed_backend_evicted_no_retry() {
     );
     assert_eq!(
         last_err,
-        Some(PoolError::ConnectionLost),
+        // M1-S9a: the `exec`/`simple_query` path has no separable prepare phase, so the loss is
+        // unattributed and takes the conservative `dispatched: true`.
+        Some(PoolError::ConnectionLost { dispatched: true }),
         "a killed backend must surface as ConnectionLost (Retryable), never a silent success"
     );
     assert_eq!(

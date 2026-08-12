@@ -8,9 +8,25 @@ pub enum PoolError {
     /// The caller waited longer than `checkout_timeout` for a permit/idle connection.
     #[error("timed out waiting for a pooled connection")]
     Timeout,
-    /// The backend connection died (ping/round-trip failure, driver task ended, etc).
-    #[error("connection to backend lost")]
-    ConnectionLost,
+    /// The backend connection died (transport failure, FATAL/PANIC session end, driver task gone).
+    ///
+    /// `dispatched` records whether the USER STATEMENT this error is being reported for had
+    /// already been TRANSMITTED when the loss surfaced (M1-S9a, finding 3):
+    ///
+    /// - `true` — the DEFAULT direction, and the one every site that cannot attribute the phase
+    ///   MUST take: the statement may be executing, so on a sent, non-readonly, non-in-tx call
+    ///   site §19.3 reports `Indeterminate`.
+    /// - `false` — PROVABLE pre-dispatch ONLY: a connect failure (nothing was ever sent on this
+    ///   socket), or a PREPARE-phase loss where Parse/Describe (PG) / `COM_STMT_PREPARE` (MySQL)
+    ///   failed and the Execute never left the process. A known did-not-apply — always
+    ///   `Retryable`, never `Indeterminate`.
+    ///
+    /// The asymmetry is deliberate and load-bearing: a wrong `true` cries wolf (a write that did
+    /// not apply is reported unconfirmed); a wrong `false` LICENSES REPLAY of a possibly-applied
+    /// write. Only mark `false` where non-dispatch is provable from the control flow, not merely
+    /// likely. `dispatched` narrows the Indeterminate set; it can never widen it.
+    #[error("connection to backend lost (dispatched: {dispatched})")]
+    ConnectionLost { dispatched: bool },
     /// The pool has been shut down and is no longer accepting checkouts.
     #[error("pool is closed")]
     Closed,
@@ -76,7 +92,7 @@ pub enum Branch {
 impl PoolError {
     pub fn taxonomy_branch(&self) -> Branch {
         match self {
-            PoolError::Timeout | PoolError::ConnectionLost => Branch::Retryable,
+            PoolError::Timeout | PoolError::ConnectionLost { .. } => Branch::Retryable,
             PoolError::Closed | PoolError::Unsupported(_) | PoolError::Backend(_) => {
                 Branch::NonRetryable
             }
@@ -102,10 +118,25 @@ impl PoolError {
         use ferro_proto::consts::errc;
         match self {
             PoolError::Timeout => errc::POOL_TIMEOUT,
-            PoolError::ConnectionLost => errc::CONNECTION_LOST,
+            PoolError::ConnectionLost { .. } => errc::CONNECTION_LOST,
             PoolError::Unsupported(_) => errc::UNSUPPORTED,
             PoolError::Closed | PoolError::Backend(_) => errc::PROTOCOL,
             PoolError::Sql { code, .. } => *code,
+        }
+    }
+
+    /// Mark a [`PoolError::ConnectionLost`] as PROVABLY pre-dispatch (M1-S9a finding 3; see the
+    /// variant doc for the direction rule). Identity on every other variant, so a phase-aware call
+    /// site can write `error_map::map(&e).undispatched()` without re-deriving the classification —
+    /// the mapper keeps deciding WHAT the error is, this only records WHEN it happened.
+    ///
+    /// Correct at exactly one kind of site: one where the control flow proves the user statement
+    /// was not yet transmitted — a backend `prepare()` that returned `Err` before the Bind/Execute
+    /// (PG) or `COM_STMT_EXECUTE` (MySQL) call was ever reached. Do not use it to express a hunch.
+    pub fn undispatched(self) -> PoolError {
+        match self {
+            PoolError::ConnectionLost { .. } => PoolError::ConnectionLost { dispatched: false },
+            other => other,
         }
     }
 }

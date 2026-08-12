@@ -157,7 +157,9 @@ impl<B: PoolBackend> Pool<B> {
                             queue_us,
                         ))
                     }
-                    Ok(Err(_)) => Err(PoolError::ConnectionLost),
+                    // A DIAL failure: nothing was ever sent on this socket, so the caller's
+                    // statement provably never left the process (M1-S9a finding 3).
+                    Ok(Err(_)) => Err(PoolError::ConnectionLost { dispatched: false }),
                     // The dial outlived the caller's whole budget: DROP the wedged future (which
                     // is what tears down the half-open dial) and answer Timeout. THIS is the
                     // finding-4a fix — the permit releases here instead of being pinned forever.

@@ -402,7 +402,7 @@ mod tests {
                     assert_eq!(code, errc::UNSUPPORTED);
                     assert_eq!(b, errc::UNSUPPORTED_BRANCH);
                 }
-                Err(PoolError::ConnectionLost) => {
+                Err(PoolError::ConnectionLost { .. }) => {
                     panic!("REGRESSION: an arity mismatch must NEVER be ConnectionLost (§19.3)")
                 }
                 other => panic!("expected Sql{{Unsupported}}, got {other:?}"),
@@ -739,7 +739,7 @@ mod tests {
                         "{v:?}: the message must name the offending placeholder, got {message:?}"
                     );
                 }
-                Err(PoolError::ConnectionLost) => panic!(
+                Err(PoolError::ConnectionLost { .. }) => panic!(
                     "REGRESSION: {v:?} must NEVER be ConnectionLost — a pre-send bind rejection \
                      has a KNOWN fate (§19.3)"
                 ),

@@ -111,7 +111,9 @@ impl PoolBackend for PgBackend {
             .await
             .map_err(|e| {
                 tracing::warn!(error = %e, "ferro-backend-pg: connect failed");
-                PoolError::ConnectionLost
+                // M1-S9a finding 3: a dial that never completed transmitted nothing, so any
+                // statement the caller was about to run provably did not apply.
+                PoolError::ConnectionLost { dispatched: false }
             })?;
 
         // M1-S8c (D-S8b-6) — install the `Bind` RESULT-FORMAT POLICY before anything is prepared.
@@ -159,7 +161,11 @@ impl PoolBackend for PgBackend {
             .map(|_| ())
             .map_err(|e| {
                 tracing::debug!(error = %e, "ferro-backend-pg: ping (round trip) failed");
-                PoolError::ConnectionLost
+                // NOT a connect-path site: the ping itself IS a round trip that reached the wire,
+                // and this error is not reported for a user statement at all (it drives eviction
+                // in `checkout`/the reaper). The conservative `true` (M1-S9a finding 3) — nothing
+                // here may narrow the Indeterminate set on evidence it does not have.
+                PoolError::ConnectionLost { dispatched: true }
             })
     }
 
@@ -232,7 +238,9 @@ impl PoolBackend for PgBackend {
         conn.client.clear_typeinfo_statement_cache();
         conn.client.batch_execute(sql).await.map_err(|e| {
             tracing::warn!(error = %e, profile = ?profile, "ferro-backend-pg: reset failed");
-            PoolError::ConnectionLost
+            // Same reasoning as `ping`: the reset batch DID reach the wire, and this error is a
+            // recycle-path signal, not a user statement's fate. Conservative `true` (M1-S9a).
+            PoolError::ConnectionLost { dispatched: true }
         })
     }
 

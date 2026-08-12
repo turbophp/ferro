@@ -1201,7 +1201,9 @@ fn send_err_to_pool_error(e: StreamSendError) -> PoolError {
             "a streamed row exceeds one frame (MAX_FRAME_PAYLOAD); large-row streaming is post-M1"
                 .to_string(),
         ),
-        StreamSendError::LinkLost => PoolError::ConnectionLost,
+        // M1-S9a: a control-channel loss is a CLIENT-side link failure discovered while the
+        // statement was already streaming rows back — unambiguously dispatched.
+        StreamSendError::LinkLost => PoolError::ConnectionLost { dispatched: true },
     }
 }
 
@@ -2013,7 +2015,11 @@ mod tests {
 
         // A COMMIT (readonly=false) that loses the connection → §19.3 WriteUnconfirmed{Indeterminate}.
         let (r, cell) = Responder::new_pair();
-        declare_ctl(r, CtlReply::Err(PoolError::ConnectionLost), false);
+        declare_ctl(
+            r,
+            CtlReply::Err(PoolError::ConnectionLost { dispatched: true }),
+            false,
+        );
         match cell.lock().unwrap().clone() {
             Some(Terminal::Error(ep)) => {
                 assert_eq!(ep.code, errc::WRITE_UNCONFIRMED);
@@ -2025,7 +2031,11 @@ mod tests {
         // A ROLLBACK (readonly=true) that loses the connection → known-fate ConnectionLost{Retryable},
         // NOT Indeterminate (a failed rollback is not a lost write).
         let (r, cell) = Responder::new_pair();
-        declare_ctl(r, CtlReply::Err(PoolError::ConnectionLost), true);
+        declare_ctl(
+            r,
+            CtlReply::Err(PoolError::ConnectionLost { dispatched: true }),
+            true,
+        );
         match cell.lock().unwrap().clone() {
             Some(Terminal::Error(ep)) => {
                 assert_eq!(ep.code, errc::CONNECTION_LOST);

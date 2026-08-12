@@ -44,10 +44,19 @@ pub async fn run(
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, PoolError> {
-    // (1) prepare.
+    // (1) prepare. `.undispatched()` (M1-S9a finding 3): this await is `COM_STMT_PREPARE` only,
+    // and `drain()` — the sole caller of `exec_iter`, i.e. the only thing that ever sends
+    // `COM_STMT_EXECUTE` — is unreachable unless this returns `Ok`. So a loss HERE provably did not
+    // apply the statement, exactly as PG's `prepare()` never reaches Bind/Execute. Without the
+    // mark, a conn that died before this round trip reports `WriteUnconfirmed{Indeterminate}` for a
+    // write that could not have happened. `map_stmt_error` still decides WHAT the error is (and
+    // still sets the `closed` flag); this only records WHEN, and is identity on every
+    // non-`ConnectionLost` outcome — a 1146 unknown-table stays a `Sql` error.
+    // Measured live on MySQL 8.4 AND MariaDB 11.8 (`tests/pre_dispatch_fate_it.rs`), because
+    // "structurally unreachable" is a claim about our code, not about the driver's buffering.
     let stmt = match conn.mysql.prep(sql).await {
         Ok(s) => s,
-        Err(e) => return Err(conn.map_stmt_error(&e)),
+        Err(e) => return Err(conn.map_stmt_error(&e).undispatched()),
     };
 
     // (2) cols from the prepared statement's columns — correct even for a zero-row result, and an

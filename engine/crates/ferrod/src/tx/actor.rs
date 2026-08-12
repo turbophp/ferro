@@ -2559,7 +2559,8 @@ mod tests {
         ));
 
         // Statement 3: lost mid-flight (armed ConnectionLost) — the reply MUST be persisted-marked.
-        pool.backend().arm_next_query_err(PoolError::ConnectionLost);
+        pool.backend()
+            .arm_next_query_err(PoolError::ConnectionLost { dispatched: true });
         let (r3_tx, r3_rx) = oneshot::channel();
         cmd_tx
             .send(TxCommand::Exec {

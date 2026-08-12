@@ -593,7 +593,9 @@ impl PoolBackend for FakeBackend {
             })
             .is_ok();
         if should_fail {
-            return Err(PoolError::ConnectionLost);
+            // Inside `connect()`: nothing was ever sent on this socket, so any statement the
+            // caller was about to run provably never left the process (M1-S9a finding 3).
+            return Err(PoolError::ConnectionLost { dispatched: false });
         }
 
         // Test-only gate (see `block_connect`/`release_connect`): if armed, park here until
@@ -626,7 +628,9 @@ impl PoolBackend for FakeBackend {
     async fn ping(&self, conn: &mut Self::Conn) -> Result<(), PoolError> {
         if conn.fail_next_ping {
             conn.fail_next_ping = false;
-            return Err(PoolError::ConnectionLost);
+            // A POST-connect loss model (the conn existed and answered before): the conservative
+            // `dispatched: true`, exactly as a real backend's non-connect sites take (M1-S9a).
+            return Err(PoolError::ConnectionLost { dispatched: true });
         }
         // Test-only gate (see `block_pings`/`release_pings`): if armed, park here until released.
         // The counter is bumped *before* the (only) await point below, in the same synchronous

@@ -254,7 +254,7 @@ async fn query_wrong_param_count_is_known_fate_not_connection_lost() {
                 "a pre-send bind rejection has no vendor errno — no server answered"
             );
         }
-        PoolError::ConnectionLost => panic!(
+        PoolError::ConnectionLost { .. } => panic!(
             "REGRESSION: a wrong param count was classified ConnectionLost \
              (fate-unknown) — this is the false-Indeterminate defect"
         ),
@@ -340,7 +340,7 @@ async fn query_i64_against_int4_is_known_fate_not_connection_lost() {
                 "the refusal must name the reason and the offending value: {message}"
             );
         }
-        PoolError::ConnectionLost => panic!(
+        PoolError::ConnectionLost { .. } => panic!(
             "REGRESSION: an out-of-range I64-vs-int4 bind was classified ConnectionLost \
              (fate-unknown) — this is the exact false-Indeterminate the pre-validation prevents"
         ),

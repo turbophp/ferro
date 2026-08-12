@@ -37,7 +37,12 @@ async fn fake_arms_ping_failure() {
         .ping(&mut conn)
         .await
         .expect_err("armed ping should fail");
-    assert!(matches!(err, PoolError::ConnectionLost));
+    // M1-S9a: a ping loss is a POST-connect event this fake cannot phase-attribute, so it takes
+    // the conservative `dispatched: true` — the direction that can only ever cry wolf.
+    assert!(matches!(
+        err,
+        PoolError::ConnectionLost { dispatched: true }
+    ));
     assert_eq!(err.taxonomy_branch(), Branch::Retryable);
 }
 
@@ -228,10 +233,14 @@ async fn fake_conn_status_per_connection_not_shared() {
 #[test]
 fn taxonomy_mapping() {
     assert_eq!(PoolError::Timeout.taxonomy_branch(), Branch::Retryable);
-    assert_eq!(
-        PoolError::ConnectionLost.taxonomy_branch(),
-        Branch::Retryable
-    );
+    // M1-S9a: the coarse pool-level branch is Retryable for BOTH dispatch phases — the phase
+    // only refines the §19.3 classification in `ferrod`'s `fate.rs`, never this label.
+    for dispatched in [true, false] {
+        assert_eq!(
+            PoolError::ConnectionLost { dispatched }.taxonomy_branch(),
+            Branch::Retryable
+        );
+    }
     assert_eq!(PoolError::Closed.taxonomy_branch(), Branch::NonRetryable);
     assert_eq!(
         PoolError::Unsupported("bare tx-control".to_string()).taxonomy_branch(),
@@ -249,10 +258,12 @@ fn errc_mapping_matches_registry() {
         PoolError::Timeout.errc(),
         ferro_proto::consts::errc::POOL_TIMEOUT
     );
-    assert_eq!(
-        PoolError::ConnectionLost.errc(),
-        ferro_proto::consts::errc::CONNECTION_LOST
-    );
+    for dispatched in [true, false] {
+        assert_eq!(
+            PoolError::ConnectionLost { dispatched }.errc(),
+            ferro_proto::consts::errc::CONNECTION_LOST
+        );
+    }
     assert_eq!(
         PoolError::Unsupported("x".to_string()).errc(),
         ferro_proto::consts::errc::UNSUPPORTED

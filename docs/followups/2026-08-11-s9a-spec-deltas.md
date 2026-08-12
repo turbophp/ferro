@@ -283,3 +283,62 @@ the S8a §22.2 (u)/(v) contradiction.
 - **Build-graph note for Task 13's accuracy:** `ferrod` gained a `ferro-classify` path dependency
   (the actor calls `implicit_commit_hazard` directly). The crate was already in the graph via
   `ferro-pool`; no new external dependency, no vendor change.
+
+### Task 9
+
+- **§19.3 — NEW RULE (the finding-3 refinement).** `PoolError::ConnectionLost` now carries the
+  DISPATCH PHASE: `ConnectionLost { dispatched: bool }`. Indeterminate requires
+  `ctx.sent && dispatched && !ctx.readonly && !ctx.in_tx` — a statement the error itself proves
+  never left the process (a connect failure, or a PREPARE-phase loss where Parse/Describe (PG) /
+  `COM_STMT_PREPARE` (MySQL) failed and the Execute was never reached) is a KNOWN did-not-apply and
+  reports `CONNECTION_LOST{Retryable}`, even under a `sent: true` context.
+
+  **`sent` and `dispatched` answer different questions and neither subsumes the other**, which is
+  why both are needed: `ctx.sent` is a CALL-SITE claim (the buffered and stream-OPEN paths pre-build
+  `true` the moment a checkout succeeds — honest about the site, silent about the phase), while
+  `dispatched` is carried by the ERROR, from the layer that knows. Reproduced live on PG 17: check
+  out, `pg_terminate_backend` from a side connection, `INSERT` → `ConnectionLost` with the row
+  provably absent, reported `WriteUnconfirmed{Indeterminate}` before this change.
+
+  **Direction (§19.3's own rule):** `dispatched` may only ever SHRINK the Indeterminate set. A wrong
+  `true` cries wolf; a wrong `false` licenses replay of a possibly-applied write. So the default at
+  every site that cannot attribute the phase is `true`, including both `error_map::map`s, both
+  `ping`/`reset` paths and the stream control-channel `LinkLost`. The variant is STRUCT-shaped so
+  every one of the ~14 construction sites had to CHOOSE at compile time rather than inherit a
+  default — the compiler, not a grep, produced the enumeration.
+
+- **§22.2 — MySQL phase attribution is DONE, not deferred (the plan left this open).** The plan
+  allowed the refinement to be PG-only if `mysql_async`'s prepare/execute error could not be phase
+  attributed. It can: `ferro-backend-mysql/src/query.rs` step 1 is `conn.mysql.prep(sql).await` with
+  its own early `return`, and `drain()` — the only caller of `exec_iter`, i.e. the only thing that
+  sends `COM_STMT_EXECUTE` — is unreachable unless it returns `Ok`. Structural reachability is a
+  claim about our code and not about the driver's buffering, so it was MEASURED live on **MySQL
+  8.4 and MariaDB 11.8** (`ferro-backend-mysql/tests/pre_dispatch_fate_it.rs`): kill the pooled
+  session, poll `information_schema.processlist` until it is gone, INSERT → `dispatched: false`,
+  row absent on read-back. Each engine also carries a CONTROL that kills a genuinely IN-FLIGHT
+  statement (string-literal marker, `COMMAND IN ('Execute','Query')` filter) and requires
+  `dispatched: true`.
+
+- **§19.3 / §21 open item 1 — the pre-`HEAD` `Indeterminate` sighting: mechanism SUPPLIED and
+  fixed; the observation itself remains unproven.** The spec asks (line ~550) "can a terminal
+  produced before the first row reach `classify_fate`'s `sent` arm?" **Yes.** The stream OPEN path
+  pre-builds `sent: true`, so a prepare-phase loss on an already-checked-out connection produces a
+  pre-`HEAD` terminal carrying `Indeterminate` — the exact reported shape — and it is now
+  `Retryable`. The note's own guess (a pool-checkout failure) is refuted: that path passes
+  `sent: false` and structurally cannot produce it. **State it as an answered question, not as a
+  closed flake:** the original observation captured no message text and did not reproduce in 16
+  runs, so nothing proves it WAS this. The §21 item should be rewritten to record the answer and
+  the fix, and the residual 1-in-12 stability flake (open item 2) stays open regardless.
+
+- **No `/proto` change, and none implied.** The refined case rides the EXISTING
+  `CONNECTION_LOST{Retryable}` cell; the only wire-visible movement is which of two existing codes a
+  pre-dispatch loss carries. No client change (`php/*` already handles both codes).
+
+- **Message text worth pinning if §19.3 quotes it:** the known-fate `CONNECTION_LOST` message gained
+  a fourth reason — "statement not transmitted, **the loss preceded dispatch**, a readonly read, or
+  an in-tx statement whose transaction is now dead".
+
+- **Cross-task note for Task 13 (accuracy, no action):** Task 8's recorded residual — the hazard
+  latch marking a transaction persisted when the in-tx statement errored WITHOUT running — is a
+  neighbouring problem this task does NOT close. `dispatched` is a plausible future input to it, but
+  the two signals are produced at different layers and nothing here changes Task 8's behaviour.

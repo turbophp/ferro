@@ -185,8 +185,9 @@ async fn connect_failure_releases_permit() {
 
     let result = pool.checkout().await;
     assert!(
-        matches!(result, Err(PoolError::ConnectionLost)),
-        "the armed first connect() should fail with ConnectionLost"
+        matches!(result, Err(PoolError::ConnectionLost { dispatched: false })),
+        "the armed first connect() should fail with ConnectionLost, marked PRE-dispatch: a dial \
+         that never completed cannot have transmitted the caller's statement (M1-S9a finding 3)"
     );
 
     // If the permit had leaked when connect() failed above, this would time out (max_size=1).

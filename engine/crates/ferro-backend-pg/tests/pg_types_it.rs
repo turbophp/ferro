@@ -1193,7 +1193,7 @@ async fn cross_engine_payloads_are_clean_errors_never_panics() {
             .await;
         match r {
             Err(PoolError::Sql { .. }) => {}
-            Err(PoolError::ConnectionLost) => panic!(
+            Err(PoolError::ConnectionLost { .. }) => panic!(
                 "{v:?} -> {col}: a non-representable payload must NEVER be ConnectionLost — that \
                  would mint a false §19.3 Indeterminate for a write that never happened"
             ),
