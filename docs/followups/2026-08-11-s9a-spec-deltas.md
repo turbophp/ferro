@@ -23,3 +23,28 @@ the S8a §22.2 (u)/(v) contradiction.
   `COMMAND IN ('Execute','Query')` so a PREPARE-phase match can never be mistaken for an in-flight
   statement. Both are pre-existing in-tree rules (`mysql_chaos_it.rs`) that this file now depends on
   for its falsifiability once Task 9 lands `ConnectionLost { dispatched }`.
+
+### Task 2
+
+- **§7.1** — add the implicit-commit hazard as a SECOND assist signal alongside the S2 lexer:
+  pre-dispatch, **MySQL/MariaDB-dialect only**, unknown-leading-keyword → HAZARD. Same
+  assist-not-authority contract as `classify`: it may only make a later loss-classification MORE
+  conservative (Retryable → Indeterminate), never less, and the protocol latch (Task 8) corrects a
+  false positive the moment the statement completes. PostgreSQL and SQLite are unconditionally
+  `false` (PG DDL is transactional), so PG behaviour is byte-identical.
+
+- **§7.1 / §22.2** — record the measured deviation from the plan's drafted hazard list: **`EXECUTE`
+  is a hazard, `PREPARE` and `DEALLOCATE` are not.** The implicit commit is a property of the
+  statement that RUNS, not of how it was dispatched, so `PREPARE s FROM 'CREATE TABLE …'; EXECUTE s`
+  commits the open transaction at the EXECUTE. Measured live on **MySQL 8.4.11 and MariaDB
+  11.8.8**: the transaction's earlier INSERT survives a subsequent `ROLLBACK` on both engines, while
+  the identical shape with a prepared DML does not. Unlike the leading `COMMIT` the plan-verify pass
+  correctly refused to add, `EXECUTE` is genuinely reachable through tx-scoped EXEC — it is not
+  transaction control, so `ferro-pool`'s `guard_tx_control` passes it to the wire. Leaving it on the
+  safe list would have left `branch::RETRYABLE` mintable for a statement that had already committed,
+  i.e. the exact at-least-once blocker this slice exists to close.
+
+- **§7.1 note (scope honesty, not a behaviour change)** — the hazard is a LEXICAL assist over the
+  statement text the client sent. It cannot see inside a stored program, which is why `CALL`/`DO`
+  are hazards unconditionally (same reasoning as S6's unconditional CALL/DO pin), and it says
+  nothing about whether a statement mutates session state (that stays `classify`'s question).

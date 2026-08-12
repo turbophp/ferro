@@ -348,6 +348,49 @@ pub(crate) fn classify_one_mysql(
     }
 }
 
+/// One top-level MySQL statement: does it CAUSE AN IMPLICIT COMMIT? (MySQL manual, "Statements
+/// That Cause an Implicit Commit".) See [`crate::implicit_commit_hazard`] for the directional
+/// rationale — this list enumerates the SAFE side; everything else, including an unknown leading
+/// keyword, is a hazard.
+pub(crate) fn mysql_implicit_commit_hazard(stmt: &str) -> bool {
+    let Some(kw) = scan::leading_keyword(stmt) else {
+        // Empty/comment-only: nothing dispatchable, nothing can have committed.
+        return false;
+    };
+    match kw.as_str() {
+        // Never implicitly commit: plain DML, reads, diagnostics, tx-internal verbs, and the
+        // server-side prepared-statement verbs (they may TAINT via classify_one_mysql — that is
+        // a different, orthogonal question).
+        "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "WITH" | "TABLE" | "VALUES"
+        | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "USE" | "HANDLER" | "SAVEPOINT"
+        | "RELEASE" | "ROLLBACK" | "COMMIT" | "PREPARE" | "DEALLOCATE" => false,
+        // CREATE/DROP TEMPORARY do NOT commit; every other CREATE/DROP does.
+        "CREATE" => !create_is_temp(stmt),
+        "DROP" => scan::next_token_after_keyword(stmt).as_deref() != Some("TEMPORARY"),
+        // Plain SET never commits; SET PASSWORD and any autocommit assignment DO.
+        "SET" => {
+            scan::next_token_after_keyword(stmt).as_deref() == Some("PASSWORD")
+                || scan::contains_identifier_ci(stmt, "autocommit")
+        }
+        // The documented committing families (ALTER/RENAME/TRUNCATE/GRANT/REVOKE/ANALYZE/CHECK/
+        // FLUSH/OPTIMIZE/REPAIR/RESET/CACHE/LOAD/INSTALL/UNINSTALL/LOCK/UNLOCK/START/BEGIN/XA/
+        // CHANGE/STOP/PURGE), CALL/DO (a routine may run DDL), `EXECUTE` (see below), and every
+        // UNKNOWN keyword.
+        //
+        // `EXECUTE` is deliberately NOT on the safe list above, and this is a MEASURED deviation
+        // from the M1-S9a plan's draft (which listed it beside `PREPARE`/`DEALLOCATE`). The
+        // implicit commit is a property of the statement that RUNS, not of how it was dispatched:
+        // `PREPARE s FROM 'DROP TABLE t'; EXECUTE s` commits the open transaction at the EXECUTE.
+        // Confirmed live on MySQL 8.4.11 AND MariaDB 11.8.8 (task-2 journal, "adversarial pass"):
+        // BEGIN; INSERT; PREPARE s FROM 'CREATE TABLE …'; EXECUTE s; ROLLBACK  ⇒ the INSERT
+        // SURVIVES the ROLLBACK on both engines. `PREPARE` and `DEALLOCATE` stay safe — neither
+        // runs the prepared text — and `EXECUTE` is reachable through tx-scoped EXEC (it is not
+        // transaction control, so `ferro-pool`'s `guard_tx_control` does not refuse it, unlike the
+        // structurally-unreachable leading `COMMIT` the plan-verify pass refuted).
+        _ => true,
+    }
+}
+
 fn is_safe_leading_keyword(leading: Option<&str>) -> bool {
     matches!(leading, Some(kw) if SAFE_LEADING_KEYWORDS.contains(&kw))
 }

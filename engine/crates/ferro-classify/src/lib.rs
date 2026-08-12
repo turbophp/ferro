@@ -90,6 +90,34 @@ pub fn classify(
         .max_by_key(|trigger| trigger.precedence())
 }
 
+/// M1-S9a (finding 1): the PRE-dispatch implicit-commit hazard — a dialect-scoped lexical ASSIST,
+/// never an authority (SPEC §7.1's pattern, same species as [`classify`]).
+///
+/// On MySQL/MariaDB an implicit-commit statement (DDL, `LOCK TABLES`, `SET autocommit`, …) inside
+/// an explicit transaction COMMITS everything before it — and the commit fires BEFORE the
+/// statement executes, so a statement LOST mid-flight may already be past the commit point with
+/// NO protocol signal ever arriving (no OK packet, no tracker). The tx actor therefore consults
+/// this BEFORE dispatching each in-tx statement: if the statement is hazard-shaped and is then
+/// interrupted/lost, the loss is classified as if the transaction's earlier writes persisted
+/// (`OpContext.tx_writes_persisted`) — the branch that never licenses replay.
+///
+/// Directional by design (charter rule 5 / §19.3): a FALSE hazard costs one conservative
+/// `Indeterminate` iff that statement is then lost mid-flight (the protocol latch corrects it on
+/// completion); a MISSED hazard licenses replay of persisted writes. So the unknown leading
+/// keyword defaults to HAZARD, and only the documented never-committing families are exempt.
+/// PostgreSQL DDL is transactional and SQLite has no implicit commit — both dialects are
+/// unconditionally `false`, so PG behavior is byte-identical.
+///
+/// TOTAL: never panics on any input (inherits `scan.rs`'s panic-safety).
+pub fn implicit_commit_hazard(sql: &str, dialect: Dialect) -> bool {
+    match dialect {
+        Dialect::Postgres | Dialect::Sqlite => false,
+        Dialect::MySql => scan::split_top_level_statements(sql)
+            .into_iter()
+            .any(rules::mysql_implicit_commit_hazard),
+    }
+}
+
 /// Dispatches a single already-split top-level statement to the per-dialect rule set.
 fn classify_one(
     stmt: &str,
@@ -673,5 +701,141 @@ mod tests {
         // over-pins when the flag is set, same as any other unrecognized statement).
         assert_eq!(my("`col` = 1"), Some(PinTrigger::Unknown));
         assert_eq!(classify("`col` = 1", Dialect::MySql, &[], false), None);
+    }
+
+    // ---- M1-S9a: implicit_commit_hazard (the finding-1 pre-dispatch assist) ---------------------
+
+    mod implicit_commit {
+        use super::*;
+
+        fn hz(sql: &str) -> bool {
+            implicit_commit_hazard(sql, Dialect::MySql)
+        }
+
+        /// The documented implicit-commit families (MySQL manual, "Statements That Cause an
+        /// Implicit Commit"), plus CALL/DO (a routine may run DDL — the S6 unconditional-CALL-pin
+        /// precedent). Losing any of these mid-flight may already be past the commit point.
+        #[test]
+        fn implicit_commit_families_are_hazards() {
+            for sql in [
+                "CREATE TABLE t (x INT)",
+                "ALTER TABLE t ADD COLUMN y INT",
+                "DROP TABLE t",
+                "RENAME TABLE t TO u",
+                "TRUNCATE TABLE t",
+                "GRANT SELECT ON *.* TO 'a'@'%'",
+                "REVOKE SELECT ON *.* FROM 'a'@'%'",
+                "ANALYZE TABLE t",
+                "OPTIMIZE TABLE t",
+                "FLUSH TABLES",
+                "LOCK TABLES t WRITE",
+                "UNLOCK TABLES",
+                "START SLAVE",
+                "XA START 'x'",
+                "CALL migrate()",
+                "DO migrate()",
+                "SET autocommit = 1",
+                "SET @@autocommit = 1",
+                "SET PASSWORD FOR 'a'@'%' = 'b'",
+            ] {
+                assert!(hz(sql), "{sql:?} must be an implicit-commit hazard");
+            }
+        }
+
+        /// Plain DML, reads, diagnostics and tx-internal verbs never implicitly commit — these must
+        /// stay Retryable-eligible, or the hazard swallows the useful §19.3 in-tx branch whole.
+        #[test]
+        fn dml_and_tx_internal_verbs_are_not_hazards() {
+            for sql in [
+                "SELECT 1",
+                "INSERT INTO t VALUES (1)",
+                "UPDATE t SET x = 1",
+                "DELETE FROM t",
+                "REPLACE INTO t VALUES (1)",
+                "WITH c AS (SELECT 1) SELECT * FROM c",
+                "SAVEPOINT s1",
+                "ROLLBACK TO SAVEPOINT s1",
+                "RELEASE SAVEPOINT s1",
+                "SHOW TABLES",
+                "EXPLAIN SELECT 1",
+                "USE ferro",
+            ] {
+                assert!(!hz(sql), "{sql:?} must NOT be a hazard");
+            }
+        }
+
+        /// The two edges the manual carves out: TEMPORARY objects do not commit; their persistent
+        /// twins do. A hazard that marks CREATE TEMPORARY cries wolf on every S2 temp-table shape.
+        #[test]
+        fn temporary_objects_do_not_commit_but_persistent_twins_do() {
+            assert!(!hz("CREATE TEMPORARY TABLE t (x INT)"));
+            assert!(!hz("create temporary table t (x int)"));
+            assert!(!hz("DROP TEMPORARY TABLE t"));
+            assert!(hz("CREATE TABLE t (x INT)"));
+            assert!(hz("DROP TABLE t"));
+        }
+
+        /// Plain SET is tx-safe (it may TAINT via the S2 lexer, but it does not commit); the two
+        /// committing SET shapes are autocommit assignment and SET PASSWORD.
+        #[test]
+        fn plain_set_is_safe_the_two_committing_sets_are_not() {
+            assert!(!hz("SET SESSION sql_mode = ''"));
+            assert!(!hz("SET @user_var = 1"));
+            assert!(hz("SET autocommit = 0"));
+            assert!(hz("SET PASSWORD = 'x'"));
+        }
+
+        /// PLAN DEVIATION, measured live on MySQL 8.4.11 AND MariaDB 11.8.8 (task-2 journal):
+        /// the M1-S9a plan's draft listed `EXECUTE` beside `PREPARE`/`DEALLOCATE` on the
+        /// never-commits side. It does not belong there. The implicit commit is a property of the
+        /// statement that RUNS, not of how it was dispatched, so
+        /// `PREPARE s FROM 'CREATE TABLE …'; EXECUTE s` commits the open transaction AT the
+        /// EXECUTE — proven live: the transaction's earlier INSERT survives a subsequent
+        /// `ROLLBACK` on both engines, while the identical shape with a prepared DML does not.
+        ///
+        /// This one is reachable, unlike the leading `COMMIT` the plan-verify pass correctly
+        /// refused to add: `EXECUTE` is not transaction control, so `ferro-pool`'s
+        /// `guard_tx_control` passes it straight to the wire. A missed hazard here licenses replay
+        /// of already-persisted writes — the exact at-least-once blocker this slice exists to
+        /// close. `PREPARE` and `DEALLOCATE` stay safe: neither runs the prepared text.
+        #[test]
+        fn execute_is_a_hazard_but_prepare_and_deallocate_are_not() {
+            assert!(
+                hz("EXECUTE s"),
+                "EXECUTE runs the prepared text; if that text is DDL it has ALREADY committed"
+            );
+            assert!(hz("EXECUTE s USING @a"));
+            assert!(!hz("PREPARE s FROM 'CREATE TABLE t (x INT)'"));
+            assert!(!hz("DEALLOCATE PREPARE s"));
+        }
+
+        /// The §19.3 directional default: an UNKNOWN leading keyword is a hazard. A false hazard
+        /// costs one cry-wolf Indeterminate iff that statement is then LOST mid-flight; a missed
+        /// hazard licenses replay of persisted writes (at-least-once).
+        #[test]
+        fn unknown_leading_keyword_defaults_to_hazard() {
+            assert!(hz("FROBNICATE THE THING"));
+        }
+
+        /// Multi-statement input: any hazardous top-level statement makes the whole text hazardous
+        /// (mirrors `classify`'s split semantics); comment-only/empty input dispatches nothing.
+        #[test]
+        fn multi_statement_any_hazard_wins_and_empty_is_safe() {
+            assert!(hz("INSERT INTO t VALUES (1); CREATE TABLE u (x INT)"));
+            assert!(!hz("INSERT INTO t VALUES (1); UPDATE t SET x = 2"));
+            assert!(!hz("/* nothing */"));
+            assert!(!hz(""));
+        }
+
+        /// PostgreSQL DDL is transactional and SQLite has no implicit-commit class of this shape:
+        /// the hazard is DIALECT-SCOPED and must never fire there (PG behavior stays byte-identical).
+        #[test]
+        fn postgres_and_sqlite_never_hazard() {
+            for d in [Dialect::Postgres, Dialect::Sqlite] {
+                assert!(!implicit_commit_hazard("CREATE TABLE t (x int)", d));
+                assert!(!implicit_commit_hazard("LOCK TABLES t WRITE", d));
+                assert!(!implicit_commit_hazard("FROBNICATE", d));
+            }
+        }
     }
 }
