@@ -148,6 +148,42 @@ the S8a §22.2 (u)/(v) contradiction.
   (`sql.rs:329`, `sql.rs:755`). PostgreSQL has no implicit commit, so the flag stays `false` there
   forever and no PG cell can ever move.
 
+### Task 3
+
+- **§7 (pooling) — `checkout_timeout` now means what the docs always claimed.** It bounds the WHOLE
+  checkout: the semaphore acquire, any recycle cleanup on popped idle conns, and a fresh dial all
+  run under ONE deadline (`tokio::time::timeout_at`). Before this, the knob wrapped only the permit
+  acquire while `backend.connect()` was a bare `.await` and `tokio_postgres::connect` has no connect
+  timeout of its own — so a backend that accepts TCP and never finishes the startup handshake pinned
+  a permit forever, and `max_size` such dials took the pool to ZERO usable capacity permanently, even
+  after the backend recovered (confirmed by execution, M0 core review finding 4a).
+
+- **§7 — a stated, deliberate behaviour change on the recycle path.** The checkout-time cleanup
+  (defensive `ROLLBACK` + hygiene reset) used to get a FRESH FULL `checkout_timeout` PER popped conn,
+  so one checkout's total latency could reach `max_size x checkout_timeout` while the knob claimed
+  1x. It is now bounded by the checkout's SHARED deadline, and a cleanup that consumes the whole
+  budget ends that checkout in `Err(PoolError::Timeout)` (-> `POOL_TIMEOUT{Retryable}` on the wire)
+  instead of silently spending a second budget to dial. The eviction rule is UNCHANGED and still the
+  safety property: a conn whose cleanup did not complete is dropped, never handed out and never
+  pushed back (no cross-tenant state leak); the next checkout dials fresh. Retry remains client
+  policy — the engine adds none (charter rule 3). `ferro-pool/tests/tx_api.rs`'s
+  `bounded_recycle_evicts_a_conn_whose_cleanup_blocks` was updated to assert the new contract; both
+  of its original properties (bounded, evicted) are still asserted.
+
+- **§7 / §12 (hygiene) — a poisoned idle mutex is no longer a process abort.** All three
+  idle-stack lock sites in `pool.rs` (checkout pop, `poison_idle_for_test`, and critically
+  `Checkout::drop`) recover with `.unwrap_or_else(std::sync::PoisonError::into_inner)` — the
+  in-tree `ferrod/src/pools.rs` `PoolEntry::lock` idiom. `Checkout::drop` runs during unwind, and a
+  panic raised while another unwind is in progress is `std::process::abort()`, which would take every
+  worker's connections down with it. The lock only ever guards a trivial pop/push, so recovery (not
+  eviction) is correct. The same idiom is Task 4's to apply in `health.rs`.
+
+- **Followup closable:** `docs/followups/2026-08-10-unbounded-backend-dial.md` — the ~127s OS-TCP
+  black-hole case it documents is now bounded by `checkout_timeout`.
+
+- **No `/proto` change.** A wedged/expired checkout reuses the existing `PoolError::Timeout` ->
+  `POOL_TIMEOUT{Retryable}` mapping; no new wire constant was minted.
+
 ### Task 4
 
 - **§7.6/§16 (the liveness reaper): the ping is BOUNDED by `checkout_timeout`.** A backend that

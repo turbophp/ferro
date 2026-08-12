@@ -96,8 +96,8 @@ async fn cancel_handle_returns_a_handle() {
 async fn bounded_recycle_evicts_a_conn_whose_cleanup_blocks() {
     let cfg = PoolConfig {
         max_size: 4,
-        // The per-conn recycle-cleanup bound (reused as the checkout bound). Short so the test is
-        // fast; the outer timeout below is the real "never hang" guard.
+        // ONE budget for the whole checkout — permit + recycle cleanup + dial (M1-S9a, finding
+        // 4a). Short so the test is fast; the outer timeout below is the real "never hang" guard.
         checkout_timeout: Duration::from_millis(200),
         ..Default::default()
     };
@@ -114,12 +114,35 @@ async fn bounded_recycle_evicts_a_conn_whose_cleanup_blocks() {
     // Arm the block hook so that defensive ROLLBACK hangs indefinitely on the next checkout.
     pool.backend().block_simple_query();
 
-    // The next checkout pops the poisoned idle conn, its ROLLBACK blocks, the BOUNDED-recycle
-    // timeout fires, the conn is EVICTED, and a fresh conn is connected instead — bounded, never a
-    // hang. The outer 5s timeout is the hard proof it does not hang.
+    // The next checkout pops the poisoned idle conn and its ROLLBACK blocks. Two properties, and
+    // M1-S9a changed which one this checkout ends on:
+    //   * BOUNDED — the recycle cleanup is cut off, never a hang (the outer 5s is the hard proof);
+    //   * EVICTED — the conn whose cleanup did not complete is DROPPED, never handed out or pushed
+    //     back (the cross-tenant-leak rule).
+    // Before M1-S9a the cleanup got its own FRESH full `checkout_timeout`, so this checkout could
+    // still spend a second budget dialling and return a fresh conn — i.e. total checkout latency
+    // could reach `max_size * checkout_timeout` while the knob claimed 1x. Now the cleanup is
+    // bounded by the checkout's SHARED deadline, so a cleanup that eats the whole budget ends
+    // THIS checkout in `Err(Timeout)` — the honest answer for a caller whose budget is spent — and
+    // the eviction is proven by the FOLLOWING checkout getting a different conn.
+    let r = tokio::time::timeout(Duration::from_secs(5), pool.checkout())
+        .await
+        .expect("checkout must be bounded (evict on recycle timeout), never hang");
+    assert!(
+        matches!(r, Err(PoolError::Timeout)),
+        "a recycle cleanup that consumes the whole checkout_timeout must end the checkout in \
+         Err(Timeout), not silently spend a second budget: got {}",
+        match &r {
+            Ok(_) => "Ok(<checkout>)".to_string(),
+            Err(e) => format!("Err({e:?})"),
+        }
+    );
+
+    // The poisoned conn was EVICTED by that expiry, not pushed back: the next checkout finds the
+    // idle stack empty and dials fresh (still bounded, still never a hang).
     let co2 = tokio::time::timeout(Duration::from_secs(5), pool.checkout())
         .await
-        .expect("checkout must be bounded (evict on recycle timeout), never hang")
+        .expect("the checkout after the eviction must be bounded too")
         .expect("checkout should reconnect fresh after evicting the poisoned conn");
     assert_ne!(
         co2.conn().id,

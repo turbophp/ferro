@@ -1,6 +1,9 @@
 //! The hand-rolled pool (S4 Task 2, decision D9 — no `deadpool`/`bb8`).
 //!
-//! Checkout is semaphore-bounded (`max_size`) and measures `queue_us` — the time spent waiting
+//! Checkout is semaphore-bounded (`max_size`) and **the whole of it — permit wait, recycle
+//! cleanup, fresh dial — runs under ONE `checkout_timeout` deadline** (M1-S9a, finding 4a; before
+//! that the knob wrapped only the permit acquire, so a wedged dial pinned its permit forever).
+//! It measures `queue_us` — the time spent waiting
 //! for a permit *and* for a usable connection to end up in hand (v2/m2). Release (`Checkout`'s
 //! `Drop`) is fully synchronous (v2/B1): it returns the connection to the idle stack and records
 //! `tx_open`/`tainted` flags, but never runs the async ROLLBACK/reset itself. That async cleanup
@@ -94,14 +97,25 @@ impl<B: PoolBackend> Pool<B> {
         Self { inner }
     }
 
-    /// Checks out a connection, waiting up to `config.checkout_timeout` for a free permit and a
-    /// usable connection. `queue_us` on the returned `Checkout` covers the whole wait, including
-    /// any async cleanup (defensive ROLLBACK/reset) performed on a recycled idle connection.
+    /// Checks out a connection. **`config.checkout_timeout` bounds the WHOLE checkout** (M1-S9a,
+    /// finding 4a): the permit acquire, any recycle cleanup on popped idle conns, and a fresh dial
+    /// all run under ONE deadline — the guarantee this module's docs have always claimed.
+    /// `queue_us` on the returned `Checkout` covers that whole wait.
+    ///
+    /// On deadline: `Err(PoolError::Timeout)`. A dial that outlives the budget is DROPPED — the
+    /// permit releases on the return, so capacity comes back even against a backend that accepts
+    /// TCP and never finishes the startup handshake (`tokio_postgres::connect` has no connect
+    /// timeout of its own; before M1-S9a `max_size` such dials took the pool to zero usable
+    /// capacity PERMANENTLY, confirmed by execution). A recycle cleanup that outlives the budget
+    /// EVICTS its conn — never hand out a conn whose cleanup did not complete; the cost of a
+    /// spurious eviction when the CALLER's budget simply ran out is one reconnect, the safe
+    /// direction (charter rule 5).
     pub async fn checkout(&self) -> Result<Checkout<B>, PoolError> {
         let start = Instant::now();
+        let deadline = start + self.inner.config.checkout_timeout;
 
         let acquire = Arc::clone(&self.inner.semaphore).acquire_owned();
-        let permit = match tokio::time::timeout(self.inner.config.checkout_timeout, acquire).await {
+        let permit = match tokio::time::timeout_at(deadline, acquire).await {
             Ok(Ok(permit)) => permit,
             // The semaphore is never explicitly closed in M0; treat it as a (non-retryable) pool
             // shutdown rather than panicking.
@@ -110,18 +124,30 @@ impl<B: PoolBackend> Pool<B> {
         };
 
         loop {
+            // The caller's budget is spent (a recycle cleanup consumed it, or several did): answer
+            // Timeout rather than keep spending on an already-late checkout. Without this, a
+            // checkout could return *after* its deadline and still report success — the knob would
+            // bound nothing observable on the recycle path.
+            if Instant::now() >= deadline {
+                return Err(PoolError::Timeout);
+            }
+
             let popped = {
-                let mut idle = self.inner.idle.lock().unwrap();
+                let mut idle = self
+                    .inner
+                    .idle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 idle.pop()
             };
 
             let Some(mut idle_conn) = popped else {
                 // No idle connection: connect a fresh one, up to max_size (the permit already
-                // bounds this). A connect failure surfaces immediately (v2/M5) — no hidden retry
-                // loop here; `permit` drops on this early return, releasing capacity so it is not
-                // leaked.
-                return match self.inner.backend.connect().await {
-                    Ok(conn) => {
+                // bounds this), WITHIN the remaining budget. A connect failure surfaces
+                // immediately (v2/M5) — no hidden retry loop here (charter rule 3); `permit` drops
+                // on every one of these returns, releasing capacity so it is not leaked.
+                return match tokio::time::timeout_at(deadline, self.inner.backend.connect()).await {
+                    Ok(Ok(conn)) => {
                         let queue_us = start.elapsed().as_micros() as u64;
                         Ok(Checkout::new(
                             conn,
@@ -131,7 +157,11 @@ impl<B: PoolBackend> Pool<B> {
                             queue_us,
                         ))
                     }
-                    Err(_) => Err(PoolError::ConnectionLost),
+                    Ok(Err(_)) => Err(PoolError::ConnectionLost),
+                    // The dial outlived the caller's whole budget: DROP the wedged future (which
+                    // is what tears down the half-open dial) and answer Timeout. THIS is the
+                    // finding-4a fix — the permit releases here instead of being pinned forever.
+                    Err(_) => Err(PoolError::Timeout),
                 };
             };
 
@@ -145,10 +175,13 @@ impl<B: PoolBackend> Pool<B> {
             // BOUNDED recycle (S6 BLOCKER-half): a poisoned `tx_open`/`tainted` conn whose
             // defensive ROLLBACK/reset HANGS must not block a future checkout unboundedly, so the
             // cleanup runs under a timeout. On timeout — OR a cleanup error — EVICT the conn (drop
-            // it and try the next idle one / connect fresh), never wait on it forever. NOTE: the
-            // `checkout_timeout` at the top of `checkout()` wraps ONLY the permit acquire, not this
-            // pop/rollback/reset loop, so without this bound a single wedged conn could stall every
-            // subsequent checkout. Reuses `checkout_timeout` as the per-conn cleanup bound.
+            // it and try the next idle one / connect fresh), never wait on it forever.
+            //
+            // M1-S9a (finding 4a): the bound is now the checkout's SHARED `deadline`, not a fresh
+            // full `checkout_timeout` per conn — which let a single checkout's total latency reach
+            // `max_size * checkout_timeout` while the knob claimed otherwise. A cleanup that eats
+            // the whole budget therefore ends the checkout in `Err(Timeout)` at the loop top, with
+            // the conn evicted; the NEXT checkout dials fresh.
             //
             // M1-S3 (SPEC §7.2): a NON-tainted recycled conn now ALSO needs cleanup (the backend's
             // `clean_reset_profile()` targeted reset — the §7.4 assist-lexer blind-spot backstop),
@@ -182,7 +215,7 @@ impl<B: PoolBackend> Pool<B> {
                     }
                     Ok::<(), PoolError>(())
                 };
-                match tokio::time::timeout(self.inner.config.checkout_timeout, cleanup).await {
+                match tokio::time::timeout_at(deadline, cleanup).await {
                     Ok(Ok(())) => {}        // cleaned: hand it out below
                     Ok(Err(_)) => continue, // cleanup errored: evict + try again
                     Err(_) => continue,     // cleanup timed out: evict (drop) + try again
@@ -207,10 +240,32 @@ impl<B: PoolBackend> Pool<B> {
     /// directly. Not intended for production callers.
     #[doc(hidden)]
     pub fn poison_idle_for_test(&self, f: impl FnOnce(&mut B::Conn)) {
-        let mut idle = self.inner.idle.lock().unwrap();
+        let mut idle = self
+            .inner
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(idle_conn) = idle.last_mut() {
             f(&mut idle_conn.conn);
         }
+    }
+
+    /// Test-support hook: POISONS the idle-stack mutex (panics on a scratch thread while holding
+    /// it), so tests can prove the pool's lock sites RECOVER instead of double-panicking into a
+    /// process abort (M1-S9a finding 7b: a panic raised while another unwind is in progress is
+    /// `std::process::abort()`, which would take every worker's connections down). Not intended
+    /// for production callers.
+    #[doc(hidden)]
+    pub fn poison_idle_mutex_for_test(&self) {
+        let inner = Arc::clone(&self.inner);
+        let _ = std::thread::spawn(move || {
+            let _guard = inner
+                .idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("deliberate poison (test hook)");
+        })
+        .join();
     }
 
     /// Read-only access to the backend this pool was constructed with. Mainly for tests that need
@@ -970,7 +1025,16 @@ impl<B: PoolBackend> Drop for Checkout<B> {
             // Only return live connections to the idle stack; a connection the backend already
             // considers closed is simply dropped (the permit still releases below).
             if !self.pool.backend.is_closed(&conn) {
-                let mut idle = self.pool.idle.lock().unwrap();
+                // M1-S9a finding 7b: RECOVER a poisoned idle mutex rather than `unwrap()`ing it.
+                // This runs in `Drop`, so a panic here can land *during another unwind* — which is
+                // `std::process::abort()`, taking every worker's connections down with it. The
+                // lock only ever guards a trivial pop/push of the idle stack, so there is no
+                // broken invariant to protect: recovery, not eviction, is the correct response.
+                let mut idle = self
+                    .pool
+                    .idle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 idle.push(IdleConn {
                     conn,
                     created_at: self.created_at,

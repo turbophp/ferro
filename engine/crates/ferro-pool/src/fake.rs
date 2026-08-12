@@ -271,6 +271,18 @@ pub struct FakeBackend {
     /// Number of `ping()` calls currently parked on `ping_gate`. Tests poll this until it is `> 0`
     /// to prove the reaper has actually entered the blocked ping, rather than racing on timing.
     pings_waiting: AtomicU64,
+    /// M1-S9a Task 3: when `Some`, every `connect()` call parks on this `Notify` until
+    /// `release_connect()` — modelling a backend that accepts TCP but never completes the startup
+    /// handshake (finding 4a; `tokio_postgres::connect` has no connect timeout). Armed via
+    /// `block_connect`.
+    ///
+    /// NOTE: if a parked `connect()` future is DROPPED (a caller-side deadline expiring — exactly
+    /// what this gate exists to prove), the `connects_waiting` decrement below is never reached,
+    /// so the counter is a high-water-ish mark. Tests must compare against a captured baseline,
+    /// never assert an absolute count.
+    connect_gate: Mutex<Option<Arc<Notify>>>,
+    /// Number of `connect()` calls currently (or last observed) parked on `connect_gate`.
+    connects_waiting: AtomicU64,
     /// Canned result returned by `query()` (S5). Defaults to an empty `QueryResult`; a test arms
     /// it via `set_query_result` so the guarded `Checkout::query` path can be exercised (both the
     /// tx-control rejection AND a normal row-returning return) without a live Postgres.
@@ -343,6 +355,8 @@ impl FakeBackend {
             fail_connect_remaining: AtomicU64::new(0),
             ping_gate: Mutex::new(None),
             pings_waiting: AtomicU64::new(0),
+            connect_gate: Mutex::new(None),
+            connects_waiting: AtomicU64::new(0),
             canned_query: Mutex::new(QueryResult::default()),
             simple_query_gate: Mutex::new(None),
             query_gate: Mutex::new(None),
@@ -454,6 +468,27 @@ impl FakeBackend {
         self.pings_waiting.load(Ordering::SeqCst)
     }
 
+    /// Arms every subsequent `connect()` call to park until `release_connect()` — the wedged-dial
+    /// model for the M1-S9a finding-4a checkout bound (a backend that accepts TCP but never
+    /// finishes the startup handshake).
+    pub fn block_connect(&self) {
+        *self.connect_gate.lock().unwrap() = Some(Arc::new(Notify::new()));
+    }
+
+    /// Releases every `connect()` call currently parked by `block_connect()` and clears the gate so
+    /// future `connect()` calls are unaffected — the "backend recovers" half of the capacity proof.
+    pub fn release_connect(&self) {
+        if let Some(notify) = self.connect_gate.lock().unwrap().take() {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Number of `connect()` calls currently parked on the gate armed by `block_connect()` (see the
+    /// field note: a dropped parked future skips the decrement, so compare against a baseline).
+    pub fn connects_waiting(&self) -> u64 {
+        self.connects_waiting.load(Ordering::SeqCst)
+    }
+
     /// Arms every subsequent `simple_query()` call to block until `release_simple_query()` (S6).
     /// Used by the bounded-recycle test to freeze the checkout-time defensive ROLLBACK.
     pub fn block_simple_query(&self) {
@@ -540,6 +575,18 @@ impl PoolBackend for FakeBackend {
             .is_ok();
         if should_fail {
             return Err(PoolError::ConnectionLost);
+        }
+
+        // Test-only gate (see `block_connect`/`release_connect`): if armed, park here until
+        // released — mirrors the ping gate at the top of `ping()`. The counter is bumped *before*
+        // the (only) await point, in the same synchronous span, so once a test observes
+        // `connects_waiting() > 0` this call has already registered as a waiter and a later
+        // `release_connect()` cannot race a lost wakeup.
+        let gate = self.connect_gate.lock().unwrap().clone();
+        if let Some(notify) = gate {
+            self.connects_waiting.fetch_add(1, Ordering::SeqCst);
+            notify.notified().await;
+            self.connects_waiting.fetch_sub(1, Ordering::SeqCst);
         }
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
