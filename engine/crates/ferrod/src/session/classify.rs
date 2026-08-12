@@ -218,7 +218,7 @@ mod tests {
         ];
 
         for bytes_in in crafted {
-            let mut codec = FrameCodec;
+            let mut codec = FrameCodec::default();
             let mut buf = BytesMut::from(&bytes_in[..]);
             loop {
                 match classify_next(&mut codec, &mut buf) {

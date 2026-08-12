@@ -11,7 +11,7 @@ use libfuzzer_sys::fuzz_target;
 // rid=0 error frame and closes the connection itself (see `session::classify`'s doc comment) — so
 // none of the three ever warrants classifying further bytes out of the same buffer.
 fuzz_target!(|data: &[u8]| {
-    let mut codec = FrameCodec;
+    let mut codec = FrameCodec::default();
     let mut buf = BytesMut::from(data);
     // Bounded iterations as a belt-and-suspenders against any accidental non-advancing case.
     for _ in 0..10_000 {

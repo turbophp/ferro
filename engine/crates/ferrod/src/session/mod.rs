@@ -135,6 +135,23 @@
 //!   error, detached handler/supervisor tasks are orphaned" hole: no per-request task outlives its
 //!   session. The supervisor remains the sole terminal-sender throughout — this only changes who
 //!   *owns* (and, past a bound, hard-aborts) the task that awaits it.
+//!
+//! **Session liveness (M1-S9a, M0-core-review finding 5c).** The reader loop's `select!` gained a
+//! third arm: a `config::LIVENESS_TICK` timer enforcing two deadlines and nothing else.
+//! - **`frame_read_timeout`** — a PARTIALLY-received frame that stops making progress is
+//!   session-fatal. Because `.split()` puts the codec out of reach, the codec publishes its
+//!   progress through a shared `codec::ReadProgress` handle created alongside it; the tick compares
+//!   whole snapshots, so any arriving byte restarts the clock. This is deliberately a STALL
+//!   detector and not a per-frame completion deadline: the latter would share its budget with the
+//!   daemon's own scheduling latency and start severing healthy sessions exactly when the host is
+//!   loaded (see `Config::frame_read_timeout` for the full argument).
+//! - **`idle_timeout`** — DISABLED by default, and vetoed by any activity at all: an in-flight
+//!   request (`supervisors` non-empty), a half-received frame, or a complete frame inside the
+//!   window. It closes silently; there is no request to fail.
+//!
+//! Both exits `break` into the SAME cleanup path every other exit uses, so exactly-one-`END` is
+//! untouched (charter rule 4): the stall exit declares its one `rid=0` terminal first, and the idle
+//! exit has no request to declare anything for (that is what its in-flight veto guarantees).
 
 pub mod classify;
 pub mod codec;
@@ -169,7 +186,7 @@ use crate::epoch::BootEpoch;
 use crate::pools::PoolRegistry;
 use crate::tx::TxRegistry;
 use classify::Classification;
-use codec::{ControlMsg, FrameCodec, InFrame, OutFrame};
+use codec::{ControlMsg, FrameCodec, InFrame, OutFrame, ReadProgress};
 use error::SessionError;
 use flow::{Credit, SessionCap};
 use registry::{InsertErr, Registry};
@@ -262,7 +279,11 @@ impl Session {
         let session_id = tx_registry.next_session_id();
         let handler = factory(session_id);
 
-        let framed = Framed::new(stream, FrameCodec);
+        // The codec becomes unreachable by name the moment we `.split()` below, so the session's
+        // own liveness arm learns about half-received frames through this shared handle, created
+        // WITH the codec (M1-S9a finding 5c).
+        let progress = Arc::new(ReadProgress::default());
+        let framed = Framed::new(stream, FrameCodec::with_progress(Arc::clone(&progress)));
         let (sink, mut reader) = framed.split();
 
         let (control_tx, control_rx) =
@@ -396,6 +417,20 @@ impl Session {
         // the loop ends, below, so no per-request task outlives this session.
         let mut supervisors: JoinSet<()> = JoinSet::new();
 
+        // The session's own liveness clock (M1-S9a finding 5c). Fires every `LIVENESS_TICK`; the
+        // arm below is the ONLY consumer, and it does no I/O unless a deadline has actually
+        // expired. `Delay` (not `Burst`) because a session that was descheduled must not then run
+        // a backlog of ticks back to back — the deadlines are wall-clock comparisons, so a missed
+        // tick costs granularity, never correctness.
+        let mut tick = tokio::time::interval(crate::config::LIVENESS_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The last read-side snapshot seen with a partial frame outstanding, and when it was first
+        // seen. Equal snapshots across `frame_read_timeout` mean NO byte of that frame arrived in
+        // the window — see `codec::ReadSnapshot`.
+        let mut stall_since: Option<(codec::ReadSnapshot, tokio::time::Instant)> = None;
+        // Last time a COMPLETE inbound frame was classified — the idle clock's zero point.
+        let mut last_frame_at = tokio::time::Instant::now();
+
         loop {
             let classification = tokio::select! {
                 biased;
@@ -404,6 +439,62 @@ impl Session {
                 // otherwise affects frame delivery — the terminal it sent already went out on the
                 // control channel independently of when this JoinSet gets around to reaping it.
                 Some(_res) = supervisors.join_next(), if !supervisors.is_empty() => {
+                    continue;
+                }
+
+                // Liveness (M1-S9a finding 5c). Ahead of the read arm so a saturated peer cannot
+                // starve it; behind the reap arm because reaping is what makes `supervisors`
+                // trustworthy as the in-flight veto below.
+                _ = tick.tick() => {
+                    let snap = progress.snapshot();
+
+                    // (a) A partial frame that has stopped MAKING PROGRESS. The key is the whole
+                    // snapshot, so any arriving byte restarts the clock: this bounds a peer that
+                    // sent a header and went silent (measured: 17 bytes held a session open with
+                    // no reply and no close), and it never touches a peer that is slowly but
+                    // genuinely delivering. Session-fatal, so it declares its ONE rid=0 terminal
+                    // frame and leaves by the same cleanup path as every other exit (charter
+                    // rule 4).
+                    if snap.is_partial() {
+                        match stall_since {
+                            Some((seen, since)) if seen == snap => {
+                                if since.elapsed() >= config.frame_read_timeout {
+                                    tracing::warn!(
+                                        buffered = snap.buffered,
+                                        timeout = ?config.frame_read_timeout,
+                                        "partial frame made no progress within frame_read_timeout: \
+                                         closing the session"
+                                    );
+                                    let fatal = SessionError::protocol_fatal(
+                                        "partial frame made no progress within frame_read_timeout",
+                                    )
+                                    .into_out_frame();
+                                    let _ = control_tx.send(ControlMsg::bare(fatal)).await;
+                                    break;
+                                }
+                            }
+                            // A different snapshot (or the first one): progress happened, restart
+                            // the clock from now.
+                            _ => stall_since = Some((snap, tokio::time::Instant::now())),
+                        }
+                    } else {
+                        stall_since = None;
+                    }
+
+                    // (b) Idle reaping — OFF unless an operator turned it on (see
+                    // `Config::idle_timeout` for why any nonzero default is an outage). "Idle"
+                    // means nothing at all is happening: no complete frame for the duration, no
+                    // request in flight (a streaming response consumes no INBOUND frames, so the
+                    // read side looks identical to silence), and no half-received frame. Closed
+                    // silently — there is no request to fail and the client reconnects on next use.
+                    if let Some(idle) = config.idle_timeout
+                        && last_frame_at.elapsed() >= idle
+                        && supervisors.is_empty()
+                        && !snap.is_partial()
+                    {
+                        tracing::debug!(?idle, "idle session: closing");
+                        break;
+                    }
                     continue;
                 }
 
@@ -431,6 +522,10 @@ impl Session {
                 }
                 Classification::Frame(frame) => frame,
             };
+
+            // A complete frame arrived: the session is demonstrably alive, whatever the frame
+            // turns out to be (a PING and a CANCEL are client activity exactly as much as an EXEC).
+            last_frame_at = tokio::time::Instant::now();
 
             // CANCEL is flag-based and checked BEFORE any other dispatch, regardless of the
             // frame's service/method: it always targets `header.request_id`, carries an empty

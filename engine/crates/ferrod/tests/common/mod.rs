@@ -228,7 +228,7 @@ pub async fn connect(socket_path: &Path) -> TestClient {
         .await
         .expect("client connect to test server");
     TestClient {
-        framed: Framed::new(stream, FrameCodec),
+        framed: Framed::new(stream, FrameCodec::default()),
     }
 }
 

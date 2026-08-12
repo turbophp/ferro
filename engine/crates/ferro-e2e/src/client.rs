@@ -45,7 +45,7 @@ impl DemoClient {
     pub async fn connect(path: &Path) -> Result<Self, BoxErr> {
         let stream = UnixStream::connect(path).await?;
         Ok(Self {
-            framed: Framed::new(stream, FrameCodec),
+            framed: Framed::new(stream, FrameCodec::default()),
         })
     }
 

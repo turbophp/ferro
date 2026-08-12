@@ -43,6 +43,23 @@ impl SessionError {
         SessionError::Fatal(error_payload(errc::AUTH, errc::AUTH_BRANCH, detail))
     }
 
+    /// The daemon is at `config.max_connections` and this connection is the overflow (M1-S9a,
+    /// finding 5b) — session-fatal, one frame then close, never a silent drop (SPEC G-4, the same
+    /// contract as a peercred denial).
+    ///
+    /// It rides `errc::POOL_TIMEOUT`, whose registry-pinned branch is `Retryable`, because that is
+    /// precisely the truth being told: a resource is momentarily unavailable and the client's
+    /// resilience loop should come back. A dedicated `ERR_OVERLOADED` code would say it more
+    /// exactly, and is a recorded, DEFERRED `/proto` candidate — minting one here would be a
+    /// registry + golden-vectors + both-codecs change set (charter rule 2), not a constant.
+    pub fn overloaded(detail: impl Into<String>) -> Self {
+        SessionError::Fatal(error_payload(
+            errc::POOL_TIMEOUT,
+            errc::POOL_TIMEOUT_BRANCH,
+            detail,
+        ))
+    }
+
     /// Encode `self` as the terminal `OutFrame` it becomes on the wire: always
     /// `service=CORE, method=0, flags=END, payload=Outcome::Error(ep).encode()`; `request_id` is
     /// `0` for `Fatal` (the session-fatal convention) or the carried `rid` for `PerRequest`. The
@@ -109,6 +126,23 @@ mod tests {
         let frame = SessionError::type_registry_mismatch("mismatch").into_out_frame();
         match Outcome::decode(&frame.payload).unwrap() {
             Outcome::Error(ep) => assert_eq!(ep.code, errc::UNSUPPORTED),
+            other => panic!("expected Outcome::Error, got {other:?}"),
+        }
+    }
+
+    /// The overload rejection must be Retryable — an overflow client that treats it as fatal, or
+    /// worse as indeterminate, is the outage the cap exists to prevent, not the one it causes.
+    #[test]
+    fn overloaded_is_a_retryable_pool_timeout_on_rid_zero() {
+        let frame = SessionError::overloaded("connection limit (512) reached").into_out_frame();
+        assert_eq!(frame.header.request_id, 0);
+        assert_eq!(frame.header.flags, flags::END);
+        match Outcome::decode(&frame.payload).unwrap() {
+            Outcome::Error(ep) => {
+                assert_eq!(ep.code, errc::POOL_TIMEOUT);
+                assert_eq!(ep.branch, errc::POOL_TIMEOUT_BRANCH);
+                assert_eq!(ep.branch, ferro_proto::consts::branch::RETRYABLE);
+            }
             other => panic!("expected Outcome::Error, got {other:?}"),
         }
     }

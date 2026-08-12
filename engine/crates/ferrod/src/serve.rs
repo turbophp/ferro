@@ -12,6 +12,21 @@
 //! Outcome::Error{code: AUTH}` frame (`SessionError::peercred_denied`), then closes it. Only an
 //! allowed peer's connection is spawned as a session task.
 //!
+//! **Connection cap (M1-S9a, M0-core-review finding 5b).** An allowed peer's connection is spawned
+//! only while `sessions.len() < config.max_connections`; the overflow gets the same one-frame
+//! treatment via `deny_connection`, carrying `POOL_TIMEOUT{Retryable}` (`SessionError::overloaded`)
+//! so the client's resilience loop retries rather than treating it as terminal. The check sits
+//! INSIDE the peercred-allowed arm on purpose: authentication stays the outermost gate, so a
+//! peer we would refuse anyway is answered `AUTH` (SPEC G-4) whatever the daemon's load, and never
+//! learns it from a different reply. It costs one `getsockopt` on a connection we are about to
+//! close — the fd is already accepted either way, so nothing is reclaimed sooner by reordering.
+//!
+//! Note what the cap does NOT cover: if the process fd limit binds before `max_connections`,
+//! `accept(2)` fails with `EMFILE` and the arm below logs + `continue`s while the connection stays
+//! in the backlog, i.e. a hot retry loop. That is why the default cap is chosen to sit under the
+//! usual `LimitNOFILE` (see `config::DEFAULT_MAX_CONNECTIONS`); the loop's own EMFILE behaviour is
+//! recorded as out of this slice's scope, not fixed here.
+//!
 //! **Drain.** The accept loop is a `tokio::select!` between `drain.wait()`, an opportunistic
 //! **reap** of finished session tasks, and `listener.accept()` — `biased` so that (1) once
 //! draining has started, a connection already queued in the kernel's accept backlog is never
@@ -96,6 +111,27 @@ pub async fn serve(
 
                 match peercred::peer_uid(&stream) {
                     Ok(uid) if config.uid_allowed(uid) => {
+                        // The connection cap (M1-S9a finding 5b), checked on the ALLOWED path
+                        // only: a peer we would refuse anyway never learns anything about our
+                        // load, and never displaces the AUTH answer SPEC G-4 owes it. `len()` is
+                        // the live session count for free (hazard 20) — the reap arm above is
+                        // `biased` ahead of this one, so no finished session is still counted here.
+                        if sessions.len() >= config.max_connections {
+                            tracing::warn!(
+                                limit = config.max_connections,
+                                "connection limit reached: rejecting new connection"
+                            );
+                            deny_connection(
+                                stream,
+                                SessionError::overloaded(format!(
+                                    "connection limit ({}) reached; retry shortly",
+                                    config.max_connections
+                                )),
+                            )
+                            .await;
+                            continue;
+                        }
+
                         let session_config = config.clone();
                         let session_factory = factory.clone();
                         let session_pool_registry = pool_registry.clone();
@@ -139,7 +175,7 @@ pub async fn serve(
 /// write/flush failure (the peer already gone) is logged and otherwise ignored — either way the
 /// stream is dropped right after, closing the connection.
 async fn deny_connection(stream: UnixStream, err: SessionError) {
-    let mut framed = Framed::new(stream, FrameCodec);
+    let mut framed = Framed::new(stream, FrameCodec::default());
     if let Err(send_err) = framed.send(err.into_out_frame()).await {
         tracing::warn!(error = %send_err, "failed to send peercred-deny frame");
     }

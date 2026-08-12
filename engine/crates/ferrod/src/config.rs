@@ -56,6 +56,42 @@ const DEFAULT_MAX_TX: Duration = Duration::from_secs(60);
 /// Symmetric with the pool's bounded recycle (`PoolConfig::checkout_timeout`).
 const DEFAULT_TX_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default cap on concurrent client connections (M1-S9a, M0-core-review finding 5b). Chosen for a
+/// FD BUDGET, not for a round number: every session costs one client fd, and the daemon also holds
+/// its upstream pool connections on the same table. systemd's `DefaultLimitNOFILE` soft limit is
+/// still 1024 on mainstream distributions, and an fd ceiling that binds BEFORE this cap is strictly
+/// worse than the cap — `accept(2)` then fails with `EMFILE` while the connection stays in the
+/// backlog, which the accept loop retries immediately (see the note in `serve.rs`). 512 leaves that
+/// headroom untouched while sitting comfortably above what a host actually opens: one connection per
+/// PHP-FPM worker, and `pm.max_children` is memory-bound to the low hundreds per app.
+///
+/// An operator raising this MUST raise `LimitNOFILE` with it (SPEC §18's unit is the place for
+/// that). Being at the cap is not data loss: the overflow connection gets one loud
+/// `POOL_TIMEOUT{Retryable}` frame and the client's resilience loop retries.
+const DEFAULT_MAX_CONNECTIONS: usize = 512;
+
+/// Default deadline for a partially-received frame to make PROGRESS (M1-S9a, finding 5c). Read the
+/// semantics off [`Config::frame_read_timeout`] — it is a stall detector, not a per-frame
+/// completion deadline — which is what makes 30 s the right order of magnitude in BOTH directions:
+///
+/// - not shorter, because tripping it is session-fatal, and a session-fatal close also aborts every
+///   SIBLING request multiplexed on that connection (§10.1). 30 s of a client delivering literally
+///   zero bytes of a frame it began is not a slow client; it is a stopped one.
+/// - not longer (and not off), because the measured hazard is exactly this: post-handshake, a
+///   17-byte send held a session open indefinitely with no reply, no close, and (pre-Task-5) 16 MiB
+///   of buffer.
+///
+/// A legitimate local UDS frame makes progress in microseconds, so this is ~7 orders of magnitude of
+/// slack for a healthy client — and, being progress-based, it does not shrink as the frame grows.
+const DEFAULT_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a session re-checks its own liveness deadlines. Coarse on purpose: both knobs it
+/// serves are seconds-scale, and this is a per-session timer — one wakeup per second per idle
+/// connection is the cost. It is the ENFORCEMENT GRANULARITY, so an expiry lands somewhere in
+/// `[timeout, timeout + 2 x LIVENESS_TICK]` (the first tick observing a stalled snapshot only
+/// records it; a later one measures the elapsed time against it).
+pub const LIVENESS_TICK: Duration = Duration::from_secs(1);
+
 /// The upstream backend a pool speaks (M1-S6). Inferred from the DSN scheme by [`infer_pool_kind`]
 /// (`postgres`/`postgresql` → [`PoolKind::Postgres`]; `mysql`/`mariadb` → [`PoolKind::Mysql`]) — the
 /// daemon has no separate `kind =` knob, the scheme IS the selector. `PoolRegistry::build` matches
@@ -259,6 +295,45 @@ pub struct Config {
     /// on abort/deadline the pinned conn is rolled back before release; if that hangs, the conn is
     /// tainted + dropped rather than held (with its pool permit) until an OS TCP timeout.
     pub tx_teardown_timeout: Duration,
+    /// Max concurrent client connections the daemon will serve (M1-S9a, finding 5b). From
+    /// `FERRO_MAX_CONNECTIONS`, default [`DEFAULT_MAX_CONNECTIONS`]. Checked at accept time, AFTER
+    /// the peercred gate: the overflow connection is answered with ONE
+    /// `POOL_TIMEOUT{Retryable}` frame and closed (SPEC G-4 — never a silent drop), so it never
+    /// becomes a session and the ones already running are untouched.
+    pub max_connections: usize,
+    /// How long a PARTIALLY-received inbound frame may make NO PROGRESS before the session is
+    /// closed with a fatal `PROTOCOL` frame (M1-S9a, finding 5c). From
+    /// `FERRO_FRAME_READ_TIMEOUT_MS`, default [`DEFAULT_FRAME_READ_TIMEOUT`].
+    ///
+    /// **Progress, not completion — and the difference is the whole point.** The clock is reset by
+    /// every byte that arrives (`session::codec::ReadProgress`), so it measures the gap between
+    /// reads, never the frame's total transfer time. A client sending a large frame slowly is never
+    /// killed however long it takes; a client that sent a header and stopped is killed. The
+    /// alternative (deadline from when the frame began) was rejected deliberately: its budget is
+    /// shared with the daemon's own scheduling latency, so it would start severing healthy sessions
+    /// precisely when the host is busy — a new outage class in exchange for no additional
+    /// protection, since what a drip client holds is a session SLOT and that is what
+    /// `max_connections` bounds.
+    ///
+    /// Enforced at [`LIVENESS_TICK`] granularity, so the close lands in
+    /// `[frame_read_timeout, frame_read_timeout + 2 x LIVENESS_TICK]`.
+    pub frame_read_timeout: Duration,
+    /// Reap sessions that have been completely quiet for this long. `None` — **the default** — is
+    /// off. From `FERRO_IDLE_TIMEOUT_MS`, where unset or `0` means disabled.
+    ///
+    /// Off by default because the sync PHP client cannot ping while blocked between requests (there
+    /// is no background thread — SPEC §10), and a PHP-FPM worker legitimately sits idle for minutes
+    /// between web requests: ANY nonzero default would sever every quiet worker on the host, which
+    /// is a new outage class, not a fix. The teeth against the measured hazard are
+    /// [`Config::frame_read_timeout`] + the codec's bounded reserve + [`Config::max_connections`].
+    /// The knob exists for operators who know their fleet (e.g. a rolling deploy that wants old
+    /// workers' connections reclaimed promptly).
+    ///
+    /// A session counts as idle only when NOTHING is happening on it: no complete frame for the
+    /// duration, no request in flight, and no partially-received frame outstanding. The close is
+    /// silent (no frame) — there is no request to fail, and the client's resilience loop reconnects
+    /// on next use.
+    pub idle_timeout: Option<Duration>,
     /// Configured upstream connection pools (S5). Each `PoolSpec` names a pool and carries its DSN
     /// (§12 server-side secret — never sent to the client, never logged). Default: empty (the EXEC
     /// handler then answers every request with `Unsupported: unknown pool`). From `FERRO_POOLS`
@@ -280,6 +355,9 @@ impl Default for Config {
             idle_in_tx: DEFAULT_IDLE_IN_TX,
             max_tx: DEFAULT_MAX_TX,
             tx_teardown_timeout: DEFAULT_TX_TEARDOWN_TIMEOUT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            frame_read_timeout: DEFAULT_FRAME_READ_TIMEOUT,
+            idle_timeout: None,
             pools: Vec::new(),
         }
     }
@@ -302,6 +380,8 @@ impl Config {
         if let Ok(names) = std::env::var("FERRO_POOLS") {
             cfg.pools = parse_pools(&names, &|k| std::env::var(k).ok());
         }
+
+        apply_liveness_knobs(&mut cfg, &|k| std::env::var(k).ok());
 
         cfg
     }
@@ -342,6 +422,61 @@ impl Config {
             });
         }
         Ok(())
+    }
+}
+
+/// Env var names for the three M1-S9a availability knobs — one place, so the docs, the parser and
+/// the tests cannot drift.
+const ENV_MAX_CONNECTIONS: &str = "FERRO_MAX_CONNECTIONS";
+const ENV_FRAME_READ_TIMEOUT_MS: &str = "FERRO_FRAME_READ_TIMEOUT_MS";
+const ENV_IDLE_TIMEOUT_MS: &str = "FERRO_IDLE_TIMEOUT_MS";
+
+/// Apply the three M1-S9a availability knobs from the environment (via an injected `lookup`, the
+/// same testability seam `parse_pools` uses — `std::env::set_var` is an `unsafe fn` under this
+/// workspace's edition-2024 `unsafe_code = "forbid"`, so a test cannot mutate the real env).
+///
+/// An unparseable or out-of-range value keeps the default and is `tracing::warn!`-ed rather than
+/// silently ignored: the same reasoning as [`parse_allow_uids`] — an operator who typed
+/// `FERRO_MAX_CONNECTIONS=1_024` must not silently get 512 with no trace of why. Zero is rejected
+/// for the two knobs where it is meaningless (a cap of 0 serves nobody; a 0 ms progress deadline
+/// closes every session at the first tick) and ACCEPTED for `FERRO_IDLE_TIMEOUT_MS`, where it is
+/// the documented spelling of "disabled".
+fn apply_liveness_knobs(cfg: &mut Config, lookup: &impl Fn(&str) -> Option<String>) {
+    if let Some(raw) = lookup(ENV_MAX_CONNECTIONS) {
+        match raw.trim().parse::<usize>() {
+            Ok(n) if n > 0 => cfg.max_connections = n,
+            _ => tracing::warn!(
+                env = ENV_MAX_CONNECTIONS,
+                token = raw.trim(),
+                default = cfg.max_connections,
+                "unparseable or zero connection cap; keeping the default"
+            ),
+        }
+    }
+
+    if let Some(raw) = lookup(ENV_FRAME_READ_TIMEOUT_MS) {
+        match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => cfg.frame_read_timeout = Duration::from_millis(ms),
+            _ => tracing::warn!(
+                env = ENV_FRAME_READ_TIMEOUT_MS,
+                token = raw.trim(),
+                default_ms = cfg.frame_read_timeout.as_millis(),
+                "unparseable or zero frame-progress deadline; keeping the default"
+            ),
+        }
+    }
+
+    if let Some(raw) = lookup(ENV_IDLE_TIMEOUT_MS) {
+        match raw.trim().parse::<u64>() {
+            // 0 is the documented spelling of "disabled", not a parse failure.
+            Ok(ms) => cfg.idle_timeout = (ms > 0).then(|| Duration::from_millis(ms)),
+            Err(err) => tracing::warn!(
+                env = ENV_IDLE_TIMEOUT_MS,
+                token = raw.trim(),
+                error = %err,
+                "unparseable idle timeout; keeping it DISABLED"
+            ),
+        }
     }
 }
 
@@ -531,6 +666,124 @@ mod tests {
                 max_frame_payload: ferro_proto::consts::MAX_FRAME_PAYLOAD,
             })
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // M1-S9a Task 11: the three availability knobs. The DEFAULTS are the design decision here, so
+    // they are asserted directly — each one is a deliberate trade recorded in its own docblock.
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn idle_timeout_defaults_to_disabled() {
+        assert!(
+            Config::default().idle_timeout.is_none(),
+            "the sync PHP client cannot ping while blocked between requests, so ANY nonzero \
+             default severs every quiet PHP-FPM worker on the host — a new outage class, not a fix"
+        );
+    }
+
+    #[test]
+    fn the_connection_cap_default_leaves_fd_headroom() {
+        let cfg = Config::default();
+        assert!(
+            cfg.max_connections > 0,
+            "a cap of 0 would serve nobody at all"
+        );
+        assert!(
+            cfg.max_connections < 1024,
+            "the default must stay under systemd's 1024 DefaultLimitNOFILE soft limit: an fd \
+             ceiling that binds before the cap turns a clean POOL_TIMEOUT rejection into EMFILE \
+             on accept, which is strictly worse — got {}",
+            cfg.max_connections
+        );
+    }
+
+    #[test]
+    fn the_frame_progress_deadline_defaults_on_and_generous() {
+        let cfg = Config::default();
+        assert!(
+            cfg.frame_read_timeout >= Duration::from_secs(10),
+            "tripping this is session-fatal and also aborts sibling multiplexed requests, so the \
+             default must be generous — got {:?}",
+            cfg.frame_read_timeout
+        );
+        assert!(
+            cfg.frame_read_timeout <= Duration::from_secs(120),
+            "and it must still bound the measured hostage shape (header + 1 byte + silence) — \
+             got {:?}",
+            cfg.frame_read_timeout
+        );
+    }
+
+    #[test]
+    fn liveness_knobs_read_their_env_vars() {
+        let mut cfg = Config::default();
+        apply_liveness_knobs(
+            &mut cfg,
+            &map_lookup(&[
+                (ENV_MAX_CONNECTIONS, " 64 "),
+                (ENV_FRAME_READ_TIMEOUT_MS, "1500"),
+                (ENV_IDLE_TIMEOUT_MS, "900"),
+            ]),
+        );
+        assert_eq!(cfg.max_connections, 64);
+        assert_eq!(cfg.frame_read_timeout, Duration::from_millis(1500));
+        assert_eq!(cfg.idle_timeout, Some(Duration::from_millis(900)));
+    }
+
+    #[test]
+    fn idle_timeout_zero_means_disabled_not_instant() {
+        let mut cfg = Config {
+            idle_timeout: Some(Duration::from_secs(5)),
+            ..Config::default()
+        };
+        apply_liveness_knobs(&mut cfg, &map_lookup(&[(ENV_IDLE_TIMEOUT_MS, "0")]));
+        assert_eq!(
+            cfg.idle_timeout, None,
+            "`FERRO_IDLE_TIMEOUT_MS=0` is the documented spelling of DISABLED — reading it as a \
+             0 ms deadline would close every session at the first tick"
+        );
+    }
+
+    #[test]
+    fn unparseable_or_zero_liveness_knobs_keep_the_defaults() {
+        let defaults = Config::default();
+        for token in ["0", "", "-1", "1_024", "lots", "12ms"] {
+            let mut cfg = Config::default();
+            apply_liveness_knobs(
+                &mut cfg,
+                &map_lookup(&[
+                    (ENV_MAX_CONNECTIONS, token),
+                    (ENV_FRAME_READ_TIMEOUT_MS, token),
+                ]),
+            );
+            assert_eq!(
+                cfg.max_connections, defaults.max_connections,
+                "max_connections for token {token:?}"
+            );
+            assert_eq!(
+                cfg.frame_read_timeout, defaults.frame_read_timeout,
+                "frame_read_timeout for token {token:?}"
+            );
+        }
+        // Same for a garbage idle timeout — which must stay DISABLED, never become 0 ms.
+        let mut cfg = Config::default();
+        apply_liveness_knobs(&mut cfg, &map_lookup(&[(ENV_IDLE_TIMEOUT_MS, "soon")]));
+        assert_eq!(cfg.idle_timeout, None);
+    }
+
+    #[test]
+    fn absent_liveness_env_vars_change_nothing() {
+        let mut cfg = Config {
+            max_connections: 7,
+            frame_read_timeout: Duration::from_millis(11),
+            idle_timeout: Some(Duration::from_millis(13)),
+            ..Config::default()
+        };
+        apply_liveness_knobs(&mut cfg, &map_lookup(&[]));
+        assert_eq!(cfg.max_connections, 7);
+        assert_eq!(cfg.frame_read_timeout, Duration::from_millis(11));
+        assert_eq!(cfg.idle_timeout, Some(Duration::from_millis(13)));
     }
 
     #[test]

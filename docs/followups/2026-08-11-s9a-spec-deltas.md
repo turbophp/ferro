@@ -385,3 +385,62 @@ the S8a §22.2 (u)/(v) contradiction.
   NOT in Task 10's scope (the plan's finding 4c enumerates only the two buffered EXEC paths) and it
   touches the measured-sound exactly-one-END/B4 ordering machinery, so it wants a plan entry, not an
   implementer's discretion.
+
+---
+
+### Task 11 — the availability knobs (`max_connections`, `frame_read_timeout`, `idle_timeout`)
+
+- **§5/§5.2 (session) — engine-side liveness, three knobs, and the semantics of the middle one is a
+  DECISION, not a detail.** `Config` gains `max_connections` (default **512**),
+  `frame_read_timeout` (default **30 s**, ON) and `idle_timeout` (default **DISABLED**), read from
+  `FERRO_MAX_CONNECTIONS` / `FERRO_FRAME_READ_TIMEOUT_MS` / `FERRO_IDLE_TIMEOUT_MS` (`0` or unset =
+  disabled for the last; an unparseable value warns and keeps the default). Enforcement is a 1 s
+  per-session tick (`config::LIVENESS_TICK`), so an expiry lands in `[timeout, timeout + 2 x tick]`.
+
+- **`frame_read_timeout` is a STALL detector, not a per-frame completion deadline** — the plan
+  specified the latter (a two-counter `started`/`completed` handle) and it is wrong. The codec now
+  also publishes `buffered` (bytes held for the current partial frame), and the tick's stall key is
+  the whole snapshot, so ANY arriving byte restarts the clock. A completion deadline kills every
+  client slower than `frame_size / timeout` — for the 16 MiB ceiling at 30 s, anything under
+  ~0.55 MiB/s — and the rate a client achieves is bounded by how often the daemon's reader task is
+  scheduled, so it would start severing HEALTHY sessions exactly when the host is loaded. It also
+  buys almost nothing: after Task 5 a partial frame pins `received x 2 + 64 KiB`, so what a drip
+  client actually holds is a session SLOT, and that is `max_connections`'s job. Measured under
+  mutation: with the completion-deadline shape, a client trickling a frame in 4-byte chunks 150 ms
+  apart has the socket closed under it mid-send (`EPIPE`).
+
+- **A partial HEADER counts as a partial frame** (the plan returned early before any bookkeeping,
+  leaving "send three bytes and stop" — the cheapest hostage of all — completely undetected), and an
+  EMPTY buffer explicitly does NOT (`Framed` polls the decoder once more after every frame it
+  yields; counting that as partial leaves every healthy session permanently "mid-frame", which
+  vetoes the idle reaper forever and arms the stall detector on sessions with nothing outstanding —
+  found live, not by reading).
+
+- **`idle_timeout` defaults OFF and is vetoed by ANY activity**: a complete frame inside the window,
+  an in-flight request, or a half-received frame. Off by default because the sync PHP client cannot
+  ping while blocked between requests (§10) and a PHP-FPM worker legitimately idles for minutes — a
+  nonzero default severs every quiet worker on the host, which is a new outage class, not a fix.
+
+- **`max_connections` default 512 is an FD BUDGET, not a round number.** systemd's
+  `DefaultLimitNOFILE` soft limit is still 1024 on mainstream distributions, and an fd ceiling that
+  binds BEFORE the cap is strictly worse than the cap: `accept(2)` fails `EMFILE` while the
+  connection stays in the backlog, which the accept loop retries immediately. (The plan named 1024,
+  i.e. exactly the ceiling.) §18's unit is where an operator raising this raises `LimitNOFILE` too.
+
+- **The overflow rejection is ONE `POOL_TIMEOUT{Retryable}` frame then close** (SPEC G-4 — never a
+  silent drop), reusing an existing registry pairing. **No `/proto` change.** A dedicated
+  `ERR_OVERLOADED` code remains the recorded, DEFERRED candidate (charter rule 2).
+
+- **The cap is checked INSIDE the peercred-allowed arm**, not ahead of it (the plan said ahead).
+  Authentication stays the outermost gate, so a peer we would refuse anyway is answered `AUTH`
+  whatever the daemon's load. The plan's stated reason for the other order ("protects fds fastest")
+  does not hold — the fd is already accepted either way; the difference is one `getsockopt`.
+
+- **Charter rule 4 is untouched:** both new exits `break` into the existing cleanup path. The stall
+  exit declares its ONE `rid=0` fatal terminal first; the idle exit has no request to declare
+  anything for, which is exactly what its in-flight veto guarantees.
+
+- **KNOWN, UNFIXED, recorded (NOT closed here):** the accept loop treats an `accept(2)` error as
+  `warn + continue`. `EMFILE`/`ENFILE` are level-triggered — the connection stays in the backlog —
+  so that is a hot retry loop under fd exhaustion. The default cap is chosen to keep us off that
+  cliff, but the loop's own behaviour wants a bounded backoff and is out of this task's scope.
