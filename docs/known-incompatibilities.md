@@ -59,8 +59,12 @@ out".
   restores the clean cancellation answer for that connection. Explicit configuration, never
   inference. **It refuses only one of the five autocommit write routes, and it changes the `BEGIN`
   the engine emits — read *Read-only connections* below before you set it.**
-- **Inside a transaction the question does not arise.** A cancelled statement rolls the transaction
-  back, the `tx_id` is tombstoned, and the fate is *known*: `Retryable`.
+- **Inside a transaction the question usually does not arise.** A cancelled statement rolls the
+  transaction back, the `tx_id` is tombstoned, and the fate is *known*: `Retryable`. **The one
+  exception is MySQL/MariaDB after an implicit commit** — once part of the transaction has already
+  been committed, "the transaction will never commit" stops being true and the fate becomes
+  `Indeterminate` instead. See *MySQL/MariaDB: an implicit commit changes what a lost statement
+  reports* below.
 
 Pinned by `ExceptionMappingLiveTest::testACancelledSelectIsIndeterminateOnAWriteConnectionAndNotOnAReadonlyOne`,
 which asserts BOTH cells, so the cost is falsifiable and cannot later be silently "fixed" by guessing
@@ -81,7 +85,7 @@ Where DBAL has one bucket, Ferro has two, because the difference is the whole po
 
 | what happened | Ferro | why |
 |---|---|---|
-| the statement's fate is **known** (never transmitted, a declared read, or an in-tx statement whose transaction is now dead) | `Ferro\DBAL\RetryableDriverException` (implements `RetryableException`) | retry is safe |
+| the statement's fate is **known** (never transmitted, a declared read, or an in-tx statement whose transaction is now dead **and has committed nothing**) | `Ferro\DBAL\RetryableDriverException` (implements `RetryableException`) | retry is safe |
 | the statement's fate is **unknown** | `Ferro\DBAL\IndeterminateWriteException` (deliberately NOT retryable) | retry could apply it twice |
 
 Neither extends `ConnectionLost`, on purpose: frameworks treat `ConnectionLost` as
@@ -319,6 +323,51 @@ and that is worth knowing before an incident rather than during one.
 
 ---
 
+## MySQL/MariaDB: an implicit commit changes what a lost statement reports
+
+**What you will see.** On MySQL and MariaDB, once a statement inside your transaction has
+implicitly committed, every LATER failure in that same transaction reports
+`IndeterminateWriteException` — "we cannot tell you whether your write landed" — instead of a
+retryable error. **Do not add a blanket retry to make this go away.** The whole point is that
+retrying is no longer safe.
+
+**Why.** MySQL and MariaDB have no transactional DDL. A statement from the implicit-commit family
+inside an explicit transaction COMMITS everything before it and ends the transaction — the server
+does this silently, and it does it even when the statement then FAILS. Ferro used to report a later
+in-transaction loss as retryable, on the reasoning "the transaction will never commit, so replaying
+it is safe". That reasoning is false once part of the transaction has already been committed:
+replaying re-applies writes that are already durable. PostgreSQL is unaffected — its DDL is
+transactional — and its behaviour is byte-identical to before.
+
+**Which statements do it.** The MySQL manual's "Statements That Cause an Implicit Commit" families,
+and three that are easy to miss:
+
+| shape | note |
+|---|---|
+| `CREATE` / `DROP` / `ALTER` / `RENAME` / `TRUNCATE` (non-`TEMPORARY`) | the common case — any migration |
+| `LOCK TABLES` / `UNLOCK TABLES`, `START TRANSACTION`, `SET autocommit` | |
+| `GRANT` / `REVOKE` / `SET PASSWORD` / **`SET DEFAULT ROLE`** | account management; `SET ROLE` does **not** commit |
+| **`EXECUTE`** of a prepared DDL | the commit belongs to the statement that RUNS, not to how it was dispatched — `PREPARE` and `DEALLOCATE` alone are safe |
+| **`/*! … */`** and MariaDB's **`/*M! … */`** | an *executable comment* is not a comment: the server runs it. `mysqldump` emits DDL this way, so a replayed dump hits it |
+| `CALL` / `DO` | a routine may run any of the above |
+
+**Who meets this in practice.** Doctrine Migrations on MySQL, where transactional migrations are the
+default: `BEGIN` → insert the migration-log row → `ALTER TABLE` (the log row is now committed) → a
+later failure. Ferro now tells you the truth about that transaction instead of inviting you to
+replay it.
+
+**What to do.** Treat `IndeterminateWriteException` as it is meant to be treated: reconcile, do not
+retry. If you need retryable migrations on MySQL, the fix is upstream of Ferro — MySQL cannot give
+you a transactional `ALTER`.
+
+**One deliberate cry-wolf.** A statement that errors *without running* (a syntax error on a DDL, say)
+cannot be distinguished from one that ran and committed, using only the information available before
+dispatch, so it is treated as if it had committed. That direction is chosen on purpose: a spurious
+`Indeterminate` costs you a reconciliation you did not need, while the opposite mistake silently
+double-applies a write.
+
+---
+
 ## Values
 
 The driver's type boundary is a **conversion step the driver owns**, not SQL rewriting. It exists
@@ -464,6 +513,30 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   (SQLite3 keeps its count, PgSQL answers `0`); ours is a choice.
 - **`Ferro\Pg\Copy`** — the first-class replacement for `pdo_pgsql` COPY hacks named in SPEC §14 —
   does not exist yet. Deferred.
+
+---
+
+## Daemon limits an operator should know about
+
+M1-S9a added three `ferrod` knobs after a review found one local client could pin the host-wide
+daemon's memory and file descriptors indefinitely. Defaults are chosen so an ordinary PHP-FPM fleet
+never meets them, but they are limits and you should know they exist.
+
+| knob | default | what it does | when to raise it |
+|---|---|---|---|
+| `max_connections` | **512** | caps concurrently accepted sessions | an fd budget sized under systemd's 1024 `DefaultLimitNOFILE`, not a round number. Raise it (and `LimitNOFILE`) if you run more than ~512 FPM workers per host |
+| `frame_read_timeout` | **30 s** | a **stall** detector — how long a session may make *no progress* | it measures time since the last progress, not since the frame started, so a slow-but-progressing client is never severed. Raise it only if a legitimate client can stall longer than 30 s mid-frame |
+| `idle_timeout` | **disabled** | closes a session doing nothing at all | deliberately off. The sync PHP client cannot ping while blocked between web requests, so ANY nonzero default would sever every quiet worker on the host — a new outage class, not a fix. Set it only if you know your fleet |
+
+An idle close is silent: there is no request to fail, and the client's resilience loop reconnects on
+next use. `max_connections` and `frame_read_timeout` are the actual teeth against the hazard; the
+idle knob exists for operators who want old workers' connections reclaimed promptly during a rolling
+deploy.
+
+**Restart timing.** SIGTERM now drains — sessions, pools and transaction actors all wind down rather
+than being cut mid-wire. The worst-case stop is `drain_deadline + session_drain_grace`, and §18's
+`TimeoutStopSec` must exceed it. That relationship is enforced at compile time: a backstop that ties
+with or undercuts the budget it backs fails the build.
 
 ---
 
