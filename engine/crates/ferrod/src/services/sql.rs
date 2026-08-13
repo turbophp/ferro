@@ -730,7 +730,20 @@ pub(crate) enum StreamEnded {
     /// a natural, NON-cancel mid-stream error the client may still handle itself (an `Error`
     /// terminal). A tx-scoped caller keeps the transaction OPEN — mirroring the buffered path, which
     /// does NOT auto-roll-back a 23505 (`non_cancel_statement_error_reported_without_auto_rollback`).
-    Intact,
+    ///
+    /// `errored` distinguishes those two sub-cases, and it is LOAD-BEARING for the M1-S9a
+    /// `tx_writes_persisted` latch rather than cosmetic. The buffered sibling latches the
+    /// pre-dispatch implicit-commit hazard on `!ok` (`tx/actor.rs`'s `if !ok && hazard`) precisely
+    /// because a MySQL/MariaDB implicit-commit statement that ERRORS server-side has already fired
+    /// its pre-commit (MEASURED: an erroring 1050 `CREATE TABLE` commits the transaction's earlier
+    /// writes on both MySQL 8.4 and MariaDB 11.8), while the post-statement authority is unreadable
+    /// there — `Checkout`'s Rule-A fail-safe force-sets `tx_open = true` on ANY `Err`. The CLEAN
+    /// sub-case must NOT latch from the hazard: the authority IS trustworthy there and is what
+    /// corrects a lexical false positive (`mysql_implicit_commit_hazard` is `_ => true` on every
+    /// unknown leading keyword and unconditionally true for `CALL`/`DO`), so latching it
+    /// unconditionally would mint cry-wolf `Indeterminate` for the rest of a transaction whose
+    /// streamed `CALL` merely returned rows.
+    Intact { errored: bool },
     /// The statement was INTERRUPTED (cancel / deadline / backpressure-unwind / lost link) OR
     /// surfaced a `57014` — so the §19.3 uniform in-tx action applies: a tx-scoped caller must ROLL
     /// BACK (and, per the deadline-vs-abort split, tombstone). The ONE fated terminal is declared.
@@ -941,7 +954,10 @@ pub(crate) async fn run_tx_streamed<B: PoolBackend>(
                     // equivalent-safety substitute for draining, exactly as the autocommit path does).
                     (StreamEnded::Broken, true)
                 } else {
-                    (StreamEnded::Intact, false)
+                    // ERRORED: the open failed on its own. A tx-scoped caller must judge this
+                    // against the pre-dispatch hazard exactly like the buffered `!ok` arm — the
+                    // authority is Rule-A-forced here and can say nothing.
+                    (StreamEnded::Intact { errored: true }, false)
                 }
             }
         }
@@ -1123,7 +1139,10 @@ async fn run_streamed_exec<B: PoolBackend>(
                 return if broken {
                     StreamEnded::Broken
                 } else {
-                    StreamEnded::Intact
+                    // ERRORED: the statement self-terminated mid-stream. On MySQL/MariaDB its
+                    // implicit pre-commit (if any) fired BEFORE it ran, so the tx-scoped caller
+                    // must latch the pre-dispatch hazard here — see `StreamEnded::Intact`'s doc.
+                    StreamEnded::Intact { errored: true }
                 };
             }
             StreamStep::Row(Some(Ok(row))) => {
@@ -1186,7 +1205,10 @@ async fn run_streamed_exec<B: PoolBackend>(
                             sent_bytes,
                         );
                         responder.end_ok(Bytes::from(body));
-                        StreamEnded::Intact
+                        // CLEAN: the stream drained and `finish()` ran the post-drain
+                        // `apply_tx_status`, so the tx-scoped caller's AUTHORITY read is
+                        // trustworthy and the lexical hazard must NOT be latched.
+                        StreamEnded::Intact { errored: false }
                     }
                     // `finish()` currently always returns Ok (a late drain error force-taints but
                     // returns Ok); handle a future Err defensively — a read never goes Indeterminate.

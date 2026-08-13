@@ -579,6 +579,28 @@ pub async fn run<B: PoolBackend>(
                 // M1-S9a: the same pre-dispatch view the buffered arm computes, for the same
                 // reason — the producer's fate context is fixed at OPEN, and a streamed statement
                 // lost mid-flight has no post-statement authority read to fall back on.
+                //
+                // REACHABILITY, stated plainly because a green live suite here proves NOTHING
+                // (S9a whole-branch review: all four streamed persisted-plumbing sites were
+                // mutated simultaneously and the full ferrod suite still ran 294/0 LIVE on
+                // PG 17 + MySQL 8.4 + MariaDB 11.8, while the same harness turned a BUFFERED-latch
+                // mutation RED). `hazard` can only be non-`tx_writes_persisted`-derived on the
+                // MySQL dialect, and a MySQL/MariaDB pool has no `query_stream` yet
+                // (§22.2 (n)) — `handle_exec` refuses `fetch:stream` on `!handle.streaming` BEFORE
+                // this command is ever constructed (`services/sql.rs`), and on PostgreSQL
+                // `implicit_commit_hazard` is unconditionally false. So in PRODUCTION today this
+                // whole hazard/latch half is inert; it is exercised only through the
+                // `FakeBackend` (a streaming backend reporting `Dialect::MySql`, i.e. exactly the
+                // §22.2 (n) future) by the two guards at the bottom of this file
+                // (`tx_streamed_*_hazard_*`).
+                //
+                // WHOEVER LANDS §22.2 (n) (MySQL/MariaDB `query_stream`) OWES A LIVE GUARD in the
+                // SAME change: an explicit tx that INSERTs, then STREAMS a hazard-shaped statement
+                // that errors server-side (`CREATE TABLE <existing>` → 1050 is the deterministic
+                // shape — it commits AND errors, no in-flight kill needed), then loses a later
+                // statement; the terminal must be the persisted `Indeterminate`, never
+                // `Retryable`, and the read-back must show the INSERT durable. The offline guards
+                // below pin the actor's arithmetic; only that live one pins the whole chain.
                 let hazard = tx_writes_persisted
                     || ferro_classify::implicit_commit_hazard(&sql, co.dialect());
 
@@ -600,11 +622,35 @@ pub async fn run<B: PoolBackend>(
                     // The statement reached its own conclusion (clean drain, or a non-cancel error the
                     // client may still `ROLLBACK`): keep the tx OPEN, exactly like the buffered 23505
                     // path. Fall through to reset the idle deadline and process the next command.
-                    StreamEnded::Intact => {
-                        // M1-S9a: the stream reached its own end, so the post-statement authority
-                        // is trustworthy here exactly as on the buffered Ok arm
-                        // (`RowStreamHandle::finish` ran the same post-drain `apply_tx_status`).
-                        if !co.tx_open() {
+                    StreamEnded::Intact { errored } => {
+                        // M1-S9a, CORRECTED by the S9a whole-branch review: this arm must latch
+                        // from BOTH sources, exactly like its buffered sibling above. As shipped
+                        // it read only the authority, which made it already wrong for the day
+                        // MySQL/MariaDB `query_stream` lands (§22.2 (n)) — see the reachability
+                        // note under `TxCommand::ExecStreamed` above.
+                        //
+                        // ERRORED (a natural non-`57014` mid-stream error, or a natural
+                        // non-`57014` OPEN error): the authority says NOTHING here — `Checkout`'s
+                        // Rule-A fail-safe force-sets `tx_open = true` on ANY `Err`, so
+                        // `!co.tx_open()` is constitutionally false on this sub-case. What must be
+                        // judged instead is the PRE-DISPATCH `hazard`, because a MySQL/MariaDB
+                        // implicit-commit statement fires its commit BEFORE it executes: an
+                        // ERRORING streamed DDL has still durably committed everything the
+                        // transaction wrote before it (measured on MySQL 8.4 AND MariaDB 11.8:
+                        // `BEGIN; INSERT; CREATE TABLE <existing>` → 1050, and the INSERT SURVIVES
+                        // the subsequent ROLLBACK). Without this latch the next loss in the same
+                        // transaction mints `Retryable` over durably persisted writes — the
+                        // streamed twin of the buffered at-least-once §22.2 (ai) closed.
+                        //
+                        // CLEAN: the authority IS trustworthy (`RowStreamHandle::finish` ran the
+                        // same post-drain `apply_tx_status` the buffered `Ok` arm reads), and it is
+                        // deliberately the ONLY source consulted, because it CORRECTS a lexical
+                        // false positive — which the assist produces freely
+                        // (`mysql_implicit_commit_hazard` is `_ => true` on every unknown leading
+                        // keyword and unconditionally true for `CALL`/`DO`). Latching the hazard
+                        // here as well would make every cleanly-streamed `CALL` poison the rest of
+                        // its transaction with cry-wolf `Indeterminate`.
+                        if (errored && hazard) || (!errored && !co.tx_open()) {
                             tx_writes_persisted = true;
                         }
                     }
@@ -2429,6 +2475,232 @@ mod tests {
             .wait_for(|t| *t)
             .await
             .expect("actor ends on the client rollback");
+    }
+
+    // ---- M1-S9a whole-branch review: the STREAMED half of the `tx_writes_persisted` latch --------
+    //
+    // THE VANTAGE, and why it is not decorative. The review proved this half unexercisable in
+    // PRODUCTION today: `handle_exec` refuses `fetch:stream` on `!handle.streaming` before the
+    // actor ever sees an `ExecStreamed`, so MySQL/MariaDB (the only dialects with an implicit
+    // commit) never reach it, and on PostgreSQL `implicit_commit_hazard` is constitutionally
+    // false — all four sites were mutated at once and the FULL live ferrod suite stayed 294/0.
+    // `FakeBackend` is exactly the missing configuration: a streaming backend reporting
+    // `Dialect::MySql`, i.e. the §22.2 (n) future, driven through the real actor. The two guards
+    // below therefore pin the ACTOR's arithmetic — which is the code this review changed — and are
+    // each proven falsifiable by a mutation. They do NOT pin the live chain (server-side implicit
+    // commit → hazard → terminal → read-back); that guard is owed by whoever lands §22.2 (n), and
+    // the shape it must take is written out at the `hazard` computation in `TxCommand::ExecStreamed`.
+    //
+    // The SQL below is a real hazard shape on this dialect (`mysql_implicit_commit_hazard`:
+    // non-`TEMPORARY` `CREATE` → true), never a stub — the classifier is called for real.
+
+    /// A hazard-shaped streamed statement that ERRORS mid-stream (`StreamEnded::Intact { errored:
+    /// true }`) LATCHES `tx_writes_persisted`, exactly like its buffered sibling's `if !ok &&
+    /// hazard`. On MySQL/MariaDB the implicit commit fires BEFORE the statement runs, so an
+    /// ERRORING streamed DDL has still committed everything the transaction wrote before it
+    /// (measured live on 8.4/11.8: `BEGIN; INSERT; CREATE TABLE <existing>` → 1050, INSERT survives
+    /// the ROLLBACK) — while the post-statement authority can say nothing, because Rule-A
+    /// force-sets `tx_open = true` on any `Err`. Both observable consequences are asserted: the
+    /// LATER statement's own terminal, and the tombstone every later touch of the tx_id gets.
+    ///
+    /// As shipped this arm read ONLY the authority, so both came back `false` — a client would be
+    /// told `Retryable` over durably persisted writes (the streamed twin of §22.2 (ai)).
+    #[tokio::test]
+    async fn tx_streamed_errored_hazard_latches_persisted_for_every_later_loss() {
+        let backend = FakeBackend::new();
+        // The §22.2 (n) configuration: a streaming backend on the dialect that implicitly commits.
+        backend.set_dialect(Dialect::MySql);
+        // error_at: Some(1) → one row, then a natural (non-cancel, non-57014) mid-stream Err: the
+        // `StreamEnded::Intact { errored: true }` branch.
+        backend.set_stream_script(StreamScript {
+            cols: vec![ColMeta {
+                name: "n".into(),
+                tag: tag::I64,
+            }],
+            rows: vec![vec![Value::I64(1)], vec![Value::I64(2)]],
+            affected: 0,
+            error_at: Some(1),
+        });
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let (tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        let (responder, cell, mut control_rx) = streaming_responder(1000);
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        cmd_tx
+            .send(TxCommand::ExecStreamed {
+                // Hazard-shaped for real: `mysql_implicit_commit_hazard` returns true for a
+                // non-TEMPORARY CREATE.
+                sql: "CREATE TABLE ddl (x INT)".into(),
+                params: vec![],
+                timeout_ms: None,
+                readonly: false,
+                cancel: CancellationToken::new(),
+                responder,
+                done: ack_tx,
+            })
+            .await
+            .expect("send exec-streamed");
+        ack_rx
+            .await
+            .expect("the actor acks after the natural error");
+        while control_rx.recv().await.is_some() {}
+
+        // Sanity on the BRANCH under test: a natural non-57014 error, so the stream ended INTACT
+        // (Protocol is branch 3 — the persisted post-filter cannot rewrite it) and the tx is alive.
+        // If this ever became TxDeadline the test would be pinning `Broken`, not `Intact`.
+        match cell.lock().unwrap().take().expect("exactly one terminal") {
+            Terminal::Error(ep) => assert_eq!(
+                ep.code,
+                errc::PROTOCOL,
+                "the natural mid-stream error's own fate — this is the Intact-on-error branch"
+            ),
+            other => panic!("expected exactly one Error terminal, got {other:?}"),
+        }
+        assert!(
+            registry.lookup(tx_id, owner).is_ok(),
+            "an errored-but-intact stream leaves the tx OPEN (no engine auto-rollback)"
+        );
+
+        // Now LOSE a later statement in the same transaction. Its own SQL is hazard-FREE
+        // (`SELECT`), so the only thing that can make its reply say persisted is the LATCH the
+        // stream left behind.
+        pool.backend().block_query();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "SELECT 1".into(),
+                params: vec![],
+                timeout_ms: Some(20),
+                cancel: CancellationToken::new(),
+                reply: reply_tx,
+            })
+            .await
+            .expect("send exec");
+
+        let reply = reply_rx.await.expect("the actor replies, never drops");
+        assert!(
+            matches!(
+                reply,
+                ExecReply::Deadline {
+                    tx_writes_persisted: true
+                }
+            ),
+            "the later loss must carry the persisted flag the errored hazard latched \
+             (a `false` here is the at-least-once: the client is told Retryable over durable \
+             writes), got {reply:?}"
+        );
+
+        // And every LATER touch of the dead tx_id gets the same non-replayable answer.
+        done_rx.wait_for(|t| *t).await.expect("actor tears down");
+        assert_eq!(
+            registry.lookup(tx_id, owner).unwrap_err(),
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: true
+            },
+            "the tombstone carries the latch too"
+        );
+    }
+
+    /// The NEGATIVE control the fix above must not break, and the reason the `errored` bit exists
+    /// at all: a hazard-shaped streamed statement that drains CLEANLY must NOT latch from the
+    /// lexical hazard — only from the AUTHORITY, which is trustworthy on that path and is what
+    /// corrects a false positive. `mysql_implicit_commit_hazard` is `_ => true` on every unknown
+    /// leading keyword and unconditionally true for `CALL`/`DO`, so latching `hazard`
+    /// unconditionally on `Intact` would make an ordinary cleanly-streamed `CALL` poison the rest
+    /// of its transaction with cry-wolf `Indeterminate` — strictly worse than the buffered sibling,
+    /// which consults the authority on its clean arm.
+    ///
+    /// Identical to the guard above in every respect EXCEPT `error_at` (and the SQL, which is the
+    /// `CALL` the cost would be paid on), so the two isolate exactly the errored/clean distinction.
+    #[tokio::test]
+    async fn tx_streamed_clean_hazard_does_not_latch_persisted_from_the_lexer_alone() {
+        let backend = FakeBackend::new();
+        backend.set_dialect(Dialect::MySql);
+        // error_at: None → the stream DRAINS: `StreamEnded::Intact { errored: false }`. The fake's
+        // conn keeps reporting an open tx, i.e. the authority says "no implicit commit happened" —
+        // the lexical hazard was a false positive and must be corrected, not latched.
+        backend.set_stream_script(stream_script(vec![vec![Value::I64(1)]], 1));
+        let pool = Pool::new(backend, test_pool_config());
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let (tx_id, cmd_tx, mut done_rx) = spawn_actor(
+            &pool,
+            &registry,
+            owner,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .await;
+
+        let (responder, cell, mut control_rx) = streaming_responder(1000);
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        cmd_tx
+            .send(TxCommand::ExecStreamed {
+                // Hazard-shaped for real (`CALL` is an unconditional hazard: a routine may run
+                // DDL) — and the shape a streaming MySQL tier would actually see.
+                sql: "CALL report_rows()".into(),
+                params: vec![],
+                timeout_ms: None,
+                readonly: false,
+                cancel: CancellationToken::new(),
+                responder,
+                done: ack_tx,
+            })
+            .await
+            .expect("send exec-streamed");
+        ack_rx.await.expect("the actor acks the clean stream");
+        while control_rx.recv().await.is_some() {}
+        assert!(
+            matches!(
+                cell.lock().unwrap().take().expect("exactly one terminal"),
+                Terminal::Ok(_)
+            ),
+            "the stream drained cleanly — this is the Intact-on-clean branch"
+        );
+
+        // Same later loss as the guard above. The authority never said the tx ended, so nothing may
+        // have latched, and the client keeps its replay license for a transaction that wrote nothing.
+        pool.backend().block_query();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Exec {
+                sql: "SELECT 1".into(),
+                params: vec![],
+                timeout_ms: Some(20),
+                cancel: CancellationToken::new(),
+                reply: reply_tx,
+            })
+            .await
+            .expect("send exec");
+
+        let reply = reply_rx.await.expect("the actor replies, never drops");
+        assert!(
+            matches!(
+                reply,
+                ExecReply::Deadline {
+                    tx_writes_persisted: false
+                }
+            ),
+            "a CLEAN hazard-shaped stream must be corrected by the authority, never latched from \
+             the lexer (a `true` here is permanent cry-wolf Indeterminate for the whole tx), \
+             got {reply:?}"
+        );
+        done_rx.wait_for(|t| *t).await.expect("actor tears down");
+        assert_eq!(
+            registry.lookup(tx_id, owner).unwrap_err(),
+            TxLookupErr::Tombstoned {
+                tx_writes_persisted: false
+            }
+        );
     }
 
     /// The OPEN itself aborted inside a tx (a blocked `query_stream` + a fired cancel): exactly ONE
