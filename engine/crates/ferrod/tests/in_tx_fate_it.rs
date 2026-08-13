@@ -33,15 +33,20 @@
 //!     family bug. So the marker form is the portable one, and the MySQL-family test below runs
 //!     against BOTH engines.
 //!
-//!  2. **The processlist poll filters `COMMAND IN ('Execute','Query')`.** `INFO` also carries the
-//!     statement text during `COM_STMT_PREPARE`, and ferrod's row path is prepare-THEN-execute, so
-//!     a bare marker match can mean "the server is PREPARING this statement" — which is NOT in
-//!     flight. Today both phases classify identically, so this test would pass either way; that is
-//!     precisely why the filter must go in NOW. **After Task 9 lands `ConnectionLost{dispatched}`,
-//!     a prep-phase kill becomes `dispatched: false` → `CONNECTION_LOST{Retryable}` — bit for bit
-//!     the value this test asserts — so the `sql.rs:332` mutation would survive GREEN and the guard
-//!     on the defining safety property would be dead, with nothing in this file or in Task 9
-//!     looking wrong in isolation.** It is a time bomb, not a flake.
+//!  2. **The processlist poll filters `COMMAND IN ('Execute','Query')`** — see
+//!     [`ACTIVE_CONN_POLL_SQL`], the one place it is written. `INFO` also carries the statement text
+//!     during `COM_STMT_PREPARE`, and ferrod's row path is prepare-THEN-execute, so a bare marker
+//!     match can mean "the server is PREPARING this statement" — which is NOT in flight.
+//!     **This is load-bearing TODAY, not after some future change:** `ferro-backend-mysql`'s
+//!     `query::run` marks the prepare arm `.undispatched()` (`query.rs:59`, M1-S9a Task 9 — landed),
+//!     so a prep-phase kill classifies `dispatched: false` → `CONNECTION_LOST{Retryable}`, bit for
+//!     bit the value the two KILL tests below assert. A poll that matched a PREPARING connection
+//!     would therefore make them pass under the very `services/sql.rs` `in_tx: true → false`
+//!     mutation they exist to catch, with nothing in this file looking wrong in isolation.
+//!     The predicate has its own guard —
+//!     [`the_poll_filter_never_mistakes_a_parked_prepare_for_an_in_flight_statement`] — so deleting
+//!     it is RED, not green. (The S9a whole-branch review measured the un-guarded state: deleting
+//!     the predicate left this file 3/3 GREEN on all three engines.)
 
 mod common;
 
@@ -151,32 +156,37 @@ async fn raw_mysql(url: &str) -> mysql_async::Conn {
         .expect("in_tx_fate harness: raw side connection to MySQL")
 }
 
+/// **The one in-flight predicate this file has** — every poll below goes through it, and
+/// [`the_poll_filter_never_mistakes_a_parked_prepare_for_an_in_flight_statement`] pins it, so
+/// deleting `AND COMMAND IN ('Execute', 'Query')` here is RED, not green (module doc rule 2).
+///
+/// An IDLE conn has `INFO = NULL` (never matches `LIKE`), so the marker predicate excludes idle
+/// threads on its own; the `COMMAND` predicate is what additionally excludes the
+/// PREPARING-but-not-yet-executing phase. The marker is bound as a PARAMETER (never inlined into
+/// the poll SQL) so the poll's own row can never self-match; `ID <> CONNECTION_ID()` excludes the
+/// poller as belt-and-braces.
+const ACTIVE_CONN_POLL_SQL: &str = "SELECT ID FROM information_schema.processlist \
+     WHERE ID <> CONNECTION_ID() AND INFO LIKE ? AND COMMAND IN ('Execute', 'Query')";
+
+/// ONE application of [`ACTIVE_CONN_POLL_SQL`]: the processlist id of a connection whose current
+/// statement text carries `marker` **and is dispatched**, or `None`.
+async fn poll_active_conn(side: &mut mysql_async::Conn, marker: &str) -> Option<u64> {
+    use mysql_async::prelude::Queryable;
+    side.exec_first(ACTIVE_CONN_POLL_SQL, (format!("%{marker}%"),))
+        .await
+        .expect("processlist poll")
+}
+
 /// Poll the processlist until a statement whose text carries `marker` is PROVABLY EXECUTING —
 /// `COMMAND IN ('Execute','Query')`, never `Prepare` (module doc rule 2) — excluding this poll's
 /// own connection, then return that connection's processlist id.
 ///
 /// Panics loudly after [`IN_FLIGHT_GUARD_BOUND`]: a kill landing before dispatch is silently
-/// ineffective, and a test built on it would pass for the wrong reason. The marker is bound as a
-/// PARAMETER (never inlined into the poll SQL) so the poll's own row can never self-match;
-/// `ID <> CONNECTION_ID()` excludes the poller as belt-and-braces.
+/// ineffective, and a test built on it would pass for the wrong reason.
 async fn wait_for_active_conn(side: &mut mysql_async::Conn, marker: &str) -> u64 {
-    use mysql_async::prelude::Queryable;
-    let pattern = format!("%{marker}%");
     let deadline = Instant::now() + IN_FLIGHT_GUARD_BOUND;
     loop {
-        // An IDLE conn has `INFO = NULL` (never matches `LIKE`), so the marker predicate excludes
-        // idle threads on its own; the `COMMAND` predicate is what additionally excludes the
-        // PREPARING-but-not-yet-executing phase.
-        let id: Option<u64> = side
-            .exec_first(
-                "SELECT ID FROM information_schema.processlist \
-                 WHERE ID <> CONNECTION_ID() AND INFO LIKE ? \
-                   AND COMMAND IN ('Execute', 'Query')",
-                (pattern.clone(),),
-            )
-            .await
-            .expect("processlist poll");
-        if let Some(id) = id {
+        if let Some(id) = poll_active_conn(side, marker).await {
             return id;
         }
         assert!(
@@ -186,6 +196,27 @@ async fn wait_for_active_conn(side: &mut mysql_async::Conn, marker: &str) -> u64
         );
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
+}
+
+/// The UNFILTERED vantage: `(id, COMMAND, STATE)` of whichever connection currently carries
+/// `marker` in its statement text — with NO `COMMAND` predicate at all.
+///
+/// This is deliberately NOT derived from [`ACTIVE_CONN_POLL_SQL`]: the parked-prepare guard needs
+/// an independent observer that can still SEE the row the filtered poll must reject, so that
+/// "filtered says None" is provably the `COMMAND` predicate discriminating and not the row having
+/// vanished.
+async fn poll_marked_conn(
+    side: &mut mysql_async::Conn,
+    marker: &str,
+) -> Option<(u64, String, Option<String>)> {
+    use mysql_async::prelude::Queryable;
+    side.exec_first(
+        "SELECT ID, COMMAND, STATE FROM information_schema.processlist \
+         WHERE ID <> CONNECTION_ID() AND INFO LIKE ?",
+        (format!("%{marker}%"),),
+    )
+    .await
+    .expect("processlist diagnostic poll")
 }
 
 /// PG half of the guard. `SELECT pg_terminate_backend(pg_backend_pid())` kills the session it
@@ -462,5 +493,214 @@ async fn mysql_in_tx_loss_after_an_implicit_commit_is_indeterminate_never_retrya
             &write_req(&format!("DROP TABLE IF EXISTS {ddl_table}")),
         )
         .await;
+    }
+}
+
+/// How long the parked-prepare guard KEEPS asserting once the shape is established. The reviewer
+/// measured 19/19 hits over 2s on both engines; a window this long makes a one-off sample
+/// impossible and still costs ~2s.
+const PARKED_PREPARE_OBSERVE_WINDOW: Duration = Duration::from_secs(2);
+/// Minimum number of poll iterations that must observe the prepare STILL parked inside that
+/// window. Without a floor the loop could pass vacuously (zero iterations, or a prepare that
+/// escaped after one).
+const PARKED_PREPARE_MIN_HITS: usize = 10;
+
+/// **The guard for module-doc rule 2** — the `COMMAND IN ('Execute','Query')` predicate in
+/// [`ACTIVE_CONN_POLL_SQL`], which is the ONLY thing keeping the two KILLs above inside the
+/// EXECUTE phase.
+///
+/// Why this must exist: `ferro-backend-mysql`'s `query::run` marks the `COM_STMT_PREPARE` arm
+/// `.undispatched()` (`query.rs:59`, M1-S9a Task 9), so a kill landing during the PREPARE phase
+/// classifies `CONNECTION_LOST{Retryable}` — **bit for bit the value the two tests above assert**.
+/// A prep-phase match therefore does not merely prove nothing; it makes those tests pass under the
+/// exact `services/sql.rs` `in_tx: true → false` mutation they exist to catch. Deleting the
+/// predicate leaves them 3/3 green on all three engines (measured in the S9a whole-branch review),
+/// which is why the predicate needs a guard of its own rather than a comment.
+///
+/// **The PREPARE phase IS holdable on demand** — the earlier "cannot be pinned by a test" note in
+/// `task-1-journal.md` (and the stronger claim in `mysql_chaos_it.rs`'s harness doc) is FALSE, and
+/// this test is the refutation. A prepare must acquire a SHARED metadata lock on every table it
+/// names, and MDL grants are queued: a **pending EXCLUSIVE request** parks every later shared
+/// acquirer behind it. So the shape is
+///
+/// 1. holder: `BEGIN; SELECT * FROM t` — an open transaction holding `SHARED_READ` on `t`;
+/// 2. blocker: `ALTER TABLE t …` — an EXCLUSIVE request that can never be granted while (1) lives,
+///    so it parks in `Waiting for table metadata lock` **with its request queued**;
+/// 3. victim: `COM_STMT_PREPARE` of a `SELECT … FROM t` carrying a marker — queued behind (2), it
+///    parks indefinitely in `COMMAND = 'Prepare'` with the marker fully visible in `INFO`.
+///
+/// The assertions are the two halves that make the predicate falsifiable:
+/// - the FILTERED poll must return `None` for the parked prepare, on every iteration of a 2s window
+///   (delete the predicate → it returns the prepare's id → RED);
+/// - the UNFILTERED poll must return that same connection with `COMMAND = 'Prepare'` — so the
+///   `None` above is the predicate discriminating, not the row having gone away; and the FILTERED
+///   poll must still return the blocker's `ALTER` (a genuine `COM_QUERY` in flight), so it is not
+///   simply a poll that matches nothing.
+#[tokio::test]
+async fn the_poll_filter_never_mistakes_a_parked_prepare_for_an_in_flight_statement() {
+    use mysql_async::prelude::Queryable;
+
+    let targets = mysql_targets();
+    if targets.is_empty() {
+        return;
+    }
+    for (label, url) in targets {
+        eprintln!("--- parked-prepare vs the COMMAND filter: {label} ---");
+        let mut side = raw_mysql(&url).await;
+
+        // Per-run names: two DISJOINT markers (the blocker's ALTER also carries one, and it is a
+        // `COMMAND = 'Query'` row that the filtered poll MUST match — if the markers overlapped the
+        // filtered poll would match the ALTER and this guard would fail for the wrong reason).
+        let table = unique_key("ferro_s9a_mdl");
+        let prep_marker = unique_key("mdlprep");
+        let alter_marker = unique_key("mdlalter");
+
+        side.query_drop(format!("CREATE TABLE {table} (x INT)"))
+            .await
+            .expect("create the MDL fixture table");
+
+        // (1) HOLDER — an open transaction that has touched the table holds SHARED_READ MDL on it
+        //     until it ends. This connection stays open for the whole scenario.
+        let mut holder = raw_mysql(&url).await;
+        holder.query_drop("BEGIN").await.expect("holder BEGIN");
+        holder
+            .query_drop(format!("SELECT * FROM {table}"))
+            .await
+            .expect("holder SELECT (takes SHARED_READ MDL)");
+
+        // (2) BLOCKER — an EXCLUSIVE MDL request that can never be granted while (1) is open. It
+        //     parks, and its pending request is what stalls every later SHARED acquirer.
+        let blocker_url = url.clone();
+        let blocker_sql = format!("ALTER TABLE {table} ADD COLUMN y INT COMMENT '{alter_marker}'");
+        let blocker = tokio::spawn(async move {
+            let mut c = raw_mysql(&blocker_url).await;
+            let _ = c.query_drop(blocker_sql).await;
+        });
+        let blocker_id = wait_for_parked_alter(&mut side, &alter_marker).await;
+
+        // (3) VICTIM — a bare `COM_STMT_PREPARE` (no execute can follow: `prep` returns first).
+        //     Its shared MDL acquisition queues behind (2)'s pending exclusive request.
+        let victim_url = url.clone();
+        let victim_sql = format!("SELECT x FROM {table} WHERE '{prep_marker}' <> ''");
+        let victim = tokio::spawn(async move {
+            let mut c = raw_mysql(&victim_url).await;
+            let _ = c.prep(victim_sql).await;
+        });
+
+        // Vantage proof FIRST: the parked prepare is visible to an unfiltered marker poll, and the
+        // server really reports it as `COMMAND = 'Prepare'`.
+        let (victim_id, victim_state) =
+            wait_for_parked_prepare(&mut side, &prep_marker, label).await;
+        eprintln!(
+            "[{label}] prepare parked: id={victim_id} COMMAND=Prepare STATE={victim_state:?}"
+        );
+
+        // THE ASSERTION. Repeated for a window, so a single lucky sample cannot carry it.
+        let mut hits = 0usize;
+        let mut last_seen: Option<(u64, String, Option<String>)> = None;
+        let until = Instant::now() + PARKED_PREPARE_OBSERVE_WINDOW;
+        while Instant::now() < until {
+            let filtered = poll_active_conn(&mut side, &prep_marker).await;
+            assert_eq!(
+                filtered, None,
+                "[{label}] the processlist poll matched a connection that is still PREPARING \
+                 (id {victim_id}, marker {prep_marker:?}). `COMMAND IN ('Execute','Query')` is the \
+                 only thing that keeps the in-tx KILL guards in this file aimed at a DISPATCHED \
+                 statement: `ferro-backend-mysql/src/query.rs` marks the prepare phase \
+                 `.undispatched()`, so a prep-phase kill classifies CONNECTION_LOST{{Retryable}} — \
+                 exactly the value those guards assert, which would make them pass under the \
+                 `in_tx: true -> false` mutation they exist to catch."
+            );
+            let row = poll_marked_conn(&mut side, &prep_marker).await;
+            if let Some((id, ref cmd, _)) = row
+                && id == victim_id
+                && cmd == "Prepare"
+            {
+                hits += 1;
+            }
+            last_seen = row;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            hits >= PARKED_PREPARE_MIN_HITS,
+            "[{label}] the prepare did not STAY parked ({hits} observations, need \
+             {PARKED_PREPARE_MIN_HITS}) — the assertion above never had a reachable failing input. \
+             Last unfiltered observation: {last_seen:?}"
+        );
+
+        // CONTROL: the very same filtered poll DOES match the blocker's ALTER — a real
+        // `COMMAND = 'Query'` in flight (parked on the same MDL, so equally "not making progress").
+        // Without this, a poll that had simply stopped matching anything would look identical.
+        assert_eq!(
+            poll_active_conn(&mut side, &alter_marker).await,
+            Some(blocker_id),
+            "[{label}] the filtered poll must still match a DISPATCHED statement — otherwise the \
+             `None` asserted above proves nothing about the COMMAND predicate"
+        );
+
+        // Teardown: kill the victim, then the blocker, then release the holder, then drop the
+        // fixture. Killing the blocker BEFORE the holder rolls back is what keeps the ALTER from
+        // running (and from racing the DROP).
+        side.query_drop(format!("KILL {victim_id}"))
+            .await
+            .expect("KILL the parked prepare");
+        side.query_drop(format!("KILL {blocker_id}"))
+            .await
+            .expect("KILL the parked ALTER");
+        let _ = tokio::time::timeout(Duration::from_secs(5), victim).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), blocker).await;
+        holder
+            .query_drop("ROLLBACK")
+            .await
+            .expect("holder ROLLBACK");
+        drop(holder);
+        side.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .expect("drop the MDL fixture table");
+    }
+}
+
+/// Wait until the blocker's `ALTER` is parked on the metadata lock, and return its processlist id.
+/// Parked (not merely present) is what matters: only a PENDING exclusive request stalls a later
+/// shared acquirer, so starting the victim before this returns would let its prepare sail past.
+async fn wait_for_parked_alter(side: &mut mysql_async::Conn, marker: &str) -> u64 {
+    let deadline = Instant::now() + IN_FLIGHT_GUARD_BOUND;
+    loop {
+        if let Some((id, cmd, state)) = poll_marked_conn(side, marker).await
+            && cmd == "Query"
+            && state
+                .as_deref()
+                .is_some_and(|s| s.to_ascii_lowercase().contains("metadata lock"))
+        {
+            return id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the blocker ALTER never parked on the metadata lock within \
+             {IN_FLIGHT_GUARD_BOUND:?} — the MDL queue this guard depends on was never formed"
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
+/// Wait until the victim's `COM_STMT_PREPARE` is observed parked, and return `(id, STATE)`.
+/// Panics on the bound: if the prepare phase is never observable the guard below would assert
+/// `None` against nothing at all (species (a): no reachable failing input).
+async fn wait_for_parked_prepare(
+    side: &mut mysql_async::Conn,
+    marker: &str,
+    label: &str,
+) -> (u64, Option<String>) {
+    let deadline = Instant::now() + IN_FLIGHT_GUARD_BOUND;
+    loop {
+        match poll_marked_conn(side, marker).await {
+            Some((id, cmd, state)) if cmd == "Prepare" => return (id, state),
+            other => assert!(
+                Instant::now() < deadline,
+                "[{label}] the prepare carrying marker {marker:?} was never observed with \
+                 COMMAND='Prepare' within {IN_FLIGHT_GUARD_BOUND:?}; last row: {other:?}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
     }
 }
