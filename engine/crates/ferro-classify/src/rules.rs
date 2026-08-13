@@ -353,9 +353,31 @@ pub(crate) fn classify_one_mysql(
 /// rationale — this list enumerates the SAFE side; everything else, including an unknown leading
 /// keyword, is a hazard.
 pub(crate) fn mysql_implicit_commit_hazard(stmt: &str) -> bool {
+    // A MySQL/MariaDB EXECUTABLE COMMENT (`/*!` or `/*M!`) is not a comment on this family — the
+    // server runs its contents, so `/*! CREATE TABLE ... */` is DDL wearing a comment's clothes and
+    // implicitly commits. The scanner masks all block comments (right for PostgreSQL), so without
+    // this check such a statement reaches the `None` arm below and is called safe.
+    //
+    // M1-S9a review BLOCKER, reproduced end to end through the engine and re-measured here on BOTH
+    // engines: `START TRANSACTION; INSERT; /*! CREATE TABLE <existing> */; ROLLBACK` leaves the
+    // INSERT SURVIVING (the DDL errors 1050 and STILL commits). With the hazard false the latch
+    // never set, and a later in-tx loss minted `CONNECTION_LOST{RETRYABLE}` over already-persisted
+    // writes — the §22.2 (ai) at-least-once, resurrected. `mysqldump` emits DDL inside versioned
+    // comments, so this is ordinary traffic, not a corner.
+    //
+    // Deliberately checked BEFORE the keyword scan and without parsing the contents: this assist may
+    // only ever move toward MORE conservative, and calling a `/*! SELECT 1 */` a hazard costs one
+    // cry-wolf `Indeterminate` on a statement that is ALSO lost, while missing a `/*! DROP TABLE */`
+    // licenses replay of committed writes.
+    if scan::has_mysql_executable_comment(stmt) {
+        return true;
+    }
     let Some(kw) = scan::leading_keyword(stmt) else {
-        // Empty/comment-only: nothing dispatchable, nothing can have committed.
-        return false;
+        // No leading keyword. Genuinely empty or comment-only means nothing dispatchable, so
+        // nothing can have committed — but anything else here is a statement this scanner could not
+        // read, and an unreadable statement takes the conservative side, exactly as an unknown
+        // keyword does below.
+        return !scan::strip_leading_noise(stmt).trim().is_empty();
     };
     match kw.as_str() {
         // Never implicitly commit: plain DML, reads, diagnostics, tx-internal verbs, and the
@@ -368,9 +390,17 @@ pub(crate) fn mysql_implicit_commit_hazard(stmt: &str) -> bool {
         "CREATE" => !create_is_temp(stmt),
         "DROP" => scan::next_token_after_keyword(stmt).as_deref() != Some("TEMPORARY"),
         // Plain SET never commits; SET PASSWORD and any autocommit assignment DO.
+        // Plain SET never commits; SET PASSWORD, SET DEFAULT ROLE and any autocommit assignment DO.
+        // `SET DEFAULT ROLE` is MySQL's account-management family and was MISSED by S9a — measured
+        // in the review on MySQL 8.4.11 AND MariaDB 11.8.8: `BEGIN; INSERT; SET DEFAULT ROLE ...;
+        // ROLLBACK` leaves the INSERT surviving on both, while the `SET ROLE` control does NOT
+        // commit on either. Exact-token match, so `SET default_storage_engine = ...` (an ordinary
+        // session GUC) is untouched — `next_token_after_keyword` refuses ident-continued words.
         "SET" => {
-            scan::next_token_after_keyword(stmt).as_deref() == Some("PASSWORD")
-                || scan::contains_identifier_ci(stmt, "autocommit")
+            matches!(
+                scan::next_token_after_keyword(stmt).as_deref(),
+                Some("PASSWORD") | Some("DEFAULT")
+            ) || scan::contains_identifier_ci(stmt, "autocommit")
         }
         // The documented committing families (ALTER/RENAME/TRUNCATE/GRANT/REVOKE/ANALYZE/CHECK/
         // FLUSH/OPTIMIZE/REPAIR/RESET/CACHE/LOAD/INSTALL/UNINSTALL/LOCK/UNLOCK/START/BEGIN/XA/
@@ -476,4 +506,80 @@ fn skip_leading_keyword(s: &str) -> &str {
         .find(|c: char| !c.is_ascii_alphabetic())
         .unwrap_or(rest.len());
     &rest[end..]
+}
+
+#[cfg(test)]
+mod s9a_review_blocker_tests {
+    use crate::{Dialect, implicit_commit_hazard};
+
+    /// **The M1-S9a review BLOCKER.** A MySQL/MariaDB EXECUTABLE COMMENT is not a comment — the
+    /// server runs it — so DDL wrapped in `/*! ... */` implicitly commits. Measured on both engines:
+    /// `START TRANSACTION; INSERT; /*! CREATE TABLE <existing> */; ROLLBACK` leaves the INSERT
+    /// SURVIVING (the DDL errors 1050 and commits anyway).
+    ///
+    /// MUTATION that must make this RED: delete the `has_mysql_executable_comment` early-return in
+    /// `mysql_implicit_commit_hazard`. Without it the statement reaches the `None` arm, is called
+    /// safe, the latch never sets, and a later in-tx loss mints `Retryable` over committed writes.
+    #[test]
+    fn a_versioned_executable_comment_is_a_hazard() {
+        for sql in [
+            "/*! CREATE TABLE t (id INT) */",
+            "/*!50000 CREATE TABLE t (id INT) */",
+            "/*M!50000 CREATE TABLE t (id INT) */",
+            "  /*!40000 ALTER TABLE t DISABLE KEYS */",
+            // mysqldump's own shape: the wrapper sits mid-statement, not at the front.
+            "CREATE TABLE t (id INT) /*!50100 PARTITION BY HASH (id) */",
+        ] {
+            assert!(
+                implicit_commit_hazard(sql, Dialect::MySql),
+                "executable comment must be a HAZARD on the MySQL family: {sql:?}"
+            );
+        }
+    }
+
+    /// The conservative direction is MySQL-only: PostgreSQL has no executable-comment syntax and its
+    /// DDL is transactional, so nothing here may make PG more conservative.
+    #[test]
+    fn an_executable_comment_is_never_a_hazard_on_postgres() {
+        assert!(!implicit_commit_hazard(
+            "/*! CREATE TABLE t (id INT) */",
+            Dialect::Postgres
+        ));
+    }
+
+    /// A genuinely comment-only or empty statement dispatches nothing, so nothing can have
+    /// committed — the `None` arm must stay false for these, or every no-op cries wolf.
+    /// MUTATION: make the `None` arm return `true` unconditionally — this goes RED.
+    #[test]
+    fn an_ordinary_comment_only_statement_is_not_a_hazard() {
+        for sql in [
+            "",
+            "   ",
+            "-- just a note",
+            "/* plain block comment */",
+            "\n\t",
+        ] {
+            assert!(
+                !implicit_commit_hazard(sql, Dialect::MySql),
+                "comment-only/empty dispatches nothing: {sql:?}"
+            );
+        }
+    }
+
+    /// `SET DEFAULT ROLE` is MySQL's account-management family and DOES implicitly commit —
+    /// measured on MySQL 8.4.11 and MariaDB 11.8.8. `SET ROLE` does NOT, and an ordinary session
+    /// GUC whose name merely starts with `default` must not be swept in (exact-token match).
+    /// MUTATION: drop `Some("DEFAULT")` from the SET arm — the first assertion goes RED.
+    #[test]
+    fn set_default_role_is_a_hazard_but_set_role_and_default_gucs_are_not() {
+        assert!(implicit_commit_hazard(
+            "SET DEFAULT ROLE ALL TO u@h",
+            Dialect::MySql
+        ));
+        assert!(!implicit_commit_hazard("SET ROLE admin", Dialect::MySql));
+        assert!(!implicit_commit_hazard(
+            "SET default_storage_engine = InnoDB",
+            Dialect::MySql
+        ));
+    }
 }

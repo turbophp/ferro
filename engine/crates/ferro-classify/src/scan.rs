@@ -340,6 +340,39 @@ fn skip_block_comment(mut s: &str) -> Option<&str> {
     }
 }
 
+/// Does this statement carry a MySQL/MariaDB **executable comment** (`/*!` or `/*M!`)?
+///
+/// These are NOT comments on the MySQL family — the server EXECUTES their contents, optionally
+/// gated on a version (`/*!50000 ... */`, MariaDB's `/*M!50000 ... */`). [`strip_leading_noise`]
+/// and the block-comment masking treat every `/* ... */` alike, which is right for PostgreSQL and
+/// wrong here: it makes a whole-statement `/*! CREATE TABLE t (...) */` look like a comment-only
+/// statement with no leading keyword.
+///
+/// MEASURED on MySQL 8.4.11 and MariaDB 11.8.8, and the reason this exists — the DDL runs, and it
+/// implicitly commits EVEN WHEN IT THEN ERRORS:
+/// ```text
+/// START TRANSACTION; INSERT INTO t VALUES (1); /*! CREATE TABLE <existing>(id INT) */; ROLLBACK;
+///   -> ERROR 1050 (table already exists), and the INSERT SURVIVES the ROLLBACK on BOTH engines.
+/// ```
+/// Real-world reach: `mysqldump` emits DDL inside versioned comments, and dumps and migrations get
+/// replayed inside transactions. Missing this re-opens the §19.3 at-least-once (§22.2 (ai)): the
+/// hazard stays false, the latch never sets, and a later loss mints `Retryable` over writes that
+/// have already durably committed.
+pub(crate) fn has_mysql_executable_comment(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let mut i = 0usize;
+    while i + 2 < b.len() {
+        if b[i] == b'/' && b[i + 1] == b'*' {
+            // `/*!` or MariaDB's `/*M!`
+            if b[i + 2] == b'!' || (b[i + 2] == b'M' && i + 3 < b.len() && b[i + 3] == b'!') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// The first maximal ASCII-alphabetic run after [`strip_leading_noise`], uppercased. `None` if
 /// nothing (or non-alphabetic content) remains.
 pub(crate) fn leading_keyword(sql: &str) -> Option<String> {
