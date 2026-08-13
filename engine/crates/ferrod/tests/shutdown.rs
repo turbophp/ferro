@@ -17,7 +17,7 @@ use ferro_proto::consts::{TYPE_REGISTRY_HASH, flags, service};
 use ferro_proto::messages::Outcome;
 use ferrod::config::Config;
 use ferrod::epoch::BootEpoch;
-use ferrod::serve::SESSION_DRAIN_GRACE;
+use ferrod::services::sql::CANCEL_DRAIN_BUDGET;
 use ferrod::session::HandlerFn;
 use ferrod::session::codec::InFrame;
 use ferrod::session::responder::Responder;
@@ -100,6 +100,71 @@ async fn drain_refuses_new_but_finishes_inflight() {
         .expect("serve's task must not panic");
 }
 
+/// **The shutdown backstops must DOMINATE the terminal-declaration budget they backstop**
+/// (M1-S9a whole-branch review, `wb-bounds` — the grace was 3s against 5s budgets).
+///
+/// The shape is the production one, not an invented slow handler: against a WEDGED backend every
+/// request path answers a cancellation by draining under [`CANCEL_DRAIN_BUDGET`] and declaring its
+/// ONE terminal only AFTER that bound expires (`run_autocommit_exec`'s Interrupted arm, the tx
+/// actor's Deadline/Abort arms, and — since this fix — `abort_stream`). So the handler here waits
+/// for the cancellation the drain deadline fires, then takes the FULL production budget to declare.
+///
+/// It is imported, never copied: raising `CANCEL_DRAIN_BUDGET` raises what this test demands of the
+/// two backstops, so the arithmetic cannot silently re-invert. Both backstops are load-bearing here
+/// and each reversion is independently RED (mutations M1/M2 in the fix journal):
+///  * `drain_supervisors`' budget back to `config.drain_deadline` → the session aborts its OWN
+///    supervisor before the handler returns, and the supervisor is the sole terminal sender;
+///  * `serve`'s grace back to a bare 3s constant → `serve` aborts the whole session task first.
+/// Either way the client gets EOF with no terminal — the charter-rule-4 break this slice closes.
+#[tokio::test]
+async fn a_request_taking_the_full_drain_budget_still_gets_its_terminal_at_the_drain_deadline() {
+    let handler: HandlerFn = Arc::new(
+        |_frame: InFrame, responder: Responder, cancel: CancellationToken| {
+            async move {
+                cancel.cancelled().await;
+                tokio::time::sleep(CANCEL_DRAIN_BUDGET).await;
+                responder.end_ok(Bytes::from_static(b"drained"));
+            }
+            .boxed()
+        },
+    );
+
+    let drain = Drain::new();
+    let config = Config {
+        drain_deadline: DRAIN_DEADLINE,
+        ..Config::default()
+    };
+    // Derived from the contract, never a literal: `worst_case_stop` IS
+    // `drain_deadline + session_drain_grace(config)`.
+    let bound = config.worst_case_stop() + Duration::from_secs(2);
+    let (socket_path, served) =
+        common::spawn_serve_with_config(config, BootEpoch(1), drain.clone(), handler);
+
+    let mut client = common::connect(&socket_path).await;
+    client.hello(1).await;
+    client
+        .send_request(7, service::SQL, SOME_METHOD, vec![])
+        .await;
+
+    drain.trigger();
+
+    // EXACTLY ONE terminal, and it must actually reach the wire (charter rule 4) ...
+    let terminal = client.recv_within(bound).await;
+    assert_eq!(terminal.header.request_id, 7);
+    assert_eq!(terminal.header.flags, flags::END);
+    match Outcome::decode(&terminal.payload).expect("decode Outcome") {
+        Outcome::Ok(body) => assert_eq!(body, b"drained"),
+        other => panic!("expected the handler's declared Outcome::Ok, got {other:?}"),
+    }
+    // ... and then the close, with no second terminal behind it.
+    client.recv_eof_within(bound).await;
+
+    tokio::time::timeout(bound, served)
+        .await
+        .expect("serve must return once its only session has wound itself down")
+        .expect("serve's task must not panic");
+}
+
 #[tokio::test]
 async fn drain_deadline_hard_closes() {
     // A handler that never completes and never declares a terminal -- the ONLY way its session
@@ -115,10 +180,16 @@ async fn drain_deadline_hard_closes() {
     );
 
     let drain = Drain::new();
+    // `request_drain_budget` shrunk alongside `drain_deadline`: this test's subject is the
+    // hard-close backstop, and the session's own cleanup budget (default: >
+    // `CANCEL_DRAIN_BUDGET`) would otherwise put ~13s of correct WAITING in front of the abort
+    // this test is here to observe. The bound below is still derived from whatever they are.
     let config = Config {
         drain_deadline: DRAIN_DEADLINE,
+        request_drain_budget: DRAIN_DEADLINE,
         ..Config::default()
     };
+    let bound = config.worst_case_stop() + Duration::from_secs(2);
     let (socket_path, served) =
         common::spawn_serve_with_config(config, BootEpoch(1), drain.clone(), handler);
 
@@ -133,14 +204,11 @@ async fn drain_deadline_hard_closes() {
     // The in-flight request never finishes, so `serve` must give up rather than hang forever. The
     // bound is the CONTRACT, not a magic number: since M1-S9a the sessions own the
     // `drain_deadline` (~100ms) wind-down themselves and `serve`'s hard-abort is the backstop one
-    // `SESSION_DRAIN_GRACE` later (that grace is what stops the abort racing — and destroying — a
-    // session's own cleanup; see `serve::SESSION_DRAIN_GRACE`). Plus slack to stay non-flaky. The
+    // `session_drain_grace` later (that grace is what stops the abort racing — and destroying — a
+    // session's own cleanup; see `serve::session_drain_grace`). Plus slack to stay non-flaky. The
     // ASSERTION is unchanged: `serve` returns, it does not hang.
-    tokio::time::timeout(
-        DRAIN_DEADLINE + SESSION_DRAIN_GRACE + Duration::from_secs(2),
-        served,
-    )
-    .await
-    .expect("serve must return within drain_deadline + SESSION_DRAIN_GRACE, not hang forever")
-    .expect("serve's task must not panic");
+    tokio::time::timeout(bound, served)
+        .await
+        .expect("serve must return within Config::worst_case_stop, not hang forever")
+        .expect("serve's task must not panic");
 }

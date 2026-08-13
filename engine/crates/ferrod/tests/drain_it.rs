@@ -132,7 +132,7 @@ fn spawn_drained_serve(url: String) -> (Drain, PathBuf, JoinHandle<()>) {
     };
     let listener = ferrod::listener::bind_uds(&config).expect("bind_uds");
     let registry = PoolRegistry::build(&config);
-    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let tx_registry = Arc::new(TxRegistry::new(config.request_drain_budget));
     let drain = Drain::new();
     let factory = sql::make_handler(
         registry.clone(),

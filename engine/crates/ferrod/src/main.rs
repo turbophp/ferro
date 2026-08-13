@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
 
     // One process-global transaction registry, shared by every connection `serve` spawns (S6
     // seam). Its `abort_session` teardown wait mirrors the graceful-drain deadline.
-    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let tx_registry = Arc::new(TxRegistry::new(config.request_drain_budget));
 
     // Minted BEFORE the handler (M1-S9a finding 6): ONE `Drain` is shared by the signal watchers,
     // `serve`'s accept loop, every session, and the SQL/TX service's new-work refusal. It used to

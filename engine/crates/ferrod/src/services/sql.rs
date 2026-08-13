@@ -107,7 +107,13 @@ const OUTCOME_OK_OVERHEAD: usize = 2;
 /// 57014 cancel shape, which `fate::classify_fate`'s override routes exactly like a completed drain
 /// — write → `Indeterminate`, read → `Cancelled`. That is honest: the outcome is genuinely
 /// unobserved. Nothing here re-dispatches anything (charter rule 3).
-pub(crate) const CANCEL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
+/// **It is also the FLOOR of the shutdown-budget chain** (M1-S9a whole-branch review): every budget
+/// that backstops a terminal declaration — `Config::request_drain_budget`, and through it
+/// `serve::session_drain_grace` — is derived from this constant and must strictly dominate it. That
+/// is enforced at COMPILE time by `config.rs`'s `const _` assertion, which is why this is `pub`
+/// rather than `pub(crate)`: `tests/shutdown.rs`'s guard imports the real budget instead of copying
+/// its number, so raising this constant raises what that guard demands of both backstops.
+pub const CANCEL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
 /// Build the real SQL/TX `HandlerFactory`, capturing the pool registry, the shared
 /// `Arc<TxRegistry>` (S6 seam), and the transaction deadlines. The factory mints one `HandlerFn`

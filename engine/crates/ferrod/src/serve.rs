@@ -48,11 +48,13 @@
 //! ITSELF down at `config.drain_deadline` through its own cleanup path (terminals delivered,
 //! transactions rolled back, pooled connections released, writer flushed — see `session`'s top doc
 //! comment). This function's `abort_all` therefore stops being the shutdown MECHANISM and becomes
-//! a backstop: it fires only [`SESSION_DRAIN_GRACE`] AFTER the sessions' own deadline, for a
+//! a backstop: it fires only [`session_drain_grace`] AFTER the sessions' own deadline, for a
 //! session whose cleanup overruns (e.g. a handler that ignores cancellation). The grace is what
 //! keeps the abort from racing the very cleanup it is backstopping — without it, `serve` would
 //! abort a session at the same instant that session starts flushing its last terminals, which is
-//! exactly the charter-rule-4 break this slice exists to close.
+//! exactly the charter-rule-4 break this slice exists to close. It is DERIVED from that cleanup's
+//! own budgets rather than picked: a grace shorter than the drains it backs (the shipped 3 s
+//! against 5 s budgets, caught by the M1-S9a whole-branch review) races them by arithmetic.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,6 +74,15 @@ use crate::session::{HandlerFactory, Session};
 use crate::shutdown::Drain;
 use crate::tx::TxRegistry;
 
+/// What [`session_drain_grace`] adds on top of the session's own cleanup ceiling: the writer's final
+/// flush of the terminals that cleanup produced (a channel hop and a `write`/`flush` on a local UDS
+/// — microseconds), plus scheduling slack on a host that is, by construction, shutting everything
+/// down at once.
+///
+/// It is the ONLY part of the grace that is a judgement call rather than arithmetic; the rest is
+/// [`crate::config::Config::session_cleanup_bound`].
+const WRITER_FLUSH_GRACE: Duration = Duration::from_secs(1);
+
 /// How long past their OWN `config.drain_deadline` wind-down the sessions get before `serve`
 /// hard-aborts whatever is left (M1-S9a finding 6).
 ///
@@ -80,19 +91,34 @@ use crate::tx::TxRegistry;
 /// those produce, drain the writer. That work takes real time — a `ROLLBACK` and an out-of-band
 /// statement cancel are network round trips. Aborting at bare `drain_deadline` would cut it off
 /// mid-flush and drop terminals the client is owed (charter rule 4), so the backstop sits a grace
-/// period later. 3s is the same order as the pool's own bounded drains
-/// (`services::sql::CANCEL_DRAIN_BUDGET`, 5s) and well under the systemd `TimeoutStopSec` an
-/// operator would set for §18's unit.
+/// period later.
 ///
-/// It is a BACKSTOP, not a proof of completion: a session whose cleanup exceeds it is still
-/// hard-aborted — exactly the pre-S9a behaviour, now the exception rather than the mechanism.
+/// **It is DERIVED, and that is the fix, not a refactor** (M1-S9a whole-branch review, `wb-bounds`).
+/// It used to be a bare 3 s constant — arithmetically SMALLER than every budget it backstops (5 s
+/// each) — so it fired DURING a legitimate in-budget drain and destroyed the terminal that drain
+/// exists to deliver: the precise charter-rule-4 break this slice was written to close, reachable
+/// through the slice's own two constants. A backstop that does not dominate its mechanism is not a
+/// backstop. It is now computed from the ceiling the session's cleanup actually has
+/// ([`crate::config::Config::session_cleanup_bound`], itself derived from
+/// `services::sql::CANCEL_DRAIN_BUDGET`) plus [`WRITER_FLUSH_GRACE`]; a later change to any budget
+/// in that chain moves this with it, and a change that would invert the relationship breaks the
+/// BUILD at `config.rs`'s `const _` assertion.
+///
+/// It stays a BACKSTOP, not a proof of completion: a session whose cleanup exceeds it is still
+/// hard-aborted — exactly the pre-S9a behaviour, now the exception rather than the mechanism. The
+/// case that genuinely reaches it is the one no budget can bound: a handler that never releases its
+/// `Responder`, so the writer never sees its channel close (`tests/shutdown.rs`'s hard-close guard).
 ///
 /// OPERATOR-VISIBLE: it extends the daemon's worst-case stop time to
-/// `drain_deadline + SESSION_DRAIN_GRACE`, which is why [`crate::config::Config::drain_deadline`]'s
-/// own doc now says so. `pub` so an acceptance test states its bound in terms of the contract
-/// instead of duplicating the number — the two hard-close tests (`tests/shutdown.rs`,
-/// `tests/session_rules.rs`) do exactly that.
-pub const SESSION_DRAIN_GRACE: Duration = Duration::from_secs(3);
+/// `drain_deadline + session_drain_grace(config)` — [`crate::config::Config::worst_case_stop`],
+/// which is what §18's `TimeoutStopSec` must exceed. `pub` so an acceptance test states its bound in
+/// terms of the contract instead of duplicating the number — the two hard-close tests
+/// (`tests/shutdown.rs`, `tests/session_rules.rs`) do exactly that.
+pub fn session_drain_grace(config: &Config) -> Duration {
+    config
+        .session_cleanup_bound()
+        .saturating_add(WRITER_FLUSH_GRACE)
+}
 
 /// Drive `listener`'s peercred-gated accept loop until `drain` is triggered, then let already-
 /// spawned session tasks finish (up to `config.drain_deadline`) before returning. Every accepted
@@ -206,8 +232,11 @@ pub async fn serve(
     }
 
     // The sessions own the `drain_deadline` wind-down themselves now; this wait is the backstop,
-    // one `SESSION_DRAIN_GRACE` later, for a session whose cleanup overruns.
-    drain_sessions(sessions, config.drain_deadline + SESSION_DRAIN_GRACE).await;
+    // one `session_drain_grace` later, for a session whose cleanup overruns. The grace is DERIVED
+    // from the budgets that cleanup runs under (see `session_drain_grace`) — a fixed constant here
+    // is what let the backstop fire mid-cleanup and destroy terminals.
+    let backstop = config.drain_deadline + session_drain_grace(&config);
+    drain_sessions(sessions, backstop).await;
 }
 
 /// Send one session-fatal Auth frame on a just-accepted, not-yet-a-`Session` stream, then close

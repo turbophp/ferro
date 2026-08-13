@@ -130,7 +130,7 @@
 //!   reader loop itself (a guarded `supervisors.join_next()` arm, mirroring `serve`'s own
 //!   accept-loop reap, so this JoinSet never accumulates one dead entry per historical request for
 //!   the connection's whole lifetime) and, once the reader loop ends for any reason, drained with
-//!   a bound (`drain_supervisors`, `config.drain_deadline`) after `registry.cancel_all()` nudges
+//!   a bound (`drain_supervisors`, `config.request_drain_budget`) after `registry.cancel_all()` nudges
 //!   still-running handlers to wrap up. This closes the "writer exits early on a `sink.send()`
 //!   error, detached handler/supervisor tasks are orphaned" hole: no per-request task outlives its
 //!   session. The supervisor remains the sole terminal-sender throughout — this only changes who
@@ -170,15 +170,21 @@
 //!   ONE terminal BEFORE the socket closes, a transaction pinned by a client that never comes back
 //!   is ROLLED BACK rather than held, and its pooled connection is released. Nothing here can hang
 //!   forever: the window is `config.drain_deadline` and the cleanup itself is bounded
-//!   (`abort_session`'s teardown wait, then `drain_supervisors`).
+//!   (`abort_session`'s teardown wait, then `drain_supervisors`) — both by
+//!   `config.request_drain_budget`, which since the M1-S9a whole-branch review is the ONE budget
+//!   that must dominate the terminal-declaration bound (`services::sql::CANCEL_DRAIN_BUDGET`) these
+//!   two stages backstop. It used to be `config.drain_deadline`, i.e. 5s against a 5s declaration:
+//!   the supervisor — the SOLE terminal-sender — was `abort_all`ed a hair before the handler it was
+//!   awaiting declared, and the client got EOF with no terminal.
 //!   WHICH terminal it is, is the `cancel_all`-then-`abort_session` race the M1-S4 NOTE further
 //!   down already records: MEASURED live (M1-S9a Task 12), the actor's `biased` `abort` arm wins,
 //!   so the client sees `PROTOCOL{NonRetryable}` ("transaction is no longer active") rather than
 //!   the `TxDeadline{Retryable}` the `cancel` arm would mint — safe in the §19.3 direction (a
 //!   NonRetryable never licenses a replay, and it is never `Indeterminate`), and deliberately not
 //!   arbitrated here.
-//!   `serve`'s `abort_all` past `drain_deadline + SESSION_DRAIN_GRACE` survives ONLY as a backstop
-//!   for a session whose own cleanup overruns — it is no longer the mechanism.
+//!   `serve`'s `abort_all` past `drain_deadline + serve::session_drain_grace(config)` survives ONLY
+//!   as a backstop for a session whose own cleanup overruns — it is no longer the mechanism, and
+//!   that grace is DERIVED from this cleanup's budgets so it can never fire inside them again.
 //!
 //! The window deadline is its own `sleep_until` arm rather than a check inside the 1s liveness
 //! tick: the tick's granularity would smear the close over `[deadline, deadline + LIVENESS_TICK]`,
@@ -269,7 +275,7 @@ impl Session {
     /// (M1-S9a: a standalone session also mints its OWN, never-triggered [`Drain`] — this entry
     /// point has no daemon lifecycle around it to be draining.)
     pub async fn run(stream: UnixStream, config: Config, epoch: BootEpoch) {
-        let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+        let tx_registry = Arc::new(TxRegistry::new(config.request_drain_budget));
         // Its own pool registry, exactly as it already mints its own throwaway `TxRegistry`
         // (M1-S8a Task 12). The `Config`s used on this path carry no pools, so this builds an EMPTY
         // registry and dials nothing — and if one ever does carry pools, `Pool::new` is lazy, so it
@@ -720,7 +726,7 @@ impl Session {
         // already rolled back, so there is no double-apply risk either way).
         registry.cancel_all();
         tx_registry.abort_session(session_id).await;
-        drain_supervisors(&mut supervisors, config.drain_deadline).await;
+        drain_supervisors(&mut supervisors, config.request_drain_budget).await;
 
         drop(control_tx);
         let _ = writer_handle.await;
@@ -735,6 +741,15 @@ impl Session {
 /// `session::supervisor`'s doc comment) — so this bounds how long THIS session's own shutdown can
 /// be blocked by a handler that ignores the cancellation `registry.cancel_all()` already sent it;
 /// it does not guarantee a truly non-cooperative handler's task stops running.
+///
+/// **The `deadline` is `config.request_drain_budget`, and what it must dominate is not obvious:**
+/// aborting a supervisor destroys its request's ONE terminal (the supervisor is the sole sender —
+/// it sends only AFTER `handle.await` resolves, so a handler that returns one microsecond later
+/// declares into a cell nobody will ever read). Every cooperative handler answers
+/// `registry.cancel_all()` within `services::sql::CANCEL_DRAIN_BUDGET` and declares just after it,
+/// so a deadline at or below that budget converts a bounded, correct drain into a charter-rule-4
+/// loss — which is exactly what `config.drain_deadline` did here until the M1-S9a whole-branch
+/// review (5s vs 5s). See `Config::request_drain_budget`.
 async fn drain_supervisors(supervisors: &mut JoinSet<()>, deadline: Duration) {
     let wait_all = async { while supervisors.join_next().await.is_some() {} };
 

@@ -112,7 +112,7 @@ impl TestServer {
         // Wrap the plain `HandlerFn` as a session-agnostic factory + mint a throwaway `TxRegistry`
         // (S6 seam): these scripted-handler tests never open a transaction, so `abort_session` at
         // cleanup is a no-op and behaviour is identical to the pre-seam harness.
-        let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+        let tx_registry = Arc::new(TxRegistry::new(config.request_drain_budget));
         // These scripted-handler tests configure no pools and none of them reads `HelloAck.pools`,
         // so an EMPTY registry built from their own `Config` is the faithful shape (M1-S8a Task 12).
         let pool_registry = PoolRegistry::build(&config);
@@ -270,7 +270,7 @@ pub fn spawn_one_session_with_config(
     };
     let listener = ferrod::listener::bind_uds(&config).expect("bind_uds in test harness");
     // Wrap the plain `HandlerFn` as a session-agnostic factory + a throwaway `TxRegistry` (S6 seam).
-    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let tx_registry = Arc::new(TxRegistry::new(config.request_drain_budget));
     // Pool-less by construction (these `Config`s declare none), so an empty registry (M1-S8a).
     let pool_registry = PoolRegistry::build(&config);
     let factory: HandlerFactory = Arc::new(move |_sid| handler.clone());
@@ -322,7 +322,7 @@ pub fn spawn_serve_with_config(
     };
     let listener = ferrod::listener::bind_uds(&config).expect("bind_uds in test harness");
     // Wrap the plain `HandlerFn` as a session-agnostic factory + a throwaway `TxRegistry` (S6 seam).
-    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let tx_registry = Arc::new(TxRegistry::new(config.request_drain_budget));
     // Pool-less by construction (these `Config`s declare none), so an empty registry (M1-S8a).
     let pool_registry = PoolRegistry::build(&config);
     let factory: HandlerFactory = Arc::new(move |_sid| handler.clone());
@@ -630,7 +630,7 @@ pub fn exec_server(url: String) -> TestServer {
         ..Config::default()
     };
     let registry = PoolRegistry::build(&config);
-    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let tx_registry = Arc::new(TxRegistry::new(config.request_drain_budget));
     let factory = sql::make_handler(
         registry.clone(),
         tx_registry.clone(),
@@ -668,7 +668,7 @@ pub fn pools_server(pools: &[(&str, &str)]) -> (TestServer, Arc<PoolRegistry>) {
         ..Config::default()
     };
     let registry = PoolRegistry::build(&config);
-    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let tx_registry = Arc::new(TxRegistry::new(config.request_drain_budget));
     let factory = sql::make_handler(
         registry.clone(),
         tx_registry.clone(),
@@ -710,7 +710,7 @@ pub fn stream_server(url: String, credit_frames: u32) -> TestServer {
         ..Config::default()
     };
     let registry = PoolRegistry::build(&config);
-    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let tx_registry = Arc::new(TxRegistry::new(config.request_drain_budget));
     let factory = sql::make_handler(
         registry.clone(),
         tx_registry.clone(),

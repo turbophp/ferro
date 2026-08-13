@@ -31,6 +31,38 @@ const DEFAULT_MAX_INFLIGHT: usize = 1024;
 /// Default deadline for a graceful (SIGTERM) drain before hard-closing remaining sessions.
 const DEFAULT_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Headroom [`DEFAULT_REQUEST_DRAIN_BUDGET`] adds on top of the terminal-DECLARATION budget it
+/// backstops. It buys the scheduling + fate-classification + `Responder`/supervisor hops that run
+/// AFTER `services::sql::CANCEL_DRAIN_BUDGET` expires — microseconds of work, but they land strictly
+/// after that bound, which is precisely why an EQUAL budget loses the race every time (M1-S9a
+/// whole-branch review; see [`Config::request_drain_budget`]).
+const REQUEST_DRAIN_HEADROOM: Duration = Duration::from_secs(1);
+
+/// Default bound on each stage of a session's post-drain-deadline cleanup — see
+/// [`Config::request_drain_budget`] for what it bounds and why it is NOT derived from
+/// [`DEFAULT_DRAIN_DEADLINE`].
+///
+/// DERIVED, never a literal: a backstop is only a backstop if it DOMINATES the mechanism it backs,
+/// and the mechanism here is `services::sql::CANCEL_DRAIN_BUDGET` — the bound within which every
+/// in-flight request declares its ONE terminal after the cleanup's `registry.cancel_all()`
+/// (`run_autocommit_exec`'s Interrupted arm, the tx actor's Deadline/Abort arms, `abort_stream`).
+const DEFAULT_REQUEST_DRAIN_BUDGET: Duration =
+    crate::services::sql::CANCEL_DRAIN_BUDGET.saturating_add(REQUEST_DRAIN_HEADROOM);
+
+/// THE relationship, enforced by the compiler (M1-S9a whole-branch review, `wb-bounds`): the
+/// session's own cleanup backstop must be STRICTLY greater than the terminal-declaration budget it
+/// backstops. Raise `services::sql::CANCEL_DRAIN_BUDGET` past this and the BUILD breaks here, rather
+/// than the daemon silently going back to destroying terminals on every SIGTERM that catches a
+/// wedged backend. `serve`'s own backstop is guarded one level up BY CONSTRUCTION
+/// ([`crate::serve::session_drain_grace`] is computed from [`Config::session_cleanup_bound`]) plus
+/// `serve`'s unit tests.
+const _: () = assert!(
+    DEFAULT_REQUEST_DRAIN_BUDGET.as_nanos() > crate::services::sql::CANCEL_DRAIN_BUDGET.as_nanos(),
+    "the per-request drain budget must STRICTLY dominate the terminal-declaration budget it \
+     backstops (services::sql::CANCEL_DRAIN_BUDGET): a backstop that ties with, or undercuts, the \
+     mechanism it backs destroys the very terminal that mechanism exists to deliver"
+);
+
 /// Default deadline for the mandatory first frame (`core/HELLO`) to arrive on a newly accepted
 /// connection. Without this bound, a peer that passes the `SO_PEERCRED` gate and then simply
 /// never sends anything pins an fd, a session task, and a writer task forever — a slowloris /
@@ -288,11 +320,45 @@ pub struct Config {
     /// their pooled connections released, the writer flushes — and only then closes the socket.
     ///
     /// It is therefore NOT the daemon's total stop time any more: `serve` hard-aborts whatever is
-    /// still outstanding one [`crate::serve::SESSION_DRAIN_GRACE`] LATER, so the worst case is
-    /// `drain_deadline + SESSION_DRAIN_GRACE`. That grace is not slack — aborting at bare
+    /// still outstanding one [`crate::serve::session_drain_grace`] LATER, so the worst case is
+    /// `drain_deadline + session_drain_grace(self)`. That grace is not slack — aborting at bare
     /// `drain_deadline` would cut a session off mid-cleanup and destroy terminals the client is
-    /// owed (measured; charter rule 4). Size §18's `TimeoutStopSec` against the SUM.
+    /// owed (measured; charter rule 4). Size §18's `TimeoutStopSec` against the SUM, which
+    /// [`Config::worst_case_stop`] computes.
+    ///
+    /// It bounds ONLY the window. Since the M1-S9a whole-branch review it no longer doubles as the
+    /// bound on the cleanup that follows the window — that is [`Config::request_drain_budget`],
+    /// which is why raising this knob no longer inflates the daemon's stop ceiling by three times
+    /// its own value.
     pub drain_deadline: Duration,
+    /// Bound on EACH stage of a session's post-`drain_deadline` cleanup: the transaction abort wait
+    /// (`TxRegistry::abort_session`, wired from here) and then the per-request supervisor drain
+    /// (`session::drain_supervisors`). Not env-settable and deliberately not derived from
+    /// [`Config::drain_deadline`] (see below); tests inject a small value to keep the two hard-close
+    /// guards fast.
+    ///
+    /// **It is a BACKSTOP over the terminal-declaration budget, and must dominate it.** At the drain
+    /// deadline the session fires `registry.cancel_all()`; every in-flight request then answers that
+    /// cancellation by draining the backend under `services::sql::CANCEL_DRAIN_BUDGET` and declaring
+    /// its ONE terminal only after that bound expires. The supervisor is the SOLE sender of that
+    /// terminal (`session::supervisor`), so a `drain_supervisors` deadline that expires first
+    /// `abort_all`s the sender and the client gets EOF with no terminal — charter rule 4, broken by
+    /// arithmetic. Before this review the stage bound was `drain_deadline`, i.e. 5 s against a 5 s
+    /// declaration budget: a tie the declaration loses every time, since the classification and the
+    /// `Responder`/supervisor hops all run strictly AFTER the drain bound expires.
+    ///
+    /// The default is therefore `CANCEL_DRAIN_BUDGET + REQUEST_DRAIN_HEADROOM`, checked at COMPILE
+    /// time (see the `const _` assertion above), and deriving it from `drain_deadline` would be
+    /// wrong in both directions: a test's 100 ms window would silently re-create the destroy-the-
+    /// terminal case, and an operator's 60 s window would push the stop ceiling past systemd's 90 s
+    /// `DefaultTimeoutStopSec`.
+    ///
+    /// What it does NOT need to cover: the actor's teardown ROLLBACK (`tx_teardown_timeout`). That
+    /// runs AFTER the actor has already replied/dropped the reply (`tx::actor`'s Deadline/Abort
+    /// arms `break 'actor` into `teardown`), so cutting the abort wait short cannot lose a terminal —
+    /// the actor finishes detached, and a transaction that dies with the process is rolled back
+    /// server-side when its socket closes.
+    pub request_drain_budget: Duration,
     /// Deadline for the mandatory first frame (`core/HELLO`) to arrive before the connection is
     /// dropped silently (no reply — there was never a valid session to fail).
     pub handshake_timeout: Duration,
@@ -364,6 +430,7 @@ impl Default for Config {
             session_cap_bytes: DEFAULT_SESSION_CAP_BYTES,
             max_inflight: DEFAULT_MAX_INFLIGHT,
             drain_deadline: DEFAULT_DRAIN_DEADLINE,
+            request_drain_budget: DEFAULT_REQUEST_DRAIN_BUDGET,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             idle_in_tx: DEFAULT_IDLE_IN_TX,
             max_tx: DEFAULT_MAX_TX,
@@ -413,6 +480,30 @@ impl Config {
         } else {
             self.peer_allow_uids.contains(&uid)
         }
+    }
+
+    /// Ceiling on ONE session's post-`drain_deadline` cleanup — the quantity
+    /// [`crate::serve::session_drain_grace`] must dominate, expressed once, here, so the two cannot
+    /// drift.
+    ///
+    /// The cleanup is two SEQUENTIAL bounded stages (`session::mod`'s shutdown block), each bounded
+    /// by [`Config::request_drain_budget`]: `tx_registry.abort_session()` then `drain_supervisors()`.
+    /// Hence twice the budget. It is a ceiling, not an expectation: the healthy path runs both
+    /// stages in milliseconds, and even the wedged-backend path normally spends the budget in ONE of
+    /// them (a terminal declared at `CANCEL_DRAIN_BUDGET` is already waiting when the second stage
+    /// starts). The writer flush that follows is NOT included — it is unbounded by construction
+    /// against a handler that never releases its `Responder`, and killing exactly that case is what
+    /// `serve`'s backstop is FOR.
+    pub fn session_cleanup_bound(&self) -> Duration {
+        self.request_drain_budget.saturating_mul(2)
+    }
+
+    /// The daemon's worst-case stop time after SIGTERM: the drain window, plus the session cleanup
+    /// backstop that follows it. This is the number §18's `TimeoutStopSec` must exceed — quoted from
+    /// the code so an operator's unit file and the daemon cannot disagree.
+    pub fn worst_case_stop(&self) -> Duration {
+        self.drain_deadline
+            .saturating_add(crate::serve::session_drain_grace(self))
     }
 
     /// Fail-fast validation of the large-row invariant (M1-S5, see the module doc): both

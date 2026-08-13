@@ -62,7 +62,7 @@ fn exec_server_with_deadlines(url: String, idle_in_tx: Duration, max_tx: Duratio
         ..Config::default()
     };
     let registry = PoolRegistry::build(&config);
-    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let tx_registry = Arc::new(TxRegistry::new(config.request_drain_budget));
     let factory = sql::make_handler(
         registry.clone(),
         tx_registry.clone(),

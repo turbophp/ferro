@@ -61,7 +61,7 @@ async fn main() -> Result<(), BoxErr> {
         ..Config::default()
     };
     let registry = PoolRegistry::build(&config);
-    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let tx_registry = Arc::new(TxRegistry::new(config.request_drain_budget));
     // ONE `Drain`, minted BEFORE the handler and shared by `serve`, every session, and the SQL/TX
     // service's new-work refusal — exactly as `main` wires it (M1-S9a finding 6).
     let drain = Drain::new();

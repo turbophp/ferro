@@ -26,7 +26,7 @@ use ferro_proto::header::Header;
 use ferro_proto::messages::{Outcome, Pong};
 use ferrod::config::Config;
 use ferrod::epoch::BootEpoch;
-use ferrod::serve::SESSION_DRAIN_GRACE;
+use ferrod::serve::session_drain_grace;
 use ferrod::session::HandlerFn;
 use ferrod::session::codec::{ControlMsg, InFrame, OutFrame};
 use ferrod::session::flow::Credit;
@@ -896,6 +896,11 @@ async fn disconnect_with_stuck_handler_hard_closes() {
         drain_deadline: Duration::from_millis(100),
         ..Config::default()
     };
+    // The grace is DERIVED from this config (see `serve::session_drain_grace`), so capture the
+    // bound BEFORE `config` is moved into the server — stating it from the contract rather than
+    // duplicating a literal is the whole point of the accessor being `pub`.
+    let hard_close_bound =
+        Duration::from_millis(100) + session_drain_grace(&config) + Duration::from_secs(2);
     let (socket_path, served) =
         common::spawn_serve_with_config(config, BootEpoch(1), drain.clone(), handler);
 
@@ -913,14 +918,11 @@ async fn disconnect_with_stuck_handler_hard_closes() {
     // Even with a stuck handler AND a client that already vanished mid-request, `serve` must
     // still return rather than hang forever. Bounded by the CONTRACT: since M1-S9a the sessions
     // own the `drain_deadline` (100ms here) wind-down and `serve`'s hard-abort is the backstop one
-    // `SESSION_DRAIN_GRACE` later (see `serve::SESSION_DRAIN_GRACE` — that grace is what keeps the
+    // `session_drain_grace(config)` later (see `serve::session_drain_grace` — that grace is what keeps the
     // abort from racing a session's own cleanup and destroying its terminals). Only the BOUND
     // moved; the assertion is unchanged.
-    tokio::time::timeout(
-        Duration::from_millis(100) + SESSION_DRAIN_GRACE + Duration::from_secs(2),
-        served,
-    )
-    .await
-    .expect("serve must return even after a mid-request disconnect with a stuck handler")
-    .expect("serve's task must not panic");
+    tokio::time::timeout(hard_close_bound, served)
+        .await
+        .expect("serve must return even after a mid-request disconnect with a stuck handler")
+        .expect("serve's task must not panic");
 }
