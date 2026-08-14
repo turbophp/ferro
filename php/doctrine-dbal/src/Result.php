@@ -354,10 +354,39 @@ final class Result implements ResultInterface
         return FetchUtils::fetchAllAssociative($this);
     }
 
-    /** @return list<mixed> */
+    /**
+     * NOT `FetchUtils::fetchFirstColumn()`, and this is a CORRECTNESS override rather than a
+     * preference.
+     *
+     * Upstream is `while (($v = $result->fetchOne()) !== false) { $rows[] = $v; }`, and
+     * `fetchOne()` returns `$row[0]` — so a first column holding a real PHP `false` is
+     * INDISTINGUISHABLE from end-of-result and the loop stops early. Every bundled driver escapes
+     * this only because PDO hands booleans back as strings (`'f'`, `'0'`), never as `bool`. Ferro
+     * decodes `TAG_BOOL` to a real `bool` (§9), which is better typing and is precisely what
+     * exposes the upstream conflation.
+     *
+     * MEASURED before the fix, on this class: `[[true],[false],[true]]` returned `[true]` — one
+     * value where three were asked for — and `[[false],[true]]` returned `[]`. Silent wrong
+     * answers, never an exception. Reachable from `SELECT <bool col> FROM …` through
+     * `fetchFirstColumn()` and through ORM's `getSingleColumnResult()`; found by the first-ever
+     * Doctrine ORM functional-suite run (upstream's GH9230), which is the only suite in either
+     * tier that puts a boolean in column 0.
+     *
+     * `fetchNumeric()` is unambiguous — it returns `false` ONLY at end-of-result, because a row is
+     * always an array — so iterating it distinguishes the two answers `fetchOne()` cannot. The NULL
+     * case that {@see fetchOne}'s docblock reasons about is unaffected and still correct; `null` is
+     * not `false`, and it was never the failing shape.
+     *
+     * @return list<mixed>
+     */
     public function fetchFirstColumn(): array
     {
-        return FetchUtils::fetchFirstColumn($this);
+        $out = [];
+        while (($row = $this->fetchNumeric()) !== false) {
+            $out[] = $row[0] ?? null;
+        }
+
+        return $out;
     }
 
     /**
