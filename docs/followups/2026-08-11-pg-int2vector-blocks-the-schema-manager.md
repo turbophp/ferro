@@ -1,5 +1,14 @@
 # Follow-up: one missing PG catalog type (`int2vector`) blocks the whole stock schema manager
 
+> **RESOLVED (M1-S8c)** by the §9.1 PostgreSQL TEXT FALLBACK (decision D-S8b-6, SPEC §22.2
+> (ae)/(af)): a column OID outside the canonical 14 now reads as `TAG_TEXT` carrying PostgreSQL's
+> own `typoutput` rendering — byte-for-byte what libpq returns — which is exactly what
+> `pg_index.indkey` needed. Guarded by `engine/crates/ferro-backend-pg/tests/pg_text_fallback_it.rs`.
+> That ONE commit moved the DBAL acceptance subset from **296 to 364 passing** on PostgreSQL
+> (`docs/dbal-suite/2026-08-11-s8c-results.md`, the bisect table), and `doctrine/migrations` now runs
+> end to end (`testkit/migrations-e2e.sh`). Everything below is the pre-fix analysis, kept for the
+> record.
+
 **Found:** M1-S8b Task 14, by the upstream `doctrine/dbal 4.4.4` functional subset — 50 of the 78
 non-passing PostgreSQL tests, all with the same root cause.
 **Belongs to:** `ferro-backend-pg`'s read path / SPEC §9 type coverage. **Not** a driver defect: the

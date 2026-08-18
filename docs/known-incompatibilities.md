@@ -6,9 +6,12 @@ Grammar/Processor, the DBAL platforms and the stock schema managers untouched. T
 where a real application can still notice the difference. Each one is a deliberate consequence of the
 engine's model — a per-host daemon that pools upstream connections in **transaction mode** and holds
 the only database credentials — not a defect waiting to be fixed quietly. Every entry below was
-MEASURED during M1-S8b; the acceptance numbers behind them are in
+MEASURED, never inferred; the acceptance numbers behind them are in
 [`docs/dbal-suite/2026-08-11-results.md`](dbal-suite/2026-08-11-results.md), re-measured after the
-compatibility pass in [`2026-08-11-s8c-results.md`](dbal-suite/2026-08-11-s8c-results.md).
+compatibility pass in [`2026-08-11-s8c-results.md`](dbal-suite/2026-08-11-s8c-results.md), and — for
+the **Doctrine ORM** section — in
+[`docs/orm-suite/2026-08-13-results.md`](orm-suite/2026-08-13-results.md) (M1-S9, the first ORM-suite
+run on any backend).
 
 > **`wrapperClass` is in that list on purpose: it is REQUIRED, not a refinement.** Omit
 > `'wrapperClass' => Ferro\DBAL\Wrapper\FerroConnection::class` and an indeterminate write inside
@@ -241,20 +244,18 @@ and that is worth knowing before an incident rather than during one.
 - **Doctrine ORM + PostgreSQL + the default IDENTITY strategy cannot insert.**
   `Doctrine\ORM\Id\IdentityGenerator::generateId()` is `(int) $conn->lastInsertId()`, and DBAL 4
   defaults PostgreSQL to `GENERATOR_TYPE_IDENTITY`. Configure the **SEQUENCE** strategy for the
-  PostgreSQL platform through the ORM's `Configuration::setIdentityGenerationPreferences()`, keyed on
-  `Doctrine\DBAL\Platforms\PostgreSQLPlatform::class`. (The exact constant for the strategy is ORM's
-  own and is not restated here: `doctrine/orm` is not a dependency of this repository, so nothing in
-  this file has been verified against it. The mechanism, and the reason it is needed, are what this
-  entry is asserting.)
+  PostgreSQL platform through the ORM's `Configuration::setIdentityGenerationPreferences()`.
 
   **Drop-in is config-only for DBAL, and is explicitly NOT config-only for ORM on PostgreSQL.** The
   engine's pooling model is not bent to fit an ORM default; the honest one-line configuration is.
+  The exact line, the measured cost of omitting it (**1229 of 3485 ORM tests error**), and the trap
+  that a per-platform preference cannot override an entity which hard-codes `strategy: 'IDENTITY'`
+  are under **Doctrine ORM** below — all three measured at the M1-S9 acceptance gate.
 - **ORM multi-table DELETE/UPDATE on class-table inheritance needs an explicit transaction.**
   `MultiTableDeleteExecutor` issues `CREATE TEMPORARY TABLE`, `INSERT`, `DELETE` and `DROP` as four
   separate statements with no transaction; on a transaction-mode pool statements 2-4 land on
-  different connections. Wrap the query in `$conn->transactional(…)`. (Read from `doctrine/orm 3`
-  during M1-S8b research; like the entry above, it has **not** been re-verified at the acceptance
-  gate, because the ORM suite is not run — see `docs/dbal-suite/2026-08-11-results.md`.)
+  different connections. Wrap the query in `$conn->transactional(…)`. Written from a reading of
+  `doctrine/orm 3` during M1-S8b research and **since MEASURED both ways** — see **Doctrine ORM**.
 
 ---
 
@@ -366,6 +367,22 @@ dispatch, so it is treated as if it had committed. That direction is chosen on p
 `Indeterminate` costs you a reconciliation you did not need, while the opposite mistake silently
 double-applies a write.
 
+**The one gap in it: if `ferrod` itself dies, this protection dies with it.** The engine's knowledge
+that part of your transaction has already committed is state inside the daemon, and no field on the
+wire carries it to your process. So when the daemon is killed or crashes mid-transaction — as
+opposed to the *backend* connection failing, where the daemon survives to classify — your
+application catches a plain connection error (`Ferro\Client\Error\TransportException`), **not**
+`IndeterminateWriteException`, and that reads as "nothing in that transaction survived". Measured on
+MySQL 8.4, killing `ferrod` with `SIGKILL` while a post-DDL `INSERT` was in flight: the pre-DDL row
+was **still there** afterwards, with no `COMMIT` ever sent, and the in-flight row was not.
+
+**What to do about it:** the advice above does not change — after ANY failure inside a MySQL
+transaction that has run an implicitly-committing statement, reconcile rather than retry. A
+retry-the-whole-transaction wrapper is the thing that double-applies here, and a connection error is
+not a licence to use one. The engine-side fix needs a protocol change and is filed at
+[`docs/followups/2026-08-13-client-side-implicit-commit-daemon-death.md`](followups/2026-08-13-client-side-implicit-commit-daemon-death.md);
+the behaviour is pinned by a live test so it cannot change silently.
+
 ---
 
 ## Values
@@ -436,6 +453,115 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   with every existence check made by `psql` inside the container.
 - **The application user has no `CREATE DATABASE` privilege** in the testkit, deliberately. Anything
   that provisions databases needs its own credentials.
+
+---
+
+## Doctrine ORM
+
+Ferro is a **DBAL** driver; the ORM sits on top of it unmodified. As of M1-S9 the Doctrine ORM 3.6.8
+functional suite has been run against Ferro on all three backends — the first time ever — and the
+numbers, the harness and the full per-test triage are in
+[`docs/orm-suite/2026-08-13-results.md`](orm-suite/2026-08-13-results.md). Read that file if you are
+deciding whether to adopt; read this section for what to DO about the differences.
+
+Of 3485 tests: PostgreSQL 3381 pass, MySQL 3416, MariaDB 3414. The four items below are what the
+non-passing tests are made of, and every one of them is a consequence of the engine's model rather
+than a defect queued for a quiet fix.
+
+- **Multi-table DQL bulk `UPDATE`/`DELETE` on JOINED (class-table) inheritance needs an explicit
+  transaction.** This is the one that will hit a real application, and it is the *entire*
+  Ferro-attributable difference on MySQL and MariaDB.
+
+  `MultiTableDeleteExecutor::execute()` — and its UPDATE twin — issues `CREATE TEMPORARY TABLE`,
+  then the INSERT, the DELETE and the DROP as **four separate `executeStatement()` calls with no
+  transaction around them**. On a transaction-mode pool each autocommit statement may land on a
+  different backend connection, so the temporary table the first statement created is invisible to
+  the second. What your application catches is a `Doctrine\DBAL\Exception\TableNotFoundException`
+  — *"An exception occurred while executing a query: table "company_persons_id_tmp" does not exist"*
+  (SQLSTATE `42P01`) on PostgreSQL, or `Unknown table '…'` (errno 1051) on MySQL/MariaDB.
+
+  **This is identical to what pgbouncer's transaction mode does to the same ORM code**, and for the
+  same reason. It is not a Ferro bug and there is nothing to configure away: a temporary table is
+  session state, and the pool's job is to not let session state leak between tenants.
+
+  **Workaround — measured, not inferred.** Wrap the bulk query in one explicit transaction, which
+  pins a single backend connection for its duration:
+
+  ```php
+  $em->wrapInTransaction(static function ($em): void {
+      $em->createQuery('DELETE FROM App\Entity\Person p WHERE p.id > 100')->execute();
+  });
+  ```
+
+  (or `$conn->transactional(…)` if you are below the ORM.)
+
+  The same statement sequence was run both ways through `ferro/client` at the acceptance gate:
+  autocommit fails with `relation "…" does not exist`, and inside one transaction it succeeds. If
+  you cannot wrap it, restructure the query so the ORM does not choose the multi-table executor
+  (delete by the root table's own criteria, or issue the DML yourself).
+
+- **On PostgreSQL, the ORM needs the SEQUENCE identity strategy — and your entities must not
+  hard-code IDENTITY.** `Doctrine\ORM\Id\IdentityGenerator::generateId()` is
+  `(int) $conn->lastInsertId()`, PostgreSQL reports no generated key on the wire, and Ferro refuses
+  to emulate it (see **Identity and keys**). DBAL 4 defaults PostgreSQL to IDENTITY, so an
+  unconfigured ORM application cannot insert at all.
+
+  **The measured cost of not configuring it: 1229 of 3485 tests error — about 35 % of the suite.**
+
+  One line, on the ORM `Configuration`:
+
+  ```php
+  $config->setIdentityGenerationPreferences([
+      Doctrine\DBAL\Platforms\PostgreSQLPlatform::class
+          => Doctrine\ORM\Mapping\ClassMetadata::GENERATOR_TYPE_SEQUENCE,
+  ]);
+  ```
+
+  **A per-platform preference does not override an entity that names a strategy explicitly.** Ten of
+  the suite's remaining PostgreSQL errors are exactly this: fixtures carrying
+  `#[GeneratedValue(strategy: 'IDENTITY')]`. In your own code, write `strategy: 'AUTO'` (or leave it
+  off) and let the preference decide, or name `SEQUENCE` on PostgreSQL entities directly.
+
+  This is decision **D-S8b-5**, and it is the reason the drop-in claim is stated as *config-only for
+  DBAL, and explicitly NOT config-only for ORM on PostgreSQL*.
+
+- **DQL `DATE_ADD`/`DATE_SUB` on PostgreSQL return a value Ferro refuses to read.** Those functions
+  produce a microsecond `timestamptz`, and a sub-second `TIMESTAMPTZ` is refused rather than
+  truncated (**Values**, and the same rule that refuses what PDO corrupts). 16 of the suite's
+  PostgreSQL tests are this one cluster.
+
+  Stock `pdo_pgsql` passes them **not because it is more careful but because the value never reaches
+  Doctrine's type layer**: a DQL function expression has no type mapping, so PDO hands the
+  application a raw string and the caller parses it. Doctrine's own `DateTimeTzType` would throw on
+  the same value. Ferro's engine knows the column's type, so the driver refuses at a point stock
+  never reaches.
+
+  **Workaround:** the refusal is on the READ path — it fires when the value comes back in a row — so
+  using `DATE_ADD(…)`/`DATE_SUB(…)` inside a `WHERE` or `HAVING` comparison, which is the common
+  case, is unaffected. If you need the computed instant returned, either register a custom DQL
+  function that truncates it (`date_trunc('second', …)`) or renders it as text (`::text`), or drop
+  to native SQL with the same cast; `DATE_TRUNC` is not a stock DQL function. Whether to relax the
+  refusal is an open policy decision, filed at
+  [`docs/followups/2026-08-13-orm-timestamptz-subsecond-read-refusal.md`](followups/2026-08-13-orm-timestamptz-subsecond-read-refusal.md).
+
+- **A few PostgreSQL bind directions are narrower than libpq**, and ordinary ORM shapes reach them:
+  a PHP float bound into a `NUMERIC` column, an integer into `DOUBLE PRECISION`, a string into
+  `SMALLINT`. 10 tests. The refusals are loud and non-retryable — never a wrong value — and the
+  workaround is to bind the declared type (`Types::DECIMAL` for a decimal field) or cast in SQL.
+  Filed, with a milestone assignment, at
+  [`docs/followups/2026-08-11-pg-bind-matrix-narrower-than-libpq.md`](followups/2026-08-11-pg-bind-matrix-narrower-than-libpq.md).
+
+**`wrapperClass` is required for the ORM exactly as it is for DBAL** — the ORM takes the DBAL
+connection you hand it, so configure `'wrapperClass' => Ferro\DBAL\Wrapper\FerroConnection::class`
+in the connection parameters as usual. An application that already needs a different wrapper
+composes `Ferro\DBAL\Wrapper\IndeterminateSafeTransactional` into it (see **Transactions and session
+state**).
+
+**What that measurement does NOT cover**, so nobody reads "3485 tests" as parity: the second-level
+cache job is not run, upstream's `performance` and `locking_functional` groups are excluded (as
+upstream's own CI excludes them), and five PostgreSQL errors are collateral from an upstream test
+teardown that is gated on DBAL 3 — a test-harness artifact with no application-facing action. All of
+it is itemised in the results document.
 
 ---
 

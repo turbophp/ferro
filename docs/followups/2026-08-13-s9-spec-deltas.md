@@ -179,3 +179,90 @@ runner-discipline wording, "a non-recordable run may not overwrite a recorded ru
 belongs beside "a non-recordable run may not compare or update the baseline".
 
 **No `/proto` change, no engine change, no `php/*/src` change in this task.**
+
+### Task 5
+
+**Everything below is FILED and MEASURED; Task 6 cites it, it does not need to re-derive it.**
+
+**1. The two follow-ups §22.2 (ap)/(aq) must cite BY PATH.**
+
+- `docs/followups/2026-08-13-orm-timestamptz-subsecond-read-refusal.md` — the 16-test PostgreSQL
+  cluster. **Category (b), a §22.2 (ab) POLICY decision, assignment M2-entry.** The sentence §14 or
+  §22.2 should carry is the INVERSION, because the obvious reading is backwards: *stock `pdo_pgsql`
+  does not pass these because it is more careful — it passes because the value never reaches
+  Doctrine's type layer at all.* `DateTimeTzType` would throw on the same microsecond value; a DQL
+  function expression has no type mapping, so PDO hands back a raw string. Ferro's engine knows the
+  column OID, so the driver refuses at a point stock never reaches. Two facts in the file that the
+  ORM run does not show: a NAIVE `TIMESTAMP` keeps its microseconds (`DateTimeType` has a fallback,
+  `DateTimeTzType` has none), and the refusal has **no backend branch**, so a MySQL `TIMESTAMP(6)`
+  column is refused by the same rule — that reach is code-derived, **not live-measured**, and is
+  labelled as such in the file. Do not promote it to a measured claim in the spec.
+- `docs/followups/2026-08-13-client-side-implicit-commit-daemon-death.md` — Task 3 cell 2b's
+  residual, with the measurement: on MySQL 8.4, `BEGIN` → `INSERT k1` → `CREATE TABLE` (implicit
+  commit) → `INSERT k2` + SIGKILL of `ferrod` leaves **`k1` durable (`count = 1`) with no COMMIT
+  ever sent**, `k2` absent, and the client throwing `TransportException :: unexpected EOF after 0 of
+  16 bytes` — connection-shaped, **NOT** `Indeterminate`.
+
+**2. A `/proto` DEFERRED CANDIDATE, to be recorded by Task 6 and NOT hand-rolled (charter rule 2):**
+a **per-statement `tx_writes_persisted` flag on the in-transaction EXEC terminal**, letting the
+client latch what the engine latches, from a signal it is GIVEN rather than one it infers — which is
+the only shape charter rule 6 permits at the client tier. The follow-up carries three open design
+questions (which terminals carry it; what a client does with it across a `boot_epoch` change;
+whether the stream terminal needs it too). **Milestone: with the next `/proto`-touching slice**,
+batched with the two candidates this milestone has already deferred — `affected` on the stream
+terminal and a `TxNotFound` code — because one `/proto` change costs the registry, the golden
+vectors and BOTH codecs in one change set.
+
+**3. §19.3's residual note (or wherever the implicit-commit rule is stated) needs the DAEMON-death
+carve-out.** M1-S9a's fix is correct and complete *while the daemon lives*; the latch is engine-side
+pool state and dies with the process, so the client reports a plain connection error for a
+transaction whose prefix is already durable. This is a KNOWN, PINNED residual, not a regression.
+
+**4. Follow-up ledger hygiene — four files re-headed, so anything citing them by path now reads the
+truth.** Every claim was verified against code/artifacts before it was stamped:
+- `2026-08-11-i64-above-2e32-unreadable-in-php-client.md` → **RESOLVED (M1-S8c)**; the title names
+  the symptom, the defect was the whole `0xcf` unsigned family, not a 2^32 boundary.
+- `2026-08-11-pg-int2vector-blocks-the-schema-manager.md` → **RESOLVED (M1-S8c)** by D-S8b-6's TEXT
+  FALLBACK; that one commit moved the PG DBAL subset **296 → 364 passing**.
+- `2026-08-10-s8b-nil-server-version-decision.md` → headline `DECISION REQUIRED` REPLACED with
+  **DECIDED (D-S8b-1)**; its own closing demand (a live test against a pool whose backend is down) is
+  MET by `tests/Live/ServerVersionLiveTest.php`. **The PATH is unchanged**, so §14's citation still
+  resolves.
+- `2026-08-11-pg-bind-matrix-narrower-than-libpq.md` → **PARTIALLY RESOLVED (M1-S8c) / REOPENED
+  (M1-S9)** with a full new section: `F64 → numeric` (7), `I64 → float8` (2), `TEXT → int2` (1),
+  minimal repros, **M2-entry**. One judgement recorded there that §22.2 (ap) should not flatten:
+  `F64 → numeric` is NOT the same shape as the closed `I64 → text` case — a binary float carries no
+  display scale, so widening it means deciding what `0.1` means in a `NUMERIC(10,2)` slot, which is
+  the coercion class §9.1 exists to refuse.
+
+**5. `docs/known-incompatibilities.md` now has a `## Doctrine ORM` section** (four operator-facing
+entries: the §7.4 multi-table-DQL temp-table semantic with its MEASURED transaction workaround and
+the pgbouncer comparison; D-S8b-5's SEQUENCE preference with the **1229 of 3485** number *and* the
+trap that a per-platform preference cannot override an entity hard-coding `strategy: 'IDENTITY'`;
+the `TIMESTAMPTZ` cluster; the bind-matrix cluster), and the implicit-commit section gained the
+daemon-death case. **Two now-FALSE sentences in that file were repaired rather than left to
+contradict the new section** — the two `## Identity and keys` ORM bullets each said the claim "has
+not been re-verified at the acceptance gate, because the ORM suite is not run", and the file's
+opening said "Every entry below was MEASURED during M1-S8b". §14's compat bullet can now point at
+this file for the ORM tier without qualification.
+
+**6. `testkit/migrations/cli-config.php` was missing the REQUIRED `wrapperClass`** (§22.2 (ah)) —
+in the template an operator copies, configured `all_or_nothing` + `transactional`, i.e. the exact
+shape whose failed COMMIT the wrapper protects. Added, and the template now ASSERTS its own wrapper
+and prints it, because a silently-ignored config key looks exactly like one that works.
+Mutation-proven: deleting the line fails the run at `diff #1` with the named reason (RED), restored
+green. `testkit/migrations-e2e.sh` re-run end to end: **PASS** (diff → migrate → empty diff →
+rollback, verified by `psql`), banner
+`driver=Ferro\DBAL\Driver wrapper=Ferro\DBAL\Wrapper\FerroConnection platform=PostgreSQL120Platform`.
+If §14 or §18 names the adoption keys anywhere, `wrapperClass` belongs beside `driverClass` there
+too.
+
+**7. `UPSTREAM_PR.md` needed NO change** — verified against the FORK's own symbols, not against the
+doc's prose: all four accessors are named in the drop-condition checklist
+(`transaction_status` `client.rs:293`, `parameter` `:306`, `clear_typeinfo_statement_cache` `:195`,
+per-column `Bind` result formats = `set_result_format_policy` `:322` + `Column::result_format`
+`statement.rs:119`), with the "**all four** must be present before the fork can be dropped" rule and
+the per-accessor consequence of losing each. research-residuals' "unverified" flag is settled as
+PRESENT.
+
+**No `/proto` change, no engine change, no `php/*/src` change in this task.**

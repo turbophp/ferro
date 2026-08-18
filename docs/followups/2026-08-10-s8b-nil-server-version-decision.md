@@ -1,4 +1,18 @@
-# Follow-up (DECISION REQUIRED before M1-S8b): what a DBAL driver does with `server_version: nil`
+# Follow-up: what a DBAL driver does with `server_version: nil`
+
+> **DECIDED (D-S8b-1, M1-S8b) — recorded in SPEC §14.** The recommendation below was taken:
+> **(c) then (a)**. `Ferro\DBAL\Connection::getServerVersion()` (`php/doctrine-dbal/src/Connection.php`,
+> `:631-657`) resolves in this order — the `HELLO_ACK` pool metadata, then ONE `SELECT version()`
+> over the wire, then a LOUD `Ferro\DBAL\Exception\ServerVersionUnavailable` NAMING the pool and
+> its kind. **Never a default platform**, because a wrong platform is a silently wrong SQL dialect
+> for every statement that follows. Option (b) — default to something — was refused outright, and
+> option (d) would have needed a `/proto` change (charter rule 2). The MySQL-family version string
+> is passed through UNNORMALISED, since MariaDB is detected only by that substring. Kept for the
+> record: everything below is the analysis the decision was made from. The closing demand of
+> this file — *"asserted by a live test that handshakes against a pool whose backend is down"* —
+> is met by `php/doctrine-dbal/tests/Live/ServerVersionLiveTest.php`
+> (`testAPoolWhoseBackendIsDownFailsLOUDLYAndNamesItself`, plus the `serverVersion` param
+> short-circuit).
 
 **Found:** M1-S8a Task 12 declared it as a carry; the S8a whole-branch review found the *consumer*
 half recorded nowhere durable (finding F19b).

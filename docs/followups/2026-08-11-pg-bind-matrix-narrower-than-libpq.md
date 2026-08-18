@@ -1,5 +1,16 @@
 # Follow-up: the PG bind matrix is narrower than libpq in the `I64 → text/bool` direction
 
+> **PARTIALLY RESOLVED (M1-S8c) / REOPENED (M1-S9).** The S8c widening closed the two directions
+> this file was written about — `I64 → text` and `I64 → bool`. The FIRST-EVER Doctrine ORM suite run
+> (M1-S9) then measured the directions it did not close, on ordinary stock-Doctrine shapes:
+> **`F64 → numeric` (7 tests), `I64 → float8` (2), `TEXT → int2` (1)** — 10 tests, category **(e)**
+> in `docs/orm-suite/2026-08-13-results.md`. Minimal reproductions: `[3.14]` into a `NUMERIC(10,2)`
+> column, `[2]` into `DOUBLE PRECISION`. **Milestone assignment: M2-entry.** Closing it is
+> S8c-shaped engine work on the fate-adjacent bind path and was DELIBERATELY not done at the exit
+> gate (SPEC §22.2 (ap)) — M1-S9a has not yet had its whole-branch review, and this path is
+> adjacent to it. The sections below describe the two CLOSED directions; the new rows are recorded
+> at the foot of the file.
+
 **Found:** M1-S8b Task 14, by the upstream `doctrine/dbal 4.4.4` functional subset — 16 PostgreSQL
 tests.
 **Belongs to:** `engine/crates/ferro-backend-pg/src/bind.rs`. **Not** a driver defect: the driver
@@ -59,3 +70,35 @@ into a `text` column is unambiguous.
 FERRO_DBAL_SVC=pg ./testkit/dbal-suite.sh --filter 'testDateAddSeconds'
 FERRO_DBAL_SVC=pg ./testkit/dbal-suite.sh --filter 'testIdempotentConversionToBoolean'
 ```
+
+---
+
+## REOPENED, M1-S9 — the three directions the S8c widening did not close
+
+**Found:** M1-S9 Task 4, by the first-ever `doctrine/orm 3.6.8` functional-suite run against Ferro
+(3485 tests). **10 PostgreSQL tests**, all category **(e)** — *an engine gap this run measured and
+did not close* — in `docs/orm-suite/2026-08-13-results.md`. They are LOUD refusals (`code=12298`,
+`NonRetryable`, never `Indeterminate`), so no wrong data has ever been produced by them; what they
+cost is capability, reached by SQL stock Doctrine emits on its own.
+
+| direction | tests | reached by |
+|---|---|---|
+| `canonical F64 cannot bind to PG type numeric` | 7 | an ORM `decimal` field bound from a PHP float — `Ticket\DDC1884Test` ×3, `Ticket\GH9230Test::testIssue` data sets `float=0.0`, `float=-0.0`, `float=null`, `TypeTest::testDecimal` |
+| `canonical I64 cannot bind to PG type float8` | 2 | an integer literal into a `DOUBLE PRECISION` column — `TypeValueSqlTest::testSelectDQL`, `::testTypeValueSqlWithAssociations` |
+| `canonical TEXT cannot bind to PG type int2` | 1 | a PHP string into a `SMALLINT` — `Ticket\DDC2494Test::testIssue` |
+
+Minimal reproductions (no ORM needed): bind `[3.14]` into a `NUMERIC(10,2)` column; bind `[2]` into
+a `DOUBLE PRECISION` column.
+
+**Assignment: M2-entry.** Recorded in SPEC §22.2 (ap) as a deliberate non-closure at the M1 exit
+gate, for a stated reason: widening this matrix is engine work on the **fate-adjacent bind path**,
+and M1-S9a — which rewrote the fate matrix — has not yet had its whole-branch adversarial review.
+Doing both in one slice would re-arm that caveat on the code that decides whether a lost write is
+`Indeterminate`.
+
+**The decision section above still governs**, and the new directions each need their own answer to
+it — in particular `F64 → numeric`, which is the one with a real objection: a binary float carries
+no display scale, so widening it means choosing what `0.1` means in a `NUMERIC(10,2)` slot. The
+canonical `DECIMAL` tag exists precisely so an application can say. `I64 → float8` and
+`TEXT → int2` have the same shape as the closed `I64 → text` case: PostgreSQL's own text input is
+unambiguous for both.

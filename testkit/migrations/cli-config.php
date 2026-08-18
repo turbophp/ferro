@@ -17,6 +17,7 @@ use Doctrine\Migrations\Configuration\Migration\ConfigurationArray;
 use Doctrine\Migrations\DependencyFactory;
 use Doctrine\Migrations\Provider\SchemaProvider;
 use Ferro\Client\Connection as FerroClientConnection;
+use Ferro\DBAL\Wrapper\FerroConnection;
 use Ferro\MigrationsAcceptance\TargetSchemaProvider;
 
 require_once __DIR__ . '/vendor/autoload.php';
@@ -29,6 +30,13 @@ if (!is_string($sock) || $sock === '') {
 
 $connection = DriverManager::getConnection([
     'driverClass' => Ferro\DBAL\Driver::class,
+    // REQUIRED, not a refinement (SPEC §22.2 (ah)). Without it `Doctrine\DBAL\Connection::
+    // transactional()` runs a rollBack() at nesting level 0 after a failed COMMIT and raises
+    // `NoActiveTransaction` FROM A `finally`, replacing the exception in flight — so an
+    // `IndeterminateWriteException` survives only as getPrevious(), where no catch block keys on
+    // it. This template configures `all_or_nothing` + `transactional` migrations, i.e. exactly the
+    // shape whose every DDL step runs inside that transactional() call.
+    'wrapperClass' => Ferro\DBAL\Wrapper\FerroConnection::class,
     'unix_socket' => $sock,
     'driverOptions' => ['pool' => 'default'],
 ]);
@@ -43,6 +51,19 @@ if (!$native instanceof FerroClientConnection) {
     fwrite(STDERR, "the DBAL connection is not a Ferro one: " . get_debug_type($native) . "\n");
     exit(1);
 }
+// The WRAPPER assertion, and it is not decoration: `wrapperClass` is a silent parameter — omit it
+// and DriverManager hands back a stock Doctrine\DBAL\Connection that works perfectly until the
+// first failed COMMIT, at which point transactional() destroys the write's fate (§22.2 (ah)). This
+// template is what an operator copies, so it fails LOUDLY rather than shipping the omission onward.
+if (!$connection instanceof FerroConnection) {
+    fwrite(STDERR, sprintf(
+        "the DBAL connection is a %s, not a %s — 'wrapperClass' is REQUIRED (SPEC §22.2 (ah)); "
+        . "without it transactional() masks IndeterminateWriteException.\n",
+        get_debug_type($connection),
+        FerroConnection::class,
+    ));
+    exit(1);
+}
 $probe = $connection->fetchOne('SELECT 1');
 if ((int) $probe !== 1) {
     fwrite(STDERR, "the round-trip probe did not reach a real backend\n");
@@ -51,8 +72,9 @@ if ((int) $probe !== 1) {
 fwrite(
     STDOUT,
     sprintf(
-        "[ferro] migrations: driver=%s platform=%s server=%s\n",
+        "[ferro] migrations: driver=%s wrapper=%s platform=%s server=%s\n",
         $connection->getDriver()::class,
+        $connection::class,
         $connection->getDatabasePlatform()::class,
         (string) $connection->fetchOne('SELECT version()'),
     ),

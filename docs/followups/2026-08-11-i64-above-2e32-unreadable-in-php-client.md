@@ -1,5 +1,13 @@
 # Follow-up: an `I64` at or above 2^32 is unreadable by `php/client`, on every value policy
 
+> **RESOLVED (M1-S8c).** The title names the symptom, not the defect: it was never a 2^32
+> boundary but **every non-negative integer riding msgpack's unsigned marker**, so
+> `PurePacker::be()` handed the whole `0xcf` family back as a decimal string. Fixed in
+> `php/client/src/Protocol/Msgpack/PurePacker.php` — the turnover is now `PHP_INT_MAX`
+> (`:157-201`), the fast path measured 40x quicker, and the long-open ext-vs-pure packer
+> conformance test shipped with it (`php/client/tests/Conformance/PackerConformanceTest.php`).
+> Everything below is the PRE-FIX measurement, kept for the record.
+
 **Found:** first as M1-S8b Task 7 finding F2 (journalled, not fixed — the task was the bind
 direction). **Independently re-measured at the M1-S8b Task 14 acceptance gate**, twice: by the
 upstream `Types\BigIntTypeTest::testSelectBigInt` on **all three backends**, and by a standalone
