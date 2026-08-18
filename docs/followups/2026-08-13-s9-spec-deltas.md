@@ -78,3 +78,38 @@ signalling and the cell asserts `killedAt <= caughtAt`. **The weaker form of (2)
 exited by now?" — was measured INSUFFICIENT** (the killer catches up inside the grace), and with
 the ordering assertion disabled under a slow-killer mutation, cell 1 reports
 `OK (1 test, 14 assertions)` while certifying `Indeterminate` with ferrod alive for another 0.94 s.
+
+### Task 2
+
+**§20.3 upstream-suites bullet** must name `testkit/orm-suite.sh` beside `testkit/dbal-suite.sh`,
+and must state the harness interventions BY NAME — the claim is "upstream suite, replaced test
+HARNESS, documented configuration", never more:
+1. the replacement `tests/Tests/TestUtil.php` (honours `db_driverClass`, which upstream's
+   `mapConnectionParameters()` silently DISCARDS; no-op `initializeDatabase()` because PHP holds no
+   credentials, SPEC §12/D8, and the container-side reset owns idempotence);
+2. the ONE-line re-parenting of the suite's own QueryLog wrapper
+   `Doctrine\Tests\DbalExtensions\Connection` onto `Ferro\DBAL\Wrapper\FerroConnection` — the
+   `wrapperClass` slot is single-occupancy and §22.2 (ah) makes Ferro's wrapper REQUIRED, so
+   inheritance is the only composition that keeps BOTH the query-count assertions and the
+   `transactional()` `IndeterminateWriteException` reporting;
+3. the D-S8b-5 SEQUENCE identity preference on the PostgreSQL leg
+   (`setIdentityGenerationPreferences([PostgreSQLPlatform::class => GENERATOR_TYPE_SEQUENCE])`,
+   one suite-wide `Configuration` call, no fixture patching) — the documented ORM-on-PG adoption
+   path, which upstream's own deprecation text recommends;
+4. **`COLUMNS=120` is pinned for the phpunit process.** Not cosmetic: nine
+   `ORM\Tools\Console\Command\*` tests assert Symfony Console output verbatim and Symfony wraps to
+   the terminal width, so an unpinned baseline would encode the terminal the recording agent sat in
+   (measured this task: unset -> 9 failures, 100 -> 4, 120 -> 0). It applies identically to the
+   ferro and stock legs.
+
+**§20.3 / §14 wording caution (already flagged by the plan verification):** the "(a) and (e) EMPTY"
+clause belongs to the DBAL runner only; the ORM runner is a MEASUREMENT bar — (a) empty, (e) filed
+and not blocking.
+
+**No `/proto` change and no new wire constant were needed by this task.**
+
+**Fact for §14 / the results doc:** the ORM harness's contact discipline is now three fail-closed
+assertions, not two — driver identity, wrapper ancestry, **and that the D-S8b-5 preference actually
+took effect** (upstream `configureProxies()` returns early on PHP >= 8.4 with native lazy objects,
+so a preference applied after that line is dead code and the suite would report ~1229 errors
+carrying the exact D-S8b-5 wording — a broken harness that reads as a genuine PostgreSQL finding).

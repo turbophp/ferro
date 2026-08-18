@@ -21,6 +21,12 @@ php/**/vendor
 # the single source of truth for which suite the recorded numbers came from.
 /.dbal-suite
 
+# M1-S9: testkit/orm-suite.sh's work directory — a PINNED git clone of doctrine/orm plus its
+# vendor/, the generated phpunit configs, the junit logs and the run's ferrod log. Same rule as
+# .dbal-suite: never commit a vendored clone; the tag in the runner is the single source of truth
+# for which suite the recorded numbers came from.
+/.orm-suite
+
 # M1-S8c: testkit/migrations-e2e.sh's harness. `composer.lock` IS committed — it is what pins
 # doctrine/migrations for a reproducible run. Its vendor tree, the migration classes
 # `migrations:diff` regenerates on every run, and the run's ferrod log are not.
