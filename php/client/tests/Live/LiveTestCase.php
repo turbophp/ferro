@@ -371,6 +371,21 @@ abstract class LiveTestCase extends TestCase
         return ['running' => (bool) $s['running'], 'exitcode' => is_int($s['exitcode']) ? $s['exitcode'] : null];
     }
 
+    /**
+     * The launched `ferrod`'s OS pid — for the M1-S9 §20.3 chaos tests, which must SIGKILL the daemon
+     * OUT-OF-BAND while this process is blocked inside a client call. {@see $proc} is private and
+     * `proc_terminate` can only signal a process the CALLER owns, so a raw pid is the one name both
+     * the test and its out-of-process killer sidecar can share.
+     */
+    protected function ferrodPid(): int
+    {
+        if ($this->proc === null || !is_resource($this->proc)) {
+            self::fail('ferrodPid(): no running ferrod process handle');
+        }
+        $s = proc_get_status($this->proc);
+        return (int) $s['pid'];
+    }
+
     private function readStderr(): string
     {
         if ($this->stderrPath === '' || !is_file($this->stderrPath)) { return '(no stderr captured)'; }
