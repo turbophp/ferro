@@ -1,5 +1,28 @@
 # Ferro M1-S9 — The M1 Exit Gate Implementation Plan
 
+> **ADVERSARIAL VERIFICATION RAN (Fable, 2026-08-13) — 1 BLOCKER + 5 MAJORS, all applied inline
+> below as `PLAN-VERIFY` blocks. Verdict before the fixes: "M1 should NOT exit on this plan as
+> written." After them the reviewer judged the skeleton sound — corrections C1–C3, the mutation set,
+> the fail-closed runner design and the triage assignments survived every attack, and all three of
+> the plan's declared "settle at task time" unknowns are now SETTLED (upstream TestUtil's surface
+> read at a real 3.6.8 clone; `DEFAULT_POOL_MAX_SIZE = 16` at `pools.rs:45`, so the killer's second
+> checkout needs no knob; and the MySQL processlist placeholder question measured on BOTH engines —
+> a param-bound `info LIKE ?` poll sees the parked sleeper and never its own bound value).
+> Journal, with every measurement: `.superpowers/sdd/2026-08-13-ferro-m1-s9-exit-gate/plan-verify.md`.
+>
+> **MINORS to fix in passing, each measured:** Task 4's recording loops pipe through `tee` without
+> `set -o pipefail`, so the runner's exit status is discarded — a failed run would record silently;
+> the ORM runner pins DBAL but NOT PHPUnit, and the results manifest omits the resolved PHPUnit
+> version (research-orm's own conclusion was "pin both"); Global constraint 8 says
+> `php/doctrine-dbal 291`, stale at this plan's own start (296 after `d436f83`); Task 3 Step 3's
+> pool-size pointer is `pools.rs:45`, not `config.rs`; Task 2 Step 7's `sed` is a no-op sandwich
+> carried only by its prose; and Wave A's "disjoint files" premise is violated by the shared
+> spec-deltas ledger that all three tasks commit to — serialize that file or give each task its own.
+>
+> **One reviewer result worth carrying into Task 4:** the DBAL baseline was re-run at HEAD and
+> MATCHES exactly (PG 730/828/3/7/354/2), so `d436f83` did not move it — the open question in
+> hazard 11 is closed for PG.
+
 > **STATUS (controller, 2026-08-13): Task 1 is ALREADY DONE — landed as `d436f83` before this plan
 > was committed.** The ORM research probe found the `fetchFirstColumn` boolean-`false` truncation
 > while the plan was still being written; it is silent data loss in a shipped path, so it was
@@ -631,8 +654,32 @@ Route the privileged-connection parameter helper (zero external call sites in OR
 the same array, and make `initializeDatabase()` a documented no-op (keep the signature; body =
 one comment pointing at the runner's reset).
 
+> **PLAN-VERIFY MAJOR — the ferro branch omits `'driver'`, and the KEPT upstream `getConnection()`
+> reads it unconditionally.** Upstream's `getConnection()` (which this step keeps verbatim) does a
+> SQLite check on `$connectionParameters['driver']` with no `isset`. In ferro mode that key is
+> absent, so every one of the suite's thousands of `getConnection()` calls emits an
+> "Undefined array key 'driver'" E_WARNING under `error_reporting(E_ALL)` (ORM's `TestInit` sets
+> it). The research probe's own replacement evidently guarded this — its recorded result lines are
+> clean — but the shape SPECIFIED here does not, and "everything else stays verbatim" forbids the
+> implementer from quietly fixing it.
+> **Required:** name the guard explicitly in this step — change that one read to
+> `$connectionParameters['driver'] ?? null` (or add `'driver' => null` to the ferro array, but the
+> `?? null` is the smaller deviation from verbatim and does not risk a stock-driver code path
+> mistaking a null driver for a configured one).
+
 (c) In `configureProxies(Configuration $config)` KEEP the upstream body (proxy dir + namespace)
-and APPEND:
+and insert the block below **AT THE TOP OF THE METHOD, BEFORE ANY OTHER STATEMENT.**
+
+> **PLAN-VERIFY BLOCKER (MEASURED, and this is not a style preference).** The original instruction
+> here said "APPEND". Upstream `configureProxies()` at ORM 3.6.8 opens with
+> `if (PHP_VERSION_ID >= 80400 && $enableNativeLazyObjects) { …enableNativeLazyObjects(true); return; }`
+> — and the harness environment is PHP 8.4.18 with native lazy objects ON (research-orm's own
+> manifest). An appended block therefore sits AFTER an early `return` and **never executes**. The
+> measured cost is the D-S8b-5 number itself: **1229 errors, ~35% of the suite** — and it surfaces
+> with the exact D-S8b-5 error text, so the failing run looks like a genuine finding about PG
+> identity strategy rather than a broken harness. That mis-triage is the real damage; the crash is
+> the cheap part. Insert FIRST, and have Step 7's smoke assert the preference actually took effect
+> rather than merely that the file parses.
 
 ```php
         if (getenv('FERRO_ORM_PG_SEQUENCE') === '1') {
@@ -1215,6 +1262,30 @@ use Ferro\Client\Error\IndeterminateException;
  *   4. open stream (PG only — MySQL-family streaming does not exist, §22.2 (n)) → exactly one
  *      thrown terminal, never a hang, never a clean end that silently truncates.
  */
+> **PLAN-VERIFY MAJOR (MEASURED) — these cells must NOT use `LiveTestCase::connectConnection()`,
+> or they can pass with the daemon ALIVE.**
+>
+> `LiveTestCase::connectConnection` hardcodes a **5.0 s io timeout** (`LiveTestCase.php:136-139`).
+> `Transport.php:94-95` surfaces a read timeout as `TransportException('read timed out…')`;
+> `Connection.php:1097` catches that **identically to a daemon death**, and `classifyLoss(Write)`
+> mints the **same `IndeterminateException`**. Every cell parks a 30 s sleep and then races the
+> killer (PHP CLI start + autoload + connect + 50 ms poll) against that 5 s client timeout. If the
+> killer is slow — a loaded CI box, which is exactly where flakes live — the client times out
+> first, the assertion passes, and the daemon is still running at classification time. The killer
+> then still finds its marker inside its 20 s budget, kills, and exits 0, so nothing anywhere
+> reports a problem. Cell 3 is worse under the same race: it reconnects to the LIVE daemon and
+> re-issues the sleep (`maxAttempts` defaults to 3).
+>
+> This is the acceptance harness for the property the whole design exists to protect, so a cell
+> that can pass for an unrelated reason is not a weak test — it is a false gate.
+>
+> **Required shape:** connect with an io timeout that EXCEEDS the parked sleep, so a client-side
+> timeout is impossible inside a cell and the only two exits are the kill (throw) or completion
+> (`self::fail`):
+> `Ferro::connect($this->socketPath, $pool, 2.0, 60.0, $policy)`.
+> **Belt as well as braces:** at catch time, assert the killer process has already EXITED — an
+> `IndeterminateException` raised while the killer is still running has not been earned.
+
 final class DaemonKillFateLiveTest extends LiveTestCase
 {
     private const KILLER_BUDGET_SEC = '20';
@@ -1248,7 +1319,8 @@ final class DaemonKillFateLiveTest extends LiveTestCase
 
     private function runAutocommitWriteCell(string $family, string $pool): void
     {
-        $conn = $this->connectConnection(pool: $pool);
+        // PLAN-VERIFY MAJOR: NOT `connectConnection()` — see the note under this class.
+        $conn = Ferro::connect($this->socketPath, $pool, 2.0, 60.0);
         $this->setupTable($conn, $family);
         $k = self::uniq('cell1');
         $marker = self::uniq('m1');
@@ -1886,6 +1958,27 @@ nightly`) with research-bar §2.4's draft, amended to name BOTH runners
 (`testkit/dbal-suite.sh` AND `testkit/orm-suite.sh`, each with its committed baseline directory)
 and to name the ORM harness interventions per Task 2's delta entry.
 
+> **PLAN-VERIFY MAJOR — this amendment as originally worded manufactures the THIRD §22.2-class
+> contradiction of the milestone, by the same mechanism as the two already repaired.**
+> research-bar §2.4's draft demands "a five-category triage with categories (a) and (e) empty".
+> Applied verbatim to BOTH runners, §20.3 would require (e) EMPTY of the ORM suite while §14 and
+> §17 — amended in this same commit — say ORM (e) rows do not block, and the recorded ORM triage
+> has a non-empty (e) BY DESIGN (the 10 bind-matrix rows). (u)/(v) and (aj) were both exactly this:
+> one draft blanket-applied across sites that needed different scopes.
+> **Required:** the (a)-and-(e)-EMPTY clause is scoped to the **DBAL runner only**; the ORM half
+> cross-references §14's measurement bar (category (a) EMPTY, (e) filed-not-blocking with a
+> milestone assignment). Before committing Step 3, read §14, §17 and §20.3's new text TOGETHER and
+> confirm they agree on what each suite must show — the contradiction is only visible across sites.
+
+> **PLAN-VERIFY MAJOR — the chaos-bullet replacement does not reach the stale sentence.**
+> §20.3's chaos bullet contains "**Not yet built** (the M0 core review, 2026-08-11): what exists
+> instead is per-slice live chaos against the BACKEND link …" TWO SENTENCES BEFORE the final
+> sentence this step replaces. Replacing only the last sentence leaves the bullet asserting both
+> "Not yet built" and "BUILT at M1-S9". Task 3's spec-delta entry defers to "the plan's Task 6
+> wording", and Task 6 replaces only the final sentence — circular, so neither instruction edits it.
+> **Required:** replace from `**Not yet built**` through the end of the bullet, so the whole claim
+> is rewritten in one piece.
+
 - [ ] **Step 4: §16.1 — append the D12 status note** (research-bar §2.5 verbatim).
 
 - [ ] **Step 5: §19.3 — insert the client-side limit paragraph** after the
@@ -1987,8 +2080,19 @@ cd /home/abdullak/projects/ferro/php/doctrine-dbal && composer install --no-inte
 Expected: zero-skip live lanes including the new `DaemonKillFateLiveTest` (client counts grow by
 its 8 tests + Task 1's; journal exact totals).
 
-- [ ] **Step 3: `/proto` regeneration zero-diff** — replicate the CI step exactly (find it in
-  `.github/workflows/ci.yml`, the proto-regen job): run the generators, then
+- [ ] **Step 3: `/proto` regeneration zero-diff.**
+
+  > **PLAN-VERIFY MAJOR — there is no proto-regen CI job to find.** `.github/workflows/ci.yml` has
+  > five jobs (rust, integration, php, deny, fuzz-smoke) and `ci/local-gate.sh` has none either, so
+  > "replicate the CI step" sends the implementer looking for something that does not exist. The
+  > real mechanism is to run the two generators and assert the tree did not move:
+  > ```bash
+  > cargo run -p ferro-proto --bin gen-registry-lock
+  > php proto/tools/gen-php.php
+  > git status --porcelain   # must be EMPTY
+  > ```
+  > (A `touch proto/*.toml && cargo build -p ferro-proto` also re-runs `build.rs` for the Rust
+  > constants.) Run the generators, then
   `git status --porcelain` must be EMPTY. This slice touched no `/proto` input, so any diff is a
   stop-and-diagnose.
 
