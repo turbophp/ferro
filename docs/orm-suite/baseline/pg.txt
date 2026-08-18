@@ -1,0 +1,47 @@
+Doctrine\Tests\ORM\Functional\AdvancedDqlQueryTest::testDeleteAs
+Doctrine\Tests\ORM\Functional\AdvancedDqlQueryTest::testUpdateAs
+Doctrine\Tests\ORM\Functional\ClassTableInheritanceTest::testBulkUpdateIssueDDC368
+Doctrine\Tests\ORM\Functional\ClassTableInheritanceTest::testBulkUpdateNonScalarParameterDDC1341
+Doctrine\Tests\ORM\Functional\ClassTableInheritanceTest::testCRUD
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateAdd with data set "day"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateAdd with data set "hour"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateAdd with data set "minute"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateAdd with data set "month"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateAdd with data set "second"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateAdd with data set "week"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateAdd with data set "year"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateAddWithColumnInterval
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateSub with data set "day"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateSub with data set "hour"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateSub with data set "minute"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateSub with data set "month"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateSub with data set "second"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateSub with data set "week"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateSub with data set "year"
+Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest::testDateSubWithColumnInterval
+Doctrine\Tests\ORM\Functional\ReadonlyPropertiesTest::testEntityWithEagerManyToOne
+Doctrine\Tests\ORM\Functional\ReadonlyPropertiesTest::testEntityWithLazyManyToOne
+Doctrine\Tests\ORM\Functional\ReadonlyPropertiesTest::testEntityWithManyToMany
+Doctrine\Tests\ORM\Functional\ReadonlyPropertiesTest::testSimpleEntity
+Doctrine\Tests\ORM\Functional\Ticket\DDC1884Test::testSelectFromInverseSideWithCompositePkAndSolelyIdentifierColumnsUsingFetchJoins
+Doctrine\Tests\ORM\Functional\Ticket\DDC1884Test::testSelectFromInverseSideWithCompositePkUsingFetchJoins
+Doctrine\Tests\ORM\Functional\Ticket\DDC1884Test::testSelectFromOwningSideUsingFetchJoins
+Doctrine\Tests\ORM\Functional\Ticket\DDC2090Test::testIssue
+Doctrine\Tests\ORM\Functional\Ticket\DDC2106Test::testDetachedEntityAsId
+Doctrine\Tests\ORM\Functional\Ticket\DDC2494Test::testIssue
+Doctrine\Tests\ORM\Functional\Ticket\DDC3597Test::testSaveImageEntity
+Doctrine\Tests\ORM\Functional\Ticket\DDC832Test::testQuotedTableBasicRemove
+Doctrine\Tests\ORM\Functional\Ticket\DDC832Test::testQuotedTableJoinedChildRemove
+Doctrine\Tests\ORM\Functional\Ticket\DDC832Test::testQuotedTableJoinedChildUpdate
+Doctrine\Tests\ORM\Functional\Ticket\DDC832Test::testQuotedTableJoinedRemove
+Doctrine\Tests\ORM\Functional\Ticket\DDC832Test::testQuotedTableJoinedUpdate
+Doctrine\Tests\ORM\Functional\Ticket\GH11341Test::testInstanceOf with data set #0
+Doctrine\Tests\ORM\Functional\Ticket\GH11341Test::testInstanceOf with data set #1
+Doctrine\Tests\ORM\Functional\Ticket\GH11341Test::testInstanceOf with data set #2
+Doctrine\Tests\ORM\Functional\Ticket\GH5562Test::testCacheShouldBeUpdatedWhenAssociationChanges
+Doctrine\Tests\ORM\Functional\Ticket\GH9230Test::testIssue with data set "float=-0.0"
+Doctrine\Tests\ORM\Functional\Ticket\GH9230Test::testIssue with data set "float=0.0"
+Doctrine\Tests\ORM\Functional\Ticket\GH9230Test::testIssue with data set "float=null"
+Doctrine\Tests\ORM\Functional\TypeTest::testDecimal
+Doctrine\Tests\ORM\Functional\TypeValueSqlTest::testSelectDQL
+Doctrine\Tests\ORM\Functional\TypeValueSqlTest::testTypeValueSqlWithAssociations

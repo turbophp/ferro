@@ -1,0 +1,10 @@
+Doctrine\Tests\ORM\Functional\AdvancedDqlQueryTest::testDeleteAs
+Doctrine\Tests\ORM\Functional\AdvancedDqlQueryTest::testUpdateAs
+Doctrine\Tests\ORM\Functional\ClassTableInheritanceTest::testBulkUpdateIssueDDC368
+Doctrine\Tests\ORM\Functional\ClassTableInheritanceTest::testBulkUpdateNonScalarParameterDDC1341
+Doctrine\Tests\ORM\Functional\ClassTableInheritanceTest::testCRUD
+Doctrine\Tests\ORM\Functional\SchemaTool\MySqlSchemaToolTest::testGetCreateSchemaSql
+Doctrine\Tests\ORM\Functional\SchemaTool\MySqlSchemaToolTest::testGetCreateSchemaSql2
+Doctrine\Tests\ORM\Functional\SchemaTool\MySqlSchemaToolTest::testGetCreateSchemaSql3
+Doctrine\Tests\ORM\Functional\Ticket\DDC2090Test::testIssue
+Doctrine\Tests\ORM\Functional\Ticket\DDC2182Test::testPassColumnOptionsToJoinColumns

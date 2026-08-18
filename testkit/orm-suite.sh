@@ -277,7 +277,16 @@ echo "[ferro-orm] tree: $repo_sha$repo_dirty · orm tests: $tag @ ${src_sha:0:12
 #    and a later re-run from a narrower window would report 9 "new" non-passing tests that have
 #    nothing to do with Ferro. It applies identically to both modes, so the stock comparator stays a
 #    fair comparator.
+#    The junit path is RECORDABILITY-AWARE, and that is a measured requirement (M1-S9 Task 4). The
+#    junit is the evidence the triage is derived from — the half of a recorded run that a reader
+#    cannot re-derive from the committed baseline. A narrowed DEBUG run used to write it to the same
+#    fixed path, so `--filter Foo` silently replaced a 3485-test recorded run's evidence with a
+#    6-test one while the baseline gate correctly reported "not compared". The baseline (the
+#    contract) was protected; the evidence was not. A non-recordable run now writes `.debug.xml`.
 junit="$work/junit-$mode-$svc.xml"
+if [ ${#narrowing[@]} -ne 0 ] || [ "$reset" != 1 ]; then
+  junit="$work/junit-$mode-$svc.debug.xml"
+fi
 set +e
 env COLUMNS=120 FERRO_ORM_SRC="$src" FERRO_ORM_MODE="$mode" \
     FERRO_ORM_PG_SEQUENCE="$( [ "$pg_sequence" = 1 ] && echo 1 || echo 0 )" \
