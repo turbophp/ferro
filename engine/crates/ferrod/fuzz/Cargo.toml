@@ -22,3 +22,13 @@ doc = false
 bench = false
 
 [workspace]
+
+# This empty [workspace] table makes the fuzz dir its own workspace ROOT (the standard cargo-fuzz
+# layout), so the repo root's [patch.crates-io] does NOT reach it — patches only apply from the
+# workspace root that resolves the graph. Without mirroring them here, this workspace resolves
+# STOCK tokio-postgres/mysql_async from crates.io and `cargo check` fails on the fork-only
+# accessors (`transaction_status`, `clear_typeinfo_statement_cache`). Keep in lockstep with the
+# root Cargo.toml's patch section; drop each line when its upstream PR merges.
+[patch.crates-io]
+tokio-postgres = { path = "../../../../vendor/tokio-postgres" }
+mysql_async = { path = "../../../../vendor/mysql-async" }
