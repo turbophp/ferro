@@ -161,4 +161,5 @@ failed iteration — a silent iteration is indistinguishable from a dead loop.
 
 | When (UTC) | Iteration | Item(s) | Outcome | PR | Gates run |
 |------------|-----------|---------|---------|----|-----------|
+| 2026-09-08 | bootstrap+1 | CI red on main | Found + fixed: the `rust` lane has been red on main since M1 landed — the ferrod fuzz dir is its own workspace root, so the root `[patch.crates-io]` never reached it and it resolved stock tokio-postgres/mysql_async (E0599 on the fork accessors). Patches mirrored into the fuzz manifest; same commit ported here. | #3 (ported into #2) | `cd engine/crates/ferrod/fuzz && cargo check` (the failing command) clean locally; full workspace gates left to CI |
 | 2026-09-08 | bootstrap | — | Ledger created from a full pass over SPEC §16/§17, CLAUDE.md "Current state", docs/followups/, and docs/product-vision.md; backlog phased A–E to the v1 gate; 2-hour Routine registered; A1 found already DONE on main (m1-s8c). | #2 | n/a (docs-only) |
