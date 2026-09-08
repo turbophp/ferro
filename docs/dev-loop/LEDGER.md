@@ -44,6 +44,9 @@ Item states: `OPEN` → `IN-FLIGHT (PR #n)` → `DONE (PR #n, merged)`; `BLOCKED
 
 ## Backlog (priority order)
 
+**Current milestone focus: M1-S9 — the M1 exit gate.** Iterations work the P0 table until every
+row is DONE and the re-recorded DBAL numbers are in; only then does the loop move down to P1/P2.
+
 ### P0 — the M1-S9 exit gate (what stands between the recorded DBAL numbers and the §14 bar)
 
 | # | Item | State | Notes |
