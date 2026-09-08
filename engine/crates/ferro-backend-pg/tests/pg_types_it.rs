@@ -759,8 +759,10 @@ async fn head_tag_equals_emitted_tag_on_both_paths() {
 /// BEFORE the query runs, so the connection stays clean and usable — paired, since M1-S8a, with
 /// the ADMISSION guard for the catalog scalars that left this list (`"char"`, `name`, `oid`,
 /// `regtype`, `regclass`). Keeping both halves in one test on one connection is what makes the
-/// boundary visible: `oidvector` is a catalog type too and stays refused, so the family was
-/// admitted by OID, not by association.
+/// boundary visible: since M1-S9 the boundary sentinel is `int2[]` (OID 1005) — the TRUE array
+/// type one step from the now-admitted `int2vector` — so admitting the catalog vectors did not
+/// quietly open the array class. (`'1 2'::oidvector` sat in this list from S8a to S9; its
+/// coverage MOVED to `s9_catalog_vectors_match_pg_own_text_rendering`, not dropped.)
 ///
 /// `timetz` carries the real trap: its payload is 12 bytes (i64 µs + i32 zone) against `time`'s 8,
 /// so admitting it into the `TIME` arm would fail MID-DECODE, after `HEAD` is already on the wire.
@@ -780,9 +782,9 @@ async fn deferred_column_types_are_refused_before_execution() {
         // M1-S8a (§22.2 (q)): `'a'::"char"` LEFT this list — PG's internal 1-byte `"char"` (OID 18)
         // is now admitted as TEXT, together with `name`/`oid`/`regtype`/`regclass`. The coverage
         // MOVED to the positive assertion after the loop, so it is relocated, not dropped.
-        // (`oidvector` takes its place here: an array-shaped catalog type that stays deferred, so
-        // admitting the catalog family did not quietly widen the array class.)
-        "'1 2'::oidvector",
+        // M1-S9: `'1 2'::oidvector` LEFT this list too (admitted with `int2vector`); `int2[]`
+        // takes its place as the nearest still-deferred array neighbour.
+        "ARRAY[1,2]::int2[]",
     ] {
         let err = co
             .query(&format!("SELECT {expr}"), &[])
@@ -829,6 +831,82 @@ async fn deferred_column_types_are_refused_before_execution() {
         );
         println!("  admitted {expr:<28} -> {want:?}");
     }
+}
+
+/// M1-S9: the catalog vectors, live, against **PG's own `::text` output as the oracle** — the
+/// same double-check discipline as `numeric_matches_pg_own_text_rendering` (a renderer written by
+/// the same author as its unit fixtures could share a misunderstanding; PG cannot).
+///
+/// Three layers, strongest last:
+/// 1. synthetic casts (`'1 3'::int2vector`, the empty vector, an oid above `i32::MAX`);
+/// 2. the follow-up doc's exact reproduction — `SELECT indkey FROM pg_index LIMIT 1` — which
+///    refused with `Unsupported` until this slice;
+/// 3. every `pg_index.indkey` and multi-arg `pg_proc.proargtypes` row on the live server,
+///    byte-compared to its own `::text` in the SAME query — the exact string `pdo_pgsql` hands
+///    stock Doctrine's `PostgreSQLSchemaManager`, which is the consumer this slice unblocks.
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_catalog_vectors_match_pg_own_text_rendering() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    // (1) Synthetic casts, HEAD-vs-producer asserted by `one` on the way through.
+    for (expr, want) in [
+        ("'1 3'::int2vector", "1 3"),
+        ("''::int2vector", ""),
+        ("'0'::int2vector", "0"),
+        ("'1 2'::oidvector", "1 2"),
+        // An oid above i32::MAX must render UNSIGNED — a signed reinterpretation would print a
+        // negative number with no error anywhere.
+        ("'4000000000'::oidvector", "4000000000"),
+    ] {
+        let (tag_got, v) = one(&mut co, expr).await;
+        assert_eq!(tag_got, tag::TEXT, "`{expr}` HEAD tag");
+        assert_eq!(v, Value::Text(want.into()), "`{expr}` canonical text");
+        println!("  vector {expr:<28} -> {want:?}");
+    }
+
+    // (2) The follow-up doc's reproduction, verbatim.
+    co.query("SELECT indkey FROM pg_index LIMIT 1", &[])
+        .await
+        .expect("the follow-up doc's reproduction must now succeed");
+
+    // (3) Real catalog cells against PG's own text rendering, in the same query so the oracle and
+    // the subject are the same row version. `indkey` includes expression-index rows (attnum 0)
+    // and multi-column indexes; `proargtypes` includes genuinely huge oid lists.
+    let idx = co
+        .query(
+            "SELECT indkey, indkey::text FROM pg_index ORDER BY indexrelid LIMIT 50",
+            &[],
+        )
+        .await
+        .expect("read pg_index.indkey");
+    assert!(!idx.rows.is_empty(), "a live PG always has catalog indexes");
+    for row in &idx.rows {
+        assert_eq!(row[0], row[1], "indkey must match PG's own ::text output");
+    }
+    let args = co
+        .query(
+            "SELECT proargtypes, proargtypes::text FROM pg_proc WHERE pronargs >= 2 \
+             ORDER BY oid LIMIT 50",
+            &[],
+        )
+        .await
+        .expect("read pg_proc.proargtypes");
+    assert!(!args.rows.is_empty(), "pg_proc always has multi-arg rows");
+    for row in &args.rows {
+        assert_eq!(
+            row[0], row[1],
+            "proargtypes must match PG's own ::text output"
+        );
+    }
+    println!(
+        "  oracle: {} indkey rows + {} proargtypes rows byte-equal to ::text",
+        idx.rows.len(),
+        args.rows.len()
+    );
 }
 
 /// **DOMAINs need no `Kind::Domain` unwrap — the plan's "domains are deferred" carry was FALSE**
