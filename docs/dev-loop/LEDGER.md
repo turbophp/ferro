@@ -5,87 +5,154 @@ every two hours, performs exactly one iteration of the protocol below, and recor
 ledger is the memory that survives across sessions — if it isn't written here (or visible in an
 open `claude/dev-loop/*` PR), the next iteration doesn't know it happened.
 
-The loop's goal: **drive Ferro from its current state (M1-S8b complete) to v1** — the M1 exit gate
-closed, then the remaining SPEC §17 milestones — one small, finished, adversarially-tested slice
-per iteration. The charter in `CLAUDE.md` and `ferro-spec-v0.2.md` govern every iteration; nothing
-in this file overrides them.
+The loop's goal: **drive Ferro to v1** along the binding roadmap — SPEC §17's milestones in
+order, to the §16 v1 exit criteria — one small, finished, adversarially-tested slice per
+iteration. Authority order: `ferro-spec-v0.2.md` is the contract, `CLAUDE.md` is the working
+agreement, SPEC §21 + the product decision log (`docs/product-vision.md` §11) are binding, and
+nothing in this file overrides any of them.
+
+## Where the project stands (sync with CLAUDE.md "Current state" each iteration)
+
+- **M0 complete** (D12 measurement recorded). **M1 slices S1–S8b complete**: pin engine, assist
+  lexer, conditional hygiene, fate matrix + chaos suites, streaming, MySQL/MariaDB backend,
+  full type coverage, and the Doctrine DBAL 4 driver with its acceptance gate.
+- **In progress: M1-S9, the M1 exit gate** — the recorded DBAL numbers (PG 296/374,
+  MySQL 372/385, MariaDB 371/384) are **not at the §14 bar**, and S8b measured exactly why.
+- Not started: M2 (Eloquent, observability, SQLite, DBAL ^3.8 bridge), M3 (Fibers, manifest,
+  memfd, COPY), M4 (MSSQL, replica routing, `ferro top`), M5 (streams product, packaging).
 
 ## Protocol (one iteration)
 
-0. **Sync**: fetch `origin/main`; read `CLAUDE.md` ("Current state" + charter) and this ledger from
-   `origin/main`, in full.
+0. **Sync**: fetch `origin/main`; read `CLAUDE.md` ("Current state" + charter) and this ledger
+   from `origin/main`, in full.
 1. **Tend the open PRs first.** List open PRs whose head branch starts with `claude/dev-loop`.
    A red-CI, merge-conflicted, or changes-requested PR from a previous iteration **is** this
    iteration's work — fix it and push before starting anything new. Items marked IN-FLIGHT below
    with an open PR are taken; do not duplicate them.
-2. **Pick** the highest-priority OPEN item from the backlog. Before writing code, **verify the
-   defect/gap is still real** against the current tree (re-run the measurement in the follow-up
-   doc, or write the failing test first). If it's already fixed, mark it DONE with evidence and
-   pick the next item.
+2. **Pick** the highest-priority OPEN item: current phase first, in item order. Before writing
+   code, **verify the defect/gap is still real** against the current tree (re-run the follow-up
+   doc's measurement, or write the failing test first). If already fixed, mark it DONE with
+   evidence and take the next item.
 3. **Implement one complete slice**: code + tests + spec truth, per the charter's definition of
    done. Protocol work updates `/proto` + golden vectors + both codecs in one change. Run every
    gate the environment allows (`cargo fmt --check`, `cargo clippy --workspace -- -D warnings`,
    `cargo test --workspace` against the testkit backends, PHPUnit, PHPStan L9, `/proto`
-   regeneration zero-diff) and record **which gates actually ran** — an unrun gate is reported as
-   unrun, never implied green.
+   regeneration zero-diff) and record **which gates actually ran** — an unrun gate is reported
+   as unrun, never implied green.
 4. **Adversarial pass**: before pushing, re-read the diff looking for what a reviewer would
    reject; every 4th iteration (or when the top item is blocked), spend the iteration on bug
-   hunting instead of feature work — chaos-harness extension, a `/code-review` pass over recent
-   merges, or re-running the DBAL acceptance suite and diffing the recorded numbers.
+   hunting instead of feature work — chaos-harness extension, a review pass over recent merges,
+   or re-running the DBAL acceptance suite and diffing the recorded numbers.
 5. **Record**: update this ledger in the same change — flip the item's state, append an
-   iteration-log row. New bugs found but not fixed are appended to the backlog with evidence,
-   never left only in the session transcript.
+   iteration-log row. New bugs found but not fixed are appended to the **Found bugs** section
+   with evidence, never left only in the session transcript.
 6. **Ship**: commit on a fresh branch `claude/dev-loop/YYYYMMDD-HHMM-<slug>`, push with
    `-u origin`, open a PR to `main`, subscribe to its activity, and drive it to green.
    **Never merge a PR** (humans merge), never push to `main`, never force-push someone else's
-   branch, never re-litigate a SPEC §21 decision.
+   branch, never re-litigate a SPEC §21 or product-log P1–P12 decision.
+
+**Scope guardrails** (from the charter + product vision, restated because a loop drifts):
+correctness over throughput — perf work only against recorded bench numbers (§16.1); no ORM
+semantics in Rust, no SQL rewriting, no result caching, no read/write inference; the engine
+never transparently retries; **v1 stays undiluted** — no post-v1 family work (HTTP engine,
+queues, State, tenant pools) enters this backlog until the §16/§17 bar is met.
+
+**Model & quota discipline.** Iterations run on the strongest model (Fable) because this codebase
+is correctness-critical, but spend it where it pays and delegate the rest:
+
+- **Delegate to cheaper subagents** (Agent tool with `model: "haiku"` or `"sonnet"`): broad
+  codebase searches and "where does X live" questions (Explore agent), gate-log triage, follow-up
+  doc cross-checks, drafting routine ledger/doc updates. Fan independent searches out in parallel.
+- **Keep on the main (Fable) thread**: slice design, the actual Rust/PHP implementation, anything
+  touching the fate matrix / pin engine / wire protocol, and the adversarial diff re-read.
+- **Cheap no-ops**: decide "nothing actionable" early — check open PRs and the ledger before
+  reading anything heavy; read spec *sections* (the CLAUDE.md reading map), never the whole spec.
+- **Proportionality**: one iteration ≈ one small slice. If an item won't fit, split it in the
+  ledger (A3 → A3a/A3b) rather than burning a session on an unfinished large diff.
 
 Item states: `OPEN` → `IN-FLIGHT (PR #n)` → `DONE (PR #n, merged)`; `BLOCKED (reason)` where noted.
 
-## Backlog (priority order)
+## Backlog, phased by roadmap
 
-**Current milestone focus: M1-S9 — the M1 exit gate.** Iterations work the P0 table until every
-row is DONE and the re-recorded DBAL numbers are in; only then does the loop move down to P1/P2.
+**Current phase: A (M1-S9).** A phase closes when every row is DONE (or explicitly BLOCKED with
+the block recorded), its milestone's acceptance bar is re-measured and recorded, and CLAUDE.md's
+"Current state" is updated in the closing PR.
 
-### P0 — the M1-S9 exit gate (what stands between the recorded DBAL numbers and the §14 bar)
+### Phase A — M1-S9: the M1 exit gate
 
-| # | Item | State | Notes |
-|---|------|-------|-------|
-| 1 | `I64 ≥ 2^32` unreadable by `php/client` | DONE (pre-loop) | Fixed on `main` as m1-s8c (`46205ca`); the turnover is `PHP_INT_MAX`, not 2^32. Follow-up doc: `docs/followups/2026-08-11-i64-above-2e32-unreadable-in-php-client.md`. |
-| 2 | `int2vector` on the PG read path | OPEN | One type; unblocks the stock PG schema manager, `doctrine/migrations`, and 50 of PG's 78 non-passing DBAL tests. `docs/followups/2026-08-11-pg-int2vector-blocks-the-schema-manager.md`. |
-| 3 | PG bind widening `I64 → text/bool` | OPEN | 16 DBAL tests; re-**derive** the §19.3 directional lockstep proof, don't just re-run it. `docs/followups/2026-08-11-pg-bind-matrix-narrower-than-libpq.md`. |
-| 4 | ext-vs-pure msgpack packer conformance test | OPEN | Was coupled to item 1 (same file, `PurePacker::be()`); verify whether m1-s8c already shipped it before writing it. |
-| 5 | Re-run `testkit/dbal-suite.sh` on all three backends; record new numbers | OPEN | After 2–4 land. Diff against PG 296/374, MySQL 372/385, MariaDB 371/384. Two runs per backend (reproducibility), numbers + ordered failure set into the ledger and CLAUDE.md. |
-
-### P1 — genuinely open M1 items (from CLAUDE.md "Next up")
+What stands between the recorded DBAL numbers and the §14 bar, in measured-impact order.
 
 | # | Item | State | Notes |
 |---|------|-------|-------|
-| 6 | `affected` on the stream terminal | OPEN | A `/proto` change; lets the prepared path stream and closes the last §14 never-buffer gap. Registry + vectors + both codecs in one change. |
-| 7 | MySQL/MariaDB `query_stream` | OPEN | §22.2 (n), deferred at S6/S8b (D-S8b-2). |
-| 8 | `/proto` `TxNotFound` error code | OPEN | So `rollBack()` need not swallow `ERR_PROTOCOL` for a tombstoned `tx_id`. |
-| 9 | Savepoint verbs in the assist-lexer safe-list | OPEN | `ferro-classify`. |
-| 10 | Unbounded backend dial | OPEN | `docs/followups/2026-08-10-unbounded-backend-dial.md`. |
-| 11 | Tracker-clean hygiene `None`-skip (R2) | BLOCKED | Still blocked; hygiene currently masks the isolation leak (Task 13). Revisit only with the leak closed. |
-| 12 | Chunked `LARGE_OBJECT` bind | OPEN | |
+| A1 | `I64 ≥ 2^32` unreadable by `php/client` | DONE (pre-loop) | Fixed on `main` as m1-s8c (`46205ca`); turnover is `PHP_INT_MAX`, not 2^32. `docs/followups/2026-08-11-i64-above-2e32-unreadable-in-php-client.md`. |
+| A2 | `int2vector` on the PG read path | OPEN | One type; unblocks the stock PG schema manager, `doctrine/migrations`, and 50 of PG's 78 non-passing DBAL tests. `docs/followups/2026-08-11-pg-int2vector-blocks-the-schema-manager.md`. |
+| A3 | PG bind widening `I64 → text/bool` | OPEN | 16 DBAL tests; re-**derive** the §19.3 directional lockstep proof, don't just re-run it. `docs/followups/2026-08-11-pg-bind-matrix-narrower-than-libpq.md`. |
+| A4 | ext-vs-pure msgpack packer conformance test | OPEN | Was coupled to A1 (same file, `PurePacker::be()`); verify whether m1-s8c already shipped it before writing it. |
+| A5 | Re-run `testkit/dbal-suite.sh` on all three backends; record numbers | OPEN | Phase-closing item, after A2–A4. Two runs per backend (reproducibility), diff against PG 296/374, MySQL 372/385, MariaDB 371/384; numbers + ordered failure set into this ledger and CLAUDE.md. State plainly what still misses the §14 bar and why (SQLite has no backend until C3; the ORM suite is C-phase). |
 
-### P2 — the road to v1 (consult SPEC §17 for the binding milestone order)
+### Phase B — M1 loose ends (open items CLAUDE.md names, before M2 starts)
 
 | # | Item | State | Notes |
 |---|------|-------|-------|
-| 13 | ORM tier on PG + MySQL | OPEN | §14 bar names the ORM suite; SEQUENCE-strategy documentation for PG (D-S8b-5) ships with it. |
-| 14 | SQLite backend | OPEN | §14's stated bar includes SQLite; unblocks the third DBAL column. |
-| 15 | Laravel/Eloquent tier (`ferro/laravel`) | OPEN | §15; execution layer only, stock Grammar/Processor. |
-| 16 | `ferro-cli` schema sync / check / gen (D10) + manifest store | OPEN | §11. |
-| 17 | Deferred perf slices, only against recorded bench numbers | OPEN | §7.2 pipelined hygiene, the 2-channel control/data split (B4), the D12 bench re-run (§16.1). Charter rule 5: measure first. |
+| B1 | `affected` on the stream terminal | OPEN | A `/proto` change; lets the prepared path stream, closes the last §14 never-buffer gap. Registry + vectors + both codecs in one change. |
+| B2 | MySQL/MariaDB `query_stream` | OPEN | §22.2 (n), deferred at S6/S8b (D-S8b-2). |
+| B3 | `/proto` `TxNotFound` error code | OPEN | So `rollBack()` need not swallow `ERR_PROTOCOL` for a tombstoned `tx_id`. |
+| B4 | Savepoint verbs in the assist-lexer safe-list | OPEN | `ferro-classify`. |
+| B5 | Unbounded backend dial | OPEN | `docs/followups/2026-08-10-unbounded-backend-dial.md`. |
+| B6 | Chunked `LARGE_OBJECT` bind | OPEN | |
+| B7 | Tracker-clean hygiene `None`-skip (R2) | BLOCKED | Hygiene currently masks the isolation leak (S8a Task 13). Revisit only with the leak closed. |
 
-## v1 definition (working)
+### Phase C — M2 (SPEC §17): the Eloquent milestone
 
-v1 = the SPEC §17 milestones complete through the drop-in bar: M1 exit gate closed (§14 bar met as
-far as backends exist, deviations recorded in §22 rather than restated), DBAL **and** Eloquent
-tiers config-only green, the chaos suite green on every shipped backend, and a fresh D12 bench
-measurement recorded in `bench/results/` with its environment manifest. Refine this section
-against SPEC §17 as milestones close — edits to it ride ordinary iteration PRs.
+| # | Item | State | Notes |
+|---|------|-------|-------|
+| C1 | Eloquent tier (`ferro/laravel`) + PDO shim | OPEN | §15; Illuminate `Connection` execution layer only, stock Grammar/Processor. Multiple slices. |
+| C2 | Illuminate integration suite green through a Ferro connection | OPEN | The M2 acceptance bar — and the P10 go-to-market prerequisite. Suite runner modeled on `testkit/dbal-suite.sh` (with its hard contact assertion — the SQLite-fallback lesson). |
+| C3 | SQLite backend, engine-owned mode (§7.6) | OPEN | Also unblocks the SQLite column of the §14 DBAL bar — re-run A5's suite when it lands. |
+| C4 | Observability: OTLP traces, Prometheus, slow log (§13) | OPEN | Redaction contract per product-vision §5: fingerprints only, closed label vocabularies. |
+| C5 | DBAL `^3.8` bridge | OPEN | §14. |
+| C6 | Known-incompatibilities doc page | OPEN | §14–15; seed from `docs/known-incompatibilities.md` + D-S8b-5 (ORM-on-PG SEQUENCE strategy). |
+
+### Phase D — M3 (SPEC §17)
+
+| # | Item | State | Notes |
+|---|------|-------|-------|
+| D1 | Fibers multiplexing in `ferro/client` (§10.1) | OPEN | |
+| D2 | `ferro check`/`gen` + `idempotent` manifest + manifest handshake (§11) | OPEN | The only licensed auto-retry lives here. |
+| D3 | memfd large-payload path behind `MEMFD_RX` (§5.1) | OPEN | |
+| D4 | COPY API | OPEN | |
+
+### Phase E — M4 + M5 (SPEC §17), then the v1 gate
+
+| # | Item | State | Notes |
+|---|------|-------|-------|
+| E1 | MSSQL backend (mode per D1 outcome) | OPEN | |
+| E2 | Manifest-only hardening mode | OPEN | |
+| E3 | Replica routing + lag gating (§7.5) | OPEN | |
+| E4 | `ferro top` | OPEN | |
+| E5 | LISTEN/NOTIFY streams | OPEN | M5. |
+| E6 | Runtime guidance (Octane; widen to FrankenPHP per product-vision §9, tested config) | OPEN | M5. |
+| E7 | Packaging: deb/rpm/container sidecar, systemd socket-activated units (§18) | OPEN | M5. |
+| E8 | **v1 exit measurement** (§16) | OPEN | On the recorded reference environment: boundary p50 < 60 µs / p99 < 200 µs, ≥5× connection reduction, fan-out ≤ max+2 ms, 1 GB stream RSS bounds, >95 % statement-cache hit rate. Honor the D12 accelerator decision. Results + env manifest into `bench/results/`. |
+
+### Standing (any phase, any iteration)
+
+- Deferred perf slices (§7.2 pipelined hygiene, the B4 two-channel split) — only against
+  recorded bench numbers, per charter rule 5.
+- Every 4th iteration: the adversarial/bug-hunt pass (protocol step 4).
+- Keep CLAUDE.md's "Current state" truthful when a slice changes it.
+
+## Found bugs (open; found by the loop, not yet fixed)
+
+*None yet. Append with evidence: what was measured, where it lives, severity, what it blocks.*
+
+## v1 definition
+
+v1 = SPEC §17 milestones M1→M5 complete in order, with the two suite bars green (DBAL per §14 as
+far as backends exist, Illuminate per §15/M2), the chaos suite green on every shipped backend,
+and the §16 performance targets **measured and recorded** in `bench/results/` on the reference
+environment. Deviations are recorded in SPEC §22, never silently absorbed. Post-v1 work (product
+vision §4) is out of the loop's scope by P-log decision.
 
 ## Iteration log
 
@@ -94,4 +161,4 @@ failed iteration — a silent iteration is indistinguishable from a dead loop.
 
 | When (UTC) | Iteration | Item(s) | Outcome | PR | Gates run |
 |------------|-----------|---------|---------|----|-----------|
-| 2026-09-08 | bootstrap | — | Ledger created; 2-hour Routine registered; backlog seeded from CLAUDE.md M1-S9 + follow-up docs; item 1 found already DONE on main (m1-s8c). | (bootstrap PR) | n/a (docs-only) |
+| 2026-09-08 | bootstrap | — | Ledger created from a full pass over SPEC §16/§17, CLAUDE.md "Current state", docs/followups/, and docs/product-vision.md; backlog phased A–E to the v1 gate; 2-hour Routine registered; A1 found already DONE on main (m1-s8c). | #2 | n/a (docs-only) |
