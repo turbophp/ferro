@@ -16,11 +16,12 @@ nothing in this file overrides any of them.
 - **M0 complete** (D12 measurement recorded). **M1 slices S1–S8b complete**: pin engine, assist
   lexer, conditional hygiene, fate matrix + chaos suites, streaming, MySQL/MariaDB backend,
   full type coverage, and the Doctrine DBAL 4 driver with its acceptance gate.
-- **In progress: M1-S9, the M1 exit gate** — the three measured gaps (int2vector read,
-  I64→text/bool bind, I64 ≥ 2^32) are all FIXED on `main`, plus B1a/B1b (streamed `affected`,
-  prepared-path streaming on PG). The recorded DBAL numbers (PG 296/374, MySQL 372/385,
-  MariaDB 371/384) predate those fixes and are **not at the §14 bar**; the A5 re-measurement
-  is running (see the A5 row) and its numbers replace these when recorded.
+- **M1-S9 (the M1 exit gate) is COMPLETE**: all three measured gaps fixed on `main`
+  (int2vector read, I64→text/bool bind, I64 ≥ 2^32), plus B1a/B1b (streamed `affected`,
+  prepared-path streaming on PG), and the A5 re-measurement RECORDED: **PG 364/374,
+  MySQL 374/385, MariaDB 373/384**, reproducible twice each, every non-pass triaged (b)/(c)
+  (`docs/dbal-suite/2026-09-09-a5-results.md`). The §14 bar as written still lacks SQLite
+  (no backend until C3) and the ORM suite (C-phase) — stated, not absorbed.
 - Not started: M2 (Eloquent, observability, SQLite, DBAL ^3.8 bridge), M3 (Fibers, manifest,
   memfd, COPY), M4 (MSSQL, replica routing, `ferro top`), M5 (streams product, packaging).
 
@@ -85,9 +86,12 @@ Item states: `OPEN` → `IN-FLIGHT (PR #n)` → `DONE (PR #n, merged)`; `BLOCKED
 
 ## Backlog, phased by roadmap
 
-**Current phase: A (M1-S9).** A phase closes when every row is DONE (or explicitly BLOCKED with
-the block recorded), its milestone's acceptance bar is re-measured and recorded, and CLAUDE.md's
-"Current state" is updated in the closing PR.
+**Current phase: B (M1 loose ends).** Phase A (M1-S9) CLOSED 2026-09-09 in PR #10: every row
+DONE, the acceptance bar re-measured on all three backends (PG 364/374, MySQL 374/385,
+MariaDB 373/384 — every non-pass triaged (b)/(c)), CLAUDE.md updated in the closing PR. A phase
+closes when every row is DONE (or explicitly BLOCKED with the block recorded), its milestone's
+acceptance bar is re-measured and recorded, and CLAUDE.md's "Current state" is updated in the
+closing PR.
 
 ### Phase A — M1-S9: the M1 exit gate
 
@@ -99,7 +103,7 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 | A2 | `int2vector` on the PG read path | DONE (PR #4, merged) | `int2vector` (22) AND `oidvector` (30) admitted as TEXT (PG's own space-separated rendering, `::text`-oracle-proven live on real catalog cells); bind direction deliberately untouched; array class stays deferred (`int2[]` is the new boundary sentinel). SPEC §22.2 (ae). |
 | A3 | PG bind widening `I64 → text/bool` | DONE (PR #5, merged) | `I64 → text` (TEXT only, decimal rendering, Format::Text) + `I64 → bool` **value-gated to 0/1** (the explicit §9.1 decision; any other integer refused pre-send). Lockstep proof re-derived: `I64(1)` added to `every_variant` — a value-gated widening is invisible to the cross product without its accept-side value. Proven live in both measured shapes. SPEC §22.2 (af). |
 | A4 | ext-vs-pure msgpack packer conformance test | DONE (pre-loop, verified) | Shipped by m1-s8c as `php/client/tests/Conformance/PackerConformanceTest.php` (three arms, fixtures derived from `registry.lock.json`, loud-skip discipline with `FERRO_REQUIRE_EXT_MSGPACK=1`). Verified by EXECUTION, not inspection: 80 tests / 93 assertions green in-container (5 skips = the ext arms, extension absent here; CI's php lane installs it and is green on main); full offline suite 712/2033 matches m1-s8c's record; PHPStan L9 clean. |
-| A5 | Re-run `testkit/dbal-suite.sh` on all three backends; record numbers | IN-FLIGHT (2 of 3 recorded; PG re-running) | Run [34351348533](https://github.com/turbophp/ferro/actions/runs/34351348533) on `main` @ `6d507de`: **MySQL 374/385, MariaDB 373/384** (both +2 = the A1 BigInt fix, confirmed by the upstream suite; remaining 11/family all triaged (b)/(c), sets identical+ordered across runs) — recorded in `docs/dbal-suite/2026-09-09-a5-results.md`. The pg job never measured: host-port 55432 bind collision (ephemeral-range flake, root-caused in the record); lane fixed (port reservation + one retry) and PG re-dispatched. The decisive PG column (A2's ~50 + A3's ~16) lands next; then CLAUDE.md numbers + phase close. |
+| A5 | Re-run `testkit/dbal-suite.sh` on all three backends; record numbers | DONE (PR #10) | **PG 364/374 (+68 — exactly the predicted 50 int2vector + 16 bind + 2 BigInt), MySQL 374/385 (+2), MariaDB 373/384 (+2)**, two-run reproducibility verified on all three (six comparisons, ordered failure sets identical). Every remaining non-pass is in S8b's (b)/(c) triage — no category-(a) driver defect, no category-(e) engine gap remains. Full record + provenance: `docs/dbal-suite/2026-09-09-a5-results.md` (runs 34351348533 + 34357604689; the first dispatch's pg job died on a host-port ephemeral-range collision, root-caused, lane fixed with kernel-side port reservation). SQLite + ORM stay C-phase debts. |
 
 ### Phase B — M1 loose ends (open items CLAUDE.md names, before M2 starts)
 
@@ -173,7 +177,7 @@ failed iteration — a silent iteration is indistinguishable from a dead loop.
 
 | When (UTC) | Iteration | Item(s) | Outcome | PR | Gates run |
 |------------|-----------|---------|---------|----|-----------|
-| 2026-09-09 | 9 (routine→session) | merge directive + A5 dispatch | First execution of protocol step 7: all six queued PRs verified 5/5 checks green on their exact expected heads (#4 `eeeefb0`, #5 `f903141`, #6 `442b10b`, #7 `1e2f78e`, #8 `2336d7e`, #9 `e9898e9`), no human review pending, then merged in stack order with merge commits, each pinned by `expectedHeadSha` — main is now `6d507de`. A2, A3, B1a, B1b flipped DONE. A5 measurement DISPATCHED on post-merge main: `dbal-suite` run 34351348533, family=all — recording the numbers is the NEXT firing's first job (or this session's, if the artifacts land before it fires). No new code this iteration by design: a merge firing measures before it builds. | (this PR) | n/a locally (docs-only; the six merged PRs each carried their own green CI, and the A5 lane is running on GH runners now) |
+| 2026-09-09 | 9 (routine→session) | merge directive + A5 → **Phase A CLOSED** | First execution of protocol step 7: all six queued PRs verified 5/5 checks green on their exact expected heads, no human review pending, merged in stack order with merge commits, each pinned by `expectedHeadSha` — main is `6d507de`; A2/A3/B1a/B1b DONE. Then A5, same firing: dispatched family=all on post-merge main (run 34351348533); MySQL 374/385 + MariaDB 373/384 recorded reproducible; the pg job died on a host-port bind collision (55432 is in Linux's ephemeral range) — root-caused, lane fixed (kernel-side `ip_local_reserved_ports` + one retry), PG re-dispatched (run 34357604689, code tree = main exactly): **PG 364/374, the predicted +68 to the test**. Every remaining non-pass on all three backends is (b)/(c)-triaged. A5 DONE, **Phase A closed**, CLAUDE.md numbers updated. Loop lesson recorded: a measurement lane's first real dispatch IS its test — the port fix is the lane's first field defect, found and closed inside one firing. | #10 | The measurement itself (4+2 suite runs on GH runners, digest-pinned backends, contact assertion + reset lines verified in every run); PR #10 CI green on both heads; no local gates (docs + workflow diff only) |
 | 2026-09-09 | 8 (routine→session) | B1b + merge directive | Prepared path streams on PG with `rowCount()` drain-then-answer; the three affected unit tests repointed with their premises named; live pin added (`executeStatement` returns 7 through the streamed path; prepared-SELECT `rowCount()` answers 10 where it answered 0). OWNER DIRECTIVE recorded as protocol step 7: standing authorization to merge green, mergeable, stack-ordered loop PRs at the start of each firing — never red, never mid-check, never someone else's. Effective next firing per the directive. | (this PR, stacked on #8) | driver offline 192/433 + live 36/176 (PG; 15 MySQL skips honest), client 714/2047, PHPStan L9 both, Rust//proto untouched. Local PG service crashed a THIRD time mid-gates (restart + clean re-run; CI authoritative). |
 | 2026-09-09 | 7 (routine→session) | B1a | The verify-first rule earned its keep: B1's premise ("the stream terminal carries no `affected` — a /proto change") was measured FALSE — PROTOCOL.md §10 has carried it since S5 and the engine fills it from the command tag; the client's pump dropped the body. Shipped the client half: `StreamTerminal` settled-state cell + `RawStream::{settled, affected, lastInsertId}`, fixture gains scripted DATA frames, unsettled-on-abandon/error/body-less pinned. §22.2 (ag) corrects (ac); B1 split → B1a (this) / B1b (driver, OPEN). | (this PR) | php/client: unit 714/2047 offline + live 50/793 (PG-only; 9 MySQL skips honest — no MySQL in-container), RawStreamLiveTest 4/518 incl. the settled-500 proof through real ferrod, PHPStan L9 clean. Rust untouched; /proto untouched (measured: nothing to change). |
 | 2026-09-09 | 6 (routine→session) | adversarial pass | A5 blocked on merges → the ledger's bug-hunt rule fired: high-effort code review over the unmerged A2+A3 stack. 4 verified findings, all in the vector walker, all FIXED on PR #4's branch pre-merge: (F1) the lower bound was the one recv-enforced field left unchecked — now refused; (F2) MEASURED via `int2vectorsend` that PG sends the empty vector as 1-D/0-items, not 0-D — the dead 0-D accept arm became a refusal and the wrong comment corrected; (F3) the hand-rolled walker documented as deliberate vs `postgres_protocol::array_from_sql` (named-refusal diagnostics); (F4) element OIDs via named `Type` constants. No severe finding survived verification; the §19.3 direction and both live shapes re-verified. | pushed to #4 | lib 73/73, live vector suite green (PG 16.13), fmt, clippy -D warnings, workspace 767/0 on re-run (one first-run failure = local PG service flake, twice-crashed container service; CI authoritative) |
