@@ -1,0 +1,90 @@
+# The M1-S9 A5 measurement lane: run the CURATED doctrine/dbal subset (testkit/dbal-suite.sh)
+# against a chosen backend family, TWICE (the two-run reproducibility rule from §22.2 (z) — the
+# result line AND the ordered failure set must not differ between runs), and upload both logs.
+#
+# ON DEMAND ONLY (workflow_dispatch). It is deliberately NOT part of the per-push `ci` workflow:
+# the suite's bar is "green modulo a recorded, triaged allow-list", so a red phpunit exit here is
+# DATA to record, not a build failure — putting it on every push would either gate merges on a bar
+# M1 has not reached yet or train everyone to ignore a red check. The job FAILS only when a run
+# died before producing a phpunit result line (the contact assertion, the TestUtil patch check, a
+# ferrod that never came up) — the silent-no-op class the runner script exists to refuse.
+#
+# The recording protocol (ledger item A5) lives in docs/dev-loop/LEDGER.md: numbers from THIS lane
+# on a MERGED main, two runs diffed, result + ordered failure set into docs/dbal-suite/ and
+# CLAUDE.md. Dispatch it against main after the M1-S9 engine PRs merge.
+name: dbal-suite
+on:
+  workflow_dispatch:
+    inputs:
+      family:
+        description: "Backend family to measure"
+        type: choice
+        options: [all, pg, mysql, mariadb]
+        default: all
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        family: ${{ fromJSON(inputs.family == 'all' && '["pg","mysql","mariadb"]' || format('["{0}"]', inputs.family)) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with: { php-version: "8.4", extensions: msgpack, tools: composer }
+      - uses: dtolnay/rust-toolchain@stable
+      # The suite resets its database via `docker compose exec`, so the family's container must be
+      # the testkit one — same digest-pinned image, credentials and healthcheck as every other lane.
+      - run: docker compose -f testkit/docker-compose.yml up -d --wait ${{ matrix.family }}
+      - name: suite, run 1 of 2
+        run: |
+          set -o pipefail +e
+          case "${{ matrix.family }}" in
+            pg)      dsn="postgres://ferro:ferro@127.0.0.1:55432/doctrine_tests" ;;
+            mysql)   dsn="mysql://ferro:ferro@127.0.0.1:33060/doctrine_tests" ;;
+            mariadb) dsn="mysql://ferro:ferro@127.0.0.1:33061/doctrine_tests" ;;
+          esac
+          echo "FERRO_DBAL_DSN=$dsn" >> "$GITHUB_ENV"
+          FERRO_DBAL_SVC="${{ matrix.family }}" FERRO_DBAL_DSN="$dsn" \
+            ./testkit/dbal-suite.sh 2>&1 | tee run1.log
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+      - name: suite, run 2 of 2 (reproducibility)
+        run: |
+          set -o pipefail +e
+          FERRO_DBAL_SVC="${{ matrix.family }}" FERRO_DBAL_DSN="$FERRO_DBAL_DSN" \
+            ./testkit/dbal-suite.sh 2>&1 | tee run2.log
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+      - name: result lines + broken-run gate
+        run: |
+          for f in run1.log run2.log; do
+            # A run that produced NO phpunit result line did not measure anything — the pre-flight
+            # (contact assertion, TestUtil patch, ferrod startup) died. That, and only that, is a
+            # lane failure; a result line with failures/errors is the measurement.
+            if ! grep -Eq '^(OK |Tests: |ERRORS!|FAILURES!|OK, but)' "$f"; then
+              echo "::error:: $f contains no phpunit result line — the run died before measuring"
+              tail -40 "$f"
+              exit 1
+            fi
+          done
+          {
+            echo "## dbal-suite · ${{ matrix.family }}"
+            echo '```'
+            echo "run 1: $(grep -E '^(Tests: |OK)' run1.log | tail -1)"
+            echo "run 2: $(grep -E '^(Tests: |OK)' run2.log | tail -1)"
+            echo '```'
+            echo "Reset lines (a recorded run must show them):"
+            echo '```'
+            grep '\[ferro\] reset:' run1.log run2.log || echo "NONE — do not record this run"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dbal-suite-${{ matrix.family }}-${{ github.run_id }}
+          path: |
+            run1.log
+            run2.log
+            .dbal-suite/ferrod.log
+          if-no-files-found: warn
