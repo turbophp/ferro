@@ -124,6 +124,78 @@ final class RawStreamTest extends TestCase
     }
 
     /**
+     * M1-S9 B1a: the terminal's `affected` reaches the handle — but only AFTER the drain. The wire
+     * has ALWAYS carried it (the engine reads the command tag post-drain); what this pins is the
+     * client-side capture that §22.2 (ac) wrongly recorded as a missing wire field. Mid-iteration
+     * the answer is honestly "not yet" (`settled() === false`, `affected() === null`), never a
+     * hardcoded 0 — the exact defect class the engine side's `StreamEnd` docs refuse. The
+     * WINDOW_UPDATE count rides along: one per consumed DATA frame, so the settled capture cannot
+     * have been bought by skipping the credit discipline.
+     */
+    public function testAffectedSettlesOnlyAfterTheDrain(): void
+    {
+        $session = (new FakeSession())
+            ->thenStreamHead([['name' => 'id', 'tag' => C::TAG_I64]])
+            ->thenStreamFrames([
+                [
+                    'type' => 'data',
+                    'rows' => [
+                        [['tag' => C::TAG_I64, 'data' => 7]],
+                        [['tag' => C::TAG_I64, 'data' => 8]],
+                    ],
+                    'bytes' => 16,
+                ],
+                [
+                    'type' => 'end',
+                    'outcome' => FakeSession::execOk([
+                        'cols' => [],
+                        'rows' => [],
+                        'affected' => 2,
+                        'last_insert_id' => null,
+                        'stats' => ['queue_us' => 0, 'exec_us' => 0, 'rows' => 2, 'bytes' => 16],
+                    ]),
+                ],
+            ]);
+        $conn = new Connection($session, 'default');
+
+        $stream = $conn->streamRaw('SELECT id FROM t', [], true);
+        $rows = [];
+        foreach ($stream->rows() as $row) {
+            $rows[] = $row;
+            self::assertFalse($stream->settled(), 'mid-iteration the terminal has not arrived');
+            self::assertNull($stream->affected(), 'never a premature (or hardcoded-0) affected');
+        }
+
+        self::assertSame([[7], [8]], $rows);
+        self::assertTrue($stream->settled(), 'the drain reached the Ok terminal');
+        self::assertSame(2, $stream->affected(), 'the terminal ExecOk affected must surface');
+        self::assertNull($stream->lastInsertId(), 'PG streams report no generated key');
+        self::assertSame(1, $session->windowUpdateCount, 'one WINDOW_UPDATE per consumed DATA frame');
+        self::assertSame(0, $session->abandonCount, 'a drained stream has nothing to abandon');
+    }
+
+    /**
+     * The two never-settle shapes, pinned so `settled()` cannot rot into "true-ish once anything
+     * happened": an ABANDONED stream (the command tag was never read — inventing an affected
+     * would be the hardcoded-0 defect) and the defensive BODY-LESS Ok end-at-open (no ExecOk
+     * payload means no information, not a decode fault — the fixture's `thenStreamEnd()` is
+     * exactly that shape).
+     */
+    public function testAbandonedAndBodylessTerminalsNeverSettle(): void
+    {
+        $abandoned = (new FakeSession())->thenStreamHead([['name' => 'id', 'tag' => C::TAG_I64]]);
+        $stream = (new Connection($abandoned, 'default'))->streamRaw('SELECT id FROM t', [], true);
+        $stream->close();
+        self::assertFalse($stream->settled());
+        self::assertNull($stream->affected());
+
+        $bodyless = (new FakeSession())->thenStreamEnd();
+        $immediate = (new Connection($bodyless, 'default'))->streamRaw('SELECT 1', [], true);
+        self::assertFalse($immediate->settled(), 'a body-less Ok carries no ExecOk to settle from');
+        self::assertNull($immediate->affected());
+    }
+
+    /**
      * `rows()` after `close()` is a caller bug, not a silently empty result. The generator behind a
      * closed handle is pointed at a stream the engine has already been told to cancel, so yielding
      * from it would read frames belonging to somebody else's request.

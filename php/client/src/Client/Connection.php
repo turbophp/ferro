@@ -544,16 +544,43 @@ final class Connection
         if ($opened['type'] === 'end') {
             // A known fate decided before any HEAD/DATA went out (e.g. a checkout failure). Throws
             // on an error terminal; otherwise there is genuinely nothing to read and — the reason
-            // the session below is `null` — nothing to abandon either.
+            // the session below is `null` — nothing to abandon either. An Ok terminal here is a
+            // COMPLETE statement, so it settles immediately (M1-S9 B1a): its `affected` is as real
+            // as any drained stream's.
             $this->throwIfError($opened['outcome']);
-            return new RawStream([], (static function (): \Generator { yield from []; })(), null, 0);
+            $terminal = new StreamTerminal();
+            $this->settleStreamTerminal($terminal, $opened['outcome']);
+            return new RawStream([], (static function (): \Generator { yield from []; })(), null, 0, $terminal);
         }
         $rid = $opened['requestId'];
         // `list<string>`: the ColMeta TAG is dropped here ON PURPOSE, for the same reason
         // {@see stream} drops it — the decode authority is the PER-CELL tag
         // ({@see ExecCodec::decodeRow}), and the buffered path drops it too.
         $cols = array_map(static fn (array $c): string => $c['name'], $opened['cols']);
-        return new RawStream($cols, $this->pumpRaw($session, $rid), $session, $rid);
+        $terminal = new StreamTerminal();
+        return new RawStream($cols, $this->pumpRaw($session, $rid, $terminal), $session, $rid, $terminal);
+    }
+
+    /**
+     * Decode an Ok stream terminal's `ExecOk` body into the shared {@see StreamTerminal} cell —
+     * the ONE writer both settle sites use (M1-S9 B1a), so the end-at-open path and the drained
+     * path can never disagree on what a settled terminal means. The caller has ALREADY run
+     * {@see throwIfError}: an error terminal never settles (the command tag was never read).
+     */
+    private function settleStreamTerminal(StreamTerminal $terminal, Outcome $outcome): void
+    {
+        // A BODY-LESS Ok stays unsettled rather than becoming a decode error or an invented 0.
+        // The real engine's stream terminal always carries an ExecOk body (success sends HEAD
+        // first, and `build_stream_terminal_body` always encodes one), so this arm is defensive —
+        // but the end-at-open shape is defensive TOO, and a defensive path that throws on the
+        // other defensive path's input would turn "no information" into a fault.
+        if ($outcome->body() === '') {
+            return;
+        }
+        $ok = $this->codec->decode($outcome);
+        $terminal->affected = $ok['affected'];
+        $terminal->lastInsertId = $ok['last_insert_id'];
+        $terminal->settled = true;
     }
 
     /**
@@ -562,9 +589,15 @@ final class Connection
      * iff the terminal was never reached AND no wire operation has already failed (a second wire op
      * on a broken connection would mask or replace the real exception).
      *
+     * On the Ok terminal the shared {@see StreamTerminal} cell settles with the ExecOk body's
+     * `affected`/`last_insert_id` (M1-S9 B1a) — the wire always carried them; this is where the
+     * client stops dropping them. An error terminal, an abandonment and a wire failure all leave
+     * the cell UNSETTLED, deliberately: the command tag of a statement that did not drain cleanly
+     * was never read, and a hardcoded 0 is the exact defect the engine side refuses.
+     *
      * @return \Generator<int, list<mixed>>
      */
-    private function pumpRaw(StreamingSessionInterface $session, int $rid): \Generator
+    private function pumpRaw(StreamingSessionInterface $session, int $rid, StreamTerminal $terminal): \Generator
     {
         $reachedTerminal = false;
         $wireFailed = false;
@@ -579,6 +612,7 @@ final class Connection
                 if ($frame['type'] === 'end') {
                     $reachedTerminal = true;
                     $this->throwIfError($frame['outcome']);
+                    $this->settleStreamTerminal($terminal, $frame['outcome']);
                     return;
                 }
                 foreach ($frame['rows'] as $rawRow) {

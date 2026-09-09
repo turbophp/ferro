@@ -34,13 +34,54 @@ final class RawStream
      * @param ?StreamingSessionInterface $session null when the stream reached its terminal during
      *   the open (a known fate decided before any HEAD/DATA went out) — nothing to abandon, and
      *   {@see close} must NOT invent a wire operation for a request id that was never a stream.
+     * @param StreamTerminal $terminal the shared settled-state cell {@see Connection}'s pump
+     *   writes when the generator reaches the Ok terminal (M1-S9 B1a). Shared BY CONSTRUCTION:
+     *   the pump exists before this handle does, so the cell is how the two meet. DEFAULTED so a
+     *   handle built without a pump (the Doctrine tier's unit fixtures construct one around a
+     *   plain generator) is simply never-settled — the honest state for a stream nothing drains
+     *   through the real terminal path.
      */
     public function __construct(
         private readonly array $cols,
         private readonly \Generator $rows,
         private readonly ?StreamingSessionInterface $session,
         private readonly int $requestId,
+        private readonly StreamTerminal $terminal = new StreamTerminal(),
     ) {}
+
+    /**
+     * Whether the stream reached its Ok terminal — the gate for {@see affected} and
+     * {@see lastInsertId}. `false` mid-iteration, after {@see close}-before-drain (an abandoned
+     * statement's command tag was never read), and after an error terminal (the taxonomy
+     * exception is the answer there). See {@see StreamTerminal} for why the flag is explicit
+     * rather than a nullable-field convention.
+     */
+    public function settled(): bool
+    {
+        return $this->terminal->settled;
+    }
+
+    /**
+     * The terminal's command-tag affected-row count, or `null` until {@see settled}. On the only
+     * streaming backend today (PostgreSQL) a drained `SELECT` reports the number of rows it
+     * returned and a DML its affected-row count — the value `Doctrine\DBAL\Result::rowCount()`
+     * needs, and the reason the prepared path can stop buffering (M1-S9 B1a; §22.2 (ac) as
+     * amended: the wire ALWAYS carried this, the client dropped it).
+     */
+    public function affected(): ?int
+    {
+        return $this->terminal->settled ? $this->terminal->affected : null;
+    }
+
+    /**
+     * The terminal's generated key, `null` until {@see settled} — and null AFTER it on every
+     * streamed statement today (PG reports none; MySQL streaming is deferred, §22.2 (n)). Gate on
+     * {@see settled} to tell the two nulls apart.
+     */
+    public function lastInsertId(): int|string|null
+    {
+        return $this->terminal->settled ? $this->terminal->lastInsertId : null;
+    }
 
     /** @return list<string> */
     public function columns(): array
