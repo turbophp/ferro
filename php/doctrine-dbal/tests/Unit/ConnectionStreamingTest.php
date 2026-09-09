@@ -57,15 +57,32 @@ final class ConnectionStreamingTest extends TestCase
 
     public function testQueryReturnsALazyStreamedResultCarryingTheHeadColumns(): void
     {
-        $session = self::head();
+        // M1-S9 B1b: rowCount() is DRAIN-THEN-ANSWER now, so the script carries the terminal it
+        // will drain through — an ExecOk whose affected is the command-tag count (§22.2 (ah); the
+        // old assertion here, "a streamed terminal carries no affected count", was (ac)'s premise
+        // and was measured false in (ag)).
+        $session = self::head()->thenStreamFrames([
+            [
+                'type' => 'end',
+                'outcome' => FakeSession::execOk([
+                    'cols' => [],
+                    'rows' => [],
+                    'affected' => 3,
+                    'last_insert_id' => null,
+                    'stats' => ['queue_us' => 0, 'exec_us' => 0, 'rows' => 0, 'bytes' => 0],
+                ]),
+            ],
+        ]);
         $result = self::pgConn($session)->query('SELECT id, note FROM t');
 
         self::assertInstanceOf(Result::class, $result);
         self::assertTrue($result->isStreaming(), 'query() on a PostgreSQL pool must stream');
         self::assertSame(2, $result->columnCount(), 'the HEAD frame is read during the open');
         self::assertSame('note', $result->getColumnName(1));
-        self::assertSame(0, $result->rowCount(), 'a streamed terminal carries no affected count');
-        self::assertSame(0, $session->abandonCount, 'and nothing is cancelled while it is live');
+        self::assertSame(0, $session->abandonCount, 'nothing is cancelled while it is live');
+        self::assertSame(3, $result->rowCount(), 'rowCount() drains to the terminal and answers it');
+        self::assertFalse($result->isStreaming(), 'the drain closed the stream');
+        self::assertSame(0, $session->abandonCount, 'a drained stream has nothing to abandon');
     }
 
     /**
@@ -151,7 +168,10 @@ final class ConnectionStreamingTest extends TestCase
     {
         $session = self::head();
         return match ($op) {
-            'exec', 'runPrepared' => $session->thenExecOk(null),
+            'exec' => $session->thenExecOk(null),
+            // M1-S9 B1b: runPrepared STREAMS on PG, so "succeeds if it ever reaches the wire"
+            // now means a second HEAD, not a buffered ExecOk.
+            'runPrepared' => $session->thenStreamHead([['name' => 'id', 'tag' => C::TAG_I64]]),
             'beginTransaction' => $session->push(FakeSession::beginOk(1), [C::SERVICE_TX, C::METHOD_TX_BEGIN]),
             'commit' => $session
                 ->push(FakeSession::beginOk(1), [C::SERVICE_TX, C::METHOD_TX_BEGIN])

@@ -185,17 +185,13 @@ final class Connection implements DriverConnection
     }
 
     /**
-     * The ZERO-PARAMETER read path, and the ONE place this driver streams.
-     * `Doctrine\DBAL\Connection::executeQuery()` calls it directly when there are no parameters and
-     * — crucially — never asks the result for a row count, so nothing here can be made wrong by a
-     * terminal that carries no `affected`.
+     * The ZERO-PARAMETER path — since M1-S9 B1b one of TWO places this driver streams on
+     * PostgreSQL ({@see runPrepared} is the other; `exec()` alone stays buffered, see its doc).
      *
-     * **Why the prepared path does not stream.** `executeStatement()` with parameters is
-     * `$stmt->execute()->rowCount()`, and a streamed request's terminal carries no `affected` field
-     * (the HEAD/DATA/END producer has none), so streaming there would make every parameterized
-     * write return 0 — a silently wrong value, which is worse than buffering. Adding `affected` to
-     * the stream terminal is a `/proto` change (registry + golden vectors + both codecs) and is
-     * DEFERRED, not smuggled in here.
+     * The paragraph that used to sit here — "the prepared path does not stream because a streamed
+     * terminal carries no `affected`" — was MEASURED FALSE (§22.2 (ag)): the wire always carried
+     * the command-tag count; the client dropped it until B1a. With `RawStream::affected()` real,
+     * `Result::rowCount()` drains-then-answers (§22.2 (ah)) and the prepared path streams too.
      *
      * **Why MySQL buffers.** `PoolBackend::supports_row_streaming()` is false for MySQL/MariaDB
      * (SPEC §22.2 (n), controller decision D-S8b-2), where `streamRaw()` would come back as a clean
@@ -236,6 +232,10 @@ final class Connection implements DriverConnection
     {
         $this->settleOpenStream();
         $this->refuseIsolationStatement($sql);
+        // Deliberately NOT streamed even on PG (M1-S9 B1b streams query()+runPrepared): this
+        // method's CONTRACT is the affected count, so a stream would be opened and drained inside
+        // one call — the same wire cost as fetch:none with more moving parts, on the path
+        // Doctrine's own savepoints ride.
         try {
             return $this->ferro->fetchRaw($sql, [], $this->readonly, false)['affected'];
         } catch (FerroException $e) {
@@ -271,6 +271,25 @@ final class Connection implements DriverConnection
     {
         $this->settleOpenStream();
         $this->refuseIsolationStatement($sql);
+        // M1-S9 B1b: the prepared path STREAMS on PostgreSQL, exactly as {@see query} does — the
+        // blocker (ac) recorded was measured false in (ag), and Result::rowCount() now
+        // drains-then-answers (§22.2 (ah)), so `executeStatement()`'s
+        // `$stmt->execute()->rowCount()` gets the REAL command-tag count: a parameterized WRITE
+        // produces no DATA frames, so its "drain" is just reading the terminal that was arriving
+        // anyway. The tx_id routing invariant above is untouched — `streamRaw()` rides the open
+        // transaction's session and tx_id exactly as `fetchRaw()` does (its own doc: "either half
+        // missing is a silent wrong answer"), and TransactionRoutingTest reads the tx_id off the
+        // encoded request either way.
+        if ($this->poolKind === PlatformVersion::KIND_POSTGRES) {
+            try {
+                $stream = $this->ferro->streamRaw($sql, $params, $this->readonly);
+            } catch (FerroException $e) {
+                throw DriverException::fromFerro($e);
+            }
+            $result = Result::streamed($stream);
+            $this->openStream = \WeakReference::create($result);
+            return $result;
+        }
         try {
             $raw = $this->ferro->fetchRaw($sql, $params, $this->readonly, true);
         } catch (FerroException $e) {

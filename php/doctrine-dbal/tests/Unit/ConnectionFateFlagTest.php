@@ -66,17 +66,41 @@ final class ConnectionFateFlagTest extends TestCase
         return ['a write connection (the default)' => [false], 'driverOptions.readonly' => [true]];
     }
 
-    #[DataProvider('fates')]
-    public function testTheConnectionLevelFateDeclarationReachesTheWireOnTheParameterisedPath(bool $readonly): void
-    {
-        $session = (new FakeSession())->thenExecOk(null);
-        $c = self::driverConn($session, $readonly);
+    /**
+     * Amended by M1-S9 B1b exactly as `query()`'s row was by Task 12: the PREPARED path now
+     * streams on PostgreSQL too (§22.2 (ah)), so it asks `fetch:stream` there and keeps
+     * `fetch:rows` on the MySQL family — both pinned per fate, so the fork rides beside the
+     * declaration instead of silently replacing this test's old single-family `fetch:rows`
+     * assertion.
+     */
+    #[DataProvider('preparedFetchModes')]
+    public function testTheConnectionLevelFateDeclarationReachesTheWireOnTheParameterisedPath(
+        bool $readonly,
+        string $kind,
+        int $expectedFetch,
+    ): void {
+        $session = $kind === PlatformVersion::KIND_POSTGRES
+            ? (new FakeSession())->thenStreamHead([['name' => 'id', 'tag' => C::TAG_I64]])
+            : (new FakeSession())->thenExecOk(null);
+        $c = self::driverConn($session, $readonly, $kind);
 
         $c->prepare('INSERT INTO t (v) VALUES (?) RETURNING id')->execute();
 
         $req = self::decodeExec($session->lastRequest()['payload']);
         self::assertSame($readonly, $req['readonly'], 'the driver declares the fate; the engine never infers it');
-        self::assertSame(0, $req['fetch'], 'a statement that may return rows asks for fetch:rows (0)');
+        self::assertSame($expectedFetch, $req['fetch']);
+        self::assertNotSame(ExecCodec::FETCH_NONE, $req['fetch'], 'the prepared path must be able to return rows');
+    }
+
+    /** @return array<string, array{0: bool, 1: string, 2: int}> */
+    public static function preparedFetchModes(): array
+    {
+        return [
+            'write conn, PG streams' => [false, PlatformVersion::KIND_POSTGRES, ExecCodec::FETCH_STREAM],
+            'readonly conn, PG streams' => [true, PlatformVersion::KIND_POSTGRES, ExecCodec::FETCH_STREAM],
+            'write conn, MySQL buffers' => [false, PlatformVersion::KIND_MYSQL, ExecCodec::FETCH_ROWS],
+            'readonly conn, MySQL buffers' => [true, PlatformVersion::KIND_MYSQL, ExecCodec::FETCH_ROWS],
+        ];
     }
 
     #[DataProvider('fates')]

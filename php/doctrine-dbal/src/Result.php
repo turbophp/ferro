@@ -62,7 +62,10 @@ final class Result implements ResultInterface
     private function __construct(
         private array $cols,
         private array $rows,
-        private readonly int $affected,
+        // NOT readonly since M1-S9 B1b: a streamed result's affected count only EXISTS once the
+        // drain reaches the Ok terminal, so {@see materialize} writes it then (from
+        // `RawStream::affected()`); the buffered mode still sets it once here and never again.
+        private int $affected,
         private int $cursor = 0,
     ) {}
 
@@ -80,8 +83,12 @@ final class Result implements ResultInterface
      * which is what makes `Doctrine\DBAL\Result::iterateAssociative()` — literally
      * `while (($row = $this->fetchAssociative()) !== false) yield $row;` — never buffer.
      *
-     * `affected` is `0`: the HEAD/DATA/END producer carries no such field, which is exactly why the
-     * PREPARED path does not stream ({@see \Ferro\DBAL\Connection::query}).
+     * `affected` STARTS at `0` and settles when the drain reaches the Ok terminal (M1-S9 B1b):
+     * the wire has always carried the command-tag count there (§22.2 (ag) corrected (ac)'s
+     * contrary claim), `RawStream::affected()` surfaces it since B1a, and {@see materialize}
+     * captures it — which is what lets the PREPARED path stream ({@see rowCount} drains on
+     * demand). A stream that never settles (freed before the terminal, or a fixture with no
+     * pump) honestly keeps the `0`.
      */
     public static function streamed(RawStream $stream): self
     {
@@ -169,6 +176,11 @@ final class Result implements ResultInterface
             $rest[] = $gen->current();
             $this->advance($gen);
         }
+        // M1-S9 B1b: the drain just reached the Ok terminal, so the shared cell is settled and the
+        // command-tag count is real — capture it BEFORE dropping the stream handle. A stream that
+        // did not settle (a pump-less fixture) keeps the honest 0; it can never be a real drained
+        // stream, whose terminal always carries an ExecOk (§22.2 (ag)).
+        $this->affected = $this->stream?->affected() ?? $this->affected;
         $this->rows = $rest;
         $this->cursor = 0;
         $this->gen = null;
@@ -321,8 +333,21 @@ final class Result implements ResultInterface
      * reported as-is rather than normalised — normalising it would mean counting rows, which is
      * exactly the conflation above.
      */
+    /**
+     * The terminal's `affected` — and on a STILL-OPEN streamed result, DRAIN-THEN-ANSWER
+     * (M1-S9 B1b): the count only exists at the terminal, so asking for it means finishing the
+     * read. That is the decision `executeStatement()` forces — DBAL returns
+     * `$stmt->execute()->rowCount()`, so the prepared path could not stream at all without it —
+     * and it is the honest trade: pure iteration still never buffers, `rowCount()` on a streamed
+     * SELECT costs the remainder of the stream and answers what `pdo_pgsql` answers (the
+     * command-tag row count) instead of the flat `0` the streamed route reported before. A
+     * FREED-before-drain result keeps its `0`: the tag was never read.
+     */
     public function rowCount(): int
     {
+        if ($this->stream !== null) {
+            $this->materialize();
+        }
         return $this->affected;
     }
 

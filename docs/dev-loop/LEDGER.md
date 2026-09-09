@@ -48,8 +48,16 @@ nothing in this file overrides any of them.
    with evidence, never left only in the session transcript.
 6. **Ship**: commit on a fresh branch `claude/dev-loop/YYYYMMDD-HHMM-<slug>`, push with
    `-u origin`, open a PR to `main`, subscribe to its activity, and drive it to green.
-   **Never merge a PR** (humans merge), never push to `main`, never force-push someone else's
-   branch, never re-litigate a SPEC §21 or product-log P1–P12 decision.
+   Never push to `main` directly, never force-push someone else's branch, never re-litigate a
+   SPEC §21 or product-log P1–P12 decision.
+7. **Merge — standing owner authorization (directive, 2026-09-09).** The loop MAY merge a
+   `claude/dev-loop/*` PR itself when ALL of these hold: every CI check is GREEN on the current
+   head; the PR is mergeable (no conflict); any PR it stacks on is merged FIRST (stack order);
+   and no human review is pending or requesting changes. Merge with a merge commit (the repo's
+   convention). **Never merge red, never merge with checks still running, never merge a PR the
+   loop did not open.** Merging happens at the START of a firing (part of step 1's PR tending),
+   so every merge is against a freshly verified state — and the phase-gate rule stands: moving
+   to the next phase still requires the current phase's acceptance bar re-measured and recorded.
 
 **Scope guardrails** (from the charter + product vision, restated because a loop drifts):
 correctness over throughput — perf work only against recorded bench numbers (§16.1); no ORM
@@ -95,7 +103,7 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 | # | Item | State | Notes |
 |---|------|-------|-------|
 | B1a | Stream terminal `affected` reaches the client | IN-FLIGHT | **The item's premise was FALSE** (verify-the-defect-first caught it): the wire + engine ALWAYS carried a truthful `affected` (command tag, post-drain); the client dropped it. No `/proto` change exists to make. `RawStream::{settled, affected, lastInsertId}` now settle on the Ok terminal — null-until-settled, never an invented 0. Proven live (500-row drain → affected 500). §22.2 (ag) corrects (ac). |
-| B1b | Driver prepared path streams using B1a | OPEN | The remaining half of the old B1: `Ferro\DBAL` `Result` rides `RawStream` on the prepared PG read path; the one open decision is `rowCount()` on an undrained stream (drain-then-answer vs unsettled). Closes the last §14 never-buffer gap. |
+| B1b | Driver prepared path streams using B1a | IN-FLIGHT | `runPrepared` streams on PG (`exec` deliberately keeps `fetch:none` — savepoints ride it); the open decision made: `Result::rowCount()` is **drain-then-answer** (drained rows stay fetchable; freed-before-terminal keeps 0). Closes §14's never-buffer clause on PG and restores `pdo_pgsql` `rowCount()` parity on streamed SELECTs. §22.2 (ah); known-incompatibilities entry replaced. |
 | B2 | MySQL/MariaDB `query_stream` | OPEN | §22.2 (n), deferred at S6/S8b (D-S8b-2). |
 | B3 | `/proto` `TxNotFound` error code | OPEN | So `rollBack()` need not swallow `ERR_PROTOCOL` for a tombstoned `tx_id`. |
 | B4 | Savepoint verbs in the assist-lexer safe-list | OPEN | `ferro-classify`. |
@@ -162,6 +170,7 @@ failed iteration — a silent iteration is indistinguishable from a dead loop.
 
 | When (UTC) | Iteration | Item(s) | Outcome | PR | Gates run |
 |------------|-----------|---------|---------|----|-----------|
+| 2026-09-09 | 8 (routine→session) | B1b + merge directive | Prepared path streams on PG with `rowCount()` drain-then-answer; the three affected unit tests repointed with their premises named; live pin added (`executeStatement` returns 7 through the streamed path; prepared-SELECT `rowCount()` answers 10 where it answered 0). OWNER DIRECTIVE recorded as protocol step 7: standing authorization to merge green, mergeable, stack-ordered loop PRs at the start of each firing — never red, never mid-check, never someone else's. Effective next firing per the directive. | (this PR, stacked on #8) | driver offline 192/433 + live 36/176 (PG; 15 MySQL skips honest), client 714/2047, PHPStan L9 both, Rust//proto untouched. Local PG service crashed a THIRD time mid-gates (restart + clean re-run; CI authoritative). |
 | 2026-09-09 | 7 (routine→session) | B1a | The verify-first rule earned its keep: B1's premise ("the stream terminal carries no `affected` — a /proto change") was measured FALSE — PROTOCOL.md §10 has carried it since S5 and the engine fills it from the command tag; the client's pump dropped the body. Shipped the client half: `StreamTerminal` settled-state cell + `RawStream::{settled, affected, lastInsertId}`, fixture gains scripted DATA frames, unsettled-on-abandon/error/body-less pinned. §22.2 (ag) corrects (ac); B1 split → B1a (this) / B1b (driver, OPEN). | (this PR) | php/client: unit 714/2047 offline + live 50/793 (PG-only; 9 MySQL skips honest — no MySQL in-container), RawStreamLiveTest 4/518 incl. the settled-500 proof through real ferrod, PHPStan L9 clean. Rust untouched; /proto untouched (measured: nothing to change). |
 | 2026-09-09 | 6 (routine→session) | adversarial pass | A5 blocked on merges → the ledger's bug-hunt rule fired: high-effort code review over the unmerged A2+A3 stack. 4 verified findings, all in the vector walker, all FIXED on PR #4's branch pre-merge: (F1) the lower bound was the one recv-enforced field left unchecked — now refused; (F2) MEASURED via `int2vectorsend` that PG sends the empty vector as 1-D/0-items, not 0-D — the dead 0-D accept arm became a refusal and the wrong comment corrected; (F3) the hand-rolled walker documented as deliberate vs `postgres_protocol::array_from_sql` (named-refusal diagnostics); (F4) element OIDs via named `Type` constants. No severe finding survived verification; the §19.3 direction and both live shapes re-verified. | pushed to #4 | lib 73/73, live vector suite green (PG 16.13), fmt, clippy -D warnings, workspace 767/0 on re-run (one first-run failure = local PG service flake, twice-crashed container service; CI authoritative) |
 | 2026-09-09 | 5 (routine→session) | A5 (enabler) | Built the `dbal-suite` measurement lane: a `workflow_dispatch` GH Actions job running `testkit/dbal-suite.sh` per family (matrix from the input), TWICE per the reproducibility rule, uploading both logs + ferrod.log as artifacts, with a broken-run gate that fails ONLY when a run produced no phpunit result line (a red suite is data, not a build failure — deliberately not in the per-push `ci` workflow). Needed because this container cannot run Docker; the recorded environment must be the digest-pinned backends anyway. | (this PR) | YAML validated; the lane itself is exercised on first dispatch — recorded honestly as UNRUN until then. Rust/PHP untouched this iteration. |

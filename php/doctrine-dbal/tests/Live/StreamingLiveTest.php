@@ -145,6 +145,44 @@ final class StreamingLiveTest extends DbalLiveTestCase
      * throw a `ProtocolException` without `settleOpenStream()`. This is the test that keeps the
      * streaming optimisation from shipping as a user-visible defect.
      */
+    /**
+     * M1-S9 B1b, the headline pins: the PREPARED path streams on PostgreSQL, and nobody can tell
+     * except by the two numbers getting BETTER. `executeStatement()` with parameters — which is
+     * `$stmt->execute()->rowCount()`, the exact shape (ac) said made prepared streaming impossible
+     * — returns the REAL command-tag count via drain-then-answer (a write has no DATA frames, so
+     * its "drain" is the terminal that was arriving anyway); and `executeQuery(...)->rowCount()`
+     * on a parameterized SELECT answers what `pdo_pgsql` answers (the row count) instead of the
+     * flat 0 the streamed route used to report. The laziness itself is pinned by the memory probe
+     * above and the interleave/abandon pair below, which all run through this same path now.
+     */
+    public function testThePreparedPathStreamsAndStillReportsRealAffectedCounts(): void
+    {
+        $c = $this->dbal();
+        $c->executeStatement('DROP TABLE IF EXISTS s9_prep');
+        $c->executeStatement('CREATE TABLE s9_prep (id int primary key, n int)');
+        $c->executeStatement('INSERT INTO s9_prep SELECT g, 0 FROM generate_series(1, 50) g');
+
+        self::assertSame(
+            7,
+            $c->executeStatement('UPDATE s9_prep SET n = 1 WHERE id <= ?', [7]),
+            'a parameterized write must report its REAL affected count through the streamed path',
+        );
+        $result = $c->executeQuery('SELECT id FROM s9_prep WHERE id <= ? ORDER BY id', [10]);
+        self::assertSame(
+            10,
+            $result->rowCount(),
+            'rowCount() on a prepared SELECT drains-then-answers the command-tag row count — '
+            . 'pdo_pgsql parity, where the streamed route used to answer 0',
+        );
+        self::assertCount(
+            10,
+            $result->fetchAllAssociative(),
+            'the drained rows are still fetchable after rowCount() — drain-then-answer buffers, never discards',
+        );
+
+        $c->executeStatement('DROP TABLE s9_prep');
+    }
+
     public function testWritingInsideAnIterationWorks(): void
     {
         $c = $this->dbal();
