@@ -299,6 +299,178 @@ pub(crate) fn char_byte_to_text(b: u8) -> Result<String, PoolError> {
     }
 }
 
+/// The element kind of a PG catalog *vector* — the discriminator [`vector_to_text`] renders by.
+/// Private on purpose: the public surface is the two OID-named functions below, so a call site
+/// always names the exact type it was gated on (same shape as the `json`/`jsonb` flag).
+#[derive(Clone, Copy)]
+enum VectorElem {
+    /// `int2vector` elements: 2-byte big-endian `i16` (element type OID 21, `int2`).
+    Int2,
+    /// `oidvector` elements: 4-byte big-endian `u32` (element type OID 26, `oid`).
+    Oid,
+}
+
+impl VectorElem {
+    fn label(self) -> &'static str {
+        match self {
+            VectorElem::Int2 => "int2vector",
+            VectorElem::Oid => "oidvector",
+        }
+    }
+
+    /// The element type OID `array_send` stamps into the payload — verified, never assumed, and
+    /// spelled via the NAMED types (review F4): the unit fixtures build payloads with the same
+    /// constants, so a bare literal here would make the cross-check number-against-number with no
+    /// tie to the type it claims to verify.
+    fn elem_oid(self) -> u32 {
+        match self {
+            VectorElem::Int2 => tokio_postgres::types::Type::INT2.oid(),
+            VectorElem::Oid => tokio_postgres::types::Type::OID.oid(),
+        }
+    }
+
+    fn elem_len(self) -> usize {
+        match self {
+            VectorElem::Int2 => 2,
+            VectorElem::Oid => 4,
+        }
+    }
+}
+
+/// PG `int2vector` (OID 22) → PG's own text output (`int2vectorout`): the elements in decimal,
+/// separated by SINGLE spaces, and the empty vector as the EMPTY string — `"1 3"`, never the
+/// regular-array `"{1,3}"` form. This is byte-identical to what `pdo_pgsql` hands stock Doctrine,
+/// which matters because DBAL's `PostgreSQLSchemaManager` selects `pg_index.indkey` raw (M1-S9;
+/// `docs/followups/2026-08-11-pg-int2vector-blocks-the-schema-manager.md`).
+///
+/// The BINARY payload is the standard array wire format (`int2vectorsend` IS `array_send`):
+/// ndim/flags/element-oid header, one dims/lbound pair for the single dimension, then per element
+/// a length word and the big-endian value. Vectors are 1-D and never hold NULLs by construction
+/// (`int2vectorrecv` enforces both), so either arriving here is a malformed payload — `Backend`
+/// (SPEC §9.1), never a panic.
+pub fn int2vector_to_text(raw: &[u8]) -> Result<String, PoolError> {
+    vector_to_text(raw, VectorElem::Int2)
+}
+
+/// PG `oidvector` (OID 30) → PG's own text output (`oidvectorout`) — same family, format and
+/// rules as [`int2vector_to_text`]; elements are 4-byte unsigned oids (`pg_proc.proargtypes`,
+/// `pg_index.indclass`). Decided together with `int2vector` per the follow-up doc's question 2.
+pub fn oidvector_to_text(raw: &[u8]) -> Result<String, PoolError> {
+    vector_to_text(raw, VectorElem::Oid)
+}
+
+/// The shared array-wire-format walker behind the two vector renderers. Strict on EVERY header
+/// field, used for rendering or not — it mirrors `int2vectorrecv`'s own gate exactly (PG
+/// `src/backend/utils/adt/int.c`: ndim must be 1, no NULL bitmap, the right element OID, lower
+/// bound 0): a violation of any of them means the payload is not the vector the OID gate
+/// admitted, and each is a distinct, named `Backend` refusal (decode mismatch, SPEC §9.1).
+///
+/// Hand-rolled DELIBERATELY, not via `postgres_protocol::types::array_from_sql` (which is in the
+/// dependency tree and parses this same format — review F3 names the trade-off): that helper's
+/// refusals are generic parse errors, and the whole point of this walker is that each malformed
+/// shape gets its OWN named refusal with the offending value in the message. ~60 lines of
+/// byte-walking is the price of §9.1-grade diagnostics.
+fn vector_to_text(raw: &[u8], elem: VectorElem) -> Result<String, PoolError> {
+    let what = elem.label();
+    let take_i32 = |cur: &mut usize, field: &str| -> Result<i32, PoolError> {
+        let end = *cur + 4;
+        let b: [u8; 4] = raw
+            .get(*cur..end)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| {
+                backend(format!(
+                    "{what}: payload truncated at {field} (offset {cur}, len {})",
+                    raw.len()
+                ))
+            })?;
+        *cur = end;
+        Ok(i32::from_be_bytes(b))
+    };
+
+    let mut cur = 0usize;
+    let ndim = take_i32(&mut cur, "ndim")?;
+    let flags = take_i32(&mut cur, "flags")?;
+    let elem_oid = take_i32(&mut cur, "element oid")? as u32;
+    if flags != 0 {
+        // `array_send` writes `hasnull` here; a vector can never contain NULLs.
+        return Err(backend(format!(
+            "{what}: unexpected array flags {flags:#x} (a vector never holds NULLs)"
+        )));
+    }
+    if elem_oid != elem.elem_oid() {
+        return Err(backend(format!(
+            "{what}: payload carries element type OID {elem_oid}, expected {}",
+            elem.elem_oid()
+        )));
+    }
+    match ndim {
+        // Exactly ONE dimension, always — the EMPTY vector included. MEASURED on PG 16.13 via the
+        // send function itself: `int2vectorsend(''::int2vector)` is `ndim=1, dims={0,0}` (an
+        // earlier draft claimed PG sends empty as zero-dimension; it does not, and
+        // `int2vectorrecv` refuses `ndim != 1` outright — review F2). Its text output is "".
+        1 => {
+            let nitems = take_i32(&mut cur, "dimension length")?;
+            let lbound = take_i32(&mut cur, "lower bound")?;
+            if nitems < 0 {
+                return Err(backend(format!(
+                    "{what}: negative dimension length {nitems}"
+                )));
+            }
+            // Vectors are 0-BASED by `int2vectorrecv`'s own gate; a nonzero bound means this is
+            // not a vector payload (review F1 — the one recv-enforced field an earlier draft
+            // left unchecked, against this walker's own strictness contract).
+            if lbound != 0 {
+                return Err(backend(format!(
+                    "{what}: lower bound {lbound} (a vector is 0-based; recv refuses anything else)"
+                )));
+            }
+            let mut out = String::new();
+            for i in 0..nitems {
+                let len = take_i32(&mut cur, "element length")?;
+                if len as usize != elem.elem_len() {
+                    // -1 (a NULL element) lands here too, with the length named in the message.
+                    return Err(backend(format!(
+                        "{what}: element {i} has length {len}, expected {}",
+                        elem.elem_len()
+                    )));
+                }
+                let end = cur + elem.elem_len();
+                let Some(body) = raw.get(cur..end) else {
+                    return Err(backend(format!(
+                        "{what}: payload truncated inside element {i} (len {})",
+                        raw.len()
+                    )));
+                };
+                cur = end;
+                if i > 0 {
+                    out.push(' ');
+                }
+                match elem {
+                    VectorElem::Int2 => {
+                        let v = i16::from_be_bytes([body[0], body[1]]);
+                        out.push_str(&v.to_string());
+                    }
+                    VectorElem::Oid => {
+                        let v = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+                        out.push_str(&v.to_string());
+                    }
+                }
+            }
+            if cur != raw.len() {
+                return Err(backend(format!(
+                    "{what}: {} trailing bytes after the last element",
+                    raw.len() - cur
+                )));
+            }
+            Ok(out)
+        }
+        n => Err(backend(format!(
+            "{what}: {n} dimensions (a vector is exactly 1-D, the empty vector included — \
+             measured via {what}send on PG; recv refuses anything else)"
+        ))),
+    }
+}
+
 /// Emits the first `take` (1..=4) decimal characters of one base-10000 group. With
 /// `strip_leading`, leading zeros are suppressed but the **last** character is always emitted —
 /// PG's own first-group rule, which is what makes a zero `numeric` render `"0"` and not `""`.

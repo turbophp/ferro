@@ -1,5 +1,14 @@
 # Follow-up: one missing PG catalog type (`int2vector`) blocks the whole stock schema manager
 
+> **RESOLVED (M1-S9, 2026-09-08).** `int2vector` (22) and `oidvector` (30) are admitted on the
+> read path as `TAG_TEXT`, rendering PG's own space-separated text, proven live byte-for-byte
+> against the `::text` oracle on real `pg_index.indkey` / `pg_proc.proargtypes` cells. All three
+> open questions below are answered in SPEC §22.2 (ae): the text form matches `pdo_pgsql` exactly
+> (question 1), `oidvector` was decided WITH `int2vector` (question 2), and the bind direction was
+> deliberately NOT widened (question 3). The array class stays deferred — the live boundary
+> sentinel moved from `oidvector` to `int2[]`. The DBAL-suite effect is measured at A5, the
+> phase-closing re-run, not asserted here.
+
 **Found:** M1-S8b Task 14, by the upstream `doctrine/dbal 4.4.4` functional subset — 50 of the 78
 non-passing PostgreSQL tests, all with the same root cause.
 **Belongs to:** `ferro-backend-pg`'s read path / SPEC §9 type coverage. **Not** a driver defect: the

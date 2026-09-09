@@ -95,6 +95,18 @@ pub enum ExtractType {
     /// A caller wanting the NAME casts in SQL (`::text` / `format_type(...)`); resolving it here
     /// would mean a catalog round trip the engine must not make (charter rule 6).
     RegOid,
+    // ---- M1-S9 catalog vectors (the two the stock schema managers select; NOT general array
+    // support, which stays deferred — a vector is 1-D, NULL-free and 0-based by PG's own recv
+    // functions, so admitting it does not open the array box).
+    /// `int2vector` (OID 22) — `pg_index.indkey`, the column that blocked the WHOLE stock PG
+    /// schema manager (50 of 78 non-passing DBAL tests). Raw array-wire payload rendered by
+    /// [`crate::pgtext::int2vector_to_text`] to PG's own space-separated text (`"1 3"`), which is
+    /// byte-identical to what `pdo_pgsql` hands stock Doctrine. READ-ONLY: it is never a bind
+    /// target (`bind.rs` is deliberately untouched — §19.3's directional rule).
+    Int2Vector,
+    /// `oidvector` (OID 30) — `pg_proc.proargtypes`, `pg_index.indclass`; same family and rules
+    /// as [`ExtractType::Int2Vector`], decided together per the follow-up doc.
+    OidVector,
 }
 
 /// Maps a PG column's type to the canonical `Value` tag (for `ColMeta`). Returns
@@ -119,7 +131,12 @@ pub fn oid_to_tag(col_name: &str, ty: &Type) -> Result<u8, PoolError> {
             | ExtractType::RegOid,
         ) => Ok(tag::I64),
         Some(ExtractType::F32 | ExtractType::F64) => Ok(tag::F64),
-        Some(ExtractType::Text | ExtractType::CharByte) => Ok(tag::TEXT),
+        Some(
+            ExtractType::Text
+            | ExtractType::CharByte
+            | ExtractType::Int2Vector
+            | ExtractType::OidVector,
+        ) => Ok(tag::TEXT),
         Some(ExtractType::Bytes) => Ok(tag::BYTES),
         Some(ExtractType::Numeric) => Ok(tag::DECIMAL),
         Some(ExtractType::Date) => Ok(tag::DATE),
@@ -177,6 +194,9 @@ pub fn oid_extract_type(oid: Oid) -> Option<ExtractType> {
         o if o == Type::CHAR.oid() => Some(ExtractType::CharByte),
         o if o == Type::OID.oid() => Some(ExtractType::OidU32),
         o if o == Type::REGTYPE.oid() || o == Type::REGCLASS.oid() => Some(ExtractType::RegOid),
+        // ---- M1-S9 catalog vectors. NOT the array family: `INT2_ARRAY` (1005) etc. stay refused.
+        o if o == Type::INT2_VECTOR.oid() => Some(ExtractType::Int2Vector),
+        o if o == Type::OID_VECTOR.oid() => Some(ExtractType::OidVector),
         _ => None,
     }
 }
@@ -315,6 +335,13 @@ pub fn extract_value(row: &Row, idx: usize, oid: Oid) -> Result<crate::Value, Po
                 Value::I64(i64::from(u32::from_be_bytes(arr)))
             }
         }),
+        // ---- M1-S9 catalog vectors: raw array-wire payload → PG's own space-separated text.
+        Some(ExtractType::Int2Vector) => {
+            Ok(raw_text(row, idx, pgtext::int2vector_to_text)?.map_or(Value::Null, Value::Text))
+        }
+        Some(ExtractType::OidVector) => {
+            Ok(raw_text(row, idx, pgtext::oidvector_to_text)?.map_or(Value::Null, Value::Text))
+        }
         // Unreachable in practice — `oid_to_tag` refused this OID at cols-build, before the query
         // ran. Kept as the belt-and-braces half of the lockstep pair (hazard 18), and it names the
         // column off the ROW's own descriptor, which is where the identity lives mid-stream.
@@ -358,8 +385,10 @@ fn unsupported_column(col_name: &str, ty: &Type) -> PoolError {
          DECIMAL (numeric), DATE, TIME, TIMESTAMP, TIMESTAMPTZ, UUID and JSON (json/jsonb) \
          plus the M1-S8a catalog scalars name and \"char\" (as TEXT) and oid, regtype and \
          regclass (as I64 — their binary payload IS a 4-byte oid; cast to ::text or \
-         format_type(..) for the name). \
-         Deferred: timetz, arrays (incl. oidvector), interval, inet, and every \
+         format_type(..) for the name) \
+         plus the M1-S9 catalog vectors int2vector and oidvector (as TEXT, PG's own \
+         space-separated rendering). \
+         Deferred: timetz, arrays, interval, inet, and every \
          enum/composite/range type. \
          (A DOMAIN is reported by PG as its BASE type, so it is supported iff that base is.)",
         ty.name(),
@@ -496,7 +525,11 @@ mod tests {
     }
 
     /// The still-deferred neighbours stay LOUD — admitting the catalog family must not quietly
-    /// widen anything else.
+    /// widen anything else. `OID_VECTOR` was in this list until M1-S9 admitted the catalog
+    /// vectors (REPOINTED into `s9_catalog_vectors_are_admitted_by_both_gates`, not deleted);
+    /// the true ARRAY types — `INT2_ARRAY` (1005) included, the nearest neighbour to the vectors
+    /// — stay refused: a vector is 1-D, NULL-free and 0-based by PG's own recv functions, a
+    /// general array is none of those.
     #[test]
     fn s8a_catalog_admission_does_not_widen_the_deferred_set() {
         for ty in [
@@ -504,13 +537,136 @@ mod tests {
             Type::INTERVAL,
             Type::INET,
             Type::INT4_ARRAY,
-            Type::OID_VECTOR,
+            Type::INT2_ARRAY,
+            Type::OID_ARRAY,
         ] {
             assert!(
                 oid_to_tag("c", &ty).is_err(),
                 "{ty:?} must stay a loud Unsupported"
             );
         }
+    }
+
+    /// M1-S9: the two catalog vectors the stock schema managers select (`pg_index.indkey`,
+    /// `pg_proc.proargtypes`). Both gates must admit them as TEXT — same lockstep rule as every
+    /// other admission (hazard 18).
+    #[test]
+    fn s9_catalog_vectors_are_admitted_by_both_gates() {
+        assert_eq!(
+            oid_extract_type(Type::INT2_VECTOR.oid()),
+            Some(ExtractType::Int2Vector)
+        );
+        assert_eq!(
+            oid_extract_type(Type::OID_VECTOR.oid()),
+            Some(ExtractType::OidVector)
+        );
+        assert_eq!(tag_of(&Type::INT2_VECTOR).unwrap(), tag::TEXT);
+        assert_eq!(tag_of(&Type::OID_VECTOR).unwrap(), tag::TEXT);
+    }
+
+    /// M1-S9: the vector renderers against hand-built array-wire payloads. The LIVE oracle —
+    /// byte-equality with PG's own `::text` output on real `pg_index.indkey` /
+    /// `pg_proc.proargtypes` cells — is in `pg_types_it.rs`; these pin the wire-format math and
+    /// every malformed-payload refusal offline.
+    #[test]
+    fn s9_vector_rendering_and_refusals() {
+        use crate::pgtext::{int2vector_to_text, oidvector_to_text};
+
+        /// `array_send` layout: ndim, flags, elem oid, then per-dim {nitems, lbound}, then per
+        /// element {len, big-endian body}.
+        fn payload(
+            ndim: i32,
+            flags: i32,
+            elem_oid: i32,
+            dims: &[(i32, i32)],
+            elems: &[&[u8]],
+        ) -> Vec<u8> {
+            let mut p = Vec::new();
+            p.extend_from_slice(&ndim.to_be_bytes());
+            p.extend_from_slice(&flags.to_be_bytes());
+            p.extend_from_slice(&elem_oid.to_be_bytes());
+            for (n, lb) in dims {
+                p.extend_from_slice(&n.to_be_bytes());
+                p.extend_from_slice(&lb.to_be_bytes());
+            }
+            for e in elems {
+                p.extend_from_slice(&(e.len() as i32).to_be_bytes());
+                p.extend_from_slice(e);
+            }
+            p
+        }
+
+        // The follow-up doc's own example: indkey "1 3". Vectors are 0-based (lbound 0).
+        let p = payload(
+            1,
+            0,
+            21,
+            &[(2, 0)],
+            &[&1i16.to_be_bytes(), &3i16.to_be_bytes()],
+        );
+        assert_eq!(int2vector_to_text(&p).unwrap(), "1 3");
+        // A single element and a negative one (attnums are never negative, but int2 is signed and
+        // the rendering must not invent an unsigned reinterpretation).
+        let p = payload(1, 0, 21, &[(1, 0)], &[&(-7i16).to_be_bytes()]);
+        assert_eq!(int2vector_to_text(&p).unwrap(), "-7");
+        // The EMPTY vector is a ONE-dimension array of ZERO items — MEASURED on PG 16.13 via
+        // `int2vectorsend(''::int2vector)` = `ndim=1, dims={0,0}` (review F2: an earlier draft
+        // claimed 0-D, which PG never sends for a vector and recv refuses). Renders as the EMPTY
+        // string, exactly what `pdo_pgsql` returns.
+        assert_eq!(
+            int2vector_to_text(&payload(1, 0, 21, &[(0, 0)], &[])).unwrap(),
+            ""
+        );
+        // oidvector: u32 elements — an oid above i32::MAX must render unsigned.
+        let p = payload(
+            1,
+            0,
+            26,
+            &[(2, 0)],
+            &[&23u32.to_be_bytes(), &4_000_000_000u32.to_be_bytes()],
+        );
+        assert_eq!(oidvector_to_text(&p).unwrap(), "23 4000000000");
+
+        // Refusals — each a Backend decode mismatch (SPEC §9.1), never a panic, never ConnectionLost.
+        for (name, bad) in [
+            (
+                "wrong element oid",
+                payload(1, 0, 23, &[(1, 0)], &[&1i16.to_be_bytes()]),
+            ),
+            (
+                "2-D",
+                payload(2, 0, 21, &[(1, 0), (1, 0)], &[&1i16.to_be_bytes()]),
+            ),
+            (
+                "hasnull flag",
+                payload(1, 1, 21, &[(1, 0)], &[&1i16.to_be_bytes()]),
+            ),
+            ("short element", payload(1, 0, 21, &[(1, 0)], &[&[1u8][..]])),
+            ("truncated header", vec![0, 0, 0, 1]),
+            // 0-D was ACCEPTED as the empty form until review F2 measured PG never sending it
+            // for a vector (`int2vectorrecv` refuses ndim != 1) — repointed from the accept
+            // side to the refusal side, not dropped.
+            ("0-D header", payload(0, 0, 21, &[], &[])),
+            // The one recv-enforced field the first draft left unchecked (review F1).
+            (
+                "nonzero lower bound",
+                payload(1, 0, 21, &[(1, 5)], &[&1i16.to_be_bytes()]),
+            ),
+            ("trailing bytes", {
+                let mut p = payload(1, 0, 21, &[(0, 0)], &[]);
+                p.push(0);
+                p
+            }),
+        ] {
+            assert!(
+                matches!(int2vector_to_text(&bad), Err(PoolError::Backend(_))),
+                "{name} must be a Backend refusal"
+            );
+        }
+        // A NULL element (len -1) is impossible in a vector; its length word must be refused.
+        let mut p = payload(1, 0, 21, &[(1, 0)], &[]);
+        p.extend_from_slice(&(-1i32).to_be_bytes());
+        assert!(matches!(int2vector_to_text(&p), Err(PoolError::Backend(_))));
     }
 
     /// PG's `"char"` is one BYTE, and `'\0'` — what `attidentity` holds on a non-identity column —
