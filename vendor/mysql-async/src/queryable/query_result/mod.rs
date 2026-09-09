@@ -376,6 +376,36 @@ where
         }
     }
 
+    /// FERRO FORK ADDITION — see `UPSTREAM_PR_MYSQL_ASYNC.md`.
+    ///
+    /// [`QueryResult::drop_result`], except the OWNED connection is handed
+    /// back instead of dropped (closed): drains every unconsumed row and
+    /// pending result set, then extracts the [`crate::Conn`]. This is the
+    /// exit a connection pool needs on the owned-connection route for a
+    /// statement that produced NO result set (`stream_and_drop` answers
+    /// `None` there — and dropping the `QueryResult` closes the connection),
+    /// and it is what [`result_set_stream::ResultSetStream::into_conn`]
+    /// delegates to after a streamed result set.
+    ///
+    /// Post-drain, `Conn::affected_rows` / `Conn::last_ok_packet` on the
+    /// returned connection reflect the drained statement's FINAL packet.
+    ///
+    /// A `QueryResult` that merely borrows its connection (or runs inside a
+    /// transaction) returns [`crate::DriverError::StreamDoesNotOwnConn`]; the
+    /// caller still holds the connection in those cases.
+    pub async fn into_conn(mut self) -> Result<crate::Conn> {
+        loop {
+            while self.next().await?.is_some() {}
+            if !self.conn.has_pending_result() {
+                break;
+            }
+        }
+        match self.conn.inner {
+            crate::connection_like::ConnectionInner::Conn(conn) => Ok(conn),
+            _ => Err(crate::DriverError::StreamDoesNotOwnConn.into()),
+        }
+    }
+
     /// Returns a reference to a columns list of this query result.
     ///
     /// Empty list means that this result set was never meant to contain rows.

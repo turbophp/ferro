@@ -1,4 +1,17 @@
-# Upstream `mysql_async` PR (draft) — negotiate `CLIENT_SESSION_TRACK` (surface OK-packet session trackers)
+# Upstream `mysql_async` PRs (drafts) — the Ferro fork's two edits
+
+The vendored fork now carries **two** independent, individually upstreamable edits:
+
+1. **Negotiate `CLIENT_SESSION_TRACK`** (M1-S6) — the original edit this file was written for;
+   the full draft is below, unchanged.
+2. **Owned-connection recovery from the streaming route** (dev-loop B2a, 2026-09-09) —
+   `ResultSetStream::into_conn()` + `QueryResult::into_conn()`; draft follows the first one.
+
+Both are DRAFT — not submitted, pending human authorization, per the standing rule below.
+
+---
+
+# Draft 1 — negotiate `CLIENT_SESSION_TRACK` (surface OK-packet session trackers)
 
 **Status: DRAFT — not yet submitted (pending maintainer sign-off / human authorization).**
 **Upstream repo:** https://github.com/blackbeam/mysql_async
@@ -103,6 +116,54 @@ knows how to parse but never enables.
 
 ---
 
+# Draft 2 — recover the owned `Conn` from the streaming route (`into_conn`)
+
+**Status: DRAFT — not yet submitted (pending maintainer sign-off / human authorization).**
+**Files:** `src/queryable/query_result/result_set_stream.rs`, `src/queryable/query_result/mod.rs`,
+`src/error/mod.rs` (one added `DriverError` variant).
+
+## Why this is upstream-worthy
+
+`mysql_async` documents and encourages the owned-`Conn` streaming route ("we can also build a
+`'static` stream by giving away the connection" — `QueryResult::stream_and_drop`'s own doc
+example), but that route is a one-way door: there is **no public way to get the `Conn` back**.
+`ResultSetStream`'s poll loop drops its state (and with it the owned connection) the moment the
+stream yields its terminal `None`, `QueryResult.conn` is private, and `stream_and_drop()` on a
+statement with no result set answers `None` while consuming — and therefore closing — the
+connection. Any consumer that needs to stream a result set and then REUSE the same server session
+(every connection pool, in other words) is locked out of the `'static` streaming route entirely,
+because dropping the stream closes the connection.
+
+## What the edit does
+
+- `ResultSetStream` gains a `done` flag: the terminal `None` (and the error terminal) RETAINS the
+  internal state instead of dropping it, so an owned connection is no longer closed at
+  exhaustion — it closes when the stream itself is dropped, which is where every existing caller
+  already ends up (they drop the stream after the last row; `FusedStream::is_terminated` reports
+  `done` so fused semantics are unchanged, and a borrowed stream's borrow was always held until
+  drop by the lifetimes, so nothing observable changes for the borrowed route).
+- `ResultSetStream::into_conn(self) -> Result<Conn>`: resolves any in-flight row future, drains
+  every unconsumed row and pending result set (exactly `drop_result`'s loop), and returns the
+  owned `Conn`. On a stream that merely borrows its connection it refuses with the new
+  `DriverError::StreamDoesNotOwnConn` — the caller still holds the connection in that case.
+- `QueryResult::into_conn(self) -> Result<Conn>`: the same exit one level down, for the
+  no-result-set case where `stream_and_drop()` answers `None`.
+- Post-drain, `Conn::affected_rows()`/`Conn::last_ok_packet()` on the returned connection reflect
+  the drained statement's final packet (the stream's own `affected_rows()` reports the ok-packet
+  captured at setup — the previous statement's — which is now documented on `into_conn`).
+
+## Testing
+
+The Ferro repo carries a live four-part gate against real MySQL 8.4 and MariaDB 11.8
+(`engine/crates/ferro-backend-mysql/tests/stream_recovery_it.rs`): full-drain recovery,
+partial-consume recovery (5 of 900 rows taken, `into_conn` drains the rest), the no-result-set
+`QueryResult::into_conn` exit with the affected-count-from-the-conn rule, and the borrowed-route
+refusal — each asserting SESSION IDENTITY (`CONNECTION_ID()` unchanged + a session user variable
+surviving), so a silent reconnect cannot pass as recovery. Happy to port these into
+`mysql_async`'s own integration suite as part of the PR.
+
+---
+
 ## Status and next step
 
 **DRAFT.** This PR has not been opened. Filing it against `github.com/blackbeam/mysql_async` is a
@@ -118,8 +179,10 @@ human authorizes it:
 
 ## Standing note — drop the fork when this lands
 
-**If this (or an equivalent, e.g. an `additional_capabilities` opts hook) lands upstream, DROP the
-vendored fork and the `[patch.crates-io]` entry:**
+**The fork can be dropped only once BOTH drafts (or equivalents) land upstream** — since B2a it
+carries the `into_conn` recovery edits as well as the capability bit, and `ferro-backend-mysql`'s
+stream-recovery gate depends on them. When that day comes, **DROP the vendored fork and the
+`[patch.crates-io]` entry:**
 
 - Delete `vendor/mysql-async/` and the `mysql_async` line + its explanatory comment in the root
   `Cargo.toml` `[patch.crates-io]` block.
@@ -128,6 +191,8 @@ vendored fork and the `[patch.crates-io]` entry:**
   `CLIENT_SESSION_TRACK` (or set the new opts hook, if that is the form that landed).
 - Re-run the M1-S6 live tracker spike (`ferro-backend-mysql`'s `tracker_spike_it.rs`) unchanged
   against the released crate to confirm `session_state_info()` is still non-empty.
+- Re-run the B2a stream-recovery gate (`ferro-backend-mysql`'s `stream_recovery_it.rs`) unchanged
+  against the released crate to confirm the recovery API survived review intact.
 
 Until then, the fork stays: it is the only way Ferro's MySQL pin engine (M1-S6 task 2+) can read the
 OK-packet session trackers that are its authoritative signal for protocol-invisible session

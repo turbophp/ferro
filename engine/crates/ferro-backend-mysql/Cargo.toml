@@ -25,3 +25,5 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "time"] }
+# StreamExt for the fork's ResultSetStream in stream_recovery_it.rs (the B2a live proof).
+futures-util = { version = "0.3", default-features = false }
