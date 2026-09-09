@@ -319,7 +319,13 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
         if ($this->streamFrames !== []) {
             return array_shift($this->streamFrames);
         }
-        throw new \LogicException('FakeSession has no scripted DATA frames (see thenStreamFrames)');
+        // The exact phrase "FakeSession models no DATA frames" is LOAD-BEARING: the Doctrine
+        // tier's ConnectionStreamingTest asserts on it to tell "the drain is what failed" apart
+        // from any other LogicException. Scripting frames (thenStreamFrames) is the M1-S9
+        // narrowing of that contract, not its repeal.
+        throw new \LogicException(
+            'FakeSession models no DATA frames unless scripted (see thenStreamFrames)',
+        );
     }
 
     public function sendWindowUpdate(int $requestId, int $frames, int $bytes): void

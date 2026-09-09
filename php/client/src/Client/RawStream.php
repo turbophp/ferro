@@ -36,14 +36,17 @@ final class RawStream
      *   {@see close} must NOT invent a wire operation for a request id that was never a stream.
      * @param StreamTerminal $terminal the shared settled-state cell {@see Connection}'s pump
      *   writes when the generator reaches the Ok terminal (M1-S9 B1a). Shared BY CONSTRUCTION:
-     *   the pump exists before this handle does, so the cell is how the two meet.
+     *   the pump exists before this handle does, so the cell is how the two meet. DEFAULTED so a
+     *   handle built without a pump (the Doctrine tier's unit fixtures construct one around a
+     *   plain generator) is simply never-settled — the honest state for a stream nothing drains
+     *   through the real terminal path.
      */
     public function __construct(
         private readonly array $cols,
         private readonly \Generator $rows,
         private readonly ?StreamingSessionInterface $session,
         private readonly int $requestId,
-        private readonly StreamTerminal $terminal,
+        private readonly StreamTerminal $terminal = new StreamTerminal(),
     ) {}
 
     /**
