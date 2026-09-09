@@ -239,3 +239,109 @@ async fn finish_drains_undrained_remainder() {
     // The fake pulled every scripted row plus the terminal None (6 polls) — proof finish drained.
     assert_eq!(pool.backend().stream_pulls(), 6);
 }
+
+/// B2b: the backend RECLAIM hook (`PoolBackend::reclaim_stream`) runs inside `finish` — BEFORE
+/// `finalize_stream` reads `tx_status` — and its two arms are load-bearing.
+///
+/// **Clean arm (the default, unarmed):** `affected` is the stream's post-drain count and the conn
+/// recycles normally. This is the byte-for-byte pre-hook behavior every other test in this file
+/// relies on; asserted here against the SAME conn id to make the contrast with the failure arm
+/// explicit.
+///
+/// **Failure arm (armed):** a conn-owning backend (MySQL, B2b-2) that cannot restore the driver
+/// connection after the drain returns `Err` from `reclaim_stream` and leaves the conn
+/// `is_closed`-dead. `finish` must then treat the stream as errored (force-taint) and the pool must
+/// DISCARD the husk rather than recycle it — proven by the next checkout on a `max_size=1` pool
+/// getting a FRESH connection id. Without this, a backend that failed to hand its connection back
+/// would leave the next tenant a dead or mid-protocol session (the cross-tenant-leak class, charter
+/// rule 6). No live MySQL needed — the fake models the conn-owning failure directly.
+#[tokio::test]
+async fn reclaim_hook_clean_recycles_but_a_failed_reclaim_discards_the_conn() {
+    let script = || StreamScript {
+        cols: vec![ColMeta {
+            name: "n".to_string(),
+            tag: tag::I64,
+        }],
+        rows: vec![row(1), row(2)],
+        affected: 2,
+        error_at: None,
+    };
+
+    // ── clean arm: default hook, conn recycles on the same id ──
+    let backend = FakeBackend::new();
+    backend.set_stream_script(script());
+    let pool = Pool::new(
+        backend,
+        PoolConfig {
+            max_size: 1,
+            ..Default::default()
+        },
+    );
+    let first_id = {
+        let mut co = pool.checkout().await.expect("checkout");
+        let id = co.conn().id;
+        let end = co
+            .query_stream("SELECT n FROM t", &[])
+            .await
+            .expect("open")
+            .finish()
+            .await
+            .expect("finish");
+        assert_eq!(
+            end.affected, 2,
+            "clean reclaim answers the post-drain count"
+        );
+        assert!(!co.tainted(), "a clean stream does not taint");
+        id
+    };
+    let reused = pool.checkout().await.expect("re-checkout");
+    assert_eq!(
+        reused.conn().id,
+        first_id,
+        "clean reclaim recycles the same conn (max_size=1)"
+    );
+    drop(reused);
+
+    // ── failure arm: reclaim Err marks the conn dead → the pool discards it ──
+    let backend = FakeBackend::new();
+    backend.set_stream_script(script());
+    let pool = Pool::new(
+        backend,
+        PoolConfig {
+            max_size: 1,
+            ..Default::default()
+        },
+    );
+    let failed_id = {
+        let mut co = pool.checkout().await.expect("checkout");
+        let id = co.conn().id;
+        pool.backend().arm_reclaim_fail();
+        let end = co
+            .query_stream("SELECT n FROM t", &[])
+            .await
+            .expect("open")
+            .finish()
+            .await
+            .expect("finish returns Ok even when reclaim fails — the stream itself completed");
+        assert_eq!(
+            end.affected, 0,
+            "a failed reclaim reports 0 affected (the count could not be trusted)"
+        );
+        assert!(
+            co.tainted(),
+            "a failed reclaim force-taints (finish's errored arm)"
+        );
+        id
+    };
+    let fresh = pool
+        .checkout()
+        .await
+        .expect("re-checkout after a failed reclaim");
+    assert_ne!(
+        fresh.conn().id,
+        failed_id,
+        "a failed reclaim DISCARDS the conn: the next checkout connects fresh, never inheriting \
+         a dead/mid-protocol session (charter rule 6)"
+    );
+    assert!(!fresh.conn().closed, "and the fresh conn is live");
+}

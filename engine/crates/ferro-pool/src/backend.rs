@@ -272,6 +272,32 @@ pub trait PoolBackend: Send + Sync + 'static {
         sql: &str,
         params: &[Value],
     ) -> Result<(Vec<ColMeta>, Self::RowStream), PoolError>;
+
+    /// Post-drain RECLAIM hook (B2b, SPEC §22.2 (n)). Called by `RowStreamHandle::finish` AFTER
+    /// its drain loop, INSTEAD of reading `rows.rows_affected()` directly — the one place a
+    /// backend whose [`Self::RowStream`] OWNS the driver connection (MySQL: `query_stream` MOVES
+    /// it out of `Self::Conn` into the stream, because every `mysql_async` streaming entry point
+    /// either borrows the conn or consumes it) can hand the connection BACK into `conn` *before*
+    /// `finalize_stream` reads `tx_status(&conn)`, and answer `affected` from the CONNECTION's
+    /// post-drain packet (the §22.2 (n) measured rule: the stream's own accessor reports the
+    /// PREVIOUS statement's ok-packet).
+    ///
+    /// **Default: the stream does not own the conn** (PG's is channel-backed, the fake's is a
+    /// scripted `Vec`) — return the stream's post-drain `rows_affected()`, exactly what `finish`
+    /// read before this hook existed. Zero behavior change for those backends.
+    ///
+    /// An `Err` means the connection could NOT be restored. The contract on that arm: the backend
+    /// MUST leave `conn` in a state its [`PoolBackend::is_closed`] reports dead, and `finish`
+    /// treats the stream as errored (the Rule-A force-taint), so the pool discards the husk
+    /// instead of recycling it — a reclaim failure can never hand the next tenant a connection
+    /// that is mid-protocol or gone (charter rule 6).
+    async fn reclaim_stream(
+        &self,
+        _conn: &mut Self::Conn,
+        rows: Self::RowStream,
+    ) -> Result<u64, PoolError> {
+        Ok(rows.rows_affected())
+    }
 }
 
 #[cfg(test)]

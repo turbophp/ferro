@@ -334,6 +334,13 @@ pub struct FakeBackend {
     stream_pull_gate: Arc<Mutex<Option<Arc<Notify>>>>,
     /// Number of `FakeRowStream::next()` pulls currently parked on `stream_pull_gate`.
     stream_pulls_waiting: Arc<AtomicU64>,
+    /// B2b: when `true`, the [`PoolBackend::reclaim_stream`] override marks the conn `closed` and
+    /// returns `Err` — modelling a conn-owning backend (MySQL) that fails to recover the driver
+    /// connection after a streamed statement. Armed via [`FakeBackend::arm_reclaim_fail`]; lets a
+    /// test prove `finish`'s reclaim-Err arm force-taints and the pool DISCARDS the husk rather
+    /// than recycling it, WITHOUT a live MySQL. Default `false` — every existing stream test
+    /// inherits the trait's default passthrough hook, unchanged.
+    reclaim_fail: AtomicBool,
 }
 
 impl FakeBackend {
@@ -357,7 +364,16 @@ impl FakeBackend {
             stream_opens_waiting: Arc::new(AtomicU64::new(0)),
             stream_pull_gate: Arc::new(Mutex::new(None)),
             stream_pulls_waiting: Arc::new(AtomicU64::new(0)),
+            reclaim_fail: AtomicBool::new(false),
         }
+    }
+
+    /// B2b: arm the [`PoolBackend::reclaim_stream`] override to fail (mark the conn `closed`,
+    /// return `Err`) on the NEXT stream `finish`. Models a conn-owning backend that cannot restore
+    /// the driver connection after the drain — the path `finish` must treat as errored so the pool
+    /// discards the husk (charter rule 6).
+    pub fn arm_reclaim_fail(&self) {
+        self.reclaim_fail.store(true, Ordering::SeqCst);
     }
 
     /// Total `FakeCancelHandle::cancel()` calls across every handle this backend minted (M1-S5 Task
@@ -714,6 +730,24 @@ impl PoolBackend for FakeBackend {
                 pulls_waiting: Arc::clone(&self.stream_pulls_waiting),
             },
         ))
+    }
+
+    /// B2b reclaim hook. Unarmed (the common case) it behaves EXACTLY like the trait default —
+    /// answer the stream's post-drain `rows_affected()` — so every existing fake-driven stream
+    /// test is unchanged. When `arm_reclaim_fail` was called, it models a conn-owning backend
+    /// (MySQL) that could not restore the driver connection: it marks `conn` `closed` (honoring
+    /// the reclaim contract — the conn MUST read `is_closed`-dead on the Err arm) and returns
+    /// `Err`, so `finish` force-taints and the pool discards the husk.
+    async fn reclaim_stream(
+        &self,
+        conn: &mut Self::Conn,
+        rows: Self::RowStream,
+    ) -> Result<u64, PoolError> {
+        if self.reclaim_fail.load(Ordering::SeqCst) {
+            conn.closed = true;
+            return Err(PoolError::ConnectionLost);
+        }
+        Ok(rows.rows_affected())
     }
 }
 
