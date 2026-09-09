@@ -71,6 +71,15 @@ pub struct ResultSetStream<'r, 'a: 'r, 't: 'a, T, P> {
     query_result: Option<ResultSetStreamState<'r, 'a, 't, P>>,
     ok_packet: Option<OkPacket<'static>>,
     columns: Arc<[Column]>,
+    /// FERRO FORK (see `UPSTREAM_PR_MYSQL_ASYNC.md`): set once the stream has
+    /// yielded its terminal `None` (or an error). The state — and with it an
+    /// OWNED connection — is retained instead of being dropped at that point,
+    /// so exhaustion no longer closes an owned connection out from under the
+    /// caller; [`ResultSetStream::into_conn`] can recover it. The connection
+    /// now closes when the stream itself is dropped, which is when every
+    /// pre-fork caller closed it anyway (they drop the stream after the last
+    /// row).
+    done: bool,
     __from_row_type: PhantomData<T>,
 }
 
@@ -80,7 +89,7 @@ where
     T: FromRow + Unpin + Send + 'static,
 {
     fn is_terminated(&self) -> bool {
-        self.query_result.is_none()
+        self.done || self.query_result.is_none()
     }
 }
 
@@ -140,6 +149,57 @@ impl<'r, 'a: 'r, 't: 'a, T, P> ResultSetStream<'r, 'a, 't, T, P> {
     }
 }
 
+impl<'r, 'a: 'r, 't: 'a, T, P> ResultSetStream<'r, 'a, 't, T, P>
+where
+    P: Protocol + Unpin,
+    T: FromRow + Unpin + Send + 'static,
+{
+    /// FERRO FORK ADDITION — see `UPSTREAM_PR_MYSQL_ASYNC.md`.
+    ///
+    /// Consumes the stream and returns the OWNED [`crate::Conn`] it was
+    /// driving, after draining every unconsumed row and pending result set so
+    /// the connection is protocol-clean and immediately reusable. This is the
+    /// missing exit from the owned-connection route: without it, the only way
+    /// out of a `ResultSetStream` built over an owned connection is to drop
+    /// it, which closes the connection — unusable for a connection pool that
+    /// must stream a result set and then RECYCLE the same server session.
+    ///
+    /// Only a stream that owns its connection can be recovered — one built
+    /// through [`QueryResult::stream_and_drop`] on an owned-connection
+    /// `QueryResult` (e.g. the [`crate::prelude::Query::stream`] route). A
+    /// stream over a borrowed connection or a transaction returns
+    /// [`crate::DriverError::StreamDoesNotOwnConn`]; the caller still holds
+    /// the connection in those cases, so there is nothing to recover.
+    ///
+    /// Post-drain, the connection's own accessors (`Conn::affected_rows`,
+    /// `Conn::last_ok_packet`) reflect the FINAL packet of the drained
+    /// statement — the value a caller must use for row counts, since this
+    /// stream's [`ResultSetStream::affected_rows`] reports the ok-packet
+    /// captured at stream SETUP (the previous statement's).
+    ///
+    /// An error while resolving an in-flight row future or during the drain
+    /// propagates and the connection is dropped (closed), exactly as if the
+    /// stream itself had been dropped at that error.
+    pub async fn into_conn(mut self) -> crate::Result<crate::Conn> {
+        let cow = match self.query_result.take() {
+            Some(ResultSetStreamState::Idle(cow)) => cow,
+            Some(ResultSetStreamState::NextFut(fut)) => {
+                // Resolve the in-flight row future so the state machine hands
+                // the connection back; the row it fetched (if any) is part of
+                // the drain and is discarded.
+                let (row, cow) = fut.await;
+                row?;
+                cow
+            }
+            None => return Err(crate::DriverError::StreamDoesNotOwnConn.into()),
+        };
+        match cow {
+            CowMut::Owned(query_result) => query_result.into_conn().await,
+            CowMut::Borrowed(_) => Err(crate::DriverError::StreamDoesNotOwnConn.into()),
+        }
+    }
+}
+
 impl<'r, 'a: 'r, 't: 'a, T, P> Stream for ResultSetStream<'r, 'a, 't, T, P>
 where
     P: Protocol + Unpin,
@@ -152,6 +212,9 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
         loop {
             let columns = this.columns.clone();
             match this.query_result.take() {
@@ -168,8 +231,21 @@ where
                             this.query_result = Some(ResultSetStreamState::Idle(query_result));
                             return Poll::Ready(Some(Ok(crate::from_row(row))));
                         }
-                        Ok(None) => return Poll::Ready(None),
-                        Err(err) => return Poll::Ready(Some(Err(err))),
+                        // FERRO FORK: retain the state on both terminal arms
+                        // (see the `done` field) instead of dropping it — and
+                        // with it an owned connection — here.
+                        Ok(None) => {
+                            this.done = true;
+                            this.query_result =
+                                Some(ResultSetStreamState::Idle(query_result));
+                            return Poll::Ready(None);
+                        }
+                        Err(err) => {
+                            this.done = true;
+                            this.query_result =
+                                Some(ResultSetStreamState::Idle(query_result));
+                            return Poll::Ready(Some(Err(err)));
+                        }
                     },
                     Poll::Pending => {
                         this.query_result = Some(ResultSetStreamState::NextFut(fut));
@@ -287,6 +363,7 @@ where
                         ok_packet,
                         columns,
                         query_result: Some(ResultSetStreamState::Idle(CowMut::Borrowed(self))),
+                        done: false,
                         __from_row_type: PhantomData,
                     },
                 ))
@@ -351,6 +428,7 @@ where
                     ok_packet,
                     columns,
                     query_result: Some(ResultSetStreamState::Idle(CowMut::Owned(self))),
+                    done: false,
                     __from_row_type: PhantomData,
                 }))
         }

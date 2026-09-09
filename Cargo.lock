@@ -276,6 +276,7 @@ dependencies = [
  "async-trait",
  "ferro-pool",
  "ferro-proto",
+ "futures-util",
  "mysql_async",
  "mysql_common",
  "tokio",

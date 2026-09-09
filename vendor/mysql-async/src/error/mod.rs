@@ -123,6 +123,13 @@ pub enum DriverError {
     #[error("Named and positional parameters mixed in one statement.")]
     MixedParams,
 
+    /// FERRO FORK ADDITION — see `UPSTREAM_PR_MYSQL_ASYNC.md`.
+    #[error(
+        "`ResultSetStream::into_conn' called on a stream that does not own its \
+         connection (it borrows a `Conn' or a `Transaction')."
+    )]
+    StreamDoesNotOwnConn,
+
     #[error("Transactions couldn't be nested.")]
     NestedTransaction,
 
