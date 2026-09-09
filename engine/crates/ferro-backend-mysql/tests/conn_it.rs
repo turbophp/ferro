@@ -23,7 +23,7 @@ use ferro_backend_mysql::MysqlBackend;
 /// Read a single `u64` scalar off the raw handle — a verification-only read (bypasses the pin
 /// authority, which is fine for asserting server state in a test).
 async fn read_u64(conn: &mut ferro_backend_mysql::MysqlConn, sql: &str) -> u64 {
-    conn.mysql
+    conn.driver_mut()
         .query_first::<u64, _>(sql)
         .await
         .unwrap_or_else(|e| panic!("read `{sql}` failed: {e:?}"))
@@ -214,7 +214,7 @@ async fn run_backend_suite(url: &str, label: &str) {
 
     // ---- ping / clean disconnect -----------------------------------------------------------------
     backend.ping(&mut conn).await.expect("ping round trip");
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 
     println!("[{label}] Task-3 backend suite PASSED");
 }
@@ -235,4 +235,104 @@ async fn mariadb_backend_behavior() {
         return;
     };
     run_backend_suite(&url, "MARIADB").await;
+}
+
+/// B2b-2a: the PARKED-CONN contract, which is the FB-2 finding from the iteration-12 adversarial
+/// pass turned into an executable guard.
+///
+/// `PoolBackend::RowStream` is an associated type with no lifetime, so a streaming
+/// `MysqlRowStream` must OWN its `Conn` (SPEC §22.2 (n)) — meaning `query_stream` takes the driver
+/// handle OUT of `MysqlConn`, leaving a husk until `reclaim_stream` puts it back. FB-2 measured
+/// that the pool CANNOT protect itself here: `RowStreamHandle`'s `Drop` net sets only `tainted`,
+/// and a tainted conn is RECYCLED (with a reset), not discarded — **only `is_closed()` prevents
+/// reuse**. So if this backend's `is_closed` failed to report a parked conn dead, the next tenant
+/// would be handed a wrapper with no session behind it (charter rule 6).
+///
+/// This asserts the whole contract on a real connection, and it is deliberately written against
+/// the `PoolBackend` trait methods (not the inherent ones) because those are what the pool calls.
+async fn parked_conn_reads_dead_and_unparks_to_the_same_session(url: &str, label: &str) {
+    let backend = MysqlBackend::new(url);
+    let mut conn = backend.connect().await.expect("connect");
+
+    // A session marker + the server-side id, so "the same session came back" is provable rather
+    // than merely "a working connection came back".
+    conn.driver_mut()
+        .query_drop("SET @ferro_parked_probe := 7")
+        .await
+        .expect("marker set");
+    let id_before = conn.driver().id();
+    assert!(
+        !backend.is_closed(&conn),
+        "[{label}] a live conn is not closed"
+    );
+    assert!(!conn.is_parked(), "[{label}] and not parked");
+
+    // ── park: the driver handle leaves, exactly as query_stream will hand it to the stream ──
+    let taken = conn.park().expect("park yields the driver handle");
+    assert!(conn.is_parked(), "[{label}] the wrapper is now a husk");
+    assert!(
+        backend.is_closed(&conn),
+        "[{label}] PARKED MUST READ DEAD — this is the only signal that makes the pool DISCARD \
+         the husk instead of recycling it (tainted alone would recycle)"
+    );
+    assert_eq!(
+        backend.tx_status(&conn),
+        TxStatus::Failed,
+        "[{label}] a parked conn's tx state is unknowable; Failed is the conservative encoding \
+         (it force-taints), never a falsely-clean Idle"
+    );
+    assert!(
+        !backend.take_session_mutated(&mut conn),
+        "[{label}] no packet to read while parked — false, not a panic"
+    );
+    assert_eq!(
+        conn.last_insert_id(),
+        None,
+        "[{label}] no key while parked — None, never a stale one from another statement"
+    );
+    // The cancel handle must stay obtainable while parked (it reads the stored conn id), because
+    // an in-flight streamed statement is exactly when a cancel is most likely to be needed.
+    let _cancel = backend.cancel_handle(&conn);
+
+    // ── unpark: the reclaim hook's half of the round trip ──
+    conn.unpark(taken);
+    assert!(!conn.is_parked(), "[{label}] restored");
+    assert!(!backend.is_closed(&conn), "[{label}] and live again");
+    assert_eq!(
+        conn.driver().id(),
+        id_before,
+        "[{label}] the SAME server session came back, not a silent reconnect"
+    );
+    let probe: Option<i64> = conn
+        .driver_mut()
+        .query_first("SELECT @ferro_parked_probe")
+        .await
+        .expect("probe read")
+        .expect("one row");
+    assert_eq!(
+        Some(7),
+        probe,
+        "[{label}] the session marker survived the park/unpark round trip"
+    );
+
+    conn.disconnect().await;
+    println!("[{label}] parked-conn contract PASSED");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_parked_conn_contract() {
+    let Ok(url) = std::env::var("FERRO_TEST_MYSQL_URL") else {
+        eprintln!("skip: FERRO_TEST_MYSQL_URL unset (mysql_parked_conn_contract)");
+        return;
+    };
+    parked_conn_reads_dead_and_unparks_to_the_same_session(&url, "MYSQL").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mariadb_parked_conn_contract() {
+    let Ok(url) = std::env::var("FERRO_TEST_MARIADB_URL") else {
+        eprintln!("skip: FERRO_TEST_MARIADB_URL unset (mariadb_parked_conn_contract)");
+        return;
+    };
+    parked_conn_reads_dead_and_unparks_to_the_same_session(&url, "MARIADB").await;
 }

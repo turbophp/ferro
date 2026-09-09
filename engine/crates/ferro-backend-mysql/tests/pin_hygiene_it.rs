@@ -63,7 +63,7 @@ fn config(max_size: usize) -> PoolConfig {
 /// under test. `sort_buffer_size` is an unsigned integer variable → `u64`.
 async fn read_sbs(co: &mut Checkout<MysqlBackend>) -> u64 {
     co.conn_mut()
-        .mysql
+        .driver_mut()
         .query_first::<u64, _>("SELECT @@session.sort_buffer_size")
         .await
         .expect("read @@session.sort_buffer_size")
@@ -74,7 +74,7 @@ async fn read_sbs(co: &mut Checkout<MysqlBackend>) -> u64 {
 /// connection — the same read as [`read_sbs`], but for the raw `MysqlConn` the tracker-authority
 /// proof and the parity `(b1)` open directly via `pool.backend().connect()`.
 async fn read_sbs_raw(raw: &mut ferro_backend_mysql::MysqlConn) -> u64 {
-    raw.mysql
+    raw.driver_mut()
         .query_first::<u64, _>("SELECT @@session.sort_buffer_size")
         .await
         .expect("read @@session.sort_buffer_size (raw)")
@@ -89,7 +89,7 @@ async fn read_sbs_raw(raw: &mut ferro_backend_mysql::MysqlConn) -> u64 {
 /// `COM_RESET_CONNECTION` preserves this id (it re-initializes session state on the same TCP conn),
 /// so equal ids across two checkouts proves the SAME physical conn was reused.
 fn conn_id(co: &Checkout<MysqlBackend>) -> u32 {
-    co.conn().mysql.id()
+    co.conn().driver().id()
 }
 
 // -------------------------------------------------------------------------------------------------

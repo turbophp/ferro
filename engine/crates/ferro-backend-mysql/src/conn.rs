@@ -43,12 +43,28 @@ const CURATED_SESSION_TRACK_VARS: &str =
 /// synchronous "obviously dead" flag + the connect `Opts` (so the out-of-band `KILL QUERY` cancel
 /// can open a SIDE connection with the same creds, borrowing nothing from this conn).
 pub struct MysqlConn {
-    /// The vendored `mysql_async` connection. `pub` for the same reason PG's `client` is: the
-    /// pool-internal surface only reports success/failure, but a `Checkout<MysqlBackend>` holder
-    /// (integration tests, the SQL EXEC service) needs the raw handle for real queries. The same
-    /// CONTRACT applies — running statements directly BYPASSES the pin authority; go through the
-    /// instrumented `Checkout` methods for anything that must be tracked.
-    pub mysql: Conn,
+    /// The vendored `mysql_async` connection — **`Option` because it can be PARKED** (B2b-2a).
+    ///
+    /// Every `mysql_async` streaming entry point either borrows the connection or consumes it, and
+    /// `PoolBackend::RowStream` is an associated type with no lifetime, so a streaming
+    /// `MysqlRowStream` must OWN the `Conn` (SPEC §22.2 (n)). `query_stream` will therefore
+    /// [`take`](MysqlConn::park) it out of here for the duration of the stream, and the pool's
+    /// `reclaim_stream` hook puts it back ([`MysqlConn::unpark`]) via the fork's `into_conn`.
+    /// While parked this is `None` and the wrapper is a husk.
+    ///
+    /// **Every method reachable while parked answers safely rather than unwrapping** — see
+    /// `is_closed` (dead), `tx_status` (`Failed`), `take_session_mutated` (`false`),
+    /// `last_insert_id` (`None`), and `MysqlBackend::cancel_handle` (uses the stored `conn_id`).
+    /// That is the FB-2 contract from the iteration-12 hunt: a parked or failed-to-reclaim conn
+    /// must read `is_closed`-dead so the pool DISCARDS it instead of handing the next tenant a
+    /// husk (charter rule 6). Accessors that need the live handle ([`MysqlConn::driver`] /
+    /// [`MysqlConn::driver_mut`]) are only reachable when it is present — the `RowStreamHandle`
+    /// holds `&mut Checkout` for the whole parked window, so no other pool method can run then.
+    mysql: Option<Conn>,
+    /// The server-side connection id, captured at connect so the out-of-band `KILL QUERY` cancel
+    /// handle can be minted WITHOUT touching the live `Conn` — which matters because the handle
+    /// must remain obtainable while the conn is parked.
+    conn_id: u32,
     /// The fully-built connect `Opts` (creds + the session-tracker setup commands). Cloned into a
     /// [`MysqlCancel`] so the side-connection cancel is borrow-free and `Send + 'static`.
     opts: Opts,
@@ -65,13 +81,59 @@ pub struct MysqlConn {
 }
 
 impl MysqlConn {
+    /// The live driver handle. Only callable while the conn is NOT parked — which every caller
+    /// here is, by construction: parking happens inside `query_stream` and is undone by
+    /// `reclaim_stream`, and the `RowStreamHandle` holds `&mut Checkout` across that whole window,
+    /// so no other pool method can observe the parked state. The `expect` documents that invariant
+    /// rather than masking a violation of it.
+    pub fn driver(&self) -> &Conn {
+        self.mysql.as_ref().expect(
+            "MysqlConn::driver on a PARKED conn — the driver handle is owned by a live row stream",
+        )
+    }
+
+    /// Mutable [`MysqlConn::driver`]; same invariant.
+    pub fn driver_mut(&mut self) -> &mut Conn {
+        self.mysql
+            .as_mut()
+            .expect("MysqlConn::driver_mut on a PARKED conn — the driver handle is owned by a live row stream")
+    }
+
+    /// Is the driver handle currently owned by a live row stream (B2b-2a)? A parked conn is a husk:
+    /// `is_closed` reports it dead so the pool can never recycle it.
+    pub fn is_parked(&self) -> bool {
+        self.mysql.is_none()
+    }
+
+    /// Take the driver handle OUT for a streaming statement, leaving this wrapper parked. Returns
+    /// `None` if it is already parked (a caller bug — a second stream on one checkout).
+    pub fn park(&mut self) -> Option<Conn> {
+        self.mysql.take()
+    }
+
+    /// Put a recovered driver handle back (the `reclaim_stream` hook, via the fork's `into_conn`),
+    /// ending the parked window. The recovered conn must be the same session that was parked.
+    pub fn unpark(&mut self, conn: Conn) {
+        self.mysql = Some(conn);
+    }
+
+    /// Close the underlying session, consuming the wrapper. Parked-safe (B2b-2a): a parked conn's
+    /// handle belongs to a live row stream, so there is nothing here to close and this is a no-op —
+    /// the stream's own drop/reclaim closes or recovers it. Errors are swallowed: a disconnect is
+    /// best-effort teardown, and the caller has already given the connection up.
+    pub async fn disconnect(mut self) {
+        if let Some(conn) = self.mysql.take() {
+            let _ = conn.disconnect().await;
+        }
+    }
+
     /// Record the last statement's session-tracker verdict into the per-lease flag (§7.1). Additive
     /// (`|=`): once tainted, a subsequent benign statement never un-taints within the lease. Called
     /// by the leaf statement-runners ([`MysqlBackend::simple_query`], [`crate::query::run`]) AFTER
     /// the result drains (`last_ok_packet` is post-drain). `pub(crate)` so the row-returning `query`
     /// path in [`crate::query`] records the SAME taint the leaf `simple_query` does.
     pub(crate) fn record_session_mutation(&mut self) {
-        let mutated = tracker::ok_reports_session_mutation(self.mysql.last_ok_packet());
+        let mutated = tracker::ok_reports_session_mutation(self.driver().last_ok_packet());
         self.session_mutated |= mutated;
     }
 
@@ -96,8 +158,10 @@ impl MysqlConn {
     /// The last `AUTO_INCREMENT` id generated on this connection (`LAST_INSERT_ID()` off the last OK
     /// packet), if any. Exposed for S7's DBAL `lastInsertId()` — `QueryResult` (a shared type) does
     /// not carry it, and a successful [`crate::query::run`] leaves it populated on the conn.
+    /// Parked-safe (B2b-2a): a parked conn has no packet to read, so `None` — never a panic and
+    /// never a stale key from another statement.
     pub fn last_insert_id(&self) -> Option<u64> {
-        self.mysql.last_insert_id()
+        self.mysql.as_ref().and_then(|c| c.last_insert_id())
     }
 }
 
@@ -183,8 +247,10 @@ impl PoolBackend for MysqlBackend {
     /// opts so [`MysqlCancel::cancel`] can `KILL QUERY` over a side connection while this conn's own
     /// query future is still live.
     fn cancel_handle(&self, conn: &Self::Conn) -> Self::CancelHandle {
+        // Reads the STORED id, not the live handle, so a cancel handle stays obtainable even
+        // while the conn is parked by a live row stream (B2b-2a).
         MysqlCancel {
-            conn_id: conn.mysql.id(),
+            conn_id: conn.conn_id,
             opts: conn.opts.clone(),
         }
     }
@@ -237,8 +303,10 @@ impl PoolBackend for MysqlBackend {
         // at handshake — autocommit/sql_mode/time_zone) NEVER went through `record_session_mutation`,
         // so `session_mutated` is a clean `false` here — a fresh conn is truly clean for the FIRST
         // per-lease measurement. Set explicitly to document the invariant.
+        let conn_id = mysql.id();
         Ok(MysqlConn {
-            mysql,
+            mysql: Some(mysql),
+            conn_id,
             opts,
             session_mutated: false,
             closed: AtomicBool::new(false),
@@ -247,7 +315,7 @@ impl PoolBackend for MysqlBackend {
 
     async fn ping(&self, conn: &mut Self::Conn) -> Result<(), PoolError> {
         // A real COM_PING round trip (catches a backend killed out from under an idle conn).
-        let res = conn.mysql.ping().await;
+        let res = conn.driver_mut().ping().await;
         match res {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -259,9 +327,18 @@ impl PoolBackend for MysqlBackend {
     }
 
     fn is_closed(&self, conn: &Self::Conn) -> bool {
+        // PARKED IS DEAD (B2b-2a, the FB-2 contract). If the driver handle is owned by a live row
+        // stream — or was lost because a reclaim failed, timed out, or the stream was abandoned and
+        // dropped — this wrapper is a husk. Reporting it dead is what makes `Checkout::drop`
+        // DISCARD it instead of pushing it onto the idle stack, where the next tenant would get a
+        // connection with no session behind it (charter rule 6). `tainted` alone would NOT do this:
+        // a tainted conn is recycled (with a full reset), not discarded.
+        if conn.is_parked() {
+            return true;
+        }
         // Our own transport-failure flag OR the driver's own disconnected state (there is no separate
         // spawned driver task to mirror, unlike PG — mysql_async tracks disconnection internally).
-        conn.closed.load(Ordering::SeqCst) || conn.mysql.is_disconnected()
+        conn.closed.load(Ordering::SeqCst) || conn.driver().is_disconnected()
     }
 
     /// This backend always speaks MySQL — a per-backend constant (the assist lexer keys off it).
@@ -283,7 +360,15 @@ impl PoolBackend for MysqlBackend {
     /// The transaction AUTHORITY (SPEC §7.1): reads `SERVER_STATUS_IN_TRANS` off the last OK packet.
     /// NEVER returns `Failed` — MySQL/MariaDB have no aborted-open-tx state (see [`crate::tracker`]).
     fn tx_status(&self, conn: &Self::Conn) -> TxStatus {
-        tracker::tx_status_from_ok(conn.mysql.last_ok_packet())
+        // Parked-safe (B2b-2a): with no handle there is no OK packet to read and the truthful
+        // answer is "unknown". `Failed` is the conservative encoding of unknown — it force-taints
+        // via `apply_tx_status` — and it is reachable only through `finalize_stream` after a
+        // reclaim failed or timed out, a path whose Rule-A force already sets both bits anyway.
+        // Returning `Idle` there would be the one unsafe choice, so it is not offered.
+        match conn.mysql.as_ref() {
+            Some(c) => tracker::tx_status_from_ok(c.last_ok_packet()),
+            None => TxStatus::Failed,
+        }
     }
 
     /// The ASSIST taint (SPEC §7.1): read-and-clear the per-lease session-mutation flag. Reported
@@ -303,7 +388,7 @@ impl PoolBackend for MysqlBackend {
     async fn reset(&self, conn: &mut Self::Conn, profile: ResetProfile) -> Result<(), PoolError> {
         // `Conn::reset` sends COM_RESET_CONNECTION, clears the stmt cache, and re-runs our setup
         // commands (the session-tracker SETs), returning the whole session to a clean baseline.
-        let res = conn.mysql.reset().await;
+        let res = conn.driver_mut().reset().await;
         match res {
             Ok(_) => {
                 // A clean baseline again — clear the per-lease taint (belt-and-braces; the pool has
@@ -337,11 +422,11 @@ impl PoolBackend for MysqlBackend {
     /// failure/deadlock caught AT COMMIT survives as `Sql{Retryable}`, while a transport failure is
     /// the distinct `ConnectionLost` variant.
     async fn simple_query(&self, conn: &mut Self::Conn, sql: &str) -> Result<u64, PoolError> {
-        match conn.mysql.query_drop(sql).await {
+        match conn.driver_mut().query_drop(sql).await {
             Ok(()) => {
                 // Post-drain: the OK packet now carries the status flag + session trackers.
                 conn.record_session_mutation();
-                Ok(conn.mysql.affected_rows())
+                Ok(conn.driver().affected_rows())
             }
             Err(e) => Err(conn.map_stmt_error(&e)),
         }
