@@ -1,5 +1,15 @@
 # Follow-up: the PG bind matrix is narrower than libpq in the `I64 → text/bool` direction
 
+> **RESOLVED (M1-S9, 2026-09-09).** Both widenings shipped in `PgInt`, SPEC §22.2 (af):
+> `I64 → text` (`Type::TEXT` only — the measured target; decimal rendering, `Format::Text`) and
+> `I64 → bool` with the explicit decision this doc demanded made in favour of a **value gate** —
+> only 0 and 1 bind (exactly what Doctrine's `BooleanType` emits), every other integer is refused
+> pre-send with both routes named, so the §9.1 "stray integer silently becomes boolean" class
+> stays refused. `accepts`/`to_sql`/`encode_format` moved in one edit; the directional lockstep
+> proof was RE-DERIVED (its fixture-blindness to value-gated pairs is named in §22.2 (af), and
+> `every_variant` gained `I64(1)`); the F64 arms are untouched. Proven live in both measured
+> shapes. The suite effect is measured at ledger item A5, not asserted here.
+
 **Found:** M1-S8b Task 14, by the upstream `doctrine/dbal 4.4.4` functional subset — 16 PostgreSQL
 tests.
 **Belongs to:** `engine/crates/ferro-backend-pg/src/bind.rs`. **Not** a driver defect: the driver

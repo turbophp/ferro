@@ -909,6 +909,94 @@ async fn s9_catalog_vectors_match_pg_own_text_rendering() {
     );
 }
 
+/// M1-S9 (§22.2 (af)): the two libpq-parity bind widenings, live, in the EXACT shapes the DBAL
+/// suite measured — 16 failures, all `canonical I64 cannot bind to PG type text/bool`.
+#[tokio::test(flavor = "multi_thread")]
+async fn s9_i64_binds_text_and_bool_in_the_measured_doctrine_shapes() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    // Shape 1 (14 tests): DBAL's own date-arithmetic SQL concatenates the placeholder into a
+    // string, so PG infers `text` for the parameter while DBAL binds INTEGER → TAG_I64.
+    let r = co
+        .query("SELECT ? || ' SECOND'", &[Value::I64(300)])
+        .await
+        .expect("the getDateAddSecondsExpression shape must bind since M1-S9");
+    assert_eq!(r.rows, vec![vec![Value::Text("300 SECOND".into())]]);
+    // ...and the real thing end to end: PG evaluates the interval arithmetic the expression feeds.
+    let r = co
+        .query(
+            "SELECT (TIMESTAMP '2026-08-05 11:00:00' + CAST(? || ' SECOND' AS interval))::text",
+            &[Value::I64(90)],
+        )
+        .await
+        .expect("the full date-add expression must run");
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Text("2026-08-05 11:01:30".into())]]
+    );
+
+    // Shape 2 (2 tests): BooleanType emits int(1)/int(0); an untyped insert() binds it TAG_I64
+    // into a bool column. Written to a REAL table so the round trip is proven, not inferred.
+    co.exec("DROP TABLE IF EXISTS s9_boolcast").await.unwrap();
+    co.exec("CREATE TABLE s9_boolcast (id int4 PRIMARY KEY, flag bool, note text)")
+        .await
+        .unwrap();
+    co.query(
+        "INSERT INTO s9_boolcast (id, flag, note) VALUES (?, ?, ?)",
+        &[Value::I64(1), Value::I64(1), Value::I64(42)],
+    )
+    .await
+    .expect("I64 into bool (=1) and into text must bind since M1-S9");
+    co.query(
+        "INSERT INTO s9_boolcast (id, flag) VALUES (?, ?)",
+        &[Value::I64(2), Value::I64(0)],
+    )
+    .await
+    .expect("I64 into bool (=0)");
+    let r = co
+        .query("SELECT flag, note FROM s9_boolcast ORDER BY id", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Value::Bool(true), Value::Text("42".into())],
+            vec![Value::Bool(false), Value::Null],
+        ],
+        "the widened binds must round-trip as the COLUMN's own values"
+    );
+
+    // The VALUE gate, live: a non-0/1 integer into bool is refused PRE-SEND — known fate, the
+    // statement never executed — and the connection is untouched and immediately reusable.
+    let err = co
+        .query(
+            "INSERT INTO s9_boolcast (id, flag) VALUES (?, ?)",
+            &[Value::I64(3), Value::I64(5)],
+        )
+        .await
+        .expect_err("5 into bool must be refused");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("only 0 and 1"),
+        "the refusal must carry the value gate's reason: {msg}"
+    );
+    let ok = co
+        .query("SELECT count(*) FROM s9_boolcast", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.rows,
+        vec![vec![Value::I64(2)]],
+        "the refused statement must never have executed, and the conn must stay clean"
+    );
+    co.exec("DROP TABLE s9_boolcast").await.unwrap();
+    println!("  s9 binds: '300 SECOND', date-add end to end, bool 1/0 round trip, 5→refused clean");
+}
+
 /// **DOMAINs need no `Kind::Domain` unwrap — the plan's "domains are deferred" carry was FALSE**
 /// (T4b review F1). PG resolves a domain to its BASE type when it builds the `RowDescription`
 /// (`printtup.c` → `getBaseTypeAndTypmod`), so the domain's own custom OID never reaches the wire
