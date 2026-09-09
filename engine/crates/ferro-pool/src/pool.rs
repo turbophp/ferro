@@ -776,7 +776,7 @@ impl<B: PoolBackend> Checkout<B> {
             // (the `&mut Checkout`) can move into the handle without a self-referential borrow.
             Ok((cols, rows)) => Ok(RowStreamHandle {
                 checkout: self,
-                rows,
+                rows: Some(rows),
                 cols,
                 sql: sql.to_owned(),
                 errored: false,
@@ -1018,7 +1018,12 @@ pub struct StreamEnd {
 /// task keeps feeding the stream.
 pub struct RowStreamHandle<'a, B: PoolBackend> {
     checkout: &'a mut Checkout<B>,
-    rows: B::RowStream,
+    /// `Some` until [`RowStreamHandle::finish`] hands the stream to the backend's
+    /// `reclaim_stream` hook (B2b) — `Option` because this struct has a `Drop` impl, so the field
+    /// cannot be moved out directly. On an abandoned handle it drops here with the struct, which
+    /// for a conn-owning stream (MySQL) closes the moved-out driver connection; the checkout's
+    /// conn slot is then empty, `is_closed` reports dead, and the pool discards the husk.
+    rows: Option<B::RowStream>,
     cols: Vec<ColMeta>,
     sql: String,
     /// Set once any `next()` yields an `Err` — drives the Rule-A force-taint in `finish`.
@@ -1038,7 +1043,7 @@ impl<'a, B: PoolBackend> RowStreamHandle<'a, B> {
     /// not produced until this is polled) and records `errored` so [`RowStreamHandle::finish`] can
     /// apply the Rule-A force-taint.
     pub async fn next(&mut self) -> Option<Result<Vec<Value>, PoolError>> {
-        match self.rows.next().await {
+        match self.rows.as_mut()?.next().await {
             Some(Err(e)) => {
                 self.errored = true;
                 Some(Err(e))
@@ -1066,8 +1071,34 @@ impl<'a, B: PoolBackend> RowStreamHandle<'a, B> {
         // Drain the remainder (a no-op if the caller already pulled to `None`). Going through
         // `self.next()` records any late error into `self.errored`.
         while self.next().await.is_some() {}
-        let affected = self.rows.rows_affected();
-        let errored = self.errored;
+        // Hand the drained stream to the backend's RECLAIM hook (B2b): for a backend whose stream
+        // OWNS the driver connection (MySQL) this is where the conn re-enters the checkout —
+        // BEFORE `finalize_stream` reads `tx_status(&conn)` — and where `affected` is answered
+        // from the connection's own post-drain packet (SPEC §22.2 (n)). For PG/the fake the
+        // default hook returns the stream's `rows_affected()`, byte-for-byte what this method
+        // read before the hook existed.
+        let rows = self
+            .rows
+            .take()
+            .expect("RowStreamHandle::finish consumes the stream exactly once");
+        let pool = Arc::clone(&self.checkout.pool);
+        let (affected, errored) = match pool
+            .backend
+            .reclaim_stream(self.checkout.conn_mut(), rows)
+            .await
+        {
+            Ok(a) => (a, self.errored),
+            // The conn could not be restored (the reclaim contract obliges the backend to leave
+            // it `is_closed`-dead). Treat the stream as ERRORED so finalize's Rule-A force-taint
+            // runs; the pool then discards the husk at return instead of recycling it.
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "ferro-pool: stream reclaim failed — connection will be discarded"
+                );
+                (0, true)
+            }
+        };
         let stats = self.checkout.stats();
         self.checkout.finalize_stream(errored, &self.sql);
         self.finished = true;
