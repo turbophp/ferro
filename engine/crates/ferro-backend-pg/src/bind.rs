@@ -368,24 +368,39 @@ pg_canonical_text_param! {
 }
 
 /// A canonical `I64` bound against whichever PG integer width the prepared statement inferred
-/// (M1-S8a). PG's own `ToSql for i64` accepts `int8` ONLY, so before this every DBAL insert into a
-/// `serial`/`int4` PK — and every `$qb->setParameter('id', 5)` against one — was a hard, pre-send
-/// `NonRetryable` refusal.
+/// (M1-S8a), **plus — M1-S9 — the two non-integer targets ordinary stock-Doctrine shapes reach**:
+/// `text` and `bool`. PG's own `ToSql for i64` accepts `int8` ONLY, so before S8a every DBAL insert
+/// into a `serial`/`int4` PK — and every `$qb->setParameter('id', 5)` against one — was a hard,
+/// pre-send `NonRetryable` refusal.
 ///
-/// **Format is BINARY**, not text: PG's param format IS per-param selectable (`encode_format`), but
-/// there is nothing to gain here — `<i16/i32/i64 as ToSql>` already writes the exact native binary
-/// form, so this delegates rather than re-rendering a decimal string PG would have to re-parse.
+/// **The S9 widening, and its two-sentence membership rule** (the mirror of [`PgText`]'s (aa)):
+/// - `text` — PG infers `text` for a parameter concatenated into a string (`? || ' SECOND'`, which
+///   is DBAL's own date-arithmetic SQL on PostgreSQL, 14 measured suite failures), and an integer's
+///   decimal rendering IS valid text input for a text column — `pdo_pgsql` sends exactly that. Only
+///   `Type::TEXT` itself: `varchar`/`bpchar` have no measured caller, and unmeasured widening is
+///   how a pre-flight rots (§22.2 (af)). The rendering is the decimal string, sent `Format::Text`.
+/// - `bool` — Doctrine's own `BooleanType::convertToDatabaseValue(true, pg)` returns `int(1)`
+///   (measured), and `Connection::insert()` with no `$types` binds it STRING → `TAG_I64`. Admitted
+///   with a VALUE gate in [`check_range`]: **only 0 and 1 bind** — the exact values Doctrine emits
+///   — and every other integer is refused PRE-SEND, so a stray `5` can never silently become a
+///   boolean (the §9.1 coercion class the follow-up doc weighs; this is the explicit decision).
+///   The bind itself is a real binary `bool`, delegated.
 ///
-/// **The range check is NOT here.** It lives in [`check_param`], which sees the VALUE (unlike
-/// `ToSql::accepts`, which sees only the `Type`), one step earlier. The reason is **misclassification**,
-/// not transmission: `encode_bind_raw` serialises every param into a LOCAL buffer BEFORE `start`
-/// writes anything to the socket, so a `to_sql` failure means the statement provably never left the
-/// process — but it surfaces as `Error::to_sql(..)`, whose `as_db_error()` is `None`, which
-/// `conn.rs`'s `is_session_fatal` reads as a transport failure → `PoolError::ConnectionLost` →
-/// which §19.3 turns into `WriteUnconfirmed{Indeterminate}` on a sent, non-readonly, non-in-tx op.
-/// A statement that never left the process would then be reported as a write of UNKNOWN fate. The
-/// `try_from`s below are therefore a totality backstop for a caller that skipped the pre-flight —
-/// they yield a typed `WrongType`-class error, never a panic.
+/// **Format is BINARY** for the integer widths and `bool` (`<i16/i32/i64/bool as ToSql>` already
+/// write the exact native binary form) and **TEXT** for the `text` target — [`encode_format`]
+/// branches with `to_sql` on the RESOLVED base, exactly as [`PgText`]'s widening had to.
+///
+/// **The range/value checks are NOT here.** They live in [`check_param`], which sees the VALUE
+/// (unlike `ToSql::accepts`, which sees only the `Type`), one step earlier. The reason is
+/// **misclassification**, not transmission: `encode_bind_raw` serialises every param into a LOCAL
+/// buffer BEFORE `start` writes anything to the socket, so a `to_sql` failure means the statement
+/// provably never left the process — but it surfaces as `Error::to_sql(..)`, whose `as_db_error()`
+/// is `None`, which `conn.rs`'s `is_session_fatal` reads as a transport failure →
+/// `PoolError::ConnectionLost` → which §19.3 turns into `WriteUnconfirmed{Indeterminate}` on a
+/// sent, non-readonly, non-in-tx op. A statement that never left the process would then be
+/// reported as a write of UNKNOWN fate. The `try_from`s and the non-0/1-into-`bool` `Err` below
+/// are therefore a totality backstop for a caller that skipped the pre-flight — they yield a typed
+/// `WrongType`-class error, never a panic, and never a byte on the wire.
 #[derive(Debug)]
 struct PgInt(i64);
 
@@ -408,13 +423,40 @@ impl ToSql for PgInt {
             i32::try_from(self.0)?.to_sql(base, out)
         } else if *base == Type::INT8 {
             self.0.to_sql(base, out)
+        } else if *base == Type::TEXT {
+            // M1-S9: the decimal rendering, verbatim, in TEXT format (see `encode_format`).
+            out.extend_from_slice(self.0.to_string().as_bytes());
+            Ok(IsNull::No)
+        } else if *base == Type::BOOL {
+            // M1-S9: only the two values with a boolean MEANING. The pre-flight refused everything
+            // else already; this arm is the totality backstop for a caller that skipped it.
+            match self.0 {
+                0 => false.to_sql(base, out),
+                1 => true.to_sql(base, out),
+                n => Err(format!(
+                    "PgInt cannot bind {n} to PG type bool (only 0 and 1 have a boolean meaning)"
+                )
+                .into()),
+            }
         } else {
             Err(format!("PgInt cannot bind PG type {}", ty.name()).into())
         }
     }
 
     fn accepts(ty: &Type) -> bool {
-        [Type::INT2, Type::INT4, Type::INT8].contains(resolve_domain(ty))
+        let base = resolve_domain(ty);
+        [Type::INT2, Type::INT4, Type::INT8, Type::TEXT, Type::BOOL].contains(base)
+    }
+
+    /// TEXT format for the `text` target only; every other target keeps the native BINARY form its
+    /// delegated encoder writes. Resolves the domain for the same reason `to_sql` does: the format
+    /// must be decided by the encoder that actually runs (see [`PgText::encode_format`]).
+    fn encode_format(&self, ty: &Type) -> Format {
+        if *resolve_domain(ty) == Type::TEXT {
+            Format::Text
+        } else {
+            Format::Binary
+        }
     }
 
     to_sql_checked!();
@@ -688,6 +730,18 @@ fn check_range(v: &Value, ty: &Type) -> Result<(), String> {
                      (pre-send rejection: the statement was never executed)"
                 ));
             }
+            // M1-S9: the VALUE half of the I64→bool widening — the explicit decision the follow-up
+            // doc demanded. Doctrine's BooleanType emits exactly 0/1; any other integer acquiring a
+            // boolean meaning is the §9.1 coercion class, refused pre-send with the actionable
+            // routes named. (PG's own text input would refuse '5' too — 22P02 — but server-side
+            // and after the statement was sent; this keeps the fate KNOWN.)
+            if *ty == Type::BOOL && *n != 0 && *n != 1 {
+                return Err(format!(
+                    "canonical I64 value {n} cannot bind to PG type bool: only 0 and 1 have a \
+                     boolean meaning — bind a BOOL (DBAL: declare Types::BOOLEAN), or pass 0/1 \
+                     (pre-send rejection: the statement was never executed)"
+                ));
+            }
             Ok(())
         }
         Value::F64(f) => {
@@ -850,17 +904,100 @@ mod tests {
             assert!(accepts(&Value::F64(1.5), &ty), "F64 must bind {ty:?}");
         }
         // Still NARROW: widening the integer arms must not make an int bindable anywhere else.
-        for ty in [
-            Type::TEXT,
-            Type::NUMERIC,
-            Type::DATE,
-            Type::TIMESTAMP,
-            Type::UUID,
-            Type::BOOL,
-        ] {
+        // M1-S9 REPOINTED `TEXT` and `BOOL` out of this list into
+        // `s9_i64_binds_text_and_bool_like_libpq` (I64 now binds both, bool value-gated to 0/1);
+        // the F64 half is UNCHANGED and keeps asserting both, because no measured caller binds a
+        // float into either and unmeasured widening is how a pre-flight rots.
+        for ty in [Type::NUMERIC, Type::DATE, Type::TIMESTAMP, Type::UUID] {
             assert!(!accepts(&Value::I64(42), &ty), "I64 must not bind {ty:?}");
             assert!(!accepts(&Value::F64(1.5), &ty), "F64 must not bind {ty:?}");
         }
+        for ty in [Type::TEXT, Type::BOOL] {
+            assert!(!accepts(&Value::F64(1.5), &ty), "F64 must not bind {ty:?}");
+        }
+    }
+
+    /// **M1-S9: the two libpq-parity widenings, §22.2 (af)** — the second of (z)'s three named
+    /// M1-exit gaps (16 measured suite failures). `I64 → text` because PG infers `text` for DBAL's
+    /// own date-arithmetic placeholder (`? || ' SECOND'`); `I64 → bool` because Doctrine's
+    /// `BooleanType` emits `int(1)` and an untyped `insert()` binds it through as `TAG_I64`.
+    #[test]
+    fn s9_i64_binds_text_and_bool_like_libpq() {
+        use tokio_postgres::types::Kind;
+        // The accept side. `0`/`1` are the ONLY integers with a boolean meaning.
+        assert!(accepts(&Value::I64(42), &Type::TEXT));
+        assert!(accepts(&Value::I64(i64::MIN), &Type::TEXT));
+        assert!(accepts(&Value::I64(0), &Type::BOOL));
+        assert!(accepts(&Value::I64(1), &Type::BOOL));
+
+        // The VALUE gate: any other integer into bool is refused PRE-SEND, with the value, the
+        // reason and both actionable routes named — and the boxed impl refuses it too, so the
+        // pre-flight is EQUAL to the impl here, never looser (§19.3's direction).
+        for n in [2i64, -1, 5, i64::MAX] {
+            let err = check_param(&Value::I64(n), &Type::BOOL).expect_err("non-0/1 into bool");
+            assert!(err.contains(&n.to_string()), "must name the value: {err}");
+            assert!(err.contains("only 0 and 1"), "must say why: {err}");
+            assert!(err.contains("Types::BOOLEAN"), "must name the route: {err}");
+            let mut buf = tokio_postgres::types::private::BytesMut::new();
+            assert!(
+                value_to_boxed(&Value::I64(n))
+                    .to_sql_checked(&Type::BOOL, &mut buf)
+                    .is_err(),
+                "the impl backstop must refuse {n} into bool as well"
+            );
+            assert!(buf.is_empty(), "a refused bind must write no bytes");
+        }
+
+        // Membership stays MEASURED: `text` only, never the other character types — no suite
+        // failure ever reached them with an integer, and unmeasured widening is the §22.2 (af)
+        // anti-pattern this comment exists to stop.
+        for ty in [Type::VARCHAR, Type::BPCHAR, Type::NAME, Type::UNKNOWN] {
+            assert!(!accepts(&Value::I64(42), &ty), "I64 must not bind {ty:?}");
+        }
+
+        // The wire form. `text` gets the DECIMAL RENDERING in TEXT format; `bool` gets the native
+        // 1-byte binary bool; the integer widths keep the binary format they always had.
+        let mut buf = tokio_postgres::types::private::BytesMut::new();
+        PgInt(-42).to_sql(&Type::TEXT, &mut buf).unwrap();
+        assert_eq!(&buf[..], b"-42");
+        assert!(matches!(
+            PgInt(-42).encode_format(&Type::TEXT),
+            Format::Text
+        ));
+        let mut buf = tokio_postgres::types::private::BytesMut::new();
+        PgInt(1).to_sql(&Type::BOOL, &mut buf).unwrap();
+        assert_eq!(&buf[..], [1u8], "a bool bind is the native binary form");
+        assert!(matches!(
+            PgInt(1).encode_format(&Type::BOOL),
+            Format::Binary
+        ));
+        assert!(matches!(
+            PgInt(1).encode_format(&Type::INT8),
+            Format::Binary
+        ));
+
+        // The domain unwrap applies to the widened targets, format included (the wire bug class
+        // `s8b_bare_text_binds_…` pins for PgText, pinned here for PgInt's new branch).
+        let dom_text = Type::new(
+            "dom_text_i64".into(),
+            900_030,
+            Kind::Domain(Type::TEXT),
+            "public".into(),
+        );
+        let dom_bool = Type::new(
+            "dom_bool_i64".into(),
+            900_031,
+            Kind::Domain(Type::BOOL),
+            "public".into(),
+        );
+        assert!(accepts(&Value::I64(7), &dom_text));
+        assert!(accepts(&Value::I64(1), &dom_bool));
+        assert!(
+            !accepts(&Value::I64(7), &dom_bool),
+            "the value gate resolves the domain too"
+        );
+        assert!(matches!(PgInt(7).encode_format(&dom_text), Format::Text));
+        assert!(matches!(PgInt(1).encode_format(&dom_bool), Format::Binary));
     }
 
     /// The range check is a PRE-SEND, known-fate rejection — NOT a `to_sql` failure. A value outside
@@ -1200,6 +1337,14 @@ mod tests {
             Value::Null,
             Value::Bool(true),
             Value::I64(-200),
+            // M1-S9: the ACCEPT-side value of the I64→bool VALUE gate. The lockstep proof
+            // `continue`s past every pair `accepts` refuses, so a value-gated widening whose
+            // accept-side value is missing from this fixture is silently NEVER EXERCISED by the
+            // cross product — the exact structural blindness S8a found once already, re-derived
+            // for this slice rather than re-run: `1` is the only fixture value for which
+            // accepts(I64, BOOL) is true, so its presence is what makes the widened pair reach
+            // the boxed impl in `s7_accepts_is_never_looser_than_the_boxed_impl` at all.
+            Value::I64(1),
             // M1-S8a: the magnitudes the narrowing range gate exists for. Without these three the
             // cross-product proof below only ever sees an in-range integer and the gate is UNPROVEN
             // (the hard-coded-fixture failure mode).
