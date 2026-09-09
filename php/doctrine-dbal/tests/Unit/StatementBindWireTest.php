@@ -41,7 +41,7 @@ final class StatementBindWireTest extends TestCase
      */
     private static function sendAndDecodeParams(array $binds): array
     {
-        $session = (new FakeSession())->thenExecOk(null);
+        $session = (new FakeSession())->thenStreamEnd(); // M1-S9 B1b: the PG prepared path streams; an immediate Ok terminal is "success if it reaches the wire"
         $conn = new Connection(
             new FerroClientConnection($session, 'default'),
             'default',
@@ -149,7 +149,7 @@ final class StatementBindWireTest extends TestCase
      */
     public function testParametersAreSentInPositionalOrderNotInBindOrder(): void
     {
-        $session = (new FakeSession())->thenExecOk(null);
+        $session = (new FakeSession())->thenStreamEnd(); // M1-S9 B1b: the PG prepared path streams; an immediate Ok terminal is "success if it reaches the wire"
         $conn = new Connection(
             new FerroClientConnection($session, 'default'),
             'default',

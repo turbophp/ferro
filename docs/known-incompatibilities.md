@@ -250,12 +250,15 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   `0` for pure iteration and for a properly abandoned one, non-zero only for interleaving.
 - **On a streamed read, a statement's ERROR surfaces mid-iteration, not from `executeQuery()`.** The
   open reads only the column header. The fate classification is unchanged; the vantage point is.
-- **`rowCount()` after a `SELECT` diverges by family AND by route.** PostgreSQL through the
-  parameterised (buffered) route reports the row count; PostgreSQL through the zero-parameter
-  (streamed) route reports `0`, because a stream terminal carries no `affected`; MySQL reports `0`
-  either way. It is not normalised, because normalising means counting rows — the exact conflation
-  §14 warns about — and DBAL itself documents `rowCount()`-on-a-`SELECT` as driver-specific.
-  `rowCount()` after an `INSERT`/`UPDATE`/`DELETE` is always correct.
+- **`rowCount()` on a PostgreSQL streamed `SELECT` is DRAIN-THEN-ANSWER** (M1-S9 B1b, §22.2 (ah);
+  this REPLACES the old "streamed route reports 0" divergence, whose stated cause — "a stream
+  terminal carries no `affected`" — was measured false, §22.2 (ag)). On PostgreSQL BOTH routes now
+  stream and both answer what `pdo_pgsql` answers: the command-tag row count. The cost is honest
+  and only paid when asked: calling `rowCount()` on a still-open streamed result finishes the read
+  (buffering the remaining rows, which stay fetchable); pure iteration still never buffers. MySQL
+  reports `0` for a `SELECT` either way, unchanged. A result `free()`d before its terminal keeps
+  `0` — a command tag that was never read has no honest value.
+  `rowCount()` after an `INSERT`/`UPDATE`/`DELETE` is always correct on both families.
 - **`free()` keeps `rowCount()`** while emptying rows and columns. Upstream is split on this
   (SQLite3 keeps its count, PgSQL answers `0`); ours is a choice.
 - **`Ferro\Pg\Copy`** — the first-class replacement for `pdo_pgsql` COPY hacks named in SPEC §14 —

@@ -4,6 +4,7 @@ namespace Ferro\DBAL\Tests\Unit;
 
 use Ferro\Client\Error\NonRetryableException;
 use Ferro\Client\RawStream;
+use Ferro\Client\StreamTerminal;
 use Ferro\DBAL\Exception\DriverException;
 use Ferro\DBAL\Result;
 use Ferro\Protocol\ErrorPayload;
@@ -341,13 +342,69 @@ final class StreamedResultTest extends TestCase
     }
 
     /**
-     * A streamed read reports `rowCount() === 0`, because the HEAD/DATA/END producer carries no
-     * `affected` field at all. This is the reason the PREPARED path does not stream:
-     * `Doctrine\DBAL\Connection::executeStatement()` RETURNS this number.
+     * REPOINTED at M1-S9 B1b (was "a streamed read reports rowCount() === 0, because the producer
+     * carries no affected field" — the premise was measured FALSE, §22.2 (ag)). What survives is
+     * the honest half: a stream whose terminal NEVER SETTLES — this fixture has no pump writing
+     * the shared cell, the same state as a freed-before-drain result — keeps the 0, because a
+     * command tag that was never read has no value to report. The drain still happens (rowCount
+     * is drain-then-answer now), it just finds nothing settled.
      */
-    public function testAStreamedResultReportsNoAffectedCount(): void
+    public function testAnUnsettledStreamReportsZeroAffected(): void
     {
         $pulled = 0;
         self::assertSame(0, Result::streamed($this->stream([[1, 'a']], $pulled))->rowCount());
+    }
+
+    /**
+     * M1-S9 B1b: `rowCount()` on a streamed result is DRAIN-THEN-ANSWER. The settled cell is what
+     * a real pump writes at the Ok terminal (proven live in `StreamingLiveTest`); here it is
+     * pre-settled through the same `StreamTerminal` type to pin the Result-side mechanics offline:
+     * the drain runs (the generator finishes), the settled count surfaces, and the already-drained
+     * result keeps answering it without a second drain.
+     */
+    public function testRowCountDrainsAndAnswersTheSettledCount(): void
+    {
+        $terminal = new StreamTerminal();
+        $terminal->affected = 42;
+        $terminal->settled = true;
+        $pulled = 0;
+        $r = Result::streamed(new RawStream(
+            ['id', 'note'],
+            $this->stream([[1, 'a'], [2, 'b']], $pulled)->rows(),
+            null,
+            7,
+            $terminal,
+        ));
+
+        self::assertSame(42, $r->rowCount(), 'drain-then-answer must surface the settled count');
+        self::assertFalse($r->isStreaming(), 'rowCount() drained the stream');
+        self::assertSame(2, $pulled, 'the drain consumed the remaining rows');
+        self::assertSame(42, $r->rowCount(), 'idempotent after the drain');
+    }
+
+    /**
+     * The OTHER order — fetch to exhaustion, THEN ask. The CI round on PR #9 proved the two
+     * orders can disagree: the fetch-exhaustion arm of `fetchNumeric()` dropped the stream handle
+     * without capturing the settled count, so `fetchAll…()` + `rowCount()` answered 0 while
+     * `rowCount()` + `fetchAll…()` answered the truth. An ordering dependence in an SPI accessor
+     * is a defect class of its own; both orders stay pinned.
+     */
+    public function testRowCountAfterFetchExhaustionAnswersTheSettledCountToo(): void
+    {
+        $terminal = new StreamTerminal();
+        $terminal->affected = 42;
+        $terminal->settled = true;
+        $pulled = 0;
+        $r = Result::streamed(new RawStream(
+            ['id', 'note'],
+            $this->stream([[1, 'a'], [2, 'b']], $pulled)->rows(),
+            null,
+            7,
+            $terminal,
+        ));
+
+        self::assertSame([[1, 'a'], [2, 'b']], $r->fetchAllNumeric());
+        self::assertFalse($r->isStreaming(), 'exhaustion ended the stream');
+        self::assertSame(42, $r->rowCount(), 'the settled count must survive the exhaustion arm');
     }
 }
