@@ -35,9 +35,19 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with: { php-version: "8.4", extensions: msgpack, tools: composer }
       - uses: dtolnay/rust-toolchain@stable
+      # The testkit host ports (55432/33060/33061) sit inside Linux's ephemeral range
+      # (32768–60999), so any transient outbound socket on the runner can be holding one when
+      # docker-proxy tries to bind it — MEASURED: run 34351348533's pg job died on
+      # "bind host port 0.0.0.0:55432 … address already in use" while both MySQL-family jobs
+      # got lucky. Reserving the ports stops the kernel handing them out as ephemeral source
+      # ports; the retry covers the residual case of a connection that grabbed one BEFORE the
+      # reservation and is still alive at bind time.
+      - run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=33060,33061,55432
       # The suite resets its database via `docker compose exec`, so the family's container must be
       # the testkit one — same digest-pinned image, credentials and healthcheck as every other lane.
-      - run: docker compose -f testkit/docker-compose.yml up -d --wait ${{ matrix.family }}
+      - run: |
+          docker compose -f testkit/docker-compose.yml up -d --wait ${{ matrix.family }} \
+            || { sleep 15; docker compose -f testkit/docker-compose.yml up -d --wait ${{ matrix.family }}; }
       - name: suite, run 1 of 2
         run: |
           set -o pipefail +e
