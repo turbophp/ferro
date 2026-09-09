@@ -76,9 +76,13 @@ pub struct ResultSetStream<'r, 'a: 'r, 't: 'a, T, P> {
     /// OWNED connection — is retained instead of being dropped at that point,
     /// so exhaustion no longer closes an owned connection out from under the
     /// caller; [`ResultSetStream::into_conn`] can recover it. The connection
-    /// now closes when the stream itself is dropped, which is when every
-    /// pre-fork caller closed it anyway (they drop the stream after the last
-    /// row).
+    /// now closes when the stream itself is dropped (or is recovered via
+    /// `into_conn`), rather than at the terminal `None`/`Err`. For a caller
+    /// that drops the stream right after the last row this is unobservable;
+    /// a caller that keeps the exhausted stream alive to read the trailing
+    /// accessors (`affected_rows`/`last_insert_id`/`info`/`get_warnings`) and
+    /// does more work before dropping it now holds the connection open for
+    /// that window — recover it promptly with `into_conn` to avoid that.
     done: bool,
     __from_row_type: PhantomData<T>,
 }

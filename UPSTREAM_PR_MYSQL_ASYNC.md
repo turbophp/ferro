@@ -138,10 +138,14 @@ because dropping the stream closes the connection.
 
 - `ResultSetStream` gains a `done` flag: the terminal `None` (and the error terminal) RETAINS the
   internal state instead of dropping it, so an owned connection is no longer closed at
-  exhaustion — it closes when the stream itself is dropped, which is where every existing caller
-  already ends up (they drop the stream after the last row; `FusedStream::is_terminated` reports
+  exhaustion — it closes when the stream itself is dropped (`FusedStream::is_terminated` reports
   `done` so fused semantics are unchanged, and a borrowed stream's borrow was always held until
-  drop by the lifetimes, so nothing observable changes for the borrowed route).
+  drop by the lifetimes, so nothing observable changes for the borrowed route). For an OWNED
+  stream this shifts the close point from the terminal `None` to stream-drop: unobservable for the
+  common "drop after the last row" pattern, but a caller that keeps the exhausted stream alive to
+  read its trailing accessors (`affected_rows`/`last_insert_id`/`info`/`get_warnings`) and does
+  more work before dropping it holds the connection open for that window — `into_conn` (below)
+  recovers it promptly, and Ferro's pool calls it immediately after the drain so it never lingers.
 - `ResultSetStream::into_conn(self) -> Result<Conn>`: resolves any in-flight row future, drains
   every unconsumed row and pending result set (exactly `drop_result`'s loop), and returns the
   owned `Conn`. On a stream that merely borrows its connection it refuses with the new
