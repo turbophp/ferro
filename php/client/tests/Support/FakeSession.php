@@ -70,6 +70,16 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
     /** How many times {@see abandonStream} was called — the eager-open leak guard reads it. */
     public int $abandonCount = 0;
 
+    /** Per-consumed-DATA-frame `WINDOW_UPDATE`s the pump sent (M1-S9 B1a — see {@see thenStreamFrames}). */
+    public int $windowUpdateCount = 0;
+
+    /**
+     * Scripted frames for {@see readStreamFrame}, served in order (M1-S9 B1a).
+     *
+     * @var list<array{type:'data', rows:list<list<array{tag:int,data:mixed}>>, bytes:int}|array{type:'end', outcome:Outcome}>
+     */
+    private array $streamFrames = [];
+
     public function __construct(private readonly int|string $epoch = 1) {}
 
     /**
@@ -230,6 +240,23 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
      *
      * @param list<array{name:string,tag:int}> $cols
      */
+    /**
+     * Script the frames {@see readStreamFrame} serves after a {@see thenStreamHead} open (M1-S9
+     * B1a). Until this existed the fixture deliberately modelled NO data frames — the settled-
+     * terminal capture needed a drain to test offline, so the loud-throw contract is now scoped
+     * to UNSCRIPTED reads (still loud: a broken stream path cannot look green by reading silence).
+     * Whether the wire genuinely behaves this way stays proven live (`RawStreamLiveTest`).
+     *
+     * @param list<array{type:'data', rows:list<list<array{tag:int,data:mixed}>>, bytes:int}|array{type:'end', outcome:Outcome}> $frames
+     */
+    public function thenStreamFrames(array $frames): self
+    {
+        foreach ($frames as $f) {
+            $this->streamFrames[] = $f;
+        }
+        return $this;
+    }
+
     public function thenStreamHead(array $cols): self
     {
         $this->streamHeads[] = $cols;
@@ -287,15 +314,19 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
     /** @return array{type:'data', rows:list<list<array{tag:int,data:mixed}>>, bytes:int}|array{type:'end', outcome:Outcome} */
     public function readStreamFrame(int $requestId): array
     {
-        // Unreachable for both shapes this fixture models: after an immediate terminal there is
-        // nothing to read, and after a `thenStreamHead` the tests deliberately never iterate. Loud
+        // Scripted frames ({@see thenStreamFrames}) serve in order; an UNSCRIPTED read stays loud
         // on purpose — a silent empty frame here would let a broken stream path look green.
-        throw new \LogicException('FakeSession models no DATA frames (see the class docblock)');
+        if ($this->streamFrames !== []) {
+            return array_shift($this->streamFrames);
+        }
+        throw new \LogicException('FakeSession has no scripted DATA frames (see thenStreamFrames)');
     }
 
     public function sendWindowUpdate(int $requestId, int $frames, int $bytes): void
     {
-        throw new \LogicException('FakeSession models no DATA frames (see the class docblock)');
+        // Counted, not modelled (same shape as {@see abandonStream}): the pump sends one per
+        // consumed DATA frame, and the count is what the credit-discipline assertion reads.
+        ++$this->windowUpdateCount;
     }
 
     public function sendCancel(int $requestId): void

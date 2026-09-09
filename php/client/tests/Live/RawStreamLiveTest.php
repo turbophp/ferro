@@ -31,9 +31,23 @@ final class RawStreamLiveTest extends LiveTestCase
         $seen = 0;
         foreach ($stream->rows() as $row) {
             self::assertSame($seen + 1, $row[0], 'rows are POSITIONAL and in order');
+            if ($seen === 0) {
+                // M1-S9 B1a: mid-drain the terminal has not arrived, and the honest answer is
+                // "not yet" — never a premature count.
+                self::assertFalse($stream->settled());
+                self::assertNull($stream->affected());
+            }
             ++$seen;
         }
         self::assertSame(500, $seen);
+
+        // M1-S9 B1a: the drained terminal's command-tag count surfaces on the handle — PG's tag
+        // for a SELECT is the number of rows returned, read by the ENGINE post-drain (never a
+        // hardcoded 0) and now no longer dropped by the client. This is the value that lets the
+        // Doctrine prepared path stream (B1b) without lying to rowCount().
+        self::assertTrue($stream->settled(), 'a full drain settles the terminal');
+        self::assertSame(500, $stream->affected(), "the SELECT command tag's row count");
+        self::assertNull($stream->lastInsertId(), 'PG streams report no generated key');
 
         // A FULL drain reached the ONE terminal (charter rule 4) and needs no close(): if it had
         // not, this next statement would be refused by the session's single-in-flight guard.
