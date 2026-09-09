@@ -318,11 +318,14 @@ impl VectorElem {
         }
     }
 
-    /// The element type OID `array_send` stamps into the payload — verified, never assumed.
+    /// The element type OID `array_send` stamps into the payload — verified, never assumed, and
+    /// spelled via the NAMED types (review F4): the unit fixtures build payloads with the same
+    /// constants, so a bare literal here would make the cross-check number-against-number with no
+    /// tie to the type it claims to verify.
     fn elem_oid(self) -> u32 {
         match self {
-            VectorElem::Int2 => 21,
-            VectorElem::Oid => 26,
+            VectorElem::Int2 => tokio_postgres::types::Type::INT2.oid(),
+            VectorElem::Oid => tokio_postgres::types::Type::OID.oid(),
         }
     }
 
@@ -356,10 +359,17 @@ pub fn oidvector_to_text(raw: &[u8]) -> Result<String, PoolError> {
     vector_to_text(raw, VectorElem::Oid)
 }
 
-/// The shared array-wire-format walker behind the two vector renderers. Strict on every header
-/// field it does not use for rendering: a dimension count other than 0/1, a NULL bitmap flag, a
-/// foreign element OID or a short element all mean the payload is not the vector the OID gate
+/// The shared array-wire-format walker behind the two vector renderers. Strict on EVERY header
+/// field, used for rendering or not — it mirrors `int2vectorrecv`'s own gate exactly (PG
+/// `src/backend/utils/adt/int.c`: ndim must be 1, no NULL bitmap, the right element OID, lower
+/// bound 0): a violation of any of them means the payload is not the vector the OID gate
 /// admitted, and each is a distinct, named `Backend` refusal (decode mismatch, SPEC §9.1).
+///
+/// Hand-rolled DELIBERATELY, not via `postgres_protocol::types::array_from_sql` (which is in the
+/// dependency tree and parses this same format — review F3 names the trade-off): that helper's
+/// refusals are generic parse errors, and the whole point of this walker is that each malformed
+/// shape gets its OWN named refusal with the offending value in the message. ~60 lines of
+/// byte-walking is the price of §9.1-grade diagnostics.
 fn vector_to_text(raw: &[u8], elem: VectorElem) -> Result<String, PoolError> {
     let what = elem.label();
     let take_i32 = |cur: &mut usize, field: &str| -> Result<i32, PoolError> {
@@ -394,22 +404,24 @@ fn vector_to_text(raw: &[u8], elem: VectorElem) -> Result<String, PoolError> {
         )));
     }
     match ndim {
-        // PG sends the EMPTY vector as a zero-dimension array; its text output is "".
-        0 => {
-            if cur != raw.len() {
-                return Err(backend(format!(
-                    "{what}: {} trailing bytes after a zero-dimension header",
-                    raw.len() - cur
-                )));
-            }
-            Ok(String::new())
-        }
+        // Exactly ONE dimension, always — the EMPTY vector included. MEASURED on PG 16.13 via the
+        // send function itself: `int2vectorsend(''::int2vector)` is `ndim=1, dims={0,0}` (an
+        // earlier draft claimed PG sends empty as zero-dimension; it does not, and
+        // `int2vectorrecv` refuses `ndim != 1` outright — review F2). Its text output is "".
         1 => {
             let nitems = take_i32(&mut cur, "dimension length")?;
-            let _lbound = take_i32(&mut cur, "lower bound")?;
+            let lbound = take_i32(&mut cur, "lower bound")?;
             if nitems < 0 {
                 return Err(backend(format!(
                     "{what}: negative dimension length {nitems}"
+                )));
+            }
+            // Vectors are 0-BASED by `int2vectorrecv`'s own gate; a nonzero bound means this is
+            // not a vector payload (review F1 — the one recv-enforced field an earlier draft
+            // left unchecked, against this walker's own strictness contract).
+            if lbound != 0 {
+                return Err(backend(format!(
+                    "{what}: lower bound {lbound} (a vector is 0-based; recv refuses anything else)"
                 )));
             }
             let mut out = String::new();
@@ -453,7 +465,8 @@ fn vector_to_text(raw: &[u8], elem: VectorElem) -> Result<String, PoolError> {
             Ok(out)
         }
         n => Err(backend(format!(
-            "{what}: {n} dimensions (a vector is 1-D; 0-D only when empty)"
+            "{what}: {n} dimensions (a vector is exactly 1-D, the empty vector included — \
+             measured via {what}send on PG; recv refuses anything else)"
         ))),
     }
 }

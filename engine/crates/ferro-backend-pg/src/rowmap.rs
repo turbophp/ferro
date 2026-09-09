@@ -609,10 +609,12 @@ mod tests {
         // the rendering must not invent an unsigned reinterpretation).
         let p = payload(1, 0, 21, &[(1, 0)], &[&(-7i16).to_be_bytes()]);
         assert_eq!(int2vector_to_text(&p).unwrap(), "-7");
-        // The EMPTY vector is a zero-dimension array and renders as the EMPTY string — exactly
-        // what `pdo_pgsql` returns for an expression index's indkey-free rows.
+        // The EMPTY vector is a ONE-dimension array of ZERO items — MEASURED on PG 16.13 via
+        // `int2vectorsend(''::int2vector)` = `ndim=1, dims={0,0}` (review F2: an earlier draft
+        // claimed 0-D, which PG never sends for a vector and recv refuses). Renders as the EMPTY
+        // string, exactly what `pdo_pgsql` returns.
         assert_eq!(
-            int2vector_to_text(&payload(0, 0, 21, &[], &[])).unwrap(),
+            int2vector_to_text(&payload(1, 0, 21, &[(0, 0)], &[])).unwrap(),
             ""
         );
         // oidvector: u32 elements — an oid above i32::MAX must render unsigned.
@@ -641,8 +643,17 @@ mod tests {
             ),
             ("short element", payload(1, 0, 21, &[(1, 0)], &[&[1u8][..]])),
             ("truncated header", vec![0, 0, 0, 1]),
+            // 0-D was ACCEPTED as the empty form until review F2 measured PG never sending it
+            // for a vector (`int2vectorrecv` refuses ndim != 1) — repointed from the accept
+            // side to the refusal side, not dropped.
+            ("0-D header", payload(0, 0, 21, &[], &[])),
+            // The one recv-enforced field the first draft left unchecked (review F1).
+            (
+                "nonzero lower bound",
+                payload(1, 0, 21, &[(1, 5)], &[&1i16.to_be_bytes()]),
+            ),
             ("trailing bytes", {
-                let mut p = payload(0, 0, 21, &[], &[]);
+                let mut p = payload(1, 0, 21, &[(0, 0)], &[]);
                 p.push(0);
                 p
             }),
