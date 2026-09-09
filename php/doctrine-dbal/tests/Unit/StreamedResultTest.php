@@ -381,4 +381,30 @@ final class StreamedResultTest extends TestCase
         self::assertSame(2, $pulled, 'the drain consumed the remaining rows');
         self::assertSame(42, $r->rowCount(), 'idempotent after the drain');
     }
+
+    /**
+     * The OTHER order — fetch to exhaustion, THEN ask. The CI round on PR #9 proved the two
+     * orders can disagree: the fetch-exhaustion arm of `fetchNumeric()` dropped the stream handle
+     * without capturing the settled count, so `fetchAll…()` + `rowCount()` answered 0 while
+     * `rowCount()` + `fetchAll…()` answered the truth. An ordering dependence in an SPI accessor
+     * is a defect class of its own; both orders stay pinned.
+     */
+    public function testRowCountAfterFetchExhaustionAnswersTheSettledCountToo(): void
+    {
+        $terminal = new StreamTerminal();
+        $terminal->affected = 42;
+        $terminal->settled = true;
+        $pulled = 0;
+        $r = Result::streamed(new RawStream(
+            ['id', 'note'],
+            $this->stream([[1, 'a'], [2, 'b']], $pulled)->rows(),
+            null,
+            7,
+            $terminal,
+        ));
+
+        self::assertSame([[1, 'a'], [2, 'b']], $r->fetchAllNumeric());
+        self::assertFalse($r->isStreaming(), 'exhaustion ended the stream');
+        self::assertSame(42, $r->rowCount(), 'the settled count must survive the exhaustion arm');
+    }
 }

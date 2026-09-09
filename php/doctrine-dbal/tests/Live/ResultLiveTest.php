@@ -81,26 +81,21 @@ final class ResultLiveTest extends DbalLiveTestCase
     }
 
     /**
-     * `rowCount()` after a SELECT: DBAL documents it as driver-specific, and ours diverges on TWO
-     * axes, both pinned here so a silent change is caught.
+     * `rowCount()` after a SELECT: DBAL documents it as driver-specific; ours diverges by FAMILY
+     * only since M1-S9 B1b (§22.2 (ah)) — PostgreSQL answers the command-tag row count on BOTH
+     * routes (drain-then-answer, `pdo_pgsql` parity), MySQL answers 0 on both, and the Task-12
+     * ROUTE divergence this test used to pin ("the streamed route reports 0, because a stream
+     * terminal carries no affected") is GONE, because its premise was measured false (§22.2 (ag)).
      *
-     * By FAMILY: PostgreSQL's command tag carries the row count, MySQL's carries 0.
-     *
-     * By ROUTE, **since Task 12**: the zero-parameter `executeQuery()` reaches
-     * `Connection::query()`, which STREAMS on PostgreSQL — and a `HEAD`/`DATA`/`END` producer has no
-     * `affected` field at all, so a streamed result reports **0**. The parameterised form reaches
-     * `Statement::execute()` → `runPrepared()`, which buffers and still reports PostgreSQL's count.
-     * That asymmetry is the price of §14's never-buffer requirement (adding `affected` to the stream
-     * terminal is a `/proto` change and is deferred), it is why the PREPARED path deliberately does
-     * NOT stream — `executeStatement()` RETURNS this number — and it is a real drop-in difference
-     * that belongs in `docs/known-incompatibilities.md`.
-     *
-     * Asserted per route rather than collapsed, so the pair also proves the streaming fork itself:
-     * a driver that stopped streaming would make the two PostgreSQL numbers equal again.
+     * Both ORDERS are pinned per route, deliberately: `fetchAll…()` then `rowCount()` exercises
+     * the fetch-to-exhaustion capture, `rowCount()` first exercises the drain-through-materialize
+     * capture — and the CI round on PR #9 proved they can disagree (the exhaustion arm shipped
+     * without the capture and answered 0 exactly where this test looks).
      */
     public function testRowCountAfterASelectIsTheDocumentedPerFamilyValue(): void
     {
         foreach ($this->families() as $kind => $pool) {
+            $expectSelect = static fn (int $n): int => $kind === 'postgres' ? $n : 0;
             $c = $this->dbal($pool);
             $c->executeStatement('DROP TABLE IF EXISTS s8b_res2');
             $c->executeStatement(
@@ -113,21 +108,21 @@ final class ResultLiveTest extends DbalLiveTestCase
             $result = $c->executeQuery('SELECT id FROM s8b_res2');
             self::assertCount(3, $result->fetchAllNumeric(), "[$kind] the rows are all there");
             self::assertSame(
-                0,
+                $expectSelect(3),
                 $result->rowCount(),
-                "[$kind] a zero-parameter SELECT streams on PostgreSQL and buffers on MySQL, and "
-                . 'BOTH report 0 — the streamed terminal carries no affected field, and MySQL never '
-                . 'reports one for a SELECT',
+                "[$kind] fetch-to-exhaustion THEN rowCount(): the settled command-tag count must "
+                . 'survive the exhaustion arm (PG answers the row count since B1b; MySQL never '
+                . 'reports one for a SELECT)',
             );
 
             $paramd = $c->executeQuery('SELECT id FROM s8b_res2 WHERE id > ?', [1]);
-            self::assertSame([[2], [3]], $paramd->fetchAllNumeric(), "[$kind] the parameterised rows");
             self::assertSame(
-                $kind === 'postgres' ? 2 : 0,
+                $expectSelect(2),
                 $paramd->rowCount(),
-                "[$kind] the PREPARED route buffers on both families, so PostgreSQL's count comes "
-                . 'back here — the route divergence, not just the family one',
+                "[$kind] rowCount() FIRST on the prepared route: drain-then-answer, and the rows "
+                . 'must survive the drain',
             );
+            self::assertSame([[2], [3]], $paramd->fetchAllNumeric(), "[$kind] the drained parameterised rows");
 
             $c->executeStatement('DROP TABLE s8b_res2');
         }

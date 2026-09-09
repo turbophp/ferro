@@ -127,6 +127,13 @@ final class Result implements ResultInterface
                 // and so is `Session::abandonStream`), but keeping the handle here would make an
                 // ENDED stream indistinguishable from an open one to `isStreaming()` and to
                 // `Connection::settleOpenStream()`.
+                //
+                // Capture the settled count BEFORE dropping the handle (M1-S9 B1b — CI finding on
+                // PR #9): this arm is how the NORMAL fetch-to-exhaustion path ends, and shipping
+                // the capture only in `materialize()` made `fetchAll…()` then `rowCount()` answer
+                // 0 while `rowCount()` then `fetchAll…()` answered the real count — an ordering
+                // dependence nothing documented and no one would forgive.
+                $this->affected = $this->stream?->affected() ?? $this->affected;
                 $this->gen = null;
                 $this->stream = null;
                 return false;
