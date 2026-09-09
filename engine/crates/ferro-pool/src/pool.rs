@@ -1082,19 +1082,40 @@ impl<'a, B: PoolBackend> RowStreamHandle<'a, B> {
             .take()
             .expect("RowStreamHandle::finish consumes the stream exactly once");
         let pool = Arc::clone(&self.checkout.pool);
-        let (affected, errored) = match pool
-            .backend
-            .reclaim_stream(self.checkout.conn_mut(), rows)
-            .await
-        {
-            Ok(a) => (a, self.errored),
+        // BOUNDED (FB-3): reclaim is post-statement cleanup that can do real protocol I/O — a
+        // conn-owning backend's restore is a `COM_RESET_CONNECTION`-class round trip, which can
+        // hang indefinitely on a half-dead socket. `finish()` is awaited UNRACED by `ferrod`'s
+        // stream producer (it is the one backend-touching await there with no cancel/deadline
+        // arm), so an unbounded reclaim would strand the request's single terminal END frame —
+        // a charter-rule-4 violation. The bound is `checkout_timeout`, the SAME knob the
+        // checkout-time recycle already uses to bound its ROLLBACK/RESET cleanup (see
+        // `Pool::checkout`), because this is the same class of operation; no new knob for an
+        // operator to discover.
+        let reclaim_bound = pool.config.checkout_timeout;
+        let reclaim = pool.backend.reclaim_stream(self.checkout.conn_mut(), rows);
+        let (affected, errored) = match tokio::time::timeout(reclaim_bound, reclaim).await {
+            Ok(Ok(a)) => (a, self.errored),
             // The conn could not be restored (the reclaim contract obliges the backend to leave
             // it `is_closed`-dead). Treat the stream as ERRORED so finalize's Rule-A force-taint
             // runs; the pool then discards the husk at return instead of recycling it.
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     error = %e,
                     "ferro-pool: stream reclaim failed — connection will be discarded"
+                );
+                (0, true)
+            }
+            // TIMED OUT: the reclaim future is dropped here, which drops the `B::RowStream` it
+            // took ownership of — for a conn-owning backend that closes the moved-out driver
+            // connection. The backend never got to signal anything, so the SAME contract as the
+            // Err arm applies and is the backend's to honour: after a dropped/failed reclaim its
+            // `is_closed` MUST report the conn dead so the pool discards it (never recycles a
+            // parked or mid-protocol session — charter rule 6). Either way `finish` RETURNS, so
+            // the producer always reaches its single terminal END.
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_ms = reclaim_bound.as_millis() as u64,
+                    "ferro-pool: stream reclaim timed out — connection will be discarded"
                 );
                 (0, true)
             }

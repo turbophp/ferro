@@ -345,3 +345,66 @@ async fn reclaim_hook_clean_recycles_but_a_failed_reclaim_discards_the_conn() {
     );
     assert!(!fresh.conn().closed, "and the fresh conn is live");
 }
+
+/// FB-3 (iteration-12 adversarial pass, HIGH): the reclaim step inside `finish()` is BOUNDED, so a
+/// backend whose connection-restore round trip hangs can never strand the request's terminal frame.
+///
+/// Why this is the load-bearing property: `ferrod`'s stream producer awaits `handle.finish()`
+/// UNRACED — it is the one backend-touching await there with no cancel/deadline arm (every row
+/// pull and every send is raced). B2b-1 put a `reclaim_stream().await` inside `finish`, and a real
+/// conn-owning backend restores its connection with a `COM_RESET_CONNECTION`-class round trip that
+/// can hang indefinitely on a half-dead socket. Unbounded, that hang means the request NEVER emits
+/// its single END frame — a charter-rule-4 violation, and the exact class the whole producer is
+/// otherwise written defensively against.
+///
+/// The fake's armed reclaim parks forever and — deliberately — never marks the conn closed, because
+/// a hung backend never gets to signal anything. The pool's bound is the only thing that returns.
+/// `start_paused` drives the clock, so this asserts the BOUND, not wall-clock luck: the test would
+/// hang forever if the timeout were removed.
+#[tokio::test(start_paused = true)]
+async fn a_hung_reclaim_cannot_strand_finish() {
+    let backend = FakeBackend::new();
+    backend.set_stream_script(StreamScript {
+        cols: vec![ColMeta {
+            name: "n".to_string(),
+            tag: tag::I64,
+        }],
+        rows: vec![row(1), row(2)],
+        affected: 2,
+        error_at: None,
+    });
+    let bound = std::time::Duration::from_secs(5);
+    let pool = Pool::new(
+        backend,
+        PoolConfig {
+            max_size: 1,
+            checkout_timeout: bound,
+            ..Default::default()
+        },
+    );
+
+    let mut co = pool.checkout().await.expect("checkout");
+    pool.backend().arm_reclaim_hang();
+
+    let started = tokio::time::Instant::now();
+    let end = co
+        .query_stream("SELECT n FROM t", &[])
+        .await
+        .expect("open")
+        .finish()
+        .await
+        .expect("finish MUST return even though the backend's reclaim never completes");
+
+    assert!(
+        started.elapsed() >= bound,
+        "the reclaim really did park until the bound elapsed"
+    );
+    assert_eq!(
+        end.affected, 0,
+        "a timed-out reclaim reports 0 affected — the count could not be trusted"
+    );
+    assert!(
+        co.tainted(),
+        "a timed-out reclaim force-taints, exactly like a failed one"
+    );
+}

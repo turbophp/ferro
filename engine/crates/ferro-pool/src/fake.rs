@@ -334,6 +334,12 @@ pub struct FakeBackend {
     stream_pull_gate: Arc<Mutex<Option<Arc<Notify>>>>,
     /// Number of `FakeRowStream::next()` pulls currently parked on `stream_pull_gate`.
     stream_pulls_waiting: Arc<AtomicU64>,
+    /// FB-3: when `Some`, the [`PoolBackend::reclaim_stream`] override PARKS forever on this
+    /// `Notify` (never released) — modelling a conn-owning backend whose restore round trip hangs
+    /// on a half-dead socket. Lets a test prove `finish()` still RETURNS (so the producer reaches
+    /// its single terminal END, charter rule 4) because the reclaim await is bounded. Armed via
+    /// [`FakeBackend::arm_reclaim_hang`].
+    reclaim_hang: Mutex<Option<Arc<Notify>>>,
     /// B2b: when `true`, the [`PoolBackend::reclaim_stream`] override marks the conn `closed` and
     /// returns `Err` — modelling a conn-owning backend (MySQL) that fails to recover the driver
     /// connection after a streamed statement. Armed via [`FakeBackend::arm_reclaim_fail`]; lets a
@@ -365,7 +371,15 @@ impl FakeBackend {
             stream_pull_gate: Arc::new(Mutex::new(None)),
             stream_pulls_waiting: Arc::new(AtomicU64::new(0)),
             reclaim_fail: AtomicBool::new(false),
+            reclaim_hang: Mutex::new(None),
         }
+    }
+
+    /// FB-3: arm the [`PoolBackend::reclaim_stream`] override to HANG (park on a `Notify` that is
+    /// never released), modelling a conn-owning backend whose restore round trip never completes.
+    /// The pool's bound on the reclaim await is what must still let `finish()` return.
+    pub fn arm_reclaim_hang(&self) {
+        *self.reclaim_hang.lock().unwrap() = Some(Arc::new(Notify::new()));
     }
 
     /// B2b: arm the [`PoolBackend::reclaim_stream`] override to fail (mark the conn `closed`,
@@ -746,6 +760,13 @@ impl PoolBackend for FakeBackend {
         if self.reclaim_fail.load(Ordering::SeqCst) {
             conn.closed = true;
             return Err(PoolError::ConnectionLost);
+        }
+        // FB-3: park forever if armed. Note this happens WITHOUT marking the conn closed — a hung
+        // backend never gets to signal anything, which is exactly the state the pool's bound must
+        // survive.
+        let hang = self.reclaim_hang.lock().unwrap().clone();
+        if let Some(notify) = hang {
+            notify.notified().await;
         }
         Ok(rows.rows_affected())
     }
