@@ -97,10 +97,21 @@ the tier above cannot read it.
   is the S8b lesson: a HARD CONTACT ASSERTION (`getNativeConnection() instanceof …` + a round-tripped
   `SELECT 1`) before a single suite test runs. Upstream's `TestUtil` silently fell back to SQLite
   and reported a green 105-test run with zero Ferro contact; that must not be re-learned.
-- **C1c — writes + transactions**, including the `attempts:` mapping. Its premise is now checked (see
-  above): the requirement is that the driver exception put SQLSTATE in `getCode()`, and the exit gate
-  is a LIVE guard proving a PG serialization failure actually RE-RUNS the closure — not merely that
-  it classifies `Retryable`.
+- **C1c — writes + transactions. DONE.** `statement()`/`affectingStatement()`/`unprepared()` over
+  `fetch:none`; transactions over a minimal `FerroPdoShim`. The exit gate landed as specified and the
+  requirement was **mutation-proven live**: swapping `FerroQueryException` to the sibling Doctrine
+  tier's errno convention makes a real PG `40001` propagate OUT of `transaction(attempts: 3)` instead
+  of retrying — `attempts:` silently inert, exactly as predicted.
+  **One design change fell out of building it, and it moves a later slice earlier:** the PDO shim is
+  NOT merely a compatibility layer for ecosystem packages, as §15 frames it. `ManagesTransactions` —
+  which owns the transaction counter, savepoint naming through the stock grammar, the connection
+  events and the `attempts:` retry loop — is written entirely against
+  `getPdo()->beginTransaction()/commit()/rollBack()/inTransaction()/exec()`. Supplying those five
+  methods inherits all of that unchanged; the alternative was copying the trait's body and keeping it
+  in step with Laravel forever. It is possible because `Connection::getPdo()` has NO return type, so
+  the shim is duck-typed and need not extend `\PDO`. **C1e is therefore already half-built**, and what
+  remains of it is the question of which further PDO methods any real package needs — with `quote()`
+  still refused (see the table above).
 - **C1d — `cursor()`/`LazyCollection`**, which should be small given B2.
 - **C1e — the PDO shim**, scoped by what C1b–C1d actually turn out to need, not by §15's list
   up front.
