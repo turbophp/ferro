@@ -151,8 +151,8 @@ final class RawFetchTest extends TestCase
     {
         $session = new FakeSession();
         $session->poolInfo = [
-            new PoolInfo('default', 'postgres', 'PostgreSQL 17.10 (Debian)'),
-            new PoolInfo('mysql', 'mysql', '8.4.11'),
+            new PoolInfo('default', 'postgres', 'PostgreSQL 17.10 (Debian)', true),
+            new PoolInfo('mysql', 'mysql', '8.4.11', false),
         ];
         $conn = new Connection($session, 'mysql');
 
@@ -180,7 +180,7 @@ final class RawFetchTest extends TestCase
         $before = new FakeSession(epoch: 1);
         $before->poolInfo = [new PoolInfo('default', 'postgres', 'PostgreSQL 16.4 (Debian)')];
         $after = new FakeSession(epoch: 2);
-        $after->poolInfo = [new PoolInfo('default', 'postgres', 'PostgreSQL 17.10 (Debian)')];
+        $after->poolInfo = [new PoolInfo('default', 'postgres', 'PostgreSQL 17.10 (Debian)', true)];
 
         $loop = new ReconnectLoop(
             $before,

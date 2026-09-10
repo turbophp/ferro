@@ -255,20 +255,38 @@ fn main() {
         engine_version: 1,
         boot_epoch: 0xFFFF_FFFF_FFFF_FFF0,
         features: 0,
-        // NON-EMPTY on purpose: an empty list byte-locks no element shape. Both the Some and the
-        // None arm of `server_version` are present so the nested fixarray is fully pinned, and the
-        // two elements carry DIFFERENT `name`/`kind` values so a field-order swap in either codec
+        // NON-EMPTY on purpose: an empty list byte-locks no element shape. Every arm of every
+        // optional element appears somewhere in the list so the nested fixarray is fully pinned, and
+        // the elements carry DIFFERENT `name`/`kind` values so a field-order swap in either codec
         // moves the bytes (a fixture whose fields were interchangeable would not catch one).
+        //
+        // M2-C2g's `literals_are_standard` has THREE states, not two — `true`, `false` and nil — so
+        // it takes a third element to cover them, and the third is not padding: nil is the arm the
+        // client's fail-closed refusal hangs off, and a vector that never encoded it would let a
+        // codec emitting (say) `false` for nil pass.
+        //
+        // The two Options are also deliberately NOT covariant across the fixture — element 2 pairs
+        // `server_version: None` with `literals_are_standard: Some`, element 3 the reverse. Letting
+        // them vary together is the easy mistake, and it would leave a codec that read one where it
+        // meant the other producing identical bytes.
         pools: vec![
             PoolInfo {
                 name: "main".into(),
                 kind: "postgres".into(),
                 server_version: Some("PostgreSQL 17.10".into()),
+                literals_are_standard: Some(true),
             },
             PoolInfo {
                 name: "reporting".into(),
                 kind: "mysql".into(),
                 server_version: None,
+                literals_are_standard: Some(false),
+            },
+            PoolInfo {
+                name: "unprobed".into(),
+                kind: "postgres".into(),
+                server_version: Some("PostgreSQL 16.4".into()),
+                literals_are_standard: None,
             },
         ],
         type_registry_hash: "deadbeef".into(),
@@ -282,9 +300,19 @@ fn main() {
         ack.encode(),
         serde_json::json!({ "engine_version":1, "boot_epoch":"18446744073709551600",
                             "features":0,
+                            // KEPT IN STEP BY HAND with the `ack` struct above — `write_case` takes
+                            // the encoded BYTES and this human-readable message SEPARATELY, so the
+                            // two can drift. They did exactly that when M2-C2g added the fourth
+                            // field, and what caught it was the PHP conformance test, which
+                            // re-encodes THIS json and compares it to `frame_hex`. That is the
+                            // guard; do not weaken it by deriving one side from the other here.
                             "pools":[
-                              {"name":"main","kind":"postgres","server_version":"PostgreSQL 17.10"},
-                              {"name":"reporting","kind":"mysql","server_version":null}
+                              {"name":"main","kind":"postgres","server_version":"PostgreSQL 17.10",
+                               "literals_are_standard":true},
+                              {"name":"reporting","kind":"mysql","server_version":null,
+                               "literals_are_standard":false},
+                              {"name":"unprobed","kind":"postgres","server_version":"PostgreSQL 16.4",
+                               "literals_are_standard":null}
                             ],
                             "type_registry_hash":"deadbeef" }),
     );

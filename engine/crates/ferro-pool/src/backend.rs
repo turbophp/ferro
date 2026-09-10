@@ -215,6 +215,28 @@ pub trait PoolBackend: Send + Sync + 'static {
     /// (`Checkout::query_stream`'s Err arm). Both arms now read THIS method, so a backend that
     /// gains streaming flips one line and both arms follow.
     ///
+    /// Is a backslash inside a single-quoted string literal an ORDINARY CHARACTER on this
+    /// connection's backend? `None` when the backend cannot answer without a round trip it has not
+    /// made — never a guess.
+    ///
+    /// **Synchronous and free, or `None`.** This is read while a probe already holds the checkout,
+    /// so it must not cost a statement: PostgreSQL reports `standard_conforming_strings` as a
+    /// `GUC_REPORT` parameter, which arrives in the startup `ParameterStatus` stream and again on
+    /// every change, so the M1-S1 fork's mirrored map answers it with no wire traffic at all.
+    ///
+    /// **Why the trait says nothing about `standard_conforming_strings`.** The question a client
+    /// asks is whether doubling `'` is the whole quoting rule, and two families answer it under
+    /// different names (`standard_conforming_strings`; MySQL's `NO_BACKSLASH_ESCAPES` in
+    /// `sql_mode`). Naming either here would push one backend's vocabulary through the pool and out
+    /// onto the wire. See `/proto/PROTOCOL.md` §4 (M2-C2g).
+    ///
+    /// **The default is `None`, and that is the safe direction**: a client that cannot get an
+    /// unambiguous `true` refuses to build a literal. A backend that guessed `Some(true)` would
+    /// hand a caller an escaping rule the server does not honour.
+    fn literals_are_standard(&self, _conn: &Self::Conn) -> Option<bool> {
+        None
+    }
+
     /// **Default `true`** — Postgres and the `FakeBackend` stream today and are unchanged.
     fn supports_row_streaming(&self) -> bool {
         true

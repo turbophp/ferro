@@ -4,7 +4,7 @@ namespace Ferro\Laravel\Tests\Unit;
 
 use Ferro\Client\Connection as FerroClient;
 use Ferro\Laravel\FerroPdoShim;
-use Ferro\Protocol\Generated\Constants as C;
+use Ferro\Protocol\PoolInfo;
 use Ferro\Tests\Support\FakeSession;
 use PHPUnit\Framework\TestCase;
 
@@ -13,32 +13,29 @@ use PHPUnit\Framework\TestCase;
  *
  * `EscapeLiveTest` proves the escaping is correct against PostgreSQL's own parser — and it caught
  * the escaping mutation (drop the `'`-doubling and 9 of its cases go red). It could NOT catch the
- * `standard_conforming_strings` verification being removed, because every server this project runs
- * against has it `on`, so deleting the check changes nothing observable there. MEASURED, and stated
- * rather than left as an assumption: that mutation was green live. This file is where it goes red.
+ * quoting-rule verification being removed, because every server this project runs against reports
+ * `literals_are_standard: true`, so deleting the check changes nothing observable there. MEASURED,
+ * and stated rather than left as an assumption: that mutation was green live. This file is where it
+ * goes red.
+ *
+ * M2-C2g moved the source of that verification from a cached `SHOW` to `HELLO_ACK`'s advertised
+ * `literals_are_standard` (SPEC §21 D5 forbids the round trip the `SHOW` was), so these fixtures
+ * script POOL METADATA rather than a query reply. The PROPERTY under test is unchanged: only an
+ * unambiguous `true` may proceed.
  */
 final class PdoShimQuoteTest extends TestCase
 {
-    /** A one-row, one-column TEXT `ExecOk`, the shape `SHOW standard_conforming_strings` returns. */
-    private static function showValue(string $value): FakeSession
+    /** A session whose HELLO_ACK advertised this pool's quoting rule. */
+    private static function advertising(?bool $literalsAreStandard): FakeSession
     {
         $session = new FakeSession();
-        $session->push(
-            FakeSession::execOk([
-                'cols' => [['name' => 'standard_conforming_strings', 'tag' => C::TAG_TEXT]],
-                'rows' => [[['tag' => C::TAG_TEXT, 'data' => $value]]],
-                'affected' => 0,
-                'last_insert_id' => null,
-                'stats' => ['queue_us' => 0, 'exec_us' => 0, 'rows' => 1, 'bytes' => 0],
-            ]),
-            [C::SERVICE_SQL, C::METHOD_SQL_EXEC],
-        );
+        $session->poolInfo = [new PoolInfo('main', 'postgres', 'PostgreSQL 17.10', $literalsAreStandard)];
         return $session;
     }
 
     public function testAnOnBackendQuotesByDoublingTheSingleQuote(): void
     {
-        $shim = new FerroPdoShim(new FerroClient(self::showValue('on'), 'main'));
+        $shim = new FerroPdoShim(new FerroClient(self::advertising(true), 'main'));
 
         self::assertSame("'Hello''World'", $shim->quote("Hello'World"));
     }
@@ -51,56 +48,61 @@ final class PdoShimQuoteTest extends TestCase
      */
     public function testAnOffBackendRefusesRatherThanEmittingAnUnsafeLiteral(): void
     {
-        $shim = new FerroPdoShim(new FerroClient(self::showValue('off'), 'main'));
+        $shim = new FerroPdoShim(new FerroClient(self::advertising(false), 'main'));
 
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessageMatches('/standard_conforming_strings=off/');
-        $shim->quote("anything");
+        $this->expectExceptionMessageMatches('/literals_are_standard=true.*got false/s');
+        $shim->quote('anything');
     }
 
     /**
-     * Anything that is not an unambiguous `on` refuses too — the check is written so that an
-     * unreadable answer fails CLOSED. That shape is not theoretical: routing the probe through the
-     * shim's `guard()` helper (which coerces its result for the boolean-returning PDO methods)
-     * turned the row set into `true`, and this is the branch that caught it.
+     * UNKNOWN refuses too, and this is the arm that actually happens in production: an engine that
+     * could not probe a pool advertises `nil`, and a client must not read that as either answer.
+     * Reading it as `false` would merely be over-strict; reading it as `true` would hand a caller an
+     * escaping rule the server never confirmed.
      */
-    public function testAnUnreadableAnswerAlsoRefuses(): void
+    public function testAnUnknownQuotingRuleAlsoRefuses(): void
+    {
+        $shim = new FerroPdoShim(new FerroClient(self::advertising(null), 'main'));
+
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessageMatches('/got NULL/i');
+        $shim->quote('x');
+    }
+
+    /** No pool metadata at all is the same refusal — there is nothing to have verified. */
+    public function testAbsentPoolMetadataRefuses(): void
     {
         $session = new FakeSession();
-        $session->push(
-            FakeSession::execOk([
-                'cols' => [['name' => 'standard_conforming_strings', 'tag' => C::TAG_TEXT]],
-                'rows' => [],
-                'affected' => 0,
-                'last_insert_id' => null,
-                'stats' => ['queue_us' => 0, 'exec_us' => 0, 'rows' => 0, 'bytes' => 0],
-            ]),
-            [C::SERVICE_SQL, C::METHOD_SQL_EXEC],
-        );
+        $session->poolInfo = [];
         $shim = new FerroPdoShim(new FerroClient($session, 'main'));
 
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessageMatches('/\(unreadable\)/');
+        $this->expectExceptionMessageMatches('/no pool metadata/');
         $shim->quote('x');
     }
 
     /**
-     * The probe is paid for ONCE. `Grammar::substituteBindingsIntoRawSql()` escapes every binding of
-     * a query, so a per-call `SHOW` would turn one `toRawSql()` into N round trips. Asserted by
-     * scripting only ONE reply and quoting twice — a second probe would find the script exhausted.
+     * Quoting costs NO round trip at all — SPEC §21 D5's actual requirement, and the reason this
+     * moved off the `SHOW`. `Grammar::substituteBindingsIntoRawSql()` escapes every binding of a
+     * query, so even a once-cached probe was N-times-nothing but still one more than D5 allows.
+     * Asserted on the session's own record of what it SENT, which is the only thing that can tell a
+     * cached round trip from no round trip.
      */
-    public function testTheProbeRunsOnlyOnce(): void
+    public function testQuotingSendsNothingOnTheWire(): void
     {
-        $shim = new FerroPdoShim(new FerroClient(self::showValue('on'), 'main'));
+        $session = self::advertising(true);
+        $shim = new FerroPdoShim(new FerroClient($session, 'main'));
 
         self::assertSame("'a'", $shim->quote('a'));
         self::assertSame("'b'", $shim->quote('b'));
+        self::assertSame([], $session->sent, 'quote() must not send a frame — SPEC §21 D5');
     }
 
     /** `PDO::PARAM_LOB` is a different literal shape entirely; it is refused, not silently ignored. */
     public function testABinaryParamTypeIsRefusedByName(): void
     {
-        $shim = new FerroPdoShim(new FerroClient(self::showValue('on'), 'main'));
+        $shim = new FerroPdoShim(new FerroClient(self::advertising(true), 'main'));
 
         $this->expectException(\LogicException::class);
         $this->expectExceptionMessageMatches('/PARAM_STR/');

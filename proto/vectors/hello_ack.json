@@ -1,5 +1,5 @@
 {
-  "frame_hex": "f70200000100020001000000480000009501cffffffffffffffff0009293a46d61696ea8706f737467726573b0506f737467726553514c2031372e313093a97265706f7274696e67a56d7973716cc0a86465616462656566",
+  "frame_hex": "f703000001000200010000006e0000009501cffffffffffffffff0009394a46d61696ea8706f737467726573b0506f737467726553514c2031372e3130c394a97265706f7274696e67a56d7973716cc0c294a8756e70726f626564a8706f737467726573af506f737467726553514c2031362e34c0a86465616462656566",
   "header": {
     "flags": 0,
     "method": 2,
@@ -13,13 +13,21 @@
     "pools": [
       {
         "kind": "postgres",
+        "literals_are_standard": true,
         "name": "main",
         "server_version": "PostgreSQL 17.10"
       },
       {
         "kind": "mysql",
+        "literals_are_standard": false,
         "name": "reporting",
         "server_version": null
+      },
+      {
+        "kind": "postgres",
+        "literals_are_standard": null,
+        "name": "unprobed",
+        "server_version": "PostgreSQL 16.4"
       }
     ],
     "type_registry_hash": "deadbeef"

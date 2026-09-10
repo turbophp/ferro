@@ -69,9 +69,9 @@ final class TypePolicyOptions
             throw new \InvalidArgumentException(
                 'naive_datetime_zone=server is deferred: nothing on the wire carries the '
                 . "backend's session timezone. HELLO_ACK DOES advertise per-pool metadata as of "
-                . 'M1-S8a — [name, kind, server_version] — but none of those three is a timezone, '
-                . 'so the client still cannot honour it; it waits on a further metadata field. '
-                . 'Use "utc" (the default) or "error" (SPEC §9.1, §22.2).',
+                . 'M1-S8a — [name, kind, server_version, literals_are_standard] — but none of '
+                . 'them is a timezone, so the client still cannot honour it; it waits on a further '
+                . 'metadata field. Use "utc" (the default) or "error" (SPEC §9.1, §22.2).',
             );
         }
         self::check('decimal', $decimal, self::DECIMAL_FORMS);

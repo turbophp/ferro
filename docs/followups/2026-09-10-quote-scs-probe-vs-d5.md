@@ -1,5 +1,11 @@
 # Follow-up: `quote()`'s `standard_conforming_strings` probe is a round trip, and D5 says there is none
 
+**Status: RESOLVED in M2-C2g** (SPEC §22.2 (at)). `HELLO_ACK` advertises `literals_are_standard`
+per pool; `FerroPdoShim::quote()` reads it from `poolInfo()` and sends nothing on the wire, asserted
+on the session's own sent-frame record. The rest of this document is kept as the record of how the
+conflict arose and what was rejected — the "drop the probe and document the assumption" option in
+particular, which must not be revisited as a simplification.
+
 **Found:** M2-C2f, by me, while scoping C3 and reading SPEC §21 for an unrelated reason.
 **Severity:** low as a defect (the shipped behaviour is safe and correct), **high as a process
 matter** — charter ground rule 1 makes §21 decisions binding and says an impossible one is to be
@@ -83,9 +89,9 @@ change", which reads cheaper than it is.
   judgement call, and the reason it is written down here rather than left in a commit message is
   that the alternative was defensible.
 
-## Status
+## Status (superseded — see the header)
 
-**OPEN.** The shipped behaviour is safe; what is outstanding is the D5 conflict, and the resolution
+**Was OPEN.** The shipped behaviour is safe; what is outstanding is the D5 conflict, and the resolution
 above is a designed slice, not a sketch. It should be taken before any further `quote()`-adjacent
 work, and SPEC §21 D5 should gain a pointer to it either way so the next reader does not have to
 rediscover the conflict.

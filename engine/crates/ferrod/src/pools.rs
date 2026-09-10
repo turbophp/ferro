@@ -188,8 +188,14 @@ struct VersionCache {
 enum VersionState {
     /// Never probed, or the last attempt's backoff has expired.
     Unknown,
-    /// Learned at `at`; trusted until `at + VERSION_TTL`.
-    Known { version: String, at: Instant },
+    /// Learned at `at`; trusted until `at + VERSION_TTL`. Both values come from ONE probe, so they
+    /// share its TTL and its backoff — advertising a fresh version beside a stale quoting rule (or
+    /// the reverse) would need two caches and would have no reader.
+    Known {
+        version: String,
+        literals_are_standard: Option<bool>,
+        at: Instant,
+    },
     /// Failed at `at`; not retried until `at + VERSION_RETRY_BACKOFF`.
     Failed { at: Instant },
 }
@@ -349,6 +355,7 @@ impl PoolRegistry {
                 name: name.clone(),
                 kind: entry.kind.wire_name().to_string(),
                 server_version: entry.cached_version(),
+                literals_are_standard: entry.cached_literals_are_standard(),
             })
             .collect()
     }
@@ -384,10 +391,26 @@ impl PoolEntry {
     /// its TTL — a version we no longer trust is advertised as UNKNOWN, never as a stale string a
     /// driver would turn into a platform choice.
     fn cached_version(&self) -> Option<String> {
+        self.cached().map(|(v, _)| v)
+    }
+
+    /// Whether a backslash is an ordinary character inside a literal on this pool's backend, as of
+    /// the last probe. `None` on an unknown/expired cache, exactly like [`cached_version`], and
+    /// `None` too when the probe ran but the BACKEND could not answer for free (the MySQL arm
+    /// today) — a client cannot tell those apart and must not: both mean "do not build a literal".
+    fn cached_literals_are_standard(&self) -> Option<bool> {
+        self.cached().and_then(|(_, l)| l)
+    }
+
+    /// The one cache read both accessors share, so an expiry can never be applied to one value and
+    /// not the other.
+    fn cached(&self) -> Option<(String, Option<bool>)> {
         match &self.lock().state {
-            VersionState::Known { version, at } if at.elapsed() < self.tuning.ttl => {
-                Some(version.clone())
-            }
+            VersionState::Known {
+                version,
+                literals_are_standard,
+                at,
+            } if at.elapsed() < self.tuning.ttl => Some((version.clone(), *literals_are_standard)),
             _ => None,
         }
     }
@@ -430,8 +453,11 @@ impl PoolEntry {
         let mut guard = ProbeGuard {
             entry: self,
             version: None,
+            literals_are_standard: None,
         };
-        guard.version = probe_version(&self.pool, &self.tuning).await;
+        let probed = probe_version(&self.pool, &self.tuning).await;
+        guard.version = probed.version;
+        guard.literals_are_standard = probed.literals_are_standard;
     }
 
     /// The version-state lock. Poisoning is recovered from rather than propagated: the guarded
@@ -452,6 +478,10 @@ impl PoolEntry {
 struct ProbeGuard<'a> {
     entry: &'a PoolEntry,
     version: Option<String>,
+    /// M2-C2g, read off the SAME checkout the version probe holds (free — see
+    /// `PoolBackend::literals_are_standard`). Kept beside the version rather than in its own cache
+    /// because one probe produces both, so one TTL and one backoff govern them.
+    literals_are_standard: Option<bool>,
 }
 
 impl Drop for ProbeGuard<'_> {
@@ -461,6 +491,7 @@ impl Drop for ProbeGuard<'_> {
         cache.state = match self.version.take() {
             Some(version) => VersionState::Known {
                 version,
+                literals_are_standard: self.literals_are_standard,
                 at: Instant::now(),
             },
             None => {
@@ -474,7 +505,15 @@ impl Drop for ProbeGuard<'_> {
 /// Ask one pool for its server version. `None` on ANY failure — unreachable backend, a refused
 /// checkout, a statement error, or an unexpected row shape. The caller turns that into
 /// `server_version: nil`; it never fails a handshake.
-async fn probe_version(pool: &AnyPool, tuning: &ProbeTuning) -> Option<String> {
+/// What ONE probe learns. Both values come off the same checkout, which is why they travel together
+/// (M2-C2g): the version costs the statement, the quoting rule costs nothing on top of it.
+#[derive(Default)]
+struct Probed {
+    version: Option<String>,
+    literals_are_standard: Option<bool>,
+}
+
+async fn probe_version(pool: &AnyPool, tuning: &ProbeTuning) -> Probed {
     #[cfg(test)]
     if tuning.fault == Some(ProbeFault::Panic) {
         panic!("ferrod test fault: the server-version probe panicked");
@@ -505,18 +544,24 @@ async fn probe_version(pool: &AnyPool, tuning: &ProbeTuning) -> Option<String> {
 /// a probe that never returns is what seals a pool permanently un-probeable. Two of those awaits
 /// (the dial and the cancel) can be DROPPED safely: neither has a pooled connection in hand. The
 /// drain cannot, so when it is the one that expires the checkout is force-TAINTED before release.
-async fn probe_version_on<B: PoolBackend>(pool: &Pool<B>, tuning: &ProbeTuning) -> Option<String> {
+async fn probe_version_on<B: PoolBackend>(pool: &Pool<B>, tuning: &ProbeTuning) -> Probed {
     // A dial failure surfaces immediately (`Pool::checkout` has no hidden retry loop); a black-holed
     // host would otherwise never return, hence the bound. Dropping THIS future is safe: no
     // connection has been handed out and the semaphore permit releases with it.
     let mut co = match tokio::time::timeout(tuning.checkout_budget, pool.checkout()).await {
         Ok(Ok(co)) => co,
-        Ok(Err(_)) => return None,
+        Ok(Err(_)) => return Probed::default(),
         Err(_) => {
             tracing::debug!("ferrod: server-version probe timed out dialling the backend");
-            return None;
+            return Probed::default();
         }
     };
+
+    // M2-C2g: read BEFORE the statement, and free — it is a mirrored `ParameterStatus` value, not a
+    // query (see `PoolBackend::literals_are_standard`). Taking it here means it survives even when
+    // the version statement below times out, which is the honest outcome: the connection answered
+    // this the moment it handshook, and a slow `version()` says nothing about it.
+    let literals_are_standard = co.literals_are_standard();
 
     // Scoped so the query future — and with it the `&mut co` borrow — is gone before the wedged
     // arm below can force-taint the checkout.
@@ -543,11 +588,17 @@ async fn probe_version_on<B: PoolBackend>(pool: &Pool<B>, tuning: &ProbeTuning) 
         // pool itself bounds and — if that hangs too — evicts (charter rule 6).
         co.set_tainted(true);
         tracing::debug!("ferrod: server-version probe wedged; connection force-tainted");
-        return None;
+        return Probed {
+            version: None,
+            literals_are_standard,
+        };
     };
 
-    match res.ok()?.rows.first()?.first()? {
-        Value::Text(s) => Some(s.clone()),
+    let version = match res
+        .ok()
+        .and_then(|r| r.rows.first().and_then(|row| row.first()).cloned())
+    {
+        Some(Value::Text(s)) => Some(s),
         other => {
             tracing::debug!(
                 ?other,
@@ -555,6 +606,11 @@ async fn probe_version_on<B: PoolBackend>(pool: &Pool<B>, tuning: &ProbeTuning) 
             );
             None
         }
+    };
+
+    Probed {
+        version,
+        literals_are_standard,
     }
 }
 
@@ -647,6 +703,55 @@ mod tests {
     /// by name — and an UNREACHABLE backend still gets its name and family advertised, with
     /// `server_version: None`. This runs the REAL `pool_info` path (probe attempted, probe failed),
     /// which is what makes "the handshake never depends on backend availability" a property of the
+    /// M2-C2g: an UNREACHABLE pool advertises `literals_are_standard: None`, and that arm matters
+    /// more than the reachable one — it is what a client's fail-closed refusal hangs off. Asserted
+    /// here rather than only live because "unreachable" is the state a live test cannot stage
+    /// cheaply, and the handshake must survive it (§4's nil contract).
+    #[tokio::test]
+    async fn an_unreachable_pool_advertises_an_unknown_quoting_rule_rather_than_a_guess() {
+        let registry = PoolRegistry::build(&config_with_unreachable_pools());
+        let info = registry.pool_info().await;
+
+        assert!(!info.is_empty(), "the fixture must advertise pools at all");
+        for p in &info {
+            assert_eq!(
+                p.literals_are_standard, None,
+                "pool {:?} could not be probed, so its quoting rule is UNKNOWN — advertising \
+                 Some(false) would claim backslashes ARE escapes, and Some(true) would hand a \
+                 client an escaping rule the server never confirmed",
+                p.name
+            );
+        }
+    }
+
+    /// The reachable arm, live: a real PostgreSQL reports `standard_conforming_strings` as a
+    /// `GUC_REPORT` parameter, so the engine learns it with NO round trip of its own and advertises
+    /// `Some(true)` — which is what makes SPEC §21 D5 satisfiable for the client's `quote()`.
+    ///
+    /// The version is asserted alongside deliberately: both values come from ONE probe and share its
+    /// cache, so a test that checked only the new one could pass against a build that had broken the
+    /// pairing.
+    #[tokio::test]
+    async fn a_reachable_postgres_pool_advertises_a_known_quoting_rule() {
+        let Some(url) = env_url("FERRO_TEST_PG_URL") else {
+            return;
+        };
+        let registry = PoolRegistry::build(&one_pool("default", &url));
+        let info = registry.pool_info().await;
+
+        let p = info.first().expect("one pool");
+        assert_eq!(
+            p.literals_are_standard,
+            Some(true),
+            "PostgreSQL has defaulted standard_conforming_strings=on since 9.1, and it arrives as a \
+             ParameterStatus rather than a query"
+        );
+        assert!(
+            p.server_version.is_some(),
+            "both values ride the same probe; a missing version means the pairing broke"
+        );
+    }
+
     /// production code rather than of a config-only shortcut.
     #[tokio::test]
     async fn pool_info_carries_the_backend_family_even_when_the_backend_is_unreachable() {

@@ -267,11 +267,19 @@ fn a_v1_frame_is_rejected_with_the_documented_skew_message() {
         ferro_proto::consts::PROTOCOL_VERSION,
         "the hello vector must be a CURRENT-version frame before we roll it back"
     );
-    frame[1] = 1; // an old (v1) client's HELLO reaching a v2 engine
+    frame[1] = 1; // an old (v1) client's HELLO reaching a current engine
     let err = Header::decode(&frame).expect_err("a v1 frame must be rejected");
+    // The EXPECTED number is derived, the SHAPE is literal. Hardcoding the number meant editing this
+    // test on every bump (it was left at 2 when M2-C2g moved to 3), and an edit-on-bump assertion is
+    // one someone eventually "fixes" by pasting whatever the code now says — which pins nothing.
+    // Deriving it keeps the real claim: the wording published in /proto/PROTOCOL.md is the wording
+    // the codec emits, so a reader who greps for that message finds the code that produces it.
     assert_eq!(
         err.to_string(),
-        "unsupported protocol version: expected 2, got 1",
+        format!(
+            "unsupported protocol version: expected {}, got 1",
+            ferro_proto::consts::PROTOCOL_VERSION
+        ),
         "the skew message published in /proto/PROTOCOL.md must be the one the codec emits"
     );
 }
