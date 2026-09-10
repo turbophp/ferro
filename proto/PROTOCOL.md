@@ -501,6 +501,19 @@ the core messages (§4) — not the bespoke `Value`-splicing codec. `tx_id` is a
 counter, contractually **bounded < 2^63** (§2), so it is a native PHP int, NOT the `boot_epoch`
 decimal-string treatment.
 
+**A `tx_id` the engine has no LIVE entry for is `errc::TX_NOT_FOUND` (`0x300B`, NonRetryable), never
+`errc::PROTOCOL`.** It covers unknown, already-committed, already-rolled-back, aborted, and another
+session's — all deliberately indistinguishable to the client (SPEC §7), and it applies to a tx-scoped
+`EXEC` as much as to the TX methods. The one tx-gone case that is NOT this code is the engine's own
+deadline tombstone, which stays `errc::TX_DEADLINE` (`0x1003`, **Retryable**) so its owner can tell
+"the engine ended this" from "this was never yours".
+
+The split from `errc::PROTOCOL` — which stays reserved for a genuine WIRE fault (a body that will not
+decode, an unknown savepoint name) — is load-bearing for clients, not cosmetic. A client's
+`rollBack()` is normally called from a `finally` already carrying the caller's real error, so it must
+swallow "that transaction is gone" rather than replace that error; while the two facts shared one
+code, swallowing the first meant swallowing the client's own codec defects with it.
+
 ### 9.1 `Isolation` (a message-field `u8`, not a registry constant)
 
 `BeginRequest.isolation` is an optional `u8`. It is a message-field VALUE, not a `/proto` registry
@@ -560,6 +573,11 @@ The method id selects the savepoint operation; the body is a positional fixarray
 `tx_begin_request` (`SERIALIZABLE`, not readonly), `tx_begin_response` (the terminal
 `Outcome::Ok(BeginResponse)` envelope, locking the one-field-msg-composes-with-`Outcome::Ok` path),
 `tx_commit` (a bare `TxControl`), and `tx_savepoint` (a named `SavepointRequest`).
+
+`error_tx_not_found` is the TX service's terminal vector: an `Outcome::Error(ErrorPayload)` carrying
+`code = 0x300B` on `TX`/`COMMIT` with the `END` flag. It is the first committed vector that is a TX
+RESPONSE rather than a request, which is why a decoder keyed only on `(service, method)` must also
+read the `END` flag to tell the two apart.
 
 ## 10. STREAM service messages (`HEAD`/`DATA`)
 

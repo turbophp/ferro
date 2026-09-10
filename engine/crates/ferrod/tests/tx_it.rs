@@ -787,8 +787,8 @@ async fn tx_max_deadline() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// Cross-session: session A opens a tx; session B using A's tx_id → Protocol (indistinguishable from
-// unknown); A's tx is undisturbed and commits.
+// Cross-session: session A opens a tx; session B using A's tx_id → TxNotFound (indistinguishable
+// from unknown); A's tx is undisturbed and commits.
 // -------------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -804,24 +804,24 @@ async fn tx_cross_session_rejected() {
 
     let tx_id = begin(&mut client_a, 12, "default", None, false).await;
 
-    // B forwards a tx-scoped EXEC with A's tx_id → Protocol (owner mismatch, indistinguishable from
-    // an unknown id).
+    // B forwards a tx-scoped EXEC with A's tx_id → TxNotFound (owner mismatch, indistinguishable
+    // from an unknown id).
     match exec_in_tx(&mut client_b, 20, tx_id, "SELECT 1", vec![], 0, true).await {
         Outcome::Error(ep) => assert_eq!(
             ep.code,
-            errc::PROTOCOL,
-            "a cross-session tx-scoped EXEC is Protocol"
+            errc::TX_NOT_FOUND,
+            "a cross-session tx-scoped EXEC is TxNotFound"
         ),
-        other => panic!("expected Protocol, got {other:?}"),
+        other => panic!("expected TxNotFound, got {other:?}"),
     }
-    // B's COMMIT of A's tx_id is likewise Protocol.
+    // B's COMMIT of A's tx_id is likewise TxNotFound.
     match commit(&mut client_b, 21, tx_id).await {
         Outcome::Error(ep) => assert_eq!(
             ep.code,
-            errc::PROTOCOL,
-            "a cross-session COMMIT is Protocol"
+            errc::TX_NOT_FOUND,
+            "a cross-session COMMIT is TxNotFound"
         ),
-        other => panic!("expected Protocol, got {other:?}"),
+        other => panic!("expected TxNotFound, got {other:?}"),
     }
     assert_session_alive(&mut client_b, 110).await;
 
@@ -838,11 +838,13 @@ async fn tx_cross_session_rejected() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// Unknown tx_id: a COMMIT for a never-issued tx_id → Protocol; the session survives.
+// Unknown tx_id: a COMMIT for a never-issued tx_id → TxNotFound; the session survives. And THE B3
+// SPLIT, proven live on ONE session: the same TX service answers "that tx is gone" and "your frame
+// is malformed" with DIFFERENT codes.
 // -------------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn tx_unknown_id_protocol() {
+async fn tx_unknown_id_is_tx_not_found_and_a_malformed_body_is_still_protocol() {
     let Some(url) = pg_url() else {
         return;
     };
@@ -850,15 +852,44 @@ async fn tx_unknown_id_protocol() {
     let mut client = server.connect().await;
     client.hello(1).await;
 
+    // (a) a never-issued tx_id → TxNotFound.
     match commit(&mut client, 12, 999_999).await {
         Outcome::Error(ep) => assert_eq!(
             ep.code,
-            errc::PROTOCOL,
-            "a COMMIT for a never-issued tx_id is Protocol"
+            errc::TX_NOT_FOUND,
+            "a COMMIT for a never-issued tx_id is TxNotFound"
         ),
-        other => panic!("expected Protocol, got {other:?}"),
+        other => panic!("expected TxNotFound, got {other:?}"),
     }
     assert_session_alive(&mut client, 112).await;
+
+    // (b) a ROLLBACK whose body is NOT a decodable TxControl → still Protocol. This is the half a
+    // client's `rollBack()` must keep hearing about: it is a CLIENT CODEC DEFECT, not a fact about
+    // any transaction. Before B3 both (a) and (b) came back as the same code, so a client that
+    // swallowed (a) — which it must, from a `finally` already carrying the real error — silently
+    // swallowed (b) too. Asserting the pair on ONE session is what makes the split observable;
+    // either assertion alone passes just as well if the two codes collapse back together.
+    client
+        .send_request(13, service::TX, method_tx::ROLLBACK, vec![0xC1])
+        .await;
+    let t = client.recv().await;
+    assert_ne!(t.header.flags & flags::END, 0, "exactly one END terminal");
+    match Outcome::decode(&t.payload).expect("decode Outcome") {
+        Outcome::Error(ep) => {
+            assert_eq!(
+                ep.code,
+                errc::PROTOCOL,
+                "a malformed TxControl body is a WIRE fault, not a missing transaction"
+            );
+            assert_ne!(
+                ep.code,
+                errc::TX_NOT_FOUND,
+                "…and it must not share a code with one"
+            );
+        }
+        other => panic!("expected Protocol, got {other:?}"),
+    }
+    assert_session_alive(&mut client, 113).await;
 }
 
 // -------------------------------------------------------------------------------------------------

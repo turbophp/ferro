@@ -195,10 +195,16 @@ fn message_payloads_are_canonical_and_byte_stable() {
             (s, m) if s == service::TX && m == method_tx::BEGIN && (h.flags & flags::END) == 0 => {
                 BeginRequest::decode(payload).unwrap().encode()
             }
-            (s, m) if s == service::TX && m == method_tx::COMMIT => {
+            // END-guarded like the BEGIN arm above, and for the same reason: a TX RESPONSE rides the
+            // same (service, method) pair as its request and is an `Outcome`, not a request body. B3's
+            // `error_tx_not_found` is exactly that shape — a terminal on TX/COMMIT — and without the
+            // guard it would be decoded as a `TxControl` and fail here for the wrong reason.
+            (s, m) if s == service::TX && m == method_tx::COMMIT && (h.flags & flags::END) == 0 => {
                 TxControl::decode(payload).unwrap().encode()
             }
-            (s, m) if s == service::TX && m == method_tx::SAVEPOINT => {
+            (s, m)
+                if s == service::TX && m == method_tx::SAVEPOINT && (h.flags & flags::END) == 0 =>
+            {
                 SavepointRequest::decode(payload).unwrap().encode()
             }
             // A TX BEGIN response (END flag) is a terminal Outcome::Ok(BeginResponse body). CRACK

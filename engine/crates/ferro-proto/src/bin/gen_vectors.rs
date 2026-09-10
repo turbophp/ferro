@@ -353,6 +353,31 @@ fn main() {
             "detail":null, "retry_after_ms":null } }),
     );
 
+    // B3: the dedicated "that tx_id is not live here" terminal. Its whole reason to exist is to be
+    // a DIFFERENT code from `Protocol` on the wire, so the vector's job is to lock that byte — a
+    // client swallowing this code on `rollBack()` must not thereby swallow a real protocol fault.
+    let err_tx = ErrorPayload {
+        code: consts::errc::TX_NOT_FOUND,
+        branch: consts::errc::TX_NOT_FOUND_BRANCH,
+        sqlstate: None,
+        errno: None,
+        message: "unknown or forbidden tx_id".into(),
+        detail: None,
+        retry_after_ms: None,
+    };
+    write_case(
+        "error_tx_not_found",
+        flags::END,
+        service::TX,
+        method_tx::COMMIT,
+        22,
+        Outcome::Error(err_tx).encode(),
+        serde_json::json!({ "status": consts::outcome::ERROR, "error": {
+            "code": consts::errc::TX_NOT_FOUND, "branch": consts::errc::TX_NOT_FOUND_BRANCH,
+            "sqlstate":null, "errno":null, "message":"unknown or forbidden tx_id",
+            "detail":null, "retry_after_ms":null } }),
+    );
+
     // The FIRST vector locking a NON-NULL errno + a real SQLSTATE together. Shape: a MySQL duplicate
     // key — errno 1062, SQLSTATE 23000 — the pair a Doctrine MySQL ExceptionConverter keys on, and
     // the pair that proves the two fields are independent on the wire (23000 alone cannot

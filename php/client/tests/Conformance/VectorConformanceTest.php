@@ -375,6 +375,58 @@ final class VectorConformanceTest extends TestCase
     }
 
     /**
+     * `error_tx_not_found` (B3): the dedicated "that `tx_id` is not live here" terminal.
+     *
+     * Its whole purpose is to be a DIFFERENT code from `Protocol` on the wire — `Connection::rollBack()`
+     * swallows this one by code and must NOT thereby swallow a real wire fault — so the assertion
+     * that earns this vector its place is the INEQUALITY against `error_protocol`'s code, read out
+     * of the two committed vectors rather than out of the constants both sides generate from the
+     * same lock. Two generated constants agreeing proves nothing about the bytes; two vectors
+     * disagreeing does.
+     *
+     * It is also the first committed vector whose header is a TX-service RESPONSE (END flag on
+     * `SERVICE_TX`/`METHOD_TX_COMMIT`), which is why the Rust golden-vector dispatch had to learn to
+     * tell a TX response from a TX request.
+     */
+    public function testErrorTxNotFoundVectorIsADistinctCodeFromErrorProtocol(): void
+    {
+        $v = self::loadVector('error_tx_not_found.json');
+        $message = is_array($v['message']) ? $v['message'] : [];
+        $errorFields = is_array($message['error'] ?? null) ? $message['error'] : [];
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $p = new PurePacker();
+
+        // (a) encode
+        $this->assertSame(bin2hex($payload), bin2hex(Outcome::error(ErrorPayload::fromArray($errorFields))->encode($p)),
+            'PHP Outcome::Error(ErrorPayload) encode must byte-match error_tx_not_found');
+
+        // (b) decode
+        $outcome = Outcome::decode($payload, $p);
+        $this->assertTrue($outcome->isError(), 'error_tx_not_found is an Outcome::Error');
+        $err = $outcome->errorPayload();
+        $this->assertSame(C::ERR_TX_NOT_FOUND, $err->code, 'decoded code is the generated TX_NOT_FOUND');
+        $this->assertSame(C::BRANCH_NON_RETRYABLE, $err->branch, 'TxNotFound is a NonRetryable branch');
+        $this->assertNull($err->sqlstate, 'an engine-side tx fact carries no backend SQLSTATE');
+        $this->assertNull($err->errno, 'and no vendor errno');
+        $this->assertEquals($errorFields, $err->toArray(), 'PHP ErrorPayload decode==value for error_tx_not_found');
+
+        // (c) fixpoint
+        $this->assertSame(bin2hex($payload), bin2hex(Outcome::error($err)->encode($p)),
+            'error_tx_not_found decode->encode fixpoint');
+
+        // (d) THE POINT: distinct from Protocol on the WIRE, read from the two vectors.
+        $proto = self::loadVector('error_protocol.json');
+        $protoMessage = is_array($proto['message']) ? $proto['message'] : [];
+        $protoFields = is_array($protoMessage['error'] ?? null) ? $protoMessage['error'] : [];
+        $this->assertNotSame($protoFields['code'], $errorFields['code'],
+            'TxNotFound and Protocol must be different codes on the wire, or rollBack() cannot tell '
+            . 'a dead transaction from a client codec defect');
+        $this->assertSame($protoFields['branch'], $errorFields['branch'],
+            'both are NonRetryable — the split is in the code, which is why keying on the branch '
+            . 'alone could never have worked');
+    }
+
+    /**
      * `error_mysql_errno`: the first vector carrying a NON-NULL `errno` alongside a SQLSTATE. Locks
      * that PHP's `ErrorPayload` moves BOTH fields, independently, in both directions — the pair a
      * Doctrine MySQL ExceptionConverter keys on (it matches the errno EXCLUSIVELY; MySQL's `23000`
