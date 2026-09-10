@@ -83,6 +83,51 @@ final class FerroPdoShim
     }
 
     /**
+     * `PDO::ATTR_SERVER_VERSION` only, and it is here because C2 MEASURED that stock framework code
+     * needs it — not because §15 lists a shim surface.
+     *
+     * `Connection::getServerVersion()` is `getPdo()->getAttribute(PDO::ATTR_SERVER_VERSION)`, and
+     * the stock `PostgresGrammar::compileColumns()` branches on it:
+     * `version_compare($this->connection?->getServerVersion(), '12.0', '<')` decides whether the
+     * introspection SQL selects `a.attgenerated`. So every `hasColumn()`/`getColumnListing()` — and
+     * therefore a large part of any schema-touching test — goes through this.
+     *
+     * **A missing version is LOUD, never defaulted**, and that is the whole point: `version_compare`
+     * against `null` evaluates as older-than-12 and would silently emit the wrong introspection SQL
+     * for a modern PostgreSQL. The sibling Doctrine tier made the same call for the same reason —
+     * a wrong version is a silently wrong dialect (§22.2, D-S8b-1).
+     *
+     * Every OTHER attribute still refuses by name. That is deliberate: the roster grows only as
+     * real framework code is measured needing it, which is exactly how this one arrived.
+     */
+    public function getAttribute(int $attribute): string
+    {
+        if ($attribute !== \PDO::ATTR_SERVER_VERSION) {
+            throw new \LogicException(sprintf(
+                'Ferro: PDO::getAttribute(%d) is not implemented by FerroPdoShim. Only '
+                . 'ATTR_SERVER_VERSION (%d) is, because that is the one stock Illuminate code was '
+                . 'measured to need. If a package needs another, that is a scope decision — see '
+                . 'docs/dev-loop/PHASE-C-SCOPE.md.',
+                $attribute,
+                \PDO::ATTR_SERVER_VERSION,
+            ));
+        }
+
+        $info = $this->ferro->poolInfo();
+        $version = $info?->serverVersion;
+        if ($version === null || $version === '') {
+            throw new \LogicException(sprintf(
+                'Ferro: the engine advertises no server_version for pool "%s", and Illuminate needs '
+                . 'one — PostgresGrammar::compileColumns() version_compares it against 12.0 to pick '
+                . 'its introspection SQL, so guessing would silently emit the wrong query. Check '
+                . 'that ferrod can reach the pool\'s backend.',
+                $info->name ?? '(unknown)',
+            ));
+        }
+        return $version;
+    }
+
+    /**
      * @param array<int,mixed> $arguments
      * @throws \LogicException always
      */

@@ -170,11 +170,21 @@ belt and braces, and per FB-7 it must be an unguessable probe, not a constant.
 `MSSQL_*` onto `database.connections.{driver}.*`. A `ferro-pgsql` connection gets no env syncing, so
 the harness must supply the connection config directly.
 
-**4. `migrate:fresh` is a real dependency on DDL through the tier**, and is the first thing the next
-slice should verify rather than assume: on PostgreSQL it drives the stock schema builder's
-`dropAllTables()`, which introspects the catalog and issues `DROP TABLE … CASCADE`. C1c's
-`statement()`/`unprepared()` should carry it, but "should" is not "does" — and the sibling suite's
-50-test `int2vector` failure was exactly a stock-schema-manager introspection gap.
+**4. `migrate:fresh` — VERIFIED, and it produced C1e's first non-speculative requirement.**
+`dropAllTables()` (what `migrate:fresh` runs) works through the tier, including across a foreign
+key, so **C2 is not blocked**. But `hasColumn()`/`getColumnListing()` were: stock
+`PostgresGrammar::compileColumns()` does
+`version_compare($this->connection?->getServerVersion(), '12.0', '<')` to decide whether its
+introspection SQL selects `a.attgenerated`, and `Connection::getServerVersion()` is
+`getPdo()->getAttribute(PDO::ATTR_SERVER_VERSION)` — which the shim refused.
+
+**This is the C2-before-C1e reordering paying off exactly as argued.** C1e was deferred because
+nothing had demanded a PDO method and building to §15's list would have been speculative; the
+measurement then named the one method real framework code needs, and it is backed by `poolInfo()`'s
+`server_version`, already on the wire since S8a. A missing version is LOUD rather than defaulted —
+`version_compare(null, '12.0', '<')` is true, so a silent default would emit pre-12 introspection SQL
+against a modern PostgreSQL. Every other attribute still refuses by name; the roster grows only as
+real code is measured needing it.
 
 **5. Scale and isolation.** 131 `.php` files under `tests/Integration/Database/` (~656 `test*`
 methods). There is **one flat testsuite** in the root `phpunit.xml.dist` covering `./tests`; upstream
