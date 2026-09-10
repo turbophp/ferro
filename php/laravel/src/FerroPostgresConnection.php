@@ -4,6 +4,7 @@ namespace Ferro\Laravel;
 
 use Ferro\Client\Connection as FerroClient;
 use Ferro\Client\Error\FerroException;
+use Ferro\Client\RawStream;
 use Ferro\Laravel\Exception\FerroQueryException;
 use Illuminate\Database\PostgresConnection;
 
@@ -14,10 +15,9 @@ use Illuminate\Database\PostgresConnection;
  * Schema builder are inherited untouched — they only build SQL strings and post-process arrays, and
  * charter rule 6 says the drop-in tiers change execution and never SQL generation.
  *
- * **C1b + C1c: reads, writes and transactions.** `cursor()`/`LazyCollection` (C1d) and the wider PDO
- * surface (C1e) are still to come; anything reaching for an unimplemented PDO method refuses BY NAME
- * through {@see FerroPdoShim::__call} rather than failing obscurely. See
- * `docs/dev-loop/PHASE-C-SCOPE.md`.
+ * **C1b–C1d: reads, writes, transactions and streaming.** The wider PDO surface (C1e) is still to
+ * come; anything reaching for an unimplemented PDO method refuses BY NAME through
+ * {@see FerroPdoShim::__call} rather than failing obscurely. See `docs/dev-loop/PHASE-C-SCOPE.md`.
  */
 class FerroPostgresConnection extends PostgresConnection
 {
@@ -92,6 +92,71 @@ class FerroPostgresConnection extends PostgresConnection
             return self::hydrate($result['cols'], $result['rows']);
         });
         return self::narrowRows($rows);
+    }
+
+    /**
+     * Stream a result set one row at a time — the engine's windowed HEAD/DATA/END producer surfaced
+     * as a Generator. `Model::lazy()`, `chunkById()` and `LazyCollection` all build on this, and the
+     * point of the method is that a million-row table never materialises in PHP memory.
+     *
+     * **This method is itself a Generator, so its body is LAZY** — nothing reaches the engine until
+     * the caller starts iterating. Stock Illuminate's `cursor()` has exactly the same property (it
+     * `yield`s too), so preserving it is fidelity rather than an optimisation.
+     *
+     * **The `finally` is the load-bearing part.** If the caller stops early — the canonical
+     * `foreach ($conn->cursor(...) as $r) { break; }`, or simply dropping the Generator — PHP runs
+     * the `finally` on destruction, and {@see \Ferro\Client\RawStream::close} sends an outbound
+     * `CANCEL` and drains to the one terminal. Without it the unread DATA frames would sit on the
+     * session socket and the NEXT request would read them as its own reply. That failure does not
+     * surface on the abandoned query at all — which is why `CursorLiveTest` asserts the NEXT query,
+     * not this one.
+     *
+     * **Mutation-proven, and the failure is worse than a wrong answer.** Deleting this `finally`
+     * does not corrupt the following query — it HANGS the session: the abandoned stream leaves
+     * ~50 000 rows in flight and the next request waits behind frames nobody will read. The whole
+     * suite stopped rather than failing, which is exactly the shape of bug that looks like an
+     * infrastructure problem in CI and gets re-run instead of fixed.
+     *
+     * Fate: `readonly: false`, consistent with {@see select} and for the same reason — see that
+     * method's note. A cursor is in practice always a read, but the tier does not infer read-vs-write
+     * (charter rule 6), and the cost is the §22.2 (ac) trade rather than a safety risk.
+     *
+     * @param  string  $query
+     * @param  array<int|string,mixed>  $bindings
+     * @param  bool  $useReadPdo
+     * @return \Generator<int,\stdClass>
+     */
+    public function cursor($query, $bindings = [], $useReadPdo = true)
+    {
+        $stream = $this->run($query, $bindings, function (string $query, array $bindings): ?RawStream {
+            if ($this->pretending()) {
+                return null;
+            }
+            try {
+                return $this->ferro->streamRaw($query, array_values($bindings), readonly: false);
+            } catch (FerroException $e) {
+                throw FerroQueryException::fromFerro($e);
+            }
+        });
+
+        if ($stream === null) {
+            return;
+        }
+        if (!$stream instanceof RawStream) {
+            throw new \LogicException(
+                'Ferro: Illuminate\'s Connection::run() no longer returns its callback\'s value '
+                . 'verbatim (expected RawStream, got ' . get_debug_type($stream) . ').',
+            );
+        }
+
+        $cols = $stream->columns();
+        try {
+            foreach ($stream->rows() as $row) {
+                yield self::hydrateOne($cols, $row);
+            }
+        } finally {
+            $stream->close();
+        }
     }
 
     /**
@@ -227,12 +292,24 @@ class FerroPostgresConnection extends PostgresConnection
     {
         $out = [];
         foreach ($rows as $row) {
-            $o = new \stdClass();
-            foreach ($cols as $i => $name) {
-                $o->{$name} = $row[$i] ?? null;
-            }
-            $out[] = $o;
+            $out[] = self::hydrateOne($cols, $row);
         }
         return $out;
+    }
+
+    /**
+     * One row. Shared by the buffered and streamed paths so they can never drift — a streamed row
+     * that hydrated differently from a buffered one would be a difference no test asserts directly.
+     *
+     * @param list<string> $cols
+     * @param list<mixed> $row
+     */
+    private static function hydrateOne(array $cols, array $row): \stdClass
+    {
+        $o = new \stdClass();
+        foreach ($cols as $i => $name) {
+            $o->{$name} = $row[$i] ?? null;
+        }
+        return $o;
     }
 }

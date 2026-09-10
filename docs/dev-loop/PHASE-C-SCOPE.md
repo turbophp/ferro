@@ -112,7 +112,16 @@ the tier above cannot read it.
   the shim is duck-typed and need not extend `\PDO`. **C1e is therefore already half-built**, and what
   remains of it is the question of which further PDO methods any real package needs — with `quote()`
   still refused (see the table above).
-- **C1d — `cursor()`/`LazyCollection`**, which should be small given B2.
+- **C1d — `cursor()`/`LazyCollection`. DONE**, and it was small as predicted: `streamRaw()` already
+  streamed on both families since B2, so this was tier wiring rather than engine work. `cursor()` is
+  itself a Generator (stock Illuminate's is too), so the body stays lazy; a `finally` calls
+  `RawStream::close()` for the `CANCEL`+drain on abandonment.
+  **The abandonment guard asserts the NEXT query, not the abandoned one** — a missing cancel does not
+  damage the query you stopped, it damages the one after. Mutation-proven, and the failure mode is
+  worse than a wrong answer: deleting the `finally` HANGS the session (the next request waits behind
+  ~50 000 unread frames) rather than returning wrong data. That is the shape of bug that reads as CI
+  infrastructure flakiness and gets re-run instead of fixed — worth knowing before it happens in
+  anger.
 - **C1e — the PDO shim**, scoped by what C1b–C1d actually turn out to need, not by §15's list
   up front.
 - **C2 — the `illuminate/database` suite**, modelled on `testkit/dbal-suite.sh`.
