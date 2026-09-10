@@ -346,6 +346,95 @@ async fn reclaim_hook_clean_recycles_but_a_failed_reclaim_discards_the_conn() {
     assert!(!fresh.conn().closed, "and the fresh conn is live");
 }
 
+/// **FB-3b (dev-loop ledger, MED, open since S5): the DRAIN inside `finish()` is BOUNDED too.**
+///
+/// FB-3 bounded the reclaim await and deliberately left the drain loop beside it alone, because
+/// bounding the drain means abandoning a MID-PROTOCOL stream and that "must not be done blind".
+/// The ledger's own condition for revisiting was "fix when a backend can actually hang a drain" —
+/// which B2b-2 made true, since MySQL now owns its driver connection inside the stream.
+///
+/// The hazard is the same shape as FB-3's: `ferrod` awaits `finish` UNRACED, so a row pull that
+/// never returns means the request never emits its single terminal END (charter rule 4). What kept
+/// this from being a one-line fix is the OTHER half — abandoning the drain leaves a connection
+/// that is **alive and healthy but mid-result-set**, and every other discard in the pool is decided
+/// by `backend.is_closed()`, which cannot express that. PostgreSQL is precisely the case: its
+/// stream is channel-backed, so the client stays fine and the connection would be handed to the
+/// next tenant carrying the previous tenant's unread rows. The `discard` latch is what makes the
+/// bound safe, and this test asserts the latch, not just the return.
+///
+/// `start_paused` drives the clock, so this asserts the BOUND rather than wall-clock luck: with
+/// the timeout removed the test hangs forever.
+#[tokio::test(start_paused = true)]
+async fn a_hung_drain_cannot_strand_finish_and_never_recycles_the_conn() {
+    let backend = FakeBackend::new();
+    backend.set_stream_script(StreamScript {
+        cols: vec![ColMeta {
+            name: "n".to_string(),
+            tag: tag::I64,
+        }],
+        rows: vec![row(1), row(2), row(3)],
+        affected: 3,
+        error_at: None,
+    });
+    let bound = std::time::Duration::from_secs(5);
+    let pool = Pool::new(
+        backend,
+        PoolConfig {
+            max_size: 1,
+            checkout_timeout: bound,
+            ..Default::default()
+        },
+    );
+
+    let hung_id = {
+        let mut co = pool.checkout().await.expect("checkout");
+        let id = co.conn().id;
+        let handle = co.query_stream("SELECT n FROM t", &[]).await.expect("open");
+        // Arm AFTER the open so the stream exists: every subsequent pull parks forever. The caller
+        // pulled nothing, so `finish`'s own drain is what meets the gate.
+        pool.backend().block_stream_pulls();
+
+        let started = tokio::time::Instant::now();
+        let end = handle
+            .finish()
+            .await
+            .expect("finish MUST return even though every row pull hangs");
+
+        assert!(
+            started.elapsed() >= bound,
+            "the drain really did park until the bound elapsed"
+        );
+        assert_eq!(
+            end.affected, 0,
+            "a timed-out drain reports 0 affected — nothing about the count can be trusted"
+        );
+        assert!(
+            co.tainted(),
+            "a timed-out drain force-taints, exactly like a failed reclaim"
+        );
+        assert!(
+            !co.conn().closed,
+            "the fake's conn is deliberately NOT closed — a hung drain damages the SESSION, not \
+             the socket, which is exactly why `is_closed` cannot be what protects the next tenant"
+        );
+        id
+    };
+
+    // THE LOAD-BEARING ASSERTION. The conn is alive and `is_closed` reports it healthy, so
+    // `is_closed` alone would happily recycle it mid-result-set. Only the `discard` latch stops the
+    // next tenant inheriting that session — a cross-tenant leak, not merely an untidy connection.
+    let fresh = pool
+        .checkout()
+        .await
+        .expect("re-checkout after an abandoned drain");
+    assert_ne!(
+        fresh.conn().id,
+        hung_id,
+        "a connection whose drain was abandoned MUST NOT be recycled: the next checkout connects \
+         fresh, never inheriting a mid-result-set session (charter rule 6)"
+    );
+}
+
 /// FB-3 (iteration-12 adversarial pass, HIGH): the reclaim step inside `finish()` is BOUNDED, so a
 /// backend whose connection-restore round trip hangs can never strand the request's terminal frame.
 ///

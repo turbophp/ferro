@@ -291,6 +291,17 @@ pub struct Checkout<B: PoolBackend> {
     /// other seven assist causes (`Listen`/`AdvisoryLock`/`Prepare`/`Temp`/`Set`/`PinFunction`/
     /// `Unknown`) from the classifier (`apply_classify`, M1-S2).
     last_pin_cause: Option<PinCause>,
+    /// **FB-3b — the pool's own "never recycle this connection" latch.** Once set, `Drop` discards
+    /// the connection instead of pushing it onto the idle stack, WITHOUT consulting the backend.
+    ///
+    /// Every other discard in this file is decided by `backend.is_closed(&conn)`, i.e. it relies on
+    /// the backend having noticed and recorded the damage. That is the right default and it is what
+    /// the reclaim contract is built on — but it cannot express "this connection is alive and
+    /// healthy AND must not be reused", which is exactly the state a connection is left in when a
+    /// stream drain is abandoned part-way: the socket is fine, the SESSION is mid-result-set, and
+    /// handing it to the next tenant would leak the previous tenant's rows. This latch is the
+    /// backend-independent way to say that, and it is why bounding the drain is safe at all.
+    discard: bool,
 }
 
 impl<B: PoolBackend> Checkout<B> {
@@ -311,6 +322,7 @@ impl<B: PoolBackend> Checkout<B> {
             tainted: false,
             pin: PinState::Unpinned,
             last_pin_cause: None,
+            discard: false,
         }
     }
 
@@ -1014,8 +1026,10 @@ impl<B: PoolBackend> Drop for Checkout<B> {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             // Only return live connections to the idle stack; a connection the backend already
-            // considers closed is simply dropped (the permit still releases below).
-            if !self.pool.backend.is_closed(&conn) {
+            // considers closed is simply dropped (the permit still releases below). `discard` is
+            // the pool's OWN latch (FB-3b) for a connection that is alive but must never be reused
+            // — a backend cannot report that through `is_closed`.
+            if !self.discard && !self.pool.backend.is_closed(&conn) {
                 let mut idle = self.pool.idle.lock().unwrap();
                 idle.push(IdleConn {
                     conn,
@@ -1120,7 +1134,27 @@ impl<'a, B: PoolBackend> RowStreamHandle<'a, B> {
     pub async fn finish(mut self) -> Result<StreamEnd, PoolError> {
         // Drain the remainder (a no-op if the caller already pulled to `None`). Going through
         // `self.next()` records any late error into `self.errored`.
-        while self.next().await.is_some() {}
+        //
+        // BOUNDED (FB-3b). This loop was unbounded from S5 until now, and `ferrod` awaits `finish`
+        // UNRACED — so a backend that can hang a row pull stranded the request's single terminal
+        // END frame, a charter-rule-4 violation. FB-3 bounded the reclaim await immediately below
+        // and deliberately left this alone, because bounding it means abandoning a MID-PROTOCOL
+        // stream and that "must not be done blind". What makes it safe now is the `discard` latch:
+        // on timeout the connection is dropped rather than recycled, so a half-drained session can
+        // never reach the next tenant. Without that latch this would be a CROSS-TENANT LEAK on any
+        // backend whose `is_closed` still reports a mid-result-set connection healthy — which
+        // PostgreSQL's does, since its stream is channel-backed and the client stays fine.
+        //
+        // The bound is `checkout_timeout`, the same knob FB-3 chose for the reclaim beside it and
+        // the same one `Pool::checkout` uses for its recycle cleanup: this is the same class of
+        // post-statement work, and an operator should not have to discover a third knob. It is a
+        // HANG bound, not a throughput budget — a drain slow enough to exceed it costs one
+        // connection, which is strictly better than never emitting the terminal.
+        let drain_bound = self.checkout.pool.config.checkout_timeout;
+        let drain_timed_out =
+            tokio::time::timeout(drain_bound, async { while self.next().await.is_some() {} })
+                .await
+                .is_err();
         // Hand the drained stream to the backend's RECLAIM hook (B2b): for a backend whose stream
         // OWNS the driver connection (MySQL) this is where the conn re-enters the checkout —
         // BEFORE `finalize_stream` reads `tx_status(&conn)` — and where `affected` is answered
@@ -1141,6 +1175,26 @@ impl<'a, B: PoolBackend> RowStreamHandle<'a, B> {
         // checkout-time recycle already uses to bound its ROLLBACK/RESET cleanup (see
         // `Pool::checkout`), because this is the same class of operation; no new knob for an
         // operator to discover.
+        // A timed-out drain does NOT go on to reclaim. The connection is already condemned, so a
+        // second bounded wait buys nothing; and for a conn-owning backend, dropping `rows` here is
+        // itself the kill (it closes the moved-out driver connection), which is the same mechanism
+        // the reclaim-timeout arm below relies on.
+        if drain_timed_out {
+            tracing::warn!(
+                timeout_ms = drain_bound.as_millis() as u64,
+                "ferro-pool: stream drain timed out — connection will be discarded"
+            );
+            drop(rows);
+            self.checkout.discard = true;
+            let stats = self.checkout.stats();
+            self.checkout.finalize_stream(true, &self.sql);
+            self.finished = true;
+            return Ok(StreamEnd {
+                affected: 0,
+                last_insert_id: None,
+                stats,
+            });
+        }
         let reclaim_bound = pool.config.checkout_timeout;
         let reclaim = pool.backend.reclaim_stream(self.checkout.conn_mut(), rows);
         let (reclaimed, errored) = match tokio::time::timeout(reclaim_bound, reclaim).await {
@@ -1153,6 +1207,10 @@ impl<'a, B: PoolBackend> RowStreamHandle<'a, B> {
                     error = %e,
                     "ferro-pool: stream reclaim failed — connection will be discarded"
                 );
+                // FB-3b: latch the discard rather than trusting the backend to have marked itself
+                // closed. The contract still stands and every backend honours it; this just stops
+                // the invariant depending on that being true.
+                self.checkout.discard = true;
                 (Reclaimed::default(), true)
             }
             // TIMED OUT: the reclaim future is dropped here, which drops the `B::RowStream` it
@@ -1167,6 +1225,9 @@ impl<'a, B: PoolBackend> RowStreamHandle<'a, B> {
                     timeout_ms = reclaim_bound.as_millis() as u64,
                     "ferro-pool: stream reclaim timed out — connection will be discarded"
                 );
+                // FB-3b, same reasoning as the Err arm: the backend never got to signal anything
+                // here, so not depending on its signal is the point.
+                self.checkout.discard = true;
                 (Reclaimed::default(), true)
             }
         };
