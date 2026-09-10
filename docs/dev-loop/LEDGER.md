@@ -121,7 +121,8 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 | B3 | `/proto` `TxNotFound` error code | DONE | `0x300B`, NonRetryable. Two engine sites move (`resolve_active`'s not-found/forbidden arm, `actor_gone_terminal`'s non-tombstone arm); everything else stays `Protocol`. `ERR_PROTOCOL` is OUT of the client's `TX_ALREADY_GONE`, so a malformed `TxControl` body throws out of `rollBack()` again. Falsifier at all three tiers + live; both unit guards mutation-proven. SPEC §22.2 (ai); the (t) known-cost note is marked paid off. |
 | B4 | Savepoint verbs in the assist-lexer safe-list | CLOSED — WONTFIX, item was stale | **Verified before building, and the premise did not survive.** The classifier really does return `Some(Unknown)` for `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` on both dialects (measured) — but that is UNREACHABLE: `Checkout::apply_classify_for` skips the lexer entirely on a `SavepointPassthrough` verdict, and outside a transaction the guard refuses the statement outright. Measured through a real `Checkout`: all three verbs give `tainted=false`. M1-S8a considered widening `SAFE_LEADING_KEYWORDS` and **rejected it in writing** — keying off the guard's verdict is NARROWER, so a savepoint reaching any path that did not pass the guard's three refusals is still conservatively classified. Already proven by `s8a_savepoint_passthrough_does_not_taint`. Implementing B4 would have undone a deliberate decision. |
 | B5 | Unbounded backend dial | DONE | `Pool::checkout` bounds `backend.connect()` with `checkout_timeout` → `PoolError::Timeout` (fix direction 1; the knob is REUSED, not replaced, because the BOUNDED-recycle block below it already treats `checkout_timeout` as a per-step bound — so it was never a total budget). Both backends' `Cancel::cancel()` bound their SIDE dial at a fixed 2 s `CANCEL_DIAL_BUDGET` — that one mattered more, since `ferrod` awaits `cancel()` INLINE on the deadline/cancel arms, so an unbounded cancel stalled the teardown the deadline started. Guard asserts the RELEASED PERMIT (a `max_size: 1` pool must serve a second checkout), not elapsed time, because a leaked permit passes a naive timing check and still costs a slot forever; mutation-proven. TCP keepalive (direction 3) stays open — a different hazard. |
-| B6 | Chunked `LARGE_OBJECT` bind | OPEN | |
+| B6a | Outbound frame-size guard (`php/client`) | DONE | **Found by verifying B6's premise; it was not what the item said.** `Header::decode` enforced `MAX_FRAME_PAYLOAD`; `Codec::encodeFrame` did NOT — measured: `encode()` of `payloadLen = MAX+1` succeeds and the client's own `decode()` then rejects it. Rust's `Encoder<OutFrame>` has always guarded (`session/codec.rs`), so this was a cross-codec asymmetry. It mattered because `ferrod` classifies an oversize `payload_len` as `Classification::Fatal` and CLOSES the session (correctly — the framing is desynchronised; already proven by `session_rules::oversize_payload_len_is_fatal`), so an oversize bind was a session kill instead of a local refusal. Guard added at the mirror site, before any byte reaches the transport; tests assert the inclusive boundary and that the session stays usable after a refusal; mutation-proven. |
+| B6b | Chunked `LARGE_OBJECT` bind | DEFERRED to M2 | Carrying ONE payload across multiple frames is a `/proto` design change — registry + golden vectors + both codecs in one change set (charter rule 2) — plus an engine-side reassembly path with its own memory bound. That is a slice, not a Phase B loose end. B6a makes the current ceiling honest (a clear local error naming the limit) rather than a dropped connection, which is what B6b would replace. |
 | B7 | Tracker-clean hygiene `None`-skip (R2) | BLOCKED | Hygiene currently masks the isolation leak (S8a Task 13). Revisit only with the leak closed. |
 
 ### Phase C — M2 (SPEC §17): the Eloquent milestone
@@ -191,6 +192,27 @@ the B2b-2 row above.
   returns. Mutation-proven (removing the bound hangs the test). The MySQL-side half of the
   contract — that a dropped/timed-out reclaim leaves the conn `is_closed`-dead — remains B2b-2's
   (it is the FB-2 contract, and no fake can model a parked conn).
+- **FB-6 (MEDIUM, FOUND AND FIXED IN B6a — the third consecutive item whose stated premise did not
+  survive checking).** `php/client` enforced `MAX_FRAME_PAYLOAD` on DECODE only. `Codec::encodeFrame`
+  had no guard, so the client would put on the wire a frame **its own `Header::decode` would
+  reject** — measured directly: `encode()` of `payloadLen = MAX_FRAME_PAYLOAD + 1` succeeds, and
+  feeding those 16 bytes back to `decode()` throws `frame too large 16777217`. The Rust codec has
+  guarded its ENCODER since M0 (`session/codec.rs`, `Encoder<OutFrame>`), so this was a cross-codec
+  asymmetry of exactly the kind charter rule 2 exists to prevent — and the comment in `ferrod`'s own
+  `session_rules::oversize_payload_len_is_fatal` even says the Rust encoder "would refuse to build
+  such a frame", i.e. the missing mirror was documented in passing and never noticed.
+  **Severity comes from the engine's (correct) response, not from the send:** an oversize
+  `payload_len` is `Classification::Fatal`, so `ferrod` emits a `Protocol` terminal on `request_id 0`
+  and CLOSES the connection — it has no choice, since the framing is desynchronised and a payload it
+  refused to read cannot be skipped. So binding a `Ferro\Bytes` over 16 MiB (reachable through
+  DBAL's `ParameterType::LARGE_OBJECT`) dropped the session instead of failing locally.
+  **Two harmless second-order effects were found while testing and are recorded rather than hidden:**
+  a refused request still consumes a `RequestIdAllocator` id (ids are monotonic and never reused, and
+  since nothing was written the engine never saw it, so a gap reconciles with nothing), and
+  `Session::$lastInFlight` is set before the write and so is left pointing at the refused call (it
+  exists only to classify a LOSS per §19.3, no loss occurred, and the next `sendRequest` overwrites
+  it before writing). Both are asserted in the test so a future reader does not re-discover them as
+  suspected bugs.
 - **FB-5 (HIGH, INTRODUCED AND FIXED IN B2c — recorded because the near-miss is the lesson).**
   Making `runPrepared()` stream on MySQL silently broke `lastInsertId()` for every streamed
   INSERT: `streamRaw()` CLEARS the connection-level key on the way in and, until this fix, never
