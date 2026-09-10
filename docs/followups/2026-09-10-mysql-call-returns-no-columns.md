@@ -72,6 +72,11 @@ test a_prepared_call_reports_its_columns_only_after_execution ... ok
 3. **One result set** for a single-`SELECT` procedure. The trailing OK packet is not surfaced as a
    set by `collect()`/`is_empty()`, so a `CALL` with N `SELECT`s should yield N — worth re-checking
    at S2 with a two-`SELECT` procedure, since only the N=1 case is measured here.
+   **DONE at S2:** the spike now also runs a two-`SELECT` procedure and prints its set count. It
+   asserts `> 1` rather than a fixed number: what S4 needs is that a multi-`SELECT` procedure really
+   does surface more than one set (otherwise a multi-result-set wire change has nothing to carry),
+   while the exact count — whether a trailing OK packet surfaces as a set on a given engine — is
+   printed for S4 to design against rather than pinned into a per-engine red.
 
 Note what the row already proves: through the DRIVER the cells are there (`Some(2)`). Ferro's rows
 come back cell-less only because `query.rs` maps them against the prepare-time list. Nothing about
@@ -113,8 +118,26 @@ not a MySQL wall.**
 
 - **S1 (CI only, no engine code): DONE.** `call_columns_spike_it.rs` landed and ran green; output
   recorded above. It could have invalidated everything below and did not.
-- **S2:** move the buffered path's `cols` to the executed result set's metadata, with the fate trade
-  recorded and a live test that a `CALL` returns real cells.
-- **S3:** the same for `query_stream`.
+- **S2 (buffered path): DONE.** `query.rs` now falls back to the executed result set's metadata
+  **when — and only when — the prepared statement declares no columns.** The design is narrower than
+  this document proposed, and the narrowing was forced by a test rather than chosen for taste:
+  `query_it.rs`'s `out_of_scope_column_is_unsupported` asserts that a deferred column type is
+  refused *before the query runs* and that the conn stays clean. A uniform post-drain read would
+  have changed that for every buffered statement in the tree; preferring the prepared list confines
+  the fate change to the `CALL` shape that was broken anyway, and leaves that test passing
+  unchanged. **The fate trade is therefore paid only on the fallback arm**, and it is recorded in
+  SPEC §22.2 (av) and in `run`'s own comment: the refusal is still KNOWN-FATE (raised after a full
+  drain, conn clean and reusable, never `Indeterminate`), but a procedure that writes *and* selects
+  an out-of-scope column type now has its write applied before the client sees `Unsupported`.
+  Live guards: `call_returns_real_cells` (mutation-proven — revert the `None` arm and both `cols`
+  and the row's cells come back empty) and `no_result_set_statement_is_unchanged_by_the_fallback`,
+  which exists because every INSERT/UPDATE reaches the fallback arm too and "inert there" needed an
+  assertion rather than an argument. The spike was widened to a TWO-`SELECT` procedure in the same
+  change, closing the N=1 gap noted above.
+- **S3:** the same for `query_stream` — **and note S2 did NOT touch it**: `stream.rs`'s
+  no-result-set dispatch (`if columns.is_empty()` → never park, run buffered, discard rows) also
+  branches on the PREPARED list, so a streamed `CALL` still discards its rows. That dispatch is the
+  substance of S3, not an afterthought: it decides whether the connection is parked, so the fallback
+  cannot simply be pasted in.
 - **S4:** the `/proto` multi-result-set change for `selectResultSets()`, which is only worth doing
   once S2/S3 make a `CALL` return anything at all.
