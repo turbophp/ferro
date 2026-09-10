@@ -29,17 +29,27 @@ the Illuminate tier need that `ferro/client` does not have yet?*
 | `beginTransaction`/`commit`/`rollBack` + savepoints | **[verified]** present | Imperative trio (S8a) + savepoint SQL passthrough (§22.2 (r)). |
 | `lastInsertId` | **[verified]** present | On the wire since S8a; on stream terminals since B2c. |
 | `getAttribute(SERVER_VERSION)` for the PDO shim | **[verified]** present | `poolInfo()` carries `server_version` (S8a, `HELLO_ACK` v2). |
-| **`selectResultSets()` — MULTIPLE result sets** | **GAP [verified]** | `ExecOk` carries exactly ONE `cols` + ONE `rows`. There is no wire representation for a statement returning several result sets (a stored procedure's). §15 lists the method without noting this. **This is a `/proto` change** — registry + golden vectors + both codecs (charter rule 2) — and it is the one true C1 carry found so far. |
+| **`selectResultSets()` — MULTIPLE result sets** | **GAP [verified], but NOT the binding constraint** | `ExecOk` carries exactly ONE `cols` + ONE `rows`, so several result sets have no wire representation; §15 lists the method without noting this. **The deeper blocker, also [verified]:** a MySQL `CALL` returns no usable rows today — a prepared `CALL` declares zero result columns even when the procedure emits a result set, so the streamed path discards the rows and the buffered path yields N cell-less rows. Fixing the wire without fixing that would ship a feature that still returns nothing. See C1a. |
 | `DB::transaction($fn, attempts: 3)` retry mapping | **[UNVERIFIED]** | The fate branches exist (§19.3); what is unchecked is whether Illuminate's `ManagesTransactions` retry loop can be driven from them without reimplementing it. Check before slicing. |
 | `read`/`write` split → a second pool | **[UNVERIFIED]** | §15 shows `'read' => ['pool' => 'main_ro']`. Whether `ferrod` exposes replica pools usably today is unchecked. |
 | `FerroPdoShim` (`quote`, `lastInsertId`, `inTransaction`, `exec`, `getAttribute`) | **[UNVERIFIED]** | `quote()` is the one to think hardest about: it is a SQL-generation-adjacent API, and charter rule 6 forbids SQL rewriting. Decide what it may legitimately do before writing it. |
 
 ## Proposed slices
 
-- **C1a — the `selectResultSets()` wire gap.** Either carry multiple result sets on the wire, or
-  decide it is a documented incompatibility. Doing it is a `/proto` slice; NOT doing it is a
-  one-line entry in `docs/known-incompatibilities.md`. **Decide before building the tier**, because
-  it is the only found carry and its answer changes whether C1b needs a new client method.
+- **C1a — the `selectResultSets()` wire gap. DECIDED while scoping: documented incompatibility for
+  M2, because the wire is not its real blocker.** The primary consumer of `selectResultSets()` is a
+  stored procedure, and **a MySQL `CALL` cannot return usable rows today at all** — a prepared `CALL`
+  reports ZERO result columns even when the procedure emits a result set at run time. Verified in
+  code (`ferro-backend-mysql/src/stream.rs`), and the two paths round the same blind spot off
+  differently: the STREAMED path takes the no-rows arm and discards the rows, while the BUFFERED path
+  maps every row through the empty prepared-column list and yields **N rows with no cells**. So
+  carrying multiple result sets on the wire would be building on sand: the feature would still return
+  nothing usable on the backend that motivates it.
+  **The dependency order is therefore CALL-blind-spot FIRST, multi-result-set SECOND**, and both are
+  engine work, not tier work. Recorded so the tier is not blocked on a `/proto` slice that would not
+  have helped. The blind-spot fix is its own investigation (likely: read column metadata from the
+  EXECUTE response rather than the PREPARE response, or route `CALL` over the text protocol) and is
+  not scheduled here.
 - **C1b — package skeleton + service provider + one connection class, `select()` only.** The
   smallest thing that can execute a real query through a real Illuminate connection. Its exit gate
   is the S8b lesson: a HARD CONTACT ASSERTION (`getNativeConnection() instanceof …` + a round-tripped
