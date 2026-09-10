@@ -373,6 +373,82 @@ async fn mysql_autocommit_stream_delivers_rows_and_the_session_survives() {
     }
 }
 
+/// **M2/S3 — a streamed `CALL` delivers REAL ROWS.** The guard for the one shape whose result
+/// columns do not exist until the statement has run.
+///
+/// Before S3 this path dispatched on the PREPARE-time column list, which a `CALL` leaves empty even
+/// when the procedure emits a result set — so a `fetch:stream` `CALL` took the no-result-set arm,
+/// ran buffered, and DISCARDED its rows. The module docs recorded that as a known limitation; S3
+/// moved the dispatch to the EXECUTED metadata, which is where a `CALL`'s columns actually live.
+///
+/// MUTATION PROOF: restore the prepare-time dispatch and this goes red on the rows assertion —
+/// the stream completes with a clean terminal and ZERO rows, which is exactly the failure mode
+/// that made the old behaviour so easy to miss.
+///
+/// The session assertion is the other half and is not decoration: this arm now PARKS the driver
+/// connection (it must, to stream), where before it never did. If the hand-back through
+/// `into_conn`/`unpark` were wrong, the rows would still arrive and the pool would be one
+/// connection down.
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_streamed_call_delivers_rows_and_the_session_survives() {
+    for (label, url) in mysql_targets() {
+        let server = common::exec_server(url);
+        let mut client = server.connect().await;
+        client.hello(1).await;
+
+        exec_ok(
+            &mut client,
+            50,
+            &ddl("DROP PROCEDURE IF EXISTS s3_call_rows"),
+        )
+        .await;
+        exec_ok(
+            &mut client,
+            51,
+            &ddl(
+                "CREATE PROCEDURE s3_call_rows() BEGIN                  SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3; END",
+            ),
+        )
+        .await;
+
+        let mut r = req("CALL s3_call_rows()");
+        r.fetch = FETCH_STREAM;
+        let (rows, outcome) = drain_stream(&mut client, 52, &r).await;
+
+        assert_eq!(
+            rows,
+            vec![1, 2, 3],
+            "[{label}] a streamed CALL must deliver the procedure's rows, in order"
+        );
+        assert!(
+            matches!(outcome, Outcome::Ok(_)),
+            "[{label}] a fully-drained CALL stream ends in exactly one Ok terminal, got {outcome:?}"
+        );
+        assert!(
+            client
+                .recv_or_none(Duration::from_millis(250))
+                .await
+                .is_none(),
+            "[{label}] nothing may follow the terminal (charter rule 4: exactly one END)"
+        );
+
+        // The park/reclaim proof for the arm that never parked before S3.
+        let ok = exec_ok(&mut client, 53, &req("SELECT 1")).await;
+        assert_eq!(
+            first_i64(&ok),
+            1,
+            "[{label}] the connection that streamed a CALL came back usable"
+        );
+
+        exec_ok(
+            &mut client,
+            54,
+            &ddl("DROP PROCEDURE IF EXISTS s3_call_rows"),
+        )
+        .await;
+    }
+}
+
 /// **A streamed INSERT reports its AUTO_INCREMENT key** — the engine-level guard for the B2c
 /// regression that CI caught and no offline gate could see.
 ///

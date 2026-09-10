@@ -19,23 +19,35 @@
 //!   safely (`is_closed` → dead above all, which is what makes the pool DISCARD a husk rather than
 //!   recycle it — the FB-2 contract).
 //!
-//! ## The two shapes, and why the dispatch is on the PREPARED columns
+//! ## The two shapes, and where the dispatch reads them (M2/S3)
 //!
 //! `stream_and_drop()` answers `None` for a statement with no result set — **and consumes the
 //! `QueryResult`, closing the connection with it**. So a statement that returns no rows must never
-//! take the owned route. The prepared statement tells us which shape we have before anything runs:
-//! zero result columns means no result set (measured on both engines by
-//! `stream_recovery_it.rs`), and that path runs BUFFERED on the borrowed conn — never parking —
-//! and hands back a stream that yields nothing.
+//! reach that call. What decides it is the result-column metadata, and MySQL publishes that in two
+//! different places depending on the statement:
 //!
-//! **Known consequence, recorded rather than hidden:** a prepared `CALL` reports zero result columns
-//! even when the procedure emits a result set at run time, so a `fetch:stream` `CALL` takes the
-//! no-rows path and its rows are discarded with the buffered drain. The BUFFERED path has the same
-//! blind spot from the same cause (it maps every row through the empty prepared-column list, so it
-//! yields rows with no cells), so this is a pre-existing MySQL-backend limitation surfaced here, not
-//! one introduced by streaming — the two paths merely round it off differently (0 rows vs N empty
-//! rows). `ferro-classify` pins unconditionally on `CALL`/`DO` regardless, so the SESSION stays
-//! safe either way.
+//! * **The prepared statement declares columns** (every ordinary `SELECT`). Dispatch on that, before
+//!   anything runs: park, run, `stream_and_drop`. This is the hot path and S3 left it untouched.
+//! * **The prepared statement declares none.** That covers BOTH a genuine no-result-set statement
+//!   (an `INSERT`) and a `CALL`, whose columns MySQL reports only at EXECUTION time — and they need
+//!   opposite handling. Nothing available before the statement runs separates them, so this arm
+//!   parks, RUNS, and reads `QueryResult::columns_ref()`: a non-empty executed set streams (a `CALL`
+//!   now yields real rows, incrementally), an empty one hands the connection straight back.
+//!
+//! Parking before knowing which shape it is only became safe with the B2a fork's
+//! [`mysql_async::QueryResult::into_conn`], whose docblock names exactly this case: the owned-route
+//! exit for a statement that produced no result set. Without it, guessing wrong ate the connection.
+//!
+//! **S3 closed the `CALL` blind spot on this path; S2 closed it on the buffered one** (SPEC §22.2
+//! (av)). Both pay the same narrow §19.3 trade, and only on the empty-prepared-list arm: the
+//! metadata does not exist until the statement has run, so an out-of-scope column type is refused
+//! AFTER the send rather than before it. The refusal stays KNOWN-FATE, never `Indeterminate`, and
+//! the connection is handed back clean rather than discarded. `ferro-classify` pins unconditionally
+//! on `CALL`/`DO` regardless, so the SESSION is safe on every arm.
+//!
+//! **Still open (S4):** a multi-`SELECT` procedure streams only its FIRST result set; the rest are
+//! drained by `into_conn`. `ExecOk` carries exactly one `cols`+`rows`, so representing more is a
+//! `/proto` change.
 //!
 //! ## The affected-row rule (§22.2 (n), measured)
 //!
@@ -68,8 +80,10 @@ type OwnedRowStream = ResultSetStream<'static, 'static, 'static, Row, BinaryProt
 /// one must never take the owned route.
 pub enum MysqlRowStream {
     /// A real result set. **Owns the driver connection** (parked out of [`MysqlConn`]) until
-    /// [`reclaim`] recovers it; the per-cell classifier needs `columns`, which is the same
-    /// prepared-statement metadata `cols` was built from, so rows and cols can never disagree.
+    /// [`reclaim`] recovers it; the per-cell classifier needs `columns`, which is ALWAYS the very
+    /// list `cols` was built from, so rows and cols can never disagree. Since M2/S3 that list is
+    /// the prepared metadata for an ordinary `SELECT` and the EXECUTED metadata for a `CALL` — the
+    /// invariant is that the two are produced together, not that they come from one source.
     Rows {
         stream: Box<OwnedRowStream>,
         columns: Vec<Column>,
@@ -77,10 +91,16 @@ pub enum MysqlRowStream {
         /// never resumes after its terminal.
         done: bool,
     },
-    /// No result set (e.g. an INSERT sent with `fetch:stream`). The statement already ran BUFFERED on
-    /// the borrowed conn — nothing was ever parked — so this yields no rows and carries the count
-    /// AND THE GENERATED KEY straight through to [`reclaim`]. The key matters precisely here: an
-    /// `INSERT` is the no-result-set shape, and `lastInsertId()` is what reads it.
+    /// No result set (e.g. an INSERT sent with `fetch:stream`). This yields no rows and carries the
+    /// count AND THE GENERATED KEY straight through to [`reclaim`]. The key matters precisely here:
+    /// an `INSERT` is the no-result-set shape, and `lastInsertId()` is what reads it.
+    ///
+    /// **Contract corrected at M2/S3:** this used to be decided on the PREPARED column count, and
+    /// ran buffered on a never-parked connection. It is now decided on the EXECUTED set — because
+    /// an empty prepared list also describes a `CALL`, which does return rows — so reaching this
+    /// variant means the connection WAS parked, ran, reported no result set, and was handed back
+    /// via `into_conn` before `open` returned. Both values below were read from that recovered
+    /// connection post-drain, the same rule [`reclaim`] uses.
     NoRows {
         affected: u64,
         last_insert_id: Option<u64>,
@@ -110,7 +130,7 @@ impl BackendRows for MysqlRowStream {
                         None => {
                             *done = true;
                             return Some(Err(PoolError::Backend(format!(
-                                "row cell index {idx} out of range (row has {} cells, statement has {} columns)",
+                                "row cell index {idx} out of range (row has {} cells, result has {} columns)",
                                 row.len(),
                                 columns.len()
                             ))));
@@ -148,6 +168,29 @@ impl BackendRows for MysqlRowStream {
     }
 }
 
+/// Builds the wire `ColMeta` list from a driver column list, refusing an out-of-scope column type
+/// with a loud `Unsupported` naming the column (§9.1 — never a silent miscast).
+fn build_cols(columns: &[Column]) -> Result<Vec<ColMeta>, PoolError> {
+    let mut cols = Vec::with_capacity(columns.len());
+    for col in columns.iter() {
+        cols.push(ColMeta {
+            name: col.name_str().into_owned(),
+            tag: rowmap::column_to_tag(col)?,
+        });
+    }
+    Ok(cols)
+}
+
+/// A second concurrent stream on one checkout — the conn is already parked, so there is nothing to
+/// hand to this one.
+fn park_conflict() -> PoolError {
+    PoolError::Backend(
+        "query_stream on an already-parked MySQL connection (a second concurrent stream on one \
+         checkout)"
+            .to_string(),
+    )
+}
+
 /// `PoolBackend::query_stream` for MySQL/MariaDB. See the module docs for the dispatch and the
 /// ownership handshake.
 pub async fn open(
@@ -164,13 +207,7 @@ pub async fn open(
     // (2) cols from the prepared statement (correct even for a zero-row result); an out-of-scope
     // column type is a loud `Unsupported` HERE, before anything runs, with the conn still clean.
     let columns: Vec<Column> = stmt.columns().to_vec();
-    let mut cols = Vec::with_capacity(columns.len());
-    for col in columns.iter() {
-        cols.push(ColMeta {
-            name: col.name_str().into_owned(),
-            tag: rowmap::column_to_tag(col)?,
-        });
-    }
+    let cols = build_cols(&columns)?;
 
     // (3) bind PRE-FLIGHT, both halves before anything is sent, both KNOWN-FATE (never
     // ConnectionLost) — identical to the buffered path, so a payload MySQL cannot represent is
@@ -178,23 +215,86 @@ pub async fn open(
     bind::validate_arity(params, stmt.num_params() as usize)?;
     let bound = bind::to_params(params)?;
 
-    // (4) NO RESULT SET → never park (see the module docs: `stream_and_drop` would answer `None`
-    // and eat the connection). Run it buffered on the borrowed conn and yield an empty stream.
+    // (4) The prepared statement declared NO result columns. That is TWO different statements —
+    // one with genuinely no result set (an INSERT), and a `CALL`, whose columns MySQL reports only
+    // at EXECUTION time — and they need opposite handling. Nothing available before the statement
+    // runs can tell them apart, so this arm parks, RUNS, and asks the executed result which it is.
+    //
+    // Parking first is safe precisely because the B2a fork exposes `QueryResult::into_conn`, whose
+    // own docblock names this case: it is the owned-route exit for a statement that produced no
+    // result set, where `stream_and_drop` would answer `None` and close the connection with it.
     if columns.is_empty() {
-        // `_cols` is the EXECUTED set's metadata, unused on this arm: it is reached only when the
-        // PREPARED list is empty, and S3 is where `query_stream` learns to fall back to it (a `CALL`
-        // still discards its rows through this path — see the follow-up doc).
-        let (_cols, _rows, affected, last_insert_id) =
-            match crate::query::drain(conn, &stmt, bound).await {
-                Ok(t) => t,
-                Err(e) => return Err(conn.map_stmt_error(&e)),
+        let owned: Conn = conn.park().ok_or_else(park_conflict)?;
+        let qr = match stmt.with(bound).run(owned).await {
+            Ok(qr) => qr,
+            // The owned conn was consumed by the failed run; the wrapper stays parked and the pool
+            // discards the husk (the FB-2 contract).
+            Err(e) => return Err(conn.map_stmt_error(&e)),
+        };
+
+        // Read the EXECUTED metadata before anything consumes the `QueryResult`.
+        let executed: Vec<Column> = qr.columns_ref().to_vec();
+
+        if executed.is_empty() {
+            // Genuinely no result set. Hand the connection straight back rather than streaming
+            // nothing: `into_conn` drains and returns it, and its post-drain packet is THIS
+            // statement's, so both values are read here on the same rule `reclaim` uses.
+            let recovered = match qr.into_conn().await {
+                Ok(c) => c,
+                Err(e) => return Err(crate::error_map::map(&e)),
             };
-        conn.record_session_mutation();
+            let affected = recovered.affected_rows();
+            let last_insert_id = recovered.last_insert_id();
+            conn.unpark(recovered);
+            conn.record_session_mutation();
+            return Ok((
+                cols,
+                MysqlRowStream::NoRows {
+                    affected,
+                    last_insert_id,
+                },
+            ));
+        }
+
+        // A `CALL` that really did emit a result set. Build `cols` from the executed metadata — the
+        // §19.3 trade SPEC §22.2 (av) records for the buffered path applies here for the same
+        // reason and only on this arm: the metadata does not exist until the statement has run, so
+        // an out-of-scope column type is refused AFTER the send rather than before it. The refusal
+        // stays KNOWN-FATE, and the connection is handed back CLEAN rather than discarded.
+        let call_cols = match build_cols(&executed) {
+            Ok(c) => c,
+            Err(e) => {
+                // On an `Err` here the conn cannot be recovered, so it is left PARKED and the
+                // pool discards the husk. Either way the caller sees the `Unsupported`, which is
+                // the more informative of the two errors and the one that is actionable.
+                if let Ok(recovered) = qr.into_conn().await {
+                    conn.unpark(recovered);
+                    conn.record_session_mutation();
+                }
+                return Err(e);
+            }
+        };
+
+        let stream = match qr.stream_and_drop::<Row>().await {
+            Ok(Some(s)) => s,
+            // Unreachable: `columns_ref` just reported a non-empty executed set. Handled as a real
+            // error rather than `unreachable!` so a surprising server never panics ferrod.
+            Ok(None) => {
+                return Err(PoolError::Backend(
+                    "MySQL reported no result set for a statement whose EXECUTED metadata declared \
+                     result columns"
+                        .to_string(),
+                ));
+            }
+            Err(e) => return Err(conn.map_stmt_error(&e)),
+        };
+
         return Ok((
-            cols,
-            MysqlRowStream::NoRows {
-                affected,
-                last_insert_id,
+            call_cols,
+            MysqlRowStream::Rows {
+                stream: Box::new(stream),
+                columns: executed,
+                done: false,
             },
         ));
     }
@@ -202,13 +302,7 @@ pub async fn open(
     // (5) PARK: the driver handle moves into the stream for the duration. From here on, any failure
     // leaves the conn parked — which reads `is_closed`-dead, so the pool DISCARDS the husk instead
     // of recycling a connection whose session is gone (the FB-2 contract, charter rule 6).
-    let owned: Conn = conn.park().ok_or_else(|| {
-        PoolError::Backend(
-            "query_stream on an already-parked MySQL connection (a second concurrent stream on one \
-             checkout)"
-                .to_string(),
-        )
-    })?;
+    let owned: Conn = conn.park().ok_or_else(park_conflict)?;
 
     let qr = match stmt.with(bound).run(owned).await {
         Ok(qr) => qr,

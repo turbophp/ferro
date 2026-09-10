@@ -134,10 +134,28 @@ not a MySQL wall.**
   which exists because every INSERT/UPDATE reaches the fallback arm too and "inert there" needed an
   assertion rather than an argument. The spike was widened to a TWO-`SELECT` procedure in the same
   change, closing the N=1 gap noted above.
-- **S3:** the same for `query_stream` — **and note S2 did NOT touch it**: `stream.rs`'s
-  no-result-set dispatch (`if columns.is_empty()` → never park, run buffered, discard rows) also
-  branches on the PREPARED list, so a streamed `CALL` still discards its rows. That dispatch is the
-  substance of S3, not an afterthought: it decides whether the connection is parked, so the fallback
-  cannot simply be pasted in.
-- **S4:** the `/proto` multi-result-set change for `selectResultSets()`, which is only worth doing
-  once S2/S3 make a `CALL` return anything at all.
+- **S3 (streamed path): DONE.** And the dispatch really was the substance — the fallback could not
+  be pasted in, because the signal S2 used does not exist at the moment the park decision is made.
+  What resolved it: the **B2a fork already exposes `QueryResult::into_conn`**, whose docblock names
+  exactly this case (the owned-route exit for a statement that produced no result set). So the
+  empty-prepared-list arm now **parks, RUNS, and then reads `columns_ref()`** — a non-empty executed
+  set streams (a `CALL` yields real rows, **incrementally**, not buffered), an empty one hands the
+  connection straight back. No new fork edit was needed; the capability was built at B2a and simply
+  never used from this direction. The (av) narrowing is preserved exactly: an ordinary `SELECT`
+  (non-empty prepared list) takes the same code it always did. **Cost, stated rather than
+  discovered later:** a streamed `INSERT` now parks and recovers where it previously ran buffered on
+  a borrowed conn, so a *failed* streamed INSERT discards its connection instead of reusing it —
+  efficiency, never correctness, and the recovery mechanism was already proven live on both engines
+  by `stream_recovery_it.rs`'s `no_result_set_recovers_via_query_result`. `MysqlRowStream::NoRows`'s
+  contract changed with it and its docblock says so. Live guard:
+  `ferrod`'s `mysql_streamed_call_delivers_rows_and_the_session_survives` — mutation-proven (restore
+  the prepare-time dispatch and it goes red with a *clean terminal and zero rows*, which is what
+  made the old behaviour so easy to miss) — plus the pre-existing
+  `mysql_streamed_insert_reports_its_generated_key`, which is now the regression guard for the
+  INSERT arm's park/recover round trip. SPEC §22.2 (aw).
+- **S4:** the `/proto` multi-result-set change for `selectResultSets()`. **Its precondition is now
+  met** — S2 and S3 make a `CALL` return real rows on both paths — so this is the next real slice
+  here. Note what both paths currently do with a multi-`SELECT` procedure: they surface the FIRST
+  result set and drain the rest (`drop_result` buffered, `into_conn` streamed). The two-`SELECT`
+  set count is printed by the spike in every CI integration run, and S4 should be designed against
+  that printed number rather than against an assumption.
