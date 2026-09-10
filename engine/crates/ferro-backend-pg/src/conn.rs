@@ -77,6 +77,14 @@ impl PgBackend {
 /// directly — both are foreign to this crate).
 pub struct PgCancel(pub tokio_postgres::CancelToken);
 
+/// How long an out-of-band cancel may spend dialing its SIDE connection before it gives up (B5).
+///
+/// Deliberately a constant and not a `PoolConfig` knob: a cancel is best-effort by contract, so its
+/// timeout and its failure have the SAME handling (log at debug, return), and the caller is never
+/// promised the statement was actually interrupted. The value only needs to be comfortably longer
+/// than a healthy local dial and far shorter than the ~127 s OS TCP connect timeout it replaces.
+const CANCEL_DIAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Fire the out-of-band statement cancel over a SIDE connection (S6). `CancelToken::cancel_query`
 /// opens its own short-lived connection using the captured backend key data, so it can run while
 /// the pinned connection's own query future still holds `&mut Client`. Best-effort: a failure
@@ -85,8 +93,32 @@ pub struct PgCancel(pub tokio_postgres::CancelToken);
 #[async_trait]
 impl Cancel for PgCancel {
     async fn cancel(self) {
-        if let Err(e) = self.0.cancel_query(tokio_postgres::NoTls).await {
-            tracing::debug!(error = %e, "ferro-backend-pg: out-of-band cancel_query failed (best-effort)");
+        // BOUNDED (B5). `cancel_query` DIALS A FRESH CONNECTION, and like every other dial in the
+        // engine it carried no connect timeout — so against a black-holed backend it ran to the OS
+        // TCP timeout (~127 s). That is worse here than at checkout: `ferrod` awaits this INLINE on
+        // the timeout/cancel arms of `run_autocommit_exec` before it re-awaits the query future, so
+        // an unbounded cancel stalls the very teardown the deadline was supposed to start.
+        //
+        // A fixed budget rather than a config knob, because `cancel` is best-effort BY CONTRACT: the
+        // failure and the timeout are the same outcome (log and move on), the actor tears the
+        // transaction down regardless, and no statement is ever re-run (charter rule 3). Giving up
+        // on the cancel loses nothing the caller was promised.
+        match tokio::time::timeout(
+            CANCEL_DIAL_BUDGET,
+            self.0.cancel_query(tokio_postgres::NoTls),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "ferro-backend-pg: out-of-band cancel_query failed (best-effort)");
+            }
+            Err(_elapsed) => {
+                tracing::debug!(
+                    budget_ms = CANCEL_DIAL_BUDGET.as_millis() as u64,
+                    "ferro-backend-pg: out-of-band cancel_query exceeded its budget (best-effort)"
+                );
+            }
         }
     }
 }

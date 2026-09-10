@@ -263,6 +263,10 @@ pub struct FakeBackend {
     /// `ConnectionLost` and decrements the counter. Armed via `arm_fail_connect` (used by later
     /// tasks' backoff/reconnect tests; Task 1 only needs the mechanism to exist).
     fail_connect_remaining: AtomicU64,
+    /// B5: when set, [`PoolBackend::connect`] parks on this `Notify` forever, modelling a
+    /// black-holed backend whose dial neither answers nor resets. The pool's bound on the dial is
+    /// what must still let `checkout()` return AND release its permit.
+    connect_hang: Mutex<Option<Arc<Notify>>>,
     /// When `Some`, every `ping()` call parks on this `Notify` until `release_pings()` clears it
     /// and wakes any waiters. Armed via `block_pings` -- lets a test deterministically freeze the
     /// reaper mid-ping (holding its owned semaphore permit) before issuing a concurrent burst of
@@ -354,6 +358,7 @@ impl FakeBackend {
         Self {
             next_id: AtomicU64::new(0),
             fail_connect_remaining: AtomicU64::new(0),
+            connect_hang: Mutex::new(None),
             ping_gate: Mutex::new(None),
             pings_waiting: AtomicU64::new(0),
             canned_query: Mutex::new(QueryResult::default()),
@@ -460,6 +465,18 @@ impl FakeBackend {
     }
 
     /// Arms the next `n` `connect()` calls to fail with `PoolError::ConnectionLost`.
+    /// B5: arm [`PoolBackend::connect`] to HANG forever (park on a `Notify` that is never
+    /// released), modelling the black-holed dial that used to run to the ~127 s OS TCP connect
+    /// timeout while holding a pool permit.
+    pub fn arm_connect_hang(&self) {
+        *self.connect_hang.lock().unwrap() = Some(Arc::new(Notify::new()));
+    }
+
+    /// B5: disarm the hang so a later dial succeeds — used to prove the permit came BACK.
+    pub fn disarm_connect_hang(&self) {
+        *self.connect_hang.lock().unwrap() = None;
+    }
+
     pub fn arm_fail_connect(&self, n: u64) {
         self.fail_connect_remaining.store(n, Ordering::SeqCst);
     }
@@ -562,6 +579,13 @@ impl PoolBackend for FakeBackend {
     }
 
     async fn connect(&self) -> Result<Self::Conn, PoolError> {
+        // B5: the black-holed dial. Checked FIRST — a hung dial never reaches the fail counter,
+        // exactly as a real one never reaches the server.
+        let hang = self.connect_hang.lock().unwrap().clone();
+        if let Some(gate) = hang {
+            gate.notified().await;
+        }
+
         let should_fail = self
             .fail_connect_remaining
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {

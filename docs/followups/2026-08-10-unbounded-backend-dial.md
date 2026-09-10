@@ -1,5 +1,12 @@
 # Follow-up: the backend DIAL is unbounded — `checkout_timeout` does not cover it
 
+> **STATUS: FIXED (M1 Phase B, B5) for the two dials that hold something.** `Pool::checkout` now
+> bounds `backend.connect()` with `checkout_timeout` (fix direction 1, reusing the existing knob —
+> see the decision below), and both backends' out-of-band `Cancel::cancel()` bound their SIDE-connection
+> dial with a fixed `CANCEL_DIAL_BUDGET` (2 s). **Still open:** fix direction 3 (TCP keepalive on
+> established connections), which is a different hazard — a connection going silent AFTER it is up,
+> which no dial bound can reach.
+
 **Found:** M1-S8a Task 12 (the server-version probe) self-declared it as a carry; the S8a
 whole-branch review verified it against the code and promoted it out of the task report.
 **Belongs to:** M0 / M1-S3 (`ferro-pool`'s checkout path) — **not an S8a regression.** S8a is only
@@ -70,3 +77,40 @@ still dials unbounded, and each one bounding itself is duplicated policy in the 
 Only here, and in the doc comment on `VERSION_CHECKOUT_BUDGET`. It was previously recorded ONLY in
 the Task 12 report — not in SPEC §22.2, not in `proto/PROTOCOL.md` — which is what the S8a review
 flagged (finding F19a).
+
+## What B5 actually changed, and the decision it had to make
+
+**The choice was fix direction 1, with `checkout_timeout` reused rather than a new
+`connect_timeout`.** The open question this document left — *"needs a decision on whether
+`checkout_timeout` should mean 'time to a usable connection' (it currently does not, despite the
+name)"* — resolved by reading what the knob already means in the shipped code rather than by
+picking a new meaning. The BOUNDED-recycle block, ten lines below the dial, **already** reuses
+`checkout_timeout` as a per-conn cleanup bound. So `checkout_timeout` has never been a total budget:
+a checkout could always spend it on the acquire and then again on each conn it recycled. Bounding
+the dial with the same value is consistent with that; inventing a second knob would have implied the
+first one was a total, which it is not. This is recorded as a per-step bound in the code comment so
+the next reader does not have to re-derive it.
+
+**A timed-out dial is `PoolError::Timeout`, not `ConnectionLost`.** Both are Retryable and neither
+ever sent a user statement (`sent = false`, so there is no `Indeterminate` question either way), but
+the split is what lets an operator distinguish "the backend refused us" from "the backend never
+answered at all" — the entire signature of the black-hole case.
+
+**The cancel dial was worse than the checkout dial, which is why it is in scope.** `ferrod` awaits
+`cancel_handle.cancel().await` INLINE on the timeout/cancel arms of `run_autocommit_exec`, before it
+re-awaits the query future. An unbounded cancel therefore stalled the very teardown the deadline was
+supposed to start. A fixed budget is right there rather than a config knob because a cancel is
+best-effort *by contract*: its timeout and its failure have identical handling (log at debug, move
+on), the actor tears the transaction down regardless, and no statement is ever re-run (charter rule 3).
+
+**The guard asserts the released permit, not the elapsed time.** A `checkout()` that returned
+`Timeout` while leaking its permit would pass a naive "did it come back?" check and still leave the
+pool one slot short forever — which is the harm this document records. `b5_a_black_holed_dial_is_bounded_and_releases_its_permit`
+therefore drives a `max_size: 1` pool and requires a SECOND checkout to succeed. A companion test
+pins the success path, so the bound cannot silently become a ban. Both are mutation-proven (widen the
+bound to an hour and the first goes red).
+
+**The per-caller bandage is now redundant but was left in place.** `ferrod`'s
+`VERSION_CHECKOUT_BUDGET` still wraps the probe's checkout; it is tighter than the pool's bound in
+the shipped tuning, so it still fires first and its live guard still passes. Removing it is a
+separate change and is not smuggled in here.
