@@ -723,6 +723,113 @@ async fn checkout_force_taint_on_query_error(url: &str, label: &str) {
     );
 }
 
+/// **M2/S2 — a `CALL` returns REAL CELLS.** The regression guard for the one shape whose column
+/// metadata does not exist at prepare time.
+///
+/// `call_columns_spike_it.rs` measured the cause live before this was written: a prepared `CALL`
+/// declares ZERO columns, while the EXECUTED result set declares them normally. `query.rs` used to
+/// build `cols` from the prepared list and then map each row's cells by iterating that same list,
+/// so an empty list did not merely lose column NAMES — it produced rows with zero cells.
+///
+/// MUTATION PROOF (what this test is worth): revert `run`'s `None` arm to the prepared list and
+/// this goes red on BOTH assertions — `cols` comes back empty and the single row comes back as an
+/// empty `Vec`, i.e. exactly the symptom C1a recorded as a MySQL wall.
+///
+/// The procedure is NOT temporary (MySQL has no `CREATE TEMPORARY PROCEDURE`), so it is dropped at
+/// the end and named per-run: a crashed earlier run must not leave one behind that this run then
+/// silently reuses with a different body.
+async fn call_returns_real_cells(backend: &MysqlBackend, label: &str) {
+    let mut conn = backend.connect().await.expect("connect");
+    let p = format!(
+        "ferro_s2_call_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    backend
+        .simple_query(
+            &mut conn,
+            &format!("CREATE PROCEDURE {p}() BEGIN SELECT 7 AS seven, 'x' AS letter; END"),
+        )
+        .await
+        .expect("create the procedure");
+
+    let out = backend
+        .query(&mut conn, &format!("CALL {p}()"), &[])
+        .await
+        .unwrap_or_else(|err| {
+            panic!("[{label}] a CALL that SELECTs must return rows, got {err:?}")
+        });
+
+    // cols come from the EXECUTED set: both the names and the tags are real.
+    assert_eq!(
+        out.cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["seven", "letter"],
+        "[{label}] a CALL's column names must come from the executed result set"
+    );
+    assert_eq!(
+        out.cols.iter().map(|c| c.tag).collect::<Vec<_>>(),
+        vec![tag::I64, tag::TEXT],
+        "[{label}] a CALL's column tags must be classified, not defaulted"
+    );
+
+    // The rows carry CELLS — the assertion that was structurally unreachable before S2.
+    assert_eq!(
+        out.rows,
+        vec![vec![Value::I64(7), Value::Text("x".into())]],
+        "[{label}] a CALL's rows must carry real cells"
+    );
+
+    // The conn survives the multi-result-set teardown a CALL produces (the trailing OK packet is
+    // drained by `drop_result`), so the next statement on it is ordinary.
+    let ok = backend
+        .query(&mut conn, "SELECT 1", &[])
+        .await
+        .expect("conn still usable after a CALL");
+    assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
+
+    backend
+        .simple_query(&mut conn, &format!("DROP PROCEDURE {p}"))
+        .await
+        .expect("drop the procedure");
+    conn.disconnect().await;
+}
+
+/// A statement that returns NO columns is untouched by S2's fallback: the prepared list is empty
+/// AND the executed set's is too, so an INSERT still reports no cols and no rows while carrying its
+/// `affected`. This exists because S2's `None` arm is reached by every INSERT/UPDATE in the tree,
+/// not just by a `CALL` — the fallback must be inert there, and "inert" needs an assertion.
+async fn no_result_set_statement_is_unchanged_by_the_fallback(backend: &MysqlBackend, label: &str) {
+    let mut conn = backend.connect().await.expect("connect");
+    backend
+        .simple_query(&mut conn, "CREATE TEMPORARY TABLE ferro_s2_nrs (a BIGINT)")
+        .await
+        .expect("create temp table");
+
+    let out = backend
+        .query(
+            &mut conn,
+            "INSERT INTO ferro_s2_nrs (a) VALUES (?)",
+            &[Value::I64(11)],
+        )
+        .await
+        .expect("insert");
+
+    assert!(
+        out.cols.is_empty(),
+        "[{label}] an INSERT declares no columns on either list; got {:?}",
+        out.cols
+    );
+    assert!(out.rows.is_empty(), "[{label}] an INSERT returns no rows");
+    assert_eq!(
+        out.affected, 1,
+        "[{label}] affected still comes off the OK packet"
+    );
+    conn.disconnect().await;
+}
+
 async fn run_query_suite(url: &str, label: &str) {
     let backend = MysqlBackend::new(url);
     scoped_scalars_round_trip(&backend, label).await;
@@ -735,6 +842,8 @@ async fn run_query_suite(url: &str, label: &str) {
     errno_distinguishes_two_errors_that_share_sqlstate_23000(&backend, label).await;
     deadlock_two_txs_is_retryable(url, label).await;
     checkout_force_taint_on_query_error(url, label).await;
+    call_returns_real_cells(&backend, label).await;
+    no_result_set_statement_is_unchanged_by_the_fallback(&backend, label).await;
     println!("[{label}] Task-4 buffered data-path suite PASSED");
 }
 

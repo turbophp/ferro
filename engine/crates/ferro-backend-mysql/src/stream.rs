@@ -181,11 +181,14 @@ pub async fn open(
     // (4) NO RESULT SET → never park (see the module docs: `stream_and_drop` would answer `None`
     // and eat the connection). Run it buffered on the borrowed conn and yield an empty stream.
     if columns.is_empty() {
-        let (_rows, affected, last_insert_id) = match crate::query::drain(conn, &stmt, bound).await
-        {
-            Ok(t) => t,
-            Err(e) => return Err(conn.map_stmt_error(&e)),
-        };
+        // `_cols` is the EXECUTED set's metadata, unused on this arm: it is reached only when the
+        // PREPARED list is empty, and S3 is where `query_stream` learns to fall back to it (a `CALL`
+        // still discards its rows through this path — see the follow-up doc).
+        let (_cols, _rows, affected, last_insert_id) =
+            match crate::query::drain(conn, &stmt, bound).await {
+                Ok(t) => t,
+                Err(e) => return Err(conn.map_stmt_error(&e)),
+            };
         conn.record_session_mutation();
         return Ok((
             cols,
