@@ -1,8 +1,8 @@
 # Spike: the MySQL `CALL` blind spot is where Ferro READS the column metadata
 
-**Status:** SPIKE. The confirming test is `engine/crates/ferro-backend-mysql/tests/call_columns_spike_it.rs`
-— it SKIPS without `FERRO_TEST_MYSQL_URL`, so it is CI's integration lane that answers the three
-questions below. **Its output must be recorded here before any engine change.** Every claim below is marked **VERIFIED (source)** — read out of this
+**Status: SPIKE ANSWERED.** `engine/crates/ferro-backend-mysql/tests/call_columns_spike_it.rs` ran
+green against live MySQL in CI's `integration` lane (run 34466153085, job 102835108802,
+2026-09-10). Its output is recorded below, and **the diagnosis is confirmed exactly**. Every claim below is marked **VERIFIED (source)** — read out of this
 tree and the vendored driver at `53c984e` — or **UNVERIFIED HERE**, meaning it needs a live
 MySQL that this container does not have (no Docker daemon), so CI's integration lane is the
 authority.
@@ -55,15 +55,27 @@ drains rows without returning them.
 This matters because S1 and S6 both needed a vendored fork for their signals. **This one does not**,
 which changes the cost estimate materially.
 
-**UNVERIFIED HERE — and it is the crux, so CI must confirm it before any code:**
+**VERIFIED LIVE (CI, MySQL 8.4)** — the three questions, answered. Procedure body was
+`BEGIN SELECT 7 AS seven, 'x' AS letter; END`:
 
-1. that a prepared `CALL p()`'s `stmt.columns()` is in fact empty at runtime;
-2. that the **executed** result set's `columns()` is populated for the same procedure;
-3. how many result sets a `CALL` actually produces (MySQL emits the procedure's sets plus a final
-   OK), and whether `affected_rows` lands where the engine expects.
+```
+[spike] prepare-time columns: 0 -> []
+[spike] set #0: execution-time columns 2 -> ["seven", "letter"]; 1 row(s), first row cells = Some(2)
+[spike] total result sets seen: 1
+test a_prepared_call_reports_its_columns_only_after_execution ... ok
+```
 
-A spike test in the `mysql_chaos_it.rs` style — create a procedure, prepare, execute, print both
-column lists — settles all three in one CI run.
+1. **A prepared `CALL`'s `stmt.columns()` is empty** — `0 -> []`. Confirmed.
+2. **The executed result set's `columns()` IS populated** — `2 -> ["seven", "letter"]`, and the row
+   carries `Some(2)` cells. Confirmed, and it is the whole fix: the metadata exists, one call away
+   from where the engine currently looks.
+3. **One result set** for a single-`SELECT` procedure. The trailing OK packet is not surfaced as a
+   set by `collect()`/`is_empty()`, so a `CALL` with N `SELECT`s should yield N — worth re-checking
+   at S2 with a two-`SELECT` procedure, since only the N=1 case is measured here.
+
+Note what the row already proves: through the DRIVER the cells are there (`Some(2)`). Ferro's rows
+come back cell-less only because `query.rs` maps them against the prepare-time list. Nothing about
+MySQL or `mysql_async` needs to change.
 
 ## The option someone will reach for, and why it is closed
 
@@ -99,9 +111,8 @@ not a MySQL wall.**
 
 ## Suggested slicing
 
-- **S1 (CI only, no engine code):** `call_columns_spike_it.rs`, LANDED but not yet run against a
-  live MySQL. It can invalidate everything below, which is why it lands first; record its printed
-  output in this document when CI has run it.
+- **S1 (CI only, no engine code): DONE.** `call_columns_spike_it.rs` landed and ran green; output
+  recorded above. It could have invalidated everything below and did not.
 - **S2:** move the buffered path's `cols` to the executed result set's metadata, with the fate trade
   recorded and a live test that a `CALL` returns real cells.
 - **S3:** the same for `query_stream`.
