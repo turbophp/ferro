@@ -373,6 +373,36 @@ async fn mysql_autocommit_stream_delivers_rows_and_the_session_survives() {
     }
 }
 
+/// Create a stored procedure over a RAW driver connection, on the TEXT protocol.
+///
+/// `CREATE PROCEDURE` cannot be PREPARED on MySQL (errno 1295), and every user statement ferrod
+/// issues goes through `COM_STMT_PREPARE` — so a procedure fixture cannot be built through the
+/// daemon at all. `mysql_async` is already a dev-dependency here for exactly this class of
+/// side-channel setup (see `Cargo.toml`) and resolves to the SAME vendored fork the backend uses.
+async fn create_procedure(url: &str, name: &str, body: &str) {
+    use mysql_async::prelude::Queryable;
+    let opts = mysql_async::Opts::from_url(url).expect("a valid mysql:// url");
+    let mut c = mysql_async::Conn::new(opts).await.expect("side connection");
+    c.query_drop(format!("DROP PROCEDURE IF EXISTS {name}"))
+        .await
+        .expect("drop any leftover procedure");
+    c.query_drop(format!("CREATE PROCEDURE {name}() {body}"))
+        .await
+        .expect("create the procedure");
+    c.disconnect().await.expect("close the side connection");
+}
+
+/// Tear down a [`create_procedure`] fixture, over the same raw text-protocol route.
+async fn drop_procedure(url: &str, name: &str) {
+    use mysql_async::prelude::Queryable;
+    let opts = mysql_async::Opts::from_url(url).expect("a valid mysql:// url");
+    let mut c = mysql_async::Conn::new(opts).await.expect("side connection");
+    c.query_drop(format!("DROP PROCEDURE IF EXISTS {name}"))
+        .await
+        .expect("drop the procedure");
+    c.disconnect().await.expect("close the side connection");
+}
+
 /// **M2/S3 — a streamed `CALL` delivers REAL ROWS.** The guard for the one shape whose result
 /// columns do not exist until the statement has run.
 ///
@@ -392,24 +422,23 @@ async fn mysql_autocommit_stream_delivers_rows_and_the_session_survives() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_streamed_call_delivers_rows_and_the_session_survives() {
     for (label, url) in mysql_targets() {
-        let server = common::exec_server(url);
+        // The procedure is created over a RAW side connection on the TEXT protocol, NOT through
+        // ferrod. That is not a shortcut: MySQL's prepared-statement protocol does not accept
+        // `CREATE PROCEDURE` (errno 1295, "not supported in the prepared statement protocol yet"),
+        // and every user statement ferrod runs is prepared. The S2 sibling in
+        // `ferro-backend-mysql/tests/query_it.rs` meets the same wall and answers it the same way,
+        // through `simple_query`. The fixture is not what this test is about — the `CALL` below is,
+        // and that still goes through ferrod end to end.
+        create_procedure(
+            &url,
+            "s3_call_rows",
+            "BEGIN SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3; END",
+        )
+        .await;
+
+        let server = common::exec_server(url.clone());
         let mut client = server.connect().await;
         client.hello(1).await;
-
-        exec_ok(
-            &mut client,
-            50,
-            &ddl("DROP PROCEDURE IF EXISTS s3_call_rows"),
-        )
-        .await;
-        exec_ok(
-            &mut client,
-            51,
-            &ddl(
-                "CREATE PROCEDURE s3_call_rows() BEGIN                  SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3; END",
-            ),
-        )
-        .await;
 
         let mut r = req("CALL s3_call_rows()");
         r.fetch = FETCH_STREAM;
@@ -440,12 +469,7 @@ async fn mysql_streamed_call_delivers_rows_and_the_session_survives() {
             "[{label}] the connection that streamed a CALL came back usable"
         );
 
-        exec_ok(
-            &mut client,
-            54,
-            &ddl("DROP PROCEDURE IF EXISTS s3_call_rows"),
-        )
-        .await;
+        drop_procedure(&url, "s3_call_rows").await;
     }
 }
 
