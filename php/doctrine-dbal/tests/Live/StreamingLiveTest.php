@@ -391,18 +391,19 @@ final class StreamingLiveTest extends DbalLiveTestCase
     }
 
     /**
-     * MySQL BUFFERS, and that is a documented asymmetry rather than a defect (SPEC §22.2 (n) —
-     * MySQL row streaming is deferred, controller decision D-S8b-2). Asserted so the asymmetry is
-     * known, and so the day MySQL streaming lands, this test is what says "now change the driver
-     * too".
+     * **MySQL STREAMS now** — and this test is the one that said it would have to change on the day
+     * it did (dev-loop B2c; the engine half closed SPEC §22.2 (n), retiring controller decision
+     * D-S8b-2). It used to assert the opposite: that MySQL buffered, so an interleaved statement had
+     * nothing to settle.
      *
-     * `settledRowCount()` is the discriminator: on a buffering family an interleaved statement has
-     * NOTHING to settle, because no stream was ever opened. Without that half, a driver that
-     * streamed on MySQL (and therefore threw on `supports_row_streaming() == false`) would be the
-     * only thing this test could catch, and a driver that streamed successfully one day would pass
-     * it while silently changing behaviour.
+     * `settledRowCount()` is still the discriminator, and it is exactly what flipped. On a BUFFERING
+     * family it was `0` — no stream was ever opened. On a streaming one the interleave must
+     * MATERIALISE the remainder, paid once on the first inner statement, exactly as the PostgreSQL
+     * sibling {@see testWritingInsideAnIterationWorks} asserts. Keeping the assertion on this
+     * counter rather than merely on the rows is what makes the two families provably alike now,
+     * instead of alike-looking because nothing was measured.
      */
-    public function testMysqlIteratesCorrectlyEvenThoughItBuffers(): void
+    public function testMysqlStreamsAndInterleavingMaterialisesLikePostgres(): void
     {
         $c = $this->dbal($this->requireMysqlPool());
         $c->executeStatement('DROP TABLE IF EXISTS s8b_stream_my');
@@ -412,15 +413,16 @@ final class StreamingLiveTest extends DbalLiveTestCase
         $ids = [];
         foreach ($c->iterateAssociative('SELECT id FROM s8b_stream_my ORDER BY id') as $row) {
             $ids[] = (int) $row['id'];
-            // The interleave that would be fatal on a real stream: on MySQL there is no stream at
-            // all, so nothing is settled and nothing throws.
+            // The interleave: on a streaming family this settles the open stream (buffering the
+            // remainder) rather than throwing — the documented degradation, not a failure.
             $c->executeStatement('UPDATE s8b_stream_my SET id = id WHERE id = ?', [$row['id']]);
         }
         self::assertSame([1, 2, 3], $ids);
         self::assertSame(
-            0,
+            2,
             $this->driverConnection($c)->settledRowCount(),
-            'MySQL never opens a stream, so an interleaved statement settles nothing',
+            'MySQL now opens a real stream, so the first interleaved statement settles the '
+            . 'remaining 2 of 3 rows — the same cost PostgreSQL pays, paid once',
         );
 
         $c->executeStatement('DROP TABLE s8b_stream_my');

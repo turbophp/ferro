@@ -193,10 +193,17 @@ final class Connection implements DriverConnection
      * the command-tag count; the client dropped it until B1a. With `RawStream::affected()` real,
      * `Result::rowCount()` drains-then-answers (§22.2 (ah)) and the prepared path streams too.
      *
-     * **Why MySQL buffers.** `PoolBackend::supports_row_streaming()` is false for MySQL/MariaDB
-     * (SPEC §22.2 (n), controller decision D-S8b-2), where `streamRaw()` would come back as a clean
-     * `Unsupported` — paying a round trip to discover that on every query is not worth it when the
-     * pool kind is already known from `HELLO_ACK`.
+     * **Every family streams as of B2c.** MySQL/MariaDB used to buffer here because
+     * `PoolBackend::supports_row_streaming()` was false for them (SPEC §22.2 (n), controller
+     * decision D-S8b-2) and `streamRaw()` would have come back a clean `Unsupported`. The engine
+     * now streams both families, so the pool-kind gate is gone and this path no longer varies by
+     * backend.
+     *
+     * **The consequence, stated rather than assumed:** this now assumes EVERY Ferro backend can
+     * stream. Both shipped backends do. A future backend that cannot (a SQLite one, ledger C3)
+     * would make `streamRaw()` fail here instead of falling back — closing that needs either
+     * streaming in that backend or the streaming capability advertised on `HELLO_ACK`, since the
+     * client is told the pool's `kind`, never its capabilities.
      *
      * The returned result is the CALLER's alone; this connection keeps only a `\WeakReference`
      * ({@see $openStream}). A caller that discards it — `$conn->query($sql);` in statement position —
@@ -207,9 +214,6 @@ final class Connection implements DriverConnection
     {
         $this->settleOpenStream();
         $this->refuseIsolationStatement($sql);
-        if ($this->poolKind !== PlatformVersion::KIND_POSTGRES) {
-            return $this->runPrepared($sql, []);
-        }
         try {
             $stream = $this->ferro->streamRaw($sql, [], $this->readonly);
         } catch (FerroException $e) {
@@ -271,7 +275,8 @@ final class Connection implements DriverConnection
     {
         $this->settleOpenStream();
         $this->refuseIsolationStatement($sql);
-        // M1-S9 B1b: the prepared path STREAMS on PostgreSQL, exactly as {@see query} does — the
+        // M1-S9 B1b: the prepared path STREAMS — on EVERY family since B2c, exactly as {@see query}
+        // does (the MySQL fallback D-S8b-2 required is gone now that the engine streams there). The
         // blocker (ac) recorded was measured false in (ag), and Result::rowCount() now
         // drains-then-answers (§22.2 (ah)), so `executeStatement()`'s
         // `$stmt->execute()->rowCount()` gets the REAL command-tag count: a parameterized WRITE
@@ -280,22 +285,14 @@ final class Connection implements DriverConnection
         // transaction's session and tx_id exactly as `fetchRaw()` does (its own doc: "either half
         // missing is a silent wrong answer"), and TransactionRoutingTest reads the tx_id off the
         // encoded request either way.
-        if ($this->poolKind === PlatformVersion::KIND_POSTGRES) {
-            try {
-                $stream = $this->ferro->streamRaw($sql, $params, $this->readonly);
-            } catch (FerroException $e) {
-                throw DriverException::fromFerro($e);
-            }
-            $result = Result::streamed($stream);
-            $this->openStream = \WeakReference::create($result);
-            return $result;
-        }
         try {
-            $raw = $this->ferro->fetchRaw($sql, $params, $this->readonly, true);
+            $stream = $this->ferro->streamRaw($sql, $params, $this->readonly);
         } catch (FerroException $e) {
             throw DriverException::fromFerro($e);
         }
-        return Result::buffered($raw['cols'], $raw['rows'], $raw['affected']);
+        $result = Result::streamed($stream);
+        $this->openStream = \WeakReference::create($result);
+        return $result;
     }
 
     /**

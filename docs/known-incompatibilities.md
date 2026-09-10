@@ -230,11 +230,12 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
 
 ## Performance and shape
 
-- **`iterateAssociative()` streams on PostgreSQL for parameterless queries and buffers otherwise**,
-  and **always buffers on MySQL/MariaDB**, where engine-side row streaming is still deferred. The
-  parameterised path buffers by necessity: a streamed request's terminal carries no `affected`
-  field, so streaming it would make every parameterised write return `0` from
-  `executeStatement()`.
+- **`iterateAssociative()` streams — on every family and on both the parameterless and the
+  parameterised path.** This entry has been narrowed twice as its two stated causes were removed.
+  The parameterised path was said to buffer "by necessity, because a streamed terminal carries no
+  `affected`"; that was measured FALSE (§22.2 (ag)) and it now streams (§22.2 (ah)). MySQL/MariaDB
+  were said to buffer because engine-side streaming was deferred; that deferral is now closed
+  (§22.2 (n)) and they stream too. Nothing here buffers for iteration any more.
 - **Abandoning an iteration cancels the stream — for the canonical idiom.**
   `foreach ($conn->iterateAssociative($sql) as $row) { break; }` cancels: the driver `Result` is
   destroyed by refcount and frees itself. `$it = $conn->iterateAssociative($sql); foreach ($it as $row) { break; }`
@@ -255,8 +256,11 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   terminal carries no `affected`" — was measured false, §22.2 (ag)). On PostgreSQL BOTH routes now
   stream and both answer what `pdo_pgsql` answers: the command-tag row count. The cost is honest
   and only paid when asked: calling `rowCount()` on a still-open streamed result finishes the read
-  (buffering the remaining rows, which stay fetchable); pure iteration still never buffers. MySQL
-  reports `0` for a `SELECT` either way, unchanged. A result `free()`d before its terminal keeps
+  (buffering the remaining rows, which stay fetchable); pure iteration still never buffers.
+  **MySQL/MariaDB report `0` for a `SELECT` — still, and now for a different reason.** They used to
+  report `0` because they buffered and a buffered MySQL SELECT has no affected count; since B2c they
+  stream, and the post-drain OK packet a MySQL SELECT ends with also reports `0` (SPEC §22.2 (n)'s
+  second measured fact). The observable answer is unchanged; only the mechanism behind it is. A result `free()`d before its terminal keeps
   `0` — a command tag that was never read has no honest value.
   `rowCount()` after an `INSERT`/`UPDATE`/`DELETE` is always correct on both families.
 - **`free()` keeps `rowCount()`** while emptying rows and columns. Upstream is split on this
