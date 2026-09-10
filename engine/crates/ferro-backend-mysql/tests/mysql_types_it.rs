@@ -75,7 +75,7 @@ fn mariadb_url() -> Option<String> {
 /// Read one text scalar off the raw handle — a verification-only read that deliberately bypasses
 /// the canonical mapping (it is asserting SERVER state, not Ferro's rendering of it).
 async fn read_text(conn: &mut MysqlConn, sql: &str) -> String {
-    conn.mysql
+    conn.driver_mut()
         .query_first::<String, _>(sql)
         .await
         .unwrap_or_else(|e| panic!("read `{sql}` failed: {e:?}"))
@@ -242,7 +242,7 @@ async fn types_round_trip_exact_canonical_text(url: &str, label: &str) {
         .expect("conn still usable");
     assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
     println!("  [{label}] maria={maria} canonical-text matrix PASSED");
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// **Hazard 23 / F5, live.** A `BIGINT UNSIGNED` value ≤ `i64::MAX` arrives as `MyValue::Int`, not
@@ -299,7 +299,7 @@ async fn bigint_unsigned_covers_both_driver_forms(url: &str, label: &str) {
         );
     }
     println!("  [{label}] BIGINT UNSIGNED: {cases:?} all -> U64 (Int form AND UInt form)");
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// **`DATETIME` is naive, `TIMESTAMP` is a UTC instant — and the INSTANT is proven, not the suffix
@@ -450,7 +450,7 @@ async fn timestamp_is_a_utc_instant_and_datetime_is_naive(url: &str, label: &str
         .simple_query(&mut reader, "DROP TABLE IF EXISTS ferro_s7_ts")
         .await
         .expect("cleanup");
-    reader.mysql.disconnect().await.ok();
+    reader.disconnect().await;
 }
 
 /// **Expression columns classify too.** A `CAST(...)` or function result carries its own column
@@ -525,7 +525,7 @@ async fn expression_columns_classify_off_metadata_alone(url: &str, label: &str) 
             "MySQL keeps BIGINT UNSIGNED -> U64"
         }
     );
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// **The `TIME` extremes, and the engine divergence at the very top of the range.** A MySQL/MariaDB
@@ -609,7 +609,7 @@ async fn time_spans_the_full_signed_range(url: &str, label: &str) {
             "MySQL clamps to .000000"
         }
     );
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// **The DECIMAL display scale survives byte-for-byte**, cross-checked against the server's OWN
@@ -672,7 +672,7 @@ async fn decimal_matches_the_servers_own_rendering(url: &str, label: &str) {
     // The display scale is genuinely preserved (this would be vacuous if the server trimmed).
     assert_eq!(r.rows[0][0], Value::Decimal("-12345.6700000000".into()));
     assert_eq!(r.rows[0][2], Value::Decimal("1.10".into()));
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// **JSON is engine-conditional and asserted EXPLICITLY, never skipped (F15).** MySQL 8 emits a real
@@ -753,7 +753,7 @@ async fn json_classifies_per_engine(url: &str, label: &str) {
             "MySQL 8: JSON"
         }
     );
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// **Zero dates, live (hazard 27 / F35).** `'0000-00-00'` is a legal MySQL value under a permissive
@@ -824,7 +824,7 @@ async fn zero_dates_render_as_the_verbatim_sentinel(url: &str, label: &str) {
         );
     }
     println!("  [{label}] zero date/datetime/timestamp -> verbatim sentinels");
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// The live DEFERRAL guard: each must be a loud `Unsupported` raised at cols-build — BEFORE the
@@ -892,7 +892,7 @@ async fn deferred_column_types_are_refused_before_execution(url: &str, label: &s
         "[{label}] HEAD vs producer on the ENUM column"
     );
     println!("  [{label}] admitted ENUM  -> TEXT(\"a\")");
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// **MariaDB's extended types, MEASURED and recorded (hazard 25).** MariaDB 10.7+ has a native
@@ -960,7 +960,7 @@ async fn mariadb_extended_types_classify_as_text(url: &str, label: &str) {
         );
     }
     println!("  [{label}] MariaDB UUID/INET6/INET4 -> TEXT (measured, recorded in §22.2)");
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// **Task 8b — the BIND path: read → bind straight back → read again is BYTE-IDENTICAL.**
@@ -1282,7 +1282,7 @@ async fn bind_round_trip_is_byte_identical(url: &str, label: &str) {
         println!("  [{label}] non-representable {v:?} -> {col}: clean SQL error, conn clean");
     }
 
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// **Task 8b fix round 1 — a non-canonical payload is rejected PRE-SEND, and stays rejected under a
@@ -1523,7 +1523,7 @@ async fn non_canonical_payloads_are_rejected_pre_send_under_permissive_sql_mode(
         "  [{label}] the legal sentinels + 24:00:00/26:00:00 TIME still bind under sql_mode=''"
     );
 
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 // ---------------------------------------------------------------------------------------------

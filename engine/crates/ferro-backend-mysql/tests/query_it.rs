@@ -115,7 +115,7 @@ async fn scoped_scalars_round_trip(backend: &MysqlBackend, label: &str) {
          TINYINT(1), and a NULL)"
     );
 
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// Doubles whose nearest `f32` is a **different number** — the only F64 fixtures that can witness a
@@ -249,7 +249,7 @@ async fn f64_bind_round_trip_is_bit_exact(backend: &MysqlBackend, label: &str) {
         "[{label}] {} f32-lossy doubles bind bit-exactly",
         F32_LOSSY_DOUBLES.len()
     );
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// A still-deferred column type is a LOUD `Unsupported`, raised before the query runs (conn stays
@@ -318,7 +318,7 @@ async fn out_of_scope_column_is_unsupported(backend: &MysqlBackend, label: &str)
         .await
         .expect("conn still usable after an Unsupported cols-build");
     assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// A bind-arity mismatch is a KNOWN-FATE `Unsupported`, NEVER `ConnectionLost` (§19.3). The cols
@@ -354,7 +354,7 @@ async fn bind_arity_mismatch_is_known_fate(backend: &MysqlBackend, label: &str) 
         .await
         .expect("usable");
     assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// `last_insert_id` is populated after an INSERT on a SIGNED `AUTO_INCREMENT` column.
@@ -398,7 +398,7 @@ async fn last_insert_id_after_insert(backend: &MysqlBackend, label: &str) {
         Some(2),
         "[{label}] AUTO_INCREMENT advanced"
     );
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// M1-S8a: the OK packet's `LAST_INSERT_ID()` must reach `QueryResult` itself, not just the driver's
@@ -458,7 +458,7 @@ async fn insert_carries_last_insert_id_on_query_result(backend: &MysqlBackend, l
         r3.last_insert_id
     );
 
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// A duplicate key (errno 1062) is a generic SQL NonRetryable (`Unique`), NEVER `Protocol` — the T3
@@ -501,7 +501,7 @@ async fn duplicate_key_is_unique_nonretryable(backend: &MysqlBackend, label: &st
         .await
         .expect("usable");
     assert_eq!(ok.rows, vec![vec![Value::I64(1)]]);
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// THE reason the vendor errno has to be on the wire at all (M1-S8a): MySQL's SQLSTATE is far
@@ -571,7 +571,7 @@ async fn errno_distinguishes_two_errors_that_share_sqlstate_23000(
         "[{label}] only the errno separates them"
     );
 
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
 }
 
 /// A real deadlock (two concurrent txs each locking a row, then crossing) → `error_map` →
@@ -671,9 +671,9 @@ async fn deadlock_two_txs_is_retryable(url: &str, label: &str) {
         .simple_query(&mut setup, "DROP TABLE IF EXISTS ferro_dl")
         .await
         .ok();
-    a.mysql.disconnect().await.ok();
-    b.mysql.disconnect().await.ok();
-    setup.mysql.disconnect().await.ok();
+    a.disconnect().await;
+    b.disconnect().await;
+    setup.disconnect().await;
 }
 
 /// A statement error via a real `Checkout` force-taints the conn: `query` PROPAGATES the `Err`, so

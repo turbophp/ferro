@@ -45,7 +45,7 @@ pub async fn run(
     params: &[Value],
 ) -> Result<QueryResult, PoolError> {
     // (1) prepare.
-    let stmt = match conn.mysql.prep(sql).await {
+    let stmt = match conn.driver_mut().prep(sql).await {
         Ok(s) => s,
         Err(e) => return Err(conn.map_stmt_error(&e)),
     };
@@ -113,7 +113,7 @@ async fn drain(
     stmt: &Statement,
     params: Params,
 ) -> Result<(Vec<Row>, u64, Option<u64>), mysql_async::Error> {
-    let mut result = conn.mysql.exec_iter(stmt, params).await?;
+    let mut result = conn.driver_mut().exec_iter(stmt, params).await?;
     let rows = result.collect::<Row>().await?;
     // ORDER IS LOAD-BEARING — read these AFTER `collect()` has drained the set. Before the drain,
     // the driver is still reporting the PREVIOUS statement's OK packet, so hoisting either read

@@ -24,7 +24,7 @@ use ferro_backend_mysql::MysqlBackend;
 /// Read a single text scalar off the raw handle — a verification-only read (bypasses the pin
 /// authority, which is fine for asserting server state in a test).
 async fn read_text(conn: &mut ferro_backend_mysql::MysqlConn, sql: &str) -> String {
-    conn.mysql
+    conn.driver_mut()
         .query_first::<String, _>(sql)
         .await
         .unwrap_or_else(|e| panic!("read `{sql}` failed: {e:?}"))
@@ -76,7 +76,7 @@ async fn utc_pin_holds_fresh_and_recycled(url: &str, label: &str) {
     );
     println!("[{label}] recycled conn @@session.time_zone = {z}");
 
-    conn.mysql.disconnect().await.ok();
+    conn.disconnect().await;
     println!("[{label}] utc_pin fresh+recycled PASSED");
 }
 
