@@ -82,7 +82,7 @@ class FerroPostgresConnection extends PostgresConnection
                 return [];
             }
             try {
-                $result = $this->ferro->fetchRaw($query, array_values($bindings), readonly: false);
+                $result = $this->ferro->fetchRaw($query, $this->ferroBindings($bindings), readonly: false);
             } catch (FerroException $e) {
                 // Mapped here, not at `run()`: Illuminate wraps whatever escapes into a
                 // QueryException and COPIES ITS CODE, so the SQLSTATE has to be on the exception
@@ -133,7 +133,7 @@ class FerroPostgresConnection extends PostgresConnection
                 return null;
             }
             try {
-                return $this->ferro->streamRaw($query, array_values($bindings), readonly: false);
+                return $this->ferro->streamRaw($query, $this->ferroBindings($bindings), readonly: false);
             } catch (FerroException $e) {
                 throw FerroQueryException::fromFerro($e);
             }
@@ -258,6 +258,31 @@ class FerroPostgresConnection extends PostgresConnection
     }
 
     /**
+     * Illuminate's OWN binding normalisation, which the execution paths must not skip.
+     *
+     * `Connection::prepareBindings()` converts every `DateTimeInterface` to the query grammar's
+     * date format and every bool to an int. Stock Illuminate calls it before binding on every path;
+     * the first cut of this tier passed `array_values($bindings)` straight through and skipped it.
+     *
+     * **That was a real defect, and it took a full framework suite to surface it.** Eloquent binds
+     * `Carbon` instances directly for datetime attributes, so a plain
+     * `Model::create(['created_at' => $carbon])` reached the engine as a `DateTimeInterface`, was
+     * tagged canonical `TIMESTAMPTZ`, and was refused against PostgreSQL's naive `timestamp` column
+     * — which is what `$table->timestamps()` creates. Unit tests with scalar bindings could not see
+     * it; C2's first real run failed on it immediately.
+     *
+     * Deliberately delegating rather than reimplementing: the grammar owns the date format, and
+     * charter rule 6 keeps the grammar stock.
+     *
+     * @param array<int|string,mixed> $bindings
+     * @return list<mixed>
+     */
+    private function ferroBindings(array $bindings): array
+    {
+        return array_values($this->prepareBindings($bindings));
+    }
+
+    /**
      * The one place a write reaches the engine, so the fate declaration and the exception mapping
      * are stated once.
      *
@@ -269,7 +294,7 @@ class FerroPostgresConnection extends PostgresConnection
     private function execWrite(string $query, array $bindings): int
     {
         try {
-            return $this->ferro->exec($query, array_values($bindings), readonly: false);
+            return $this->ferro->exec($query, $this->ferroBindings($bindings), readonly: false);
         } catch (FerroException $e) {
             throw FerroQueryException::fromFerro($e);
         }

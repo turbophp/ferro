@@ -21,6 +21,12 @@ php/**/vendor
 # the single source of truth for which suite the recorded numbers came from.
 /.dbal-suite
 
+# M2-C2: testkit/laravel-suite.sh's work directory — a PINNED git clone of laravel/framework plus
+# the harness vendor tree and the generated phpunit config. Same rule as /.dbal-suite: never commit
+# a vendored clone; the tag in the runner is the single source of truth.
+/.laravel-suite
+testkit/laravel/vendor
+
 # Editors / OS
 .idea/
 .vscode/
