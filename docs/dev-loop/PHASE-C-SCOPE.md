@@ -34,12 +34,20 @@ the Illuminate tier need that `ferro/client` does not have yet?*
 | `read`/`write` split → a second pool | **[verified] — no engine work needed** | `PoolSpec` (name, dsn, kind, pin_functions, pin_on_unknown) has NO replica or read-role concept; pools are just named DSNs, and `read-replica` appears in the tree only as an example pool NAME in a config test. That is GOOD news: Laravel's `'read' => ['pool' => 'main_ro']` is satisfied entirely client-side by selecting a different pool name per query. **The work is inheriting Illuminate's stickiness rules, not building replication:** the base `Connection` already decides read-vs-write per query (a write makes subsequent reads sticky; reads inside a transaction go to the write connection) and expresses that by picking `getPdo()` vs `getReadPdo()`. Our execution layer does not use PDO, so the subclass must read WHICH role the base class selected and map it to a pool name — inheriting the semantics rather than re-deriving them. |
 | `FerroPdoShim` (`quote`, `lastInsertId`, `inTransaction`, `exec`, `getAttribute`) | **[decided] — do NOT implement `quote()` speculatively** | `lastInsertId`/`inTransaction`/`exec`/`getAttribute` are all backed by things that already exist. `quote()` is different in kind: implementing it means owning dialect-specific SQL string escaping, which is security-critical code written for no known caller. §15 lists it because ecosystem packages touch it, but WHICH packages and HOW is unknown. The slice that finds a real caller decides; until then it refuses, with a message naming the alternative (parameter binding). This follows the house stance set at S7 — *we refuse what PDO corrupts* — and charter rule 6, and it is reversible in the safe direction: a refusal can become an implementation, an unnoticed escaping bug cannot be un-shipped. |
 
-## The `attempts:` requirement (verified against Illuminate 11.x source)
+## The `attempts:` requirement (verified against the INSTALLED `illuminate/database` v11.51.0)
+
+**Container feasibility, checked first:** `illuminate/database ^11.0` installs cleanly here
+(v11.51.0, via `env -u GITHUB_TOKEN COMPOSER_AUTH='{}' composer install`), so C1b can be built and
+tested locally rather than only in CI. The three structural facts below were read out of that
+installed tree, not fetched from a branch — `Connection::resolverFor($driver, Closure)` exists at
+`Connection.php:1683` with a `static::$resolvers` map, `QueryException extends PDOException`
+(`QueryException.php:9`), and it does `$this->code = $previous->getCode()` (line 48).
 
 `DB::transaction($fn, attempts: 3)` retries iff `causedByConcurrencyError($e)` is true. That helper
 matches on exactly two things:
 
-1. `$e instanceof PDOException` **and** the exception CODE is SQLSTATE `40001`; or
+1. `$e instanceof PDOException` **and** `($e->getCode() === 40001 || $e->getCode() === '40001')` —
+   verbatim from the installed source, so EITHER the int or the string form satisfies it; or
 2. the exception MESSAGE containing one of a fixed list of substrings — among them
    `"Deadlock found when trying to get lock"`, `"deadlock detected"` and
    `"Lock wait timeout exceeded; try restarting transaction"`.
@@ -47,8 +55,10 @@ matches on exactly two things:
 Two consequences, and the second is the one that would have shipped silently.
 
 **Criterion 2 already works, by faithfulness rather than by design.** Ferro preserves the raw server
-message verbatim on every fate arm, so a MySQL deadlock, a PG `deadlock detected` and a MySQL 1205
-lock-wait timeout all match those substrings as-is. Nothing is needed for those.
+message verbatim on every fate arm, so a MySQL deadlock, a PG `deadlock detected` (PostgreSQL's own
+deadlock wording, and it IS in the list) and a MySQL 1205 lock-wait timeout all match those
+substrings as-is. Nothing is needed for those — **which is exactly what makes the gap below easy to
+miss**: the common cases pass without anyone implementing anything.
 
 **Criterion 1 requires the tier's exception to put SQLSTATE in `getCode()` — the OPPOSITE of what the
 DBAL driver does.** `Illuminate\Database\QueryException extends PDOException` and its constructor
