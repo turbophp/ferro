@@ -97,6 +97,12 @@ final class FerroPdoShim
      * for a modern PostgreSQL. The sibling Doctrine tier made the same call for the same reason —
      * a wrong version is a silently wrong dialect (§22.2, D-S8b-1).
      *
+     * **A version that is PRESENT but unparseable is the same failure and much quieter, so the raw
+     * wire string is normalised before it leaves here** ({@see ServerVersion}). The engine caches the
+     * backend's `version()` output verbatim, and PostgreSQL's leads with the product name — which
+     * `version_compare` reads as older than any number, so the guard above passed while the branch
+     * it protects still went the wrong way. Measured, and caught only by upstream's own suite.
+     *
      * Every OTHER attribute still refuses by name. That is deliberate: the roster grows only as
      * real framework code is measured needing it, which is exactly how this one arrived.
      */
@@ -124,7 +130,9 @@ final class FerroPdoShim
                 $info->name ?? '(unknown)',
             ));
         }
-        return $version;
+        // `$info` is non-null here BY CONSTRUCTION: `$version` came off it, and a null `$version`
+        // already threw above. PHPStan agrees — a `?->` here is a reported error, not caution.
+        return ServerVersion::normalise($info->kind, $version);
     }
 
     /**
