@@ -42,8 +42,8 @@ final class Message
         return $p->packArrayLen(count($items)) . implode('', $items);
     }
     /**
-     * `HelloAck.pools` (M1-S8a): an array of NESTED `[name, kind, server_version]` triples, not
-     * bare names. The input is either a golden vector's decoded-JSON `message.pools` (a list of
+     * `HelloAck.pools` (M1-S8a; fourth field M2-C2g): an array of NESTED
+     * `[name, kind, server_version, literals_are_standard]` entries, not bare names. The input is either a golden vector's decoded-JSON `message.pools` (a list of
      * assoc arrays) or a list of {@see PoolInfo}.
      *
      * **Which guard covers which branch — the note that used to sit here named the wrong one.** It
@@ -62,7 +62,7 @@ final class Message
      *    instances and re-encodes, pinning `toWire()`'s positional ORDER to the golden bytes.
      *
      * Independently, `PoolInfoTest`'s `fromWire`↔`toWire` mirror also catches a reorder — but only
-     * because `testFromWireDecodesThePositionalTripleInOrder` pins `fromWire` absolutely; the mirror
+     * because `testFromWireDecodesThePositionalEntryInOrder` pins `fromWire` absolutely; the mirror
      * on its own would survive a consistently-reordered pair.
      */
     private static function poolInfoArray(PackerInterface $p, mixed $pools): string
@@ -72,15 +72,24 @@ final class Message
         foreach ($list as $entry) {
             if ($entry instanceof PoolInfo) { $entry = $entry->toWire(); }
             if (!is_array($entry)) {
-                throw new CodecException('hello_ack: each pool must be a [name, kind, server_version] triple');
+                throw new CodecException(
+                    'hello_ack: each pool must be a [name, kind, server_version, literals_are_standard] entry',
+                );
             }
             $name = $entry['name'] ?? $entry[0] ?? null;
             $kind = $entry['kind'] ?? $entry[1] ?? null;
             $version = $entry['server_version'] ?? $entry[2] ?? null;
-            $out .= $p->packArrayLen(3)
+            // `array_key_exists`, NOT `??`: this field's whole point is that `null` (unknown) is a
+            // MEANINGFUL value distinct from absent, and `??` cannot tell a present null from a
+            // missing key. Using `??` here would be harmless today only because both spellings
+            // produce nil — until someone gives the fallback a default other than null.
+            $literals = $entry['literals_are_standard']
+                ?? ($entry[3] ?? null);
+            $out .= $p->packArrayLen(4)
                 . $p->packStr(self::scalarToStr($name))
                 . $p->packStr(self::scalarToStr($kind))
-                . ($version === null ? $p->packNil() : $p->packStr(self::scalarToStr($version)));
+                . ($version === null ? $p->packNil() : $p->packStr(self::scalarToStr($version)))
+                . ($literals === null ? $p->packNil() : $p->packBool((bool) $literals));
         }
         return $out;
     }

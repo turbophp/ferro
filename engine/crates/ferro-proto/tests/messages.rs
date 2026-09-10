@@ -39,11 +39,21 @@ fn hello_ack_carries_structured_pool_metadata() {
                 name: "main".into(),
                 kind: "postgres".into(),
                 server_version: Some("PostgreSQL 17.10 (Debian 17.10-1.pgdg13+1)".into()),
+                literals_are_standard: Some(true),
             },
             PoolInfo {
                 name: "reporting".into(),
                 kind: "mysql".into(),
                 server_version: None,
+                literals_are_standard: Some(false),
+            },
+            // M2-C2g's third state. `nil` is not padding here: it is what a pool the engine could
+            // not probe advertises, and it is the arm a client's fail-closed refusal hangs off.
+            PoolInfo {
+                name: "unprobed".into(),
+                kind: "postgres".into(),
+                server_version: Some("PostgreSQL 16.4".into()),
+                literals_are_standard: None,
             },
         ],
         type_registry_hash: "deadbeef".into(),
@@ -52,6 +62,12 @@ fn hello_ack_carries_structured_pool_metadata() {
     assert_eq!(back, ack);
     assert_eq!(back.pools[0].kind, "postgres");
     assert_eq!(back.pools[1].server_version, None);
+    // The two Options are NOT covariant across the fixture — element 1 pairs a known version with
+    // `true`, element 2 an unknown version with `false`, element 3 a known version with `nil`. A
+    // codec that read one where it meant the other would move at least one of these.
+    assert_eq!(back.pools[0].literals_are_standard, Some(true));
+    assert_eq!(back.pools[1].literals_are_standard, Some(false));
+    assert_eq!(back.pools[2].literals_are_standard, None);
 }
 
 #[test]

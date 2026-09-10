@@ -189,6 +189,25 @@ impl PoolBackend for PgBackend {
         TxStatus::from_pg_byte(conn.client.transaction_status())
     }
 
+    /// M2-C2g. `standard_conforming_strings` is a `GUC_REPORT` parameter, so PostgreSQL sends it in
+    /// the startup `ParameterStatus` stream and again on every change; the M1-S1 fork mirrors every
+    /// reported parameter into a map `Client::parameter` reads synchronously. So this costs NO round
+    /// trip — which is the whole reason the value can be advertised in `HELLO_ACK` and honour SPEC
+    /// §21 D5's "no engine round trip" for the client's `quote()`.
+    ///
+    /// `None` when the parameter is absent rather than `Some(false)`: absent means the connection
+    /// never reported it, which is "unknown", and a client must refuse to build a literal on
+    /// unknown. Reporting `false` would instead be a claim that backslashes ARE escapes.
+    ///
+    /// Compared case-insensitively because it is a GUC value, not a protocol token — PostgreSQL
+    /// itself accepts `on`/`ON`/`On`, and pinning the comparison to one casing would make this
+    /// answer depend on how the server happened to spell its own default.
+    fn literals_are_standard(&self, conn: &Self::Conn) -> Option<bool> {
+        conn.client
+            .parameter("standard_conforming_strings")
+            .map(|v| v.eq_ignore_ascii_case("on"))
+    }
+
     /// M1-S3 (SPEC §7.2): `Full` runs Postgres's own `DISCARD ALL` (used for a `tainted` conn);
     /// `Targeted` runs a narrower batch — exactly `DISCARD ALL` minus its two prepare-affecting
     /// statements (`DEALLOCATE ALL`, which destroys them, and `DISCARD PLANS`, which drops their

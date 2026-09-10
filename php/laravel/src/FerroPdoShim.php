@@ -36,11 +36,6 @@ final class FerroPdoShim
 {
     public function __construct(private readonly FerroClient $ferro) {}
 
-    /**
-     * Cached answer to {@see assertStandardConformingStrings}'s one `SHOW`. Null until first asked,
-     * so a connection that never escapes anything never pays for the round trip.
-     */
-    private ?string $standardConformingStrings = null;
 
     /**
      * Illuminate calls this only at transaction level 0 — nested levels become savepoints via
@@ -108,26 +103,20 @@ final class FerroPdoShim
      *
      * **The rule is doubling `'` and NOTHING else, and that is only correct while
      * `standard_conforming_strings` is `on`** — so it is VERIFIED rather than assumed
-     * ({@see assertStandardConformingStrings}). With it on, a backslash is an ordinary character;
+     * ({@see assertLiteralsAreStandard}). With it on, a backslash is an ordinary character;
      * with it off, PostgreSQL would read `\` as an escape and a value ending in a backslash could
      * consume the closing quote. MEASURED against `pdo_pgsql` on PostgreSQL 16 over eight cases
      * including `backslash-then-quote \'` and `quote-then-backslash '\`: this rule is
      * BYTE-IDENTICAL to PDO's output, and every case round-trips through `SELECT <literal>` back to
      * the original bytes.
      *
-     * **KNOWN CONFLICT WITH SPEC §21 D5, recorded rather than glossed:** D5 reads "`quote()`
-     * implemented client-side with per-platform tables; **no engine round trip**", and the
-     * verification below IS one round trip (cached, so amortised to nothing across the N bindings
-     * `substituteBindingsIntoRawSql()` escapes — but one nonetheless). The resolution is designed
-     * and better than either alternative: `standard_conforming_strings` is a `GUC_REPORT`
-     * parameter, so the engine already holds it with ZERO round trips via the M1-S1 fork's
-     * `Client::parameter()`, and advertising it in `HELLO_ACK` pool metadata would be both
-     * D5-compliant and MORE correct than a cached `SHOW` (which is a snapshot of one checkout,
-     * where `ParameterStatus` tracks the value live). That is a `/proto` slice — registry, golden
-     * vectors and both codecs in one change set, charter rule 2 — which is why it is not done here.
-     * See `docs/followups/2026-09-10-quote-scs-probe-vs-d5.md`. Do NOT "fix" this by deleting the
-     * verification: an unverified premise under an escaping function is the one option that was
-     * considered and rejected outright.
+     * **SPEC §21 D5 is SATISFIED, and it briefly was not.** D5 reads "`quote()` implemented
+     * client-side with per-platform tables; **no engine round trip**". The first version of this
+     * method verified the rule with a cached `SHOW standard_conforming_strings` — one round trip,
+     * which D5 forbids. It is now read from `HELLO_ACK`'s per-pool `literals_are_standard`
+     * (§22.2 (at)), which the engine learns from a `ParameterStatus` and therefore costs nothing at
+     * all. Do NOT "fix" a future concern here by deleting the check: an unverified premise under an
+     * escaping function is the one option that was considered and rejected outright.
      *
      * **`PDO::PARAM_LOB` is refused rather than guessed at.** PostgreSQL's binary literal is
      * `'\x…'::bytea`, a different shape entirely, and Illuminate never asks this method for one —
@@ -146,59 +135,43 @@ final class FerroPdoShim
                 $type,
             ));
         }
-        $this->assertStandardConformingStrings();
+        $this->assertLiteralsAreStandard();
 
         return "'" . str_replace("'", "''", $string) . "'";
     }
 
     /**
-     * Confirm ONCE per shim that the backend treats a backslash as an ordinary character.
+     * Confirm the backend treats a backslash as an ordinary character inside a literal.
      *
-     * **Why once, and why a server round trip at all.** {@see quote}'s rule is complete only under
-     * `standard_conforming_strings = on`, which has been PostgreSQL's default since 9.1 — but
-     * "almost always true" is not a basis for SQL escaping, and an operator CAN set it `off` in
-     * `postgresql.conf`. One `SHOW` on first use is a negligible cost for removing an unverified
-     * assumption from a security-relevant path.
+     * **Read off the HANDSHAKE, not the connection — SPEC §21 D5 requires exactly that.** D5 says
+     * `quote()` is client-side with NO ENGINE ROUND TRIP, and the first version of this method
+     * violated it with a cached `SHOW standard_conforming_strings`. `HELLO_ACK` now advertises
+     * `literals_are_standard` per pool (§22.2 (at)), which the engine learns for free — PostgreSQL
+     * reports the GUC as a `ParameterStatus`, so nothing is ever asked. The value is also better
+     * than the `SHOW` was, not merely cheaper: `ParameterStatus` tracks it LIVE, where a cached
+     * `SHOW` was one checkout's snapshot.
      *
-     * **Reading it from a POOLED connection is sound, and that is not obvious.** The checkout that
-     * answers this `SHOW` is not the one that will later execute whatever the caller interpolates.
-     * What makes the answer representative is the pool's own hygiene: a non-local `SET` taints the
-     * connection (`ferro-classify`, SPEC §7.1) and the reset profile restores the server default,
-     * so every checkout begins from the value this probe observed. A session that changed it mid-
-     * checkout is precisely the case hygiene exists to stop leaking, so it cannot reach a later
-     * tenant.
-     *
-     * A refusal is a `LogicException` rather than a query error: it says the deployment is one this
-     * escaping cannot serve, not that a statement failed.
+     * **Fail-closed, and `null` is the case that matters.** `null` means the engine has not learned
+     * it — an unreachable backend, an expired cache, a backend family whose arm is unfilled — and a
+     * client must REFUSE to build a literal on unknown. Never read it as false (that would claim
+     * backslashes ARE escapes) and never as true. Only an unambiguous `true` proceeds.
      */
-    private function assertStandardConformingStrings(): void
+    private function assertLiteralsAreStandard(): void
     {
-        if ($this->standardConformingStrings !== null) {
+        $info = $this->guardValue(fn (): ?\Ferro\Protocol\PoolInfo => $this->ferro->poolInfo());
+
+        if ($info?->literalsAreStandard === true) {
             return;
         }
-        // `guardValue`, NOT `guard`: the latter COERCES its result to `int|true` for the
-        // boolean-returning PDO methods it was written for, and routing a row set through it turns
-        // the answer into `true`. Measured — the first version of this did exactly that and the
-        // probe read `(unreadable)`. It failed LOUDLY rather than silently reading `on`, which is
-        // the shape this check is deliberately written in: anything that is not an unambiguous
-        // `'on'` refuses.
-        $r = $this->guardValue(fn (): array => $this->ferro->fetchRaw(
-            'SHOW standard_conforming_strings',
-            [],
-            readonly: true,
+        throw new \LogicException(sprintf(
+            'Ferro: this pool (%s) does not advertise literals_are_standard=true (got %s), and '
+            . 'quoting a string literal safely without it needs backslash escaping this driver does '
+            . 'not implement. On PostgreSQL that means standard_conforming_strings is off (set it '
+            . "on — it is PostgreSQL's own default since 9.1), or the engine has not learned it yet "
+            . 'for this pool. Otherwise avoid DB::escape() / toRawSql() on this connection.',
+            $info->name ?? '(unknown pool)',
+            $info === null ? 'no pool metadata' : var_export($info->literalsAreStandard, true),
         ));
-        $value = $r['rows'][0][0] ?? null;
-        $this->standardConformingStrings = is_string($value) ? $value : '(unreadable)';
-
-        if ($this->standardConformingStrings !== 'on') {
-            throw new \LogicException(sprintf(
-                'Ferro: this backend reports standard_conforming_strings=%s, and quoting a string '
-                . 'literal safely under that setting needs backslash escaping this driver does not '
-                . 'implement. Set standard_conforming_strings=on (PostgreSQL\'s own default since '
-                . '9.1), or avoid DB::escape() / toRawSql() on this connection.',
-                $this->standardConformingStrings,
-            ));
-        }
     }
 
     /**
@@ -293,7 +266,8 @@ final class FerroPdoShim
      *
      * {@see guard} exists for the PDO methods whose contract is `bool`/`int`, and its coercion to
      * `int|true` is right for those and wrong for anything that returns data — a row set routed
-     * through it becomes `true`, which is how {@see assertStandardConformingStrings} first read
+     * through it becomes `true`, which is how the removed `SHOW`-based predecessor of
+     * {@see assertLiteralsAreStandard} first read
      * `(unreadable)`. Splitting the two makes the coercion a deliberate choice at each call site
      * rather than something a new caller inherits by accident.
      *

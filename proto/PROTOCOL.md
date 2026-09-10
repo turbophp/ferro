@@ -59,7 +59,7 @@ row 1 (rid, `END`, code, branch, message, one-frame-then-EOF) and
 
 | what arrived | engine's terminal on `request_id=0` | message |
 |---|---|---|
-| a `HELLO` frame with version byte `1` | `errc::PROTOCOL` (`0x3009`) | `unsupported protocol version: expected 2, got 1` |
+| a `HELLO` frame with version byte `1` | `errc::PROTOCOL` (`0x3009`) | `unsupported protocol version: expected 3, got 1` |
 | a well-formed v2 `HELLO` with a stale `type_registry_hash` | `errc::UNSUPPORTED` (`0x300A`) | `type_registry_hash mismatch: client sent …, engine is …` |
 
 So: (1) the code is `PROTOCOL`, not `UNSUPPORTED` — anything keying on `errc::UNSUPPORTED` to mean
@@ -247,16 +247,17 @@ service's terminal frame carries.
 | 1 | `engine_version` | `u32` | |
 | 2 | `boot_epoch` | `u64` | unique per daemon start (§19.1); see §2 uint64-overflow note |
 | 3 | `features` | `u32` | engine feature bitfield: `MEMFD 0x01`, `LISTEN_STREAMS 0x02`, `MANIFEST 0x04` |
-| 4 | `pools` | `array<[str, str, str \| nil]>` | one nested positional triple per pool available on this engine — `[name, kind, server_version]`; see below (M1-S8a) |
+| 4 | `pools` | `array<[str, str, str \| nil, bool \| nil]>` | one nested positional entry per pool available on this engine — `[name, kind, server_version, literals_are_standard]`; see below (M1-S8a; fourth element M2-C2g) |
 | 5 | `type_registry_hash` | `str` | echoed back; mismatch vs. the client's hash is a hard error |
 
-**`pools` element (`PoolInfo`, M1-S8a)** — a positional fixarray of 3, in this order:
+**`pools` element (`PoolInfo`, M1-S8a; fourth element M2-C2g)** — a positional fixarray of 4, in this order:
 
 | # | field | type | notes |
 |---|---|---|---|
 | 1 | `name` | `str` | what a client puts in `ExecRequest.pool` / `BeginRequest.pool` |
 | 2 | `kind` | `str` | the backend FAMILY: `"postgres"` or `"mysql"` (MariaDB is `"mysql"` — it is the same family and the same wire protocol; the *product* is distinguishable only from `server_version`). Derived engine-side from the DSN SCHEME, so it is known without dialling the backend |
 | 3 | `server_version` | `str \| nil` | the backend's own `version()` output, **verbatim and unnormalised**; `nil` when the engine has not learned it |
+| 4 | `literals_are_standard` | `bool \| nil` | is a backslash inside a single-quoted string literal an ORDINARY CHARACTER on this backend? `nil` when the engine has not learned it. See below (M2-C2g) |
 
 Two rules that are contract, not implementation detail. **`server_version` is never normalised on
 the wire** — stripping PostgreSQL's leading product word or extracting a `major.minor.patch` is a
@@ -270,6 +271,25 @@ bounded budget, a success is cached with a TTL and a failure with a short backof
 has not answered when the budget expires simply rides as `nil` for that handshake. So `nil` may mean
 "never learned", "learned then expired", or "not learned YET" — all three are the same contract to a
 client, and none of them can fail or delay the handshake.
+
+**`literals_are_standard` answers ONE question, and it is deliberately not named for a backend's own
+setting.** A client that must build a SQL string literal — `PDO::quote()`, and therefore Laravel's
+`DB::escape()` and every `Builder::toRawSql()` — needs to know whether doubling `'` is the whole
+rule. It is, exactly when a backslash is an ordinary character inside the literal. Both families
+have that property under different names: PostgreSQL's `standard_conforming_strings`, MySQL's
+`NO_BACKSLASH_ESCAPES` in `sql_mode`. Putting either NAME on the wire would bake one backend's
+vocabulary into the protocol, and a client would then have to know which family's spelling to look
+for. **MySQL needs this bit more than PostgreSQL does**: PostgreSQL has defaulted to the safe value
+since 9.1, while MySQL defaults to the UNSAFE one, so a MySQL `quote()` cannot be written at all
+without it.
+
+It costs no round trip in either family. PostgreSQL reports `standard_conforming_strings` as a
+`GUC_REPORT` parameter, so it arrives in the startup `ParameterStatus` stream and again on every
+change, and the M1-S1 vendored fork already mirrors it (`Client::parameter`). It rides the same
+lazy, concurrent, TTL'd per-pool probe as `server_version`, so it inherits that probe's `nil`
+contract exactly: `nil` may mean never learned, learned then expired, or not learned yet, and all
+three are one thing to a client — **unknown**. A client that cannot get an unambiguous `true` must
+REFUSE to build a literal rather than assume; an escaping rule is not a place for a default.
 
 The DSN is **never** on the wire (SPEC §12 — it is a server-side secret), and `pools` is ordered by
 `name` so two connections to one engine see the identical list.

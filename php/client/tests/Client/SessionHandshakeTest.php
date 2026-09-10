@@ -63,7 +63,12 @@ final class SessionHandshakeTest extends TestCase
             'engine_version' => 1,
             'boot_epoch' => $bigEpoch,
             'features' => 0,
-            'pools' => [['name' => 'default', 'kind' => 'postgres', 'server_version' => 'PostgreSQL 17.10']],
+            'pools' => [[
+                'name' => 'default',
+                'kind' => 'postgres',
+                'server_version' => 'PostgreSQL 17.10',
+                'literals_are_standard' => true,
+            ]],
             'type_registry_hash' => C::TYPE_REGISTRY_HASH,
         ], $packer);
         // request_id deliberately NOT the HELLO id (=1): the session must not assert they match.
@@ -95,8 +100,18 @@ final class SessionHandshakeTest extends TestCase
             'boot_epoch' => 42,
             'features' => 0,
             'pools' => [
-                ['name' => 'default', 'kind' => 'postgres', 'server_version' => null],
-                ['name' => 'replica', 'kind' => 'mysql', 'server_version' => '8.4.11'],
+                [
+                    'name' => 'default',
+                    'kind' => 'postgres',
+                    'server_version' => null,
+                    'literals_are_standard' => true,
+                ],
+                [
+                    'name' => 'replica',
+                    'kind' => 'mysql',
+                    'server_version' => '8.4.11',
+                    'literals_are_standard' => null,
+                ],
             ],
             'type_registry_hash' => C::TYPE_REGISTRY_HASH,
         ], $packer);

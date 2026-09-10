@@ -64,8 +64,28 @@ msg!(
     /// handshake never depends on backend availability. Filled since M1-S8a Task 12, off a lazy,
     /// concurrent, TTL'd per-pool probe in `ferrod`'s `PoolRegistry::pool_info`.
     ///
+    /// `literals_are_standard` (M2-C2g) answers ONE question — is a backslash inside a single-quoted
+    /// string literal an ORDINARY CHARACTER on this backend? — and is deliberately NOT named for
+    /// either family's own setting. A client that must build a SQL literal (`PDO::quote()`, and so
+    /// Laravel's `DB::escape()` and every `Builder::toRawSql()`) needs to know whether doubling `'`
+    /// is the whole rule; it is, exactly when that property holds. PostgreSQL spells it
+    /// `standard_conforming_strings`, MySQL spells it `NO_BACKSLASH_ESCAPES` in `sql_mode`, and
+    /// putting either NAME on the wire would bake one backend's vocabulary into the protocol.
+    /// **MySQL needs the bit MORE than PostgreSQL does**: PG has defaulted to the safe value since
+    /// 9.1, MySQL defaults to the unsafe one.
+    ///
+    /// It costs no round trip: PG reports the GUC via `ParameterStatus` (the M1-S1 fork mirrors it
+    /// in `Client::parameter`), and it rides the SAME per-pool probe as `server_version`, inheriting
+    /// that probe's `nil` contract exactly. A client that cannot get an unambiguous `true` must
+    /// REFUSE to build a literal rather than assume — an escaping rule is not a place for a default.
+    ///
     /// Still NEVER exposed: the DSN (§12 server secret).
-    PoolInfo { name: String, kind: String, server_version: Option<String> }
+    PoolInfo {
+        name: String,
+        kind: String,
+        server_version: Option<String>,
+        literals_are_standard: Option<bool>
+    }
 );
 
 msg!(HelloAck { engine_version: u32, boot_epoch: u64, features: u32, pools: Vec<PoolInfo>, type_registry_hash: String });

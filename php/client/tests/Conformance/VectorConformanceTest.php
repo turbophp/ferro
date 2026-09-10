@@ -112,16 +112,24 @@ final class VectorConformanceTest extends TestCase
         foreach (is_array($message['pools'] ?? null) ? $message['pools'] : [] as $entry) {
             $this->assertIsArray($entry, 'the hello_ack vector must carry assoc pool entries');
             $version = $entry['server_version'] ?? null;
+            $literals = $entry['literals_are_standard'] ?? null;
             $pools[] = new PoolInfo(
                 (string) ($entry['name'] ?? ''),
                 (string) ($entry['kind'] ?? ''),
                 $version === null ? null : (string) $version,
+                $literals === null ? null : (bool) $literals,
             );
         }
         // Without this the test would pass VACUOUSLY on an empty pool list, proving nothing about
-        // toWire(). The vector carries two triples, the second with a nil version.
-        $this->assertCount(2, $pools, 'the hello_ack vector must carry two pool triples for this lock');
+        // toWire(). The vector carries three entries chosen so every optional arm rides this lock:
+        // a known version with `true`, a NIL version with `false`, and a known version with a NIL
+        // quoting rule — deliberately not covariant, so a codec reading one Option where it meant
+        // the other still moves the bytes.
+        $this->assertCount(3, $pools, 'the hello_ack vector must carry three pool entries for this lock');
         $this->assertNull($pools[1]->serverVersion, 'the nil-version arm must ride this lock too');
+        $this->assertTrue($pools[0]->literalsAreStandard);
+        $this->assertFalse($pools[1]->literalsAreStandard);
+        $this->assertNull($pools[2]->literalsAreStandard, 'the nil quoting-rule arm is the fail-closed one');
 
         $message['pools'] = $pools;
         $expected = substr((string) hex2bin((string) $v['frame_hex']), 16);

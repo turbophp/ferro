@@ -86,22 +86,26 @@ final class TypePolicyOptionsTest extends TestCase
         );
         sort($fields);
         self::assertSame(
-            ['kind', 'name', 'serverVersion'],
+            ['kind', 'literalsAreStandard', 'name', 'serverVersion'],
             $fields,
             'PoolInfo changed shape. The naive_datetime_zone=server refusal enumerates HELLO_ACK '
             . 'pool metadata as [name, kind, server_version] and rests on none of them being a '
             . 'timezone. If a timezone field just landed, the policy is implementable and the '
             . 'refusal must GO; if some other field landed, fix the enumeration in the message.',
         );
-        foreach (['name', 'kind', 'server_version'] as $wireField) {
+        foreach (['name', 'kind', 'server_version', 'literals_are_standard'] as $wireField) {
             self::assertStringContainsString(
                 $wireField,
                 $msg,
                 "the refusal must enumerate the advertised pool field '{$wireField}'",
             );
         }
+        // Count-agnostic ON PURPOSE. The previous form pinned the literal word "three", so adding a
+        // fourth advertised field (M2-C2g's `literals_are_standard`) failed this assertion for a
+        // reason that had nothing to do with the claim it exists to protect. What must hold is the
+        // CLAIM — none of what is advertised is a timezone — not how many things there are.
         self::assertMatchesRegularExpression(
-            '/none of those three is a timezone/i',
+            '/none of them is a timezone/i',
             $msg,
             'the refusal must state the REAL blocker: what is advertised is not a timezone',
         );
