@@ -1462,7 +1462,7 @@ fn resolve_active(
 ) -> Result<TxHandle, ErrorPayload> {
     match tx_registry.lookup(tx_id, session_id) {
         Ok(h) => Ok(h),
-        Err(TxLookupErr::NotFoundOrForbidden) => Err(protocol(
+        Err(TxLookupErr::NotFoundOrForbidden) => Err(tx_not_found(
             "unknown or forbidden tx_id (committed, rolled back, aborted, or another session's)",
         )),
         Err(TxLookupErr::Tombstoned) => Err(tx_deadline(
@@ -1513,7 +1513,7 @@ fn actor_gone_terminal(
             "transaction deadline exceeded; the pinned connection was rolled back and released \
              (retryable — the engine never re-runs)",
         ),
-        _ => protocol("transaction is no longer active"),
+        _ => tx_not_found("transaction is no longer active"),
     }
 }
 
@@ -1642,6 +1642,27 @@ pub(crate) fn tx_deadline(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: errc::TX_DEADLINE,
         branch: errc::TX_DEADLINE_BRANCH,
+        sqlstate: None,
+        errno: None,
+        message: message.into(),
+        detail: None,
+        retry_after_ms: None,
+    }
+}
+
+/// A `TxNotFound{NonRetryable}` terminal (0x300B): the request named a `tx_id` this session has no
+/// LIVE entry for — unknown, already committed or rolled back, aborted, or another session's (all
+/// indistinguishable to the client by design, §7).
+///
+/// It exists to be a DIFFERENT code from [`protocol`]. Both used to be `Protocol`, which forced a
+/// client's `rollBack()` — which must not throw out of the `finally` that is already carrying the
+/// caller's real error — to swallow `Protocol` wholesale, and with it the client's OWN codec
+/// defects (a malformed `TxControl` body lands on the same path). `Protocol` is now reserved for a
+/// genuine wire fault; "that transaction is gone" is this. SPEC §22.2.
+pub(crate) fn tx_not_found(message: impl Into<String>) -> ErrorPayload {
+    ErrorPayload {
+        code: errc::TX_NOT_FOUND,
+        branch: errc::TX_NOT_FOUND_BRANCH,
         sqlstate: None,
         errno: None,
         message: message.into(),
@@ -1832,7 +1853,7 @@ mod tests {
         assert_eq!(ep.branch, branch::RETRYABLE);
     }
 
-    /// `resolve_active`: unknown/cross-session → `Protocol` (indistinguishable); the owner's own
+    /// `resolve_active`: unknown/cross-session → `TxNotFound` (indistinguishable); the owner's own
     /// tombstone → `TxDeadline{Retryable}`; a live entry → the handle.
     #[test]
     fn resolve_active_maps_lookup_states() {
@@ -1840,19 +1861,18 @@ mod tests {
         let owner = reg.next_session_id();
         let other = reg.next_session_id();
 
-        // Unknown id → Protocol.
-        assert_eq!(
-            resolve_active(&reg, 1, owner).unwrap_err().code,
-            errc::PROTOCOL
-        );
+        // Unknown id → TxNotFound (B3: NOT Protocol — that stays a wire fault).
+        let ep = resolve_active(&reg, 1, owner).unwrap_err();
+        assert_eq!(ep.code, errc::TX_NOT_FOUND);
+        assert_eq!(ep.branch, branch::NON_RETRYABLE);
 
-        // Live entry → the handle for the owner; Protocol (NOT leaked) for anyone else.
+        // Live entry → the handle for the owner; TxNotFound (NOT leaked) for anyone else.
         reg.register(1, dummy_handle(owner));
         assert!(resolve_active(&reg, 1, owner).is_ok());
         assert_eq!(
             resolve_active(&reg, 1, other).unwrap_err().code,
-            errc::PROTOCOL,
-            "a cross-session lookup is Protocol, indistinguishable from unknown"
+            errc::TX_NOT_FOUND,
+            "a cross-session lookup is TxNotFound, indistinguishable from unknown"
         );
 
         // The owner's tombstone → TxDeadline{Retryable}.
@@ -1863,14 +1883,14 @@ mod tests {
     }
 
     /// `actor_gone_terminal` (send-Err / recv-Err mid-teardown): a now-tombstoned id → `TxDeadline`,
-    /// otherwise `Protocol`. Never a hang — a PROMPT declared terminal so exactly-one-END holds.
+    /// otherwise `TxNotFound`. Never a hang — a PROMPT declared terminal so exactly-one-END holds.
     #[test]
-    fn actor_gone_terminal_prompt_maps_tombstone_else_protocol() {
+    fn actor_gone_terminal_prompt_maps_tombstone_else_tx_not_found() {
         let reg = TxRegistry::new(Duration::from_secs(5));
         let owner = reg.next_session_id();
 
-        // Actor gone + id already deregistered → Protocol.
-        assert_eq!(actor_gone_terminal(&reg, 7, owner).code, errc::PROTOCOL);
+        // Actor gone + id already deregistered → TxNotFound.
+        assert_eq!(actor_gone_terminal(&reg, 7, owner).code, errc::TX_NOT_FOUND);
 
         // Actor gone + id tombstoned (deadline raced the send) → TxDeadline.
         reg.register(7, dummy_handle(owner));
@@ -1878,6 +1898,23 @@ mod tests {
         let ep = actor_gone_terminal(&reg, 7, owner);
         assert_eq!(ep.code, errc::TX_DEADLINE);
         assert_eq!(ep.branch, branch::RETRYABLE);
+    }
+
+    /// THE B3 SPLIT, asserted as one fact rather than two independent ones: the "that transaction is
+    /// gone" terminal and the "your frame was malformed" terminal must NOT share a code. A client's
+    /// `rollBack()` swallows the former by code; if these ever collapse back together it silently
+    /// starts swallowing the latter too, which is unobservable from either test above alone.
+    #[test]
+    fn tx_not_found_is_a_distinct_code_from_protocol() {
+        assert_ne!(
+            errc::TX_NOT_FOUND,
+            errc::PROTOCOL,
+            "TxNotFound exists precisely to be distinguishable from a wire fault"
+        );
+        // Both are NonRetryable — the split is about the CODE, not the branch, which is why a
+        // client keying on the branch alone could never have made this distinction.
+        assert_eq!(errc::TX_NOT_FOUND_BRANCH, errc::PROTOCOL_BRANCH);
+        assert_eq!(errc::TX_NOT_FOUND_BRANCH, branch::NON_RETRYABLE);
     }
 
     /// `declare_ctl` reply → terminal mapping, including the COMMIT-loss §19.3 case. Exercises the

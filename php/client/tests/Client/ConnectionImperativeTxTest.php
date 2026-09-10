@@ -6,6 +6,7 @@ use Ferro\Client\Backoff;
 use Ferro\Client\Connection;
 use Ferro\Client\Error\IndeterminateException;
 use Ferro\Client\Error\InvalidTransactionStateException;
+use Ferro\Client\Error\NonRetryableException;
 use Ferro\Client\Error\RetryableException;
 use Ferro\Client\ExecCodec;
 use Ferro\Client\ReconnectLoop;
@@ -301,15 +302,15 @@ final class ConnectionImperativeTxTest extends TestCase
 
     /**
      * The other "the transaction is gone" terminal: an unknown-or-forbidden `tx_id`, which
-     * `resolve_active` reports as `Protocol` (NonRetryable) — a client can never tell an unknown id
-     * from another session's. Same conclusion, different branch byte, so the swallow must key on the
-     * `code` rather than on the exception class.
+     * `resolve_active` reports as `TxNotFound` (NonRetryable) — a client can never tell an unknown
+     * id from another session's. Same conclusion as the tombstone arm, different branch byte, so the
+     * swallow must key on the `code` rather than on the exception class.
      */
     public function testARollbackOnAnUnknownTxIdIsAlsoSwallowed(): void
     {
         $session = FakeSession::withTxBegin(txId: 72)->push(
             FakeSession::errorOutcome(self::errorPayload(
-                C::ERR_PROTOCOL,
+                C::ERR_TX_NOT_FOUND,
                 C::BRANCH_NON_RETRYABLE,
                 'unknown or forbidden tx_id (committed, rolled back, aborted, or another session\'s)',
             )),
@@ -320,6 +321,41 @@ final class ConnectionImperativeTxTest extends TestCase
 
         $c->rollBack(); // must not throw
 
+        $this->assertFalse($c->inTransaction());
+    }
+
+    /**
+     * THE B3 GUARD, and the reason the dedicated code was worth a registry change: a `Protocol`
+     * terminal on ROLLBACK now THROWS.
+     *
+     * `Protocol` on this path means a malformed `TxControl` body — a CLIENT codec defect, the one
+     * failure a client most needs to hear about. While "tx is gone" and "your frame was malformed"
+     * shared the `Protocol` code, swallowing the first swallowed the second, and this test could not
+     * have been written. It is the falsifier for the narrowed swallow list: put `C::ERR_PROTOCOL`
+     * back into `TX_ALREADY_GONE` and this test is the one that goes red.
+     */
+    public function testAProtocolTerminalOnRollbackIsNoLongerSwallowed(): void
+    {
+        $session = FakeSession::withTxBegin(txId: 74)->push(
+            FakeSession::errorOutcome(self::errorPayload(
+                C::ERR_PROTOCOL,
+                C::BRANCH_NON_RETRYABLE,
+                'malformed TxControl: trailing bytes after payload: 3 extra',
+            )),
+            [C::SERVICE_TX, C::METHOD_TX_ROLLBACK],
+        );
+        $c = new Connection(session: $session);
+        $c->begin();
+
+        try {
+            $c->rollBack();
+            $this->fail('a Protocol terminal on ROLLBACK must not be swallowed');
+        } catch (NonRetryableException $e) {
+            $this->assertSame(C::ERR_PROTOCOL, $e->errorCode());
+        }
+
+        // The handle is cleared on the failure path too — a thrown rollback must not leave the
+        // Connection reporting an open transaction forever.
         $this->assertFalse($c->inTransaction());
     }
 

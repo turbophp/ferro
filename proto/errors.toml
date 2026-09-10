@@ -57,3 +57,11 @@ branch = 3
 [codes.Unsupported]
 code = 0x300A
 branch = 3
+# A tx-scoped request naming a `tx_id` the engine has no LIVE entry for: unknown, already committed
+# or rolled back, aborted, or another session's (indistinguishable by design — §7). Distinct from
+# `Protocol`, which stays reserved for a genuine WIRE fault (a malformed body, an unknown savepoint).
+# The split is what lets a client's `rollBack()` swallow "that transaction is already gone" without
+# also swallowing its own codec defects — SPEC §22.2.
+[codes.TxNotFound]
+code = 0x300B
+branch = 3

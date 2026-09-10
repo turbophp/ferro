@@ -1,0 +1,22 @@
+{
+  "frame_hex": "f7020200030002001600000026000000920197cd300b03c0c0ba756e6b6e6f776e206f7220666f7262696464656e2074785f6964c0c0",
+  "header": {
+    "flags": 2,
+    "method": 2,
+    "request_id": 22,
+    "service": 3
+  },
+  "message": {
+    "error": {
+      "branch": 3,
+      "code": 12299,
+      "detail": null,
+      "errno": null,
+      "message": "unknown or forbidden tx_id",
+      "retry_after_ms": null,
+      "sqlstate": null
+    },
+    "status": 1
+  },
+  "name": "error_tx_not_found"
+}

@@ -53,13 +53,19 @@ final class Connection
      * source-text matching against engine strings that are free to change.
      *
      * `ERR_TX_DEADLINE` is `ferrod`'s tombstone arm (the tx was rolled back + released by a deadline
-     * or an in-tx cancel); `ERR_PROTOCOL` is its unknown-or-forbidden `tx_id` and its
+     * or an in-tx cancel); `ERR_TX_NOT_FOUND` is its unknown-or-forbidden `tx_id` and its
      * "transaction is no longer active" (the actor is already gone). Both are engine-side facts
      * about a transaction that has ALREADY ended — see {@see rollBack}'s docblock.
      *
+     * **`ERR_PROTOCOL` used to be in this list and deliberately is not any more.** Until the engine
+     * gained a dedicated `TxNotFound` code, "that tx_id is gone" and "your frame was malformed"
+     * arrived as the SAME code, so swallowing the first meant swallowing the second — a CLIENT codec
+     * defect on a `TxControl` body vanished silently on the rollback path. Now `ERR_PROTOCOL` throws
+     * out of `rollBack()` like any other unexpected rejection, which is the whole point of the split.
+     *
      * @var list<int>
      */
-    private const TX_ALREADY_GONE = [C::ERR_TX_DEADLINE, C::ERR_PROTOCOL];
+    private const TX_ALREADY_GONE = [C::ERR_TX_DEADLINE, C::ERR_TX_NOT_FOUND];
 
     private readonly ExecCodec $codec;
     private readonly RetryPolicy $policy;
@@ -791,7 +797,7 @@ final class Connection
      * statement hits `idle_in_tx` / `max_tx` / an in-tx cancel, the engine rolls the transaction
      * back, releases the pinned connection and TOMBSTONES the `tx_id`; the caller's `finally` then
      * sends `ROLLBACK` on that dead id and gets back a well-formed `Outcome::Error` —
-     * {@see C::ERR_TX_DEADLINE} (`resolve_active`'s tombstone arm) or {@see C::ERR_PROTOCOL}
+     * {@see C::ERR_TX_DEADLINE} (`resolve_active`'s tombstone arm) or {@see C::ERR_TX_NOT_FOUND}
      * ("unknown or forbidden tx_id", "transaction is no longer active"). Letting those throw
      * defeated the exact property this swallow exists to protect: the `finally` replaced the
      * caller's real error with a `RetryableException` about a transaction that was already dead.
@@ -804,12 +810,17 @@ final class Connection
      * exist", and swallowing every class here would leave `rollBack()` unable to report anything at
      * all. The closure form's rollback arm is a blanket `catch (\Throwable)`; this one is scoped.
      *
-     * Known cost of keying on the wire code: `ERR_PROTOCOL` on a ROLLBACK has a third producer — a
-     * malformed `TxControl` body, i.e. a CLIENT codec defect — which is indistinguishable on the
-     * wire from the two "tx is gone" cases and is therefore swallowed here too. It stays loud on
-     * COMMIT and on every savepoint op, which do not swallow. A dedicated `TxNotFound` error code in
-     * `/proto` would remove the ambiguity; that is a registry change and is left to the tier that
-     * owns `/proto`.
+     * **The old cost of keying on the wire code is PAID OFF.** `ERR_PROTOCOL` used to have a third
+     * producer on this path — a malformed `TxControl` body, i.e. a CLIENT codec defect — which was
+     * indistinguishable on the wire from the two "tx is gone" cases and was therefore swallowed
+     * here too. `/proto` now carries a dedicated `TxNotFound` (`0x300B`) for the tx-is-gone fact and
+     * `Protocol` is back to meaning only a wire fault, so a malformed body throws out of
+     * `rollBack()` again — as it always did on COMMIT and on every savepoint op.
+     *
+     * Consequence worth naming: this is a WIRE change, so the swallow is correct only against an
+     * engine that speaks it. A client and engine at different registry revisions do not reach this
+     * code path at all — `TYPE_REGISTRY_HASH` moved with the new code, so they fail at the
+     * handshake instead (§5), which is exactly why the pair cannot silently disagree here.
      */
     public function rollBack(): void
     {

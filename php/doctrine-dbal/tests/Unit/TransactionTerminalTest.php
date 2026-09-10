@@ -4,6 +4,7 @@ namespace Ferro\DBAL\Tests\Unit;
 
 use Ferro\Client\Connection as FerroClientConnection;
 use Ferro\Client\Error\IndeterminateException;
+use Ferro\Client\Error\NonRetryableException;
 use Ferro\Client\Error\RetryableException;
 use Ferro\DBAL\Connection as FerroDriverConnection;
 use Ferro\DBAL\Exception\DriverException;
@@ -145,10 +146,10 @@ final class TransactionTerminalTest extends TestCase
         $c->rollBack();
         self::assertFalse($c->ferro()->inTransaction(), 'the handle is cleared either way');
 
-        // 2. the engine has already ended this transaction (a tombstoned tx_id) — quiet.
+        // 2. the engine has already ended this transaction (an unknown tx_id) — quiet.
         $session = FakeSession::withTxBegin(txId: 12)->push(
             FakeSession::errorOutcome(self::payload(
-                C::ERR_PROTOCOL,
+                C::ERR_TX_NOT_FOUND,
                 C::BRANCH_NON_RETRYABLE,
                 null,
                 'unknown tx_id 12',
@@ -158,6 +159,32 @@ final class TransactionTerminalTest extends TestCase
         $c = self::conn($session);
         $c->beginTransaction();
         $c->rollBack();
+        self::assertFalse($c->ferro()->inTransaction());
+
+        // 2b. a PROTOCOL terminal — LOUD, and this row is new with the dedicated `TxNotFound` code.
+        // It sits next to row 2 on purpose: the two codes are one hex digit apart and both
+        // NonRetryable, so only running BOTH through the same method shows the driver distinguishes
+        // them. A malformed `TxControl` body is a client codec defect; it used to vanish here.
+        $session = FakeSession::withTxBegin(txId: 14)->push(
+            FakeSession::errorOutcome(self::payload(
+                C::ERR_PROTOCOL,
+                C::BRANCH_NON_RETRYABLE,
+                null,
+                'malformed TxControl: trailing bytes after payload: 3 extra',
+            )),
+            [C::SERVICE_TX, C::METHOD_TX_ROLLBACK],
+        );
+        $c = self::conn($session);
+        $c->beginTransaction();
+        try {
+            $c->rollBack();
+            self::fail('a Protocol terminal on rollBack is a codec defect and must surface');
+        } catch (DriverException $e) {
+            $prev = $e->getPrevious();
+            self::assertInstanceOf(NonRetryableException::class, $prev);
+            self::assertSame(C::ERR_PROTOCOL, $prev->errorCode(),
+                'the surfaced terminal is the Protocol one, not a coincidental other failure');
+        }
         self::assertFalse($c->ferro()->inTransaction());
 
         // 3. anything else — LOUD.

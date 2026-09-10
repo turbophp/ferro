@@ -157,6 +157,10 @@
       "code": 4099,
       "branch": 1
     },
+    "TxNotFound": {
+      "code": 12299,
+      "branch": 3
+    },
     "Unique": {
       "code": 12290,
       "branch": 3

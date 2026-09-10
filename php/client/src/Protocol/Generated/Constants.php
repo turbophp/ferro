@@ -103,6 +103,8 @@ final class Constants
     public const ERR_SYNTAX_BRANCH = 3;
     public const ERR_TX_DEADLINE = 4099;
     public const ERR_TX_DEADLINE_BRANCH = 1;
+    public const ERR_TX_NOT_FOUND = 12299;
+    public const ERR_TX_NOT_FOUND_BRANCH = 3;
     public const ERR_UNIQUE = 12290;
     public const ERR_UNIQUE_BRANCH = 3;
     public const ERR_UNSUPPORTED = 12298;
@@ -110,5 +112,5 @@ final class Constants
     public const ERR_WRITE_UNCONFIRMED = 8193;
     public const ERR_WRITE_UNCONFIRMED_BRANCH = 2;
 
-    public const TYPE_REGISTRY_HASH = 'c84a88cd97f6c689';
+    public const TYPE_REGISTRY_HASH = '8c1115be54a9446b';
 }

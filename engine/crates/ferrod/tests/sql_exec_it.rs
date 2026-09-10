@@ -276,16 +276,19 @@ async fn unsupported_query_id_pool_stream() {
     );
 
     // A tx-scoped EXEC naming an UNKNOWN tx_id (no prior BEGIN) → the unknown/forbidden-tx guard
-    // (`resolve_active` → Protocol), which fires BEFORE any fetch handling. Both the autocommit
-    // fetch=stream producer (M1-S5 Task 4b) AND the tx-scoped one (M1-S5 Task 5) are now live, so
-    // fetch=stream is no longer an error shape here — an unknown tx_id is (Protocol, not
+    // (`resolve_active` → TxNotFound since B3), which fires BEFORE any fetch handling. Both the
+    // autocommit fetch=stream producer (M1-S5 Task 4b) AND the tx-scoped one (M1-S5 Task 5) are now
+    // live, so fetch=stream is no longer an error shape here — an unknown tx_id is (TxNotFound, not
     // Unsupported). Using fetch=stream keeps the request identical to the pre-M1-S5 case.
+    //
+    // Sitting in a test whose other two rows are `Unsupported` is the point: three different
+    // per-request rejections, three distinguishable codes, one surviving session.
     let mut stream = req("SELECT 1");
     stream.fetch = 2;
     stream.tx_id = Some(1);
     assert_eq!(
         exec_err(&mut client, 52, &stream).await.code,
-        errc::PROTOCOL
+        errc::TX_NOT_FOUND
     );
 
     // All three were per-request errors; the session is unaffected.
