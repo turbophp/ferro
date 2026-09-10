@@ -20,10 +20,10 @@ mysql_async = { version = "0.37", default-features = false, features = ["minimal
 # the `OkPacket` / `SessionStateChange` / `StatusFlags` types are then identical across the boundary.
 mysql_common = { version = "0.37", default-features = false }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+# StreamExt drives the fork's owned ResultSetStream in `stream.rs` (B2b-2b).
+futures-util = { version = "0.3", default-features = false }
 async-trait = "0.1"
 tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "time"] }
-# StreamExt for the fork's ResultSetStream in stream_recovery_it.rs (the B2a live proof).
-futures-util = { version = "0.3", default-features = false }

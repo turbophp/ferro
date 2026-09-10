@@ -26,9 +26,11 @@ pub mod error_map;
 pub mod mytext;
 pub mod query;
 pub mod rowmap;
+pub mod stream;
 pub mod tracker;
 
-pub use conn::{MysqlBackend, MysqlCancel, MysqlConn, MysqlRowStream};
+pub use conn::{MysqlBackend, MysqlCancel, MysqlConn};
+pub use stream::MysqlRowStream;
 
 /// Re-exported so this crate's modules (and downstream tests) can name the canonical scalar type
 /// without reaching into `ferro-proto`'s module path (parity with `ferro-backend-pg`).

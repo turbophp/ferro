@@ -19,9 +19,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use ferro_pool::backend::{
-    BackendRows, Cancel, Dialect, PoolBackend, QueryResult, ResetProfile, TxStatus,
-};
+use ferro_pool::backend::{Cancel, Dialect, PoolBackend, QueryResult, ResetProfile, TxStatus};
 use ferro_pool::error::PoolError;
 use ferro_proto::messages::sql::ColMeta;
 use ferro_proto::value::Value;
@@ -216,31 +214,10 @@ impl Cancel for MysqlCancel {
     }
 }
 
-/// Placeholder incremental row stream — MySQL/MariaDB row streaming is DEFERRED (SPEC §22.2 (n)),
-/// so [`MysqlBackend::supports_row_streaming`] is `false`, [`MysqlBackend::query_stream`] returns
-/// `PoolError::Unsupported` and this type is NEVER constructed. Exists only to satisfy the
-/// `PoolBackend::RowStream: BackendRows` bound.
-pub struct MysqlRowStream;
-
-#[async_trait]
-impl BackendRows for MysqlRowStream {
-    async fn next(&mut self) -> Option<Result<Vec<Value>, PoolError>> {
-        unreachable!(
-            "MysqlRowStream is a compile-time placeholder; MySQL streaming is deferred (SPEC §22.2 (n))"
-        )
-    }
-
-    fn rows_affected(&self) -> u64 {
-        unreachable!(
-            "MysqlRowStream is a compile-time placeholder; MySQL streaming is deferred (SPEC §22.2 (n))"
-        )
-    }
-}
-
 #[async_trait]
 impl PoolBackend for MysqlBackend {
     type Conn = MysqlConn;
-    type RowStream = MysqlRowStream;
+    type RowStream = crate::stream::MysqlRowStream;
     type CancelHandle = MysqlCancel;
 
     /// Owned, borrow-free cancel handle (S6): captures the server-side connection id + the connect
@@ -346,15 +323,14 @@ impl PoolBackend for MysqlBackend {
         crate::DIALECT
     }
 
-    /// MySQL/MariaDB cannot stream rows incrementally in M1 — DEFERRED, SPEC §22.2 (n).
+    /// MySQL/MariaDB DO stream rows incrementally as of dev-loop B2b-2b (SPEC §22.2 (n) closed).
     ///
-    /// Not a policy choice: every `mysql_async` streaming entry point BORROWS the connection, and
-    /// the owned-`Conn` route (which does type-check) has **no way to get the `Conn` back** — there
-    /// is no `into_inner`/accessor on `ResultSetStream`, and dropping it CLOSES the connection. An
-    /// implementation therefore needs a THIRD vendored-fork divergence plus a restructure of
-    /// `Checkout::finalize_stream`, which reads `tx_status(&B::Conn)` synchronously after the drain.
+    /// This is the ONE authority both EXEC arms read, so flipping it here is what turns streaming on
+    /// for the autocommit and tx-scoped paths at once. It became true only when all three pieces
+    /// were in place: the fork's `into_conn` (B2a), the pool's `reclaim_stream` seam (B2b-1), and a
+    /// parkable `MysqlConn` whose parked state reads dead (B2b-2a). See [`crate::stream`].
     fn supports_row_streaming(&self) -> bool {
-        false
+        true
     }
 
     /// The transaction AUTHORITY (SPEC §7.1): reads `SERVER_STATUS_IN_TRANS` off the last OK packet.
@@ -449,19 +425,27 @@ impl PoolBackend for MysqlBackend {
         crate::query::run(conn, sql, params).await
     }
 
+    /// The INCREMENTAL row path (B2b-2b) — see [`crate::stream`] for the ownership handshake and
+    /// why a no-result-set statement must never take the owned route.
     async fn query_stream(
         &self,
-        _conn: &mut Self::Conn,
-        _sql: &str,
-        _params: &[Value],
+        conn: &mut Self::Conn,
+        sql: &str,
+        params: &[Value],
     ) -> Result<(Vec<ColMeta>, Self::RowStream), PoolError> {
-        // Unreachable through the SQL service: both arms refuse on `supports_row_streaming()`
-        // BEFORE dispatch. Kept as a real error (not `unreachable!()`) so a future direct caller
-        // gets a clean refusal rather than a daemon panic.
-        Err(PoolError::Unsupported(
-            "row streaming is not supported on MySQL/MariaDB (deferred — SPEC §22.2 (n))"
-                .to_string(),
-        ))
+        crate::stream::open(conn, sql, params).await
+    }
+
+    /// Put the streamed connection BACK and answer the post-drain affected count (B2b-1's seam,
+    /// B2b-2b's implementation). The pool calls this inside `RowStreamHandle::finish`, before
+    /// `finalize_stream` reads `tx_status` — and bounds it, so a hung restore cannot strand the
+    /// request's terminal frame.
+    async fn reclaim_stream(
+        &self,
+        conn: &mut Self::Conn,
+        rows: Self::RowStream,
+    ) -> Result<u64, PoolError> {
+        crate::stream::reclaim(conn, rows).await
     }
 }
 
@@ -484,11 +468,12 @@ mod tests {
         assert_eq!(backend.clean_reset_profile(), Some(ResetProfile::Full));
     }
 
-    /// M1-S8a: the ONE streaming-capability authority is FALSE for MySQL/MariaDB (SPEC §22.2 (n)).
-    /// Behavioural, not a signature assertion: it calls the real method through the real trait.
+    /// B2b-2b: the ONE streaming-capability authority is now TRUE for MySQL/MariaDB — SPEC §22.2
+    /// (n)'s deferral is closed. Behavioural, not a signature assertion: it calls the real method
+    /// through the real trait, and both EXEC arms in `ferrod` read exactly this.
     #[test]
-    fn mysql_does_not_support_row_streaming() {
+    fn mysql_supports_row_streaming() {
         let backend = MysqlBackend::new("mysql://unused/unused");
-        assert!(!backend.supports_row_streaming());
+        assert!(backend.supports_row_streaming());
     }
 }

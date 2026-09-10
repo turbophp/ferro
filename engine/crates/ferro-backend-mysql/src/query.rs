@@ -108,7 +108,7 @@ pub async fn run(
 /// Bind + execute + fully drain a single result set, returning owned rows and the OK-packet
 /// `affected`/`last_insert_id`. Isolates the driver's `&mut Conn` borrow so `run` can touch `conn`
 /// (error mapping, taint recording) once this returns.
-async fn drain(
+pub(crate) async fn drain(
     conn: &mut MysqlConn,
     stmt: &Statement,
     params: Params,
