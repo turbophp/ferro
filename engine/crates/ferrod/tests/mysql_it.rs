@@ -7,11 +7,9 @@
 //!    uses (the monomorphic → heterogeneous registry fix);
 //!  * runs a `BEGIN .. COMMIT` transaction through the tx path (the actor spawns a
 //!    `Checkout<MysqlBackend>`; the routing + terminal are backend-agnostic);
-//!  * REJECTS `fetch:stream` EARLY with a clean, documented `Unsupported` terminal (MySQL streaming
-//!    is DEFERRED — SPEC §22.2 (n)) — NOT a mid-stream error;
-//!  * (M1-S8a) refuses it IDENTICALLY on BOTH EXEC arms — autocommit and tx-scoped — off the ONE
-//!    `PoolBackend::supports_row_streaming()` authority, the tx-scoped one BEFORE the actor can
-//!    touch (and force-taint) the pinned connection;
+//!  * STREAMS `fetch:stream` on BOTH EXEC arms — autocommit and tx-scoped — off the ONE
+//!    `PoolBackend::supports_row_streaming()` authority (dev-loop B2b-2b closed SPEC §22.2 (n)'s
+//!    deferral), handing the PARKED connection back so the session and the transaction survive it;
 //!  * (M1-S8a Task 8) opens an ISOLATION-scoped and/or READ ONLY transaction — the dialect-aware
 //!    `compose_begin_sql` batch (SPEC §22.2 (s)), which before this slice was ERROR 1064.
 //!
@@ -31,12 +29,14 @@ mod common;
 use std::time::Duration;
 
 use common::{TestClient, exec, exec_err, exec_ok, mariadb_url, mysql_url, req};
-use ferro_proto::consts::{branch, errc, flags, method_tx, service};
+use ferro_proto::consts::{branch, errc, flags, method_sql, method_stream, method_tx, service};
 use ferro_proto::messages::Outcome;
 use ferro_proto::messages::sql::ExecRequest;
+use ferro_proto::messages::sql::StreamData;
 use ferro_proto::messages::tx::{BeginRequest, BeginResponse, Isolation, TxControl};
 use ferro_proto::value::Value;
 use ferrod::services::sql::{FETCH_NONE, FETCH_ROWS, FETCH_STREAM};
+use ferrod::session::codec::InFrame;
 
 // -------------------------------------------------------------------------------------------------
 // Targets: run each scenario against every configured dialect (MySQL 8 + MariaDB 11) that is set.
@@ -235,147 +235,189 @@ async fn mysql_tx_begin_commit_roundtrips() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// (3) A fetch:stream EXEC to a MySQL pool → the documented Unsupported terminal (NOT a mid-stream
-//     error). MySQL row streaming is DEFERRED — SPEC §22.2 (n).
+// (3) A fetch:stream EXEC to a MySQL pool now STREAMS (dev-loop B2b-2b, SPEC §22.2 (n) closed).
+//     These two scenarios REPLACE the refusal tests this file carried while streaming was deferred.
 // -------------------------------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn mysql_fetch_stream_rejected_as_unsupported() {
-    let targets = mysql_targets();
-    if targets.is_empty() {
-        return;
+/// One classified streamed frame. Mirrors `stream_it.rs`'s classifier (PG) so the MySQL family is
+/// asserted at the same wire level: exactly one HEAD, then DATA, then exactly one END terminal.
+enum SFrame {
+    Head,
+    Data(Vec<Vec<Value>>),
+    End(Outcome),
+}
+
+fn classify(frame: &InFrame, rid: u32) -> SFrame {
+    assert_eq!(
+        frame.header.request_id, rid,
+        "every frame echoes the request id"
+    );
+    if frame.header.flags & flags::END == flags::END {
+        assert_eq!(
+            frame.header.service,
+            service::SQL,
+            "the terminal rides the SQL/EXEC request, not the STREAM service"
+        );
+        return SFrame::End(Outcome::decode(&frame.payload).expect("decode terminal Outcome"));
     }
-    for (label, url) in targets {
+    assert_eq!(
+        frame.header.service,
+        service::STREAM,
+        "a streamed frame is on the STREAM service"
+    );
+    match frame.header.method {
+        method_stream::HEAD => {
+            assert_eq!(
+                frame.header.flags & flags::STREAM,
+                0,
+                "HEAD carries no STREAM flag"
+            );
+            SFrame::Head
+        }
+        method_stream::DATA => {
+            assert_eq!(
+                frame.header.flags & flags::STREAM,
+                flags::STREAM,
+                "a DATA frame carries the STREAM flag"
+            );
+            SFrame::Data(
+                StreamData::decode(&frame.payload)
+                    .expect("decode StreamData")
+                    .rows,
+            )
+        }
+        other => panic!("unexpected STREAM method {other}"),
+    }
+}
+
+/// Drain a `fetch:stream` request to its terminal, replenishing credit after every streamed frame,
+/// and return the single-int-column rows in arrival ORDER plus the terminal.
+async fn drain_stream(client: &mut TestClient, rid: u32, r: &ExecRequest) -> (Vec<i64>, Outcome) {
+    client
+        .send_request(rid, service::SQL, method_sql::EXEC, r.encode())
+        .await;
+    let mut rows: Vec<i64> = Vec::new();
+    let mut saw_head = false;
+    loop {
+        let frame = client.recv().await;
+        let plen = frame.header.payload_len;
+        match classify(&frame, rid) {
+            SFrame::Head => {
+                assert!(!saw_head, "exactly one HEAD frame per stream");
+                saw_head = true;
+                client.window_update(rid, 1, plen).await;
+            }
+            SFrame::Data(batch) => {
+                assert!(saw_head, "HEAD must precede any DATA frame");
+                for row in batch {
+                    assert_eq!(row.len(), 1, "the fixture selects one column per row");
+                    match &row[0] {
+                        Value::I64(n) => rows.push(*n),
+                        other => panic!("expected an I64 cell, got {other:?}"),
+                    }
+                }
+                client.window_update(rid, 1, plen).await;
+            }
+            SFrame::End(outcome) => {
+                assert!(
+                    saw_head,
+                    "a stream always emits its HEAD before the terminal"
+                );
+                return (rows, outcome);
+            }
+        }
+    }
+}
+
+/// A multi-row fixture that needs no table: a 5-row UNION whose values arrive in a known order.
+const STREAM_SQL: &str = "SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 \
+                          UNION ALL SELECT 4 UNION ALL SELECT 5";
+
+/// The autocommit arm streams — and, the load-bearing part, the SESSION SURVIVES it.
+///
+/// Streaming on this backend PARKS the driver connection inside the row stream and puts it back
+/// through `reclaim_stream` (B2b-1's seam + B2a's `into_conn`). If that hand-back were broken, the
+/// pooled connection would be lost or left mid-protocol: the follow-up buffered SELECT below is what
+/// proves it came home usable, not merely that rows arrived.
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_autocommit_stream_delivers_rows_and_the_session_survives() {
+    for (label, url) in mysql_targets() {
         let server = common::exec_server(url);
         let mut client = server.connect().await;
         client.hello(1).await;
 
-        let mut r = req("SELECT 1");
+        let mut r = req(STREAM_SQL);
         r.fetch = FETCH_STREAM;
+        let (rows, outcome) = drain_stream(&mut client, 30, &r).await;
 
-        // A SINGLE END-terminal error (exactly-one-END), Unsupported, with the documented message —
-        // asserted via `exec_err` (which checks the one-END SQL/EXEC terminal shape).
-        let ep = exec_err(&mut client, 30, &r).await;
-        assert_eq!(
-            ep.code,
-            errc::UNSUPPORTED,
-            "[{label}] fetch:stream on MySQL is an Unsupported terminal"
-        );
+        assert_eq!(rows, vec![1, 2, 3, 4, 5], "[{label}] every row, in order");
         assert!(
-            ep.message.contains("MySQL"),
-            "[{label}] the reject message names MySQL, got {:?}",
-            ep.message
+            matches!(outcome, Outcome::Ok(_)),
+            "[{label}] a fully-drained stream ends in exactly one Ok terminal, got {outcome:?}"
         );
-        // M1-S8a: the refusal now cites the SPEC deferral entry, not a slice number that has
-        // already shipped (the stale "M1-S7" text was the drift this task removed).
-        assert!(
-            ep.message.contains("§22.2"),
-            "[{label}] the reject message points at the SPEC §22.2 deferral, got {:?}",
-            ep.message
-        );
-
-        // The buffered path on the SAME session still works — only streaming was rejected, the
-        // session is intact (no mid-stream desync).
-        let ok = exec_ok(&mut client, 31, &req("SELECT 1")).await;
-        assert_eq!(
-            first_i64(&ok),
-            1,
-            "[{label}] buffered SELECT still works after the reject"
-        );
-    }
-}
-
-// -------------------------------------------------------------------------------------------------
-// (4) M1-S8a Task 1 — ONE streaming-capability authority: BOTH EXEC arms (autocommit and tx-scoped)
-//     refuse `fetch:stream` on a MySQL pool with the SAME terminal, and the tx-scoped one refuses
-//     BEFORE the actor ever touches the pinned connection.
-// -------------------------------------------------------------------------------------------------
-
-/// Both `fetch:stream` arms on a MySQL pool must refuse with the SAME, precise terminal — and the
-/// tx-scoped one must refuse BEFORE the actor touches the pinned connection.
-///
-/// Falsifiable: before this task the tx-scoped arm reached `MysqlBackend::query_stream` and returned
-/// the stale `"MySQL streaming lands in M1-S7"` string (a different message from the autocommit
-/// arm's), after force-tainting the pinned conn at `ferro-pool/src/pool.rs:674-677`. The
-/// byte-equality assertion below is what goes RED if the two arms ever drift again.
-#[tokio::test(flavor = "multi_thread")]
-async fn mysql_stream_is_refused_identically_on_both_arms_and_the_tx_survives() {
-    for (label, url) in mysql_targets() {
-        let server = common::exec_server(url);
-        let mut client = server.connect().await;
-        client.hello(0).await;
-
-        // (a) autocommit arm — `req` is fetch:rows, so flip it to stream.
-        let mut auto_req = req("SELECT 1");
-        auto_req.fetch = FETCH_STREAM;
-        let auto = exec_err(&mut client, 1, &auto_req).await;
-
-        // (b) tx-scoped arm.
-        let tx_id = begin(&mut client, 2, "default", None, false).await;
-        let mut scoped_req = tx_read_req(tx_id, "SELECT 1");
-        scoped_req.fetch = FETCH_STREAM;
-        let scoped = exec_err(&mut client, 3, &scoped_req).await;
-
-        // Charter rule 4 on the NEW refusal path: `exec_err` already consumed exactly one
-        // END-flagged terminal for rid 3 (at-least-one); nothing else may follow it (at-most-one).
-        // A second frame here — a stray HEAD, a duplicate terminal, or the actor's own late
-        // terminal — makes this `Some(..)` and the test RED.
         assert!(
             client
                 .recv_or_none(Duration::from_millis(250))
                 .await
                 .is_none(),
-            "[{label}] the tx-scoped stream refusal must emit EXACTLY one frame (one END)"
+            "[{label}] nothing may follow the terminal (charter rule 4: exactly one END)"
         );
 
+        // THE reclaim proof: the parked conn was handed back and recycled cleanly.
+        let ok = exec_ok(&mut client, 31, &req("SELECT 1")).await;
         assert_eq!(
-            auto.message, scoped.message,
-            "[{label}] the autocommit and tx-scoped stream refusals must come from ONE constructor"
+            first_i64(&ok),
+            1,
+            "[{label}] the streamed connection came back usable (reclaim + unpark worked)"
         );
-        assert_eq!(auto.code, scoped.code, "[{label}] same terminal code");
-        assert_eq!(
-            auto.code,
-            errc::UNSUPPORTED,
-            "[{label}] a stream refusal is Unsupported"
-        );
+    }
+}
 
-        // The refusal must be the PRE-DISPATCH one. Asserted against the daemon's OWN constructor,
-        // not a literal restated here — which is what makes this falsifiable in BOTH directions:
-        // `MysqlBackend::query_stream`'s late refusal carries a DIFFERENT string, so if either arm
-        // stops guarding (or `supports_row_streaming()` is wrongly `true`), the request reaches the
-        // backend, the message changes, and this goes RED. Message equality alone cannot see that —
-        // both arms would degrade to the same late string together.
-        let expected = ferrod::services::sql::stream_unsupported().message;
+/// The tx-scoped arm streams off the SAME `supports_row_streaming()` authority, on the PINNED
+/// connection — and the transaction is still intact afterwards.
+///
+/// This is the arm that used to refuse late and force-taint the pinned conn. Now it must stream and
+/// give the connection back to the SAME transaction: the in-tx statement and the COMMIT below are
+/// what prove the pin survived a park/reclaim round trip.
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_tx_scoped_stream_delivers_rows_and_the_tx_survives() {
+    for (label, url) in mysql_targets() {
+        let server = common::exec_server(url);
+        let mut client = server.connect().await;
+        client.hello(0).await;
+
+        let tx_id = begin(&mut client, 2, "default", None, false).await;
+        let mut r = tx_read_req(tx_id, STREAM_SQL);
+        r.fetch = FETCH_STREAM;
+        let (rows, outcome) = drain_stream(&mut client, 3, &r).await;
+
         assert_eq!(
-            scoped.message, expected,
-            "[{label}] the tx-scoped refusal must be declared BEFORE dispatch (the actor never \
-             touches — and never force-taints — the pinned conn)"
-        );
-        assert_eq!(
-            auto.message, expected,
-            "[{label}] the autocommit refusal must be declared BEFORE checkout"
+            rows,
+            vec![1, 2, 3, 4, 5],
+            "[{label}] in-tx stream delivers every row in order"
         );
         assert!(
-            auto.message.contains("§22.2"),
-            "[{label}] the refusal must cite the spec deferral, got {:?}",
-            auto.message
+            matches!(outcome, Outcome::Ok(_)),
+            "[{label}] one Ok terminal for the tx-scoped stream, got {outcome:?}"
         );
         assert!(
-            !auto.message.contains("M1-S7"),
-            "[{label}] the stale slice name must be gone, got {:?}",
-            auto.message
+            client
+                .recv_or_none(Duration::from_millis(250))
+                .await
+                .is_none(),
+            "[{label}] exactly one END on the tx-scoped stream too"
         );
 
-        // The tx was never touched: a normal statement still runs and COMMIT succeeds.
+        // The pinned conn was reclaimed into the SAME transaction, not lost or tainted away.
         let ok = exec_ok(&mut client, 4, &tx_read_req(tx_id, "SELECT 7")).await;
         assert_eq!(
             first_i64(&ok),
             7,
-            "[{label}] the pinned tx conn must still be usable after a refused stream"
+            "[{label}] the pinned tx connection is still usable after a streamed statement"
         );
         match commit(&mut client, 5, tx_id).await {
             Outcome::Ok(_) => {}
-            other => panic!("[{label}] COMMIT after a refused tx-scoped stream: {other:?}"),
+            other => panic!("[{label}] COMMIT after a tx-scoped stream: {other:?}"),
         }
     }
 }
