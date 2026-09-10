@@ -3,6 +3,8 @@ declare(strict_types=1);
 namespace Ferro\Laravel;
 
 use Ferro\Client\Connection as FerroClient;
+use Ferro\Client\Error\FerroException;
+use Ferro\Laravel\Exception\FerroQueryException;
 use Illuminate\Database\PostgresConnection;
 
 /**
@@ -12,10 +14,10 @@ use Illuminate\Database\PostgresConnection;
  * Schema builder are inherited untouched — they only build SQL strings and post-process arrays, and
  * charter rule 6 says the drop-in tiers change execution and never SQL generation.
  *
- * **C1b implements `select()` and nothing else.** Writes, transactions, `cursor()` and the PDO shim
- * are later slices; until they land, every other execution method still runs Illuminate's stock PDO
- * path, which will fail for want of a real PDO — deliberately, and loudly, rather than appearing to
- * work. See `docs/dev-loop/PHASE-C-SCOPE.md`.
+ * **C1b + C1c: reads, writes and transactions.** `cursor()`/`LazyCollection` (C1d) and the wider PDO
+ * surface (C1e) are still to come; anything reaching for an unimplemented PDO method refuses BY NAME
+ * through {@see FerroPdoShim::__call} rather than failing obscurely. See
+ * `docs/dev-loop/PHASE-C-SCOPE.md`.
  */
 class FerroPostgresConnection extends PostgresConnection
 {
@@ -28,22 +30,15 @@ class FerroPostgresConnection extends PostgresConnection
         string $tablePrefix = '',
         array $config = [],
     ) {
-        // Illuminate's constructor accepts `\PDO|\Closure`. A closure is passed rather than a real
-        // PDO because Ferro has none: `Connection::$pdo` is resolved lazily, so as long as nothing
-        // in the implemented path asks for it, this is never invoked. When it IS invoked the
-        // failure names the reason instead of surfacing as a TypeError deep inside Illuminate.
-        parent::__construct(
-            static function (): never {
-                throw new \LogicException(
-                    'Ferro: this connection has no PDO. The execution path that asked for one is '
-                    . 'not implemented yet (C1b implements select() only) — or it is a caller that '
-                    . 'reaches for the raw PDO, which the FerroPdoShim slice will address.',
-                );
-            },
-            $database,
-            $tablePrefix,
-            $config,
-        );
+        // `Connection::getPdo()` has NO return type — it hands back whatever `$this->pdo` holds —
+        // so the shim need not extend `\PDO` (which cannot be constructed without a real DSN).
+        // Passing it here is what lets `ManagesTransactions` run UNCHANGED: the transaction counter,
+        // savepoint naming through the stock grammar, the connection events and the `attempts:`
+        // retry loop are all inherited, and only the five PDO methods underneath them are ours.
+        // Passed as a CLOSURE, which `getPdo()` resolves on first use, because Illuminate documents
+        // the parameter as `\PDO|\Closure`. The closure form satisfies that contract exactly and
+        // costs nothing — `getPdo()` memoises the result into `$this->pdo` on the first call.
+        parent::__construct(static fn (): FerroPdoShim => new FerroPdoShim($ferro), $database, $tablePrefix, $config);
     }
 
     /** The underlying Ferro client — the handle a contact assertion checks. */
@@ -82,14 +77,137 @@ class FerroPostgresConnection extends PostgresConnection
      */
     public function select($query, $bindings = [], $useReadPdo = true)
     {
-        /** @var list<\stdClass> */
-        return $this->run($query, $bindings, function (string $query, array $bindings): array {
+        $rows = $this->run($query, $bindings, function (string $query, array $bindings): array {
             if ($this->pretending()) {
                 return [];
             }
-            $result = $this->ferro->fetchRaw($query, array_values($bindings), readonly: false);
+            try {
+                $result = $this->ferro->fetchRaw($query, array_values($bindings), readonly: false);
+            } catch (FerroException $e) {
+                // Mapped here, not at `run()`: Illuminate wraps whatever escapes into a
+                // QueryException and COPIES ITS CODE, so the SQLSTATE has to be on the exception
+                // BEFORE it leaves this closure or `attempts:` cannot see it.
+                throw FerroQueryException::fromFerro($e);
+            }
             return self::hydrate($result['cols'], $result['rows']);
         });
+        return self::narrowRows($rows);
+    }
+
+    /**
+     * A write whose result the caller does not need. Illuminate's contract is a bare success bool.
+     *
+     * `fetch:none` rather than `fetch:rows`: the engine then never materialises a result set, which
+     * is the whole point of the distinction Illuminate draws between `statement()` and `select()`.
+     *
+     * @param  string  $query
+     * @param  array<int|string,mixed>  $bindings
+     * @return bool
+     */
+    public function statement($query, $bindings = [])
+    {
+        return self::narrowBool($this->run($query, $bindings, function (string $query, array $bindings): bool {
+            if ($this->pretending()) {
+                return true;
+            }
+            $this->execWrite($query, $bindings);
+            $this->recordsHaveBeenModified();
+            return true;
+        }));
+    }
+
+    /**
+     * A write whose affected-row count the caller DOES need — `update()`, `delete()`, and
+     * `executeStatement`-shaped calls.
+     *
+     * The count comes from the engine's own `affected`, never from counting rows: they are different
+     * numbers, and an `UPDATE` that matched 10 rows and changed none still affected 10.
+     *
+     * @param  string  $query
+     * @param  array<int|string,mixed>  $bindings
+     * @return int
+     */
+    public function affectingStatement($query, $bindings = [])
+    {
+        return self::narrowInt($this->run($query, $bindings, function (string $query, array $bindings): int {
+            if ($this->pretending()) {
+                return 0;
+            }
+            $affected = $this->execWrite($query, $bindings);
+            $this->recordsHaveBeenModified($affected > 0);
+            return $affected;
+        }));
+    }
+
+    /**
+     * Raw SQL with no bindings — migrations and `DB::unprepared()`.
+     *
+     * @param  string  $query
+     * @return bool
+     */
+    public function unprepared($query)
+    {
+        return self::narrowBool($this->run($query, [], function (string $query): bool {
+            if ($this->pretending()) {
+                return true;
+            }
+            $this->execWrite($query, []);
+            $this->recordsHaveBeenModified(true);
+            return true;
+        }));
+    }
+
+    /**
+     * `Connection::run()` is annotated `@return mixed` even though it hands back exactly what its
+     * callback returned. These two narrow that back, and they CHECK rather than assert: a violation
+     * can only mean Illuminate changed `run()`'s contract, which is worth a loud failure naming the
+     * fact instead of a silently wrong return type.
+     */
+    /** @return list<\stdClass> */
+    private static function narrowRows(mixed $v): array
+    {
+        if (!is_array($v)) {
+            throw new \LogicException(
+                'Ferro: Illuminate\'s Connection::run() no longer returns its callback\'s value '
+                . 'verbatim (expected array, got ' . get_debug_type($v) . ').',
+            );
+        }
+        /** @var list<\stdClass> $v */
+        return $v;
+    }
+
+    private static function narrowBool(mixed $v): bool
+    {
+        return is_bool($v) ? $v : throw new \LogicException(
+            'Ferro: Illuminate\'s Connection::run() no longer returns its callback\'s value verbatim '
+            . '(expected bool, got ' . get_debug_type($v) . ').',
+        );
+    }
+
+    private static function narrowInt(mixed $v): int
+    {
+        return is_int($v) ? $v : throw new \LogicException(
+            'Ferro: Illuminate\'s Connection::run() no longer returns its callback\'s value verbatim '
+            . '(expected int, got ' . get_debug_type($v) . ').',
+        );
+    }
+
+    /**
+     * The one place a write reaches the engine, so the fate declaration and the exception mapping
+     * are stated once.
+     *
+     * `readonly: false` is unambiguous here (unlike on {@see select}, where it needed an argument):
+     * every caller of this method is a write by Illuminate's own contract.
+     *
+     * @param array<int|string,mixed> $bindings
+     */
+    private function execWrite(string $query, array $bindings): int
+    {
+        try {
+            return $this->ferro->exec($query, array_values($bindings), readonly: false);
+        } catch (FerroException $e) {
+            throw FerroQueryException::fromFerro($e);
+        }
     }
 
     /**
