@@ -201,3 +201,33 @@ unreachable until C3 lands** — exactly the situation §14's bar was in, and th
 from the S8b close applies: report the columns that ran, name the one that could not, and do not
 restate the bar as if it were met. Whether C3 should therefore come BEFORE C2 is an open sequencing
 question, not a settled one.
+
+---
+
+## What the first C2 run actually measured (2026-09-10)
+
+Numbers and full triage: `docs/laravel-suite/2026-09-10-c2-results.md`. Three things that change how
+the rest of Phase C should be planned:
+
+**1. The runner is NOT CI-only.** The scope note above recorded "Docker's daemon is not running here,
+so the runner is CI-only exactly like its sibling". That held for the container-side reset and not
+for anything else: `FERRO_LARAVEL_SVC=psql` runs the *identical* `reset-pg.sql` through a local
+`psql`, so a box with PostgreSQL and no Docker daemon produces recordable numbers. The reset is what
+makes a number reproducible; where the client binary lives is not. Every subsequent measurement slice
+gets a same-session feedback loop it was assumed not to have.
+
+**2. The `driver` NAME is a measurement variable, so C2 records two columns.** Illuminate resolves by
+driver name, and six of upstream's own `QueryBuilderTest` cases assert nothing at all unless
+`$this->driver` is `pgsql` or `sqlsrv`. `FerroConnections::register()` now takes an opt-in alias, and
+the suite runs under both names. This is the same class of problem as the DBAL suite's `TestUtil`
+(which honoured only `driver`) — but the failure mode is the opposite and gentler: there, the wrong
+name meant a silently green run against SQLite; here it means silently *skipped* assertions. Both are
+"the harness decided something the numbers then hide".
+
+**3. The premise that most needed checking was our own tests' coverage, not upstream's shape.** Every
+structural premise about testbench held. What did not hold was the implicit assumption that
+`php/laravel`'s own passing suite meant the tier worked: the framework's suite found two defects in
+its first two runs, and both were invisible to the tier's tests *by construction* — the binding one
+because unit tests bind scalars and Eloquent binds `Carbon`, the decode one because the tier's live
+tests asserted on columns whose canonical tag is a plain scalar. **Carry this into C1e and C3: a
+tier's own green suite is evidence about the tier's tests, not about the tier.**

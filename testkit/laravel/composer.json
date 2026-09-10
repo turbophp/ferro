@@ -1,0 +1,23 @@
+{
+    "name": "ferro/laravel-suite-harness",
+    "description": "Vendor tree for the upstream Illuminate integration suite run (M2 / C2). Not shipped.",
+    "type": "project",
+    "license": "Apache-2.0",
+    "repositories": [
+        { "type": "path", "url": "../../php/laravel" },
+        { "type": "path", "url": "../../php/client" }
+    ],
+    "require": {
+        "php": ">=8.2",
+        "laravel/framework": "11.51.0",
+        "orchestra/testbench-core": "^9.0",
+        "ferro/laravel": "@dev"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.0",
+        "mockery/mockery": "^1.6"
+    },
+    "config": { "sort-packages": true },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}

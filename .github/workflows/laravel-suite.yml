@@ -1,0 +1,87 @@
+# The M2 / C2 measurement lane: run the CURATED laravel/framework database subset
+# (testkit/laravel-suite.sh) against PostgreSQL, TWICE (the two-run reproducibility rule — the
+# result line AND the ordered failure set must not differ between runs), and upload both logs.
+#
+# TWO COLUMNS, because the recorded number depends on which Illuminate `driver` NAME the application
+# registers Ferro under, and both names are real product configurations:
+#   ferro-pgsql — §15's one-word config change. The default.
+#   pgsql       — the same engine under the stock name, via `FerroConnections::register()`'s opt-in
+#                 alias. Six of upstream's own QueryBuilderTest cases gate their assertions on
+#                 `in_array($this->driver, ['pgsql','sqlsrv'])` and assert NOTHING under any other
+#                 name, so the alias column is higher for a reason that is about the harness, not
+#                 about the engine. Recording one column alone would hide that either way.
+#
+# ON DEMAND ONLY (workflow_dispatch), for the same reason as the dbal-suite lane: the bar is "green
+# modulo a recorded, triaged allow-list", so a red phpunit exit here is DATA to record, not a build
+# failure. Putting it on every push would either gate merges on a bar M2 has not reached or train
+# everyone to ignore a red check. The job FAILS only when a run died before producing a phpunit
+# result line — the contact assertion, the base-class patch check, or a ferrod that never came up.
+# That is the silent-no-op class the runner exists to refuse.
+#
+# ONLY PostgreSQL is wired, and that is not an oversight: `ferro/laravel` registers `ferro-pgsql`
+# and nothing else today. §15's bar also names MySQL and SQLite; MySQL waits on the tier registering
+# a MySQL connection, and SQLite is unreachable until the SQLite backend (C3) exists at all. Report
+# which columns ran and which could not — never restate the bar as if met.
+name: laravel-suite
+on:
+  workflow_dispatch:
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with: { php-version: "8.4", extensions: msgpack, tools: composer }
+      - uses: dtolnay/rust-toolchain@stable
+      # The testkit host port 55432 sits inside Linux's ephemeral range (32768–60999), so a
+      # transient outbound socket can be holding it when docker-proxy tries to bind — MEASURED on
+      # the sibling lane, whose first real dispatch died exactly there. Reserving the port stops the
+      # kernel handing it out; the retry covers a connection that grabbed it before the reservation.
+      - run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=55432
+      - run: |
+          docker compose -f testkit/docker-compose.yml up -d --wait pg \
+            || { sleep 15; docker compose -f testkit/docker-compose.yml up -d --wait pg; }
+      - name: measure both driver-name columns, twice each
+        run: |
+          set -o pipefail +e
+          for drv in ferro-pgsql pgsql; do
+            for run in 1 2; do
+              FERRO_LARAVEL_DRIVER="$drv" FERRO_LARAVEL_SVC=pg \
+                FERRO_LARAVEL_DSN="postgres://ferro:ferro@127.0.0.1:55432/laravel_tests" \
+                bash testkit/laravel-suite.sh 2>&1 | tee "$drv-run$run.log"
+              echo "phpunit exit: $?"
+            done
+          done
+      # The lane's OWN pass/fail: a run that never produced a result line did not measure anything.
+      # A red phpunit exit is data; a missing result line is a broken lane.
+      - name: assert every run actually measured
+        run: |
+          for f in ferro-pgsql-run1.log ferro-pgsql-run2.log pgsql-run1.log pgsql-run2.log; do
+            grep -qE '^(OK|FAILURES!|ERRORS!|Tests: )' "$f" \
+              || { echo "::error:: $f has no phpunit result line — the run died before measuring"; tail -40 "$f"; exit 1; }
+            grep -q '\[ferro\] connection=' "$f" \
+              || { echo "::error:: $f is missing the contact assertion line — it may not have reached Ferro"; exit 1; }
+            grep -q '\[ferro\] reset: ' "$f" \
+              || { echo "::error:: $f has no reset line — a number from an un-reset database is not reproducible"; exit 1; }
+          done
+          # And the column really ran under the name it claims: the contact assertion echoes the
+          # driver it resolved through, so a broken FERRO_LARAVEL_DRIVER cannot silently produce two
+          # copies of the same column.
+          grep -q '\[ferro\] connection=.* driver=ferro-pgsql ' ferro-pgsql-run1.log \
+            || { echo "::error:: the ferro-pgsql column did not run under that driver name"; exit 1; }
+          grep -q '\[ferro\] connection=.* driver=pgsql ' pgsql-run1.log \
+            || { echo "::error:: the pgsql column did not run under that driver name"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: laravel-suite-logs
+          path: |
+            ferro-pgsql-run1.log
+            ferro-pgsql-run2.log
+            pgsql-run1.log
+            pgsql-run2.log
+            .laravel-suite/ferrod.log
+      - if: always()
+        run: docker compose -f testkit/docker-compose.yml logs --no-color --tail=80 pg

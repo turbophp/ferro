@@ -1,0 +1,31 @@
+# testkit/laravel/allowlist.txt — the curated subset of laravel/framework's
+# tests/Integration/Database/ that the C2 runner executes. Paths are relative to the pinned clone.
+#
+# SMALL BY DESIGN in this first slice. The point of C2's first runner is to prove the harness
+# reaches a real engine and can migrate — not to chase a pass rate. Widening this list is the next
+# slice's job, and each addition should be a deliberate choice with its result recorded.
+#
+# DRIVER-GATED SUBDIRECTORIES ARE DELIBERATELY EXCLUDED, and the reason is worth stating rather
+# than leaving as an absence. Upstream's per-driver base classes skip on the DRIVER NAME:
+#
+#     abstract class PostgresTestCase extends DatabaseTestCase {
+#         protected function defineDatabaseMigrations() {
+#             if ($this->driver !== 'pgsql') { $this->markTestSkipped('Test requires a Postgres connection.'); }
+#         }
+#     }
+#
+# Our connection reports `ferro-pgsql`, so every test under Postgres/ (and MySql/, MariaDb/,
+# SqlServer/, Sqlite/) would SKIP — and a wall of skips reads as success while testing nothing,
+# which is the same false-green class the contact assertion exists to prevent. Including them would
+# make the number meaningless. Reaching them needs a decision recorded in PHASE-C-SCOPE.md
+# (register Ferro AS `pgsql` for the suite run, so the gate passes), and that decision is NOT made
+# here.
+#
+# Everything below is driver-agnostic: it exercises the query builder, Eloquent and the schema
+# builder through whatever connection is configured.
+
+tests/Integration/Database/DatabaseConnectionsTest.php
+tests/Integration/Database/EloquentWhereTest.php
+tests/Integration/Database/EloquentUpdateTest.php
+tests/Integration/Database/EloquentDeleteTest.php
+tests/Integration/Database/QueryBuilderTest.php
