@@ -1025,10 +1025,14 @@ async fn run_streamed_exec<B: PoolBackend>(
                     Ok(end) => {
                         let body = build_stream_terminal_body(
                             end.affected,
-                            // `StreamEnd` carries no generated key: PG (the only streaming backend)
-                            // has no LAST_INSERT_ID protocol field, and MySQL streaming is deferred
-                            // (§22.2 (n)). A streaming backend that reports one wires it HERE.
-                            None,
+                            // The generated key, when the streamed statement's backend reports one
+                            // (B2c). This was hardcoded `None` while PostgreSQL — which has no
+                            // LAST_INSERT_ID protocol field — was the only streaming backend, and
+                            // that became silently wrong the moment MySQL/MariaDB started
+                            // streaming: every streamed INSERT reported NO key, so DBAL's
+                            // `lastInsertId()` threw and Doctrine ORM's IdentityGenerator broke on
+                            // MySQL. Caught live by the driver's `LastInsertIdLiveTest`.
+                            end.last_insert_id,
                             streamed_rows,
                             end.stats.queue_us,
                             exec_us,

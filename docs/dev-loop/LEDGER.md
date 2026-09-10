@@ -199,9 +199,19 @@ the B2b-2 row above.
   the driver threw `NoIdentityValue`, which is exactly what Doctrine ORM's `IdentityGenerator`
   calls. **Nothing offline caught it** — the whole driver + client suite was green locally; only
   CI's live `LastInsertIdLiveTest::testMysqlReportsTheGeneratedKey` failed. FIXED by propagating
-  the settled terminal's key in `settleStreamTerminal`, and the missing offline guard now exists
+  the ENGINE end to end — the first fix was necessary plumbing but insufficient, and CI said so a
+  second time. **The real root cause was in `ferrod`:** `build_stream_terminal_body` has always had a
+  `last_insert_id` slot, but `run_streamed_exec` hardcoded `None` into it, with a comment saying "a
+  streaming backend that reports one wires it HERE" — correct while PostgreSQL (no such protocol
+  field) was the only streaming backend, silently wrong the moment MySQL streamed. MySQL's own
+  `stream::open` also discarded the key as `_lii`. So `PoolBackend::reclaim_stream` now returns a
+  `Reclaimed { affected, last_insert_id }` instead of a bare `u64`, `StreamEnd` carries the key, the
+  MySQL `NoRows` arm (which is the INSERT shape) keeps it, and the producer sends it. The offline
+  guard now exists
   (`RawStreamTest::testAStreamedStatementsGeneratedKeyReachesTheConnection`, mutation-proven:
-  removing the propagation fails it with the exact CI signature). **Known asymmetry left
+  removing the propagation fails it with the exact CI signature), plus an ENGINE-level live guard
+  (`mysql_it.rs::mysql_streamed_insert_reports_its_generated_key`) asserting the key on the terminal
+  itself. **Known asymmetry left
   deliberately:** the typed `stream()` generator still does not propagate, because it never
   decodes the Ok terminal body at all — widening it is a behavior change to a public read API,
   out of scope for a regression fix, and its own docs already say it reports no key.
