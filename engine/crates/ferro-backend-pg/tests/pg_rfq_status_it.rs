@@ -32,6 +32,42 @@ fn test_url() -> Option<String> {
     }
 }
 
+/// Wait (bounded) for `transaction_status()` to reach `want`, then return it.
+///
+/// **This is not sleeping past a flake; it is synchronising on a protocol event the client API
+/// gives no other handle for**, and only the ERROR path needs it. `batch_execute` resolves its
+/// future at `ErrorResponse`, which the backend sends BEFORE the trailing `ReadyForQuery` — so on
+/// an Err the atomic has not necessarily been written yet, and the byte read at that instant is the
+/// PREVIOUS statement's. `Client::transaction_status`'s own docblock states the precondition
+/// exactly ("callers ... fully drain each statement before returning"), and an errored
+/// `batch_execute` is the one case that does not.
+///
+/// MEASURED: asserting `b'E'` immediately after the error reproduces at roughly 1 run in 40 —
+/// reading `b'T'`, the byte the preceding `BEGIN` left — and it is what turned `main` red at
+/// bbf99ff. **The engine is unaffected, and knowingly so:** every instrumented `Checkout` method
+/// forces `tx_open`/`tainted` unconditionally on its Err arm precisely because "the RFQ atomic is
+/// stale-UNTRUSTWORTHY" there (`ferro_pool::pool`, the Rule A fail-safe). Only this test, which
+/// goes at the raw `Client` deliberately, ever reads the byte on an Err path.
+///
+/// The claim being tested is therefore unchanged in substance and now true in timing: the server
+/// DID report `E`. A byte that never arrives still fails, loudly, with what was seen instead.
+async fn await_tx_status(client: &tokio_postgres::Client, want: u8, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = client.transaction_status();
+        if got == want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: expected RFQ status {:?}, still {:?} after 5s",
+            want as char,
+            got as char,
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 fn config(max_size: usize) -> PoolConfig {
     PoolConfig {
         max_size,
@@ -86,11 +122,12 @@ async fn transaction_status_tracks_rfq_i_t_e() {
         div_by_zero.is_err(),
         "division by zero must error the statement"
     );
-    assert_eq!(
-        co.conn().client.transaction_status(),
+    await_tx_status(
+        &co.conn().client,
         b'E',
-        "a failed statement inside an open tx -> RFQ status 'E'"
-    );
+        "a failed statement inside an open tx -> RFQ status 'E'",
+    )
+    .await;
 
     // ROLLBACK clears the failed transaction back to idle.
     co.conn_mut()
