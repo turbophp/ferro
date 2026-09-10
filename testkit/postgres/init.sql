@@ -13,3 +13,10 @@ INSERT INTO ferro_smoke (id, note) VALUES (1, 'hello'), (2, 'world');
 -- SPEC §12 / D8); `testkit/dbal-suite.sh` resets it container-side before every recorded run.
 SELECT 'CREATE DATABASE doctrine_tests OWNER ferro'
  WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'doctrine_tests') \gexec
+
+-- M2 / C2: the same treatment for the Illuminate (Laravel) integration suite. Its own database for
+-- the same reason as `doctrine_tests` above — a framework suite creates and abandons its own
+-- tables, and nothing would ever clean them out of the shared `ferro` one. Reset happens
+-- container-side before a recorded run, never from PHP (SPEC §12 / D8).
+SELECT 'CREATE DATABASE laravel_tests OWNER ferro'
+ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'laravel_tests') \gexec
