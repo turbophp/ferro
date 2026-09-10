@@ -1,5 +1,20 @@
 # Follow-up: the PG bind matrix refuses `I64 → float8` and `I64 → numeric`
 
+> **RESOLVED (M2-C2b, 2026-09-10).** Both widenings shipped in `PgInt`, SPEC §22.2 (an), exactly as
+> designed below: `NUMERIC` with **no value gate** (arbitrary-precision, so an `i64`'s decimal
+> rendering is exact at every magnitude, sent `Format::Text`) and `FLOAT8` **gated on exact
+> representability** (refused pre-send otherwise, naming both routes out). `FLOAT4` was deliberately
+> NOT widened — no measured caller, per the §22.2 (af) membership rule. `accepts` / `to_sql` /
+> `encode_format` moved in one edit; the directional lockstep proof's `every_variant` fixture gained
+> `2^53` and `2^53 + 1`, and **that growth is mutation-proven load-bearing**: with the `to_sql`
+> backstop mutated stricter than the gate the proof goes RED, and removing just those two fixture
+> entries turns it green over the same bug. One correction to the design below: the gate could NOT
+> be written as the obvious `(n as f64) as i64 == n`, because Rust's float→int `as` cast saturates
+> and so reports TRUE for `i64::MAX` — it compares through `i128`. Proven live against PG 17 with PG
+> itself as the oracle. Suite effect measured, and it matched the prediction exactly: **65/71** under
+> `ferro-pgsql` and **71/71** under the `pgsql` alias.
+
+
 **Found:** M2-C2, by the upstream `laravel/framework v11.51.0` integration subset — 3 PostgreSQL
 tests, and they are the ONLY non-passing tests in that subset once the driver-name artifacts are
 accounted for.

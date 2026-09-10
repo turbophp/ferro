@@ -427,6 +427,27 @@ impl ToSql for PgInt {
             // M1-S9: the decimal rendering, verbatim, in TEXT format (see `encode_format`).
             out.extend_from_slice(self.0.to_string().as_bytes());
             Ok(IsNull::No)
+        } else if *base == Type::NUMERIC {
+            // M2-C2: `numeric` is arbitrary-precision, so an i64's decimal rendering is EXACT at
+            // every magnitude and needs no value gate. Written as canonical text (see
+            // `encode_format`), the same shape `PgDecimalText` writes.
+            out.extend_from_slice(self.0.to_string().as_bytes());
+            Ok(IsNull::No)
+        } else if *base == Type::FLOAT8 {
+            // M2-C2: exact only to 2^53. The pre-flight refused everything past that already; this
+            // arm is the totality backstop for a caller that skipped it, and it must MATCH the
+            // gate exactly — a backstop looser than the pre-flight would let a silent rounding
+            // through, one stricter would break the directional lockstep proof.
+            if i64_is_exact_as_f64(self.0) {
+                (self.0 as f64).to_sql(base, out)
+            } else {
+                Err(format!(
+                    "PgInt cannot bind {} to PG type float8 (it is not exactly representable as an \
+                     f64 and would round silently)",
+                    self.0
+                )
+                .into())
+            }
         } else if *base == Type::BOOL {
             // M1-S9: only the two values with a boolean MEANING. The pre-flight refused everything
             // else already; this arm is the totality backstop for a caller that skipped it.
@@ -445,14 +466,26 @@ impl ToSql for PgInt {
 
     fn accepts(ty: &Type) -> bool {
         let base = resolve_domain(ty);
-        [Type::INT2, Type::INT4, Type::INT8, Type::TEXT, Type::BOOL].contains(base)
+        [
+            Type::INT2,
+            Type::INT4,
+            Type::INT8,
+            Type::TEXT,
+            Type::BOOL,
+            // M2-C2, measured targets only (the §22.2 (af) membership rule).
+            Type::NUMERIC,
+            Type::FLOAT8,
+        ]
+        .contains(base)
     }
 
-    /// TEXT format for the `text` target only; every other target keeps the native BINARY form its
-    /// delegated encoder writes. Resolves the domain for the same reason `to_sql` does: the format
-    /// must be decided by the encoder that actually runs (see [`PgText::encode_format`]).
+    /// TEXT format for the two targets whose encoder above writes canonical text (`text` and
+    /// `numeric`); every other target keeps the native BINARY form its delegated encoder writes.
+    /// Resolves the domain for the same reason `to_sql` does: the format must be decided by the
+    /// encoder that actually runs (see [`PgText::encode_format`]).
     fn encode_format(&self, ty: &Type) -> Format {
-        if *resolve_domain(ty) == Type::TEXT {
+        let base = resolve_domain(ty);
+        if *base == Type::TEXT || *base == Type::NUMERIC {
             Format::Text
         } else {
             Format::Binary
@@ -715,6 +748,22 @@ pub fn check_param(v: &Value, ty: &Type) -> Result<(), String> {
 /// Spelled with `==` rather than constant patterns: `match (v, *ty)` is E0507 (`Type` is not
 /// `Copy`), and `Type` is a non-structural type, so equality is both the compiling and the durable
 /// form (hazard 57).
+/// Whether an `i64` survives a round trip through `f64` unchanged (M2-C2).
+///
+/// Spelled as the round trip rather than as a `|n| <= 2^53` magnitude bound, because the two are
+/// NOT the same predicate: every even integer above 2^53 is exactly representable too (and every
+/// multiple of 4 above 2^54, and so on), so a magnitude bound would refuse binds that are provably
+/// lossless. `i64::MIN` needs no special case here either, where an `abs()` would overflow.
+///
+/// **The comparison goes back through `i128`, and that is load-bearing.** Rust's float→int `as`
+/// cast SATURATES, so `(i64::MAX as f64) as i64` is `i64::MAX` again — the round trip appears to
+/// succeed for the one value most obviously not representable (`i64::MAX as f64` is 2^63, one past
+/// it). Widening to `i128` puts the true value inside the destination range, so the inequality is
+/// the real one. Every `i64` maps to a finite `f64`, so there is nothing further to check.
+fn i64_is_exact_as_f64(n: i64) -> bool {
+    ((n as f64) as i128) == i128::from(n)
+}
+
 fn check_range(v: &Value, ty: &Type) -> Result<(), String> {
     match v {
         Value::I64(n) => {
@@ -735,6 +784,23 @@ fn check_range(v: &Value, ty: &Type) -> Result<(), String> {
             // boolean meaning is the §9.1 coercion class, refused pre-send with the actionable
             // routes named. (PG's own text input would refuse '5' too — 22P02 — but server-side
             // and after the statement was sent; this keeps the fate KNOWN.)
+            // M2-C2: the VALUE half of the I64→float8 widening. `numeric` needs no mirror arm —
+            // it is arbitrary-precision, so the decimal rendering is exact at every magnitude.
+            //
+            // This is STRICTER than `pdo_pgsql`, deliberately and for the reason §9.1 exists: PDO
+            // sends the decimal text and PostgreSQL rounds it without a word, so a `bigint` id
+            // past 2^53 lands in a `double precision` column one or more apart from what was
+            // written. That is the same silent-corrupt-write class the `F64 → float4` arms below
+            // already refuse in both directions; refusing it here keeps the fate KNOWN (pre-send,
+            // never `Indeterminate`) and names the two real routes out.
+            if *ty == Type::FLOAT8 && !i64_is_exact_as_f64(*n) {
+                return Err(format!(
+                    "canonical I64 value {n} cannot bind to PG type float8: it is not exactly \
+                     representable as an f64 (|n| > 2^53), so the write would silently round — \
+                     bind an F64 if that rounding is intended, or use a numeric/decimal column if \
+                     it is not (pre-send rejection: the statement was never executed)"
+                ));
+            }
             if *ty == Type::BOOL && *n != 0 && *n != 1 {
                 return Err(format!(
                     "canonical I64 value {n} cannot bind to PG type bool: only 0 and 1 have a \
@@ -908,12 +974,128 @@ mod tests {
         // `s9_i64_binds_text_and_bool_like_libpq` (I64 now binds both, bool value-gated to 0/1);
         // the F64 half is UNCHANGED and keeps asserting both, because no measured caller binds a
         // float into either and unmeasured widening is how a pre-flight rots.
-        for ty in [Type::NUMERIC, Type::DATE, Type::TIMESTAMP, Type::UUID] {
+        for ty in [Type::DATE, Type::TIMESTAMP, Type::UUID] {
             assert!(!accepts(&Value::I64(42), &ty), "I64 must not bind {ty:?}");
             assert!(!accepts(&Value::F64(1.5), &ty), "F64 must not bind {ty:?}");
         }
-        for ty in [Type::TEXT, Type::BOOL] {
+        // M2-C2 REPOINTED `NUMERIC` out of the list above for the I64 half only, exactly as M1-S9
+        // repointed `TEXT`/`BOOL` — see `c2_i64_binds_numeric_and_float8_like_libpq`. The F64 half
+        // is UNCHANGED here and in the `TEXT`/`BOOL` loop below, because no measured caller binds a
+        // float into any of the three and unmeasured widening is how a pre-flight rots.
+        for ty in [Type::TEXT, Type::BOOL, Type::NUMERIC] {
             assert!(!accepts(&Value::F64(1.5), &ty), "F64 must not bind {ty:?}");
+        }
+        // ...and the I64 arms stay narrow where nothing measured reaches: `float4` in particular.
+        // Laravel's `$table->float()` compiles to `double precision` on PostgreSQL, so `real` has
+        // no caller, and the S9 membership rule names the exact Type or leaves it out.
+        assert!(
+            !accepts(&Value::I64(42), &Type::FLOAT4),
+            "I64 must not bind float4 — no measured caller"
+        );
+    }
+
+    /// **M2-C2: `I64 → numeric` and `I64 → float8`** — the last three non-passing tests in the
+    /// `laravel/framework` v11.51.0 integration subset, and the direct continuation of S9's
+    /// `I64 → text`/`bool` widening under the same membership rule (widen only what is MEASURED,
+    /// name the exact `Type`).
+    ///
+    /// `numeric` because PostgreSQL types `extract(year from …)` as `numeric` (it changed from
+    /// `double precision` in PG 14) and Laravel's stock grammar compiles `whereYear` to exactly
+    /// that; `float8` because `$table->float()` compiles to `double precision` and
+    /// `insert(['wallet_1' => 100])` is what anyone writes for a round amount.
+    ///
+    /// The two carry DIFFERENT value handling, which is the whole design: `numeric` is
+    /// arbitrary-precision and therefore exact at every magnitude, while `float8` is exact only
+    /// where the value round-trips — so `float8` gets a pre-send gate and `numeric` gets none.
+    #[test]
+    fn c2_i64_binds_numeric_and_float8_like_libpq() {
+        // `numeric`: every magnitude, including the ones float8 refuses.
+        for n in [0, 42, -42, i64::MIN, i64::MAX, (1_i64 << 53) + 1] {
+            assert!(
+                accepts(&Value::I64(n), &Type::NUMERIC),
+                "numeric is arbitrary-precision, so {n} must bind"
+            );
+        }
+        // `float8`: the exactly-representable magnitudes bind...
+        for n in [0, 42, -42, 1_i64 << 53, -(1_i64 << 53), 1_i64 << 62] {
+            assert!(
+                accepts(&Value::I64(n), &Type::FLOAT8),
+                "{n} round-trips through f64, so it must bind"
+            );
+        }
+        // ...and the ones that would silently ROUND are refused PRE-SEND, with the value, the
+        // reason and both actionable routes named.
+        for n in [(1_i64 << 53) + 1, i64::MAX, i64::MIN + 1] {
+            let why = check_param(&Value::I64(n), &Type::FLOAT8).unwrap_err();
+            assert!(why.contains(&n.to_string()), "names the value: {why}");
+            assert!(why.contains("float8"), "names the target: {why}");
+            assert!(why.contains("round"), "names the harm: {why}");
+            assert!(
+                why.contains("never executed"),
+                "says the fate is KNOWN, not Indeterminate: {why}"
+            );
+            // ...and the boxed impl refuses it too, so the pre-flight is STRICTER-or-equal rather
+            // than the only thing standing between a caller and a silent rounding.
+            let boxed = value_to_boxed(&Value::I64(n));
+            let mut buf = tokio_postgres::types::private::BytesMut::new();
+            assert!(
+                boxed.to_sql_checked(&Type::FLOAT8, &mut buf).is_err(),
+                "the boxed impl must refuse {n} against float8 too"
+            );
+        }
+        // `i64::MIN` is EXACTLY representable (it is -2^63, a power of two), which is why the
+        // refused list above uses `MIN + 1`. Asserted so a future "just use |n| <= 2^53" rewrite
+        // has to notice that it would break this.
+        assert!(accepts(&Value::I64(i64::MIN), &Type::FLOAT8));
+
+        // The FORMAT split: `numeric` rides canonical TEXT (PG parses the decimal rendering
+        // itself), `float8` rides the native BINARY form its delegated encoder writes.
+        assert!(matches!(
+            PgInt(42).encode_format(&Type::NUMERIC),
+            Format::Text
+        ));
+        assert!(matches!(
+            PgInt(42).encode_format(&Type::FLOAT8),
+            Format::Binary
+        ));
+        assert!(matches!(
+            PgInt(42).encode_format(&Type::INT8),
+            Format::Binary
+        ));
+
+        // And the BYTES, so a format change cannot pass unnoticed.
+        let mut num = tokio_postgres::types::private::BytesMut::new();
+        PgInt(-1234).to_sql(&Type::NUMERIC, &mut num).unwrap();
+        assert_eq!(
+            &num[..],
+            b"-1234",
+            "numeric is the decimal rendering, verbatim"
+        );
+        let mut f = tokio_postgres::types::private::BytesMut::new();
+        PgInt(42).to_sql(&Type::FLOAT8, &mut f).unwrap();
+        let mut expect = tokio_postgres::types::private::BytesMut::new();
+        42.0_f64.to_sql(&Type::FLOAT8, &mut expect).unwrap();
+        assert_eq!(&f[..], &expect[..], "float8 is the native binary f64");
+    }
+
+    /// The exactness predicate itself, and specifically the trap it is written to avoid: Rust's
+    /// float→int `as` cast SATURATES, so the obvious `(n as f64) as i64 == n` reports TRUE for
+    /// `i64::MAX` — the one value most obviously not representable. Mutation check: swap the
+    /// `i128` comparison in `i64_is_exact_as_f64` for an `i64` one and the `i64::MAX` case below
+    /// goes red while every other case stays green.
+    #[test]
+    fn c2_the_exactness_predicate_is_not_fooled_by_a_saturating_cast() {
+        assert!(!i64_is_exact_as_f64(i64::MAX));
+        assert!(i64_is_exact_as_f64(i64::MIN), "-2^63 is a power of two");
+        assert!(i64_is_exact_as_f64(1_i64 << 53));
+        assert!(!i64_is_exact_as_f64((1_i64 << 53) + 1));
+        // Above 2^53 the even integers are still exact — which is why the gate is a round trip and
+        // not a magnitude bound.
+        assert!(i64_is_exact_as_f64((1_i64 << 53) + 2));
+        assert!(!i64_is_exact_as_f64((1_i64 << 54) + 2));
+        assert!(i64_is_exact_as_f64((1_i64 << 54) + 4));
+        for n in [0, 1, -1, 42, -42, (1_i64 << 53) - 1] {
+            assert!(i64_is_exact_as_f64(n), "{n} is small enough to be exact");
         }
     }
 
@@ -1351,6 +1533,16 @@ mod tests {
             Value::I64(i64::MAX),
             Value::I64(i64::from(i32::MAX) + 1),
             Value::I64(i64::from(i16::MAX) + 1),
+            // M2-C2: the two magnitudes the I64→float8 EXACTNESS gate turns on, and the same
+            // structural reason the `I64(1)` entry above exists — the lockstep proof `continue`s
+            // past every pair the value-aware pre-flight refuses, so a value gate with no
+            // accept-side fixture value is never exercised at all. `2^53` is the largest integer
+            // every smaller integer is also representable below, and binds; `2^53 + 1` is the
+            // smallest that does NOT round-trip, and is refused pre-send. (`i64::MAX` above is
+            // refused too, and is the value that proves the gate cannot be written with a
+            // saturating `as i64` round trip — see `i64_is_exact_as_f64`.)
+            Value::I64(1_i64 << 53),
+            Value::I64((1_i64 << 53) + 1),
             Value::F64(1.5),
             Value::F64(1e39),
             // The UNDERFLOW magnitude (Task 4 review). NB it cannot catch the semantic hole it was

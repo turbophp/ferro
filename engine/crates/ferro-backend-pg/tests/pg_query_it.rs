@@ -419,3 +419,90 @@ async fn a_real_pg_server_error_carries_no_errno() {
         other => panic!("expected a known-fate Sql error, got {other:?}"),
     }
 }
+
+/// **M2-C2: an `I64` binds a `numeric` and a `double precision` slot, against real PostgreSQL.**
+///
+/// The two shapes are the last three non-passing tests of the `laravel/framework` v11.51.0
+/// integration subset, and they are ordinary stock-framework SQL rather than edge cases:
+/// `where extract(year from ts) = ?` (PostgreSQL types `extract` as `numeric` since PG 14) and an
+/// insert of a PHP `int` into the `double precision` column `$table->float()` compiles to.
+///
+/// **PG is the oracle, not a hand-written expectation.** Each bound value is read back through
+/// `::text` in the same statement, so what is compared is what PostgreSQL actually stored — the
+/// same discipline `pg_types_it.rs` uses, and the reason a wrong wire FORMAT (text vs binary, which
+/// this widening splits between the two targets) cannot pass as green here.
+#[tokio::test(flavor = "multi_thread")]
+async fn c2_i64_binds_numeric_and_float8_live() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    // `numeric` is arbitrary-precision, so even a magnitude float8 refuses is EXACT here.
+    let rows = co
+        .query(
+            "SELECT ($1::numeric)::text, ($2::numeric)::text, ($3::float8)::text",
+            &[Value::I64(2026), Value::I64(i64::MAX), Value::I64(100)],
+        )
+        .await
+        .expect("an I64 must bind both a numeric and a float8 slot");
+    assert_eq!(rows.rows.len(), 1);
+    let r = &rows.rows[0];
+    assert_eq!(r[0], Value::Text("2026".into()));
+    assert_eq!(
+        r[1],
+        Value::Text(i64::MAX.to_string()),
+        "numeric keeps every digit — this is what makes it need no value gate"
+    );
+    assert_eq!(r[2], Value::Text("100".into()));
+
+    // The shape the suite actually failed on, end to end: `extract(...)` really is `numeric`.
+    let rows = co
+        .query(
+            "SELECT count(*) FROM (SELECT timestamp '2018-01-02 03:04:05' AS c) t \
+             WHERE extract(year from t.c) = $1",
+            &[Value::I64(2018)],
+        )
+        .await
+        .expect("whereYear's compiled form must bind");
+    assert_eq!(rows.rows[0][0], Value::I64(1));
+
+    // ...and the boundary of the float8 exactness gate, both sides, against the real server.
+    //
+    // The oracle is PG's OWN rendering of the same literal in the same statement, not a written-out
+    // string: `float8`'s text output is shortest-round-trip and uses scientific notation at this
+    // magnitude (`9.007199254740992e+15`), so a hand-written expectation would encode this server's
+    // float formatting rather than whether the bind was lossless.
+    let rows = co
+        .query(
+            "SELECT ($1::float8)::text, (9007199254740992::float8)::text,              $1::float8 = 9007199254740992::float8",
+            &[Value::I64(1_i64 << 53)],
+        )
+        .await
+        .expect("2^53 round-trips through f64, so it must bind");
+    assert_eq!(
+        rows.rows[0][0], rows.rows[0][1],
+        "the bound value must render identically to the literal PG parsed itself"
+    );
+    assert_eq!(rows.rows[0][2], Value::Bool(true));
+
+    let err = co
+        .query("SELECT $1::float8", &[Value::I64((1_i64 << 53) + 1)])
+        .await
+        .expect_err("2^53 + 1 would silently round, so it must be refused");
+    // PRE-SEND and known-fate: a Sql error carrying the pre-flight's own message, never the
+    // transport-shaped ConnectionLost that a `to_sql` failure would be misclassified as (§19.3).
+    match err {
+        PoolError::Sql { ref message, .. } => {
+            assert!(
+                message.contains("float8") && message.contains("never executed"),
+                "the refusal must name the target and say the statement never ran: {message}"
+            );
+        }
+        other => panic!("expected a known-fate Sql refusal, got {other:?}"),
+    }
+    // The connection is still usable — a pre-send refusal touches nothing.
+    let rows = co.query("SELECT 1", &[]).await.expect("still usable");
+    assert_eq!(rows.rows[0][0], Value::I64(1));
+}
