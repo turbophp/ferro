@@ -373,6 +373,146 @@ async fn mysql_autocommit_stream_delivers_rows_and_the_session_survives() {
     }
 }
 
+/// **FB-4 (dev-loop ledger) — the end-to-end abandonment proof for a MySQL OWNING stream.**
+///
+/// B2b-2b gave MySQL a conn-owning `RowStream` and opened this gap in the same change: every link
+/// in the abandonment chain was tested (the parked-conn contract live on both engines in
+/// `conn_it.rs`; the pool's discard in `ferro-pool`'s `query_stream.rs`) but nothing drove the
+/// WHOLE path on MySQL the way `stream_it.rs::abandonment_recovery_after_cancel` does for
+/// PostgreSQL. Criterion (c) — "an abandoned owning stream ⇒ the connection is discarded, never
+/// recycled" — was therefore proven by construction plus unit coverage, not end to end.
+///
+/// It matters more after M2/S3 than when it was filed: S3 moved the empty-prepared-list arm onto
+/// the owning route too, so MORE statements now park their connection than when FB-4 was written.
+///
+/// The chain under test: abandon mid-flight → the moved-out `Conn` is dropped with the stream →
+/// the `MysqlConn` wrapper is left PARKED → parked reads `is_closed`-dead → the pool DISCARDS the
+/// husk instead of recycling a connection whose session is gone. What proves it from outside is
+/// the LAST step: a fresh request on the same session must get its own clean reply. If a husk were
+/// recycled, that request would land on a dead or mid-protocol connection.
+///
+/// **Withholding credit after the CANCEL is what makes this self-proving** (the PG original's
+/// reasoning, and it holds here): if the CANCEL were silently ignored, the remaining rows could
+/// never be sent without further `WINDOW_UPDATE`s, so the drain loop would stall until `recv()`
+/// times out — a hard failure, never a false-green `Ok`.
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_abandoned_stream_recovers_and_the_session_survives() {
+    for (label, url) in mysql_targets() {
+        tokio::time::timeout(Duration::from_secs(60), async move {
+            // A 2-frame credit window, so a multi-frame result must park and resume repeatedly and
+            // the cancel lands genuinely mid-stream rather than after a single batch.
+            let server = common::stream_server(url, 2);
+            let mut client = server.connect().await;
+            client.hello(1).await;
+
+            let rid = 60;
+            let mut r = req(ABANDON_SQL);
+            r.fetch = FETCH_STREAM;
+            client
+                .send_request(rid, service::SQL, method_sql::EXEC, r.encode())
+                .await;
+
+            let f_head = client.recv().await;
+            let hplen = f_head.header.payload_len;
+            assert!(
+                matches!(classify(&f_head, rid), SFrame::Head),
+                "[{label}] the first frame is HEAD"
+            );
+            client.window_update(rid, 1, hplen).await;
+
+            // Take a few DATA frames, replenishing, so the producer is genuinely mid-stream.
+            let mut rows_seen = 0usize;
+            let mut data_before_cancel = 0u32;
+            while data_before_cancel < 2 {
+                let frame = client.recv().await;
+                let plen = frame.header.payload_len;
+                match classify(&frame, rid) {
+                    SFrame::Data(batch) => {
+                        rows_seen += batch.len();
+                        data_before_cancel += 1;
+                        client.window_update(rid, 1, plen).await;
+                    }
+                    SFrame::End(_) => {
+                        panic!("[{label}] the stream ended before it could be abandoned")
+                    }
+                    SFrame::Head => panic!("[{label}] a second HEAD is a protocol violation"),
+                }
+            }
+
+            // ABANDON: cancel, then drain to the ONE terminal granting NO further credit.
+            client.cancel(rid).await;
+            let terminal = loop {
+                let frame = client.recv().await;
+                match classify(&frame, rid) {
+                    SFrame::Data(batch) => rows_seen += batch.len(),
+                    SFrame::Head => panic!("[{label}] a second HEAD after cancel"),
+                    SFrame::End(o) => break o,
+                }
+            };
+
+            // TRUNCATION: the cancel cut it far short of the full result.
+            assert!(
+                rows_seen < ABANDON_ROWS / 5,
+                "[{label}] CANCEL must truncate the stream far short of {ABANDON_ROWS} rows when no \
+                 further credit is granted; got {rows_seen} — the CANCEL is not gating the producer"
+            );
+
+            // Exactly one terminal, and a cancelled READ is never Indeterminate. `Ok` stays legal
+            // for the benign race where the drain completed just before the cancel routed — the
+            // truncation assertion above already rules out a full drain reaching that arm.
+            match &terminal {
+                Outcome::Error(ep) => assert_eq!(
+                    ep.code,
+                    errc::CANCELLED,
+                    "[{label}] a cancelled streamed read reports Cancelled (57014)"
+                ),
+                Outcome::Ok(_) | Outcome::Cancelled => {}
+            }
+            assert!(
+                client
+                    .recv_or_none(Duration::from_millis(250))
+                    .await
+                    .is_none(),
+                "[{label}] nothing may follow the terminal (charter rule 4: exactly one END)"
+            );
+
+            // THE FB-4 ASSERTION. A fresh request on the SAME session gets its own clean reply:
+            // the wire re-framed, and the pool did NOT hand back the abandoned connection's husk.
+            let ok = exec_ok(&mut client, 61, &req("SELECT 42")).await;
+            assert_eq!(
+                first_i64(&ok),
+                42,
+                "[{label}] the post-abandonment request gets its own reply — no wire desync, and \
+                 the discarded husk was replaced rather than recycled"
+            );
+            common::assert_session_alive(&mut client, 0xFB4).await;
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("[{label}] cancel + drain + a fresh request on the same session must not hang")
+        });
+    }
+}
+
+/// The abandonment fixture's full row count: 900 x 30 = 27000, i.e. ~27 DATA frames at the
+/// producer's 1024-rows-per-frame default. Large enough that a cancel after two frames is
+/// unmistakably a truncation.
+const ABANDON_ROWS: usize = 27_000;
+
+/// A multi-frame fixture that needs no table and no session state, and runs UNMODIFIED on both
+/// engines.
+///
+/// Volume comes from a CROSS JOIN rather than from deep recursion, and that is the portable part:
+/// MySQL 8 caps a recursive CTE at `cte_max_recursion_depth` (default 1000) while MariaDB uses a
+/// different knob entirely (`max_recursive_iterations`) — the constraint `stream_recovery_it.rs`
+/// already records, which is why its own fixture stops at 900. Raising either limit would mean a
+/// session `SET` (pooled session state, §7.1 — it would taint the connection) or MySQL's `SET_VAR`
+/// optimizer hint, which MariaDB does not implement. Two shallow CTEs multiplied together need
+/// neither.
+const ABANDON_SQL: &str = "WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM seq \
+                           WHERE n < 900), mul AS (SELECT 1 AS m UNION ALL SELECT m + 1 FROM mul \
+                           WHERE m < 30) SELECT s.n FROM seq s CROSS JOIN mul";
+
 /// Create a stored procedure over a RAW driver connection, on the TEXT protocol.
 ///
 /// `CREATE PROCEDURE` cannot be PREPARED on MySQL (errno 1295), and every user statement ferrod
