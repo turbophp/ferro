@@ -756,7 +756,7 @@ impl PoolBackend for FakeBackend {
         &self,
         conn: &mut Self::Conn,
         rows: Self::RowStream,
-    ) -> Result<u64, PoolError> {
+    ) -> Result<crate::backend::Reclaimed, PoolError> {
         if self.reclaim_fail.load(Ordering::SeqCst) {
             conn.closed = true;
             return Err(PoolError::ConnectionLost);
@@ -768,7 +768,10 @@ impl PoolBackend for FakeBackend {
         if let Some(notify) = hang {
             notify.notified().await;
         }
-        Ok(rows.rows_affected())
+        Ok(crate::backend::Reclaimed {
+            affected: rows.rows_affected(),
+            last_insert_id: None,
+        })
     }
 }
 

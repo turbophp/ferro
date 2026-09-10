@@ -373,6 +373,57 @@ async fn mysql_autocommit_stream_delivers_rows_and_the_session_survives() {
     }
 }
 
+/// **A streamed INSERT reports its AUTO_INCREMENT key** — the engine-level guard for the B2c
+/// regression that CI caught and no offline gate could see.
+///
+/// `build_stream_terminal_body` has always had a `last_insert_id` slot, but the producer hardcoded
+/// `None` into it — correct while PostgreSQL, which has no such protocol field, was the only
+/// streaming backend, and silently wrong the moment MySQL/MariaDB started streaming. The visible
+/// consequence was that `Doctrine\DBAL\Connection::lastInsertId()` threw `NoIdentityValue` on every
+/// streamed INSERT, which is what Doctrine ORM's `IdentityGenerator` calls on every insert.
+///
+/// Asserted on the TERMINAL rather than through the driver, because that is where the value either
+/// exists or does not: an INSERT takes the no-result-set path (`MysqlRowStream::NoRows`), so this
+/// also pins that the key survives the arm that never parks the connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_streamed_insert_reports_its_generated_key() {
+    for (label, url) in mysql_targets() {
+        let server = common::exec_server(url);
+        let mut client = server.connect().await;
+        client.hello(1).await;
+
+        exec_ok(&mut client, 40, &ddl("DROP TABLE IF EXISTS b2c_lid")).await;
+        exec_ok(
+            &mut client,
+            41,
+            &ddl("CREATE TABLE b2c_lid (id BIGINT AUTO_INCREMENT PRIMARY KEY, n INT)"),
+        )
+        .await;
+
+        // The INSERT rides `fetch:stream` — the shape the DBAL driver now sends for every
+        // parameterised statement.
+        let mut r = ddl("INSERT INTO b2c_lid (n) VALUES (7)");
+        r.fetch = FETCH_STREAM;
+        let (rows, outcome) = drain_stream(&mut client, 42, &r).await;
+        assert!(rows.is_empty(), "[{label}] an INSERT streams no rows");
+
+        let Outcome::Ok(body) = outcome else {
+            panic!("[{label}] a streamed INSERT must end Ok, got {outcome:?}");
+        };
+        let ok = ferro_proto::messages::sql::ExecOk::decode(&body).expect("decode terminal ExecOk");
+        assert_eq!(ok.affected, 1, "[{label}] one row inserted");
+        assert!(
+            matches!(ok.last_insert_id, Some(Value::U64(n)) if n > 0)
+                || matches!(ok.last_insert_id, Some(Value::I64(n)) if n > 0),
+            "[{label}] the streamed terminal MUST carry the AUTO_INCREMENT key — this is what \
+             lastInsertId() reads; got {:?}",
+            ok.last_insert_id
+        );
+
+        exec_ok(&mut client, 43, &ddl("DROP TABLE b2c_lid")).await;
+    }
+}
+
 /// The tx-scoped arm streams off the SAME `supports_row_streaming()` authority, on the PINNED
 /// connection — and the transaction is still intact afterwards.
 ///

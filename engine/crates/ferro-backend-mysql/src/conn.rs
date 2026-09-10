@@ -444,7 +444,7 @@ impl PoolBackend for MysqlBackend {
         &self,
         conn: &mut Self::Conn,
         rows: Self::RowStream,
-    ) -> Result<u64, PoolError> {
+    ) -> Result<ferro_pool::backend::Reclaimed, PoolError> {
         crate::stream::reclaim(conn, rows).await
     }
 }

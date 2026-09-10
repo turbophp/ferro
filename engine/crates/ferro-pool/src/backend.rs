@@ -283,8 +283,9 @@ pub trait PoolBackend: Send + Sync + 'static {
     /// PREVIOUS statement's ok-packet).
     ///
     /// **Default: the stream does not own the conn** (PG's is channel-backed, the fake's is a
-    /// scripted `Vec`) — return the stream's post-drain `rows_affected()`, exactly what `finish`
-    /// read before this hook existed. Zero behavior change for those backends.
+    /// scripted `Vec`) — return the stream's post-drain `rows_affected()` and NO generated key,
+    /// exactly what `finish` read before this hook existed. Zero behavior change for those
+    /// backends: Postgres has no generated-key protocol field at all.
     ///
     /// An `Err` means the connection could NOT be restored. The contract on that arm: the backend
     /// MUST leave `conn` in a state its [`PoolBackend::is_closed`] reports dead, and `finish`
@@ -295,9 +296,31 @@ pub trait PoolBackend: Send + Sync + 'static {
         &self,
         _conn: &mut Self::Conn,
         rows: Self::RowStream,
-    ) -> Result<u64, PoolError> {
-        Ok(rows.rows_affected())
+    ) -> Result<Reclaimed, PoolError> {
+        Ok(Reclaimed {
+            affected: rows.rows_affected(),
+            last_insert_id: None,
+        })
     }
+}
+
+/// What [`PoolBackend::reclaim_stream`] recovers from a drained stream (B2c).
+///
+/// It is a struct rather than a bare `u64` because a streamed statement can produce a GENERATED KEY
+/// as well as a row count, and the streaming path had no way to carry one: `ferrod`'s producer
+/// hardcoded `None` into the terminal (correct while PostgreSQL — which has no such protocol field —
+/// was the only streaming backend, and silently wrong the moment MySQL/MariaDB started streaming).
+/// A streamed MySQL `INSERT` therefore reported no key at all, which is what
+/// `Doctrine\DBAL\Connection::lastInsertId()` reads and what Doctrine ORM's `IdentityGenerator`
+/// calls on every insert. Caught live by the DBAL driver's `LastInsertIdLiveTest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Reclaimed {
+    /// The affected-row count, read POST-DRAIN (see [`PoolBackend::reclaim_stream`]).
+    pub affected: u64,
+    /// The auto-generated key this statement produced, when the backend PROTOCOL reports one —
+    /// MySQL/MariaDB from the OK packet's `LAST_INSERT_ID()`. Always `None` for Postgres, which has
+    /// no such field (its callers use `INSERT … RETURNING`).
+    pub last_insert_id: Option<u64>,
 }
 
 #[cfg(test)]

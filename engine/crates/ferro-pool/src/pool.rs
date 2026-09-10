@@ -14,7 +14,7 @@ use tokio::time::Instant;
 use ferro_proto::messages::sql::ColMeta;
 use ferro_proto::value::Value;
 
-use crate::backend::{BackendRows, PoolBackend, QueryResult, ResetProfile, TxStatus};
+use crate::backend::{BackendRows, PoolBackend, QueryResult, Reclaimed, ResetProfile, TxStatus};
 use crate::config::PoolConfig;
 use crate::error::PoolError;
 use crate::pin::{self, PinCause, PinState, TxId};
@@ -995,6 +995,10 @@ pub struct StreamEnd {
     /// Command-tag affected-row count (never a hardcoded 0 — the S4 defect), read post-drain on a
     /// clean stream; `0` on an errored one, where the tag was never read.
     pub affected: u64,
+    /// The generated key the streamed statement produced, when its backend reports one (B2c). MySQL
+    /// fills it from the post-drain OK packet; Postgres has no such field and always leaves it
+    /// `None`. `None` too on any path where the terminal was not cleanly read.
+    pub last_insert_id: Option<u64>,
     /// The owning checkout's stats (currently `queue_us`), captured at `finish`.
     pub stats: CheckoutStats,
 }
@@ -1093,8 +1097,8 @@ impl<'a, B: PoolBackend> RowStreamHandle<'a, B> {
         // operator to discover.
         let reclaim_bound = pool.config.checkout_timeout;
         let reclaim = pool.backend.reclaim_stream(self.checkout.conn_mut(), rows);
-        let (affected, errored) = match tokio::time::timeout(reclaim_bound, reclaim).await {
-            Ok(Ok(a)) => (a, self.errored),
+        let (reclaimed, errored) = match tokio::time::timeout(reclaim_bound, reclaim).await {
+            Ok(Ok(r)) => (r, self.errored),
             // The conn could not be restored (the reclaim contract obliges the backend to leave
             // it `is_closed`-dead). Treat the stream as ERRORED so finalize's Rule-A force-taint
             // runs; the pool then discards the husk at return instead of recycling it.
@@ -1103,7 +1107,7 @@ impl<'a, B: PoolBackend> RowStreamHandle<'a, B> {
                     error = %e,
                     "ferro-pool: stream reclaim failed — connection will be discarded"
                 );
-                (0, true)
+                (Reclaimed::default(), true)
             }
             // TIMED OUT: the reclaim future is dropped here, which drops the `B::RowStream` it
             // took ownership of — for a conn-owning backend that closes the moved-out driver
@@ -1117,13 +1121,17 @@ impl<'a, B: PoolBackend> RowStreamHandle<'a, B> {
                     timeout_ms = reclaim_bound.as_millis() as u64,
                     "ferro-pool: stream reclaim timed out — connection will be discarded"
                 );
-                (0, true)
+                (Reclaimed::default(), true)
             }
         };
         let stats = self.checkout.stats();
         self.checkout.finalize_stream(errored, &self.sql);
         self.finished = true;
-        Ok(StreamEnd { affected, stats })
+        Ok(StreamEnd {
+            affected: reclaimed.affected,
+            last_insert_id: reclaimed.last_insert_id,
+            stats,
+        })
     }
 }
 

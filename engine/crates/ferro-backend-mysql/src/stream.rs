@@ -52,7 +52,7 @@ use mysql_async::prelude::{Query, WithParams};
 use mysql_async::{BinaryProtocol, Column, Conn, ResultSetStream, Row};
 
 use async_trait::async_trait;
-use ferro_pool::backend::BackendRows;
+use ferro_pool::backend::{BackendRows, Reclaimed};
 use ferro_pool::error::PoolError;
 use ferro_proto::messages::sql::ColMeta;
 
@@ -79,8 +79,12 @@ pub enum MysqlRowStream {
     },
     /// No result set (e.g. an INSERT sent with `fetch:stream`). The statement already ran BUFFERED on
     /// the borrowed conn — nothing was ever parked — so this yields no rows and carries the count
-    /// straight through to [`reclaim`].
-    NoRows { affected: u64 },
+    /// AND THE GENERATED KEY straight through to [`reclaim`]. The key matters precisely here: an
+    /// `INSERT` is the no-result-set shape, and `lastInsertId()` is what reads it.
+    NoRows {
+        affected: u64,
+        last_insert_id: Option<u64>,
+    },
 }
 
 #[async_trait]
@@ -177,12 +181,19 @@ pub async fn open(
     // (4) NO RESULT SET → never park (see the module docs: `stream_and_drop` would answer `None`
     // and eat the connection). Run it buffered on the borrowed conn and yield an empty stream.
     if columns.is_empty() {
-        let (_rows, affected, _lii) = match crate::query::drain(conn, &stmt, bound).await {
+        let (_rows, affected, last_insert_id) = match crate::query::drain(conn, &stmt, bound).await
+        {
             Ok(t) => t,
             Err(e) => return Err(conn.map_stmt_error(&e)),
         };
         conn.record_session_mutation();
-        return Ok((cols, MysqlRowStream::NoRows { affected }));
+        return Ok((
+            cols,
+            MysqlRowStream::NoRows {
+                affected,
+                last_insert_id,
+            },
+        ));
     }
 
     // (5) PARK: the driver handle moves into the stream for the duration. From here on, any failure
@@ -230,10 +241,16 @@ pub async fn open(
 /// (ending the parked window), and answer the affected count from the CONNECTION's post-drain packet
 /// — the §22.2 (n) rule. Called by `RowStreamHandle::finish` before `finalize_stream` reads
 /// `tx_status`, and itself bounded by the pool (FB-3), so a hung restore cannot strand the terminal.
-pub async fn reclaim(conn: &mut MysqlConn, rows: MysqlRowStream) -> Result<u64, PoolError> {
+pub async fn reclaim(conn: &mut MysqlConn, rows: MysqlRowStream) -> Result<Reclaimed, PoolError> {
     match rows {
-        // Never parked: the count was already read post-drain by the buffered path.
-        MysqlRowStream::NoRows { affected } => Ok(affected),
+        // Never parked: both values were already read post-drain by the buffered path.
+        MysqlRowStream::NoRows {
+            affected,
+            last_insert_id,
+        } => Ok(Reclaimed {
+            affected,
+            last_insert_id,
+        }),
         MysqlRowStream::Rows { stream, .. } => {
             // `into_conn` (the B2a fork edit) drains every unconsumed row and pending result set,
             // then returns the owned `Conn` instead of closing it.
@@ -247,10 +264,17 @@ pub async fn reclaim(conn: &mut MysqlConn, rows: MysqlRowStream) -> Result<u64, 
             // Post-drain, and only now: the connection's own accessor carries THIS statement's final
             // packet (the stream's would carry the previous statement's — §22.2 (n)).
             let affected = recovered.affected_rows();
+            // Same post-drain rule for the generated key: read from the CONNECTION, whose final
+            // packet is this statement's. A row-returning statement normally has none, but reading
+            // it here rather than assuming `None` keeps the two arms honest and identical.
+            let last_insert_id = recovered.last_insert_id();
             conn.unpark(recovered);
             // The §7.1 assist taint, at the same post-statement point the buffered path records it.
             conn.record_session_mutation();
-            Ok(affected)
+            Ok(Reclaimed {
+                affected,
+                last_insert_id,
+            })
         }
     }
 }

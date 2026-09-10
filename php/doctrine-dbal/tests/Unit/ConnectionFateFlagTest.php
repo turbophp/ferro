@@ -67,11 +67,11 @@ final class ConnectionFateFlagTest extends TestCase
     }
 
     /**
-     * Amended by M1-S9 B1b exactly as `query()`'s row was by Task 12: the PREPARED path now
-     * streams on PostgreSQL too (§22.2 (ah)), so it asks `fetch:stream` there and keeps
-     * `fetch:rows` on the MySQL family — both pinned per fate, so the fork rides beside the
-     * declaration instead of silently replacing this test's old single-family `fetch:rows`
-     * assertion.
+     * Amended twice, each time widening rather than weakening: M1-S9 B1b made the PREPARED path
+     * stream on PostgreSQL (§22.2 (ah)), and **B2c made it stream on the MySQL family too**, now
+     * that the engine supports it (§22.2 (n) closed). So `fetch:stream` is expected on EVERY
+     * family — the provider still enumerates both, so a family that silently stops streaming is
+     * still caught, and the fate declaration stays pinned beside it.
      */
     #[DataProvider('preparedFetchModes')]
     public function testTheConnectionLevelFateDeclarationReachesTheWireOnTheParameterisedPath(
@@ -79,9 +79,10 @@ final class ConnectionFateFlagTest extends TestCase
         string $kind,
         int $expectedFetch,
     ): void {
-        $session = $kind === PlatformVersion::KIND_POSTGRES
-            ? (new FakeSession())->thenStreamHead([['name' => 'id', 'tag' => C::TAG_I64]])
-            : (new FakeSession())->thenExecOk(null);
+        // B2c: no family fork in the fixture either — BOTH families stream, so both are scripted
+        // with a stream head. A regression that re-introduces buffering on MySQL fails loudly here
+        // (the fake refuses an unscripted buffered exec) as well as on the `fetch` assertion.
+        $session = (new FakeSession())->thenStreamHead([['name' => 'id', 'tag' => C::TAG_I64]]);
         $c = self::driverConn($session, $readonly, $kind);
 
         $c->prepare('INSERT INTO t (v) VALUES (?) RETURNING id')->execute();
@@ -98,8 +99,8 @@ final class ConnectionFateFlagTest extends TestCase
         return [
             'write conn, PG streams' => [false, PlatformVersion::KIND_POSTGRES, ExecCodec::FETCH_STREAM],
             'readonly conn, PG streams' => [true, PlatformVersion::KIND_POSTGRES, ExecCodec::FETCH_STREAM],
-            'write conn, MySQL buffers' => [false, PlatformVersion::KIND_MYSQL, ExecCodec::FETCH_ROWS],
-            'readonly conn, MySQL buffers' => [true, PlatformVersion::KIND_MYSQL, ExecCodec::FETCH_ROWS],
+            'write conn, MySQL streams too (B2c)' => [false, PlatformVersion::KIND_MYSQL, ExecCodec::FETCH_STREAM],
+            'readonly conn, MySQL streams too (B2c)' => [true, PlatformVersion::KIND_MYSQL, ExecCodec::FETCH_STREAM],
         ];
     }
 
@@ -121,11 +122,11 @@ final class ConnectionFateFlagTest extends TestCase
      * the mirror of the `exec()` row above. Without it, `query()` and `exec()` could share one
      * `fetch` value and the pair would still look consistent.
      *
-     * **Amended by Task 12, not weakened.** `query()` is now the ONE streaming path: on a
-     * PostgreSQL pool it asks for `fetch:stream` and on the MySQL family (where
-     * `supports_row_streaming()` is false, §22.2 (n)) it still asks for `fetch:rows`. Both are
-     * asserted here, per fate, so the fork itself is pinned alongside the declaration — and the
-     * original property survives in the `assertNotSame(FETCH_NONE)` row that closes the method.
+     * **Amended by Task 12 and again by B2c, not weakened.** `query()` streams, and since B2c it
+     * streams on EVERY family — the MySQL fork (which existed only because
+     * `supports_row_streaming()` was false there, §22.2 (n)) is gone. Both families are still
+     * enumerated per fate, so a regression that reverts either one is caught, and the original
+     * property survives in the `assertNotSame(FETCH_NONE)` row that closes the method.
      *
      * @param bool $readonly the connection-level fate declaration
      * @param string $kind the pool family, which decides the fetch mode
@@ -137,9 +138,8 @@ final class ConnectionFateFlagTest extends TestCase
         string $kind,
         int $expectedFetch,
     ): void {
-        $session = $kind === PlatformVersion::KIND_POSTGRES
-            ? (new FakeSession())->thenStreamHead([['name' => 'c', 'tag' => C::TAG_I64]])
-            : (new FakeSession())->thenExecOk(null);
+        // B2c: see the sibling above — one scripted shape for every family.
+        $session = (new FakeSession())->thenStreamHead([['name' => 'c', 'tag' => C::TAG_I64]]);
         $c = self::driverConn($session, $readonly, $kind);
 
         $c->query('SELECT 1');
@@ -156,7 +156,7 @@ final class ConnectionFateFlagTest extends TestCase
         $rows = [];
         foreach (self::fates() as $fate => [$readonly]) {
             $rows["postgres streams, $fate"] = [$readonly, PlatformVersion::KIND_POSTGRES, ExecCodec::FETCH_STREAM];
-            $rows["mysql buffers, $fate"] = [$readonly, PlatformVersion::KIND_MYSQL, ExecCodec::FETCH_ROWS];
+            $rows["mysql streams too, $fate"] = [$readonly, PlatformVersion::KIND_MYSQL, ExecCodec::FETCH_STREAM];
         }
         return $rows;
     }
