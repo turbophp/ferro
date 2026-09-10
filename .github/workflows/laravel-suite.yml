@@ -6,10 +6,16 @@
 # registers Ferro under, and both names are real product configurations:
 #   ferro-pgsql — §15's one-word config change. The default.
 #   pgsql       — the same engine under the stock name, via `FerroConnections::register()`'s opt-in
-#                 alias. Six of upstream's own QueryBuilderTest cases gate their assertions on
-#                 `in_array($this->driver, ['pgsql','sqlsrv'])` and assert NOTHING under any other
-#                 name, so the alias column is higher for a reason that is about the harness, not
-#                 about the engine. Recording one column alone would hide that either way.
+#                 alias. Nine of upstream's own cases gate their assertions or their skip on
+#                 `$this->driver` being `pgsql`, so the alias column is higher for a reason that is
+#                 about the harness, not about the engine. Recording one column alone would hide
+#                 that either way.
+#   stock-pgsql — THE CONTROL: upstream's own pdo_pgsql against the same server, no Ferro anywhere.
+#                 It is what makes a non-pass triageable — "is this ours, or this framework/server
+#                 pair's?" — instead of guessed at, and it earned its place before it was built (two
+#                 SchemaBuilderSchemaNameTest cases looked like a Ferro schema gap and reproduce
+#                 identically through stock PDO). Its contact assertion INVERTS: it refuses to run
+#                 if the connection turns out to be a Ferro one.
 #
 # ON DEMAND ONLY (workflow_dispatch), for the same reason as the dbal-suite lane: the bar is "green
 # modulo a recorded, triaged allow-list", so a red phpunit exit here is DATA to record, not a build
@@ -46,10 +52,10 @@ jobs:
       - name: measure both driver-name columns, twice each
         run: |
           set -o pipefail +e
-          for drv in ferro-pgsql pgsql; do
+          for drv in ferro-pgsql pgsql stock-pgsql; do
             for run in 1 2; do
               FERRO_LARAVEL_DRIVER="$drv" FERRO_LARAVEL_SVC=pg \
-                FERRO_LARAVEL_DSN="postgres://ferro:ferro@127.0.0.1:55432/laravel_tests" \
+                FERRO_LARAVEL_DSN="postgres://ferro:ferro@127.0.0.1:55432/laravel_tests?options=-csearch_path%3Dpublic,my_schema" \
                 bash testkit/laravel-suite.sh 2>&1 | tee "$drv-run$run.log"
               echo "phpunit exit: $?"
             done
@@ -58,7 +64,8 @@ jobs:
       # A red phpunit exit is data; a missing result line is a broken lane.
       - name: assert every run actually measured
         run: |
-          for f in ferro-pgsql-run1.log ferro-pgsql-run2.log pgsql-run1.log pgsql-run2.log; do
+          for f in ferro-pgsql-run1.log ferro-pgsql-run2.log pgsql-run1.log pgsql-run2.log \
+                   stock-pgsql-run1.log stock-pgsql-run2.log; do
             grep -qE '^(OK|FAILURES!|ERRORS!|Tests: )' "$f" \
               || { echo "::error:: $f has no phpunit result line — the run died before measuring"; tail -40 "$f"; exit 1; }
             grep -q '\[ferro\] connection=' "$f" \
@@ -73,6 +80,11 @@ jobs:
             || { echo "::error:: the ferro-pgsql column did not run under that driver name"; exit 1; }
           grep -q '\[ferro\] connection=.* driver=pgsql ' pgsql-run1.log \
             || { echo "::error:: the pgsql column did not run under that driver name"; exit 1; }
+          # The CONTROL must have reached the STOCK connection class. This is the inverse assertion,
+          # checked again here in the lane itself: a control that silently ran through Ferro would
+          # report Ferro's behaviour as upstream's baseline, which is worse than having no baseline.
+          grep -q '\[ferro\] connection=Illuminate.Database.PostgresConnection driver=stock-pgsql ' stock-pgsql-run1.log \
+            || { echo "::error:: the control column did not resolve the STOCK PostgresConnection"; exit 1; }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -82,6 +94,8 @@ jobs:
             ferro-pgsql-run2.log
             pgsql-run1.log
             pgsql-run2.log
+            stock-pgsql-run1.log
+            stock-pgsql-run2.log
             .laravel-suite/ferrod.log
       - if: always()
         run: docker compose -f testkit/docker-compose.yml logs --no-color --tail=80 pg

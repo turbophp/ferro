@@ -44,6 +44,49 @@ if ($sock === false || $sock === '') {
 // Illuminate's resolver map answers for that name — under the `pgsql` alias, that Ferro really did
 // take over the stock name rather than the stock PostgresConnection quietly winning.
 $driver = getenv('FERRO_LARAVEL_DRIVER') ?: 'ferro-pgsql';
+
+// -------------------------------------------------------------------------------------------------
+// THE CONTROL COLUMN INVERTS THIS ASSERTION, and that inversion is the whole safety of having one.
+// Under `stock-pgsql` the run is SUPPOSED to reach upstream's own pdo_pgsql, so "is this a Ferro
+// connection?" flips from the thing we require to the thing we refuse: a control that quietly ran
+// through Ferro would report Ferro's behaviour as upstream's baseline, which is worse than having no
+// baseline. The nonce + version() round trip stays identical — a control still has to prove it
+// reached a real PostgreSQL, for exactly the reason the Ferro column does.
+//
+// It is checked STRUCTURALLY (the RESOLVED connection's class) rather than by trusting the env var,
+// because the env var is the input being verified. MUTATION-PROVEN twice, and the two outcomes are
+// worth distinguishing: registering Ferro's resolver for `pgsql` alone kills the run one step
+// EARLIER (Ferro's own config refusal — the control array carries no `ferro_socket`), and adding
+// that socket so a real Ferro connection IS built is what makes the check below fire. Both refuse
+// to run; neither reports a number.
+// -------------------------------------------------------------------------------------------------
+if ($driver === 'stock-pgsql') {
+    $conn = (new Illuminate\Database\Connectors\ConnectionFactory(new Illuminate\Container\Container()))
+        ->make(Illuminate\Tests\Integration\Database\DatabaseTestCase::controlConfigForBootstrap(), 'control');
+
+    if ($conn instanceof Ferro\Laravel\FerroPostgresConnection) {
+        fwrite(STDERR, "CONTROL ASSERTION FAILED: the control column resolved a FERRO connection.\n"
+            . "Refusing to run: it would report Ferro's behaviour as upstream's baseline.\n");
+        exit(1);
+    }
+    $nonce = bin2hex(random_bytes(8));
+    $probe = $conn->select("select '{$nonce}' as nonce, version() as v");
+    if (count($probe) !== 1 || $probe[0]->nonce !== $nonce) {
+        fwrite(STDERR, "CONTROL ASSERTION FAILED: the nonce did not round-trip\n");
+        exit(1);
+    }
+    if (! str_contains((string) $probe[0]->v, 'PostgreSQL')) {
+        fwrite(STDERR, sprintf("CONTROL ASSERTION FAILED: not PostgreSQL (%s)\n", $probe[0]->v));
+        exit(1);
+    }
+    fwrite(STDOUT, sprintf(
+        "[ferro] connection=%s driver=%s server=%s\n",
+        get_class($conn),
+        $driver,
+        $probe[0]->v,
+    ));
+    return;
+}
 Ferro\Laravel\FerroConnections::register(['pgsql' => 'ferro-pgsql']);
 $resolver = Illuminate\Database\Connection::getResolver($driver);
 if ($resolver === null) {
