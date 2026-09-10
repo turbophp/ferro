@@ -115,6 +115,20 @@ final class FerroPdoShim
      * BYTE-IDENTICAL to PDO's output, and every case round-trips through `SELECT <literal>` back to
      * the original bytes.
      *
+     * **KNOWN CONFLICT WITH SPEC §21 D5, recorded rather than glossed:** D5 reads "`quote()`
+     * implemented client-side with per-platform tables; **no engine round trip**", and the
+     * verification below IS one round trip (cached, so amortised to nothing across the N bindings
+     * `substituteBindingsIntoRawSql()` escapes — but one nonetheless). The resolution is designed
+     * and better than either alternative: `standard_conforming_strings` is a `GUC_REPORT`
+     * parameter, so the engine already holds it with ZERO round trips via the M1-S1 fork's
+     * `Client::parameter()`, and advertising it in `HELLO_ACK` pool metadata would be both
+     * D5-compliant and MORE correct than a cached `SHOW` (which is a snapshot of one checkout,
+     * where `ParameterStatus` tracks the value live). That is a `/proto` slice — registry, golden
+     * vectors and both codecs in one change set, charter rule 2 — which is why it is not done here.
+     * See `docs/followups/2026-09-10-quote-scs-probe-vs-d5.md`. Do NOT "fix" this by deleting the
+     * verification: an unverified premise under an escaping function is the one option that was
+     * considered and rejected outright.
+     *
      * **`PDO::PARAM_LOB` is refused rather than guessed at.** PostgreSQL's binary literal is
      * `'\x…'::bytea`, a different shape entirely, and Illuminate never asks this method for one —
      * `escape($value, binary: true)` goes to `PostgresConnection::escapeBinary()`, which builds that
