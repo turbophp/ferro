@@ -124,7 +124,64 @@ the tier above cannot read it.
   anger.
 - **C1e — the PDO shim**, scoped by what C1b–C1d actually turn out to need, not by §15's list
   up front.
-- **C2 — the `illuminate/database` suite**, modelled on `testkit/dbal-suite.sh`.
+- **C2 — the `illuminate/database` suite.** Modelled on `testkit/dbal-suite.sh`, but **materially
+  heavier than that sibling**, for reasons measured against `laravel/framework` v11.x and
+  `orchestra/testbench-core` v9.0.0 source (both cloned and read; no guessing). See
+  "What C2 actually requires" below. It is **at least two slices**, and the runner is the first.
+
+## What C2 actually requires (measured against upstream source, not assumed)
+
+**1. The full framework, not a bare Capsule — this is the size driver.** Every test in
+`tests/Integration/Database/` extends `Illuminate\Tests\Integration\Database\DatabaseTestCase`,
+which extends `Orchestra\Testbench\TestCase`, which boots a real `Illuminate\Foundation\Application`
+and console `Kernel`. `DatabaseTestCase` also uses `DatabaseMigrations`, whose `refreshTestDatabase()`
+runs `$this->artisan('migrate:fresh', …)`. So the suite needs **`orchestra/testbench-core` as a new
+dependency**, a booted application, and a working Artisan console — none of which the DBAL suite
+needed. That is the honest reason C2 is bigger than its sibling.
+
+**2. The silent-SQLite trap is REAL here too, and its exact shape matters.** In
+`Orchestra\Testbench\Bootstrap\LoadConfiguration::bootstrap()`:
+
+```php
+if (\is_null($config->get('database.connections.testing'))) {
+    $config->set('database.connections.testing', [
+        'driver' => 'sqlite', 'database' => ':memory:', …
+    ]);
+}
+if ($config->get('database.default') === 'sqlite' && ! file_exists(…)) {
+    $config->set('database.default', 'testing');
+}
+```
+
+Upstream's `phpunit.xml.dist` sets `DB_CONNECTION=testing`, and the skeleton `config/database.php`
+defines no `testing` connection — so testbench **silently injects SQLite in-memory, unconditionally,
+with no warning**. Exactly the failure that made the DBAL suite report `OK (105 tests)` against
+SQLite with zero engine contact.
+
+**But it is avoidable BY CONSTRUCTION, and that is worth knowing precisely:** the injection keys on
+the connection NAME `testing` (and on `sqlite` with a missing file). A custom name that is not
+configured does **not** hit this path — `DatabaseManager::configuration()` throws
+`InvalidArgumentException: Database connection [x] not configured.` instead, which is loud. **So the
+rule for C2's harness is: never reuse the name `testing`.** The contact assertion stays regardless —
+belt and braces, and per FB-7 it must be an unguessable probe, not a constant.
+
+**3. Testbench will not wire a custom driver's config for us.** Its
+`SyncDatabaseEnvironmentVariables` bootstrapper maps only `MYSQL_*`, `MARIADB_*`, `POSTGRES_*` and
+`MSSQL_*` onto `database.connections.{driver}.*`. A `ferro-pgsql` connection gets no env syncing, so
+the harness must supply the connection config directly.
+
+**4. `migrate:fresh` is a real dependency on DDL through the tier**, and is the first thing the next
+slice should verify rather than assume: on PostgreSQL it drives the stock schema builder's
+`dropAllTables()`, which introspects the catalog and issues `DROP TABLE … CASCADE`. C1c's
+`statement()`/`unprepared()` should carry it, but "should" is not "does" — and the sibling suite's
+50-test `int2vector` failure was exactly a stock-schema-manager introspection gap.
+
+**5. Scale and isolation.** 131 `.php` files under `tests/Integration/Database/` (~656 `test*`
+methods). There is **one flat testsuite** in the root `phpunit.xml.dist` covering `./tests`; upstream
+isolates the database tests by pointing phpunit at the directory and overriding env vars
+(`.github/workflows/databases.yml` runs `vendor/bin/phpunit tests/Integration/Database` with
+`DB_CONNECTION: pgsql`). So C2 can select by path + a generated config, the same way the DBAL runner
+does with its allowlist.
 
 ## The bar, stated honestly up front
 
