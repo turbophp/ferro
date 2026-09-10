@@ -43,6 +43,36 @@ shim read it from `poolInfo()`. That is:
 - A `/proto` change, so charter rule 2 applies: registry + golden vectors + both codecs in one
   change set. That is the only reason it was not done in C2f — it is a slice, not a tweak.
 
+### The design, settled by reading rather than left as "advertise it somehow"
+
+**The field should NOT be named for PostgreSQL's GUC.** What a client needs is one bit — *is a
+backslash inside a single-quoted literal an ordinary character?* — and both families have it:
+PostgreSQL's `standard_conforming_strings`, and MySQL's `NO_BACKSLASH_ESCAPES` in `sql_mode`. A
+family-independent `literals_are_standard: bool | nil` carries exactly that and keeps a PostgreSQL
+GUC name out of the protocol. **MySQL needs it MORE than PostgreSQL does**, which is the argument
+against deferring the shape: PostgreSQL defaults to the safe value, MySQL defaults to the unsafe one,
+so a MySQL `quote()` cannot be written at all without this bit.
+
+**`nil` is a legitimate steady state**, by the same argument `server_version`'s own contract makes:
+the handshake never depends on a backend being reachable, so an unlearned value rides as `nil` and
+the client must treat it as "unknown". Fail-closed is already what the shim does — anything that is
+not an unambiguous yes refuses.
+
+**It needs no new engine machinery.** `PoolInfo` is per-POOL and `Client::parameter()` is
+per-CONNECTION, but the lazy, concurrent, TTL'd version probe added at M1-S8a Task 12 already has
+exactly that shape, so the new value rides the probe that already runs.
+
+### The cost this document originally understated
+
+**`PoolInfo` is a positional fixarray of 3** (`/proto/PROTOCOL.md` §4), and both decoders reject any
+other arity — the PHP one throws on `count($w) !== 3`. A fourth element is therefore a BREAKING wire
+change: it needs `protocol_version` 2 → 3, which makes a skewed engine/client pair fail at the first
+byte of the first frame. That is exactly what M1-S8a did when it introduced this metadata, and its
+comment in `methods.toml` explains why the bump is the honest mechanism ("the lock file carries no
+message shapes, so nothing else would move"). Pre-v1 that is acceptable, but it is a deployment
+consequence rather than a code detail, and the first version of this document said only "a `/proto`
+change", which reads cheaper than it is.
+
 ## Options considered and rejected
 
 - **Drop the probe, document the assumption.** D5-compliant and the cheapest edit, but it puts an
