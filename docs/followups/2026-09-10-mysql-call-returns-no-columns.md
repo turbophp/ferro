@@ -153,9 +153,27 @@ not a MySQL wall.**
   made the old behaviour so easy to miss) — plus the pre-existing
   `mysql_streamed_insert_reports_its_generated_key`, which is now the regression guard for the
   INSERT arm's park/recover round trip. SPEC §22.2 (aw).
-- **S4:** the `/proto` multi-result-set change for `selectResultSets()`. **Its precondition is now
-  met** — S2 and S3 make a `CALL` return real rows on both paths — so this is the next real slice
-  here. Note what both paths currently do with a multi-`SELECT` procedure: they surface the FIRST
-  result set and drain the rest (`drop_result` buffered, `into_conn` streamed). The two-`SELECT`
-  set count is printed by the spike in every CI integration run, and S4 should be designed against
-  that printed number rather than against an assumption.
+- **S4 (the `/proto` multi-result-set change): DEFERRED, and the reason has changed.** Its stated
+  precondition IS now met — S2 and S3 make a `CALL` return real rows on both paths, so the "it would
+  ship a feature that still returns nothing" argument in C1a is spent. It is deferred on a different
+  ground: **there is no consumer that could reach it.** Both checked against the tree rather than
+  assumed:
+
+  * **Doctrine tier — no SPI to put it in.** DBAL 4's driver `Result` interface
+    (`php/doctrine-dbal/vendor/doctrine/dbal/src/Driver/Result.php`) declares exactly
+    `fetchNumeric`, `fetchAssociative`, `fetchOne`, `fetchAllNumeric`, `fetchAllAssociative`,
+    `fetchFirstColumn`, `rowCount`, `columnCount`, `free`. There is no `nextRowset` and no other
+    multi-result-set method, so a second result set has nowhere to go.
+  * **Eloquent tier — the only consumer is a driver that does not exist.** `selectResultSets()` is
+    for stored procedures emitting several result sets, a MySQL/SQL Server idiom, and
+    `FerroConnections::register()` registers `ferro-pgsql` ONLY. There is no MySQL Illuminate tier
+    to call it from.
+
+  So building it now means a **breaking wire change** — `ExecOk` is positional, so carrying N result
+  sets is a `protocol_version` bump forcing every deployed engine/client pair to move in lockstep
+  (the (at) precedent) — bought for zero reachable callers. **Revisit when a MySQL Illuminate tier
+  exists**; that is the event that creates the consumer, and it is the honest trigger.
+
+  Recorded for whoever picks it up: both paths currently surface the FIRST result set and drain the
+  rest (`drop_result` buffered, `into_conn` streamed), and the two-`SELECT` set count is printed by
+  the spike in every CI integration run — design against that printed number, not an assumption.
