@@ -49,7 +49,7 @@ jobs:
       - run: |
           docker compose -f testkit/docker-compose.yml up -d --wait pg \
             || { sleep 15; docker compose -f testkit/docker-compose.yml up -d --wait pg; }
-      - name: measure both driver-name columns, twice each
+      - name: measure every driver-name column, twice each
         run: |
           set -o pipefail +e
           for drv in ferro-pgsql pgsql stock-pgsql; do
@@ -60,12 +60,30 @@ jobs:
               echo "phpunit exit: $?"
             done
           done
+      # Upstream's PostgreSQL-SPECIFIC directory, as its OWN column. It has no `ferro-pgsql` row by
+      # construction — its base class carries #[RequiresDatabase('pgsql')], so the whole directory
+      # skips under any other driver name — which is exactly why it is not folded into the list
+      # above, whose two Ferro columns exist to be comparable.
+      - name: measure the PostgreSQL-specific column, twice each
+        run: |
+          set -o pipefail +e
+          for drv in pgsql stock-pgsql; do
+            for run in 1 2; do
+              FERRO_LARAVEL_ALLOWLIST="$PWD/testkit/laravel/allowlist-postgres.txt" \
+                FERRO_LARAVEL_DRIVER="$drv" FERRO_LARAVEL_SVC=pg \
+                FERRO_LARAVEL_DSN="postgres://ferro:ferro@127.0.0.1:55432/laravel_tests?options=-csearch_path%3Dpublic,my_schema" \
+                bash testkit/laravel-suite.sh 2>&1 | tee "pg-specific-$drv-run$run.log"
+              echo "phpunit exit: $?"
+            done
+          done
       # The lane's OWN pass/fail: a run that never produced a result line did not measure anything.
       # A red phpunit exit is data; a missing result line is a broken lane.
       - name: assert every run actually measured
         run: |
           for f in ferro-pgsql-run1.log ferro-pgsql-run2.log pgsql-run1.log pgsql-run2.log \
-                   stock-pgsql-run1.log stock-pgsql-run2.log; do
+                   stock-pgsql-run1.log stock-pgsql-run2.log \
+                   pg-specific-pgsql-run1.log pg-specific-pgsql-run2.log \
+                   pg-specific-stock-pgsql-run1.log pg-specific-stock-pgsql-run2.log; do
             grep -qE '^(OK|FAILURES!|ERRORS!|Tests: )' "$f" \
               || { echo "::error:: $f has no phpunit result line — the run died before measuring"; tail -40 "$f"; exit 1; }
             grep -q '\[ferro\] connection=' "$f" \
@@ -96,6 +114,10 @@ jobs:
             pgsql-run2.log
             stock-pgsql-run1.log
             stock-pgsql-run2.log
+            pg-specific-pgsql-run1.log
+            pg-specific-pgsql-run2.log
+            pg-specific-stock-pgsql-run1.log
+            pg-specific-stock-pgsql-run2.log
             .laravel-suite/ferrod.log
       - if: always()
         run: docker compose -f testkit/docker-compose.yml logs --no-color --tail=80 pg

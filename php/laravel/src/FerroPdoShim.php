@@ -25,14 +25,22 @@ use Ferro\Laravel\Exception\FerroQueryException;
  * DSN) and is duck-typed instead. Verified against v11.51.0.
  *
  * **Everything not implemented refuses by name.** `__call` is what makes the boundary honest: a
- * caller reaching for `prepare()`, `quote()` or any other PDO method gets a message saying which
- * method and why, instead of PHP's bare "call to undefined method". `quote()` in particular is
- * deliberately absent — implementing it means owning dialect-specific SQL escaping, security-critical
- * code with no known caller (see `docs/dev-loop/PHASE-C-SCOPE.md`).
+ * caller reaching for `prepare()` or any other PDO method gets a message saying which method and
+ * why, instead of PHP's bare "call to undefined method". The roster grows only as real framework
+ * code is MEASURED needing it — which is how both members arrived. `quote()` used to be named here
+ * as deliberately absent, "security-critical code with no known caller"; M2-C2f found the caller
+ * (see {@see quote}) and the security half of that sentence is why the implementation looks the way
+ * it does, not a reason it does not exist.
  */
 final class FerroPdoShim
 {
     public function __construct(private readonly FerroClient $ferro) {}
+
+    /**
+     * Cached answer to {@see assertStandardConformingStrings}'s one `SHOW`. Null until first asked,
+     * so a connection that never escapes anything never pays for the round trip.
+     */
+    private ?string $standardConformingStrings = null;
 
     /**
      * Illuminate calls this only at transaction level 0 — nested levels become savepoints via
@@ -80,6 +88,103 @@ final class FerroPdoShim
     public function exec(string $statement): int
     {
         return $this->guard(fn (): int => $this->ferro->exec($statement));
+    }
+
+    /**
+     * Quote a string as a PostgreSQL literal — `'` doubled, wrapped in single quotes.
+     *
+     * **The caller is real and was MEASURED, which is what changed this from "deliberately absent".**
+     * `Connection::escapeString()` is `getReadPdo()->quote($value)`, reached from `DB::escape()` and
+     * — more commonly than that — from `Grammar::substituteBindingsIntoRawSql()`, i.e. every
+     * `Builder::toRawSql()`, every `->dd()`/`->dump()` on a query builder, and the query strings
+     * ecosystem debug tooling renders. Upstream's own `Postgres/EscapeTest::testEscapeString` fails
+     * without it, and the control column (stock `pdo_pgsql`, same server) passes it — so it is a
+     * Ferro gap rather than an environment one.
+     *
+     * **Illuminate has already done the dangerous half before this is called**, which is why so
+     * little is left here: `Connection::escape()` rejects NUL bytes and invalid UTF-8 itself, and
+     * routes `null`/`int`/`float`/`bool`/binary/array elsewhere entirely. What reaches `quote()` is
+     * a valid UTF-8 string with no NULs.
+     *
+     * **The rule is doubling `'` and NOTHING else, and that is only correct while
+     * `standard_conforming_strings` is `on`** — so it is VERIFIED rather than assumed
+     * ({@see assertStandardConformingStrings}). With it on, a backslash is an ordinary character;
+     * with it off, PostgreSQL would read `\` as an escape and a value ending in a backslash could
+     * consume the closing quote. MEASURED against `pdo_pgsql` on PostgreSQL 16 over eight cases
+     * including `backslash-then-quote \'` and `quote-then-backslash '\`: this rule is
+     * BYTE-IDENTICAL to PDO's output, and every case round-trips through `SELECT <literal>` back to
+     * the original bytes.
+     *
+     * **`PDO::PARAM_LOB` is refused rather than guessed at.** PostgreSQL's binary literal is
+     * `'\x…'::bytea`, a different shape entirely, and Illuminate never asks this method for one —
+     * `escape($value, binary: true)` goes to `PostgresConnection::escapeBinary()`, which builds that
+     * form in PHP without touching PDO. Accepting the parameter and ignoring it would silently
+     * produce a text literal for binary data.
+     */
+    public function quote(string $string, int $type = \PDO::PARAM_STR): string
+    {
+        if ($type !== \PDO::PARAM_STR) {
+            throw new \LogicException(sprintf(
+                'Ferro: FerroPdoShim::quote() supports only PDO::PARAM_STR (%d), not %d. '
+                . "PostgreSQL's binary literal is a different shape (\\x…::bytea) and Illuminate "
+                . 'builds it in PHP via PostgresConnection::escapeBinary(), never through here.',
+                \PDO::PARAM_STR,
+                $type,
+            ));
+        }
+        $this->assertStandardConformingStrings();
+
+        return "'" . str_replace("'", "''", $string) . "'";
+    }
+
+    /**
+     * Confirm ONCE per shim that the backend treats a backslash as an ordinary character.
+     *
+     * **Why once, and why a server round trip at all.** {@see quote}'s rule is complete only under
+     * `standard_conforming_strings = on`, which has been PostgreSQL's default since 9.1 — but
+     * "almost always true" is not a basis for SQL escaping, and an operator CAN set it `off` in
+     * `postgresql.conf`. One `SHOW` on first use is a negligible cost for removing an unverified
+     * assumption from a security-relevant path.
+     *
+     * **Reading it from a POOLED connection is sound, and that is not obvious.** The checkout that
+     * answers this `SHOW` is not the one that will later execute whatever the caller interpolates.
+     * What makes the answer representative is the pool's own hygiene: a non-local `SET` taints the
+     * connection (`ferro-classify`, SPEC §7.1) and the reset profile restores the server default,
+     * so every checkout begins from the value this probe observed. A session that changed it mid-
+     * checkout is precisely the case hygiene exists to stop leaking, so it cannot reach a later
+     * tenant.
+     *
+     * A refusal is a `LogicException` rather than a query error: it says the deployment is one this
+     * escaping cannot serve, not that a statement failed.
+     */
+    private function assertStandardConformingStrings(): void
+    {
+        if ($this->standardConformingStrings !== null) {
+            return;
+        }
+        // `guardValue`, NOT `guard`: the latter COERCES its result to `int|true` for the
+        // boolean-returning PDO methods it was written for, and routing a row set through it turns
+        // the answer into `true`. Measured — the first version of this did exactly that and the
+        // probe read `(unreadable)`. It failed LOUDLY rather than silently reading `on`, which is
+        // the shape this check is deliberately written in: anything that is not an unambiguous
+        // `'on'` refuses.
+        $r = $this->guardValue(fn (): array => $this->ferro->fetchRaw(
+            'SHOW standard_conforming_strings',
+            [],
+            readonly: true,
+        ));
+        $value = $r['rows'][0][0] ?? null;
+        $this->standardConformingStrings = is_string($value) ? $value : '(unreadable)';
+
+        if ($this->standardConformingStrings !== 'on') {
+            throw new \LogicException(sprintf(
+                'Ferro: this backend reports standard_conforming_strings=%s, and quoting a string '
+                . 'literal safely under that setting needs backslash escaping this driver does not '
+                . 'implement. Set standard_conforming_strings=on (PostgreSQL\'s own default since '
+                . '9.1), or avoid DB::escape() / toRawSql() on this connection.',
+                $this->standardConformingStrings,
+            ));
+        }
     }
 
     /**
@@ -165,11 +270,29 @@ final class FerroPdoShim
      */
     private function guard(\Closure $op): mixed
     {
+        $r = $this->guardValue($op);
+        return is_int($r) ? $r : true;
+    }
+
+    /**
+     * The error translation ALONE, with the result untouched.
+     *
+     * {@see guard} exists for the PDO methods whose contract is `bool`/`int`, and its coercion to
+     * `int|true` is right for those and wrong for anything that returns data — a row set routed
+     * through it becomes `true`, which is how {@see assertStandardConformingStrings} first read
+     * `(unreadable)`. Splitting the two makes the coercion a deliberate choice at each call site
+     * rather than something a new caller inherits by accident.
+     *
+     * @template T
+     * @param \Closure(): T $op
+     * @return T
+     */
+    private function guardValue(\Closure $op): mixed
+    {
         try {
-            $r = $op();
+            return $op();
         } catch (FerroException $e) {
             throw FerroQueryException::fromFerro($e);
         }
-        return is_int($r) ? $r : true;
     }
 }

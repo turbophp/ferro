@@ -23,6 +23,14 @@ pool="${FERRO_LARAVEL_POOL:-default}"
 dsn="${FERRO_LARAVEL_DSN:-postgres://ferro:ferro@127.0.0.1:55432/laravel_tests?options=-csearch_path%3Dpublic,my_schema}"
 svc="${FERRO_LARAVEL_SVC:-pg}"
 work="${FERRO_LARAVEL_WORK:-$root/.laravel-suite}"
+# WHICH allowlist, so a second SET of tests can be recorded as its own column instead of being
+# folded into the main one. `allowlist.txt` is the driver-agnostic tree, which all three driver
+# columns run and can therefore be compared across; `allowlist-postgres.txt` is upstream's
+# PostgreSQL-SPECIFIC subdirectory, which only runs at all under a driver NAME of `pgsql` (its base
+# class carries `#[RequiresDatabase('pgsql')]`), so it has no `ferro-pgsql` column by construction
+# and must not be mixed into one that does.
+allowlist="${FERRO_LARAVEL_ALLOWLIST:-$root/testkit/laravel/allowlist.txt}"
+[ -f "$allowlist" ] || { echo "::error:: allowlist not found: $allowlist"; exit 1; }
 # Which Illuminate `driver` NAME the application registers Ferro under. Both values are real
 # product configurations (see testkit/laravel/DatabaseTestCase.ferro.php): `ferro-pgsql` is §15's
 # one-word config change, `pgsql` is the opt-in alias `FerroConnections::register()` accepts. The
@@ -92,7 +100,7 @@ cfg="$work/phpunit.generated.xml"
     case "$line" in ''|'#'*) continue ;; esac
     if [ -d "$src/$line" ]; then echo "    <directory>$src/$line</directory>"
     else echo "    <file>$src/$line</file>"; fi
-  done < "$root/testkit/laravel/allowlist.txt"
+  done < "$allowlist"
   echo '  </testsuite></testsuites>'
   echo '</phpunit>'
 } > "$cfg"

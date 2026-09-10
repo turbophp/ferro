@@ -1,0 +1,13 @@
+# testkit/laravel/allowlist-postgres.txt — upstream's PostgreSQL-SPECIFIC tests, recorded as their
+# OWN column. Select with FERRO_LARAVEL_ALLOWLIST=testkit/laravel/allowlist-postgres.txt.
+#
+# SEPARATE FROM allowlist.txt ON PURPOSE. Every class here extends `Postgres\PostgresTestCase`,
+# which carries `#[RequiresDatabase('pgsql')]` — so under `FERRO_LARAVEL_DRIVER=ferro-pgsql` the
+# whole directory SKIPS, and it has no default-name column by construction. Folding it into the
+# driver-agnostic list would make that list's two Ferro columns non-comparable, which is the one
+# property they exist to have.
+#
+# It runs under `pgsql` (the opt-in alias) and under `stock-pgsql` (the control), which is exactly
+# the pair needed to attribute any non-pass. That pairing is what found `DB::escape()`: it failed
+# under Ferro and passed under the control, so it was a Ferro gap rather than an environment one.
+tests/Integration/Database/Postgres
