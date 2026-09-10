@@ -164,10 +164,30 @@ pg_domain_aware_param! {
 /// **The membership rule is one sentence: PG's TEXT INPUT SYNTAX for this type is exactly what a
 /// canonical text payload carries** — which is the same rule the seven [`pg_canonical_text_param`]
 /// newtypes assert per tag, and the same thing `pdo_pgsql` relies on for every parameter it sends.
-/// `int2`/`int4`/`int8`, `bool`, `float4`/`float8` and `bytea` are deliberately NOT here: the
-/// canonical wire forms for those are `I64`/`Bool`/`F64`/`Bytes`, which have their own narrow
-/// binary bind paths (the S8a [`PgInt`] narrowing is what made a `serial` primary key work), and
-/// admitting text there would disable those pre-flights for no caller that exists.
+///
+/// **M2-C2d added the INTEGER widths, and the note that used to stand here ("deliberately NOT here
+/// … for no caller that exists") was right on the reasoning and out of date on the fact.** The
+/// caller exists and is ordinary: `EloquentPivotSerializationTest` restores a serialized pivot, so
+/// Eloquent re-binds the pivot keys it round-tripped through PHP as STRINGS
+/// (`where "project_id" = ? and "user_id" = ?`), which reaches an `int4` slot as `TAG_TEXT`. Four
+/// measured failures. `pdo_pgsql` sends every parameter as text and PostgreSQL parses it.
+///
+/// **`int2`/`int8` ride along with the measured `int4`, and that is a deliberate departure from
+/// "name the exact Type", argued rather than assumed.** That rule (§22.2 (af)) exists to stop a
+/// widening spanning types whose input syntax or MEANING differs — `varchar` vs `bpchar` pad
+/// differently, `bool` assigns meaning to `'1'`. The three integer widths share exactly one input
+/// syntax and differ only in RANGE, which PostgreSQL itself enforces and reports as `22003`; and
+/// the caller shape here is a stringly-typed key, which is width-independent — `$table->id()` is
+/// `bigint`, so admitting only `int4` would leave the identical defect armed on the commonest
+/// Laravel primary key.
+///
+/// **`bool`, `float4`/`float8` and `bytea` stay OUT, and each for its own reason rather than by
+/// omission:** `bool` because `'1'`/`'t'`/`'yes'` ACQUIRING a boolean meaning is exactly the §9.1
+/// coercion class the S9 `I64 → bool` value gate exists to refuse; the float widths because a text
+/// float silently rounds, which is the harm (an) added a pre-send exactness gate for; and `bytea`
+/// because its hex-vs-escape input is a real encoding decision, not a rendering. Each of those has
+/// its own narrow binary bind path from its own canonical tag (the S8a [`PgInt`] narrowing is what
+/// made a `serial` primary key work), and text must not become a way around them.
 ///
 /// A function rather than a `const [Type; 8]`, matching the array-literal-plus-`contains` idiom
 /// [`pg_canonical_text_param`] already uses (`[$(Type::$ty),+].contains(resolve_domain(ty))`). It
@@ -183,6 +203,10 @@ fn is_text_input_target(base: &Type) -> bool {
         Type::UUID,
         Type::JSON,
         Type::JSONB,
+        // M2-C2d: the integer widths — see the membership argument above.
+        Type::INT2,
+        Type::INT4,
+        Type::INT8,
     ]
     .contains(base)
 }
@@ -423,8 +447,9 @@ impl ToSql for PgInt {
             i32::try_from(self.0)?.to_sql(base, out)
         } else if *base == Type::INT8 {
             self.0.to_sql(base, out)
-        } else if *base == Type::TEXT {
-            // M1-S9: the decimal rendering, verbatim, in TEXT format (see `encode_format`).
+        } else if *base == Type::TEXT || *base == Type::VARCHAR {
+            // M1-S9 (`text`) / M2-C2d (`varchar`): the decimal rendering, verbatim, in TEXT format
+            // (see `encode_format`).
             out.extend_from_slice(self.0.to_string().as_bytes());
             Ok(IsNull::No)
         } else if *base == Type::NUMERIC {
@@ -475,17 +500,24 @@ impl ToSql for PgInt {
             // M2-C2, measured targets only (the §22.2 (af) membership rule).
             Type::NUMERIC,
             Type::FLOAT8,
+            // M2-C2d: `varchar`. `$table->string('flag')` with an integer bound into it is ordinary
+            // Eloquent (`EloquentBelongsToManyTest`'s pivot `flag`, 5 measured failures), and
+            // PostgreSQL's varchar input syntax IS the decimal rendering. `bpchar` deliberately
+            // stays out: `char(n)` PADS, so a read-back would not equal what was written — a
+            // difference in SEMANTICS, which is what the membership rule is really about.
+            Type::VARCHAR,
         ]
         .contains(base)
     }
 
-    /// TEXT format for the two targets whose encoder above writes canonical text (`text` and
-    /// `numeric`); every other target keeps the native BINARY form its delegated encoder writes.
+    /// TEXT format for the three targets whose encoder above writes canonical text (`text`,
+    /// `varchar` and `numeric`); every other target keeps the native BINARY form its delegated
+    /// encoder writes.
     /// Resolves the domain for the same reason `to_sql` does: the format must be decided by the
     /// encoder that actually runs (see [`PgText::encode_format`]).
     fn encode_format(&self, ty: &Type) -> Format {
         let base = resolve_domain(ty);
-        if *base == Type::TEXT || *base == Type::NUMERIC {
+        if *base == Type::TEXT || *base == Type::VARCHAR || *base == Type::NUMERIC {
             Format::Text
         } else {
             Format::Binary
@@ -953,8 +985,13 @@ mod tests {
         // NULL binds against anything (PgNull::accepts is universally true).
         assert!(accepts(&Value::Null, &Type::INT4));
         assert!(accepts(&Value::Null, &Type::TEXT));
-        // A canonical mismatch is caught (Text cannot bind int4).
-        assert!(!accepts(&Value::Text("x".to_string()), &Type::INT4));
+        // M2-C2d: a canonical TEXT now binds the integer widths too (PG's int input syntax IS the
+        // decimal rendering, and a stringly-typed key is what Eloquent re-binds after a round trip).
+        assert!(accepts(&Value::Text("42".to_string()), &Type::INT4));
+        // ...but a canonical mismatch is still caught. `bool` is the right probe now: `'1'`/`'t'`
+        // ACQUIRING a boolean meaning is the one §9.1 coercion class this widening deliberately
+        // does not open.
+        assert!(!accepts(&Value::Text("x".to_string()), &Type::BOOL));
     }
 
     /// M1-S8a: a canonical `I64` binds to EVERY PG integer width, and an `F64` to both float widths.
@@ -1078,6 +1115,79 @@ mod tests {
         assert_eq!(&f[..], &expect[..], "float8 is the native binary f64");
     }
 
+    /// **M2-C2d: `I64 → varchar` and `TEXT → int2/int4/int8`** — the two directions ordinary
+    /// Eloquent reaches that the pre-flight still refused, and they are MIRRORS of each other: an
+    /// integer into a string column, and a string into an integer column.
+    ///
+    /// Both are measured in `laravel/framework` v11.51.0's own integration suite:
+    /// `EloquentBelongsToManyTest` binds an `int` into the pivot's `$table->string('flag')` (5
+    /// cases), and `EloquentPivotSerializationTest` restores a serialized pivot, so Eloquent
+    /// re-binds keys that round-tripped through PHP as STRINGS against `int4` columns (4 cases).
+    #[test]
+    fn c2d_i64_binds_varchar_and_text_binds_the_integer_widths() {
+        // --- I64 → varchar. `bpchar` stays OUT: char(n) PADS, so a read-back would not equal what
+        // was written — a difference in SEMANTICS, which is what the membership rule guards.
+        assert!(accepts(&Value::I64(42), &Type::VARCHAR));
+        assert!(
+            accepts(&Value::I64(i64::MIN), &Type::VARCHAR),
+            "no value gate: every integer has a decimal rendering"
+        );
+        assert!(
+            !accepts(&Value::I64(42), &Type::BPCHAR),
+            "char(n) pads, so this is not the same bind — and no caller was measured"
+        );
+
+        // --- TEXT → the three integer widths, all of them (one input syntax, range enforced by PG).
+        for ty in [Type::INT2, Type::INT4, Type::INT8] {
+            assert!(accepts(&Value::Text("42".to_string()), &ty), "{ty:?}");
+        }
+        // A NON-numeric string is NOT refused here on purpose: PostgreSQL's own parser answers that
+        // (`22P02`), server-side and known-fate, exactly as it already does for the `numeric`/`date`
+        // targets §22.2 (aa) admitted. Adding a digits-only pre-check would be STRICTER than libpq
+        // and would refuse forms PG accepts (leading `+`, surrounding whitespace).
+        assert!(accepts(
+            &Value::Text("not a number".to_string()),
+            &Type::INT4
+        ));
+
+        // --- and the line held: text must not ASSIGN MEANING or LOSE PRECISION.
+        for ty in [Type::BOOL, Type::FLOAT8, Type::BYTEA] {
+            assert!(!accepts(&Value::Text("1".to_string()), &ty), "{ty:?}");
+        }
+
+        // --- FORMAT. Both new arms ride PG's TEXT wire format; everything else stays binary.
+        assert!(matches!(
+            PgInt(42).encode_format(&Type::VARCHAR),
+            Format::Text
+        ));
+        assert!(matches!(
+            PgInt(42).encode_format(&Type::INT8),
+            Format::Binary
+        ));
+        assert!(matches!(
+            PgText("42".to_string()).encode_format(&Type::INT4),
+            Format::Text
+        ));
+
+        // --- BYTES, so a format change cannot pass unnoticed.
+        let mut v = tokio_postgres::types::private::BytesMut::new();
+        PgInt(-7).to_sql(&Type::VARCHAR, &mut v).unwrap();
+        assert_eq!(
+            &v[..],
+            b"-7",
+            "varchar takes the decimal rendering, verbatim"
+        );
+        let mut t = tokio_postgres::types::private::BytesMut::new();
+        PgText("42".to_string())
+            .to_sql(&Type::INT4, &mut t)
+            .unwrap();
+        assert_eq!(
+            &t[..],
+            b"42",
+            "and the text goes to an int slot verbatim too"
+        );
+    }
+
     /// The exactness predicate itself, and specifically the trap it is written to avoid: Rust's
     /// float→int `as` cast SATURATES, so the obvious `(n as f64) as i64 == n` reports TRUE for
     /// `i64::MAX` — the one value most obviously not representable. Mutation check: swap the
@@ -1130,10 +1240,13 @@ mod tests {
             assert!(buf.is_empty(), "a refused bind must write no bytes");
         }
 
-        // Membership stays MEASURED: `text` only, never the other character types — no suite
-        // failure ever reached them with an integer, and unmeasured widening is the §22.2 (af)
-        // anti-pattern this comment exists to stop.
-        for ty in [Type::VARCHAR, Type::BPCHAR, Type::NAME, Type::UNKNOWN] {
+        // Membership stays MEASURED, and it MOVED once: M2-C2d admitted `varchar` when
+        // `EloquentBelongsToManyTest` produced the caller (an integer into a pivot's
+        // `$table->string('flag')`, 5 failures). That is the rule working, not being bent — the
+        // three character types below still have none, and `bpchar` additionally PADS, so a
+        // read-back would not equal what was written.
+        assert!(accepts(&Value::I64(42), &Type::VARCHAR));
+        for ty in [Type::BPCHAR, Type::NAME, Type::UNKNOWN] {
             assert!(!accepts(&Value::I64(42), &ty), "I64 must not bind {ty:?}");
         }
 
@@ -1242,9 +1355,9 @@ mod tests {
             "the offending VALUE must be named: {too_big}"
         );
 
-        let wrong_type = check_param(&Value::Text("x".into()), &Type::INT4).expect_err("mismatch");
+        let wrong_type = check_param(&Value::Bool(true), &Type::INT4).expect_err("mismatch");
         assert!(wrong_type.contains("cannot bind"), "{wrong_type}");
-        assert!(wrong_type.contains("TEXT"), "{wrong_type}");
+        assert!(wrong_type.contains("BOOL"), "{wrong_type}");
         assert!(!wrong_type.contains("out of range"), "{wrong_type}");
 
         // The UNDERFLOW arm renders the value SCIENTIFICALLY (Task 5 fix round 1, F4). `Display`
@@ -1283,7 +1396,7 @@ mod tests {
             "a domain over int4 must accept an I64"
         );
         assert!(
-            !accepts(&Value::Text("x".into()), &dom_int4),
+            !accepts(&Value::Bool(true), &dom_int4),
             "the base type's strictness must survive the unwrap"
         );
         assert!(
@@ -1476,8 +1589,10 @@ mod tests {
             Kind::Domain(Type::INT4),
             "public".to_string(),
         );
-        let why = check_param(&Value::Text("x".into()), &dom)
-            .expect_err("a TEXT cannot bind an int4 domain");
+        // The probe is a BOOL rather than a TEXT since M2-C2d admitted text into the integer
+        // widths; what this test is about is the MESSAGE, not which tag happens to be refused.
+        let why =
+            check_param(&Value::Bool(true), &dom).expect_err("a BOOL cannot bind an int4 domain");
         assert!(why.contains("positive_int"), "names the DOMAIN: {why}");
         assert!(why.contains("int4"), "names the BASE: {why}");
     }
@@ -2124,17 +2239,24 @@ mod tests {
                  temporal/decimal/json/uuid value as a string"
             );
         }
-        // Still NARROW where text is NOT the input form: an integer, a boolean and a byte array
-        // have binary-only bind paths here, and the S8a narrowing that made `serial` PKs work
-        // must not be undone by this widening.
-        for ty in [
-            Type::INT2,
-            Type::INT4,
-            Type::INT8,
-            Type::BOOL,
-            Type::BYTEA,
-            Type::FLOAT8,
-        ] {
+        // M2-C2d: and the INTEGER widths, whose input syntax is the decimal rendering. Eloquent
+        // re-binds a pivot key it round-tripped through PHP as a STRING, which is how a `TAG_TEXT`
+        // reaches an `int4` slot in ordinary application code.
+        for ty in [Type::INT2, Type::INT4, Type::INT8] {
+            assert!(
+                accepts(&Value::Text("42".to_string()), &ty),
+                "a canonical TEXT param must bind to {ty:?} — PG's integer input syntax is exactly \
+                 the decimal rendering, and pdo_pgsql sends every parameter this way"
+            );
+        }
+        // Still NARROW where text would ASSIGN MEANING or LOSE PRECISION rather than merely render.
+        // Each of these three is out for its own reason, and none of them is "no caller yet":
+        //   bool    — `'1'`/`'t'`/`'yes'` acquiring a boolean meaning is the §9.1 coercion class the
+        //             S9 `I64 → bool` value gate exists to refuse; text must not be a way around it.
+        //   float8  — a text float silently ROUNDS, the harm §22.2 (an) added a pre-send exactness
+        //             gate for on the `I64 → float8` arm.
+        //   bytea   — hex-vs-escape input is a real encoding DECISION, not a rendering.
+        for ty in [Type::BOOL, Type::BYTEA, Type::FLOAT8] {
             assert!(
                 !accepts(&Value::Text("42".to_string()), &ty),
                 "a bare TEXT param must NOT bind to {ty:?}"

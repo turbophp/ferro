@@ -102,37 +102,49 @@ final class BindTypesLiveTest extends DbalLiveTestCase
 
     /**
      * ADDED beyond the plan — the mapping asserted as a MIRROR against a live PostgreSQL, in the
-     * direction the plan's rows do not cover.
+     * direction the plan's rows do not cover: one value, two `ParameterType`s, both landing.
      *
-     * Task 4 widened PG's canonical-TEXT bind into `numeric`, `date`, `time`, `timestamp`,
-     * `timestamptz`, `uuid`, `json` and `jsonb` — deliberately NOT into the integer family. So a
-     * numeric string is bindable into an `int` column ONLY because `ParameterType::INTEGER` narrows
-     * it to a PHP int (`TAG_I64`) first; the SAME string under `ParameterType::STRING` reaches the
-     * engine as `TAG_TEXT` and is refused PRE-SEND. One value, two `ParameterType`s, two outcomes —
-     * a property no single-sided assertion can express, and the live proof that the `INTEGER` arm
-     * is not decoration.
+     * **This test used to assert the OPPOSITE of its second half, and the change is deliberate.**
+     * S8b Task 4 widened PG's canonical-TEXT bind into `numeric`/`date`/`time`/`timestamp`/
+     * `timestamptz`/`uuid`/`json`/`jsonb` and stopped short of the integer family "for no caller
+     * that exists" — so a numeric string under `ParameterType::STRING` reached the engine as
+     * `TAG_TEXT` and was refused PRE-SEND. M2-C2d found the caller in `laravel/framework`'s own
+     * suite (Eloquent re-binds a pivot key that round-tripped through PHP as a string) and admitted
+     * `int2`/`int4`/`int8`, which is what `pdo_pgsql` has always done. So the property this test
+     * pins is now the one that is true: the two `ParameterType`s take genuinely different wire paths
+     * — `INTEGER` narrows to a PHP int (`TAG_I64`, BINARY format), `STRING` stays `TAG_TEXT` (PG's
+     * TEXT format) — and both arrive as the same integer.
      *
-     * The refusal is also the §19.3 shape this project cares about: it happens before the statement
-     * leaves the process, so it is a KNOWN fate (`NonRetryable`), never an `Indeterminate` write.
+     * The §19.3 property did NOT move: a string PostgreSQL cannot parse is still a known fate. It is
+     * now answered by PG's own parser (`22P02`) instead of by the pre-flight, which is the same
+     * arrangement the eight Task 4 targets have always had — a server error carries a `DbError`, so
+     * it classifies `NonRetryable`, never `Indeterminate`.
      */
-    public function testTheSameNumericStringIsAnIntUnderIntegerAndIsRefusedUnderString(): void
+    public function testTheSameNumericStringLandsUnderBothIntegerAndString(): void
     {
         $c = $this->dbal();
         $c->executeStatement('DROP TABLE IF EXISTS s8b_bind_int');
         $c->executeStatement('CREATE TABLE s8b_bind_int (id int primary key)');
 
         $c->executeStatement('INSERT INTO s8b_bind_int (id) VALUES (?)', ['42'], [ParameterType::INTEGER]);
-        self::assertSame(42, $c->fetchOne('SELECT id FROM s8b_bind_int'));
+        $c->executeStatement('INSERT INTO s8b_bind_int (id) VALUES (?)', ['43'], [ParameterType::STRING]);
 
+        self::assertSame(
+            [42, 43],
+            array_map('intval', $c->fetchFirstColumn('SELECT id FROM s8b_bind_int ORDER BY id')),
+            'the two ParameterTypes take different wire paths and must land on the same integers',
+        );
+
+        // ...and a string PostgreSQL cannot parse is still refused, loudly and with a known fate.
         try {
-            $c->executeStatement('INSERT INTO s8b_bind_int (id) VALUES (?)', ['43'], [ParameterType::STRING]);
-            self::fail('a canonical TEXT parameter must not bind to a PG integer column');
+            $c->executeStatement('INSERT INTO s8b_bind_int (id) VALUES (?)', ['forty-four'], [ParameterType::STRING]);
+            self::fail('a non-numeric string must not land in an integer column');
         } catch (DbalDriverException $e) {
-            self::assertStringContainsString('cannot bind to PG type int4', $e->getMessage());
+            self::assertSame('22P02', $e->getSQLState(), 'invalid_text_representation, from PG itself');
         }
 
-        // The refusal stored nothing and left the connection usable — a pre-send known fate.
-        self::assertSame(1, $c->fetchOne('SELECT count(*) FROM s8b_bind_int'));
+        // The refusal stored nothing and left the connection usable.
+        self::assertSame(2, (int) $c->fetchOne('SELECT count(*) FROM s8b_bind_int'));
 
         $c->executeStatement('DROP TABLE s8b_bind_int');
     }

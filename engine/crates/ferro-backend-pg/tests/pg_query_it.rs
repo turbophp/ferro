@@ -506,3 +506,77 @@ async fn c2_i64_binds_numeric_and_float8_live() {
     let rows = co.query("SELECT 1", &[]).await.expect("still usable");
     assert_eq!(rows.rows[0][0], Value::I64(1));
 }
+
+/// **M2-C2d: an `I64` binds a `varchar` slot and a `TEXT` binds the integer widths, live.**
+///
+/// The two directions are mirrors, and both come from ordinary Eloquent in `laravel/framework`
+/// v11.51.0's own integration suite: an `int` into a pivot's `$table->string('flag')`, and a pivot
+/// key that round-tripped through PHP as a STRING re-bound against an `int4` column.
+///
+/// PG is the oracle again — every value is read back through `::text` in the same statement, so a
+/// wrong wire FORMAT (this widening sends both new arms as TEXT) cannot pass as green.
+#[tokio::test(flavor = "multi_thread")]
+async fn c2d_i64_binds_varchar_and_text_binds_ints_live() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    let rows = co
+        .query(
+            "SELECT ($1::varchar)::text, ($2::int4)::text, ($3::int8)::text, ($4::int2)::text",
+            &[
+                Value::I64(-7),
+                Value::Text("42".into()),
+                Value::Text("9223372036854775807".into()),
+                Value::Text("-32768".into()),
+            ],
+        )
+        .await
+        .expect("both directions must bind");
+    let r = &rows.rows[0];
+    assert_eq!(r[0], Value::Text("-7".into()));
+    assert_eq!(r[1], Value::Text("42".into()));
+    assert_eq!(
+        r[2],
+        Value::Text("9223372036854775807".into()),
+        "the full int8 range survives the text bind"
+    );
+    assert_eq!(r[3], Value::Text("-32768".into()));
+
+    // A NON-numeric string is NOT pre-refused: PostgreSQL's own parser answers, server-side, with
+    // `22P02` — known fate, and the connection survives. Adding a digits-only pre-check here would
+    // be STRICTER than libpq and would refuse forms PG accepts.
+    let err = co
+        .query("SELECT $1::int4", &[Value::Text("not a number".into())])
+        .await
+        .expect_err("PG must refuse a non-numeric string for an int4 slot");
+    match err {
+        PoolError::Sql { ref sqlstate, .. } => {
+            assert_eq!(
+                sqlstate.as_deref(),
+                Some("22P02"),
+                "invalid_text_representation"
+            )
+        }
+        other => panic!("expected a known-fate Sql error, got {other:?}"),
+    }
+
+    // ...and the line held: a text `1` must NOT acquire a boolean meaning (the §9.1 coercion class
+    // the S9 `I64 → bool` value gate exists to refuse; text must not be a way around it).
+    let err = co
+        .query("SELECT $1::bool", &[Value::Text("1".into())])
+        .await
+        .expect_err("a bare TEXT must not bind a bool slot");
+    match err {
+        PoolError::Sql { ref message, .. } => assert!(
+            message.contains("cannot bind") && message.contains("bool"),
+            "a pre-send refusal naming the target: {message}"
+        ),
+        other => panic!("expected a known-fate Sql refusal, got {other:?}"),
+    }
+
+    let rows = co.query("SELECT 1", &[]).await.expect("still usable");
+    assert_eq!(rows.rows[0][0], Value::I64(1));
+}
