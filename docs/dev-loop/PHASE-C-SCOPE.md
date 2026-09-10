@@ -30,9 +30,41 @@ the Illuminate tier need that `ferro/client` does not have yet?*
 | `lastInsertId` | **[verified]** present | On the wire since S8a; on stream terminals since B2c. |
 | `getAttribute(SERVER_VERSION)` for the PDO shim | **[verified]** present | `poolInfo()` carries `server_version` (S8a, `HELLO_ACK` v2). |
 | **`selectResultSets()` — MULTIPLE result sets** | **GAP [verified], but NOT the binding constraint** | `ExecOk` carries exactly ONE `cols` + ONE `rows`, so several result sets have no wire representation; §15 lists the method without noting this. **The deeper blocker, also [verified]:** a MySQL `CALL` returns no usable rows today — a prepared `CALL` declares zero result columns even when the procedure emits a result set, so the streamed path discards the rows and the buffered path yields N cell-less rows. Fixing the wire without fixing that would ship a feature that still returns nothing. See C1a. |
-| `DB::transaction($fn, attempts: 3)` retry mapping | **[UNVERIFIED]** | The fate branches exist (§19.3); what is unchecked is whether Illuminate's `ManagesTransactions` retry loop can be driven from them without reimplementing it. Check before slicing. |
-| `read`/`write` split → a second pool | **[UNVERIFIED]** | §15 shows `'read' => ['pool' => 'main_ro']`. Whether `ferrod` exposes replica pools usably today is unchecked. |
-| `FerroPdoShim` (`quote`, `lastInsertId`, `inTransaction`, `exec`, `getAttribute`) | **[UNVERIFIED]** | `quote()` is the one to think hardest about: it is a SQL-generation-adjacent API, and charter rule 6 forbids SQL rewriting. Decide what it may legitimately do before writing it. |
+| `DB::transaction($fn, attempts: 3)` retry mapping | **[verified] — works, but ONLY if the tier's exception follows PDO's code convention, NOT DBAL's** | See "The `attempts:` requirement" below. Getting it backwards silently disables retry for PostgreSQL serialization failures. |
+| `read`/`write` split → a second pool | **[verified] — no engine work needed** | `PoolSpec` (name, dsn, kind, pin_functions, pin_on_unknown) has NO replica or read-role concept; pools are just named DSNs, and `read-replica` appears in the tree only as an example pool NAME in a config test. That is GOOD news: Laravel's `'read' => ['pool' => 'main_ro']` is satisfied entirely client-side by selecting a different pool name per query. **The work is inheriting Illuminate's stickiness rules, not building replication:** the base `Connection` already decides read-vs-write per query (a write makes subsequent reads sticky; reads inside a transaction go to the write connection) and expresses that by picking `getPdo()` vs `getReadPdo()`. Our execution layer does not use PDO, so the subclass must read WHICH role the base class selected and map it to a pool name — inheriting the semantics rather than re-deriving them. |
+| `FerroPdoShim` (`quote`, `lastInsertId`, `inTransaction`, `exec`, `getAttribute`) | **[decided] — do NOT implement `quote()` speculatively** | `lastInsertId`/`inTransaction`/`exec`/`getAttribute` are all backed by things that already exist. `quote()` is different in kind: implementing it means owning dialect-specific SQL string escaping, which is security-critical code written for no known caller. §15 lists it because ecosystem packages touch it, but WHICH packages and HOW is unknown. The slice that finds a real caller decides; until then it refuses, with a message naming the alternative (parameter binding). This follows the house stance set at S7 — *we refuse what PDO corrupts* — and charter rule 6, and it is reversible in the safe direction: a refusal can become an implementation, an unnoticed escaping bug cannot be un-shipped. |
+
+## The `attempts:` requirement (verified against Illuminate 11.x source)
+
+`DB::transaction($fn, attempts: 3)` retries iff `causedByConcurrencyError($e)` is true. That helper
+matches on exactly two things:
+
+1. `$e instanceof PDOException` **and** the exception CODE is SQLSTATE `40001`; or
+2. the exception MESSAGE containing one of a fixed list of substrings — among them
+   `"Deadlock found when trying to get lock"`, `"deadlock detected"` and
+   `"Lock wait timeout exceeded; try restarting transaction"`.
+
+Two consequences, and the second is the one that would have shipped silently.
+
+**Criterion 2 already works, by faithfulness rather than by design.** Ferro preserves the raw server
+message verbatim on every fate arm, so a MySQL deadlock, a PG `deadlock detected` and a MySQL 1205
+lock-wait timeout all match those substrings as-is. Nothing is needed for those.
+
+**Criterion 1 requires the tier's exception to put SQLSTATE in `getCode()` — the OPPOSITE of what the
+DBAL driver does.** `Illuminate\Database\QueryException extends PDOException` and its constructor
+does `$this->code = $previous->getCode()`, i.e. it inherits the code from OUR driver exception. PDO's
+convention is that `getCode()` IS the SQLSTATE; DBAL's convention (and `Ferro\DBAL\Exception\DriverException`'s)
+is that `getCode()` is the vendor ERRNO, with SQLSTATE in `getSQLState()`. **If the Eloquent tier
+copies the DBAL tier's convention, criterion 1 never fires**, and a PostgreSQL serialization failure —
+SQLSTATE `40001`, whose message `could not serialize access due to concurrent update` matches NONE of
+the substrings in criterion 2 — is **never retried**, even though Ferro classified it `Retryable`
+correctly. `attempts: 3` would appear to work (deadlocks retry via criterion 2) while silently not
+working for the one case SERIALIZABLE workloads depend on.
+
+So: **the Eloquent tier's driver exception MUST follow PDO's convention, and a live guard must assert
+that a PG serialization failure actually re-runs the closure** — not merely that it classifies
+Retryable. This is the same shape as §22.2 (ac)'s lesson: a correct classification is worthless if
+the tier above cannot read it.
 
 ## Proposed slices
 
@@ -55,7 +87,10 @@ the Illuminate tier need that `ferro/client` does not have yet?*
   is the S8b lesson: a HARD CONTACT ASSERTION (`getNativeConnection() instanceof …` + a round-tripped
   `SELECT 1`) before a single suite test runs. Upstream's `TestUtil` silently fell back to SQLite
   and reported a green 105-test run with zero Ferro contact; that must not be re-learned.
-- **C1c — writes + transactions**, including the `attempts` mapping (after its premise check).
+- **C1c — writes + transactions**, including the `attempts:` mapping. Its premise is now checked (see
+  above): the requirement is that the driver exception put SQLSTATE in `getCode()`, and the exit gate
+  is a LIVE guard proving a PG serialization failure actually RE-RUNS the closure — not merely that
+  it classifies `Retryable`.
 - **C1d — `cursor()`/`LazyCollection`**, which should be small given B2.
 - **C1e — the PDO shim**, scoped by what C1b–C1d actually turn out to need, not by §15's list
   up front.
