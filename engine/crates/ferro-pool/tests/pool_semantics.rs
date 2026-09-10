@@ -425,3 +425,74 @@ fn backoff_delay_schedule() {
         }
     }
 }
+
+// -------------------------------------------------------------------------------------------------
+// B5 — the backend DIAL is bounded, and the permit comes back.
+// `docs/followups/2026-08-10-unbounded-backend-dial.md`
+// -------------------------------------------------------------------------------------------------
+
+/// A black-holed dial must not hold a pool permit for the OS TCP connect timeout.
+///
+/// **The bound is not the property; the RELEASED PERMIT is.** A `checkout()` that merely returned
+/// `Timeout` while leaking its permit would satisfy a naive "did it come back?" assertion and still
+/// leave the pool with one less slot forever — which is exactly the harm the follow-up records
+/// (sixteen such callers exhausting a `max_size: 16` pool for two minutes with nothing running on
+/// any connection). So this drives a pool of `max_size: 1`: the SECOND checkout can only succeed if
+/// the first one gave its permit back.
+///
+/// `start_paused` makes the ~127 s hang a deterministic auto-advance rather than a real wait, so
+/// this is a unit test and not a two-minute one.
+#[tokio::test(start_paused = true)]
+async fn b5_a_black_holed_dial_is_bounded_and_releases_its_permit() {
+    let config = PoolConfig {
+        max_size: 1,
+        checkout_timeout: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let pool = Pool::new(FakeBackend::new(), config);
+    pool.backend().arm_connect_hang();
+
+    let started = tokio::time::Instant::now();
+    let err = match pool.checkout().await {
+        Ok(_) => panic!("a dial that never answers must not hand back a Checkout"),
+        Err(e) => e,
+    };
+    let waited = started.elapsed();
+
+    assert!(
+        matches!(err, PoolError::Timeout),
+        "a dial that never answered is Timeout, not ConnectionLost (the split is how an operator \
+         tells 'refused us' from 'never answered'): got {err:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(5),
+        "the dial must be bounded by checkout_timeout, not by the OS TCP timeout: waited {waited:?}"
+    );
+
+    // THE property: the permit was released, so this `max_size: 1` pool is usable again.
+    pool.backend().disarm_connect_hang();
+    let co = pool
+        .checkout()
+        .await
+        .expect("the timed-out dial must have released its permit, leaving the pool usable");
+    drop(co);
+}
+
+/// The bound does not change the SUCCESS path: a dial that answers inside the budget still yields a
+/// working checkout. Without this, deleting the whole `connect()` call would leave the test above
+/// green (it only asserts a failure), so this is what keeps the bound from becoming a ban.
+#[tokio::test(start_paused = true)]
+async fn b5_a_healthy_dial_is_unaffected_by_the_bound() {
+    let config = PoolConfig {
+        max_size: 1,
+        checkout_timeout: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let pool = Pool::new(FakeBackend::new(), config);
+
+    let co = pool
+        .checkout()
+        .await
+        .expect("a healthy dial is well inside the budget");
+    drop(co);
+}

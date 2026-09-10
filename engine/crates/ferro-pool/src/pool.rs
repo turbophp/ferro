@@ -120,7 +120,45 @@ impl<B: PoolBackend> Pool<B> {
                 // bounds this). A connect failure surfaces immediately (v2/M5) — no hidden retry
                 // loop here; `permit` drops on this early return, releasing capacity so it is not
                 // leaked.
-                return match self.inner.backend.connect().await {
+                //
+                // BOUNDED DIAL (B5, `docs/followups/2026-08-10-unbounded-backend-dial.md`). Neither
+                // `tokio_postgres::connect` nor `mysql_async`'s dial carries a connect timeout, so
+                // against a host that neither answers nor resets — a black-holed address, a
+                // drop-rule firewall, a wedged hypervisor — this ran to the OS TCP connect timeout
+                // (~127 s measured) while HOLDING one of the pool's `max_size` permits. Sixteen such
+                // callers exhausted the pool for two minutes with nothing running on any connection.
+                //
+                // The bound is `checkout_timeout`, reused as a PER-STEP bound exactly as the
+                // BOUNDED-recycle block below already reuses it. That is the shipped meaning of the
+                // knob, not a new one: a checkout has always been able to spend up to
+                // `checkout_timeout` on the acquire and then again on each conn it recycles, so
+                // total checkout time was never this value and pretending otherwise here would be
+                // the inconsistency. Fixing it in `Pool::checkout` rather than in each backend's
+                // `connect` is what makes EVERY caller — autocommit exec, the tx actor, the stream
+                // producer, the version probe — bounded from one place, instead of each re-deriving
+                // its own budget in the wrong layer.
+                //
+                // A dial that timed out is `Timeout`, not `ConnectionLost`: both are Retryable and
+                // neither ever sent a user statement (`sent = false`, so no `Indeterminate` risk
+                // either way), but the split is what lets an operator tell "the backend refused us"
+                // from "the backend never answered at all" — which is the whole signature of the
+                // black-hole case this bound exists for.
+                let dial = self.inner.backend.connect();
+                let dialed = match tokio::time::timeout(self.inner.config.checkout_timeout, dial)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            timeout_ms = self.inner.config.checkout_timeout.as_millis() as u64,
+                            "ferro-pool: backend dial exceeded checkout_timeout; releasing the permit"
+                        );
+                        // `permit` drops with this return, so a wedged backend can never hold pool
+                        // capacity for longer than the bound.
+                        return Err(PoolError::Timeout);
+                    }
+                };
+                return match dialed {
                     Ok(conn) => {
                         let queue_us = start.elapsed().as_micros() as u64;
                         Ok(Checkout::new(

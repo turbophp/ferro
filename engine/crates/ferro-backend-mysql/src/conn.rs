@@ -186,6 +186,14 @@ pub struct MysqlCancel {
     opts: Opts,
 }
 
+/// How long an out-of-band cancel may spend dialing its SIDE connection before it gives up (B5).
+///
+/// Deliberately a constant and not a `PoolConfig` knob: a cancel is best-effort by contract, so its
+/// timeout and its failure have the SAME handling (log at debug, return), and the caller is never
+/// promised the statement was actually interrupted. The value only needs to be comfortably longer
+/// than a healthy local dial and far shorter than the ~127 s OS TCP connect timeout it replaces.
+const CANCEL_DIAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[async_trait]
 impl Cancel for MysqlCancel {
     async fn cancel(self) {
@@ -193,7 +201,24 @@ impl Cancel for MysqlCancel {
         // statement. Best-effort, fire-and-forget (charter rule 3): any failure — the statement
         // already finished, the server is gone — is swallowed; the actor tears the tx down
         // regardless and NEVER re-runs the statement.
-        match Conn::new(self.opts).await {
+        // BOUNDED (B5) — same reasoning as the PG side: this opens a SIDE connection, the dial
+        // carried no timeout, and `ferrod` awaits `cancel()` inline on the deadline/cancel arms, so
+        // an unreachable backend stalled the teardown the deadline started. A fixed budget, because
+        // a best-effort cancel's timeout and its failure are the same outcome.
+        let dial = tokio::time::timeout(CANCEL_DIAL_BUDGET, Conn::new(self.opts));
+        let dialed = match dial.await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                tracing::debug!(
+                    budget_ms = CANCEL_DIAL_BUDGET.as_millis() as u64,
+                    conn_id = self.conn_id,
+                    "ferro-backend-mysql: cancel side-connection dial exceeded its budget \
+                     (best-effort)"
+                );
+                return;
+            }
+        };
+        match dialed {
             Ok(mut side) => {
                 if let Err(e) = side
                     .query_drop(format!("KILL QUERY {}", self.conn_id))
