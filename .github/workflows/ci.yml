@@ -111,6 +111,15 @@ jobs:
       - run: (cd php/doctrine-dbal && ./vendor/bin/phpunit)
       - run: (cd php/doctrine-dbal && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
       - run: (cd php/doctrine-dbal && ./vendor/bin/phpstan analyse src --level 9)
+      # C1b: the Eloquent tier. Same shape as the Doctrine lanes above and for the same reason —
+      # its own vendor/, so without these three lines the whole package is a silent no-op in CI.
+      # The live re-run under `--fail-on-skipped` is what makes "10 tests passed" mean the engine
+      # was actually reached: `LaravelLiveTestCase` self-skips without FERRO_TEST_PG_URL + a ferrod
+      # binary, both of which this job provides, so a skip here means the lane stopped testing.
+      - run: (cd php/laravel && composer install --no-interaction)
+      - run: (cd php/laravel && ./vendor/bin/phpunit)
+      - run: (cd php/laravel && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
+      - run: (cd php/laravel && ./vendor/bin/phpstan analyse src --level 9)
       - if: always()
         run: docker compose -f testkit/docker-compose.yml logs --no-color --tail=80 pg mysql
 

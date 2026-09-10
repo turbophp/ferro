@@ -148,7 +148,8 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 
 | # | Item | State | Notes |
 |---|------|-------|-------|
-| C1 | Eloquent tier (`ferro/laravel`) + PDO shim | SCOPED — see `docs/dev-loop/PHASE-C-SCOPE.md` | §15; Illuminate `Connection` execution layer only, stock Grammar/Processor. Sliced C1a–C1e on the B2 model, each premise marked verified/UNVERIFIED. **Most C1 carries are already paid** (`fetchRaw`/`fetch:none`, `streamRaw` on BOTH families since B2, the imperative tx trio, `lastInsertId`, `server_version`) — the S8a-style carry slice is much smaller than S8b's was. **C1a was found AND decided while scoping:** `selectResultSets()` has no wire representation (`ExecOk` carries exactly one `cols`+`rows`) — but the wire is not its real blocker. A MySQL `CALL` returns no usable rows today (a prepared `CALL` declares ZERO result columns even when the procedure emits a result set; streamed → rows discarded, buffered → N cell-less rows, both verified in `ferro-backend-mysql/src/stream.rs`). Since a stored procedure is what `selectResultSets()` is FOR, a `/proto` multi-result-set change would ship a feature that still returns nothing. **Documented incompatibility for M2; the CALL blind spot is the true prerequisite and is engine work, not tier work.** |
+| C1b | `ferro/laravel` skeleton + resolver + `select()` | DONE | The package exists and executes. `FerroConnections::register()` wires `ferro-pgsql` through `Illuminate\Database\Connection::resolverFor()`; `FerroPostgresConnection extends PostgresConnection` and overrides `select()` ONLY, routed through `run()` so Illuminate's query log, `QueryExecuted` event and `QueryException` wrapping are all inherited. **`select()` is fate-declared a WRITE** — verified in `illuminate/database` v11.51.0 that `PostgresProcessor::processInsertGetId` runs `insert … returning id` through `selectFromWriteConnection()` = `select($q, $b, false)`, so "select() is a read" would have mis-declared the commonest Eloquent write on PG. `$useReadPdo` is recorded as a possible refinement and NOT taken: it is an application hint, not a guarantee (`DB::select('INSERT …')` passes `true`). **The contact gate was mutation-proven and FAILED the first mutation** — see the found-bugs section. 10 live tests / 53 assertions against real `ferrod` + PG 17, PHPStan L9 clean, CI lanes added (without them the package is a silent no-op). |
+| C1 | Eloquent tier (`ferro/laravel`) + PDO shim | IN PROGRESS — C1b done; see `docs/dev-loop/PHASE-C-SCOPE.md` | §15; Illuminate `Connection` execution layer only, stock Grammar/Processor. Sliced C1a–C1e on the B2 model, each premise marked verified/UNVERIFIED. **Most C1 carries are already paid** (`fetchRaw`/`fetch:none`, `streamRaw` on BOTH families since B2, the imperative tx trio, `lastInsertId`, `server_version`) — the S8a-style carry slice is much smaller than S8b's was. **C1a was found AND decided while scoping:** `selectResultSets()` has no wire representation (`ExecOk` carries exactly one `cols`+`rows`) — but the wire is not its real blocker. A MySQL `CALL` returns no usable rows today (a prepared `CALL` declares ZERO result columns even when the procedure emits a result set; streamed → rows discarded, buffered → N cell-less rows, both verified in `ferro-backend-mysql/src/stream.rs`). Since a stored procedure is what `selectResultSets()` is FOR, a `/proto` multi-result-set change would ship a feature that still returns nothing. **Documented incompatibility for M2; the CALL blind spot is the true prerequisite and is engine work, not tier work.** |
 | C2 | Illuminate integration suite green through a Ferro connection | OPEN | The M2 acceptance bar — and the P10 go-to-market prerequisite. Suite runner modeled on `testkit/dbal-suite.sh` (with its hard contact assertion — the SQLite-fallback lesson). **§15's bar names MySQL + PG + SQLite, and the SQLite column is unreachable until C3 lands** — the same gap §14's bar had. Whether C3 should therefore precede C2 is an OPEN sequencing question, not settled. Report the columns that ran and name the one that could not; do not restate the bar as if met. |
 | C3 | SQLite backend, engine-owned mode (§7.6) | OPEN | Also unblocks the SQLite column of the §14 DBAL bar — re-run A5's suite when it lands. |
 | C4 | Observability: OTLP traces, Prometheus, slow log (§13) | OPEN | Redaction contract per product-vision §5: fingerprints only, closed label vocabularies. |
@@ -178,6 +179,16 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 | E8 | **v1 exit measurement** (§16) | OPEN | On the recorded reference environment: boundary p50 < 60 µs / p99 < 200 µs, ≥5× connection reduction, fan-out ≤ max+2 ms, 1 GB stream RSS bounds, >95 % statement-cache hit rate. Honor the D12 accelerator decision. Results + env manifest into `bench/results/`. |
 
 ### Standing (any phase, any iteration)
+
+- **Batch scoping/doc work; push ONCE.** PR #21 was pushed to four times, each a docs-only
+  amendment and each restarting a full 5-lane CI cycle (including the live integration lane against
+  three real backends), plus three stale `check_suite.completed` wakes for superseded heads that had
+  to be recognised rather than acted on. The cause was resolving premises incrementally against an
+  open PR. Nothing in those later commits needed to be visible before the whole set was ready.
+  **This does NOT apply to code slices**, where proving each push green before the next builds on it
+  is the discipline that caught FB-5 (the B2a→B2c chain). It is specific to work that produces no
+  usable artifact until it is complete.
+
 
 - Deferred perf slices (§7.2 pipelined hygiene, the B4 two-channel split) — only against
   recorded bench numbers, per charter rule 5.
@@ -211,6 +222,21 @@ the B2b-2 row above.
   returns. Mutation-proven (removing the bound hangs the test). The MySQL-side half of the
   contract — that a dropped/timed-out reclaim leaves the conn `is_closed`-dead — remains B2b-2's
   (it is the FB-2 contract, and no fake can model a parked conn).
+- **FB-7 (PROCESS/TEST-QUALITY, FOUND AND FIXED WITHIN C1b — a GATE that could not fail).** C1b's
+  contact assertion was written as `select 1 as ferro_contact`, following the S8b lesson that a
+  green suite must not be able to mean zero engine contact. Mutation-testing it showed the gate
+  itself was **fakeable**: with `select()` stubbed to return a fixed row shaped like the probe's
+  answer, the contact assertion PASSED and only two unrelated tests failed. A constant is exactly
+  what a stub can guess — which is the same failure mode as the upstream DBAL `TestUtil` reporting
+  `OK (105 tests)` against in-memory SQLite, one level up.
+  **Fixed by making the probe unguessable and engine-identifying:** a per-call `random_bytes` nonce
+  round-tripped through the query (a stub cannot know it, so its return is evidence something
+  RECEIVED it) plus `version()` asserted to contain `PostgreSQL` (a nonce alone would be satisfied
+  by any SQL database). Re-running the identical mutation against the strengthened gate now fails
+  EVERY test at contact rather than two by accident.
+  **The lesson generalises beyond this package:** "assert contact" is not a property, it is a
+  property-shaped intention. A contact gate must be mutation-tested like any other guard, and a
+  constant probe is not a gate.
 - **FB-6 (MEDIUM, FOUND AND FIXED IN B6a — the third consecutive item whose stated premise did not
   survive checking).** `php/client` enforced `MAX_FRAME_PAYLOAD` on DECODE only. `Codec::encodeFrame`
   had no guard, so the client would put on the wire a frame **its own `Header::decode` would

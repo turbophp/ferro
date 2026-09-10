@@ -1,0 +1,27 @@
+{
+    "name": "ferro/laravel",
+    "description": "Ferro connections for Laravel/Illuminate — config-only adoption of the Ferro engine",
+    "type": "library",
+    "license": "Apache-2.0",
+    "repositories": [
+        { "type": "path", "url": "../client" }
+    ],
+    "require": {
+        "php": ">=8.2",
+        "illuminate/database": "^11.0",
+        "ferro/client": "@dev"
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^2.0",
+        "phpunit/phpunit": "^11.0"
+    },
+    "autoload": { "psr-4": { "Ferro\\Laravel\\": "src/" } },
+    "autoload-dev": {
+        "psr-4": {
+            "Ferro\\Laravel\\Tests\\": "tests/",
+            "Ferro\\Tests\\": "../client/tests/"
+        }
+    },
+    "scripts": { "test": "phpunit", "stan": "phpstan analyse src --level 9" },
+    "config": { "sort-packages": true }
+}
