@@ -1,12 +1,13 @@
-# testkit/laravel/allowlist.txt — the curated subset of laravel/framework's
-# tests/Integration/Database/ that the C2 runner executes. Paths are relative to the pinned clone.
+# testkit/laravel/allowlist.txt — the slice of laravel/framework's tests/Integration/Database/ that
+# the C2 runner executes. Paths are relative to the pinned clone.
 #
-# SMALL BY DESIGN in this first slice. The point of C2's first runner is to prove the harness
-# reaches a real engine and can migrate — not to chase a pass rate. Widening this list is the next
-# slice's job, and each addition should be a deliberate choice with its result recorded.
+# EVERY DRIVER-AGNOSTIC TOP-LEVEL FILE, enumerated rather than globbed. The directory also holds
+# per-driver subdirectories (Postgres/, MySql/, MariaDb/, SqlServer/, Sqlite/) plus Fixtures/,
+# Queue/ and stubs/, and a `<directory>` entry would sweep all of those in — so the list is explicit
+# and the three non-test files below are named as excluded rather than silently absent.
 #
-# DRIVER-GATED SUBDIRECTORIES ARE DELIBERATELY EXCLUDED, and the reason is worth stating rather
-# than leaving as an absence. Upstream's per-driver base classes skip on the DRIVER NAME:
+# DRIVER-GATED SUBDIRECTORIES STAY OUT, and the reason has been MEASURED rather than assumed.
+# Upstream's per-driver base classes skip on the DRIVER NAME:
 #
 #     abstract class PostgresTestCase extends DatabaseTestCase {
 #         protected function defineDatabaseMigrations() {
@@ -14,18 +15,104 @@
 #         }
 #     }
 #
-# Our connection reports `ferro-pgsql`, so every test under Postgres/ (and MySql/, MariaDb/,
-# SqlServer/, Sqlite/) would SKIP — and a wall of skips reads as success while testing nothing,
-# which is the same false-green class the contact assertion exists to prevent. Including them would
-# make the number meaningless. Reaching them needs a decision recorded in PHASE-C-SCOPE.md
-# (register Ferro AS `pgsql` for the suite run, so the gate passes), and that decision is NOT made
-# here.
+# Under `FERRO_LARAVEL_DRIVER=pgsql` (the opt-in alias) those WOULD now run, and that is a real
+# option for a later slice. It is not taken here because the alias column would then carry ~200 more
+# tests than the default column, and the two columns exist precisely to be COMPARABLE — a difference
+# between them has to be attributable to the driver NAME, not to a different test set.
 #
-# Everything below is driver-agnostic: it exercises the query builder, Eloquent and the schema
-# builder through whatever connection is configured.
+# THREE TOP-LEVEL FILES ARE EXCLUDED, each because it defines no runnable test case:
+#   DatabaseTestCase.php                     the abstract base (replaced by our patched copy)
+#   Enums.php                                plain enum declarations
+#   EloquentTransactionWithAfterCommitTests.php   a TRAIT; its class name does not match the file, so
+#                                            PHPUnit reports "Class ... cannot be found" as a runner
+#                                            warning if it is included (measured)
 
+tests/Integration/Database/AfterQueryTest.php
+tests/Integration/Database/ConnectionThreadsCountTest.php
+tests/Integration/Database/DatabaseCacheStoreTest.php
 tests/Integration/Database/DatabaseConnectionsTest.php
-tests/Integration/Database/EloquentWhereTest.php
-tests/Integration/Database/EloquentUpdateTest.php
+tests/Integration/Database/DatabaseCustomCastsTest.php
+tests/Integration/Database/DatabaseEloquentBroadcastingTest.php
+tests/Integration/Database/DatabaseEloquentModelAttributeCastingTest.php
+tests/Integration/Database/DatabaseEloquentModelCustomCastingTest.php
+tests/Integration/Database/DatabaseLockTest.php
+tests/Integration/Database/DatabaseTransactionsTest.php
+tests/Integration/Database/EloquentAggregateTest.php
+tests/Integration/Database/EloquentBelongsToManyTest.php
+tests/Integration/Database/EloquentBelongsToTest.php
+tests/Integration/Database/EloquentCollectionFreshTest.php
+tests/Integration/Database/EloquentCollectionLoadCountTest.php
+tests/Integration/Database/EloquentCollectionLoadMissingTest.php
+tests/Integration/Database/EloquentCursorPaginateTest.php
+tests/Integration/Database/EloquentCustomPivotCastTest.php
 tests/Integration/Database/EloquentDeleteTest.php
+tests/Integration/Database/EloquentEagerLoadingLimitTest.php
+tests/Integration/Database/EloquentHasManyTest.php
+tests/Integration/Database/EloquentHasManyThroughTest.php
+tests/Integration/Database/EloquentHasOneIsTest.php
+tests/Integration/Database/EloquentHasOneOfManyTest.php
+tests/Integration/Database/EloquentLazyEagerLoadingTest.php
+tests/Integration/Database/EloquentMassPrunableTest.php
+tests/Integration/Database/EloquentModelCustomEventsTest.php
+tests/Integration/Database/EloquentModelDateCastingTest.php
+tests/Integration/Database/EloquentModelDecimalCastingTest.php
+tests/Integration/Database/EloquentModelEncryptedCastingTest.php
+tests/Integration/Database/EloquentModelEncryptedDirtyTest.php
+tests/Integration/Database/EloquentModelEnumCastingTest.php
+tests/Integration/Database/EloquentModelHashedCastingTest.php
+tests/Integration/Database/EloquentModelImmutableDateCastingTest.php
+tests/Integration/Database/EloquentModelJsonCastingTest.php
+tests/Integration/Database/EloquentModelLoadCountTest.php
+tests/Integration/Database/EloquentModelLoadMaxTest.php
+tests/Integration/Database/EloquentModelLoadMinTest.php
+tests/Integration/Database/EloquentModelLoadMissingTest.php
+tests/Integration/Database/EloquentModelLoadSumTest.php
+tests/Integration/Database/EloquentModelRefreshTest.php
+tests/Integration/Database/EloquentModelScopeTest.php
+tests/Integration/Database/EloquentModelStringCastingTest.php
+tests/Integration/Database/EloquentModelTest.php
+tests/Integration/Database/EloquentModelWithoutEventsTest.php
+tests/Integration/Database/EloquentMorphConstrainTest.php
+tests/Integration/Database/EloquentMorphCountEagerLoadingTest.php
+tests/Integration/Database/EloquentMorphCountLazyEagerLoadingTest.php
+tests/Integration/Database/EloquentMorphEagerLoadingTest.php
+tests/Integration/Database/EloquentMorphLazyEagerLoadingTest.php
+tests/Integration/Database/EloquentMorphManyTest.php
+tests/Integration/Database/EloquentMorphOneIsTest.php
+tests/Integration/Database/EloquentMorphToGlobalScopesTest.php
+tests/Integration/Database/EloquentMorphToIsTest.php
+tests/Integration/Database/EloquentMorphToLazyEagerLoadingTest.php
+tests/Integration/Database/EloquentMorphToSelectTest.php
+tests/Integration/Database/EloquentMorphToTouchesTest.php
+tests/Integration/Database/EloquentMultiDimensionalArrayEagerLoadingTest.php
+tests/Integration/Database/EloquentPaginateTest.php
+tests/Integration/Database/EloquentPivotEventsTest.php
+tests/Integration/Database/EloquentPivotSerializationTest.php
+tests/Integration/Database/EloquentPivotTest.php
+tests/Integration/Database/EloquentPrunableTest.php
+tests/Integration/Database/EloquentPushTest.php
+tests/Integration/Database/EloquentStrictLoadingTest.php
+tests/Integration/Database/EloquentThroughTest.php
+tests/Integration/Database/EloquentTouchParentWithGlobalScopeTest.php
+tests/Integration/Database/EloquentTransactionWithAfterCommitTest.php
+tests/Integration/Database/EloquentTransactionWithAfterCommitUsingDatabaseMigrationsTest.php
+tests/Integration/Database/EloquentTransactionWithAfterCommitUsingDatabaseTransactionsTest.php
+tests/Integration/Database/EloquentTransactionWithAfterCommitUsingRefreshDatabaseOnMultipleConnectionsTest.php
+tests/Integration/Database/EloquentTransactionWithAfterCommitUsingRefreshDatabaseTest.php
+tests/Integration/Database/EloquentUniqueStringPrimaryKeysTest.php
+tests/Integration/Database/EloquentUpdateTest.php
+tests/Integration/Database/EloquentWhereHasMorphTest.php
+tests/Integration/Database/EloquentWhereHasTest.php
+tests/Integration/Database/EloquentWhereTest.php
+tests/Integration/Database/EloquentWithCountTest.php
+tests/Integration/Database/MigrateWithRealpathTest.php
+tests/Integration/Database/MigratorEventsTest.php
+tests/Integration/Database/ModelInspectorTest.php
 tests/Integration/Database/QueryBuilderTest.php
+tests/Integration/Database/QueryBuilderUpdateTest.php
+tests/Integration/Database/QueryBuilderWhereLikeTest.php
+tests/Integration/Database/QueryingWithEnumsTest.php
+tests/Integration/Database/RefreshCommandTest.php
+tests/Integration/Database/SchemaBuilderSchemaNameTest.php
+tests/Integration/Database/SchemaBuilderTest.php
+tests/Integration/Database/TimestampTypeTest.php

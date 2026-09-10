@@ -12,14 +12,34 @@ tag="${FERRO_LARAVEL_TAG:-v11.51.0}"
 pool="${FERRO_LARAVEL_POOL:-default}"
 # Its OWN database, never the shared `ferro` one — the suite migrates a schema from scratch before
 # every test (`migrate:fresh`) and would otherwise wipe what every other live suite depends on.
-dsn="${FERRO_LARAVEL_DSN:-postgres://ferro:ferro@127.0.0.1:55432/laravel_tests}"
+# The `options=-csearch_path=…` is SUITE PLUMBING with a real lesson behind it, not decoration.
+# `SchemaBuilderSchemaNameTest` creates objects in `my_schema` and then renames them by UNQUALIFIED
+# name, which only resolves against the session search_path. A stock Laravel app sets `search_path`
+# in config/database.php and the PDO connector issues `SET search_path`; a Ferro app cannot, because
+# the session is POOLED — so it belongs on the pool DSN, where libpq's `options` puts it. MEASURED:
+# without it those cases fail, with it they pass. Note Laravel ALSO needs the config key, because
+# `PostgresBuilder::getSchemas()` reads it from the config array and never asks the server — so a
+# Ferro app using a non-default schema needs it in BOTH places (§22.2).
+dsn="${FERRO_LARAVEL_DSN:-postgres://ferro:ferro@127.0.0.1:55432/laravel_tests?options=-csearch_path%3Dpublic,my_schema}"
 svc="${FERRO_LARAVEL_SVC:-pg}"
 work="${FERRO_LARAVEL_WORK:-$root/.laravel-suite}"
+# WHICH allowlist, so a second SET of tests can be recorded as its own column instead of being
+# folded into the main one. `allowlist.txt` is the driver-agnostic tree, which all three driver
+# columns run and can therefore be compared across; `allowlist-postgres.txt` is upstream's
+# PostgreSQL-SPECIFIC subdirectory, which only runs at all under a driver NAME of `pgsql` (its base
+# class carries `#[RequiresDatabase('pgsql')]`), so it has no `ferro-pgsql` column by construction
+# and must not be mixed into one that does.
+allowlist="${FERRO_LARAVEL_ALLOWLIST:-$root/testkit/laravel/allowlist.txt}"
+[ -f "$allowlist" ] || { echo "::error:: allowlist not found: $allowlist"; exit 1; }
 # Which Illuminate `driver` NAME the application registers Ferro under. Both values are real
 # product configurations (see testkit/laravel/DatabaseTestCase.ferro.php): `ferro-pgsql` is §15's
 # one-word config change, `pgsql` is the opt-in alias `FerroConnections::register()` accepts. The
 # recorded numbers differ between them because upstream's own tests branch on the name.
 driver="${FERRO_LARAVEL_DRIVER:-ferro-pgsql}"
+# `stock-pgsql` is THE CONTROL: upstream's own pdo_pgsql against the same server, so a non-pass can
+# be attributed to Ferro or to the framework/server pair instead of guessed at. It is never the
+# default, and bootstrap.php's contact assertion INVERTS for it (it refuses to run if the connection
+# turns out to be a Ferro one).
 src="$work/laravel-$tag"
 reset=1
 args=()
@@ -80,7 +100,7 @@ cfg="$work/phpunit.generated.xml"
     case "$line" in ''|'#'*) continue ;; esac
     if [ -d "$src/$line" ]; then echo "    <directory>$src/$line</directory>"
     else echo "    <file>$src/$line</file>"; fi
-  done < "$root/testkit/laravel/allowlist.txt"
+  done < "$allowlist"
   echo '  </testsuite></testsuites>'
   echo '</phpunit>'
 } > "$cfg"
