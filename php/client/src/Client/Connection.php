@@ -535,9 +535,14 @@ final class Connection
             ExecCodec::FETCH_STREAM,
             $this->tx?->txId(),
         );
-        // Same contract as `stream()`: a streamed statement reports no generated key and CLEARS the
-        // previous one. Unlike `stream()`, this method is not itself a generator, so the clear
-        // happens here — the statement really has been issued by the time we return.
+        // CLEAR on the way in — the "never a stale key" half of the `lastInsertId()` contract, and
+        // the honest answer while the statement is in flight. It is REPOPULATED when the terminal
+        // settles ({@see settleStreamTerminal}), because a streamed statement CAN carry a real
+        // generated key: MySQL/MariaDB stream since B2c and their OK packet carries
+        // `LAST_INSERT_ID()`. (The older comment here claimed a streamed statement never reports a
+        // key — true only while streaming was PostgreSQL-only, where the wire has no such field.)
+        // Unlike `stream()`, this method is not a generator, so the clear happens here: the
+        // statement really has been issued by the time we return.
         $this->lastInsertId = null;
 
         $opened = $session->openStream(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
@@ -580,6 +585,18 @@ final class Connection
         $ok = $this->codec->decode($outcome);
         $terminal->affected = $ok['affected'];
         $terminal->lastInsertId = $ok['last_insert_id'];
+        // …and up to the CONNECTION, where `lastInsertId()` is read from. This line is what makes a
+        // streamed INSERT on MySQL report its AUTO_INCREMENT key (dev-loop B2c regression fix).
+        // Until B2c the driver buffered on the MySQL family, so the key arrived through
+        // {@see dispatch}; the moment `runPrepared()` started streaming there, every streamed INSERT
+        // reported NO key and DBAL's `lastInsertId()` threw `NoIdentityValue` — which is what Doctrine
+        // ORM's IdentityGenerator calls on every MySQL insert. Caught live by
+        // `LastInsertIdLiveTest::testMysqlReportsTheGeneratedKey`.
+        //
+        // The "never a stale key" half of the contract is untouched: `streamRaw()` CLEARS the field
+        // on the way in, so between dispatch and this settle the honest answer is `null`, and a
+        // statement that never drains cleanly never reaches here.
+        $this->lastInsertId = $ok['last_insert_id'];
         $terminal->settled = true;
     }
 

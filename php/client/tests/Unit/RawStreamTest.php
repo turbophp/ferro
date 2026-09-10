@@ -212,4 +212,60 @@ final class RawStreamTest extends TestCase
         $this->expectException(ProtocolException::class);
         $stream->rows();
     }
+
+    /**
+     * **A streamed statement's generated key reaches the CONNECTION** — the offline guard for the
+     * B2c regression, which only a live MySQL caught the first time.
+     *
+     * `lastInsertId()` is read from the Connection, not from the stream, so it is not enough for the
+     * key to land in the `StreamTerminal` cell. Until B2c the DBAL driver buffered on the MySQL
+     * family and the key arrived through `dispatch()`; the moment the driver started streaming
+     * there, every streamed INSERT reported no key and `lastInsertId()` threw `NoIdentityValue` —
+     * which is what Doctrine ORM's IdentityGenerator calls on every MySQL insert. The live suite
+     * caught it; nothing offline did. This is that missing test.
+     *
+     * Both halves of the contract are asserted: `null` while the statement is in flight (never a
+     * stale carry-over), and the real key once the terminal settles.
+     */
+    public function testAStreamedStatementsGeneratedKeyReachesTheConnection(): void
+    {
+        $session = (new FakeSession())
+            ->thenExecOk(4242)                       // a PRIOR buffered INSERT sets a key…
+            ->thenStreamHead([['name' => 'id', 'tag' => C::TAG_I64]])
+            ->thenStreamFrames([
+                [
+                    'type' => 'end',
+                    'outcome' => FakeSession::execOk([
+                        'cols' => [],
+                        'rows' => [],
+                        'affected' => 1,
+                        'last_insert_id' => ['tag' => C::TAG_I64, 'data' => 99],
+                        'stats' => ['queue_us' => 0, 'exec_us' => 0, 'rows' => 0, 'bytes' => 0],
+                    ]),
+                ],
+            ]);
+        $conn = new Connection($session, 'default');
+
+        $conn->fetchRaw('INSERT INTO t (v) VALUES (1)', [], false, false);
+        self::assertSame(4242, $conn->lastInsertId(), 'the buffered path still reports its key');
+
+        $stream = $conn->streamRaw('INSERT INTO t (v) VALUES (2) RETURNING id', [], false);
+        self::assertNull(
+            $conn->lastInsertId(),
+            'in flight: the previous key is CLEARED, and the new one has not arrived — never stale',
+        );
+
+        foreach ($stream->rows() as $_) {
+            // drain to the terminal
+        }
+
+        self::assertTrue($stream->settled(), 'the drain reached the Ok terminal');
+        self::assertSame(99, $stream->lastInsertId(), 'the terminal cell carries the key');
+        self::assertSame(
+            99,
+            $conn->lastInsertId(),
+            'and it reaches the CONNECTION — this is what DBAL lastInsertId() reads, and what '
+            . 'ORM IdentityGenerator needs on every MySQL insert',
+        );
+    }
 }
