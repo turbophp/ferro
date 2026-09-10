@@ -65,6 +65,22 @@ which changes the cost estimate materially.
 A spike test in the `mysql_chaos_it.rs` style — create a procedure, prepare, execute, print both
 column lists — settles all three in one CI run.
 
+## The option someone will reach for, and why it is closed
+
+"Route `CALL` through the TEXT protocol (`COM_QUERY`), which reports columns at execution" is the
+obvious alternative, and the scoping note that preceded this document proposed investigating it. It
+is **foreclosed on two counts**, so the investigation was not done:
+
+- **The text protocol takes no parameters.** `CALL p(?)` needs `COM_STMT_PREPARE`/`COM_STMT_EXECUTE`.
+  A text-protocol route would work only for parameterless `CALL`s, i.e. it would fix the easy half
+  and leave the interesting half broken.
+- **It is unnecessary.** The prepared path can read the executed set's metadata too
+  (`QueryResult::columns()`), so there is nothing the text protocol offers here that costs less.
+
+It would also mean choosing a protocol from the SQL text, which is a shape charter rule 6 is
+pointed at — the assist lexer classifies statements for PINNING, but picking an execution path from
+a leading keyword is a different thing and would want its own argument.
+
 ## The trade a fix must state rather than gloss
 
 `query.rs`'s own docblock says the current order is deliberate: `cols` is built from the prepared
