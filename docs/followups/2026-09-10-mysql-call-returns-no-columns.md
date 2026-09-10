@@ -1,6 +1,8 @@
 # Spike: the MySQL `CALL` blind spot is where Ferro READS the column metadata
 
-**Status:** SPIKE, no code. Every claim below is marked **VERIFIED (source)** — read out of this
+**Status:** SPIKE. The confirming test is `engine/crates/ferro-backend-mysql/tests/call_columns_spike_it.rs`
+— it SKIPS without `FERRO_TEST_MYSQL_URL`, so it is CI's integration lane that answers the three
+questions below. **Its output must be recorded here before any engine change.** Every claim below is marked **VERIFIED (source)** — read out of this
 tree and the vendored driver at `53c984e` — or **UNVERIFIED HERE**, meaning it needs a live
 MySQL that this container does not have (no Docker daemon), so CI's integration lane is the
 authority.
@@ -41,8 +43,12 @@ drains rows without returning them.
 
 - `QueryResult::columns()` / `columns_ref()` read the **pending (executed) result set's** metadata,
   not the prepare-time list (`vendor/mysql-async/src/queryable/query_result/mod.rs:412,425`);
-- multiple result sets are first-class: `next_set()`, `more_results_exists()`,
-  `next_row_or_next_set()`;
+- multiple result sets are first-class — **though not through the methods this document first
+  named**: `next_set()`, `more_results_exists()` and `next_row_or_next_set()` are PRIVATE. The
+  public pattern is `collect()` per set plus `is_empty()` to ask whether another follows, which the
+  driver's own doc spells out (*"`SELECT 'foo'; SELECT 'foo','bar';` will produce a QueryResult with
+  two result sets in it. One can use `QueryResult::is_empty` …"*). Caught by compiling the spike
+  test, before any design leaned on it;
 - `next_row` treats an empty column list as "empty, but not yet consumed result set" and advances —
   so an empty prepare-time list is *expected* by the driver, not an error state.
 
@@ -77,8 +83,9 @@ not a MySQL wall.**
 
 ## Suggested slicing
 
-- **S1 (CI only, no engine code):** the three-question spike test above. It can invalidate
-  everything below.
+- **S1 (CI only, no engine code):** `call_columns_spike_it.rs`, LANDED but not yet run against a
+  live MySQL. It can invalidate everything below, which is why it lands first; record its printed
+  output in this document when CI has run it.
 - **S2:** move the buffered path's `cols` to the executed result set's metadata, with the fate trade
   recorded and a live test that a `CALL` returns real cells.
 - **S3:** the same for `query_stream`.
