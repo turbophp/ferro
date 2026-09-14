@@ -13,6 +13,9 @@ use rusqlite::{Connection, ffi};
 /// constant so the number this spike asserts is the number a reader can look up.
 const SQLITE_BUSY_SNAPSHOT: i32 = 517;
 
+/// `SQLITE_READONLY` = 8. Spelled out for the same reason as `SQLITE_BUSY_SNAPSHOT`.
+const SQLITE_READONLY: i32 = 8;
+
 fn open_wal(path: &Path) -> Connection {
     let conn = Connection::open(path).expect("open");
     let mode: String = conn
@@ -113,6 +116,93 @@ fn p4a_busy_timeout_does_not_retry_a_deferred_upgrade() {
 
     // And the transaction is left for the caller to roll back — the engine cannot replay it.
     a.execute_batch("ROLLBACK").expect("A rolls back");
+}
+
+/// **P5: `PRAGMA query_only` closes the hole D13's own readonly arm opens.**
+///
+/// D13 says a transaction the client DECLARED `readonly` takes a DEFERRED reader lock. That is
+/// precisely P4a's setup — so a client that declares `readonly` and then writes anyway walks
+/// straight into the one failure class C3-1 proved the engine cannot resolve, since charter rule 3
+/// forbids the rollback-and-replay `SQLITE_BUSY_SNAPSHOT` needs. The false declaration is the
+/// client's, but the unretryable error would be the engine's to report, and it would appear only
+/// under concurrency — the worst shape for a bug.
+///
+/// `PRAGMA query_only=ON` converts it into a different error entirely: the write is refused up
+/// front with `SQLITE_READONLY` (8), which is deterministic, provably did not run (so its §9.2 fate
+/// is `NonRetryable`, never `Indeterminate`), and does not depend on whether anyone else happened
+/// to commit. Proven against the SAME fixture as P4a so the two are directly comparable.
+///
+/// This is a premise for the slice that starts composing `BEGIN DEFERRED`, NOT a claim that any
+/// backend sets the pragma — no SQLite backend exists yet. It records that the mitigation is real
+/// BEFORE the arm that needs it ships, so the arm is not left resting on an assumption.
+#[test]
+fn p5_query_only_turns_a_lying_readonly_into_a_clean_refusal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("p5.db");
+
+    let a = open_wal(&path);
+    let b = open_wal(&path);
+    a.busy_timeout(Duration::from_secs(5)).expect("timeout A");
+    b.busy_timeout(Duration::from_secs(5)).expect("timeout B");
+
+    b.execute_batch(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+         INSERT INTO t VALUES (1, 1);",
+    )
+    .expect("seed");
+
+    // The declared-readonly connection. This is what the backend would arm for a `readonly` request.
+    a.execute_batch("PRAGMA query_only=ON")
+        .expect("arm query_only");
+
+    // (a) The STALE-SNAPSHOT shape — byte for byte P4a's setup, which without the pragma yields the
+    //     unretryable 517.
+    a.execute_batch("BEGIN DEFERRED").expect("A begins");
+    let seen: i64 = a
+        .query_row("SELECT v FROM t WHERE id = 1", [], |r| r.get(0))
+        .expect("query_only must NOT interfere with reading — that is the whole point of it");
+    assert_eq!(seen, 1);
+
+    b.execute_batch("BEGIN IMMEDIATE; UPDATE t SET v = 2 WHERE id = 1; COMMIT;")
+        .expect("B moves the db past A's snapshot");
+
+    let started = Instant::now();
+    let err = a
+        .execute("UPDATE t SET v = 3 WHERE id = 1", [])
+        .expect_err("a query_only connection must refuse the write");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        extended_code(&err),
+        SQLITE_READONLY,
+        "THE LOAD-BEARING ASSERTION: under exactly P4a's conditions the failure is now READONLY \
+         (8), NOT the unretryable BUSY_SNAPSHOT (517). Compare p4a, which asserts 517 on this same \
+         fixture without the pragma — that pair is the proof the mitigation is the pragma and not \
+         some accident of timing: {err:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "refused up front, not after a busy wait: {elapsed:?}"
+    );
+    a.execute_batch("ROLLBACK").expect("A rolls back");
+
+    // (b) And it is DETERMINISTIC, not a race won: with NO concurrent writer and no stale snapshot
+    //     at all, the same write is refused identically. Without this half, (a) would be equally
+    //     consistent with "READONLY happens to win the race against BUSY_SNAPSHOT here".
+    let err = a
+        .execute("UPDATE t SET v = 4 WHERE id = 1", [])
+        .expect_err("still refused with no contention whatsoever");
+    assert_eq!(
+        extended_code(&err),
+        SQLITE_READONLY,
+        "the refusal is a property of the connection, not of contention: {err:?}"
+    );
+
+    // The pragma is reversible on the connection, which is what makes it usable on a POOLED one:
+    // a backend arms it per-checkout for a declared-readonly request and disarms it on recycle.
+    a.execute_batch("PRAGMA query_only=OFF").expect("disarm");
+    a.execute("UPDATE t SET v = 5 WHERE id = 1", [])
+        .expect("the same connection writes once the pragma is off");
 }
 
 /// **P4b: `BEGIN IMMEDIATE` removes the class by construction — and busy_timeout DOES work there.**

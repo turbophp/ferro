@@ -201,12 +201,19 @@ five storage classes.
   (b) a `spawn_blocking`-fed `BackendRows` streams without buffering, (c) no driver fork is needed,
   and (d) §1's `SQLITE_BUSY_SNAPSHOT` behaviour, which D13 requires reproduced. **DONE 2026-09-14 —
   all four HOLD**, `engine/crates/ferro-sqlite-spike/`. See §8.
-- **C3-2** — the crate and the `PoolBackend` impl minus streaming: connect/ping/`tx_status` via
+- **C3-2** — the `compose_begin_sql` SQLite arm. **DONE 2026-09-14** — see §9.
+- **C3-3** — the `readonly` seam through `Pool::checkout` (the autocommit half of D13).
+- **C3-4** — the crate and the `PoolBackend` impl minus streaming: connect/ping/`tx_status` via
   `sqlite3_get_autocommit`/`simple_query`/`query`/hygiene, plus the third `AnyPool` arm.
-- **C3-3** — `query_stream`.
-- **C3-4** — the acceptance columns: the DBAL suite's SQLite column (§14) and the Illuminate suite's
+- **C3-5** — `query_stream`.
+- **C3-6** — the acceptance columns: the DBAL suite's SQLite column (§14) and the Illuminate suite's
   (§15), each with the C2e control column alongside it.
-- **C3-5** — the online backup admin surface (§7.6's last sentence).
+- **C3-7** — the online backup admin surface (§7.6's last sentence).
+
+*(C3-2 and C3-3 were INSERTED and the rest renumbered: this list predates D13, which split the BEGIN
+composition and the pool seam into two slices and fixed their order. Renumbering rather than
+appending keeps one meaning of "C3-2" in the tree — the ledger and this document disagreeing about
+which slice a number names is exactly the kind of drift a later firing reads as fact.)*
 
 ## 7. What this document does NOT decide
 
@@ -258,3 +265,59 @@ against a spelled-out number — never cast the enum.
 via `Connection::is_autocommit()`). It fits the seam — synchronous and round-trip-free, exactly as
 the trait documents — but it is a different MECHANISM, so §7.1 needs amending rather than quietly
 re-reading. That is a spec edit C3-2 owes, not a blocker.
+
+---
+
+## 9. C3-2: the `compose_begin_sql` SQLite arm (2026-09-14) — DONE
+
+The first D13 code slice, and deliberately the smaller half. `ferrod::tx::actor::compose_begin_sql`
+had a placeholder SQLite arm that emitted a bare `"BEGIN"` for an undeclared request and REFUSED
+both `readonly` and every isolation level. It now emits:
+
+| request | composed |
+| --- | --- |
+| undeclared, or declared a write | `BEGIN IMMEDIATE` |
+| declared `readonly` | `BEGIN DEFERRED` |
+
+**The undeclared arm is the load-bearing change, and the old value was not merely weaker — it was
+wrong.** SQLite reads a bare `BEGIN` as DEFERRED, so the placeholder emitted precisely the
+deferred-upgrade shape C3-1's `p4a` proved is unretryable. Mutation-proven both ways: reverting to
+`"BEGIN"` fails the undeclared assertion, and flipping the readonly arm to `IMMEDIATE` fails the
+other.
+
+**The isolation level is accepted and emits nothing — a decision, not an oversight.** SQLite has no
+`SET TRANSACTION` to emit a level with, and under D13 there is nothing left for a client to ask for:
+every write transaction is serialized against every other by the lock it takes at BEGIN, and a
+reader sees a consistent snapshot, so no two writers ever interleave and the strongest level a
+client can name is what the discipline already provides. *That precision is deliberate — "SQLite is
+serializable" is the loose claim, since WAL readers get snapshot isolation and snapshot isolation
+alone permits write skew; it is D13's BEGIN-time lock making writers mutually exclusive that closes
+the gap.* The level also cannot change blocking behaviour, since `readonly` alone decides the lock
+mode.
+Refusing would break drop-in for an app that merely configures a level and would buy no safety. An
+unknown isolation BYTE is still a client error on every dialect — that is a protocol fault, not a
+capability gap. The tests assert the full isolation × readonly cross-product, because a level that
+silently flipped `IMMEDIATE` to `DEFERRED` would be a correctness bug no isolation-only assertion
+would catch.
+
+**A fifth premise was proven first, because this slice is what creates the hazard (`p5`).** D13's
+readonly arm hands a client a DEFERRED transaction, which is `p4a`'s exact setup — so a client that
+declares `readonly` and then WRITES walks into the one failure class charter rule 3 forbids the
+engine resolving, and it would surface only under concurrency. `PRAGMA query_only=ON` converts it
+into an up-front `SQLITE_READONLY` (8): deterministic, provably not executed (so `NonRetryable`,
+never `Indeterminate`), reproduced on `p4a`'s own fixture so the two are directly comparable, and
+shown to hold with NO contention at all — without that second half, the first would be equally
+consistent with "READONLY happened to win the race". The pragma is reversible on the connection,
+which is what makes it usable on a pooled one.
+
+**Therefore C3-4 (the backend crate) OWES `PRAGMA query_only=ON`** on a connection checked out for a
+declared-readonly request, and must disarm it on recycle. Until it does, a lying `readonly`
+declaration is the one remaining way to reach the failure class D13 exists to remove.
+
+**One gap this slice does NOT close, stated rather than implied.** The unit test asserts the engine
+EMITS `BEGIN IMMEDIATE`; the spike's `p4b` asserts that string takes the writer lock. Nothing links
+them, so changing the emitted spelling would update one and leave the other passing on its own
+literal. The MySQL lane solved the same problem with a live lockstep test
+(`ferro-backend-mysql/tests/begin_dialect_it.rs`); the SQLite equivalent is not writable until a
+SQLite pool exists, so **C3-4 owes it too**. `Dialect::Sqlite` is unreachable at runtime until then,
+which is why a unit test is the only gate this slice can honestly offer.
