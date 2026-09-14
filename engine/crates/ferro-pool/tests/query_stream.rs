@@ -497,3 +497,56 @@ async fn a_hung_reclaim_cannot_strand_finish() {
         "a timed-out reclaim force-taints, exactly like a failed one"
     );
 }
+
+/// FB-2 (iteration-12 adversarial pass, MED/structural): the `Drop` safety net on an ABANDONED
+/// `RowStreamHandle` set only `tainted`, and `tainted` does not stop `Checkout::drop` recycling —
+/// only `is_closed()` did. So the "abandoned owning stream ⇒ conn discarded" invariant rested
+/// entirely on each backend's `is_closed()` reporting a moved-out conn dead. This asserts the
+/// invariant the pool's OWN way, via the FB-3b `discard` latch, so it no longer depends on backend
+/// cooperation: the fake's conn is deliberately left alive and `is_closed`-healthy.
+#[tokio::test]
+async fn an_abandoned_handle_never_recycles_the_conn() {
+    let backend = FakeBackend::new();
+    backend.set_stream_script(StreamScript {
+        cols: vec![],
+        rows: vec![row(1), row(2), row(3)],
+        affected: 3,
+        error_at: None,
+    });
+    let pool = Pool::new(
+        backend,
+        PoolConfig {
+            max_size: 1,
+            ..Default::default()
+        },
+    );
+
+    let abandoned_id = {
+        let mut co = pool.checkout().await.expect("checkout");
+        let id = co.conn().id;
+        {
+            let mut handle = co.query_stream("SELECT n FROM t", &[]).await.expect("open");
+            assert_eq!(handle.next().await, Some(Ok(row(1))));
+            // handle drops HERE, un-finished: the conn is mid-result-set.
+        }
+        assert!(co.tainted(), "the Drop net still force-taints");
+        assert!(
+            !co.conn().closed,
+            "the fake's conn stays alive and `is_closed`-healthy — exactly the PG shape, where a \
+             channel-backed stream leaves a perfectly healthy-looking mid-result-set connection"
+        );
+        id
+    };
+
+    let fresh = pool
+        .checkout()
+        .await
+        .expect("re-checkout after an abandoned stream");
+    assert_ne!(
+        fresh.conn().id,
+        abandoned_id,
+        "FB-2: an abandoned (un-finished) stream MUST discard the conn, not merely taint it — \
+         taint only schedules hygiene on a conn that should never reach a next tenant at all \
+         (charter rule 6)"
+    );
+}
