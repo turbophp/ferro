@@ -3,9 +3,13 @@
 **Status:** SCOPING ONLY. No `ferro-backend-sqlite` code exists, and none is added here.
 **The §1 tension is SETTLED (2026-09-14): the owner chose Option C**, recorded as **SPEC D13** with
 §7.6 amended to match (§22.2 (az)). §1 below is kept as written — it is the reasoning the decision
-rests on — with the outcome noted at the end of it. C3 code may now start; the first slice must
-reproduce §1's one UNVERIFIED premise (`SQLITE_BUSY_SNAPSHOT` vs `busy_timeout`) rather than inherit
-it, because it is the crux of the option that was rejected.
+rests on — with the outcome noted at the end of it.
+
+**C3-1 IS DONE (2026-09-14): all four premises were spiked and ALL FOUR HOLD** — see
+`engine/crates/ferro-sqlite-spike/` (a spike crate, NOT the backend) and §8 below. Every
+`UNVERIFIED` marker in this document is now resolved, including §1's `SQLITE_BUSY_SNAPSHOT`
+reproduction, which D13's own revisit note required before any code slice. **C3-2 (the
+`compose_begin_sql` SQLite arm) is unblocked.**
 **Why now:** C3 is what BOTH acceptance bars are still missing — §14's names SQLite, §15's names
 SQLite, and both were closed with that column recorded as unreachable. Nothing else in M2 blocks
 those bars.
@@ -42,9 +46,16 @@ writer lock do the serializing.
 - Delivers the *stated benefit* (`SQLITE_BUSY` storms) for the ordinary case.
 - **Does NOT cover the deferred-upgrade case.** A transaction that begins as a reader and later
   writes can get `SQLITE_BUSY_SNAPSHOT`, which `busy_timeout` does **not** retry — the transaction
-  must be rolled back and replayed, and charter rule 3 forbids the engine replaying it. *(UNVERIFIED
-  against SQLite's current source; this is the documented behaviour and it is the crux of the
-  option, so it must be reproduced before Option A is either chosen or dismissed.)*
+  must be rolled back and replayed, and charter rule 3 forbids the engine replaying it.
+  ***VERIFIED 2026-09-14 (C3-1, `premises_it.rs::p4a`)*** — reproduced against a real WAL database
+  on SQLite 3.x via `rusqlite` 0.40: the upgrade fails `SQLITE_BUSY_SNAPSHOT` (extended code 517)
+  and returns in **under 500 ms with a 5-SECOND `busy_timeout` armed on the very connection that
+  fails**, i.e. the retry loop is never entered. The elapsed-time assertion is the load-bearing
+  half; observing the error alone would be equally consistent with "busy_timeout retried for 5 s
+  and gave up", a far more benign claim. `p4b` is its CONTROL on the same build and the same API:
+  with the lock taken at `BEGIN IMMEDIATE`, contention moves to the other connection, surfaces as a
+  PLAIN `SQLITE_BUSY` (5), and `busy_timeout` genuinely parks for the full duration — so the knob
+  works, and is simply inapplicable to an upgrade.
 
 ### Option B — every explicit transaction takes the write lock (`BEGIN IMMEDIATE`)
 
@@ -134,10 +145,21 @@ for §1: nothing about it forces inference. The genuine mismatches are elsewhere
   backend. *(UNVERIFIED: whether `RowStream: BackendRows + Send` can be satisfied by a
   `spawn_blocking`-fed channel without buffering the whole result — that is the property §14's
   never-buffer clause needs, and it must be proven with a spike before the slice is planned.)*
+  ***VERIFIED 2026-09-14 (C3-1, `premises_it.rs::p2`)*** — 100 000 rows cross a capacity-1
+  `tokio::sync::mpsc` from a `spawn_blocking` task that owns the `Connection`; after the consumer
+  takes 10 and then idles for 250 ms the producer has still produced fewer than 64, i.e. it is
+  parked on backpressure. The blocking task then hands the `Connection` BACK and it is usable and
+  `is_autocommit()` — the park/unpark shape B2b-2a already built for MySQL, so the existing
+  `reclaim_stream` seam fits and a stream need not cost a discarded connection.
 - **`cancel_handle` / `Cancel`.** PostgreSQL and MySQL both cancel over a SIDE connection. SQLite's
   equivalent is `sqlite3_interrupt()`, which is callable from another thread on the same handle —
   *(UNVERIFIED against `rusqlite`'s API surface: whether an `InterruptHandle` is obtainable and
   `Send + 'static` as the trait's supertrait bound requires.)*
+  ***VERIFIED 2026-09-14 (C3-1, `premises_it.rs::p3`)*** — `Connection::get_interrupt_handle()` is
+  public and the handle is `Send + Sync + 'static` (asserted at COMPILE time, which is the premise
+  that was in doubt) and actually stops a running statement (asserted at RUN time, because a handle
+  that satisfied the bounds but silently did nothing would give the pool a cancel that never
+  cancels). The statement ends `SQLITE_INTERRUPT` (9).
 - **Hygiene.** There is no `DISCARD ALL`. The reset profile has to be assembled from what SQLite
   actually leaks between tenants: temp tables, `PRAGMA`s, `ATTACH`ed databases, prepared statements.
   `classify_one_sqlite` already pins on `ATTACH`/`PRAGMA`, so the taint signal exists; the reset does
@@ -162,8 +184,13 @@ volume:
 3. **The §7.6 tension above has to be settled first**, and it is a spec change, not a coding choice.
 
 Against that, three things are *easier* than M1-S6: no vendored driver fork is needed so far
-(**UNVERIFIED** — S1 and S6 both turned out to need one, and that assumption was proven false for
-`mysql_async` before any code was written, so it must be checked, not assumed); no server to run in
+(***VERIFIED 2026-09-14 (C3-1, `premises_it.rs::p1`)*** — and stated honestly: every capability the
+`PoolBackend` seam demands is reachable on rusqlite's PUBLIC API — `is_autocommit()` (the
+`ReadyForQuery`/`SERVER_STATUS_IN_TRANS` analogue, synchronous and round-trip-free),
+`get_interrupt_handle()`, `busy_timeout()`, `last_insert_rowid()`, `execute()`'s affected count, and
+extended error codes. That is a checkable claim; "no fork will ever be needed" is not. S1 and S6
+both turned out to need a fork, and the assumption was proven FALSE for `mysql_async` before any
+code was written, so it was checked here rather than assumed); no server to run in
 CI, so every gate is reachable in a plain container; and the type matrix is small, since SQLite has
 five storage classes.
 
@@ -171,8 +198,9 @@ five storage classes.
 
 - **C3-0** — settle §1 as a D-series decision and amend §7.6. *No code.*
 - **C3-1** — a spike, not a slice: prove (a) `rusqlite` gives a `Send + 'static` interrupt handle,
-  (b) a `spawn_blocking`-fed `BackendRows` streams without buffering, (c) no driver fork is needed.
-  Each of the three is currently UNVERIFIED and each can invalidate the plan.
+  (b) a `spawn_blocking`-fed `BackendRows` streams without buffering, (c) no driver fork is needed,
+  and (d) §1's `SQLITE_BUSY_SNAPSHOT` behaviour, which D13 requires reproduced. **DONE 2026-09-14 —
+  all four HOLD**, `engine/crates/ferro-sqlite-spike/`. See §8.
 - **C3-2** — the crate and the `PoolBackend` impl minus streaming: connect/ping/`tx_status` via
   `sqlite3_get_autocommit`/`simple_query`/`query`/hygiene, plus the third `AnyPool` arm.
 - **C3-3** — `query_stream`.
@@ -187,3 +215,46 @@ blind spot, TCP keepalive, B6b chunked `LARGE_OBJECT`, B7's tracker-coverage pro
 one of them that unblocks an acceptance bar; the `CALL` blind spot is the only one that unblocks a
 documented incompatibility (`selectResultSets()`). That is a call for the project owner, and it was
 already flagged as open when the SQLite question was first asked.
+
+---
+
+## 8. C3-1 spike results (2026-09-14) — all four premises HOLD
+
+Proven in `engine/crates/ferro-sqlite-spike/tests/premises_it.rs` against real `rusqlite` 0.40
+(`bundled` SQLite) and a real on-disk WAL database. **SQLite is the first backend whose spike needs
+no server**, so unlike the PG and MySQL lanes every assertion runs in an ordinary container — no
+Docker, no compose file, and CI is not the authority for any of it.
+
+| premise | verdict |
+| --- | --- |
+| P1 — no vendored driver fork needed | **HOLDS** for every capability the seam demands (see §3's marker for the list) |
+| P2 — `BackendRows` streams across `spawn_blocking` without buffering | **HOLDS**, and the connection is handed back usable |
+| P3 — `InterruptHandle` is `Send + 'static` and interrupts | **HOLDS** (compile-time bound + runtime effect) |
+| P4 — `busy_timeout` does not retry a deferred upgrade | **HOLDS** — and `p4b` is its control |
+
+**Two findings worth carrying into C3-2, both of which are about the TESTS rather than SQLite.**
+
+**(1) The first version of the non-buffering proof asserted nothing, and the mutation caught it.**
+It read the produced-row counter immediately after taking 10 rows. That passes just as happily with
+an unbounded channel — the producer is on another thread and simply has not had time to run away
+yet. Widening the channel to 200 000 (the mutation that should have broken it) PASSED. The fix is a
+**stall probe**: sleep 250 ms with the consumer idle first, so an unconstrained producer has ample
+wall-clock to finish all 100 000 rows; a counter still under 64 afterwards can only mean
+backpressure. Re-run against the same mutation it now fails with exactly `100000`. The general
+lesson, already in the loop's process notes and now paid for again: *a timing-sensitive assertion
+that has not been mutation-proven is usually measuring scheduling latency, not the property.*
+
+**(2) `ffi::ErrorCode::X as i32` is NOT SQLite's numeric code, and it compiles cleanly.**
+`ffi::ErrorCode` is an ordinary Rust enum whose discriminants are its own declaration order:
+`DatabaseBusy` is **3** while `SQLITE_BUSY` is **5**; `OperationInterrupted` is **7** while
+`SQLITE_INTERRUPT` is **9**. Two of this spike's own assertions were written that way and failed
+loudly only because the premises held and produced the real codes. **The SQLite `error_map` that
+C3-2 writes will key on exactly these values** (the §9.2 fate matrix keys on SQLSTATE/errno pairs),
+so compare the typed `code` field against the `ErrorCode` VARIANT, or compare `extended_code`
+against a spelled-out number — never cast the enum.
+
+**Still open for C3-2, recorded so it is not rediscovered:** §7.1's pin-authority framing says
+"protocol signals" throughout, and SQLite's authority is a library call (`sqlite3_get_autocommit()`
+via `Connection::is_autocommit()`). It fits the seam — synchronous and round-trip-free, exactly as
+the trait documents — but it is a different MECHANISM, so §7.1 needs amending rather than quietly
+re-reading. That is a spec edit C3-2 owes, not a blocker.
