@@ -1247,12 +1247,27 @@ impl<B: PoolBackend> Drop for RowStreamHandle<'_, B> {
         if !self.finished {
             // The safety net (charter rule 6): an abandoned / panicked / cancelled stream left the
             // conn partially drained — mid-protocol, possibly mid-transaction. `Drop` is SYNCHRONOUS
-            // and cannot `.await`, so it can neither drain the stream nor read `tx_status`; it does
-            // the one thing it can — force `tainted` so the next checkout's async recycle runs the
-            // full ROLLBACK + DISCARD ALL. `tx_open` is left as-is: it already reflects any tx the
-            // pool opened via `begin_tx` (this streaming path never opens one itself), and `tainted`
-            // alone trips the recycle guard (`tx_open || tainted || clean_reset_profile`).
+            // and cannot `.await`, so it can neither drain the stream nor read `tx_status`.
+            //
+            // FB-2: it therefore does the only two synchronous things that matter, and the SECOND
+            // is what actually protects the next tenant. `tainted` records the truth about this
+            // connection (and would force the full ROLLBACK + DISCARD ALL on any later checkout),
+            // but taint alone NEVER stops `Checkout::drop` recycling — only `is_closed()` did, so
+            // until now the "abandoned owning stream ⇒ conn discarded" invariant rested entirely on
+            // each backend reporting a moved-out conn dead. PostgreSQL is precisely where that
+            // fails: its stream is channel-backed, so an abandoned mid-result-set connection looks
+            // perfectly healthy to `is_closed`. `discard` (the FB-3b latch) is the pool's OWN
+            // statement that this connection must never be reused, so the invariant no longer
+            // depends on backend cooperation — the same reasoning that made bounding the drain in
+            // `finish` safe. `tx_open` is left as-is: it already reflects any tx the pool opened via
+            // `begin_tx` (this streaming path never opens one itself).
+            //
+            // This costs at most ONE connection, and only on a path that is abnormal by
+            // construction: `finish()` is mandatory, and `ferrod` calls it on BOTH the success and
+            // the cancel/timeout paths, so reaching here means a panic, an unwind, or a dropped
+            // future — never ordinary operation.
             self.checkout.tainted = true;
+            self.checkout.discard = true;
         }
     }
 }
