@@ -1,6 +1,11 @@
 # C3 — the SQLite backend: scope, and the one spec tension that has to be settled first
 
 **Status:** SCOPING ONLY. No `ferro-backend-sqlite` code exists, and none is added here.
+**The §1 tension is SETTLED (2026-09-14): the owner chose Option C**, recorded as **SPEC D13** with
+§7.6 amended to match (§22.2 (az)). §1 below is kept as written — it is the reasoning the decision
+rests on — with the outcome noted at the end of it. C3 code may now start; the first slice must
+reproduce §1's one UNVERIFIED premise (`SQLITE_BUSY_SNAPSHOT` vs `busy_timeout`) rather than inherit
+it, because it is the crux of the option that was rejected.
 **Why now:** C3 is what BOTH acceptance bars are still missing — §14's names SQLite, §15's names
 SQLite, and both were closed with that column recorded as unreachable. Nothing else in M2 blocks
 those bars.
@@ -78,6 +83,25 @@ WAL pragmas from A are wanted regardless.
 
 **This should be recorded as a D-series decision (SPEC §21) and §7.6 amended to match**, because
 §7.6 as written cannot be implemented and a reader has no way to know that.
+
+### DECIDED 2026-09-14 — Option C (SPEC D13)
+
+The owner chose **C**. Recorded as **D13** in §21, with §7.6 rewritten from "one writer serialized
+engine-side" to the declaration rule, and the contradiction itself documented in §22.2 (az) so the
+next reader learns that §7.6 was wrong rather than inheriting a silent reinterpretation.
+
+**Implementation ordering** (not a re-litigation — C's own floor): the `compose_begin_sql` SQLite
+arm goes first, since C's behaviour for an UNDECLARED request is exactly B's, and that half stands
+alone as the correctness floor. The `readonly` seam through `Pool::checkout` is a SEPARATE slice —
+it is the genuinely new plumbing, it is what earns C over B, and it is not SQLite-specific: single-
+flight read coalescing and read-your-writes replica routing each need the same seam. Sequence the
+work so a failure in the second slice cannot be confused with a failure in the first.
+
+**Two things this decision does NOT license.** It does not license inferring `readonly` when the
+client did not declare it — that is the whole point. And it does not license skipping the
+`SQLITE_BUSY_SNAPSHOT` reproduction: the premise is marked UNVERIFIED above and is the crux of the
+rejected option, so it is proven before the first slice, not waved through because the decision
+already went the other way.
 
 ---
 
