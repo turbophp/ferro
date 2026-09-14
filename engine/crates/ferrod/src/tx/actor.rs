@@ -117,15 +117,41 @@ pub fn compose_begin_sql(
             })
         }
         Dialect::Sqlite => {
-            if level.is_some() || readonly {
-                Err(
-                    "isolation/readonly BEGIN is not supported on the sqlite dialect (no SQLite \
-                     backend exists yet; this arm exists so one cannot silently inherit PG syntax)"
-                        .to_string(),
-                )
+            // SPEC D13. The lock mode is chosen by what the client DECLARED, never by what the
+            // statement turns out to do — a bare `BEGIN` (which SQLite reads as DEFERRED) is the
+            // one spelling that must never be emitted for an undeclared request.
+            //
+            // The isolation level is deliberately NOT refused and emits nothing. SQLite has no
+            // `SET TRANSACTION` to emit it with, and under D13 it has nothing left to ask for:
+            // every write transaction is serialized against every other by the lock it takes at
+            // BEGIN, and a reader sees a consistent snapshot — so no two writers ever interleave,
+            // and the strongest level a client can name is what the discipline already provides.
+            // (Stated that way on purpose: "SQLite is serializable" is the loose claim. WAL readers
+            // get snapshot isolation, and snapshot isolation alone permits write skew; it is D13's
+            // BEGIN-time lock, making writers mutually exclusive, that closes that gap here.)
+            //
+            // The level also cannot change blocking behaviour, since `readonly` alone decides the
+            // lock mode — so refusing would break drop-in for an app that merely configures a level
+            // and would buy no safety. An unknown isolation BYTE is still a client error on every
+            // dialect: a protocol fault, not a capability gap, rejected above before this match.
+            Ok(if readonly {
+                // Declared read-only: a deferred reader lock, so readers run concurrently.
+                //
+                // This arm is the one that can still reach `SQLITE_BUSY_SNAPSHOT` — if the client
+                // declared `readonly` and then WRITES, it is P4a's exact setup, and charter rule 3
+                // forbids the engine resolving it. The backend slice owes `PRAGMA query_only=ON`
+                // on a connection checked out for a declared-readonly request, which converts that
+                // into an up-front `SQLITE_READONLY` (proven in the C3-1 spike's `p5`). Until it
+                // does, a lying `readonly` declaration is the one way to reach the failure class
+                // D13 exists to remove.
+                "BEGIN DEFERRED"
             } else {
-                Ok("BEGIN".to_string())
+                // Undeclared, or declared a write: take the writer lock AT BEGIN. This is the whole
+                // of D13 — it removes the deferred-upgrade class by construction rather than
+                // leaving the application a failure the engine created.
+                "BEGIN IMMEDIATE"
             }
+            .to_string())
         }
     }
 }
@@ -769,14 +795,55 @@ mod tests {
             }
         }
 
-        // --- SQLite: no backend exists yet. A bare BEGIN is composable; anything else is a LOUD
-        // refusal rather than a silently-PG-shaped string a future backend would choke on.
+        // --- SQLite (SPEC D13): the lock mode is chosen by the DECLARATION, never inferred.
+        //
+        // The undeclared arm is the load-bearing one. A bare "BEGIN" here would be SQLite's
+        // DEFERRED mode, i.e. exactly the deferred-upgrade case the C3-1 spike proved is
+        // unretryable (`p4a`: SQLITE_BUSY_SNAPSHOT returns in under 500ms with a 5s busy_timeout
+        // armed) — so "BEGIN" is not merely a weaker spelling of "BEGIN IMMEDIATE", it is the one
+        // string that reintroduces the failure class D13 exists to remove.
         assert_eq!(
             compose_begin_sql(Dialect::Sqlite, None, false).unwrap(),
-            "BEGIN"
+            "BEGIN IMMEDIATE",
+            "an UNDECLARED request is a writer and takes the lock at BEGIN (D13)"
         );
-        assert!(compose_begin_sql(Dialect::Sqlite, None, true).is_err());
-        assert!(compose_begin_sql(Dialect::Sqlite, iso_ser, false).is_err());
+        assert_eq!(
+            compose_begin_sql(Dialect::Sqlite, None, true).unwrap(),
+            "BEGIN DEFERRED",
+            "a DECLARED-readonly request takes a deferred reader lock (D13)"
+        );
+
+        // Every isolation level a client can name composes, and none of them changes the lock mode:
+        // `readonly` alone decides it. A level that silently flipped IMMEDIATE to DEFERRED would be
+        // a correctness bug that no isolation assertion would catch, so assert the cross-product
+        // rather than the levels alone.
+        for iso in [None, iso_rc, iso_rr, iso_ser] {
+            assert_eq!(
+                compose_begin_sql(Dialect::Sqlite, iso, false).unwrap(),
+                "BEGIN IMMEDIATE",
+                "isolation {iso:?} must not change the undeclared lock mode"
+            );
+            assert_eq!(
+                compose_begin_sql(Dialect::Sqlite, iso, true).unwrap(),
+                "BEGIN DEFERRED",
+                "isolation {iso:?} must not change the declared-readonly lock mode"
+            );
+        }
+
+        // SQLite has no SET TRANSACTION: the composed string is the BEGIN and nothing else.
+        for iso in [iso_rc, iso_rr, iso_ser] {
+            for ro in [false, true] {
+                let sql = compose_begin_sql(Dialect::Sqlite, iso, ro).unwrap();
+                assert!(
+                    !sql.to_ascii_uppercase().contains("ISOLATION"),
+                    "SQLite must emit no isolation SQL, got {sql:?}"
+                );
+                assert!(
+                    !sql.contains(';'),
+                    "SQLite's BEGIN is a single statement, never a batch: {sql:?}"
+                );
+            }
+        }
 
         // An unknown isolation byte is a client error on EVERY dialect, never coerced to a default.
         for d in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
