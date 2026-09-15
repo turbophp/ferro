@@ -5,6 +5,7 @@ namespace Ferro\DBAL\Tests\Unit;
 use Doctrine\DBAL\Platforms\MariaDB110700Platform;
 use Doctrine\DBAL\Platforms\MySQL84Platform;
 use Doctrine\DBAL\Platforms\PostgreSQL120Platform;
+use Doctrine\DBAL\Platforms\SQLitePlatform;
 use Ferro\DBAL\Exception\BackendFamilyUnknown;
 use Ferro\DBAL\PlatformVersion;
 use Ferro\DBAL\Value\TemporalFormat;
@@ -17,7 +18,8 @@ use PHPUnit\Framework\TestCase;
  * if a DBAL release changes `getDateTimeTzFormatString()` for either family, this goes red rather
  * than the driver silently emitting a shape DBAL can no longer parse.
  *
- * MEASURED on 4.4.4: PostgreSQL `Y-m-d H:i:sO`, MySQL and MariaDB `Y-m-d H:i:s` (no offset at all).
+ * MEASURED on 4.4.4: PostgreSQL `Y-m-d H:i:sO`, MySQL and MariaDB `Y-m-d H:i:s` (no offset at all),
+ * SQLite `Y-m-d H:i:s`.
  */
 final class TemporalFormatTest extends TestCase
 {
@@ -36,25 +38,37 @@ final class TemporalFormatTest extends TestCase
             TemporalFormat::forKind(PlatformVersion::KIND_MYSQL)->dateTimeTz,
             'MariaDB and MySQL share the format, which is why one KIND covers both',
         );
+        self::assertSame(
+            (new SQLitePlatform())->getDateTimeTzFormatString(),
+            TemporalFormat::forKind(PlatformVersion::KIND_SQLITE)->dateTimeTz,
+        );
     }
 
-    public function testTheTwoFamiliesGenuinelyDiffer(): void
+    public function testTheFamiliesGenuinelyDiffer(): void
     {
         self::assertNotSame(
             TemporalFormat::forKind(PlatformVersion::KIND_POSTGRES)->dateTimeTz,
             TemporalFormat::forKind(PlatformVersion::KIND_MYSQL)->dateTimeTz,
             'if these ever became equal, the per-kind branch would be dead code and this test a tautology',
         );
+        self::assertNotSame(
+            TemporalFormat::forKind(PlatformVersion::KIND_POSTGRES)->dateTimeTz,
+            TemporalFormat::forKind(PlatformVersion::KIND_SQLITE)->dateTimeTz,
+        );
     }
 
     /**
      * ADDED beyond the plan. The `default` arm is the only thing standing between an unknown family
-     * and a GUESSED datetime format, and nothing else in the task reaches it: the two rows above
-     * both name a known kind, so a `default => 'Y-m-d H:i:s'` would keep the whole file green.
+     * and a GUESSED datetime format, and nothing else in the task reaches it: the rows above all
+     * name a known kind, so a `default => 'Y-m-d H:i:s'` would keep the whole file green.
+     *
+     * The example used to be `'sqlite'`, which C3-6a turned into a SUPPORTED family — so this now
+     * names one no `PoolKind::wire_name()` emits. That the swap was forced (this test went red the
+     * moment SQLite was added) is the small proof that it is testing the arm and not a string.
      */
     public function testAnUnknownFamilyIsRefusedRatherThanGivenAFormat(): void
     {
         $this->expectException(BackendFamilyUnknown::class);
-        TemporalFormat::forKind('sqlite');
+        TemporalFormat::forKind('mssql');
     }
 }

@@ -587,6 +587,44 @@ fn open_configured(path: &Path, busy_timeout: Duration) -> Result<Connection, Po
         PoolError::Backend(format!("busy_timeout failed: {e}"))
     })?;
 
+    // FOREIGN KEY ENFORCEMENT IS DECLARED HERE, and the reason is that it was already ON without
+    // anyone deciding it. C3-3a left the question open ("SQLite defaults `foreign_keys` OFF while
+    // Laravel and Doctrine turn it ON") and C3-6a measured the answer through the Doctrine tier: a
+    // Ferro SQLite connection reports `PRAGMA foreign_keys = 1` and refuses an orphan INSERT with
+    // errno 787, with no pragma anywhere in this file. It comes from the BUILD — `rusqlite`'s
+    // `bundled` feature compiles libsqlite3-sys with `SQLITE_DEFAULT_FOREIGN_KEYS=1` — where
+    // PHP's `pdo_sqlite`, linked against the system library, reports 0.
+    //
+    // An engine-wide integrity guarantee that comes from a dependency's compile flag is one
+    // `cargo update` away from silently inverting, and nothing in the tree would notice. So it is
+    // stated. The VALUE is ON, which changes nothing today and is what both drop-in tiers' worlds
+    // expect: Doctrine ships an opt-in `EnableForeignKeys` middleware, Laravel's SQLite connector
+    // sets the pragma itself, and — measured — NEITHER can work here, because both apply it on one
+    // pooled connection at driver-connect time while the next request is served by another
+    // (SPEC §7.4). A per-connection setting that must hold for every tenant belongs at dial, which
+    // is the same place and the same reasoning as the MySQL family's `time_zone = '+00:00'` (S7).
+    //
+    // CHECKED rather than requested, like WAL above: the pragma is a silent no-op if the build
+    // lacks foreign-key support altogether, and an integrity guarantee nobody verified is the kind
+    // that is discovered by a corrupt row.
+    conn.execute_batch("PRAGMA foreign_keys = ON")
+        .map_err(|e| {
+            tracing::warn!(error = %e, "ferro-backend-sqlite: foreign_keys pragma failed");
+            PoolError::Backend(format!("foreign_keys=ON failed: {e}"))
+        })?;
+    let fk: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .map_err(|e| {
+            tracing::warn!(error = %e, "ferro-backend-sqlite: could not read back foreign_keys");
+            PoolError::Backend(format!("foreign_keys read-back failed: {e}"))
+        })?;
+    if fk != 1 {
+        return Err(PoolError::Backend(format!(
+            "foreign_keys is {fk} after requesting ON; this SQLite build does not enforce foreign \
+             keys, so every FK this pool serves would be advisory only"
+        )));
+    }
+
     Ok(conn)
 }
 

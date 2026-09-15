@@ -19,7 +19,7 @@ on:
       family:
         description: "Backend family to measure"
         type: choice
-        options: [all, pg, mysql, mariadb]
+        options: [all, pg, mysql, mariadb, sqlite, sqlite-control]
         default: all
 
 jobs:
@@ -29,7 +29,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        family: ${{ fromJSON(inputs.family == 'all' && '["pg","mysql","mariadb"]' || format('["{0}"]', inputs.family)) }}
+        # `sqlite-control` is not a backend, it is the CONTROL COLUMN: the identical tests against
+        # the identical file through upstream's own `pdo_sqlite`, with the contact assertion
+        # INVERTED. It rides the same matrix so the two SQLite columns are produced by one dispatch
+        # and cannot drift apart in environment.
+        family: ${{ fromJSON(inputs.family == 'all' && '["pg","mysql","mariadb","sqlite","sqlite-control"]' || format('["{0}"]', inputs.family)) }}
     steps:
       - uses: actions/checkout@v4
       - uses: shivammathur/setup-php@v2
@@ -42,28 +46,44 @@ jobs:
       # got lucky. Reserving the ports stops the kernel handing them out as ephemeral source
       # ports; the retry covers the residual case of a connection that grabbed one BEFORE the
       # reservation and is still alive at bind time.
-      - run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=33060,33061,55432
+      # SQLite has no container and no host port, so neither of the next two steps applies to it.
+      # That is the whole reason this family can also run on a box with no database server at all.
+      - if: ${{ !startsWith(matrix.family, 'sqlite') }}
+        run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=33060,33061,55432
       # The suite resets its database via `docker compose exec`, so the family's container must be
       # the testkit one — same digest-pinned image, credentials and healthcheck as every other lane.
-      - run: |
+      - if: ${{ !startsWith(matrix.family, 'sqlite') }}
+        run: |
           docker compose -f testkit/docker-compose.yml up -d --wait ${{ matrix.family }} \
             || { sleep 15; docker compose -f testkit/docker-compose.yml up -d --wait ${{ matrix.family }}; }
       - name: suite, run 1 of 2
         run: |
           set -o pipefail +e
+          svc="${{ matrix.family }}"
+          control=0
           case "${{ matrix.family }}" in
             pg)      dsn="postgres://ferro:ferro@127.0.0.1:55432/doctrine_tests" ;;
             mysql)   dsn="mysql://ferro:ferro@127.0.0.1:33060/doctrine_tests" ;;
             mariadb) dsn="mysql://ferro:ferro@127.0.0.1:33061/doctrine_tests" ;;
+            # Both SQLite columns let the runner pick its own file path; the control additionally
+            # starts no ferrod at all, so a mis-set variable cannot route it through Ferro.
+            sqlite)         svc=sqlite; dsn="" ;;
+            sqlite-control) svc=sqlite; dsn=""; control=1 ;;
           esac
           echo "FERRO_DBAL_DSN=$dsn" >> "$GITHUB_ENV"
-          FERRO_DBAL_SVC="${{ matrix.family }}" FERRO_DBAL_DSN="$dsn" \
+          echo "FERRO_DBAL_SVC=$svc" >> "$GITHUB_ENV"
+          echo "FERRO_DBAL_CONTROL=$control" >> "$GITHUB_ENV"
+          # An EMPTY FERRO_DBAL_DSN is the same as an unset one here — the script reads it with
+          # `${FERRO_DBAL_DSN:-…}`, whose `:-` treats empty as absent — so the SQLite columns pass
+          # it empty and get the runner's own file path.
+          FERRO_DBAL_SVC="$svc" FERRO_DBAL_CONTROL="$control" FERRO_DBAL_DSN="$dsn" \
             ./testkit/dbal-suite.sh 2>&1 | tee run1.log
           echo "exit=$?" >> "$GITHUB_OUTPUT"
       - name: suite, run 2 of 2 (reproducibility)
         run: |
           set -o pipefail +e
-          FERRO_DBAL_SVC="${{ matrix.family }}" FERRO_DBAL_DSN="$FERRO_DBAL_DSN" \
+          FERRO_DBAL_SVC="$FERRO_DBAL_SVC" FERRO_DBAL_CONTROL="$FERRO_DBAL_CONTROL" \
+            FERRO_DBAL_DSN="$FERRO_DBAL_DSN" \
             ./testkit/dbal-suite.sh 2>&1 | tee run2.log
           echo "exit=$?" >> "$GITHUB_OUTPUT"
       - name: result lines + broken-run gate
@@ -87,6 +107,10 @@ jobs:
             echo "Reset lines (a recorded run must show them):"
             echo '```'
             grep '\[ferro\] reset:' run1.log run2.log || echo "NONE — do not record this run"
+            echo '```'
+            echo "Contact line (Ferro columns) / inverted contact line (the control):"
+            echo '```'
+            grep -E '^\[(ferro|control)\] driver=' run1.log run2.log || echo "NONE — do not record this run"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4

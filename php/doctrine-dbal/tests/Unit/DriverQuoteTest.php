@@ -4,6 +4,7 @@ namespace Ferro\DBAL\Tests\Unit;
 
 use Doctrine\DBAL\Platforms\MySQL84Platform;
 use Doctrine\DBAL\Platforms\PostgreSQL120Platform;
+use Doctrine\DBAL\Platforms\SQLitePlatform;
 use Ferro\Client\Connection as FerroClientConnection;
 use Ferro\DBAL\Connection;
 use Ferro\DBAL\PlatformVersion;
@@ -60,13 +61,25 @@ final class DriverQuoteTest extends TestCase
             (new MySQL84Platform())->quoteStringLiteral($in),
             $this->driverConn(PlatformVersion::KIND_MYSQL)->quote($in),
         );
+        // C3-6a. SQLite takes the non-MySQL branch — `SQLitePlatform` does not override
+        // `quoteStringLiteral()`, so doubling the quote and leaving backslashes alone is what the
+        // stock platform does. Locked here rather than assumed: it is the same class of silent
+        // corruption the MySQL override exists to prevent, read the other way round.
+        self::assertSame(
+            (new SQLitePlatform())->quoteStringLiteral($in),
+            $this->driverConn(PlatformVersion::KIND_SQLITE)->quote($in),
+        );
     }
 
-    /** …and the two families genuinely differ, so neither branch is dead code. */
-    public function testTheTwoFamiliesDifferOnABackslash(): void
+    /** …and the branches genuinely differ, so neither is dead code. */
+    public function testTheFamiliesDifferOnABackslash(): void
     {
         self::assertNotSame(
             $this->driverConn(PlatformVersion::KIND_POSTGRES)->quote('a\\b'),
+            $this->driverConn(PlatformVersion::KIND_MYSQL)->quote('a\\b'),
+        );
+        self::assertNotSame(
+            $this->driverConn(PlatformVersion::KIND_SQLITE)->quote('a\\b'),
             $this->driverConn(PlatformVersion::KIND_MYSQL)->quote('a\\b'),
         );
     }
