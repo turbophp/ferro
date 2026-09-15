@@ -209,7 +209,8 @@ five storage classes.
   **DONE 2026-09-15** — see §12.
 - **C3-3c** — `query` + the row/value mapping (SQLite's five storage classes → the §9 tags).
   **DONE 2026-09-15** — see §13.
-- **C3-3d** — `cancel_handle` off `InterruptHandle`, and the `error_map` fate table.
+- **C3-3d** — `cancel_handle` off `InterruptHandle`, the `error_map` fate table, and
+  `impl PoolBackend`. **DONE 2026-09-15** — see §14.
 - **C3-3e** — the third `AnyPool` arm: the backend becomes reachable at runtime here, and ONLY
   here. Everything above is unit-testable in-crate; nothing before this point changes `ferrod`.
 - **C3-4** — the `readonly` seam through `Pool::checkout` (the autocommit half of D13).
@@ -572,3 +573,53 @@ The `column_decltype` feature was enabled to run the probe and **removed again o
 went the other way** — an unused feature flag is dependency surface with no caller. Also: the
 mutation round briefly corrupted `rowmap.rs` because it was still UNTRACKED, so `git checkout`
 could not restore it. **`git add` new files before mutation testing**, or the safety net is not there.
+
+---
+
+## 14. C3-3d: fate table, cancel handle, `impl PoolBackend` (2026-09-15) — DONE
+
+**The trait landed on the line C3-3b drew** — when only the streaming pair would be `Unsupported`,
+the shape MySQL shipped at M1-S6. `SqliteRowStream` wraps `Infallible`, so `query_stream`'s
+impossibility is enforced by the type system rather than a runtime `unimplemented!()` nobody has run.
+
+### `SQLITE_BUSY` (5) vs `SQLITE_BUSY_SNAPSHOT` (517)
+
+Both map to `SerializationFailure`/Retryable, distinguished on the wire by the extended code in
+`errno`. **The 517 reasoning did not start there.** The obvious argument is NonRetryable: `p4a`
+proved `busy_timeout` never retries it, and re-sending the statement in the same open transaction
+fails forever because the snapshot does not advance.
+
+But that is exactly PG's `40001`, which this engine already calls Retryable — it also cannot be
+fixed by re-sending, and also needs the caller to replay the transaction. `Branch`'s own doc settles
+it: *"Retryable only licenses the CALLER to retry per its own policy."* Calling 517 NonRetryable
+would say something different about SQLite than the engine says about PG for the same semantic.
+
+Under D13 a 517 is unreachable for a correctly-declared transaction, so reaching it means a
+declared-`readonly` transaction wrote — and the message says so, because that is a client bug.
+
+### The finding worth more than the slice: a runaway `spawn_blocking` cannot be timed out
+
+A mutation that never fires the cancel was expected to hit the test's 10-second timeout and fail.
+**It hung and had to be killed.** `tokio::time::timeout` drops the outer future, but the statement
+runs on a blocking thread nothing in the async world can reclaim, and tokio waits for blocking tasks
+at shutdown.
+
+**So the interrupt handle is not a convenience on this backend — it is the only thing that can stop
+a statement.** A per-request `timeout_ms` that merely abandons the future would leak a thread per
+runaway query. `ferrod` must fire the cancel. Recorded in §22.2 (bg) rather than left in a test
+comment, because it constrains how the daemon may use timeouts here.
+
+The test's own comment was corrected too: it claimed the timeout made a missed cancel fail rather
+than hang, and that claim was false.
+
+### `cancel_handle` bounds nothing, deliberately
+
+PG and MySQL bound theirs at 2 s because both open a SIDE CONNECTION to deliver the cancel. SQLite's
+`sqlite3_interrupt()` is an in-process flag set on a handle already owned — nothing opened, nothing
+awaited. Copying the constant would bound nothing and imply a hazard that does not exist.
+
+### Constants are asserted, not computed
+
+Every extended code (`1555`, `2067`, `1299`, `275`, `787`, `517`, `8`, `9`) is proven against an
+error a real SQLite produced. A companion test demonstrates the trap: `ErrorCode::DatabaseBusy as
+i32` is **3**, while `SQLITE_BUSY` is **5**.

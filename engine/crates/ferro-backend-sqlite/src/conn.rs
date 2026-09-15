@@ -17,7 +17,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ferro_pool::backend::{Dialect, QueryResult, ResetProfile, TxStatus};
+use async_trait::async_trait;
+use ferro_pool::backend::{
+    BackendRows, Cancel, Dialect, PoolBackend, QueryResult, ResetProfile, TxStatus,
+};
 use ferro_pool::error::PoolError;
 use ferro_proto::messages::sql::ColMeta;
 use ferro_proto::value::Value;
@@ -382,7 +385,7 @@ impl SqliteBackend {
             let before = c.total_changes();
             c.execute_batch(&sql).map_err(|e| {
                 tracing::debug!(error = %e, "ferro-backend-sqlite: simple_query failed");
-                PoolError::Backend(format!("{e}"))
+                crate::error_map::map(&e)
             })?;
             Ok(if c.total_changes() == before {
                 0
@@ -419,7 +422,7 @@ impl SqliteBackend {
 
             let mut stmt = c.prepare(&sql).map_err(|e| {
                 tracing::debug!(error = %e, "ferro-backend-sqlite: prepare failed");
-                PoolError::Backend(format!("{e}"))
+                crate::error_map::map(&e)
             })?;
             let ncol = stmt.column_count();
             let names: Vec<String> = (0..ncol)
@@ -429,16 +432,11 @@ impl SqliteBackend {
             let mut rows_out: Vec<Vec<Value>> = Vec::new();
             let mut rows = stmt
                 .query(rusqlite::params_from_iter(bound.iter()))
-                .map_err(|e| PoolError::Backend(format!("{e}")))?;
-            while let Some(r) = rows
-                .next()
-                .map_err(|e| PoolError::Backend(format!("{e}")))?
-            {
+                .map_err(|e| crate::error_map::map(&e))?;
+            while let Some(r) = rows.next().map_err(|e| crate::error_map::map(&e))? {
                 let mut row = Vec::with_capacity(ncol);
                 for i in 0..ncol {
-                    let v = r
-                        .get_ref(i)
-                        .map_err(|e| PoolError::Backend(format!("{e}")))?;
+                    let v = r.get_ref(i).map_err(|e| crate::error_map::map(&e))?;
                     row.push(crate::rowmap::value_from_ref(v));
                 }
                 rows_out.push(row);
@@ -559,6 +557,135 @@ fn open_configured(path: &Path, busy_timeout: Duration) -> Result<Connection, Po
     })?;
 
     Ok(conn)
+}
+
+/// The out-of-band cancel handle (C3-3d). An owned `InterruptHandle`, which `p3` proved is
+/// `Send + Sync + 'static` (compile-time) and really ends a running statement with
+/// `SQLITE_INTERRUPT` (run-time), so it can be grabbed BEFORE a statement starts and fired from a
+/// separate `select!` arm without borrowing the `Checkout` the running statement holds.
+///
+/// **There is no dial to bound here, and that is the whole difference from PG/MySQL.** Both of
+/// those open a SIDE CONNECTION to deliver their cancel, so both bound that dial at a fixed 2 s —
+/// otherwise an unreachable backend would stall the teardown the deadline started. SQLite's
+/// `sqlite3_interrupt()` is an in-process flag set on a handle this struct already owns: nothing is
+/// opened, nothing is awaited, and it returns immediately whether or not a statement is running.
+/// Copying that 2 s constant would bound nothing and imply a hazard that does not exist here.
+pub struct SqliteCancel {
+    handle: rusqlite::InterruptHandle,
+}
+
+#[async_trait]
+impl Cancel for SqliteCancel {
+    async fn cancel(self) {
+        // Best-effort and fire-and-forget by contract (charter rule 3): if the statement already
+        // finished this is a no-op, and the caller is never promised the statement was interrupted.
+        self.handle.interrupt();
+    }
+}
+
+/// The streaming row type, which **cannot be constructed** — `query_stream` is `Unsupported` until
+/// C3-5, exactly as the MySQL backend shipped at M1-S6.
+///
+/// It wraps `Infallible` rather than stubbing the methods with `unimplemented!()`, so the
+/// impossibility is enforced by the TYPE SYSTEM instead of by a runtime panic nobody has exercised:
+/// every method below is an exhaustive match on an uninhabited value, which the compiler accepts
+/// and which can never run.
+pub struct SqliteRowStream(std::convert::Infallible);
+
+#[async_trait]
+impl BackendRows for SqliteRowStream {
+    async fn next(&mut self) -> Option<Result<Vec<Value>, PoolError>> {
+        match self.0 {}
+    }
+    fn rows_affected(&self) -> u64 {
+        match self.0 {}
+    }
+}
+
+/// The `PoolBackend` impl (C3-3d).
+///
+/// **The trait lands here by the line drawn in C3-3b**: it goes in when only the STREAMING pair
+/// would be `Unsupported`, which is exactly this slice's end state and precisely the shape the
+/// MySQL backend shipped at M1-S6. Every method delegates to the inherent one above, so the
+/// inherent surface stays directly testable without a pool.
+#[async_trait]
+impl PoolBackend for SqliteBackend {
+    type Conn = SqliteConn;
+    type RowStream = SqliteRowStream;
+    type CancelHandle = SqliteCancel;
+
+    fn cancel_handle(&self, conn: &Self::Conn) -> Self::CancelHandle {
+        // A connection with no live handle still yields a handle-shaped value the pool can hold;
+        // there is nothing to interrupt, and firing it is the documented no-op.
+        SqliteCancel {
+            handle: conn
+                .driver()
+                .map(rusqlite::Connection::get_interrupt_handle)
+                .unwrap_or_else(|| {
+                    // Unreachable in practice (a caller holds `&mut` across every blocking window,
+                    // and a handle-less conn is `is_closed`), but the trait method is infallible,
+                    // so a throwaway in-memory handle keeps it total rather than panicking.
+                    rusqlite::Connection::open_in_memory()
+                        .expect("in-memory open for a no-op cancel handle")
+                        .get_interrupt_handle()
+                }),
+        }
+    }
+
+    async fn connect(&self) -> Result<Self::Conn, PoolError> {
+        SqliteBackend::connect(self).await
+    }
+
+    async fn ping(&self, conn: &mut Self::Conn) -> Result<(), PoolError> {
+        SqliteBackend::ping(self, conn).await
+    }
+
+    fn is_closed(&self, conn: &Self::Conn) -> bool {
+        SqliteBackend::is_closed(self, conn)
+    }
+
+    fn dialect(&self) -> Dialect {
+        SqliteBackend::dialect(self)
+    }
+
+    fn tx_status(&self, conn: &Self::Conn) -> TxStatus {
+        SqliteBackend::tx_status(self, conn)
+    }
+
+    async fn reset(&self, conn: &mut Self::Conn, profile: ResetProfile) -> Result<(), PoolError> {
+        SqliteBackend::reset(self, conn, profile).await
+    }
+
+    fn clean_reset_profile(&self) -> Option<ResetProfile> {
+        SqliteBackend::clean_reset_profile(self)
+    }
+
+    async fn simple_query(&self, conn: &mut Self::Conn, sql: &str) -> Result<u64, PoolError> {
+        SqliteBackend::simple_query(self, conn, sql).await
+    }
+
+    async fn query(
+        &self,
+        conn: &mut Self::Conn,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, PoolError> {
+        SqliteBackend::query(self, conn, sql, params).await
+    }
+
+    async fn query_stream(
+        &self,
+        _conn: &mut Self::Conn,
+        _sql: &str,
+        _params: &[Value],
+    ) -> Result<(Vec<ColMeta>, Self::RowStream), PoolError> {
+        // C3-5. `p2` already proved the mechanism works (100 000 rows across a capacity-1 channel
+        // from a `spawn_blocking` task that hands the connection back usable), so this is wiring
+        // that is not yet done rather than a capability in doubt.
+        Err(PoolError::Unsupported(
+            "fetch:stream is not yet implemented on the sqlite backend (C3-5)".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]

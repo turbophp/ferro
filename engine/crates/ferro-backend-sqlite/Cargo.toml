@@ -16,6 +16,7 @@ ferro-proto = { path = "../ferro-proto" }
 # `ferro-sqlite-spike`) a claim about the engine rather than about one machine.
 rusqlite = { version = "0.40", features = ["bundled"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+async-trait = "0.1"
 tracing = "0.1"
 
 [dev-dependencies]
