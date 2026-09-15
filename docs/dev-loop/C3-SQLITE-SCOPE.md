@@ -220,7 +220,10 @@ five storage classes.
   and `docs/dbal-suite/2026-09-15-c3-6a-sqlite-results.md`.
 - **C3-6b** — the Illuminate suite's SQLite column (§15) with its control. **DONE 2026-09-15** — see
   §20 and `docs/laravel-suite/2026-09-15-c3-6b-sqlite-results.md`.
-- **C3-7** — the online backup admin surface (§7.6's last sentence).
+- **C3-7** — the online backup admin surface (§7.6's last sentence). **SPLIT 2026-09-15 after scoping (§21):**
+  **C3-7a DONE** — the MECHANISM already works (`VACUUM INTO`, no engine code), and its four
+  properties are pinned as tests. **C3-7b NOT STARTED** — the admin service itself, which is a
+  `/proto` change plus an authorization question.
 
 ### Why this order changed on 2026-09-15 (C3-3 planning)
 
@@ -1084,3 +1087,66 @@ triage and method: `docs/laravel-suite/2026-09-15-c3-6b-sqlite-results.md`. SPEC
 **The stock-name alias is not a drop-in escape hatch on SQLite the way it is on PostgreSQL.**
 Upstream's own tests use throwaway SQLite connections regardless of the family under test, so
 hijacking the `sqlite` driver name costs 42 extra errors for the two name-gated skips it buys.
+
+---
+
+## 21. C3-7 scoping (2026-09-15) — the mechanism already works; C3-7 is an ADMIN SERVICE slice
+
+**C3-7a is DONE (this): the scoping, plus seven tests pinning what C3-7b builds on
+(`engine/crates/ferro-backend-sqlite/tests/backup_it.rs`). C3-7b — the admin service — is a `/proto`
+change and is NOT started.** SPEC §22.2 (bo).
+
+### The question the slice was handed, and the answer
+
+§7.6: *"Online backup API exposed via admin service for snapshots."* The obvious reading is that the
+backend needs `sqlite3_backup_*`. Probed first, that is unnecessary:
+
+* **`VACUUM INTO '<path>'` is a plain statement**, so the pool already runs it. It is SQLite's own
+  recommended way to snapshot a live database, and the per-request `timeout_ms` + interrupt handle
+  (§22.2 (bg) — the only thing that can stop a runaway SQLite statement) already bounds it.
+* `sqlite3_backup_*` would need a connection pair OUTSIDE the pool, i.e. a second connection
+  lifetime the `PoolBackend` seam exists to avoid.
+
+**What is missing is the transport.** `ADMIN = 5` is a reserved service id in `/proto` with no
+`[methods.admin]` table at all, and `dispatch::route(service::ADMIN, _)` returns `Unsupported` with a
+test asserting it. That is a charter-rule-2 change (registry + golden vectors + both codecs) plus an
+authorization question, so it is C3-7b. §13's `ferro top` needs the same transport, so C3-7b opens
+it for C4 too.
+
+### The four properties, measured
+
+| # | property | why an admin surface cares |
+| --- | --- | --- |
+| 1 | **No pool coordination needed.** A snapshot under a concurrent OPEN write transaction succeeds and excludes that transaction's uncommitted row. | The API does not have to drain or quiesce the pool — which was the worry worth checking, since a snapshot reads pages while a writer holds the WAL. |
+| 2 | **SQLite refuses an existing target.** | "Overwrite the previous snapshot" needs the surface to delete the file first — a destructive filesystem action, so it belongs to C3-7b's authorization rather than happening implicitly. |
+| 3 | **A refused snapshot leaves a ZERO-BYTE file**, and that leftover does **not** block the retry. | The obvious follow-on worry (a failed snapshot poisons the target name, given #2) is FALSE. Both halves recorded so an implementer does not have to guess at the pair. |
+| 4 | **`PRAGMA query_only` bounds writes to OTHER files too.** A declared-`readonly` checkout refuses `VACUUM INTO` with `SQLITE_READONLY`. | Cuts both ways: an honest `readonly` declaration already stops a tenant snapshotting on that checkout, AND C3-7b must not serve the admin surface on a declared-readonly checkout or the snapshot fails. |
+
+### The capability boundary, and why it is raised rather than patched
+
+§12/D8 keeps the database path in the engine so PHP never learns it. `VACUUM INTO` hands that choice
+back: the client names a path, the engine writes a complete copy of the database there. Refusing the
+verb was the obvious fix.
+
+**It would have been security theatre, and only a measurement showed that.** `ATTACH DATABASE
+'<path>'` plus an ordinary `CREATE TABLE side.copy AS SELECT …` writes the same copy to the same
+arbitrary path, and `ATTACH` is permitted BY DESIGN — §12's hygiene list exists to `DETACH` it.
+**The negative control makes it precise:** outside a transaction the attachment does NOT survive to
+the next statement, because `ATTACH` taints unconditionally (§19), so it is the TRANSACTION — the
+pool pinning every statement to one connection — that carries the capability, not the verb.
+
+So closing it means deciding a general rule about path-naming statements. **Raised as a §21 open
+item** with three options (leave and document in C6; confine to an operator-configured directory;
+refuse path-naming on the SQL service and expose snapshots only through the admin service) and an
+interim default of *unchanged*. A **tripwire test asserts the capability**, so a decision to close it
+turns that test RED rather than passing silently — the §18 `foreign_keys` precedent, applied on
+purpose rather than discovered.
+
+### What C3-7b still owes
+
+1. `[methods.admin]` in `/proto` + golden vectors + both codecs.
+2. An admin dispatch route in `ferrod`, replacing the `Unsupported` arm and its test.
+3. **Authorization** — an admin method that copies the whole database is privileged, and today every
+   session is equal. This is the part with no precedent in the tree.
+4. The destination policy, which is where the §21 decision above lands.
+5. A client/CLI surface (`ferro` CLI, D10) — and note §13's `ferro top` wants the same transport.
