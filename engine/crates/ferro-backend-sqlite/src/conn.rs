@@ -636,6 +636,26 @@ impl PoolBackend for SqliteBackend {
         false
     }
 
+    /// **SQLite is the first backend for which this is not a no-op** (SPEC D13, C3-4), and it is
+    /// what finally gives [`SqliteBackend::set_query_only`] a caller.
+    ///
+    /// A declared-`readonly` checkout is armed `PRAGMA query_only=ON`, so a client that declares
+    /// `readonly` and then WRITES is refused up front with `SQLITE_READONLY` (8) instead of being
+    /// believed. That matters because the same declaration is trusted elsewhere: `fate.rs` uses it
+    /// to suppress `Indeterminate` (§19.3), and under D13 it chooses `BEGIN DEFERRED`, which is
+    /// `p4a`'s exact unretryable setup. The C3-1 spike's `p5` proved the conversion — deterministic,
+    /// provably not executed, and with no contention at all, so it is a property of the connection
+    /// rather than a race that happened to be won.
+    ///
+    /// Disarming is NOT done here. `reset` clears it for the next tenant (C3-3b's explicit 4-item
+    /// list), which is the right owner: a pragma armed for one tenant and cleared by the hygiene
+    /// that runs for the next is the same shape as every other piece of session state, and making
+    /// this method responsible for both would put the cross-tenant guarantee in the hands of
+    /// whichever caller happened to check out next.
+    async fn apply_readonly(&self, conn: &mut Self::Conn, readonly: bool) -> Result<(), PoolError> {
+        self.set_query_only(conn, readonly).await
+    }
+
     fn cancel_handle(&self, conn: &Self::Conn) -> Self::CancelHandle {
         // A connection with no live handle still yields a handle-shaped value the pool can hold;
         // there is nothing to interrupt, and firing it is the documented no-op.
