@@ -1,0 +1,22 @@
+[package]
+name = "ferro-backend-sqlite"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ferro-pool = { path = "../ferro-pool" }
+# `bundled` compiles SQLite from source: the version is then a property of this build rather than of
+# whatever the host happens to ship, which is what makes D13's locking behaviour (proven in
+# `ferro-sqlite-spike`) a claim about the engine rather than about one machine.
+rusqlite = { version = "0.40", features = ["bundled"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"

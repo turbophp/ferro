@@ -204,6 +204,7 @@ five storage classes.
 - **C3-2** — the `compose_begin_sql` SQLite arm. **DONE 2026-09-14** — see §9.
 - **C3-3a** — the crate, `SqliteConn`, and connection setup: open, WAL, `busy_timeout` bounded by
   `checkout_timeout`, `query_only` arm/disarm, plus `connect`/`ping`/`is_closed`/`dialect`.
+  **DONE 2026-09-15** — see §11.
 - **C3-3b** — `tx_status` (via `is_autocommit`), `reset`/`clean_reset_profile`, `simple_query`.
 - **C3-3c** — `query` + the row/value mapping (SQLite's five storage classes → the §9 tags).
 - **C3-3d** — `cancel_handle` off `InterruptHandle`, and the `error_map` fate table.
@@ -370,3 +371,68 @@ equally consistent with "any error ends a transaction".
 
 **This premise is load-bearing for C3-3b**, which implements `tx_status`: it says the implementation
 is a read of the live signal and must never be a cached flag the pool maintains.
+
+---
+
+## 11. C3-3a: the backend crate and connection setup (2026-09-15) — DONE
+
+`engine/crates/ferro-backend-sqlite` exists. `ferro-sqlite-spike` is untouched and stays the
+premises suite; the two are separate crates on purpose.
+
+**There is deliberately NO `impl PoolBackend` yet.** The trait has a dozen required methods and this
+slice builds four, so implementing it now would mean eight bodies returning `Unsupported` — and a
+stub returning `Unsupported` is indistinguishable at the type level from a finished method, so the
+incompleteness would stop being visible exactly when it matters. Without the impl the compiler
+states the obvious: this is not a backend the pool can hold yet. The methods carry the trait's
+signatures, so C3-3b/c adds the impl mechanically and the compiler checks them then.
+
+**The park/unpark bridge is the part that matters**, because every later slice's statement runner
+goes through it. `rusqlite` is synchronous and the trait is async, so each call must cross
+`spawn_blocking`; `Connection` is `Send` but not `Sync`, so it is MOVED in and MOVED back — the
+shape the spike's `p2` proved, and the same one `MysqlConn` uses for streaming.
+
+**What connection setup actually checks:**
+
+- **WAL is verified, not requested and hoped for.** `PRAGMA journal_mode=WAL` RETURNS the mode
+  actually in force and SQLite can decline the change, so the return value is compared and a
+  non-WAL result is a hard error. *Stated honestly: the failure arm is not reachable in this
+  container* — declining WAL needs a filesystem without shared-memory support. The test proves the
+  connection IS in WAL; it does not exercise the guard.
+- **An in-memory DSN is REFUSED, and the refusal is justified rather than asserted.** SQLite gives
+  every `:memory:` connection its own private database, so a pooled `:memory:` DSN would silently
+  hand different tenants different databases. The test demonstrates that first — two in-memory
+  connections cannot see each other's table — and only then asserts the refusal, across five
+  spellings including `mode=memory`. A refusal with no proof behind it is superstition a later
+  reader deletes.
+- **`busy_timeout` is armed and read back.** It defaults to 5s, matching `PoolConfig`'s default
+  `checkout_timeout`. **Wiring debt: a backend cannot see `PoolConfig`, so C3-3e must pass the
+  pool's real `checkout_timeout`** to `with_busy_timeout`; until then a non-default value is not
+  reflected.
+- **`query_only` arm/disarm is built here although nothing calls it yet.** C3-2 shipped
+  `BEGIN DEFERRED` for a declared-`readonly` transaction, which is `p4a`'s setup — so this is the
+  mitigation for a hazard that already exists in the tree. C3-4's seam decides *when* to arm it.
+
+### Two pieces of my own speculative state, removed on review
+
+Both were found by adversarial re-reading and mutation rather than by the tests passing, and both
+are worth recording because the second is the same failure C3-1 had.
+
+1. **A `dead: bool` beside the `Option<Connection>` was unobservable.** `is_closed` already reports
+   true from `conn.is_none()`, and the only way to see a `None` is after a lost handle, since a
+   caller holds `&mut` across every blocking window. No test could tell the two apart. C3-5 may
+   genuinely need the distinction — a row stream parks the connection across a window the pool CAN
+   see, which is why `MysqlConn` carries it — and it should be reintroduced *then*, with a test that
+   distinguishes them.
+2. **An explicit `lose_handle()` in the panic arm was DEAD CODE, and the test was green either
+   way.** Deleting it left the panic-contract test passing, because `park` had already moved the
+   handle out and the error arm simply never unparks it. So the contract holds *by construction*,
+   the test is a regression guard on the behaviour rather than proof that a particular line is
+   load-bearing, and the test now says so. This is C3-1's non-buffering lesson again: a green test
+   is not evidence that the code under it does anything.
+
+### Open, and deliberately not decided here
+
+**SQLite defaults `foreign_keys` to OFF; Laravel and Doctrine both turn it ON.** That is a drop-in
+behaviour decision with an acceptance-suite consequence, not a connection-setup detail, so it is
+left to C3-6 rather than slipped in silently. Whichever way it goes, it should be recorded with the
+suite evidence behind it.
