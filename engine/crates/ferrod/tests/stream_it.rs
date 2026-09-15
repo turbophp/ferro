@@ -451,3 +451,53 @@ async fn abandonment_recovery_after_cancel() {
     .await
     .expect("cancel + drain + a fresh request on the same session must not hang");
 }
+
+// -------------------------------------------------------------------------------------------------
+// C3-5 — the same gate on a SQLite pool. No server, so unlike every test above it never skips.
+// -------------------------------------------------------------------------------------------------
+
+/// **`fetch:stream` works end to end on SQLite** — the claim C3-3e's `Unsupported` stood in for.
+///
+/// This reuses the PostgreSQL gate's own helpers deliberately rather than writing a parallel
+/// SQLite-shaped drain: the frame contract being asserted (exactly one HEAD, before any DATA;
+/// exactly one END, last; a clean `Ok` terminal) is a property of the SESSION LAYER, not of the
+/// backend, so a second implementation of the assertions could drift from the first and quietly
+/// stop checking the same thing.
+///
+/// The window is the same `SMALL_WINDOW_FRAMES` = 2 as the PG gate, so the result genuinely does
+/// not fit and backpressure is engaged rather than incidental.
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_stream_under_small_window() {
+    const ROWS: i64 = 5_000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dsn = format!("sqlite://{}", dir.path().join("stream.db").display());
+
+    tokio::time::timeout(Duration::from_secs(60), async move {
+        let server = stream_server(dsn, SMALL_WINDOW_FRAMES);
+        let mut client = server.connect().await;
+        client.hello(1).await;
+
+        let rows = drain_stream(
+            &mut client,
+            2,
+            &format!(
+                "WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < \
+                 {ROWS}) SELECT x FROM seq"
+            ),
+        )
+        .await;
+
+        assert_eq!(rows.len(), ROWS as usize, "every row arrives");
+        assert_eq!(
+            rows,
+            (1..=ROWS).collect::<Vec<_>>(),
+            "and in order, across many DATA frames under a 2-frame window"
+        );
+
+        // The session survives: exactly one END was produced and nothing else (charter rule 4).
+        assert_session_alive(&mut client, 99).await;
+    })
+    .await
+    .expect("a SQLite stream under a 2-frame window must not hang");
+}

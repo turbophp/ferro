@@ -260,9 +260,15 @@ async fn cancel_interrupts_and_maps_to_cancelled() {
     );
 }
 
-/// The backend satisfies `PoolBackend`, and the streaming pair is the only `Unsupported` left.
+/// **The backend satisfies `PoolBackend` with NOTHING left `Unsupported`** — as of C3-5.
+///
+/// This test shipped at C3-3d asserting the opposite half: that the streaming pair was the only
+/// `Unsupported` remaining, with `query_stream`'s success arm written `unreachable!()` because
+/// `SqliteRowStream` was uninhabited. C3-5 inhabited it, and the test was UPDATED rather than
+/// deleted — its subject was never "streaming is unsupported" but "the impl is complete and its
+/// gaps are exactly the ones we claim", which is a question worth keeping an answer to.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_trait_is_satisfied_and_only_streaming_is_unsupported() {
+async fn the_trait_is_satisfied_with_no_unsupported_methods_left() {
     use ferro_pool::backend::{Dialect, PoolBackend};
 
     // Generic over the trait, so this only compiles if the impl is complete.
@@ -273,16 +279,26 @@ async fn the_trait_is_satisfied_and_only_streaming_is_unsupported() {
     let dir = tempfile::tempdir().expect("tempdir");
     let backend = backend_on(&dir, "trait.db");
     assert_eq!(through_the_trait(&backend).await, Dialect::Sqlite);
+    assert!(
+        backend.supports_row_streaming(),
+        "the capability and the implementation flip together (§22.2 (bh))"
+    );
 
     let mut conn = PoolBackend::connect(&backend).await.expect("connect");
-    let err = match PoolBackend::query_stream(&backend, &mut conn, "SELECT 1", &[]).await {
-        Err(e) => e,
-        // `SqliteRowStream` is uninhabited, so this arm is unconstructible — which is the point.
-        Ok(_) => unreachable!("query_stream cannot succeed: its RowStream cannot be constructed"),
-    };
+    let (cols, rows) = PoolBackend::query_stream(&backend, &mut conn, "SELECT 1 AS one", &[])
+        .await
+        .expect("query_stream is implemented as of C3-5");
+    assert_eq!(cols.len(), 1);
+    assert_eq!(cols[0].name, "one");
+
+    // And the reclaim hand-back, through the trait: the connection is usable afterwards, which is
+    // only true if `reclaim_stream` really restored the handle the stream moved out.
+    PoolBackend::reclaim_stream(&backend, &mut conn, rows)
+        .await
+        .expect("reclaim restores the connection");
     assert!(
-        matches!(&err, PoolError::Unsupported(m) if m.contains("C3-5")),
-        "a clean Unsupported naming the slice, exactly as MySQL shipped at M1-S6: {err:?}"
+        !PoolBackend::is_closed(&backend, &conn),
+        "a reclaimed connection is not a husk"
     );
 }
 
@@ -330,27 +346,4 @@ fn handle_fatal_is_a_short_deliberate_list() {
             "extended {extended} has KNOWN fate and must stay a Sql error"
         );
     }
-}
-
-/// **The streaming capability and `query_stream` must agree, and the default is the wrong answer.**
-///
-/// `PoolBackend::supports_row_streaming` defaults to `true`, and `ferrod` reads it as the ONE
-/// authority for refusing a `fetch:stream` early — before any checkout — rather than letting the
-/// refusal arrive part-way through a result set. So a backend whose `query_stream` is `Unsupported`
-/// and whose capability says `true` is not merely inconsistent: it converts a clean, precise error
-/// into a mid-stream one.
-///
-/// C3-3e is what made that reachable (a SQLite pool can now be built at all), so the pairing is
-/// asserted here rather than left to the daemon. **Both halves flip together at C3-5** — this test
-/// is what says so out loud.
-#[tokio::test]
-async fn streaming_capability_agrees_with_query_stream() {
-    use ferro_pool::backend::PoolBackend;
-
-    let backend = ferro_backend_sqlite::SqliteBackend::new("sqlite:///tmp/ferro-never-dialed.db");
-    assert!(
-        !backend.supports_row_streaming(),
-        "the capability must be FALSE while query_stream is Unsupported — inheriting the trait's \
-         `true` default turns ferrod's early, precise refusal into a mid-stream error"
-    );
 }

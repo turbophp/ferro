@@ -801,3 +801,70 @@ connection-scoped read-only mode outside a transaction. But PostgreSQL's session
 would enforce the same declaration there. Not this slice — C3-4 is the seam plus the backend that
 already needed it — but the seam is what turns it into a small slice, and it is the first thing since
 §22.2 (ac) that would make an honest `readonly` declaration cost something on PostgreSQL.
+
+## 17. C3-5: `query_stream` + `reclaim_stream` (2026-09-15) — DONE
+
+The backend is complete against `PoolBackend`: nothing is `Unsupported`. SPEC §22.2 (bj).
+
+### Both halves flipped together, as (bh) required
+
+`supports_row_streaming` went `false` → `true` in the same change as the implementation, and the
+test that says so moved to its other side rather than being deleted. So did C3-3d's
+"streaming is the only `Unsupported` left" — its subject was never streaming, it was *the impl is
+complete and its gaps are exactly the ones we claim*, and that question still deserves an answer.
+
+### Conn-owning, forced not chosen
+
+`Statement`/`Rows` borrow the `Connection`; `Connection` is `Send`, not `Sync`. So the stream must
+own the connection on one blocking thread for its whole life — MySQL's B2b-2a shape exactly, which
+is why `reclaim_stream` exists. Counters come from the connection post-drain, because `changes()`
+goes stale (§22.2 (be)).
+
+The borrow constraint bit immediately: written inline, every early-return arm was a borrow-check
+error, since the connection cannot be handed back from inside the scope borrowing it. The producer
+is a separate `fn(&Connection, …)` for that reason, and the comment at the call site says so.
+
+### The non-buffering test was worthless twice, and both times for the same reason
+
+| version | why it proved nothing |
+|---|---|
+| take 10 rows, sleep, assert the next row follows | holds identically when the producer buffered everything during the sleep — passed under the widened-channel mutation |
+| same, plus interrupt, at `TOTAL` = 200 000 | measured: a widened producer only reaches ~157 000 in 250 ms, so the interrupt truncated either way |
+| interrupt at `TOTAL` = 50 000, 400 ms window | a widened producer finishes well inside the window, so truncation genuinely discriminates — **mutation fails with `seen == 50000`** |
+
+**The general rule this yields:** a stall probe is a proof only when what it measures cannot also be
+produced by the mutated code being merely *slow*. `p2` learned half of that at C3-1; this learned the
+other half.
+
+It doubles as the cancel proof — `SQLITE_INTERRUPT` is the only mechanism that can stop a statement
+here (§22.2 (bg)), and this is it stopping a real one.
+
+### Mutations, each failing exactly its own test
+
+| mutation | test that fails |
+|---|---|
+| `ROW_CHANNEL_CAPACITY` 1 → `TOTAL` | `the_producer_is_parked_mid_statement_not_running_ahead` |
+| capability back to `false` | `streaming_capability_agrees_with_query_stream` |
+| reclaim drops the connection instead of unparking | `the_connection_is_usable_after_a_stream` **and** `an_abandoned_stream_still_returns_its_connection` |
+| prepare-failure arm does not restore the connection | `a_prepare_failure_returns_the_connection` |
+
+The third was written first as a guess that it would still pass ("the next checkout just dials a new
+one") — running it said otherwise, because every method on the checkout goes through the handle the
+reclaim was supposed to restore. The comment records the measurement, not the guess.
+
+### C3-3a's `dead` flag stays removed, on the condition C3-3a set
+
+That slice deleted an unobservable flag and said C3-5 should bring it back only if the parked window
+turned out to be POOL-VISIBLE. Checked: it is not. Between `query_stream` and `reclaim_stream` the
+connection is checked out, so the pool's `is_closed` sweep never sees it, and `finalize_stream` reads
+`tx_status` only after the reclaim. The pair gained stream-specific names rather than becoming
+`pub(crate)`, so the "one blocking call" vs "a whole stream" distinction is documented where someone
+will look.
+
+### The ferrod-level gate reuses the PostgreSQL one's helpers
+
+Deliberately, rather than writing a SQLite-shaped drain: the frame contract (one HEAD before any
+DATA, exactly one END, a clean `Ok` terminal) is a property of the SESSION layer, not the backend, so
+a second implementation of those assertions could drift and quietly stop checking the same thing.
+Same 2-frame window as the PG gate, so backpressure is engaged rather than incidental — and unlike
+every other test in that file, it never skips, because SQLite needs no server.

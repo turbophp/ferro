@@ -19,12 +19,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ferro_pool::backend::{
-    BackendRows, Cancel, Dialect, PoolBackend, QueryResult, ResetProfile, TxStatus,
+    Cancel, Dialect, PoolBackend, QueryResult, Reclaimed, ResetProfile, TxStatus,
 };
 use ferro_pool::error::PoolError;
 use ferro_proto::messages::sql::ColMeta;
 use ferro_proto::value::Value;
 use rusqlite::Connection;
+
+use crate::stream::SqliteRowStream;
 
 /// The busy-timeout used when the caller does not name one.
 ///
@@ -110,6 +112,26 @@ impl SqliteConn {
     /// Put the handle back after a blocking call.
     fn unpark(&mut self, conn: Connection) {
         self.conn = Some(conn);
+    }
+
+    /// [`SqliteConn::park`] for a STREAM (C3-5), where the window is not one blocking call but the
+    /// whole life of the row stream.
+    ///
+    /// Separate names rather than making the pair `pub(crate)` because the two windows differ in
+    /// the one way that matters: a blocking call always restores the handle before the `await`
+    /// returns, so no other code can observe the gap, whereas a stream leaves it parked across
+    /// arbitrarily many awaits. C3-3a removed a `dead` flag as unobservable and said C3-5 should
+    /// reintroduce it only if that window turns out to be POOL-VISIBLE — it is not: between
+    /// `query_stream` and `reclaim_stream` the connection is checked out, so the pool's `is_closed`
+    /// sweep never sees it, and `finalize_stream` reads `tx_status` only after the reclaim has put
+    /// the handle back. The flag stays gone, and these names are where a future reader will look.
+    pub(crate) fn park_for_stream(&mut self) -> Option<Connection> {
+        self.park()
+    }
+
+    /// The other half of [`SqliteConn::park_for_stream`].
+    pub(crate) fn unpark_from_stream(&mut self, conn: Connection) {
+        self.unpark(conn);
     }
 }
 
@@ -592,25 +614,6 @@ impl Cancel for SqliteCancel {
     }
 }
 
-/// The streaming row type, which **cannot be constructed** — `query_stream` is `Unsupported` until
-/// C3-5, exactly as the MySQL backend shipped at M1-S6.
-///
-/// It wraps `Infallible` rather than stubbing the methods with `unimplemented!()`, so the
-/// impossibility is enforced by the TYPE SYSTEM instead of by a runtime panic nobody has exercised:
-/// every method below is an exhaustive match on an uninhabited value, which the compiler accepts
-/// and which can never run.
-pub struct SqliteRowStream(std::convert::Infallible);
-
-#[async_trait]
-impl BackendRows for SqliteRowStream {
-    async fn next(&mut self) -> Option<Result<Vec<Value>, PoolError>> {
-        match self.0 {}
-    }
-    fn rows_affected(&self) -> u64 {
-        match self.0 {}
-    }
-}
-
 /// The `PoolBackend` impl (C3-3d).
 ///
 /// **The trait lands here by the line drawn in C3-3b**: it goes in when only the STREAMING pair
@@ -623,17 +626,19 @@ impl PoolBackend for SqliteBackend {
     type RowStream = SqliteRowStream;
     type CancelHandle = SqliteCancel;
 
-    /// **False until C3-5, and it MUST be stated rather than inherited.** The trait's default is
-    /// `true`, and `ferrod`'s EXEC handler reads exactly this one method as the single authority for
-    /// the streaming capability (M1-S8a) so that a `fetch:stream` against a backend that cannot
-    /// stream is refused EARLY — before any checkout — instead of surfacing as an error part-way
-    /// through a result set the client has already begun consuming.
+    /// **True as of C3-5 — flipped in the SAME change as `query_stream`, which is the whole point
+    /// of stating it rather than inheriting it.**
     ///
-    /// Inheriting the default would therefore have been a live defect the moment C3-3e made a SQLite
-    /// pool reachable: the capability check would pass and `query_stream`'s `Unsupported` would
-    /// arrive mid-stream. It was unreachable before only because nothing could build such a pool.
+    /// `ferrod`'s EXEC handler reads exactly this one method as the single authority for the
+    /// streaming capability (M1-S8a), so that a `fetch:stream` against a backend that cannot stream
+    /// is refused EARLY — before any checkout — instead of surfacing part-way through a result set
+    /// the client has already begun consuming. C3-3e set it to `false` because inheriting the
+    /// trait's `true` default would have turned that clean refusal into a mid-stream error the
+    /// moment a SQLite pool became constructible (§22.2 (bh)); the same reasoning is why the two
+    /// move together now, and `streaming_capability_agrees_with_query_stream` is the test that says
+    /// so out loud rather than leaving it to a reader's memory.
     fn supports_row_streaming(&self) -> bool {
-        false
+        true
     }
 
     /// **SQLite is the first backend for which this is not a no-op** (SPEC D13, C3-4), and it is
@@ -715,18 +720,34 @@ impl PoolBackend for SqliteBackend {
         SqliteBackend::query(self, conn, sql, params).await
     }
 
+    /// C3-5. The connection is MOVED into a blocking task that owns it for the stream's life —
+    /// forced, not chosen: `Statement` and `Rows` borrow the `Connection`, and `Connection` is
+    /// `Send` but not `Sync`. That makes SQLite a conn-owning backend in exactly MySQL's sense, so
+    /// `reclaim_stream` below is mandatory rather than optional. See `crate::stream`.
     async fn query_stream(
         &self,
-        _conn: &mut Self::Conn,
-        _sql: &str,
-        _params: &[Value],
+        conn: &mut Self::Conn,
+        sql: &str,
+        params: &[Value],
     ) -> Result<(Vec<ColMeta>, Self::RowStream), PoolError> {
-        // C3-5. `p2` already proved the mechanism works (100 000 rows across a capacity-1 channel
-        // from a `spawn_blocking` task that hands the connection back usable), so this is wiring
-        // that is not yet done rather than a capability in doubt.
-        Err(PoolError::Unsupported(
-            "fetch:stream is not yet implemented on the sqlite backend (C3-5)".to_string(),
-        ))
+        crate::stream::start(conn, sql, params).await
+    }
+
+    /// Put the connection back and answer the counters from IT, not from the stream (SPEC §22.2
+    /// (n)'s measured rule, which holds here for SQLite's own reason: `changes()` reports the last
+    /// data-modifying statement and goes stale, so anything read before the statement finished
+    /// would be the previous one's).
+    ///
+    /// The `Err` contract is satisfied by construction: the handle is restored only on the success
+    /// arm, so a producer that panicked or vanished leaves `SqliteConn` handle-less and `is_closed`
+    /// reports it dead, which makes the pool discard the husk rather than recycle a mid-result-set
+    /// session (charter rule 6).
+    async fn reclaim_stream(
+        &self,
+        conn: &mut Self::Conn,
+        rows: Self::RowStream,
+    ) -> Result<Reclaimed, PoolError> {
+        crate::stream::reclaim(conn, rows).await
     }
 }
 
