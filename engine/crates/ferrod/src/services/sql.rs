@@ -414,7 +414,10 @@ async fn run_exec_on_pool<B: PoolBackend>(
     }
 
     // (3) checkout → queue_us (the pool-wait, including any recycle cleanup on the popped conn).
-    let mut co = match pool.checkout().await {
+    //     C3-4: the client's DECLARED `readonly` rides through to the backend here, so a backend
+    //     able to enforce it (SQLite's `PRAGMA query_only`) does, rather than the flag being trusted
+    //     by `fate.rs` alone. One of THREE call sites that must pass it — see `checkout_declared`.
+    let mut co = match pool.checkout_declared(req.readonly).await {
         Ok(co) => co,
         Err(e) => {
             // A checkout failure means NO connection was established, so the user statement was
@@ -632,7 +635,9 @@ async fn run_autocommit_streamed<B: PoolBackend>(
 ) {
     // A checkout failure means NO connection was established → the statement was NEVER transmitted
     // (sent=false), a known did-not-apply; autocommit (in_tx=false). Same fate as the buffered path.
-    let mut co = match pool.checkout().await {
+    // C3-4: the streamed path declares `readonly` exactly as the buffered one does — this is call
+    // site 2 of 3, and it is the one a plan that said "the exec path and the begin path" would miss.
+    let mut co = match pool.checkout_declared(readonly).await {
         Ok(co) => co,
         Err(e) => {
             responder.end_error(fate::classify_fate(
@@ -1299,7 +1304,13 @@ async fn begin_on_pool<B: PoolBackend>(
             }
         };
 
-    let mut co = match pool.checkout().await {
+    // C3-4, call site 3 of 3: the tx-scoped path. The pinned connection carries the declaration for
+    // the transaction's whole life, and it composes with the BEGIN string above rather than
+    // duplicating it — D13 chooses the LOCK MODE there (`BEGIN DEFERRED`) and the enforcement of the
+    // declaration here (`PRAGMA query_only`), which is precisely the pair `p4a`/`p5` proved is
+    // needed: the deferred lock is what makes a lying declaration reach an unretryable failure, and
+    // the pragma is what stops it getting there.
+    let mut co = match pool.checkout_declared(req.readonly).await {
         Ok(co) => co,
         Err(e) => {
             // No conn established: BEGIN never ran, no user statement sent → known-fate (sent=false).

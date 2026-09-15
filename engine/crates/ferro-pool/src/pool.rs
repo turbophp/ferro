@@ -98,6 +98,29 @@ impl<B: PoolBackend> Pool<B> {
     /// usable connection. `queue_us` on the returned `Checkout` covers the whole wait, including
     /// any async cleanup (defensive ROLLBACK/reset) performed on a recycled idle connection.
     pub async fn checkout(&self) -> Result<Checkout<B>, PoolError> {
+        self.checkout_declared(false).await
+    }
+
+    /// [`Pool::checkout`] carrying the request's CLIENT-DECLARED `readonly` flag through to the
+    /// backend (SPEC D13; C3-4).
+    ///
+    /// **The seam exists because `readonly` stopped at `ferrod`.** It reached the SQL and TX
+    /// services — `fate.rs` reads it to suppress `Indeterminate`, `compose_begin_sql` reads it to
+    /// choose SQLite's lock mode — but never reached `ferro-pool`, so no backend could act on it
+    /// per-connection. C3-3 planning deliberately did NOT build this seam at the time, because
+    /// nothing would have READ it: PostgreSQL and MySQL have no connection-scoped read-only mode,
+    /// and the SQLite backend did not exist. It is built now, after the backend that consumes it.
+    ///
+    /// **Additive by construction:** [`Pool::checkout`] delegates here with `false`, so every
+    /// existing caller — the version probe, every test, both wire backends' whole surface — is
+    /// byte-for-byte unchanged, exactly the shape M1-S6 used for `take_session_mutated`.
+    ///
+    /// The application happens on BOTH exits (fresh dial and recycled conn) and, on the recycled
+    /// one, AFTER the hygiene reset. Order matters in one direction only and it is not symmetric:
+    /// the reset's job is to DISARM whatever the previous tenant left, so arming before it would be
+    /// silently undone. One of the two exits is where a seam like this normally rots — the M1-S8b
+    /// `setTransactionIsolation` hole was exactly that, a third entry point the plan said was two.
+    pub async fn checkout_declared(&self, readonly: bool) -> Result<Checkout<B>, PoolError> {
         let start = Instant::now();
 
         let acquire = Arc::clone(&self.inner.semaphore).acquire_owned();
@@ -159,7 +182,18 @@ impl<B: PoolBackend> Pool<B> {
                     }
                 };
                 return match dialed {
-                    Ok(conn) => {
+                    Ok(mut conn) => {
+                        // EXIT 1 of 2: a freshly dialled connection. Nothing to undo here (a new
+                        // conn carries no previous tenant's state), but the declaration still has to
+                        // be applied or a readonly request would be enforced only when it happened
+                        // to be served a RECYCLED connection — an enforcement that depends on pool
+                        // occupancy is worse than none, because it passes under test and fails under
+                        // load. An arming failure fails the checkout rather than handing out a
+                        // connection that silently ignores the declaration.
+                        self.inner
+                            .backend
+                            .apply_readonly(&mut conn, readonly)
+                            .await?;
                         let queue_us = start.elapsed().as_micros() as u64;
                         Ok(Checkout::new(
                             conn,
@@ -225,6 +259,21 @@ impl<B: PoolBackend> Pool<B> {
                     Ok(Err(_)) => continue, // cleanup errored: evict + try again
                     Err(_) => continue,     // cleanup timed out: evict (drop) + try again
                 }
+            }
+
+            // EXIT 2 of 2: a recycled connection, and this MUST come after the cleanup block
+            // above — the reset is what disarms the previous tenant's arming, so applying first
+            // would be undone silently. An arming failure EVICTS and retries, matching what the
+            // cleanup block does with a failed reset: a connection that cannot be put into the
+            // declared state is not a connection this checkout can use.
+            if self
+                .inner
+                .backend
+                .apply_readonly(&mut idle_conn.conn, readonly)
+                .await
+                .is_err()
+            {
+                continue;
             }
 
             let queue_us = start.elapsed().as_micros() as u64;

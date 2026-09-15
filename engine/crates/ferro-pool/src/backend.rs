@@ -206,6 +206,41 @@ pub trait PoolBackend: Send + Sync + 'static {
         false
     }
 
+    /// Apply the request's CLIENT-DECLARED `readonly` flag to a connection, at checkout, before any
+    /// user statement runs (SPEC D13; C3-4).
+    ///
+    /// **This is a declaration being honoured, never an inference.** Charter rule 6 and SPEC §3
+    /// forbid the engine deciding for itself whether a statement writes; `readonly` arrives on the
+    /// request because the CLIENT said so, and this method is what makes that declaration cost
+    /// something on a backend able to enforce it. `fate.rs` already trusts the same flag to suppress
+    /// `Indeterminate` (§19.3), so a declaration that is a LIE is a real hazard — and on SQLite this
+    /// is what converts it from a silent wrong answer into an up-front `SQLITE_READONLY` (the C3-1
+    /// spike's `p5`: deterministic, and provably not executed).
+    ///
+    /// **Default: a no-op, and that is CORRECT rather than merely convenient for both wire
+    /// backends.** Outside an explicit transaction neither PostgreSQL nor MySQL has a per-statement
+    /// read-only scope to apply; the spellings that would persist (`SET SESSION CHARACTERISTICS …`,
+    /// `SET SESSION TRANSACTION …`) are connection state on a POOLED connection, i.e. the
+    /// cross-tenant leak §22.2 (s) already rules out for isolation. Their in-transaction half is
+    /// handled where it belongs, in the BEGIN string `compose_begin_sql` composes.
+    ///
+    /// Stated explicitly because C3-3d was bitten by the opposite case: `supports_row_streaming`'s
+    /// `true` default made an EXISTING backend wrong the moment its pool became constructible. This
+    /// default cannot do that — it is what both shipped wire backends would write by hand. What it
+    /// CAN do is let a FUTURE backend with a connection-scoped read-only mode inherit silence, so a
+    /// backend that has one must override, and this paragraph is the notice.
+    ///
+    /// Called on BOTH checkout paths (fresh dial and recycled conn) after any hygiene reset, so the
+    /// arming always survives the reset that would otherwise clear it. The inverse — DISARMING for
+    /// the next tenant — is the reset's job, not this method's, and is asserted as such.
+    async fn apply_readonly(
+        &self,
+        _conn: &mut Self::Conn,
+        _readonly: bool,
+    ) -> Result<(), PoolError> {
+        Ok(())
+    }
+
     /// Can this backend produce an INCREMENTAL row stream ([`PoolBackend::query_stream`]) at all?
     ///
     /// The ONE authority for the `fetch:stream` capability. It exists because the SQL service has

@@ -726,3 +726,66 @@ made a SQLite pool constructible, and unreachable before only because nothing co
 
 Overridden to `false`, with the capability/`query_stream` pairing asserted and mutation-proven
 (deleting the override fails the test). Both halves flip together at C3-5, and the test says so.
+
+## 16. C3-4: the `readonly` / `Pool::checkout` seam (2026-09-15) — DONE
+
+`Pool::checkout_declared(readonly)` → `PoolBackend::apply_readonly` → SQLite's `PRAGMA query_only`.
+SPEC §22.2 (bi). `set_query_only`, written at C3-3a with no caller, finally has one.
+
+### The item was verified before it was built, and it had changed
+
+C3-3 planning moved this slice *after* the backend because `readonly` genuinely did not reach
+`ferro-pool` but **no backend would have read it**. Re-checked at the top of this slice: still two
+occurrences in `ferro-pool`, both comments. What changed is the consumer — the SQLite backend now
+exists, and `query_only` is the thing that reads it.
+
+### Three call sites, not two
+
+`ferrod` reaches `checkout()` from the buffered autocommit exec, the STREAM path, and the tx BEGIN.
+A plan saying "the exec path and the begin path" would have wired two and left streamed
+declared-readonly requests unenforced — the same shape as M1-S8b's `setTransactionIsolation` hole,
+where the plan said two entry points and the third was found by measurement.
+
+### Both checkout exits, and the ordering
+
+`checkout_declared` returns from a fresh dial and from a recycled connection. The recycled arm must
+apply **after** the hygiene reset, which would otherwise undo the arming. Enforcement on one exit
+only would depend on pool occupancy: green wherever a test warms the pool, absent for exactly the
+requests a cold or saturated pool serves with a new connection.
+
+| mutation | test that fails | tests that stay green |
+|---|---|---|
+| delete the fresh-dial arm | `a_freshly_dialled_connection_gets_the_declaration` | the other three |
+| delete the recycled arm | `a_recycled_connection_is_re_declared_each_checkout` (step 2) | the other three |
+| move the arm above the cleanup block | `a_recycled_connection_is_re_declared_each_checkout` (step 2) | the other three |
+| delete `query_only=OFF` from `reset` | `a_user_issued_query_only_pragma_does_not_leak_to_the_next_tenant` | the other three |
+
+### Two of this slice's own tests were proven wrong, and that is the slice's value
+
+**One claimed to exercise the fresh-dial exit through `ferrod`.** It does not, and cannot: the HELLO
+handshake calls `PoolRegistry::pool_info`, whose version probe checks a connection out and returns
+it, so every EXEC in that directory is served by a recycled connection. Measured, not reasoned — the
+mutation left it green. The proof moved to pool level, where the test decides which connection serves
+a checkout.
+
+**One claimed the hygiene reset is what disarms between tenants.** Deleting `PRAGMA query_only=OFF`
+from `reset` left it green. The real mechanism is that every checkout re-declares:
+`checkout_declared(false)` disarms as surely as `true` arms, so in the ordinary path the seam
+prevents the leak and hygiene never gets a turn.
+
+That does **not** make the reset line dead, and finding out why is the useful part.
+`apply_readonly` short-circuits on its own tracked flag, so a tenant that arms the pragma ITSELF — by
+running `PRAGMA query_only=ON` as a statement, declaring nothing — leaves the flag reading `false`,
+and the next checkout's `apply_readonly(conn, false)` does nothing at all. The connection reaches the
+next tenant read-only with no declaration anywhere explaining why their writes fail. That is the §7.4
+blind-spot shape, it is what the unconditional reset covers, and it now has the test it was wrongly
+believed to already have.
+
+### Recorded, not built: the PostgreSQL arm
+
+The default `apply_readonly` is a no-op, correct today because neither wire backend has a
+connection-scoped read-only mode outside a transaction. But PostgreSQL's session-scoped
+`default_transaction_read_only`, armed per checkout and cleared by the existing hygiene `RESET ALL`,
+would enforce the same declaration there. Not this slice — C3-4 is the seam plus the backend that
+already needed it — but the seam is what turns it into a small slice, and it is the first thing since
+§22.2 (ac) that would make an honest `readonly` declaration cost something on PostgreSQL.
