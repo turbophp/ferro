@@ -202,18 +202,38 @@ five storage classes.
   and (d) §1's `SQLITE_BUSY_SNAPSHOT` behaviour, which D13 requires reproduced. **DONE 2026-09-14 —
   all four HOLD**, `engine/crates/ferro-sqlite-spike/`. See §8.
 - **C3-2** — the `compose_begin_sql` SQLite arm. **DONE 2026-09-14** — see §9.
-- **C3-3** — the `readonly` seam through `Pool::checkout` (the autocommit half of D13).
-- **C3-4** — the crate and the `PoolBackend` impl minus streaming: connect/ping/`tx_status` via
-  `sqlite3_get_autocommit`/`simple_query`/`query`/hygiene, plus the third `AnyPool` arm.
-- **C3-5** — `query_stream`.
+- **C3-3a** — the crate, `SqliteConn`, and connection setup: open, WAL, `busy_timeout` bounded by
+  `checkout_timeout`, `query_only` arm/disarm, plus `connect`/`ping`/`is_closed`/`dialect`.
+- **C3-3b** — `tx_status` (via `is_autocommit`), `reset`/`clean_reset_profile`, `simple_query`.
+- **C3-3c** — `query` + the row/value mapping (SQLite's five storage classes → the §9 tags).
+- **C3-3d** — `cancel_handle` off `InterruptHandle`, and the `error_map` fate table.
+- **C3-3e** — the third `AnyPool` arm: the backend becomes reachable at runtime here, and ONLY
+  here. Everything above is unit-testable in-crate; nothing before this point changes `ferrod`.
+- **C3-4** — the `readonly` seam through `Pool::checkout` (the autocommit half of D13).
+- **C3-5** — `query_stream` + `reclaim_stream` (until then, a clean `Unsupported`, exactly as the
+  MySQL backend shipped at M1-S6).
 - **C3-6** — the acceptance columns: the DBAL suite's SQLite column (§14) and the Illuminate suite's
   (§15), each with the C2e control column alongside it.
 - **C3-7** — the online backup admin surface (§7.6's last sentence).
 
-*(C3-2 and C3-3 were INSERTED and the rest renumbered: this list predates D13, which split the BEGIN
-composition and the pool seam into two slices and fixed their order. Renumbering rather than
-appending keeps one meaning of "C3-2" in the tree — the ledger and this document disagreeing about
-which slice a number names is exactly the kind of drift a later firing reads as fact.)*
+### Why this order changed on 2026-09-15 (C3-3 planning)
+
+**The `readonly` seam was scheduled before the backend, and that was wrong — it has no consumer.**
+`readonly` genuinely does not reach `ferro-pool` (verified: it occurs in `ferro-pool/src` exactly
+twice, both in comments). But no backend would READ it: PostgreSQL has nowhere to apply a
+per-statement readonly outside a transaction, MySQL likewise, and the SQLite backend does not exist.
+Building it first would mean adding a parameter nothing consumes and testing only that it arrives —
+scaffolding whose shape is guessed rather than fitted. It is now **C3-4**, after the backend that
+gives it a consumer.
+
+**And the backend was one undifferentiated slice, which measurement says it cannot be.** The two
+existing backends are **5623 lines (PG)** and **4040 lines (MySQL)**; SQLite will be smaller — five
+storage classes instead of two type systems, and the spike already proved every mechanic — but not
+by the order of magnitude that would make it one iteration. Left as a single item it would be read
+by a future firing as one slice and either half-built or not started. The a–e split above is by
+**what can be tested without the next piece existing**, which is why `AnyPool` is last: it is the
+step that makes the backend reachable from `ferrod`, so a failure before it cannot be confused with
+a failure in the daemon.
 
 ## 7. What this document does NOT decide
 
@@ -321,3 +341,32 @@ literal. The MySQL lane solved the same problem with a live lockstep test
 (`ferro-backend-mysql/tests/begin_dialect_it.rs`); the SQLite equivalent is not writable until a
 SQLite pool exists, so **C3-4 owes it too**. `Dialect::Sqlite` is unreachable at runtime until then,
 which is why a unit test is the only gate this slice can honestly offer.
+
+---
+
+## 10. C3-3 planning (2026-09-15) — the sequencing was wrong, and §7.1 is amended
+
+No backend code this iteration. Two things were produced instead, and both were blocking work that
+would otherwise have been done badly.
+
+**1. The order was corrected (see §6's note).** The `readonly` seam had no consumer and the backend
+was an unslice-able 4000–5600-line block. Both are fixed above.
+
+**2. §7.1 is amended, and the amendment is backed by a new premise (`p6`).** §7.1 said pin decisions
+come from "backend protocol signals" and had no SQLite paragraph for pin AUTHORITY at all — SQLite
+appeared only in the assist-lexer list. It now names the mechanism (`sqlite3_get_autocommit()` via
+`Connection::is_autocommit()`, synchronous and round-trip-free) and generalises the framing: the
+invariant is *authority from the backend, never inference from statement text*, and the form of that
+report is a protocol byte on PG, a status flag plus trackers on MySQL, and a library call on SQLite.
+
+**`p6` is why the paragraph can say the signal must be read after EVERY statement rather than
+tracked.** SQLite ends transactions by itself: a constraint declared `ON CONFLICT ROLLBACK` rolls the
+whole transaction back on violation, with nothing in the SQL text saying so, and an engine tracking
+its own `BEGIN`/`COMMIT` would hold a pin for a transaction that no longer exists. The **control** is
+the same duplicate insert against a plain unique constraint (default `ON CONFLICT ABORT`), which
+fails only the statement and leaves the signal reporting in-transaction — mutation-proven by making
+the control table `ON CONFLICT ROLLBACK` too, which fails it. Without that half, the first would be
+equally consistent with "any error ends a transaction".
+
+**This premise is load-bearing for C3-3b**, which implements `tx_status`: it says the implementation
+is a read of the live signal and must never be a cached flag the pool maintains.

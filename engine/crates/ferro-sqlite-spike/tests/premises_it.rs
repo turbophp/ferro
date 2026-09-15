@@ -118,6 +118,78 @@ fn p4a_busy_timeout_does_not_retry_a_deferred_upgrade() {
     a.execute_batch("ROLLBACK").expect("A rolls back");
 }
 
+/// **P6: `is_autocommit()` tracks an AUTOMATIC rollback — the case engine-side tracking misses.**
+///
+/// This is the premise SPEC §7.1's SQLite paragraph rests on, so it is proven rather than asserted.
+/// §7.1's rule is that pin decisions come from the backend's own authoritative state report, never
+/// from lexing the statement text. For SQLite that report is `sqlite3_get_autocommit()` via
+/// `Connection::is_autocommit()` — and the reason it must be READ AFTER EVERY STATEMENT, rather
+/// than the engine simply remembering that it sent a `BEGIN`, is that SQLite can roll a transaction
+/// back on its own. A constraint declared `ON CONFLICT ROLLBACK` does exactly that: the statement
+/// fails AND the transaction ends, with nothing in the SQL text saying so.
+///
+/// An engine that tracked `BEGIN`/`COMMIT` itself would believe a transaction was still open, hold
+/// the pin, and hand the next tenant a connection it thinks is mid-transaction — the §7.1 hazard,
+/// arrived at from the other direction.
+///
+/// The CONTROL is the second half: the same duplicate insert against a PLAIN unique constraint
+/// (SQLite's default is `ON CONFLICT ABORT`) fails the statement and leaves the transaction OPEN,
+/// so `is_autocommit()` stays false. Without it, the first half would be equally consistent with
+/// "the transaction never opened" or "any error ends a transaction".
+#[test]
+fn p6_is_autocommit_tracks_an_automatic_rollback() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("p6.db");
+    let conn = open_wal(&path);
+
+    conn.execute_batch(
+        "CREATE TABLE auto(id INTEGER PRIMARY KEY, v INTEGER UNIQUE ON CONFLICT ROLLBACK);
+         CREATE TABLE abort(id INTEGER PRIMARY KEY, v INTEGER UNIQUE);",
+    )
+    .expect("seed");
+
+    assert!(
+        conn.is_autocommit(),
+        "baseline: a connection with no transaction open reports autocommit"
+    );
+
+    // (a) ON CONFLICT ROLLBACK — the transaction ends underneath the engine.
+    conn.execute_batch("BEGIN IMMEDIATE").expect("begin");
+    conn.execute("INSERT INTO auto VALUES (1, 1)", [])
+        .expect("first insert");
+    assert!(
+        !conn.is_autocommit(),
+        "a transaction is open, so the authority reports NOT autocommit"
+    );
+
+    conn.execute("INSERT INTO auto VALUES (2, 1)", [])
+        .expect_err("duplicate v must violate the unique constraint");
+
+    assert!(
+        conn.is_autocommit(),
+        "THE LOAD-BEARING ASSERTION: SQLite rolled the transaction back BY ITSELF, and the library \
+         call reports it. Nothing in the SQL text said so, so an engine that tracked BEGIN/COMMIT \
+         itself would still believe this connection is mid-transaction and would pin it for a \
+         transaction that no longer exists."
+    );
+
+    // (b) CONTROL: a plain unique constraint (ON CONFLICT ABORT) fails the STATEMENT only. Without
+    //     this half, (a) would be equally consistent with "any error ends a transaction".
+    conn.execute_batch("BEGIN IMMEDIATE").expect("begin again");
+    conn.execute("INSERT INTO abort VALUES (1, 1)", [])
+        .expect("first insert");
+    conn.execute("INSERT INTO abort VALUES (2, 1)", [])
+        .expect_err("duplicate v must violate the unique constraint");
+    assert!(
+        !conn.is_autocommit(),
+        "THE CONTROL: an ordinary constraint failure leaves the transaction OPEN, so the same \
+         signal still reports in-transaction. The difference between (a) and (b) is SQLite's own \
+         conflict resolution, which is exactly why the signal must be read rather than inferred."
+    );
+    conn.execute_batch("ROLLBACK").expect("explicit rollback");
+    assert!(conn.is_autocommit(), "and an explicit ROLLBACK ends it too");
+}
+
 /// **P5: `PRAGMA query_only` closes the hole D13's own readonly arm opens.**
 ///
 /// D13 says a transaction the client DECLARED `readonly` takes a DEFERRED reader lock. That is
