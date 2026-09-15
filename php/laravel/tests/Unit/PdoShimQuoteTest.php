@@ -35,7 +35,7 @@ final class PdoShimQuoteTest extends TestCase
 
     public function testAnOnBackendQuotesByDoublingTheSingleQuote(): void
     {
-        $shim = new FerroPdoShim(new FerroClient(self::advertising(true), 'main'));
+        $shim = new FerroPdoShim(new FerroClient(self::advertising(true), 'main'), static fn (): null => null);
 
         self::assertSame("'Hello''World'", $shim->quote("Hello'World"));
     }
@@ -48,7 +48,7 @@ final class PdoShimQuoteTest extends TestCase
      */
     public function testAnOffBackendRefusesRatherThanEmittingAnUnsafeLiteral(): void
     {
-        $shim = new FerroPdoShim(new FerroClient(self::advertising(false), 'main'));
+        $shim = new FerroPdoShim(new FerroClient(self::advertising(false), 'main'), static fn (): null => null);
 
         $this->expectException(\LogicException::class);
         $this->expectExceptionMessageMatches('/literals_are_standard=true.*got false/s');
@@ -63,7 +63,7 @@ final class PdoShimQuoteTest extends TestCase
      */
     public function testAnUnknownQuotingRuleAlsoRefuses(): void
     {
-        $shim = new FerroPdoShim(new FerroClient(self::advertising(null), 'main'));
+        $shim = new FerroPdoShim(new FerroClient(self::advertising(null), 'main'), static fn (): null => null);
 
         $this->expectException(\LogicException::class);
         $this->expectExceptionMessageMatches('/got NULL/i');
@@ -75,7 +75,7 @@ final class PdoShimQuoteTest extends TestCase
     {
         $session = new FakeSession();
         $session->poolInfo = [];
-        $shim = new FerroPdoShim(new FerroClient($session, 'main'));
+        $shim = new FerroPdoShim(new FerroClient($session, 'main'), static fn (): null => null);
 
         $this->expectException(\LogicException::class);
         $this->expectExceptionMessageMatches('/no pool metadata/');
@@ -92,7 +92,7 @@ final class PdoShimQuoteTest extends TestCase
     public function testQuotingSendsNothingOnTheWire(): void
     {
         $session = self::advertising(true);
-        $shim = new FerroPdoShim(new FerroClient($session, 'main'));
+        $shim = new FerroPdoShim(new FerroClient($session, 'main'), static fn (): null => null);
 
         self::assertSame("'a'", $shim->quote('a'));
         self::assertSame("'b'", $shim->quote('b'));
@@ -102,7 +102,7 @@ final class PdoShimQuoteTest extends TestCase
     /** `PDO::PARAM_LOB` is a different literal shape entirely; it is refused, not silently ignored. */
     public function testABinaryParamTypeIsRefusedByName(): void
     {
-        $shim = new FerroPdoShim(new FerroClient(self::advertising(true), 'main'));
+        $shim = new FerroPdoShim(new FerroClient(self::advertising(true), 'main'), static fn (): null => null);
 
         $this->expectException(\LogicException::class);
         $this->expectExceptionMessageMatches('/PARAM_STR/');

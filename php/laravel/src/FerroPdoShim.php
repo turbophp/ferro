@@ -34,7 +34,14 @@ use Ferro\Laravel\Exception\FerroQueryException;
  */
 final class FerroPdoShim
 {
-    public function __construct(private readonly FerroClient $ferro) {}
+    /**
+     * @param \Closure(): (int|string|null) $lastInsertId the owning connection's remembered key —
+     *   see {@see lastInsertId} for why the shim does not read it from the client directly.
+     */
+    public function __construct(
+        private readonly FerroClient $ferro,
+        private readonly \Closure $lastInsertId,
+    ) {}
 
 
     /**
@@ -225,6 +232,66 @@ final class FerroPdoShim
         // `$info` is non-null here BY CONSTRUCTION: `$version` came off it, and a null `$version`
         // already threw above. PHPStan agrees — a `?->` here is a reported error, not caution.
         return ServerVersion::normalise($info->kind, $version);
+    }
+
+    /**
+     * The generated key of the last successful statement — PDO's `lastInsertId()`.
+     *
+     * **Demanded by the SQLite column, unreachable on PostgreSQL, and that asymmetry is Illuminate's
+     * rather than ours.** `PostgresProcessor::processInsertGetId` runs `insert … returning id` and
+     * reads the value out of the RESULT, so the PostgreSQL tier never touches this method — which
+     * is why it did not exist until C3-6b. SQLite has no such override: its inserts go through the
+     * BASE `Processor::processInsertGetId`, which calls `$connection->getPdo()->lastInsertId()`
+     * directly. The framework suite is what surfaced that (11 of 11 `EloquentWhereTest` cases died
+     * on the `__call` refusal), which is the whole reason the measurement is built before the tier
+     * surface (lesson: do not build what the suite has not demanded).
+     *
+     * It THROWS rather than returning PDO's falsy `false`, deliberately and on the sibling Doctrine
+     * tier's reasoning: a caller cannot tell `0`, `''` or `false` from a key, and Illuminate's
+     * `Processor::processInsertGetId` would hand a `false` straight back as the model's primary key.
+     * Loud beats silently wrong — §22.2 (m) already records a WRONG key as strictly worse than none.
+     *
+     * **It reads the CONNECTION's remembered key, not the client's, and that difference is the whole
+     * substance of this method.** `Ferro\Client\Connection::lastInsertId()` is deliberately a
+     * PER-STATEMENT value: it is cleared on the way in to every request, so a statement that
+     * generates no key leaves it `null` rather than carrying a stale one over (M1-S8a, §22.2 (bf)).
+     * That is right for the client — on a transaction-mode pool the next statement can land on a
+     * different backend connection, so the ENGINE must never carry a rowid forward — and it is
+     * exactly wrong for PDO, whose `lastInsertId()` is a property of the HANDLE and keeps answering
+     * until another insert replaces it.
+     *
+     * MEASURED, not reasoned: the framework suite reported 182 of 225 errors on this one line.
+     * `Processor::processInsertGetId()` is `insert(); getPdo()->lastInsertId();` with nothing in
+     * between — but `Connection::insert()` fires `QueryExecuted`, and any listener that runs a query
+     * (which is what `AfterQueryTest`'s whole subject matter is) clears the client's value before
+     * Illuminate reads it. Under `pdo_sqlite` the same code is fine.
+     *
+     * So the PDO SEMANTICS LIVE IN THE PDO SHIM, which is what this class is for: the connection
+     * remembers each non-null key from its own writes and never clears it, and the remembered value
+     * is byte-for-byte the one `pdo_sqlite` would return — including after a rollback, where PDO
+     * also still answers the rolled-back rowid. Nothing in the engine or the client changed, so the
+     * Doctrine tier's stricter "read it immediately" contract is untouched.
+     *
+     * The `$sequence` argument is accepted and IGNORED, which is exactly what `pdo_sqlite` does
+     * (it has no sequences). It is not silently ignored on other families: they cannot reach here.
+     */
+    public function lastInsertId(?string $sequence = null): string
+    {
+        $id = ($this->lastInsertId)();
+        if ($id === null) {
+            // `null` here means NO write on this connection has ever generated a key — the
+            // connection remembers every one it sees and never clears it, so an intervening
+            // statement, a failed one or a rolled-back transaction cannot produce this.
+            throw new \LogicException(
+                'Ferro: no statement on this connection has generated a key, so lastInsertId() has '
+                . 'nothing to return. On SQLite a key comes from last_insert_rowid(), which the '
+                . 'engine reports only when the statement actually moved it — an INSERT that '
+                . 'explicitly reuses the current rowid reports none (SPEC §22.2 (bf)). On '
+                . 'PostgreSQL the wire carries no such field at all and Illuminate does not need '
+                . 'it: PostgresProcessor uses `insert … returning id`.',
+            );
+        }
+        return (string) $id;
     }
 
     /**

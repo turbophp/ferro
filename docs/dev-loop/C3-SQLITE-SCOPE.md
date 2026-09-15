@@ -218,8 +218,8 @@ five storage classes.
   MySQL backend shipped at M1-S6).
 - **C3-6a** — the DBAL suite's SQLite column (§14) with its control. **DONE 2026-09-15** — see §18
   and `docs/dbal-suite/2026-09-15-c3-6a-sqlite-results.md`.
-- **C3-6b** — the Illuminate suite's SQLite column (§15) with its control. The Laravel tier
-  registers `ferro-pgsql` only, so this needs a `FerroSQLiteConnection` first.
+- **C3-6b** — the Illuminate suite's SQLite column (§15) with its control. **DONE 2026-09-15** — see
+  §20 and `docs/laravel-suite/2026-09-15-c3-6b-sqlite-results.md`.
 - **C3-7** — the online backup admin surface (§7.6's last sentence).
 
 ### Why this order changed on 2026-09-15 (C3-3 planning)
@@ -939,10 +939,12 @@ the rows it was meant to remove.
   `TypeConversionTest` passes, because DBAL's types parse the platform's format strings out of
   strings anyway.
 
-### Carried forward to C3-6b
+### Carried forward to C3-6b — **ALL THREE ANSWERED, see §20**
 
-- The Laravel tier registers `ferro-pgsql` only; a SQLite column needs a `FerroSQLiteConnection`
-  and a driver name, which is where C1b's `resolverFor()` work has to be repeated.
+- ~~The Laravel tier registers `ferro-pgsql` only; a SQLite column needs a `FerroSQLiteConnection`
+  and a driver name, which is where C1b's `resolverFor()` work has to be repeated.~~ **DONE** — and
+  the `resolverFor()` work was NOT repeated: the driver map gained one entry, and the execution
+  layer became a trait rather than a copy.
 - **`literals_are_standard` is nil on a SQLite pool** (measured through `poolInfo()`), and C2g's
   `FerroPdoShim::quote()` refuses on nil by design (fail-closed). So `DB::escape()` / `toRawSql()`
   will fail on a SQLite pool until the backend advertises it. SQLite literals are always standard,
@@ -951,7 +953,15 @@ the rows it was meant to remove.
   it.
 - The `foreign_keys` answer above is the DBAL half only. Laravel's SQLite connector sets the pragma
   itself and its suite may depend on enforcement; the pool-level guarantee already satisfies it, but
-  that has to be measured rather than assumed.
+  that has to be measured rather than assumed. **MEASURED: the pool-level guarantee satisfies the
+  suite, and Illuminate's own four `configure*` pragmas are no-ops unless their config keys are set
+  — so nothing was overridden.** But enforcement being ON is also what makes the one genuine
+  incompatibility bite (§20): `PRAGMA foreign_keys = OFF` cannot be suspended across a column
+  change's six checkouts.
+
+- **`literals_are_standard` never came up.** It was carried as a likely blocker for `DB::escape()` /
+  `toRawSql()`, and 633 upstream cases never reached it — so it stays unfixed, on the same
+  check-for-a-consumer rule that kept it out of C3-6a.
 
 
 ---
@@ -1041,3 +1051,36 @@ nothing at all.
   statements that DO work through Ferro, but only because `PRAGMA writable_schema` persisted, which
   is the leak this section closes. **After the fix that branch will need a transaction around it**,
   which is C3-6a's verified remedy applied again. This is C3-6b's real first problem.
+
+
+---
+
+## 20. C3-6b (2026-09-15) — the Illuminate tier learns SQLite. DONE
+
+**575 passed / 579 executed under `ferro-sqlite`, against a CONTROL at 586/588.** Full numbers,
+triage and method: `docs/laravel-suite/2026-09-15-c3-6b-sqlite-results.md`. SPEC §22.2 (bn).
+
+### The three things worth carrying out of it
+
+1. **`lastInsertId()` is where a pooled engine and PDO genuinely disagree.** The client's value is
+   per-STATEMENT by design; PDO's belongs to the handle. `Connection::insert()` fires
+   `QueryExecuted` before Illuminate reads the id, so any listener that runs a query clears it —
+   182 of the first full run's 225 errors. The PDO semantics now live in the PDO shim, which is what
+   that class is for; the engine, the client and the Doctrine tier are untouched.
+
+2. **`dropAllTables()` is fixed; `refreshDatabaseFile()` now refuses.** Under Ferro
+   `getDatabaseName()` is a LABEL, so upstream's file branch truncates a junk file and leaves every
+   table in place — observed as two empty files in the repository root during the mutation round.
+
+3. **One real incompatibility, with three remedies ruled out by measurement.**
+   `SQLiteGrammar::compileAlter()`'s six statements are six checkouts, so `PRAGMA foreign_keys = OFF`
+   never reaches the `drop table`. Wrapping all six in ONE transaction does NOT help — the pragma is
+   a no-op inside a transaction — which is exactly what makes this different from §18's `__temp__`
+   remedy and from `dropAllTables()`. `PRAGMA defer_foreign_keys` does not help either. There is no
+   execution-layer fix that does not amount to substituting SQL the stock grammar did not emit.
+
+### And one about the alias
+
+**The stock-name alias is not a drop-in escape hatch on SQLite the way it is on PostgreSQL.**
+Upstream's own tests use throwaway SQLite connections regardless of the family under test, so
+hijacking the `sqlite` driver name costs 42 extra errors for the two name-gated skips it buys.

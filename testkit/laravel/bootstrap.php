@@ -34,16 +34,91 @@ $loader->addPsr4('Illuminate\\Tests\\', $src . '/tests');
 // per-call random nonce cannot be guessed, so its return is evidence that something RECEIVED it;
 // version() rides along because a nonce alone would be satisfied by any SQL database.
 // -------------------------------------------------------------------------------------------------
-$sock = getenv('FERRO_LARAVEL_SOCK');
-if ($sock === false || $sock === '') {
-    fwrite(STDERR, "FERRO CONTACT ASSERTION FAILED: FERRO_LARAVEL_SOCK is unset\n");
-    exit(1);
-}
-
 // The probe uses the SAME driver NAME the suite is about to run under, so it also proves that
 // Illuminate's resolver map answers for that name — under the `pgsql` alias, that Ferro really did
 // take over the stock name rather than the stock PostgresConnection quietly winning.
 $driver = getenv('FERRO_LARAVEL_DRIVER') ?: 'ferro-pgsql';
+$family = Illuminate\Tests\Integration\Database\DatabaseTestCase::familyOf($driver);
+
+// -------------------------------------------------------------------------------------------------
+// THE PROBE IS PER-FAMILY, because SQLite has no `version()` at all — the same premise that measured
+// FALSE for the engine's own version probe at C3-3e. `sqlite_version()` is its equivalent.
+//
+// **And on SQLite the "is it really the engine?" question cannot be answered by the server product,
+// because the trap IS SQLite.** Testbench's injected fallback is an in-memory SQLite, so a probe
+// that only proved "something SQLite answered" would pass against exactly the thing it exists to
+// catch. `PRAGMA database_list` names the FILE the main database is open on, so it distinguishes the
+// intended file from `:memory:` (which reports an empty path) and from any other file. For the Ferro
+// column that is end-to-end evidence the ENGINE opened the expected path — which the connection
+// itself cannot know, since §12/D8 keeps the path out of PHP.
+// -------------------------------------------------------------------------------------------------
+$expectFile = null;
+if ($family === 'sqlite') {
+    // From the RUNNER, not parsed here: the engine's DSN rule is `strip_prefix("sqlite://")` and
+    // PHP's `parse_url()` disagrees with it outright — it returns FALSE for `sqlite:///abs/path`.
+    $expectFile = getenv('FERRO_LARAVEL_SQLITE_DB') ?: '';
+    if ($expectFile === '') {
+        fwrite(STDERR, "FERRO CONTACT ASSERTION FAILED: FERRO_LARAVEL_SQLITE_DB is unset\n");
+        exit(1);
+    }
+}
+
+/** One probe, used by both the Ferro column and its control. Returns the server version string. */
+$probeServer = static function (Illuminate\Database\Connection $conn) use ($family, $expectFile): string {
+    $nonce = bin2hex(random_bytes(8));
+    $vsql = $family === 'sqlite' ? 'sqlite_version()' : 'version()';
+    $probe = $conn->select("select '{$nonce}' as nonce, {$vsql} as v");
+    if (count($probe) !== 1 || $probe[0]->nonce !== $nonce) {
+        fwrite(STDERR, "CONTACT ASSERTION FAILED: the nonce did not round-trip — whatever answered did not receive it\n");
+        exit(1);
+    }
+    $v = (string) $probe[0]->v;
+
+    if ($family === 'sqlite') {
+        $rows = $conn->select('PRAGMA database_list');
+        $main = null;
+        foreach ($rows as $r) {
+            if (($r->name ?? null) === 'main') {
+                $main = (string) ($r->file ?? '');
+            }
+        }
+        if ($main === null) {
+            fwrite(STDERR, "CONTACT ASSERTION FAILED: PRAGMA database_list named no `main` database\n");
+            exit(1);
+        }
+        if ($main === '') {
+            fwrite(STDERR, "CONTACT ASSERTION FAILED: the main database is IN-MEMORY, not a file.\n"
+                . "That is the testbench SQLite-fallback trap this assertion exists for.\n");
+            exit(1);
+        }
+        // Both sides must RESOLVE. `realpath()` returns false for a missing path, and
+        // `false === false` would make this comparison pass for two files that do not exist —
+        // a check that succeeds for the wrong reason is worse than no check.
+        $got = realpath($main);
+        $want = realpath((string) $expectFile);
+        if ($got === false || $want === false || $got !== $want) {
+            fwrite(STDERR, sprintf(
+                "CONTACT ASSERTION FAILED: open on %s (resolved %s), expected %s (resolved %s)\n",
+                $main,
+                var_export($got, true),
+                (string) $expectFile,
+                var_export($want, true),
+            ));
+            exit(1);
+        }
+        return 'SQLite ' . $v;
+    }
+
+    if (! str_contains($v, 'PostgreSQL')) {
+        fwrite(STDERR, sprintf(
+            "CONTACT ASSERTION FAILED: something answered, but it was not PostgreSQL (%s).\n"
+            . "That is the SQLite-fallback trap this assertion exists for.\n",
+            $v,
+        ));
+        exit(1);
+    }
+    return $v;
+};
 
 // -------------------------------------------------------------------------------------------------
 // THE CONTROL COLUMN INVERTS THIS ASSERTION, and that inversion is the whole safety of having one.
@@ -60,34 +135,40 @@ $driver = getenv('FERRO_LARAVEL_DRIVER') ?: 'ferro-pgsql';
 // that socket so a real Ferro connection IS built is what makes the check below fire. Both refuse
 // to run; neither reports a number.
 // -------------------------------------------------------------------------------------------------
-if ($driver === 'stock-pgsql') {
+if (str_starts_with($driver, 'stock-')) {
     $conn = (new Illuminate\Database\Connectors\ConnectionFactory(new Illuminate\Container\Container()))
         ->make(Illuminate\Tests\Integration\Database\DatabaseTestCase::controlConfigForBootstrap(), 'control');
 
-    if ($conn instanceof Ferro\Laravel\FerroPostgresConnection) {
+    // Checked against the Ferro BASE, not one family's class, so adding a family cannot silently
+    // leave the inversion unenforced for it.
+    if ($conn instanceof Ferro\Laravel\FerroPostgresConnection || $conn instanceof Ferro\Laravel\FerroSQLiteConnection) {
         fwrite(STDERR, "CONTROL ASSERTION FAILED: the control column resolved a FERRO connection.\n"
             . "Refusing to run: it would report Ferro's behaviour as upstream's baseline.\n");
         exit(1);
     }
-    $nonce = bin2hex(random_bytes(8));
-    $probe = $conn->select("select '{$nonce}' as nonce, version() as v");
-    if (count($probe) !== 1 || $probe[0]->nonce !== $nonce) {
-        fwrite(STDERR, "CONTROL ASSERTION FAILED: the nonce did not round-trip\n");
-        exit(1);
-    }
-    if (! str_contains((string) $probe[0]->v, 'PostgreSQL')) {
-        fwrite(STDERR, sprintf("CONTROL ASSERTION FAILED: not PostgreSQL (%s)\n", $probe[0]->v));
-        exit(1);
-    }
+    $v = $probeServer($conn);
     fwrite(STDOUT, sprintf(
         "[ferro] connection=%s driver=%s server=%s\n",
         get_class($conn),
         $driver,
-        $probe[0]->v,
+        $v,
     ));
     return;
 }
-Ferro\Laravel\FerroConnections::register(['pgsql' => 'ferro-pgsql']);
+// Same rule as the test case: only the column that RUNS under the stock name registers the alias.
+if ($driver === $family) {
+    Ferro\Laravel\FerroConnections::register([$family => "ferro-$family"]);
+} else {
+    Ferro\Laravel\FerroConnections::register();
+}
+// Required by the FERRO columns only — the SQLite control starts no daemon, so demanding a socket
+// before the control branch above would refuse the one configuration that must not have one.
+$sock = getenv('FERRO_LARAVEL_SOCK');
+if ($sock === false || $sock === '') {
+    fwrite(STDERR, "FERRO CONTACT ASSERTION FAILED: FERRO_LARAVEL_SOCK is unset\n");
+    exit(1);
+}
+
 $resolver = Illuminate\Database\Connection::getResolver($driver);
 if ($resolver === null) {
     fwrite(STDERR, sprintf("FERRO CONTACT ASSERTION FAILED: the %s resolver is not registered\n", $driver));
@@ -100,28 +181,19 @@ $conn = $resolver(null, 'laravel_tests', '', [
     'pool' => getenv('FERRO_LARAVEL_POOL') ?: 'default',
 ]);
 
-if (! $conn instanceof Ferro\Laravel\FerroPostgresConnection) {
+$want = $family === 'sqlite'
+    ? Ferro\Laravel\FerroSQLiteConnection::class
+    : Ferro\Laravel\FerroPostgresConnection::class;
+if (! $conn instanceof $want) {
     fwrite(STDERR, sprintf(
-        "FERRO CONTACT ASSERTION FAILED: the connection is a %s, not a Ferro one.\n"
+        "FERRO CONTACT ASSERTION FAILED: the connection is a %s, not a %s.\n"
         . "Refusing to run: a green result here would mean nothing.\n",
         get_debug_type($conn),
+        $want,
     ));
     exit(1);
 }
 
-$nonce = bin2hex(random_bytes(8));
-$probe = $conn->select("select '{$nonce}' as nonce, version() as v");
-if (count($probe) !== 1 || $probe[0]->nonce !== $nonce) {
-    fwrite(STDERR, "FERRO CONTACT ASSERTION FAILED: the nonce did not round-trip — whatever answered did not receive it\n");
-    exit(1);
-}
-if (! str_contains((string) $probe[0]->v, 'PostgreSQL')) {
-    fwrite(STDERR, sprintf(
-        "FERRO CONTACT ASSERTION FAILED: something answered, but it was not PostgreSQL (%s).\n"
-        . "That is the SQLite-fallback trap this assertion exists for.\n",
-        $probe[0]->v,
-    ));
-    exit(1);
-}
+$v = $probeServer($conn);
 
-fwrite(STDOUT, sprintf("[ferro] connection=%s driver=%s server=%s\n", get_class($conn), $driver, $probe[0]->v));
+fwrite(STDOUT, sprintf("[ferro] connection=%s driver=%s server=%s\n", get_class($conn), $driver, $v));
