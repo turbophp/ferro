@@ -5,6 +5,7 @@ namespace Ferro\DBAL\Tests\Unit;
 use Doctrine\DBAL\Platforms\MariaDB110700Platform;
 use Doctrine\DBAL\Platforms\MySQL84Platform;
 use Doctrine\DBAL\Platforms\PostgreSQL120Platform;
+use Doctrine\DBAL\Platforms\SQLitePlatform;
 use Ferro\DBAL\Exception\BackendFamilyUnknown;
 use Ferro\DBAL\PlatformVersion;
 use PHPUnit\Framework\TestCase;
@@ -31,6 +32,8 @@ final class PlatformVersionTest extends TestCase
         . 'compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit';
     private const MYSQL_LIVE = '8.4.11';
     private const MARIADB_LIVE = '11.8.8-MariaDB-ubu2404';
+    /** `SELECT sqlite_version()` through a Ferro SQLite pool, measured 2026-09-15. */
+    private const SQLITE_LIVE = '3.53.2';
 
     public function testTheLivePostgresStringSelectsThePostgresPlatform(): void
     {
@@ -73,11 +76,36 @@ final class PlatformVersionTest extends TestCase
         );
     }
 
-    /** An unknown family is a LOUD failure, never a default platform (SPEC §14). */
+    /**
+     * C3-6a. SQLite has exactly one platform and the stock abstract driver IGNORES the version, so
+     * the assertion that carries weight is the second one: a version string that would throw on the
+     * PostgreSQL ladder must not throw here, which is what proves the arm delegates to
+     * `AbstractSQLiteDriver` rather than sharing either of the other two paths.
+     */
+    public function testTheLiveSqliteStringSelectsTheSqlitePlatform(): void
+    {
+        self::assertInstanceOf(
+            SQLitePlatform::class,
+            PlatformVersion::platformFor(PlatformVersion::KIND_SQLITE, self::SQLITE_LIVE),
+        );
+        self::assertInstanceOf(
+            SQLitePlatform::class,
+            PlatformVersion::platformFor(PlatformVersion::KIND_SQLITE, 'anything at all'),
+            'the SQLite platform is version-independent; a version ladder here would be invented',
+        );
+    }
+
+    /**
+     * An unknown family is a LOUD failure, never a default platform (SPEC §14).
+     *
+     * The example was `'sqlite'` until C3-6a made it a supported family — the swap was forced by
+     * this test going red, which is the evidence that it exercises the `default` arm rather than a
+     * particular string.
+     */
     public function testAnUnknownFamilyThrows(): void
     {
         $this->expectException(BackendFamilyUnknown::class);
-        PlatformVersion::platformFor('sqlite', '3.45');
+        PlatformVersion::platformFor('mssql', '16.0');
     }
 
     /**
@@ -96,6 +124,10 @@ final class PlatformVersionTest extends TestCase
         // `8.4.11` is a real MySQL answer AND a plausible PostgreSQL 8.4 answer — which is exactly
         // why it must be null rather than either family.
         self::assertNull(PlatformVersion::familyFromVersion(self::MYSQL_LIVE));
-        self::assertNull(PlatformVersion::familyFromVersion('3.45'));
+        // SQLite is the SAME case, not a new one: its banner is a bare `3.53.2`, indistinguishable
+        // in shape from MySQL's `8.4.11`. Recognising either would be a guess, so neither is
+        // recognised and the caller fails loudly — the practical rule being "do not set
+        // serverVersion on a MySQL or SQLite pool".
+        self::assertNull(PlatformVersion::familyFromVersion(self::SQLITE_LIVE));
     }
 }

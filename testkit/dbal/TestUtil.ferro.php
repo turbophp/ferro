@@ -50,6 +50,14 @@ use const JSON_THROW_ON_ERROR;
  * and into whole vendor sub-trees written against those extensions. Answering nothing means every
  * vendor-gated test takes its "other" branch, which is the honest description of what Ferro is.
  *
+ * **It answers FALSE under the CONTROL column too, and that is also deliberate.** The control's job
+ * is to isolate ONE variable — the driver — so that a non-pass can be attributed. Letting it answer
+ * `pdo_sqlite` would change the SKIP GATING as well, and the two columns would then be running
+ * different test sets; the Illuminate lane measured exactly that confound when six of upstream's
+ * tests turned out to branch on the driver NAME (SPEC §22.2 (am)). The cost is stated rather than
+ * hidden: the control is not "upstream's own numbers", it is upstream's own DRIVER on this suite's
+ * own gating, which is what makes the two columns comparable line by line.
+ *
  * The public surface below is the MEASURED one, read out of the pinned 4.4.4 clone rather than
  * guessed: `isDriverOneOf` (:237), `getPrivilegedConnection` (:232), `isPdoStringifyFetchesEnabled`
  * (:245), `generateResultSetQuery` (:257), `getConnectionParams` (:82), `getConnection` (:64) are
@@ -86,7 +94,7 @@ class TestUtil
     {
         $params = [];
 
-        foreach (['driverClass', 'host', 'port', 'user', 'password', 'dbname', 'unix_socket', 'wrapperClass'] as $key) {
+        foreach (['driver', 'driverClass', 'path', 'host', 'port', 'user', 'password', 'dbname', 'unix_socket', 'wrapperClass'] as $key) {
             if (isset($GLOBALS['db_' . $key]) && $GLOBALS['db_' . $key] !== '') {
                 $params[$key] = $GLOBALS['db_' . $key];
             }
@@ -106,10 +114,30 @@ class TestUtil
             $params['serverVersion'] = $GLOBALS['db_serverVersion'];
         }
 
-        if (! isset($params['driverClass'])) {
+        // EXACTLY ONE of the two must be set, and neither may be inferred.
+        //
+        // `driverClass` is the Ferro column. `driver` is THE CONTROL — upstream's own `pdo_sqlite`
+        // against the SAME database file, so a non-pass can be ATTRIBUTED (to Ferro, or to the
+        // suite/engine pair) instead of guessed at; it is the C2e shape, and `bootstrap.php`'s
+        // contact assertion INVERTS for it.
+        //
+        // Requiring one of them, rather than defaulting, is the whole reason this file exists:
+        // upstream falls back to in-memory SQLite when it finds neither, and the functional suite
+        // then passes genuinely, with nothing skipped, against the wrong engine. Accepting `driver`
+        // for the control does NOT reopen that hole — an unset `db_driver` is still a throw.
+        if (isset($params['driver']) && isset($params['driverClass'])) {
             throw new RuntimeException(
-                'Ferro TestUtil: db_driverClass is not set. This runner exists precisely because the '
-                . 'upstream TestUtil would silently fall back to in-memory SQLite here.',
+                'Ferro TestUtil: both db_driver and db_driverClass are set. One run is either the '
+                . 'Ferro column or the control, never both — DriverManager would silently prefer '
+                . 'driverClass and the "control" would be measuring Ferro.',
+            );
+        }
+
+        if (! isset($params['driverClass']) && ! isset($params['driver'])) {
+            throw new RuntimeException(
+                'Ferro TestUtil: neither db_driverClass nor db_driver is set. This runner exists '
+                . 'precisely because the upstream TestUtil would silently fall back to in-memory '
+                . 'SQLite here.',
             );
         }
 

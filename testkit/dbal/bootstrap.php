@@ -31,10 +31,31 @@ $loader->addPsr4('Doctrine\\DBAL\\Tests\\', $dbal . '/tests');
 // functional suite then passes — genuinely, with nothing skipped — against the wrong engine.
 // `--fail-on-skipped` cannot catch that; only asking the connection what it IS can.
 // -------------------------------------------------------------------------------------------------
+$control = getenv('FERRO_DBAL_CONTROL') === '1';
+
 $conn   = Doctrine\DBAL\Tests\TestUtil::getConnection();
 $native = $conn->getNativeConnection();
 
-if (! $native instanceof Ferro\Client\Connection) {
+if ($control) {
+    // THE CONTROL INVERTS IT. This run is SUPPOSED to reach upstream's own driver, so "is this a
+    // Ferro connection" is the failure, not the pass. Without the inversion a mis-set variable
+    // would quietly produce a second Ferro column labelled "control", and every attribution drawn
+    // from the pair would be wrong in the same direction — which is worse than having no control,
+    // because it reads as corroboration.
+    if ($native instanceof Ferro\Client\Connection) {
+        fwrite(STDERR,
+            "CONTROL CONTACT ASSERTION FAILED: the control's connection IS a Ferro one.\n"
+            . "Refusing to run: this column exists to measure the suite WITHOUT Ferro.\n");
+        exit(1);
+    }
+    if (! $native instanceof PDO) {
+        fwrite(STDERR, sprintf(
+            "CONTROL CONTACT ASSERTION FAILED: expected a PDO, got %s.\n",
+            get_debug_type($native),
+        ));
+        exit(1);
+    }
+} elseif (! $native instanceof Ferro\Client\Connection) {
     fwrite(STDERR, sprintf(
         "FERRO CONTACT ASSERTION FAILED: the suite's connection is a %s, not a Ferro one.\n"
         . "Refusing to run: a green result here would mean nothing.\n",
@@ -53,7 +74,7 @@ if ((int) $conn->fetchOne('SELECT 1') !== 1) {
 }
 
 fwrite(STDOUT, sprintf(
-    "[ferro] driver=%s platform=%s server=%s\n",
+    ($control ? "[control] " : "[ferro] ") . "driver=%s platform=%s server=%s\n",
     get_class($conn->getDriver()),
     $platform,
     $version,

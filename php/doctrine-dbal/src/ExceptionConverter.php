@@ -5,6 +5,7 @@ namespace Ferro\DBAL;
 use Doctrine\DBAL\Driver\API\ExceptionConverter as ExceptionConverterInterface;
 use Doctrine\DBAL\Driver\API\MySQL\ExceptionConverter as MySQLExceptionConverter;
 use Doctrine\DBAL\Driver\API\PostgreSQL\ExceptionConverter as PostgreSQLExceptionConverter;
+use Doctrine\DBAL\Driver\API\SQLite\ExceptionConverter as SQLiteExceptionConverter;
 use Doctrine\DBAL\Driver\Exception as DriverExceptionInterface;
 use Doctrine\DBAL\Exception\DriverException as DbalDriverException;
 use Doctrine\DBAL\Query;
@@ -27,6 +28,14 @@ use Ferro\Protocol\Generated\Constants as C;
  *     precisely so those tables are reachable. Restating them here would be a second source of
  *     truth that rots as DBAL adds codes — and charter rule 6's spirit is that the drop-in tiers
  *     reuse Doctrine's own knowledge rather than re-deriving it.
+ *
+ *     **SQLite's stock table keys on NEITHER — it keys on the MESSAGE TEXT** (`str_contains($msg,
+ *     'UNIQUE constraint failed')`, `'no such table:'`, `'database is locked'`, …), which is what
+ *     every bundled SQLite driver gives it. So the thing that makes this arm work is that the
+ *     engine's `error_map` passes SQLite's own message through to the wire unaltered; that is
+ *     asserted live rather than assumed, because a message the engine reworded would degrade every
+ *     specialised exception to a bare `DriverException` silently — no test of the CODE path would
+ *     notice.
  *  3. **A `Retryable` the stock table did not recognise is upgraded**, and only then. DBAL marks
  *     just Deadlock and LockWaitTimeout as retryable, while Ferro's Retryable branch also covers a
  *     pool checkout timeout, a connect failure and a lost read — cases where retrying is correct
@@ -54,9 +63,11 @@ final class ExceptionConverter implements ExceptionConverterInterface
             return new IndeterminateWriteException($exception, $query);
         }
 
-        $stock = $this->kind === PlatformVersion::KIND_MYSQL
-            ? new MySQLExceptionConverter()
-            : new PostgreSQLExceptionConverter();
+        $stock = match ($this->kind) {
+            PlatformVersion::KIND_MYSQL => new MySQLExceptionConverter(),
+            PlatformVersion::KIND_SQLITE => new SQLiteExceptionConverter(),
+            default => new PostgreSQLExceptionConverter(),
+        };
         $converted = $stock->convert($exception, $query);
 
         // `$converted::class === DbalDriverException::class` is deliberate and is NOT the same as an

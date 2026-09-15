@@ -216,8 +216,10 @@ five storage classes.
 - **C3-4** — the `readonly` seam through `Pool::checkout` (the autocommit half of D13).
 - **C3-5** — `query_stream` + `reclaim_stream` (until then, a clean `Unsupported`, exactly as the
   MySQL backend shipped at M1-S6).
-- **C3-6** — the acceptance columns: the DBAL suite's SQLite column (§14) and the Illuminate suite's
-  (§15), each with the C2e control column alongside it.
+- **C3-6a** — the DBAL suite's SQLite column (§14) with its control. **DONE 2026-09-15** — see §18
+  and `docs/dbal-suite/2026-09-15-c3-6a-sqlite-results.md`.
+- **C3-6b** — the Illuminate suite's SQLite column (§15) with its control. The Laravel tier
+  registers `ferro-pgsql` only, so this needs a `FerroSQLiteConnection` first.
 - **C3-7** — the online backup admin surface (§7.6's last sentence).
 
 ### Why this order changed on 2026-09-15 (C3-3 planning)
@@ -868,3 +870,79 @@ DATA, exactly one END, a clean `Ok` terminal) is a property of the SESSION layer
 a second implementation of those assertions could drift and quietly stop checking the same thing.
 Same 2-frame window as the PG gate, so backpressure is engaged rather than incidental — and unlike
 every other test in that file, it never skips, because SQLite needs no server.
+
+
+---
+
+## 18. C3-6a: the DBAL suite's SQLite column, and its control (2026-09-15) — DONE
+
+**The measurement was built first and it named the work.** The tier got only the minimum that lets a
+connection open — `PlatformVersion::KIND_SQLITE` with an `AbstractSQLiteDriver` delegate, and a
+`TemporalFormat` arm, without which `bindBackend()` refuses the handshake — and then the suite was
+pointed at it and the failures said what else was needed (the stock SQLite exception table, a third
+`lastInsertId` message). That is C1e-1's ordering, applied deliberately rather than rediscovered.
+
+### The numbers
+
+| column | result line (both runs) | executed | passed |
+|---|---|---|---|
+| SQLite 3.53.2 through Ferro | `Tests: 729, Assertions: 662, Errors: 28, Skipped: 361, Incomplete: 11` | 357 | **329** |
+| CONTROL — SQLite 3.45.1 through `pdo_sqlite` | `Tests: 729, Assertions: 742, Skipped: 361, Incomplete: 11` | 357 | **357** |
+
+The full manifest, triage and the two decisions are in
+`docs/dbal-suite/2026-09-15-c3-6a-sqlite-results.md`. What belongs here is what the slice learned
+about the SHAPE of the work.
+
+### The control is what makes the column worth recording
+
+Upstream's own `pdo_sqlite` against the **same database file**, with `bootstrap.php`'s contact
+assertion INVERTED — it refuses to run if the connection turns out to be a Ferro one. Three guards
+were mutation-proven rather than asserted:
+
+1. the control pointed at Ferro → refused;
+2. the Ferro column pointed at `pdo_sqlite` → refused;
+3. `db_driver` **and** `db_driverClass` both set → refused, because `DriverManager` silently prefers
+   `driverClass`, so a "control" configured that way would have been a second Ferro column wearing
+   a control's label — corroboration that is wrong in the same direction as the thing it corroborates.
+
+`isDriverOneOf()` answers FALSE under the control too, deliberately: letting it answer `pdo_sqlite`
+would change the SKIP gating as well, and the two columns would stop being comparable line by line.
+The cost is stated in the file — the control is not "upstream's own numbers", it is upstream's own
+DRIVER on this suite's own gating.
+
+### The runner had to grow a shape, not just a case
+
+SQLite is the first family with no container, so the reset is a file delete — and it must happen
+**before** `ferrod` opens the file, where every other family's reset happens after the daemon is up.
+That is why the reset became a `do_reset()` function with two explicit call sites rather than one
+step at a fixed point: calling it at the wrong moment would not fail loudly. The `-wal` and `-shm`
+sidecars go with the file; a stale WAL beside a deleted database is how a "reset" silently restores
+the rows it was meant to remove.
+
+### What the column measured that no unit test could
+
+- **24 of the 28 non-passes are §7.4, not SQLite.** DBAL's SQLite table-rebuild runs five statements
+  outside a transaction and expects a TEMP table to survive between them. **PostgreSQL loses one
+  identically** (measured), and both families keep it inside a transaction. SQLite is simply the
+  first family whose STOCK Doctrine schema manager depends on session state between statements.
+- **`foreign_keys` was already ON and nobody had decided it** — `rusqlite`'s bundled build compiles
+  `SQLITE_DEFAULT_FOREIGN_KEYS=1`. C3-3a's open item therefore resolves against its own premise.
+  Now declared at dial and read back. **And neither tier's own FK mechanism can work here**, for the
+  same §7.4 reason: both apply a session pragma at driver-connect.
+- **The dates-as-`TEXT` asymmetry costs the Doctrine tier nothing** — every temporal row of
+  `TypeConversionTest` passes, because DBAL's types parse the platform's format strings out of
+  strings anyway.
+
+### Carried forward to C3-6b
+
+- The Laravel tier registers `ferro-pgsql` only; a SQLite column needs a `FerroSQLiteConnection`
+  and a driver name, which is where C1b's `resolverFor()` work has to be repeated.
+- **`literals_are_standard` is nil on a SQLite pool** (measured through `poolInfo()`), and C2g's
+  `FerroPdoShim::quote()` refuses on nil by design (fail-closed). So `DB::escape()` / `toRawSql()`
+  will fail on a SQLite pool until the backend advertises it. SQLite literals are always standard,
+  so the value is not in question — only that nothing sets it. Recorded, not fixed: the Doctrine
+  tier's `quote()` branches on the family and does not read the field, so C3-6a had no consumer for
+  it.
+- The `foreign_keys` answer above is the DBAL half only. Laravel's SQLite connector sets the pragma
+  itself and its suite may depend on enforcement; the pool-level guarantee already satisfies it, but
+  that has to be measured rather than assumed.

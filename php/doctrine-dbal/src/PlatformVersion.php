@@ -4,6 +4,7 @@ namespace Ferro\DBAL;
 
 use Doctrine\DBAL\Driver\AbstractMySQLDriver;
 use Doctrine\DBAL\Driver\AbstractPostgreSQLDriver;
+use Doctrine\DBAL\Driver\AbstractSQLiteDriver;
 use Doctrine\DBAL\Driver\Connection as DriverConnection;
 use Doctrine\DBAL\Platforms\AbstractPlatform;
 use Ferro\DBAL\Exception\BackendFamilyUnknown;
@@ -30,6 +31,8 @@ use Ferro\DBAL\Exception\BackendFamilyUnknown;
  *    `stripos($version, 'mariadb') !== false`. Measured: normalising `11.8.8-MariaDB-ubu2404` down
  *    to `11.8.8` selects `MySQL84Platform` — a MariaDB server driven with MySQL's grammar, silently.
  *    So the MySQL-family string passes through BYTE-IDENTICAL.
+ *  - **SQLite** answers a bare `3.53.2` (`sqlite_version()`), and there is exactly one SQLite
+ *    platform whose selection ignores the version altogether. Nothing to transform.
  *
  * Charter rule 6 is intact: no platform is subclassed, no SQL is generated here. We select.
  */
@@ -38,6 +41,7 @@ final class PlatformVersion
     /** The `PoolInfo.kind` wire values (`PoolKind::wire_name()` in `ferrod`). Never nil. */
     public const KIND_POSTGRES = 'postgres';
     public const KIND_MYSQL = 'mysql';
+    public const KIND_SQLITE = 'sqlite';
 
     /**
      * Strip PostgreSQL's leading product name and NOTHING else; leave every other family verbatim.
@@ -62,6 +66,7 @@ final class PlatformVersion
         return match ($kind) {
             self::KIND_POSTGRES => self::postgres()->getDatabasePlatform($provider),
             self::KIND_MYSQL => self::mysql()->getDatabasePlatform($provider),
+            self::KIND_SQLITE => self::sqlite()->getDatabasePlatform($provider),
             default => throw BackendFamilyUnknown::forKind($kind),
         };
     }
@@ -71,6 +76,15 @@ final class PlatformVersion
      * platform-before-connect path (`Doctrine\DBAL\Connection::getDatabasePlatform()` builds a
      * static provider from `$params['serverVersion']` and never asks the driver connection).
      * Returns null when the string names no family; the caller must then FAIL, never guess.
+     *
+     * **Two of the three families are unidentifiable from a version string alone, and SQLite is not
+     * a new case.** MySQL answers a bare `8.4.11` and SQLite a bare `3.53.2`; neither names itself,
+     * and no pattern separates them that is not a guess (`3.53.2` and `8.4.11` have the same shape).
+     * So both take the null arm and the caller fails loudly. The practical rule is the same one that
+     * has always applied to a MySQL pool: **do not set `serverVersion` in the connection params** —
+     * it short-circuits the handshake that is the only authoritative source of the family
+     * (`PoolInfo.kind`). Only PostgreSQL, whose banner names the product, survives that
+     * short-circuit.
      */
     public static function familyFromVersion(string $version): ?string
     {
@@ -86,6 +100,24 @@ final class PlatformVersion
     private static function postgres(): AbstractPostgreSQLDriver
     {
         return new class extends AbstractPostgreSQLDriver {
+            /** @param array<string,mixed> $params */
+            public function connect(#[\SensitiveParameter] array $params): DriverConnection
+            {
+                throw new \LogicException('platform-only delegate: this driver never connects');
+            }
+        };
+    }
+
+    /**
+     * SQLite has exactly one platform and `AbstractSQLiteDriver::getDatabasePlatform()` IGNORES the
+     * version provider entirely (measured on 4.4.4: the body is `return new SQLitePlatform();`).
+     * The delegate is kept anyway rather than constructing `SQLitePlatform` here, for the same
+     * reason as the other two: if a future DBAL grows a version ladder for SQLite, this inherits it
+     * instead of silently continuing to return the base platform.
+     */
+    private static function sqlite(): AbstractSQLiteDriver
+    {
+        return new class extends AbstractSQLiteDriver {
             /** @param array<string,mixed> $params */
             public function connect(#[\SensitiveParameter] array $params): DriverConnection
             {

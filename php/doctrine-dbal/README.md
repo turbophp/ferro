@@ -4,12 +4,13 @@ A **Doctrine DBAL 4** driver whose execution layer talks to `ferrod` — the Fer
 `ferro/client`. An existing Doctrine or Symfony application switches by **configuration only**:
 Grammar/Processor, the DBAL platform classes and the stock schema managers stay untouched.
 
-Requires PHP ≥ 8.2 and `doctrine/dbal ^4.0`. Backends: **PostgreSQL** and **MySQL/MariaDB**.
-There is no SQLite backend.
+Requires PHP ≥ 8.2 and `doctrine/dbal ^4.0`. Backends: **PostgreSQL**, **MySQL/MariaDB** and
+**SQLite**.
 
 > Read [`docs/known-incompatibilities.md`](../../docs/known-incompatibilities.md) before you adopt
 > this. It is short, every entry is measured, and two of them (a cancelled `SELECT` reported as an
-> indeterminate write; the PostgreSQL schema manager) will change how you plan the migration.
+> indeterminate write; a non-simple `ALTER TABLE` on SQLite needing a transaction around it) will
+> change how you plan the migration.
 
 ## Install
 

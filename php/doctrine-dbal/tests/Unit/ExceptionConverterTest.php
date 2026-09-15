@@ -133,6 +133,50 @@ final class ExceptionConverterTest extends TestCase
         );
     }
 
+    /**
+     * **SQLite keys on NEITHER code — it keys on the MESSAGE TEXT**, which is how every bundled
+     * SQLite driver feeds it (`str_contains($msg, 'UNIQUE constraint failed')`, `'no such table:'`,
+     * …). So the thing this arm depends on is that the engine's `error_map` passes SQLite's own
+     * message through unaltered, and the payloads below are the real strings a Ferro SQLite pool
+     * produced, not invented ones.
+     *
+     * The second half is the load-bearing direction: the SAME payload under the PostgreSQL table
+     * comes out a bare `DriverException`, because it carries no SQLSTATE at all. A converter
+     * hard-wired to PG would therefore pass the Indeterminate tests above and still degrade every
+     * SQLite exception to the generic class — silently, since a generic `DriverException` is still
+     * catchable and still an error.
+     */
+    public function testSqliteDelegatesToTheStockMessageTable(): void
+    {
+        $sqlite = new ExceptionConverter(PlatformVersion::KIND_SQLITE);
+        self::assertInstanceOf(
+            UniqueConstraintViolationException::class,
+            $sqlite->convert($this->ferroSaying('UNIQUE constraint failed: t.id', 2067), null),
+        );
+        $notFound = $this->ferroSaying('no such table: __temp__orders', 1);
+        self::assertInstanceOf(TableNotFoundException::class, $sqlite->convert($notFound, null));
+
+        $pg = new ExceptionConverter(PlatformVersion::KIND_POSTGRES);
+        $viaPg = $pg->convert($notFound, null);
+        self::assertSame(
+            DbalDriverException::class,
+            $viaPg::class,
+            'the same payload under the PG table is generic — which is what makes the family choice '
+            . 'load-bearing for SQLite rather than decorative',
+        );
+    }
+
+    /**
+     * A SQLite failure with no SQLSTATE and an errno, carrying a real message. SQLite is the mirror
+     * image of PostgreSQL on error identity (§22.2 (bg)): an errno and no SQLSTATE, where PG has a
+     * SQLSTATE and no errno.
+     */
+    private function ferroSaying(string $message, int $errno): FerroDriverException
+    {
+        $payload = new ErrorPayload(1, C::BRANCH_NON_RETRYABLE, null, $errno, $message, null, null);
+        return FerroDriverException::fromFerro(new NonRetryableException($payload));
+    }
+
     /** MySQL keys on the vendor errno in `getCode()` — the S8a errno-on-wire carry, consumed. */
     public function testMysqlDelegatesToTheStockErrnoTable(): void
     {

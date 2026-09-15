@@ -306,6 +306,12 @@ final class Connection implements DriverConnection
      * therefore no server version — which matters, because `quote()` must keep working on a pool
      * whose version is unknown. `DriverQuoteTest` locks both branches against the stock platform
      * accessors, so a DBAL change to either goes red here.
+     *
+     * **SQLite takes the non-MySQL branch, and that is a decision rather than a fallthrough.**
+     * `SQLitePlatform` does not override `quoteStringLiteral()`, so doubling the single quote is
+     * exactly what the stock platform does; SQLite has no backslash-escape mode to detect (unlike
+     * MySQL's `NO_BACKSLASH_ESCAPES`, which is why `literals_are_standard` exists on the wire at
+     * all — C2g, §22.2 (at)). The same `DriverQuoteTest` lock covers this branch.
      */
     public function quote(string $value): string
     {
@@ -346,15 +352,30 @@ final class Connection implements DriverConnection
     {
         $id = $this->ferro->lastInsertId();
         if ($id === null) {
-            throw new NoIdentityValue($this->poolKind === PlatformVersion::KIND_POSTGRES
-                ? 'Ferro: PostgreSQL reports no generated key on the wire, and Ferro will not '
+            throw new NoIdentityValue(match ($this->poolKind) {
+                PlatformVersion::KIND_POSTGRES =>
+                    'Ferro: PostgreSQL reports no generated key on the wire, and Ferro will not '
                     . 'emulate lastInsertId() with a follow-up query — on a transaction-mode pool '
                     . 'that runs on a different connection and returns a wrong key. Use '
                     . '`INSERT … RETURNING id`, or configure Doctrine ORM to use the SEQUENCE '
-                    . 'identity strategy on PostgreSQL.'
-                : 'Ferro: the last statement reported no generated key. lastInsertId() reflects the '
+                    . 'identity strategy on PostgreSQL.',
+                // SQLite DOES report a key (`last_insert_rowid()`), so this arm is the genuine
+                // "nothing was generated" case rather than PostgreSQL's structural absence — but
+                // the counter is STICKY, so the engine reports it only when the statement actually
+                // MOVED it (SPEC §22.2 (bf)). A rowid an earlier INSERT set would be a silently
+                // wrong key, which §22.2 (m) already records as strictly worse than none.
+                PlatformVersion::KIND_SQLITE =>
+                    'Ferro: the last statement generated no rowid. SQLite\'s last_insert_rowid() is '
+                    . 'sticky — it still holds the PREVIOUS insert\'s value after any other '
+                    . 'statement — so Ferro reports it only when the statement moved it, and never '
+                    . 'carries a stale one over. Read it immediately after a successful INSERT, and '
+                    . 'note that an INSERT which explicitly reuses the current rowid reports '
+                    . 'nothing.',
+                default =>
+                    'Ferro: the last statement reported no generated key. lastInsertId() reflects the '
                     . 'MOST RECENT statement and is cleared by a statement that fails, so read it '
-                    . 'immediately after a successful INSERT into an AUTO_INCREMENT column.');
+                    . 'immediately after a successful INSERT into an AUTO_INCREMENT column.',
+            });
         }
         return $id;
     }

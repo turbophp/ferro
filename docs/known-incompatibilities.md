@@ -167,6 +167,17 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   it just turns Ferro's central win off.
 - **Savepoints work normally.** DBAL nests transactions client-side and emits ordinary savepoint SQL;
   those statements ride the same pinned `tx_id` as the transaction that opened them.
+- **A `PRAGMA`, `SET` or any other session setting applied at connect-time does not stick.** It lands
+  on whichever pooled connection served that one call. Doctrine's opt-in
+  `AbstractSQLiteDriver\Middleware\EnableForeignKeys` is the clearest case: it runs
+  `PRAGMA foreign_keys=ON` when the driver connects, and through Ferro that is a no-op. **Foreign
+  keys are enforced anyway** — the engine sets and verifies the pragma on every SQLite connection it
+  dials, so the guarantee comes from the pool rather than from your middleware. Settings the engine
+  does not apply at dial cannot be made to stick from PHP; ask for them on the pool.
+- **Several statements in one `executeStatement()` are refused, on every backend.** Ferro prepares
+  every statement, so `"CREATE TABLE a (…); CREATE TABLE b (…)"` in a single call fails —
+  PostgreSQL with `42601` *"cannot insert multiple commands into a prepared statement"*, SQLite with
+  *"Multiple statements provided"*. Send them one at a time.
 
 ---
 
@@ -208,23 +219,38 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
 
 ## Schema, migrations and introspection
 
-- **The stock PostgreSQL schema manager does not work yet.** DBAL's
-  `PostgreSQLSchemaManager::selectIndexColumns()` selects `pg_index.indkey`, an `int2vector`, and the
-  engine's PG read path has no mapping for that type — so `introspectTable()`, `listTableIndexes()`,
-  schema diffing and `doctrine/migrations` all fail on PostgreSQL with a loud
-  *"unsupported type for column \"indkey\""*. It is a single missing catalog type amplified across
-  every introspection path (50 of the 78 non-passing PostgreSQL tests at the acceptance gate).
-  The MySQL family is unaffected. Tracked in
-  `docs/followups/2026-08-11-pg-int2vector-blocks-the-schema-manager.md`.
-- **Two stock-Doctrine bind shapes are refused on PostgreSQL** and work on MySQL:
-  a bound interval in the platform's date-arithmetic SQL (`? || ' SECOND'` makes PostgreSQL infer
-  `text` for an `INTEGER` bind), and a boolean written through `Connection::insert()` **without** a
-  `$types` entry (Doctrine's `BooleanType` hands the driver `int(1)`, and PostgreSQL's `bool` slot
-  refuses an integer). The workaround for the second is to declare the type:
-  `$conn->insert('t', ['flag' => true], ['flag' => Types::BOOLEAN])`. Tracked in
-  `docs/followups/2026-08-11-pg-bind-matrix-narrower-than-libpq.md`.
+- **FIXED at M1-S9 — the stock PostgreSQL schema manager works.** This page used to say it did not:
+  DBAL's `PostgreSQLSchemaManager::selectIndexColumns()` selects `pg_index.indkey`, an `int2vector`,
+  which the PG read path had no mapping for, and it took `introspectTable()`, `listTableIndexes()`,
+  schema diffing and `doctrine/migrations` down with it (50 of the 78 non-passing PostgreSQL tests
+  at the S8b gate). `int2vector`/`oidvector` are admitted as TEXT as of M1-S9 (SPEC §22.2 (ae)) and
+  the re-measurement recovered exactly those 50
+  ([`docs/dbal-suite/2026-09-09-a5-results.md`](dbal-suite/2026-09-09-a5-results.md)). Kept here
+  rather than deleted because the entry was public long enough to be believed.
+- **FIXED at M1-S9 — the two stock-Doctrine bind shapes that were refused on PostgreSQL.** A bound
+  interval in the platform's date-arithmetic SQL (`? || ' SECOND'`, where PostgreSQL infers `text`
+  for an `INTEGER` bind) and a boolean written through `Connection::insert()` without a `$types`
+  entry (Doctrine's `BooleanType` hands the driver `int(1)`) both work now: the PG bind widened
+  `I64` into `text` and into `bool`, the latter value-gated to 0/1 (SPEC §22.2 (af)). The
+  16 tests this blocked came back in the same re-measurement.
 - **The application user has no `CREATE DATABASE` privilege** in the testkit, deliberately. Anything
   that provisions databases needs its own credentials.
+- **On SQLite, a non-simple `ALTER TABLE` must run inside a transaction.** `SQLitePlatform` rebuilds
+  a table through `CREATE TEMPORARY TABLE __temp__x AS SELECT …` plus four more statements, and
+  `AbstractSchemaManager::alterTable()` runs those as SEPARATE calls with no transaction around
+  them. A TEMP table is session state, and on a transaction-mode pool it does not survive to the
+  next request — so statement 2 fails with `no such table: __temp__x`. Wrap it:
+
+  ```php
+  $conn->transactional(static fn ($c) => $c->createSchemaManager()->alterTable($diff));
+  ```
+
+  and it works, because a transaction pins the connection. SQLite has transactional DDL, so the
+  wrap costs nothing. This is not a SQLite quirk — **PostgreSQL loses an autocommit TEMP table
+  exactly the same way** (`42P01` on the next request); SQLite is simply the first family whose
+  stock Doctrine schema manager depends on it. 24 of the 28 non-passing SQLite tests at the C3-6a
+  gate are this one cause
+  ([`docs/dbal-suite/2026-09-15-c3-6a-sqlite-results.md`](dbal-suite/2026-09-15-c3-6a-sqlite-results.md)).
 
 ---
 
@@ -272,7 +298,14 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
 
 ## Not supported, and where it went
 
-- **SQLite:** there is no SQLite backend. `AnyPool` is `{ Pg | Mysql }`.
+- **SQLite: supported since M2/C3.** A pool is spelled `sqlite:///path/to/file.db` on `ferrod` —
+  a bare filesystem path is deliberately NOT inferred as SQLite, and an in-memory database is
+  refused outright (two `:memory:` connections are two different databases, so a pool would hand
+  different tenants different data). Every connection runs in WAL mode with foreign keys enforced,
+  both verified at dial rather than requested. Two things to know before adopting it: the
+  `ALTER TABLE` entry under *Schema, migrations and introspection*, and that **an ISO date in a
+  SQLite column reads back as a string**, not a `Ferro\Date` — SQLite has no date-time storage
+  class, and `pdo_sqlite` behaves the same way, so Doctrine's own types handle it unchanged.
 - **Named parameters at the driver:** positional `?` only. DBAL expands named parameters above the
   driver for `executeQuery()`/`executeStatement()`, so this is only visible if you call
   `prepare()->bindValue(':name', …)` yourself — exactly as capable as the stock mysqli driver.

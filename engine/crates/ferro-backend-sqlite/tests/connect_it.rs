@@ -200,3 +200,59 @@ async fn the_connection_survives_repeated_blocking_calls() {
         "and it comes back autocommit-clean, as the spike's p2 proved"
     );
 }
+
+/// **C3-6a: foreign-key enforcement is DECLARED, and this test says where it used to come from.**
+///
+/// The behavioural half is what matters to a user: every connection this pool dials refuses an
+/// orphan row. The second half is the part worth writing down — it asserts what the BUILD would do
+/// on its own, so that a future `cargo update` that flips libsqlite3-sys's
+/// `SQLITE_DEFAULT_FOREIGN_KEYS` shows up here as a failing measurement rather than as advisory
+/// foreign keys in production.
+///
+/// STATED PLAINLY: with today's `rusqlite = { features = ["bundled"] }` the raw default is already
+/// ON, so deleting the pragma from `open_configured` leaves the first assertion GREEN. That is the
+/// same shape as C3-3a's removed `lose_handle()` — a green test is not evidence the line beneath it
+/// does anything — and it is exactly why the pragma is there: the guarantee must not rest on a
+/// dependency's compile flag. The raw-default assertion below is the tripwire that makes the
+/// pragma's value visible if that flag ever moves; today it records the redundancy honestly.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_enforces_foreign_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = backend_on(&dir, "fk.db");
+    let conn = backend.connect().await.expect("connect");
+    let driver = conn.driver().expect("live handle");
+
+    let fk: i64 = driver
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .expect("read foreign_keys");
+    assert_eq!(
+        fk, 1,
+        "the pool's own connections must enforce foreign keys"
+    );
+
+    driver
+        .execute_batch(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER REFERENCES parent(id));",
+        )
+        .expect("fixture");
+    let orphan = driver.execute("INSERT INTO child (id, p) VALUES (1, 999)", []);
+    let err = orphan.expect_err("an orphan row must be refused, not stored");
+    assert!(
+        format!("{err}").contains("FOREIGN KEY constraint failed"),
+        "expected a foreign-key violation, got {err}"
+    );
+
+    // The tripwire. `rusqlite`'s bundled build currently compiles SQLITE_DEFAULT_FOREIGN_KEYS=1,
+    // which is why the pragma changes nothing today — and why it has to be written down.
+    let raw = rusqlite::Connection::open(dir.path().join("raw.db")).expect("raw open");
+    let raw_default: i64 = raw
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .expect("read raw default");
+    assert_eq!(
+        raw_default, 1,
+        "the bundled SQLite build's own default for foreign_keys has CHANGED (it was 1). The \
+         pragma in open_configured is now load-bearing rather than declarative — keep it, and \
+         update this measurement."
+    );
+}

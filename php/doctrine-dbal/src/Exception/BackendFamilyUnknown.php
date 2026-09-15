@@ -15,9 +15,9 @@ final class BackendFamilyUnknown extends AbstractException
     {
         return new self(sprintf(
             'Ferro: the pool advertises backend family "%s", for which this driver has no Doctrine '
-            . 'platform. M1 supports "postgres" and "mysql" (MariaDB reports "mysql" and is '
-            . 'distinguished by its version string). No default platform is guessed, because a '
-            . 'wrong platform means a wrong SQL dialect for every statement.',
+            . 'platform. Supported families are "postgres", "mysql" (MariaDB reports "mysql" and is '
+            . 'distinguished by its version string) and "sqlite". No default platform is guessed, '
+            . 'because a wrong platform means a wrong SQL dialect for every statement.',
             $kind,
         ));
     }
@@ -29,8 +29,10 @@ final class BackendFamilyUnknown extends AbstractException
             . 'configured serverVersion "%s" does not name a backend family. Either remove the '
             . '`serverVersion` connection parameter so the driver learns the family from the engine '
             . 'handshake, or write a family-bearing version string (e.g. "PostgreSQL 17.10" or '
-            . '"11.8.8-MariaDB"). No family is guessed: PostgreSQL and MySQL are different SQL '
-            . 'dialects.',
+            . '"11.8.8-MariaDB"). Note that a bare MySQL version ("8.4.11") and a bare SQLite one '
+            . '("3.53.2") are indistinguishable, so neither can be recognised here — on those two '
+            . 'families the handshake is the only authority. No family is guessed: the three are '
+            . 'different SQL dialects.',
             $version,
         ));
     }
