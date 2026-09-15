@@ -320,6 +320,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferro-backend-sqlite"
+version = "0.0.0"
+dependencies = [
+ "ferro-pool",
+ "rusqlite",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ferro-bench"
 version = "0.0.0"
 dependencies = [
