@@ -206,6 +206,7 @@ five storage classes.
   `checkout_timeout`, `query_only` arm/disarm, plus `connect`/`ping`/`is_closed`/`dialect`.
   **DONE 2026-09-15** — see §11.
 - **C3-3b** — `tx_status` (via `is_autocommit`), `reset`/`clean_reset_profile`, `simple_query`.
+  **DONE 2026-09-15** — see §12.
 - **C3-3c** — `query` + the row/value mapping (SQLite's five storage classes → the §9 tags).
 - **C3-3d** — `cancel_handle` off `InterruptHandle`, and the `error_map` fate table.
 - **C3-3e** — the third `AnyPool` arm: the backend becomes reachable at runtime here, and ONLY
@@ -436,3 +437,72 @@ are worth recording because the second is the same failure C3-1 had.
 behaviour decision with an acceptance-suite consequence, not a connection-setup detail, so it is
 left to C3-6 rather than slipped in silently. Whichever way it goes, it should be recorded with the
 suite evidence behind it.
+
+---
+
+## 12. C3-3b: pin authority, hygiene reset, affected count (2026-09-15) — DONE
+
+**`tx_status` is a live read**, and `p6`'s hazard is now proven through the real backend with its
+control: an `ON CONFLICT ROLLBACK` violation ends the transaction underneath the engine and the
+signal reports `Idle`, while the identical duplicate against a plain unique constraint fails only
+the statement and leaves it `InTx`. Mutation-proven — a `tx_status` reporting what the engine's own
+`BEGIN` implied fails the first assertion.
+
+`Failed` is returned in exactly one case: a connection with no live handle. That is the ABSENCE of a
+signal, not a SQLite signal, and §7.1 was amended to say so precisely rather than left to imply
+otherwise.
+
+### The affected count: both of SQLite's counters are wrong, in opposite directions
+
+Measured, not reasoned about:
+
+| | `changes()` | `total_changes()` delta |
+| --- | --- | --- |
+| 3 rows inserted, then `BEGIN` | **3 — STALE** | 0 ✓ |
+| INSERT 1 row, `AFTER INSERT` trigger writes 1 | 1 ✓ | **2 — INFLATED** |
+| DELETE 1 parent, 2 `ON DELETE CASCADE` children | 1 ✓ | **3 — INFLATED** |
+| batch `INSERT 1; INSERT 2` | 2 (last stmt) | 3 (sum) |
+
+The staleness is not a corner case: `simple_query` is exactly the path the pin hook runs
+`BEGIN`/`COMMIT`/`ROLLBACK` through, so a naive `changes()` would report the previous statement's
+row count on every transaction boundary.
+
+**So the `total_changes()` delta decides WHETHER anything changed and `changes()` reports HOW MANY.**
+That keeps `BEGIN` at 0 and a triggered INSERT at the statement's own 1 — the value PostgreSQL and
+MySQL both report for those shapes. Both failure modes are mutation-proven.
+
+**Trade-off stated:** a multi-statement batch reports its LAST statement's count rather than the
+sum. PG and MySQL do the same for a simple-query batch, so this is family behaviour.
+
+### `reset`: an explicit list, because there is no `DISCARD ALL` to port
+
+Four things a pooled SQLite connection can carry into the next tenant, and what undoes each:
+
+1. **An open transaction** → `ROLLBACK`, gated on the live signal (it errors when none is open).
+2. **`PRAGMA query_only`** armed by a declared-`readonly` checkout → disarmed.
+3. **ATTACHed databases** → `DETACH`. §7.1's assist lexer already names `ATTACH` pin-worthy, which
+   is the admission that it leaves connection state behind.
+4. **Temp objects** → dropped. `CREATE TEMP TABLE` lives in the per-connection `temp` schema and
+   survives until the CONNECTION closes, so it outlives the checkout that made it.
+
+**Both profiles do the same thing, and that is stated rather than hidden.** PostgreSQL uses
+`Targeted` to avoid `DISCARD ALL` destroying its prepared statements; SQLite's reset is in-process,
+issues no round trip, and destroys no prepared statements, so a `Targeted` differing from `Full`
+would be a distinction with no behaviour behind it. `clean_reset_profile` is `Some(Full)`. `None`
+(skip hygiene) is NOT taken even though SQLite has no stored procedures and therefore none of the
+§7.4 function-body blind spot — that is the same optimization still deferred for MySQL (R2).
+
+### `impl PoolBackend` — still absent, but the line is now drawn
+
+Nine of twelve methods are real. `cancel_handle`, `query`, `query_stream` and `reclaim_stream` are
+not, and two associated types have no implementation. **The trait lands at C3-3d**, when only the
+STREAMING pair would be `Unsupported` — which is exactly the shape the MySQL backend shipped at
+M1-S6, so it is a precedent rather than an excuse.
+
+### Process note
+
+A test here was written as "a lost handle reports `Failed`" and asserted `Idle`, because a failing
+statement does not lose the handle — only a panicking blocking task does. It was renamed to what it
+actually verifies, and the real contract moved to a unit test where the private blocking bridge is
+reachable. A test whose name and body disagree is worse than no test: the name is what a later
+reader greps for.

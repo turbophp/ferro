@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ferro_pool::backend::Dialect;
+use ferro_pool::backend::{Dialect, ResetProfile, TxStatus};
 use ferro_pool::error::PoolError;
 use rusqlite::Connection;
 
@@ -213,6 +213,184 @@ impl SqliteBackend {
         Dialect::Sqlite
     }
 
+    /// The pin AUTHORITY (SPEC §7.1). A LIVE read of `sqlite3_get_autocommit()` — never a cached
+    /// flag the pool maintains.
+    ///
+    /// The spike's `p6` is why: SQLite ends transactions BY ITSELF. A constraint declared
+    /// `ON CONFLICT ROLLBACK` rolls the whole transaction back when violated, with nothing in the
+    /// statement text saying so, so an engine tracking its own `BEGIN`/`COMMIT` would hold a pin
+    /// for a transaction that no longer exists and eventually hand the next tenant a connection it
+    /// believes is mid-transaction.
+    ///
+    /// **`Failed` here is the ABSENCE of a signal, not a signal.** SQLite has no
+    /// aborted-open-transaction state in which later statements are refused, so no SQLite
+    /// transaction-state signal ever means `Failed` (§7.1). The one case that returns it is a
+    /// connection with no live handle — lost to a panicking blocking task — where there is nothing
+    /// to read. `Failed` is the safest answer the enum offers (it has no "unknown"), and it matches
+    /// `MysqlConn`'s contract for its own handle-less window. In practice the pool reaches
+    /// `is_closed` first, which already reports such a connection closed; this is defence in depth,
+    /// and it can never fire for a merely PARKED connection, because a caller holds `&mut` across
+    /// every blocking window and so no `&` borrow can exist to call this.
+    pub fn tx_status(&self, conn: &SqliteConn) -> TxStatus {
+        match conn.driver() {
+            Some(c) => {
+                if c.is_autocommit() {
+                    TxStatus::Idle
+                } else {
+                    TxStatus::InTx
+                }
+            }
+            None => TxStatus::Failed,
+        }
+    }
+
+    /// What a recycled NON-tainted connection gets.
+    ///
+    /// `Some(Full)` — and unlike PostgreSQL that costs nothing. PG uses `Targeted` to avoid
+    /// `DISCARD ALL`'s `DEALLOCATE ALL`, which would destroy its prepared statements; SQLite's
+    /// reset is in-process against a local file, issues no round trip, and destroys no prepared
+    /// statements, so there is no cheaper profile to choose and nothing is bought by choosing one.
+    ///
+    /// `None` (skip hygiene entirely) is deliberately NOT taken even though SQLite has no stored
+    /// procedures and therefore none of the §7.4 function-body blind spot that motivated PG's
+    /// backstop. That is an optimization, it is the same one still deferred for MySQL (R2), and
+    /// nothing here is expensive enough to justify the risk.
+    pub fn clean_reset_profile(&self) -> Option<ResetProfile> {
+        Some(ResetProfile::Full)
+    }
+
+    /// Hygiene reset. **Both profiles do the same thing, stated rather than hidden:** see
+    /// [`SqliteBackend::clean_reset_profile`] — there is no cheaper-but-weaker reset for SQLite to
+    /// offer, so a `Targeted` that differed from `Full` would be a distinction with no behaviour
+    /// behind it.
+    ///
+    /// SQLite has **no `DISCARD ALL` analogue**, so this is an explicit list rather than a ported
+    /// one. What a pooled SQLite connection can carry into the next tenant:
+    ///
+    /// 1. **An open transaction** — the floor. Gated on the live signal, because `ROLLBACK` errors
+    ///    with "cannot rollback - no transaction is active" when none is open.
+    /// 2. **`PRAGMA query_only`**, if a declared-`readonly` checkout armed it (C3-3a).
+    /// 3. **ATTACHed databases** — §7.1's assist lexer already names `ATTACH` pin-worthy, which is
+    ///    exactly the admission that it leaves connection state behind.
+    /// 4. **Temp objects** — `CREATE TEMP TABLE` lives in the per-connection `temp` schema and
+    ///    survives until the connection closes, so it outlives the checkout that made it.
+    pub async fn reset(
+        &self,
+        conn: &mut SqliteConn,
+        _profile: ResetProfile,
+    ) -> Result<(), PoolError> {
+        Self::with_conn(conn, |c| {
+            // 1. Any open transaction, including one the caller never closed.
+            if !c.is_autocommit() {
+                c.execute_batch("ROLLBACK").map_err(|e| {
+                    tracing::warn!(error = %e, "ferro-backend-sqlite: reset rollback failed");
+                    PoolError::Backend(format!("reset rollback failed: {e}"))
+                })?;
+            }
+
+            // 2. Read-only arming from a declared-readonly checkout.
+            c.execute_batch("PRAGMA query_only=OFF")
+                .map_err(|e| PoolError::Backend(format!("reset query_only=OFF failed: {e}")))?;
+
+            // 3. Attached databases. `main` and `temp` are built in and cannot be detached.
+            let attached: Vec<String> = {
+                let mut stmt = c
+                    .prepare(
+                        "SELECT name FROM pragma_database_list WHERE name NOT IN ('main','temp')",
+                    )
+                    .map_err(|e| PoolError::Backend(format!("reset database_list failed: {e}")))?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map_err(|e| PoolError::Backend(format!("reset database_list failed: {e}")))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| PoolError::Backend(format!("reset database_list failed: {e}")))?
+            };
+            for name in attached {
+                // The name comes from SQLite's own catalogue, not from user text, but it is still
+                // quoted rather than interpolated bare: a database attached under a name containing
+                // a quote would otherwise compose broken SQL.
+                let quoted = name.replace('"', "\"\"");
+                c.execute_batch(&format!("DETACH DATABASE \"{quoted}\""))
+                    .map_err(|e| PoolError::Backend(format!("reset detach failed: {e}")))?;
+            }
+
+            // 4. Temp objects. Views and triggers go before tables, since dropping a table a view
+            //    depends on is fine but the reverse leaves a dangling object.
+            let temp_objects: Vec<(String, String)> = {
+                let mut stmt = c
+                    .prepare(
+                        "SELECT type, name FROM temp.sqlite_master \
+                         WHERE type IN ('view','trigger','index','table') \
+                         ORDER BY CASE type WHEN 'trigger' THEN 0 WHEN 'view' THEN 1 \
+                                            WHEN 'index' THEN 2 ELSE 3 END",
+                    )
+                    .map_err(|e| PoolError::Backend(format!("reset temp scan failed: {e}")))?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .map_err(|e| PoolError::Backend(format!("reset temp scan failed: {e}")))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| PoolError::Backend(format!("reset temp scan failed: {e}")))?
+            };
+            for (kind, name) in temp_objects {
+                // SQLite creates internal indexes (autoindex) that cannot be dropped directly;
+                // they disappear with their table, so a failure to drop one is not a reset failure.
+                let quoted = name.replace('"', "\"\"");
+                let sql = format!("DROP {kind} IF EXISTS temp.\"{quoted}\"");
+                if let Err(e) = c.execute_batch(&sql) {
+                    if name.starts_with("sqlite_") {
+                        continue;
+                    }
+                    return Err(PoolError::Backend(format!(
+                        "reset drop temp {kind} failed: {e}"
+                    )));
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        conn.query_only = false;
+        Ok(())
+    }
+
+    /// Raw simple query — UNGUARDED, as the trait documents (the pin hook and internal reset).
+    ///
+    /// # Why the affected count is not simply `changes()`
+    ///
+    /// Both of SQLite's counters are wrong on their own, in opposite directions, and both were
+    /// MEASURED rather than reasoned about:
+    ///
+    /// * **`changes()` goes STALE.** It reports the last data-modifying statement's count, so after
+    ///   a `BEGIN`, a `SELECT` or a `COMMIT` it still returns whatever the previous INSERT changed.
+    ///   Measured: 3 rows inserted, then `BEGIN` → still 3. Since this method is exactly what the
+    ///   pin hook runs `BEGIN`/`COMMIT`/`ROLLBACK` through, that is the common case, not a corner.
+    /// * **`total_changes()` OVER-reports.** It is cumulative and includes rows written by triggers
+    ///   and by foreign-key cascades. Measured: inserting 1 row into a table with an `AFTER INSERT`
+    ///   trigger moves it by 2; deleting 1 parent with 2 `ON DELETE CASCADE` children moves it by 3.
+    ///
+    /// So the delta of `total_changes()` decides WHETHER the statement changed anything, and
+    /// `changes()` reports HOW MANY. That keeps `BEGIN` at 0 and keeps a triggered INSERT at the
+    /// statement's own 1 — which is what PostgreSQL and MySQL report for the same shapes.
+    ///
+    /// **The trade-off, stated:** a multi-statement batch reports its LAST statement's count rather
+    /// than the sum. That is also what PG and MySQL do for a simple-query batch (the command tag of
+    /// the final statement), so it is family behaviour rather than a SQLite quirk.
+    pub async fn simple_query(&self, conn: &mut SqliteConn, sql: &str) -> Result<u64, PoolError> {
+        let sql = sql.to_string();
+        Self::with_conn(conn, move |c| {
+            let before = c.total_changes();
+            c.execute_batch(&sql).map_err(|e| {
+                tracing::debug!(error = %e, "ferro-backend-sqlite: simple_query failed");
+                PoolError::Backend(format!("{e}"))
+            })?;
+            Ok(if c.total_changes() == before {
+                0
+            } else {
+                c.changes()
+            })
+        })
+        .await
+    }
+
     /// Arm or disarm `PRAGMA query_only` for a declared-`readonly` checkout (D13; proven by the
     /// spike's `p5`).
     ///
@@ -322,6 +500,28 @@ mod tests {
             backend.is_closed(&conn),
             "THE CONTRACT: the wrapper must read closed so the pool discards it rather than \
              handing on a husk"
+        );
+    }
+
+    /// `tx_status` on a connection whose handle was LOST reports `Failed` — the one place it can,
+    /// and reachable only from inside the crate because losing the handle needs the private
+    /// blocking bridge. `Failed` here is the absence of a signal, not a SQLite signal: SQLite has
+    /// no aborted-open-transaction state (§7.1), and the enum offers no "unknown".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tx_status_on_a_lost_handle_is_failed() {
+        let (_dir, backend) = temp_backend();
+        let mut conn = backend.connect().await.expect("connect");
+        assert_eq!(backend.tx_status(&conn), TxStatus::Idle, "healthy before");
+
+        let _ = SqliteBackend::with_conn(&mut conn, |_c| -> Result<(), PoolError> {
+            panic!("lose the handle")
+        })
+        .await;
+
+        assert_eq!(
+            backend.tx_status(&conn),
+            TxStatus::Failed,
+            "with no handle there is nothing to read, so the safest answer the enum offers"
         );
     }
 
