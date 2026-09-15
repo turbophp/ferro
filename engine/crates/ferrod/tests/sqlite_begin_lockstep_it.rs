@@ -183,24 +183,38 @@ async fn engines_declared_readonly_begin_leaves_the_writer_lock_free() {
 /// the pooled connection parked for five seconds and fails the upper bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_pools_checkout_timeout_becomes_the_connections_busy_timeout() {
+    /// The busy timeout under test. Short, so that "waited it out" and "used the 5 s standalone
+    /// default" are twenty times apart.
     const CONFIGURED: Duration = Duration::from_millis(250);
+    /// **Deliberately NOT `CONFIGURED`, and that is a fix rather than a shortcut.** The registry
+    /// passes `checkout_timeout` straight through as the busy timeout, so the natural thing is to
+    /// set one value and use it for both — which is what this test did, and it went RED on CI:
+    /// `Pool::checkout` also bounds the DIAL by `checkout_timeout` (B5), so a 250 ms checkout
+    /// timeout gives the connect 250 ms too, and a loaded runner opening a file and switching it to
+    /// WAL does not always make that. The failure was `warm the pool into WAL: Timeout` — the pool
+    /// working exactly as designed, and the test asking it to dial faster than it can.
+    ///
+    /// Separating them here costs nothing the test was actually asserting: the WIRING (that the
+    /// registry passes one to the other) is pinned by `pools.rs`'s unit test, and what this one
+    /// measures is that the backend USES the busy timeout it was given. Tying that observation to
+    /// the dial bound only made it hostage to runner speed.
+    const GENEROUS_CHECKOUT: Duration = Duration::from_secs(5);
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("busy.db");
 
     let config = PoolConfig {
         max_size: 4,
-        checkout_timeout: CONFIGURED,
+        checkout_timeout: GENEROUS_CHECKOUT,
         max_lifetime: Duration::from_secs(60),
         reap_interval: None,
         pin_functions: Vec::new(),
         pin_on_unknown: true,
     };
-    // Built exactly as `PoolRegistry::build_with` builds it — the value read off the config rather
-    // than repeated as a literal, so this cannot drift from the registry arm it stands in for.
+    // The registry builds this as `.with_busy_timeout(cfg.checkout_timeout)`; here the two are set
+    // apart on purpose — see `GENEROUS_CHECKOUT`. The `pools.rs` unit test is what pins the wiring.
     let pool = Pool::new(
-        SqliteBackend::new(format!("sqlite://{}", path.display()))
-            .with_busy_timeout(config.checkout_timeout),
+        SqliteBackend::new(format!("sqlite://{}", path.display())).with_busy_timeout(CONFIGURED),
         config,
     );
     assert_eq!(
