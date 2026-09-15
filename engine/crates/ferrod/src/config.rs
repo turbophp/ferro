@@ -157,6 +157,11 @@ pub struct PoolSpec {
     /// into `PoolConfig::pin_on_unknown`. From `FERRO_POOL_<NAME>_PIN_ON_UNKNOWN`, default `true`
     /// (SPEC §7.1 — prefer a false taint to a missed one, charter rule 5).
     pub pin_on_unknown: bool,
+    /// SPEC **D14**: the directory the engine may open files in on this pool's behalf — `ATTACH`
+    /// and `VACUUM INTO`. From `FERRO_POOL_<NAME>_ALLOW_DIR`; `None` means the DEFAULT, the
+    /// database file's own directory, which is what every deployment already satisfies. SQLite
+    /// only — the other families have no statement that names a filesystem path the engine writes.
+    pub allow_dir: Option<String>,
 }
 
 impl std::fmt::Debug for PoolSpec {
@@ -373,6 +378,7 @@ fn parse_pools(names: &str, lookup: &impl Fn(&str) -> Option<String>) -> Vec<Poo
                         kind,
                         pin_functions,
                         pin_on_unknown,
+                        allow_dir: parse_pool_allow_dir(name, lookup),
                     })
                 }
                 _ => {
@@ -418,6 +424,17 @@ fn parse_pool_pin_config(
         })
         .unwrap_or(true); // default true (SPEC §7.1)
     (fns, pin_on_unknown)
+}
+
+/// SPEC **D14**: `FERRO_POOL_<NAME>_ALLOW_DIR`, the directory the engine may open files in on this
+/// pool's behalf. Unset — the normal case — means the database file's own directory, so the guard
+/// needs no configuration to be safe and an operator sets this only to point snapshots at a backup
+/// volume. A blank value is treated as unset rather than as "the empty path", which would resolve
+/// to nothing and refuse everything.
+fn parse_pool_allow_dir(name: &str, lookup: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    lookup(&format!("FERRO_POOL_{}_ALLOW_DIR", env_name(name)))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// The env-var-safe form of a pool name: ASCII-uppercased, every non-alphanumeric byte mapped to
@@ -516,6 +533,7 @@ mod tests {
             kind: PoolKind::Postgres,
             pin_functions: Vec::new(),
             pin_on_unknown: true,
+            allow_dir: None,
         };
         let dbg = format!("{s:?}");
         assert!(dbg.contains("default"), "the pool name is shown");
@@ -668,6 +686,33 @@ mod tests {
         let (fns, pin_on_unknown) = parse_pool_pin_config("main", &lookup);
         assert_eq!(fns, vec!["app_lock".to_string(), "other_fn".to_string()]);
         assert!(pin_on_unknown, "PIN_ON_UNKNOWN unset must default to true");
+    }
+
+    /// SPEC D14's knob: set, unset, and BLANK. The blank case is the one worth a test — treating
+    /// `""` as a configured value would resolve to the empty path and refuse everything, turning a
+    /// stray `export FERRO_POOL_X_ALLOW_DIR=` into a pool that cannot ATTACH at all.
+    #[test]
+    fn allow_dir_parses_set_unset_and_blank() {
+        let set = map_lookup(&[("FERRO_POOL_MAIN_ALLOW_DIR", "  /srv/backups  ")]);
+        assert_eq!(
+            parse_pool_allow_dir("main", &set),
+            Some("/srv/backups".to_string()),
+            "a configured directory must be trimmed and kept"
+        );
+
+        let unset = map_lookup(&[]);
+        assert_eq!(
+            parse_pool_allow_dir("main", &unset),
+            None,
+            "unset must mean the backend's default (the database's own directory)"
+        );
+
+        let blank = map_lookup(&[("FERRO_POOL_MAIN_ALLOW_DIR", "   ")]);
+        assert_eq!(
+            parse_pool_allow_dir("main", &blank),
+            None,
+            "a blank value must read as unset, not as the empty path"
+        );
     }
 
     #[test]

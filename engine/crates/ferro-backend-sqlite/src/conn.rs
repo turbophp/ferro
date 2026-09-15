@@ -25,6 +25,7 @@ use ferro_pool::error::PoolError;
 use ferro_proto::messages::sql::ColMeta;
 use ferro_proto::value::Value;
 use rusqlite::Connection;
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
 use crate::stream::SqliteRowStream;
 
@@ -139,6 +140,10 @@ impl SqliteConn {
 pub struct SqliteBackend {
     dsn: String,
     busy_timeout: Duration,
+    /// SPEC D14: the directory the engine will open files in on a client's behalf. `None` means
+    /// the DEFAULT — the database file's own directory — which is resolved per-connect because
+    /// that is where the DSN is parsed.
+    allow_dir: Option<PathBuf>,
 }
 
 impl SqliteBackend {
@@ -148,6 +153,7 @@ impl SqliteBackend {
         Self {
             dsn: dsn.into(),
             busy_timeout: DEFAULT_BUSY_TIMEOUT,
+            allow_dir: None,
         }
     }
 
@@ -156,6 +162,16 @@ impl SqliteBackend {
     /// backend is driven directly, as the tests here do.
     pub fn with_busy_timeout(mut self, busy_timeout: Duration) -> Self {
         self.busy_timeout = busy_timeout;
+        self
+    }
+
+    /// SPEC **D14**: widen the directory the engine may open files in on a client's behalf.
+    ///
+    /// The default — the database file's own directory — needs no configuration and is what every
+    /// existing deployment already satisfies. An operator sets this only to point snapshots at a
+    /// backup volume.
+    pub fn with_allow_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.allow_dir = Some(dir.into());
         self
     }
 
@@ -209,13 +225,15 @@ impl SqliteBackend {
     pub async fn connect(&self) -> Result<SqliteConn, PoolError> {
         let path = resolve_path(&self.dsn)?;
         let busy_timeout = self.busy_timeout;
+        let allow_dir = self.allow_dir.clone();
 
-        let conn = tokio::task::spawn_blocking(move || open_configured(&path, busy_timeout))
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = %e, "ferro-backend-sqlite: connect task panicked");
-                PoolError::ConnectionLost
-            })??;
+        let conn =
+            tokio::task::spawn_blocking(move || open_configured(&path, busy_timeout, allow_dir))
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "ferro-backend-sqlite: connect task panicked");
+                    PoolError::ConnectionLost
+                })??;
 
         Ok(SqliteConn {
             conn: Some(conn),
@@ -462,11 +480,12 @@ impl SqliteBackend {
         // gratuitous eviction.
         let path = resolve_path(&self.dsn)?;
         let busy_timeout = self.busy_timeout;
+        let allow_dir = self.allow_dir.clone();
         let old = conn.park().ok_or(PoolError::Closed)?;
 
         let fresh = tokio::task::spawn_blocking(move || {
             drop(old);
-            open_configured(&path, busy_timeout)
+            open_configured(&path, busy_timeout, allow_dir)
         })
         .await
         .map_err(|e| {
@@ -645,7 +664,11 @@ impl SqliteBackend {
 }
 
 /// Open the database and apply the setup D13 requires. Runs on the blocking pool.
-fn open_configured(path: &Path, busy_timeout: Duration) -> Result<Connection, PoolError> {
+fn open_configured(
+    path: &Path,
+    busy_timeout: Duration,
+    allow_dir: Option<PathBuf>,
+) -> Result<Connection, PoolError> {
     let conn = Connection::open(path).map_err(|e| {
         // The path is operator configuration and may sit beside a credential in the same config
         // string, so the error carries the driver message but never the DSN (SPEC §12).
@@ -717,7 +740,110 @@ fn open_configured(path: &Path, busy_timeout: Duration) -> Result<Connection, Po
         )));
     }
 
+    // SPEC D14 — see `install_path_guard`. Installed LAST, so the setup statements above run
+    // unguarded: they are engine-composed, and a guard that could refuse the engine's own dial
+    // would be a new failure mode for no gain.
+    install_path_guard(&conn, path, allow_dir)?;
+
     Ok(conn)
+}
+
+/// **SPEC D14: confine every file the engine opens on a client's behalf to one directory.**
+///
+/// §12/D8 keeps the database path in the engine so PHP never learns it, and two ordinary SQLite
+/// statements hand that choice back: `VACUUM INTO '<path>'` writes a complete copy of the database
+/// wherever the daemon can write, and `ATTACH DATABASE '<path>'` opens (and creates) a file the
+/// client names. That is a CONFUSED DEPUTY rather than a leak of data the client could not already
+/// read: the write happens as **ferrod's** user, which under §18's systemd deployment is not
+/// PHP-FPM's, so the client directs an authority it does not itself hold.
+///
+/// **The mechanism is SQLite's own authorizer, not a statement-text denylist, and the difference is
+/// the point.** Refusing `VACUUM INTO` by name was the obvious fix and would have been security
+/// theatre — measured, `ATTACH` plus `CREATE TABLE side.copy AS SELECT …` inside one transaction
+/// produces the same copy at the same path (§22.2 (bo)). Both verbs arrive here as the SAME event:
+/// SQLite reports `SQLITE_ATTACH` with the RESOLVED filename before it opens anything, so this
+/// guard covers both, and any future verb that attaches a file, without parsing SQL. Charter rule 6
+/// is untouched: nothing is rewritten and nothing is inferred from statement text — SQLite says
+/// which file it is about to open and the engine answers.
+///
+/// MEASURED on the bundled SQLite 3.53.2: `VACUUM INTO` and `ATTACH` both fire
+/// `AuthAction::Attach { filename }` carrying the resolved path, and a `Deny` yields `SQLITE_AUTH`
+/// (extended 23) with **no file created** — a cleaner refusal than the declared-`readonly` path,
+/// which leaves a zero-byte file behind.
+fn install_path_guard(
+    conn: &Connection,
+    db_path: &Path,
+    allow_dir: Option<PathBuf>,
+) -> Result<(), PoolError> {
+    // The DEFAULT is the database's own directory, which is why D14 needs no configuration to be
+    // safe: `VACUUM INTO 'snap.db'` beside the database works out of the box, and reaching outside
+    // it is an operator decision.
+    let root = match allow_dir {
+        Some(d) => d,
+        None => db_path.parent().map(Path::to_path_buf).unwrap_or_default(),
+    };
+    // Canonicalised ONCE, here, because the comparison below must not be defeated by `..` or by a
+    // symlink — and because a root that does not exist would silently allow nothing, which is a
+    // failure worth surfacing at dial rather than on a tenant's first ATTACH.
+    let root = root.canonicalize().map_err(|e| {
+        tracing::warn!(error = %e, "ferro-backend-sqlite: allow_dir does not resolve");
+        PoolError::Backend(format!(
+            "the pool's allowed directory for engine-opened files does not resolve: {e}"
+        ))
+    })?;
+
+    conn.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+        AuthAction::Attach { filename } => {
+            if attach_is_allowed(filename, &root) {
+                Authorization::Allow
+            } else {
+                tracing::warn!(
+                    filename,
+                    root = %root.display(),
+                    "ferro-backend-sqlite: refused to open a file outside the pool's allowed directory (SPEC D14)"
+                );
+                Authorization::Deny
+            }
+        }
+        _ => Authorization::Allow,
+    }))
+    .map_err(|e| {
+        tracing::warn!(error = %e, "ferro-backend-sqlite: could not install the D14 path guard");
+        PoolError::Backend(format!("path guard install failed: {e}"))
+    })
+}
+
+/// Whether SQLite may open `filename` — the D14 rule, factored out so it is unit-testable without
+/// a live connection.
+///
+/// An EMPTY name is allowed: that is how SQLite reports a temporary or in-memory attachment, which
+/// writes no file the operator could care about. Everything else must resolve to a path whose
+/// PARENT lies within `root` — the parent rather than the file itself, because the target of a
+/// snapshot does not exist yet and so cannot be canonicalised.
+fn attach_is_allowed(filename: &str, root: &Path) -> bool {
+    if filename.is_empty() || filename.eq_ignore_ascii_case(":memory:") {
+        return true;
+    }
+    let candidate = Path::new(filename);
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(candidate),
+            // No working directory means no way to resolve a relative name; refuse rather than
+            // guess, which is the safe direction for a guard.
+            Err(_) => return false,
+        }
+    };
+    let Some(parent) = absolute.parent() else {
+        return false;
+    };
+    match parent.canonicalize() {
+        Ok(p) => p.starts_with(root),
+        // A parent that does not exist cannot be inside the allowed root by any reading, and
+        // SQLite would fail to create the file there anyway.
+        Err(_) => false,
+    }
 }
 
 /// The out-of-band cancel handle (C3-3d). An owned `InterruptHandle`, which `p3` proved is

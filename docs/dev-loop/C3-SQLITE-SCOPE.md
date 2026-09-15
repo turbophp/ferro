@@ -1135,8 +1135,9 @@ arbitrary path, and `ATTACH` is permitted BY DESIGN — §12's hygiene list exis
 the next statement, because `ATTACH` taints unconditionally (§19), so it is the TRANSACTION — the
 pool pinning every statement to one connection — that carries the capability, not the verb.
 
-So closing it means deciding a general rule about path-naming statements. **Raised as a §21 open
-item** with three options (leave and document in C6; confine to an operator-configured directory;
+So closing it means deciding a general rule about path-naming statements. **It was raised as a §21
+open item and the owner then chose confinement — see §22, where it is built as SPEC D14.** As
+raised** with three options (leave and document in C6; confine to an operator-configured directory;
 refuse path-naming on the SQL service and expose snapshots only through the admin service) and an
 interim default of *unchanged*. A **tripwire test asserts the capability**, so a decision to close it
 turns that test RED rather than passing silently — the §18 `foreign_keys` precedent, applied on
@@ -1150,3 +1151,53 @@ purpose rather than discovered.
    session is equal. This is the part with no precedent in the tree.
 4. The destination policy, which is where the §21 decision above lands.
 5. A client/CLI surface (`ferro` CLI, D10) — and note §13's `ferro top` wants the same transport.
+
+
+---
+
+## 22. D14 built (2026-09-15) — the path guard
+
+The owner took option (b) from §21: **the engine confines every file it opens on a client's behalf
+to one directory per pool.** SPEC **D14**; §22.2 (bp).
+
+### Why it turned out cheap
+
+**SQLite's own authorizer is the enforcement point.** `VACUUM INTO` and `ATTACH` both fire
+`SQLITE_ATTACH` carrying the **resolved filename** before SQLite opens anything, so one guard covers
+both — and any future verb that attaches a file — with no SQL parsing at all. Charter rule 6 never
+arises: nothing is rewritten, nothing is inferred from statement text, SQLite states which file it
+is about to open and the engine answers.
+
+**Measured on the BUNDLED 3.53.2**, because §21's probe ran against the system 3.45.1 and flagged the
+difference as something to check rather than assume. A `Deny` yields `SQLITE_AUTH` (extended 23) and
+creates **no file at all** — cleaner than the declared-`readonly` refusal, which leaves a zero-byte
+one. `rusqlite`'s `hooks` feature adds no dependency.
+
+### The shape
+
+| | |
+| --- | --- |
+| default | the database file's own directory — so `VACUUM INTO 'snap.db'` beside the database works out of the box and no existing deployment changes |
+| operator knob | `FERRO_POOL_<NAME>_ALLOW_DIR`; a **blank** value reads as unset, not as the empty path |
+| root | canonicalised ONCE at dial — a root that does not resolve is a connect failure, not a guard that silently allows nothing |
+| candidate | its **parent** is canonicalised, because a snapshot's target does not exist yet |
+| empty filename | allowed — that is how SQLite reports a temporary or in-memory attachment, which writes no file |
+
+### What the tests prove, and the three mutations
+
+§21's **tripwire is now inverted**: it asserted the capability, green on purpose, so the open
+decision could not be forgotten — it asserts the refusal now, which is exactly why it was written
+that way (§18's `foreign_keys` precedent).
+
+* **No guard installed** → the five guard tests fail; the seven mechanism tests stay green.
+* **Guard on the fresh dial but not the reopen** → only `the_guard_survives_a_recycle` fails. That
+  matters because §19 made `ResetProfile::Full` a close-and-reopen, so enforcement on one exit alone
+  would depend on POOL OCCUPANCY — the C3-4 failure shape.
+* **Path strings compared instead of canonicalised** → only the `..`-traversal test fails, which is
+  the single line a naive guard falls to while passing everything else.
+
+### Cost, stated
+
+An application that `ATTACH`es a database outside the allowed directory now needs the operator to
+widen `allow_dir`. Plain `VACUUM` — which stock Laravel's `dropAllTables()` ends in — is untouched,
+because it opens no file.

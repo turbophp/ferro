@@ -55,6 +55,7 @@ fn exec_server_with_deadlines(url: String, idle_in_tx: Duration, max_tx: Duratio
             kind,
             pin_functions: Vec::new(),
             pin_on_unknown: true,
+            allow_dir: None,
         }],
         idle_in_tx,
         max_tx,
