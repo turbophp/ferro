@@ -282,39 +282,78 @@ impl SqliteBackend {
 
     /// What a recycled NON-tainted connection gets.
     ///
-    /// `Some(Full)` — and unlike PostgreSQL that costs nothing. PG uses `Targeted` to avoid
-    /// `DISCARD ALL`'s `DEALLOCATE ALL`, which would destroy its prepared statements; SQLite's
-    /// reset is in-process against a local file, issues no round trip, and destroys no prepared
-    /// statements, so there is no cheaper profile to choose and nothing is bought by choosing one.
+    /// **`Some(Targeted)`, and C3-3b's `Some(Full)` was wrong the moment `Full` grew teeth.** That
+    /// slice reasoned the two profiles were interchangeable "because SQLite's reset is in-process
+    /// and destroys no prepared statements", which was true of the reset it shipped and is no
+    /// longer true of this one: `Full` now CLOSES AND REOPENS the connection, which was measured at
+    /// ~250 µs (debug build). §16's boundary target is p50 < 60 µs, so paying that on every
+    /// recycled checkout would blow the latency budget on hygiene alone.
     ///
-    /// `None` (skip hygiene entirely) is deliberately NOT taken even though SQLite has no stored
-    /// procedures and therefore none of the §7.4 function-body blind spot that motivated PG's
-    /// backstop. That is an optimization, it is the same one still deferred for MySQL (R2), and
-    /// nothing here is expensive enough to justify the risk.
+    /// **The gate is sound, which is the reason this is safe to narrow.** The state `Full` exists
+    /// to clear is connection-scoped PRAGMA state, and the only statements that can set it are
+    /// `PRAGMA` and `ATTACH` — both of which `ferro-classify`'s SQLite dialect taints
+    /// UNCONDITIONALLY, ahead of its safe-list and independent of `pin_on_unknown` (the same shape
+    /// as MySQL's `CALL`/`DO` backstop). A connection that reaches this profile has issued neither,
+    /// so it has no pragma state to clear. What it CAN still carry — an open transaction, an armed
+    /// `query_only`, temp objects (`CREATE` is safe-listed, so temp DDL does not taint on this
+    /// dialect) — is exactly what `Targeted` handles.
+    ///
+    /// `None` (skip hygiene entirely) is still deliberately NOT taken: that is an optimization, it
+    /// is the same one still deferred for MySQL (R2), and `Targeted` is cheap.
     pub fn clean_reset_profile(&self) -> Option<ResetProfile> {
-        Some(ResetProfile::Full)
+        Some(ResetProfile::Targeted)
     }
 
-    /// Hygiene reset. **Both profiles do the same thing, stated rather than hidden:** see
-    /// [`SqliteBackend::clean_reset_profile`] — there is no cheaper-but-weaker reset for SQLite to
-    /// offer, so a `Targeted` that differed from `Full` would be a distinction with no behaviour
-    /// behind it.
+    /// Hygiene reset. **The two profiles now differ, and the difference is the point.**
+    ///
+    /// * `Full` (a TAINTED connection) closes the handle and opens a fresh one — see
+    ///   [`SqliteBackend::reopen`].
+    /// * `Targeted` (a clean recycle) runs the explicit list below.
+    ///
+    /// C3-3b shipped both arms as the same list and said so. That list was built from what the
+    /// ENGINE leaves on a connection, and it is complete for that — but a TENANT can leave a great
+    /// deal more, and none of it was cleared. MEASURED through a real pool, one tenant per column,
+    /// the next tenant inherited every one of these: `foreign_keys=OFF` (which silently disarms the
+    /// integrity guarantee `open_configured` declares, for everyone afterwards),
+    /// `writable_schema=1` (which lets the next tenant `DELETE FROM sqlite_master` — schema
+    /// destruction — without ever asking for the privilege), `trusted_schema=0`,
+    /// `ignore_check_constraints=1`, `read_uncommitted=1`, `recursive_triggers=1`,
+    /// `legacy_alter_table=1`, `cell_size_check`, `automatic_index=0`, `reverse_unordered_selects`,
+    /// `secure_delete`, `synchronous=0`, `fullfsync`, `checkpoint_fullfsync`, `cache_size`,
+    /// `hard_heap_limit`, `analysis_limit`, `threads` — and `busy_timeout`, which is the pool's own
+    /// checkout bound (C3-3e). Seventeen of the twenty-three probed.
+    ///
+    /// **Enumerating them is the wrong fix and was rejected for a stated reason.** SQLite has
+    /// around sixty pragmas and gains more with each release, so a hand-kept list rots silently —
+    /// which is exactly the failure C3-6a found in `foreign_keys` resting on a build flag nobody
+    /// had decided. The right analogue is the one MySQL already uses: `COM_RESET_CONNECTION`
+    /// (M1-S6). SQLite's equivalent of that is closing and reopening, and it is complete by
+    /// construction rather than by enumeration.
+    ///
+    /// # The `Targeted` list
     ///
     /// SQLite has **no `DISCARD ALL` analogue**, so this is an explicit list rather than a ported
-    /// one. What a pooled SQLite connection can carry into the next tenant:
+    /// one. What a pooled SQLite connection that issued no `PRAGMA`/`ATTACH` can still carry into
+    /// the next tenant:
     ///
     /// 1. **An open transaction** — the floor. Gated on the live signal, because `ROLLBACK` errors
     ///    with "cannot rollback - no transaction is active" when none is open.
-    /// 2. **`PRAGMA query_only`**, if a declared-`readonly` checkout armed it (C3-3a).
-    /// 3. **ATTACHed databases** — §7.1's assist lexer already names `ATTACH` pin-worthy, which is
-    ///    exactly the admission that it leaves connection state behind.
+    /// 2. **`PRAGMA query_only`**, if a declared-`readonly` checkout armed it (C3-3a). This is the
+    ///    ENGINE's own arming, not a tenant's, which is why it belongs on this profile too.
+    /// 3. **ATTACHed databases** — kept even though `ATTACH` taints and so takes the `Full` arm:
+    ///    the cost is one catalogue read on a connection that has none, and a profile that depended
+    ///    on the classifier being exhaustive would fail silently the day it is not.
     /// 4. **Temp objects** — `CREATE TEMP TABLE` lives in the per-connection `temp` schema and
-    ///    survives until the connection closes, so it outlives the checkout that made it.
+    ///    survives until the connection closes. `CREATE` is safe-listed on this dialect, so temp
+    ///    DDL does NOT taint and this is the only profile that will ever see it.
     pub async fn reset(
         &self,
         conn: &mut SqliteConn,
-        _profile: ResetProfile,
+        profile: ResetProfile,
     ) -> Result<(), PoolError> {
+        if profile == ResetProfile::Full {
+            return self.reopen(conn).await;
+        }
         Self::with_conn(conn, |c| {
             // 1. Any open transaction, including one the caller never closed.
             if !c.is_autocommit() {
@@ -384,6 +423,59 @@ impl SqliteBackend {
             Ok(())
         })
         .await?;
+        conn.query_only = false;
+        Ok(())
+    }
+
+    /// The `Full` profile: close this connection and open a fresh one.
+    ///
+    /// **This is SQLite's `COM_RESET_CONNECTION`.** MySQL recycles every reused connection through
+    /// that command (M1-S6) precisely because enumerating session state is not something a pool can
+    /// keep correct; SQLite offers no such command, but it also has no server to reconnect to — the
+    /// "reconnect" is a local file open — so closing and reopening buys the same completeness at a
+    /// cost a network backend could not pay. Everything a tenant could have set is gone by
+    /// construction, and [`open_configured`] re-applies the DECLARED setup (WAL verified,
+    /// `busy_timeout` from the pool's `checkout_timeout`, `foreign_keys` on and read back) rather
+    /// than trusting whatever the previous tenant left.
+    ///
+    /// **The old handle is closed BEFORE the new one opens, and the order is deliberate.** Dropping
+    /// a `rusqlite::Connection` closes it, releasing its locks and its reference to the WAL; doing
+    /// that first means the pool never briefly holds two handles per slot.
+    ///
+    /// **Two hazards were checked rather than assumed.**
+    ///
+    /// * `PRAGMA journal_mode=WAL` **cannot switch** a database while another connection holds a
+    ///   lock (found by a failing test at C3-3e), and `open_configured` treats a non-WAL answer as
+    ///   a hard connect error — so a reopen under a sibling's write lock could have made hygiene
+    ///   fail. Measured: on an ALREADY-WAL database the same pragma returns `"wal"` under another
+    ///   connection's write lock. C3-3e's failure was the rollback→WAL *switch*, which a reopen of
+    ///   a live pool's database never performs.
+    /// * A failed reopen must leave the connection DEAD, not half-reset. It does, by construction:
+    ///   the handle is parked (moved out) first and is only restored on the success arm, so every
+    ///   error path leaves `SqliteConn` handle-less, which `is_closed` reports and the pool
+    ///   discards. That is the same contract the panic arm of [`SqliteBackend::with_conn`] relies
+    ///   on.
+    async fn reopen(&self, conn: &mut SqliteConn) -> Result<(), PoolError> {
+        // Resolved BEFORE the handle is parked. Parking is what makes a connection dead on every
+        // error path below, which is right for a failure to OPEN — but a DSN that parsed at connect
+        // will parse again, so letting that (impossible) case kill a live connection would be a
+        // gratuitous eviction.
+        let path = resolve_path(&self.dsn)?;
+        let busy_timeout = self.busy_timeout;
+        let old = conn.park().ok_or(PoolError::Closed)?;
+
+        let fresh = tokio::task::spawn_blocking(move || {
+            drop(old);
+            open_configured(&path, busy_timeout)
+        })
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "ferro-backend-sqlite: reopen task panicked");
+            PoolError::ConnectionLost
+        })??;
+
+        conn.unpark(fresh);
+        // The tracked flag follows the handle: a brand-new connection has `query_only` off.
         conn.query_only = false;
         Ok(())
     }
