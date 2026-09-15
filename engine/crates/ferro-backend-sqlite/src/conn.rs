@@ -17,8 +17,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ferro_pool::backend::{Dialect, ResetProfile, TxStatus};
+use ferro_pool::backend::{Dialect, QueryResult, ResetProfile, TxStatus};
 use ferro_pool::error::PoolError;
+use ferro_proto::messages::sql::ColMeta;
+use ferro_proto::value::Value;
 use rusqlite::Connection;
 
 /// The busy-timeout used when the caller does not name one.
@@ -386,6 +388,106 @@ impl SqliteBackend {
                 0
             } else {
                 c.changes()
+            })
+        })
+        .await
+    }
+
+    /// Row-returning, parameterized statement — buffered, as the trait documents.
+    ///
+    /// **No `?`→`$n` normalization is needed**: the trait's contract says `sql` arrives already
+    /// normalized "by the backend", and SQLite's native placeholder IS `?`, so this arm has nothing
+    /// to rewrite. Named after the PG backend's need, not a universal one.
+    ///
+    /// Cell tagging is per-VALUE and `ColMeta` is advisory — see [`crate::rowmap`] for the
+    /// measurement behind that and for the nine §9 tags SQLite cannot produce.
+    pub async fn query(
+        &self,
+        conn: &mut SqliteConn,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, PoolError> {
+        let sql = sql.to_string();
+        let bound: Vec<rusqlite::types::Value> = params
+            .iter()
+            .map(crate::rowmap::param_from_value)
+            .collect::<Result<_, _>>()?;
+
+        Self::with_conn(conn, move |c| {
+            let before_changes = c.total_changes();
+            let before_rowid = c.last_insert_rowid();
+
+            let mut stmt = c.prepare(&sql).map_err(|e| {
+                tracing::debug!(error = %e, "ferro-backend-sqlite: prepare failed");
+                PoolError::Backend(format!("{e}"))
+            })?;
+            let ncol = stmt.column_count();
+            let names: Vec<String> = (0..ncol)
+                .map(|i| stmt.column_name(i).unwrap_or_default().to_string())
+                .collect();
+
+            let mut rows_out: Vec<Vec<Value>> = Vec::new();
+            let mut rows = stmt
+                .query(rusqlite::params_from_iter(bound.iter()))
+                .map_err(|e| PoolError::Backend(format!("{e}")))?;
+            while let Some(r) = rows
+                .next()
+                .map_err(|e| PoolError::Backend(format!("{e}")))?
+            {
+                let mut row = Vec::with_capacity(ncol);
+                for i in 0..ncol {
+                    let v = r
+                        .get_ref(i)
+                        .map_err(|e| PoolError::Backend(format!("{e}")))?;
+                    row.push(crate::rowmap::value_from_ref(v));
+                }
+                rows_out.push(row);
+            }
+            drop(rows);
+            drop(stmt);
+
+            // Advisory only (see `rowmap`): describes the FIRST row's actual storage classes, and
+            // NULL for an empty result. It describes the data returned rather than a declared type
+            // SQLite does not enforce — and the client drops this field regardless.
+            let cols: Vec<ColMeta> = names
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| ColMeta {
+                    name,
+                    tag: rows_out
+                        .first()
+                        .and_then(|r| r.get(i))
+                        .map_or(ferro_proto::consts::tag::NULL, Value::tag),
+                })
+                .collect();
+
+            // Same rule as `simple_query`: the delta decides WHETHER, `changes()` reports HOW MANY.
+            let affected = if c.total_changes() == before_changes {
+                0
+            } else {
+                c.changes()
+            };
+
+            // `last_insert_rowid()` is STICKY exactly like `changes()` — after a SELECT it still
+            // reports the previous INSERT's rowid. So it is reported only when this statement
+            // actually MOVED it. A key that is merely absent is an honest `None`; a key carried
+            // over from an earlier statement would be silently WRONG, and §22.2 already records
+            // (from PG's `lastval()`) that a silently wrong key is strictly worse than none.
+            //
+            // Residual, stated: an INSERT that explicitly reuses the previous rowid reports `None`
+            // rather than that rowid. Conservative in the safe direction.
+            let rowid = c.last_insert_rowid();
+            let last_insert_id = if rowid != before_rowid && rowid > 0 {
+                Some(rowid as u64)
+            } else {
+                None
+            };
+
+            Ok(QueryResult {
+                cols,
+                rows: rows_out,
+                affected,
+                last_insert_id,
             })
         })
         .await

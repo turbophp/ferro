@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 ferro-pool = { path = "../ferro-pool" }
+ferro-proto = { path = "../ferro-proto" }
 # `bundled` compiles SQLite from source: the version is then a property of this build rather than of
 # whatever the host happens to ship, which is what makes D13's locking behaviour (proven in
 # `ferro-sqlite-spike`) a claim about the engine rather than about one machine.
