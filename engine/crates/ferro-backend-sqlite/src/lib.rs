@@ -20,6 +20,7 @@
 //! so a failure in this crate can never be confused with a failure in the daemon.
 
 pub mod conn;
+pub mod error_map;
 pub mod rowmap;
 
 pub use conn::{SqliteBackend, SqliteConn, resolve_path};
