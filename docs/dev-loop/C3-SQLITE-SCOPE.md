@@ -758,7 +758,7 @@ requests a cold or saturated pool serves with a new connection.
 | delete the fresh-dial arm | `a_freshly_dialled_connection_gets_the_declaration` | the other three |
 | delete the recycled arm | `a_recycled_connection_is_re_declared_each_checkout` (step 2) | the other three |
 | move the arm above the cleanup block | `a_recycled_connection_is_re_declared_each_checkout` (step 2) | the other three |
-| delete `query_only=OFF` from `reset` | `a_user_issued_query_only_pragma_does_not_leak_to_the_next_tenant` | the other three |
+| delete `query_only=OFF` from `reset` | `a_user_issued_query_only_pragma_does_not_leak_to_the_next_tenant` AND `a_recycled_connection_is_re_declared_each_checkout` (step 3) | the other two |
 
 ### Two of this slice's own tests were proven wrong, and that is the slice's value
 
@@ -769,17 +769,29 @@ mutation left it green. The proof moved to pool level, where the test decides wh
 a checkout.
 
 **One claimed the hygiene reset is what disarms between tenants.** Deleting `PRAGMA query_only=OFF`
-from `reset` left it green. The real mechanism is that every checkout re-declares:
-`checkout_declared(false)` disarms as surely as `true` arms, so in the ordinary path the seam
-prevents the leak and hygiene never gets a turn.
+from `reset` left it green — and **the first explanation for that was also wrong**, which is the more
+useful half.
 
-That does **not** make the reset line dead, and finding out why is the useful part.
-`apply_readonly` short-circuits on its own tracked flag, so a tenant that arms the pragma ITSELF — by
-running `PRAGMA query_only=ON` as a statement, declaring nothing — leaves the flag reading `false`,
-and the next checkout's `apply_readonly(conn, false)` does nothing at all. The connection reaches the
-next tenant read-only with no declaration anywhere explaining why their writes fail. That is the §7.4
-blind-spot shape, it is what the unconditional reset covers, and it now has the test it was wrongly
-believed to already have.
+The conclusion drawn at first was "the seam disarms, not hygiene, because every checkout
+re-declares". What had actually happened is that the test stopped testing recycling: its middle step
+ends in a **refused** statement, and a connection whose statement failed is not the one the next
+checkout receives. So the final step was served a freshly dialled connection — read-write by
+construction — and passed for a reason that had nothing to do with disarming. Adding one
+**succeeding** readonly checkout between them, which returns its connection to the pool intact, makes
+the same mutation fail it.
+
+So **hygiene is what disarms a recycled connection, and the seam cannot.** `reset` clears
+`apply_readonly`'s tracked flag unconditionally, so after a reset the flag reads "off" whether or not
+the pragma actually is, and `apply_readonly(conn, false)` short-circuits and issues nothing. The flag
+and the pragma are kept in step by that one line and nothing else.
+
+The §7.4 case is the same line's job and now has its own test: a tenant that arms the pragma ITSELF —
+running `PRAGMA query_only=ON`, declaring nothing — never sets the flag, so no amount of re-declaring
+would clear it.
+
+**The reusable lesson is about this pool, not about SQLite:** a test step that ends in a failed
+statement silently converts a recycle test into a fresh-dial test. Any test meaning to exercise a
+recycled connection must end its setup on a statement that succeeded.
 
 ### Recorded, not built: the PostgreSQL arm
 

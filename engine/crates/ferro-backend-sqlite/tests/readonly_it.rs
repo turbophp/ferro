@@ -72,16 +72,24 @@ async fn a_freshly_dialled_connection_gets_the_declaration() {
 /// alternates — writable, readonly, writable — on one connection (`max_size` is 1, so there is only
 /// ever one).
 ///
-/// **What disarms between checkouts is the SEAM, not the reset, and a mutation is what settled
-/// that.** The docstring here first claimed the hygiene reset's `PRAGMA query_only=OFF` was what let
-/// step 3 write — and deleting that line left this test GREEN. The real mechanism is that every
-/// checkout re-declares: `checkout_declared(false)` calls `apply_readonly(conn, false)`, which turns
-/// the pragma off as surely as it turns it on. The reset line is not dead, but what it covers is a
-/// different case entirely, and it has its own test below.
+/// **Step 2b exists because without it this test silently stopped testing recycling**, and that took
+/// two rounds to see. Step 2 ends in a REFUSED statement, and a connection whose statement failed is
+/// not the one the next checkout gets — so step 3 was served a freshly dialled connection, which is
+/// read-write by construction, and passed for a reason that had nothing to do with disarming.
+/// Measured: with `PRAGMA query_only=OFF` deleted from `reset`, this test was GREEN until step 2b —
+/// a SUCCEEDING readonly checkout, which returns its connection to the pool intact — was added, and
+/// then it failed.
 ///
-/// MUTATION PROVEN, twice: deleting `apply_readonly` from the recycled arm fails step 2 (the
-/// declared-readonly write succeeds), and moving it ABOVE the cleanup block fails step 2 as well —
-/// the reset clears the arming that was applied too early.
+/// **So the hygiene reset IS what disarms a genuinely recycled connection**, and the seam cannot do
+/// it: `reset` clears `apply_readonly`'s tracked flag unconditionally, so after a reset the flag
+/// reads "off" whether or not the pragma actually is, and `apply_readonly(conn, false)` then
+/// short-circuits and issues nothing. The two are not redundant — the flag and the pragma are only
+/// kept in step by that one line.
+///
+/// MUTATION PROVEN, three ways: deleting `apply_readonly` from the recycled arm fails step 2 (the
+/// declared-readonly write succeeds); moving it ABOVE the cleanup block fails step 2 as well (the
+/// reset clears an arming applied too early); and deleting `query_only=OFF` from `reset` fails
+/// step 3.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_recycled_connection_is_re_declared_each_checkout() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -95,7 +103,9 @@ async fn a_recycled_connection_is_re_declared_each_checkout() {
             .expect("an undeclared checkout writes");
     }
 
-    // 2. Readonly on the RECYCLED connection: refused.
+    // 2. Readonly on the RECYCLED connection: refused. Then a SUCCEEDING readonly statement, so
+    //    the connection goes back to the pool WITHOUT a failed statement behind it — see the
+    //    comment on step 3 for why that distinction turned out to be load-bearing.
     {
         let mut co = pool.checkout_declared(true).await.expect("checkout 2");
         let err = co
@@ -107,6 +117,10 @@ async fn a_recycled_connection_is_re_declared_each_checkout() {
             Some(SQLITE_READONLY),
             "expected SQLITE_READONLY on the recycled connection, got {err:?}"
         );
+    }
+    {
+        let mut co = pool.checkout_declared(true).await.expect("checkout 2b");
+        co.query("SELECT 1", &[]).await.expect("a readonly read");
     }
 
     // 3. Writable again on that SAME connection: the arming did not leak across the checkout
@@ -164,8 +178,9 @@ fn errno_of(err: &ferro_pool::error::PoolError) -> Option<i32> {
 /// hygiene list (C3-3b) rather than in `apply_readonly`: hygiene's job is exactly the state a tenant
 /// left behind by means the engine did not mediate.
 ///
-/// MUTATION PROVEN: deleting `PRAGMA query_only=OFF` from `SqliteBackend::reset` fails this — and
-/// ONLY this, which is the point. It is the test the recycle test above was wrongly believed to be.
+/// MUTATION PROVEN: deleting `PRAGMA query_only=OFF` from `SqliteBackend::reset` fails this. It also
+/// fails the recycle test above, which is the correct outcome and not always what this file said —
+/// see that test's note on step 2b.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_user_issued_query_only_pragma_does_not_leak_to_the_next_tenant() {
     let dir = tempfile::tempdir().expect("tempdir");
