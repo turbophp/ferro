@@ -331,3 +331,26 @@ fn handle_fatal_is_a_short_deliberate_list() {
         );
     }
 }
+
+/// **The streaming capability and `query_stream` must agree, and the default is the wrong answer.**
+///
+/// `PoolBackend::supports_row_streaming` defaults to `true`, and `ferrod` reads it as the ONE
+/// authority for refusing a `fetch:stream` early — before any checkout — rather than letting the
+/// refusal arrive part-way through a result set. So a backend whose `query_stream` is `Unsupported`
+/// and whose capability says `true` is not merely inconsistent: it converts a clean, precise error
+/// into a mid-stream one.
+///
+/// C3-3e is what made that reachable (a SQLite pool can now be built at all), so the pairing is
+/// asserted here rather than left to the daemon. **Both halves flip together at C3-5** — this test
+/// is what says so out loud.
+#[tokio::test]
+async fn streaming_capability_agrees_with_query_stream() {
+    use ferro_pool::backend::PoolBackend;
+
+    let backend = ferro_backend_sqlite::SqliteBackend::new("sqlite:///tmp/ferro-never-dialed.db");
+    assert!(
+        !backend.supports_row_streaming(),
+        "the capability must be FALSE while query_stream is Unsupported — inheriting the trait's \
+         `true` default turns ferrod's early, precise refusal into a mid-stream error"
+    );
+}

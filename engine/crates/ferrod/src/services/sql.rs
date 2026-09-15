@@ -361,6 +361,7 @@ async fn handle_exec(
             let streams = match pool {
                 AnyPool::Pg(p) => p.backend().supports_row_streaming(),
                 AnyPool::Mysql(p) => p.backend().supports_row_streaming(),
+                AnyPool::Sqlite(p) => p.backend().supports_row_streaming(),
             };
             if req.fetch == FETCH_STREAM && !streams {
                 responder.end_error(stream_unsupported());
@@ -374,6 +375,7 @@ async fn handle_exec(
             match pool {
                 AnyPool::Pg(p) => run_exec_on_pool(p, responder, &req, sql, cancel).await,
                 AnyPool::Mysql(p) => run_exec_on_pool(p, responder, &req, sql, cancel).await,
+                AnyPool::Sqlite(p) => run_exec_on_pool(p, responder, &req, sql, cancel).await,
             }
         }
     }
@@ -1239,6 +1241,19 @@ async fn handle_begin(
             .await
         }
         AnyPool::Mysql(p) => {
+            begin_on_pool(
+                p,
+                responder,
+                &req,
+                tx_registry,
+                session_id,
+                idle_in_tx,
+                max_tx,
+                teardown_timeout,
+            )
+            .await
+        }
+        AnyPool::Sqlite(p) => {
             begin_on_pool(
                 p,
                 responder,

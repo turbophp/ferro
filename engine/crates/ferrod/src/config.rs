@@ -56,14 +56,16 @@ const DEFAULT_MAX_TX: Duration = Duration::from_secs(60);
 /// Symmetric with the pool's bounded recycle (`PoolConfig::checkout_timeout`).
 const DEFAULT_TX_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The upstream backend a pool speaks (M1-S6). Inferred from the DSN scheme by [`infer_pool_kind`]
-/// (`postgres`/`postgresql` → [`PoolKind::Postgres`]; `mysql`/`mariadb` → [`PoolKind::Mysql`]) — the
-/// daemon has no separate `kind =` knob, the scheme IS the selector. `PoolRegistry::build` matches
-/// on this to construct the right concrete `Pool<B>` variant (`AnyPool`).
+/// The upstream backend a pool speaks (M1-S6; SQLite added at C3-3e). Inferred from the DSN scheme
+/// by [`infer_pool_kind`] (`postgres`/`postgresql` → [`PoolKind::Postgres`]; `mysql`/`mariadb` →
+/// [`PoolKind::Mysql`]; `sqlite` → [`PoolKind::Sqlite`]) — the daemon has no separate `kind =` knob,
+/// the scheme IS the selector. `PoolRegistry::build` matches on this to construct the right concrete
+/// `Pool<B>` variant (`AnyPool`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolKind {
     Postgres,
     Mysql,
+    Sqlite,
 }
 
 impl PoolKind {
@@ -81,6 +83,7 @@ impl PoolKind {
         match self {
             PoolKind::Postgres => "postgres",
             PoolKind::Mysql => "mysql",
+            PoolKind::Sqlite => "sqlite",
         }
     }
 }
@@ -98,12 +101,22 @@ fn loggable_scheme(dsn: &str) -> &str {
 }
 
 /// Infer a pool's [`PoolKind`] from its DSN scheme (the substring before `://`, ASCII-lowercased):
-/// `postgres`/`postgresql` → [`PoolKind::Postgres`]; `mysql`/`mariadb` → [`PoolKind::Mysql`]. An
-/// unrecognized or missing scheme is `tracing::warn!`-ed and defaults to [`PoolKind::Postgres`]
-/// (the M0 backend) — a conservative default that keeps a typo'd scheme from silently disabling a
-/// pool. Pure over its `dsn` input (the warn is a side channel), so it is directly unit-testable.
+/// `postgres`/`postgresql` → [`PoolKind::Postgres`]; `mysql`/`mariadb` → [`PoolKind::Mysql`];
+/// `sqlite` → [`PoolKind::Sqlite`]. An unrecognized or missing scheme is `tracing::warn!`-ed and
+/// defaults to [`PoolKind::Postgres`] (the M0 backend) — a conservative default that keeps a typo'd
+/// scheme from silently disabling a pool. Pure over its `dsn` input (the warn is a side channel), so
+/// it is directly unit-testable.
 /// The DSN VALUE is never logged here (§12) — only the scheme token via [`loggable_scheme`], which
 /// yields `<no scheme>` (never any slice of the DSN) for a schemeless/typo'd credential-bearing DSN.
+///
+/// **A SQLite pool MUST carry the `sqlite://` scheme, and that is narrower than the backend.**
+/// `ferro_backend_sqlite::resolve_path` also accepts a BARE filesystem path (`/var/lib/app.db`),
+/// which is convenient when the backend is driven directly, but a bare path reaches this function
+/// with no scheme at all and therefore lands in the warn-and-default arm above, i.e. it would be
+/// built as a Postgres pool. Widening the inference to "looks like a path" is the one repair not
+/// taken: it is inference rather than declaration (the thing charter rule 6 rules out elsewhere),
+/// and it would swallow precisely the typo'd DSNs the warn arm exists to surface. The scheme is the
+/// selector, so under `ferrod` a SQLite pool is spelled `sqlite:///var/lib/app.db`.
 pub fn infer_pool_kind(dsn: &str) -> PoolKind {
     match dsn
         .split_once("://")
@@ -112,6 +125,7 @@ pub fn infer_pool_kind(dsn: &str) -> PoolKind {
     {
         Some("mysql") | Some("mariadb") => PoolKind::Mysql,
         Some("postgres") | Some("postgresql") => PoolKind::Postgres,
+        Some("sqlite") => PoolKind::Sqlite,
         _ => {
             tracing::warn!(
                 scheme = loggable_scheme(dsn),
@@ -543,12 +557,35 @@ mod tests {
             infer_pool_kind("postgresql://ferro@localhost/ferro"),
             PoolKind::Postgres
         );
+        // C3-3e: the third backend. This line previously asserted `PoolKind::Postgres` — i.e. the
+        // warn-and-default arm — and flipping it is the whole registry-facing change.
+        assert_eq!(
+            infer_pool_kind("sqlite:///var/lib/app.db"),
+            PoolKind::Sqlite
+        );
         // Scheme is case-insensitive.
         assert_eq!(infer_pool_kind("MySQL://h/db"), PoolKind::Mysql);
+        assert_eq!(infer_pool_kind("SQLite:///tmp/a.db"), PoolKind::Sqlite);
         // Unknown / missing scheme defaults to Postgres (the M0 backend), never a panic.
-        assert_eq!(infer_pool_kind("sqlite://x"), PoolKind::Postgres);
         assert_eq!(infer_pool_kind("not-a-dsn"), PoolKind::Postgres);
         assert_eq!(infer_pool_kind(""), PoolKind::Postgres);
+        // A BARE filesystem path is NOT a SQLite pool here, and that is deliberate (see
+        // `infer_pool_kind`'s docs): `ferro_backend_sqlite::resolve_path` accepts one, but it
+        // carries no scheme, so inferring from it would mean guessing "does this look like a path?"
+        // — and would swallow the typo'd DSNs this arm exists to warn about. Under `ferrod` a
+        // SQLite pool is spelled `sqlite://…`.
+        assert_eq!(infer_pool_kind("/var/lib/app.db"), PoolKind::Postgres);
+    }
+
+    /// The `HELLO_ACK` `PoolInfo.kind` token per backend family — the string a driver tier reads to
+    /// pick a platform before it has seen a server version. Asserted for all three because the match
+    /// has no `_` arm precisely so that a new family cannot silently inherit `"postgres"`, and a
+    /// test that omitted the new one would leave that guard unexercised.
+    #[test]
+    fn wire_name_per_backend_family() {
+        assert_eq!(PoolKind::Postgres.wire_name(), "postgres");
+        assert_eq!(PoolKind::Mysql.wire_name(), "mysql");
+        assert_eq!(PoolKind::Sqlite.wire_name(), "sqlite");
     }
 
     /// §12 secret hygiene: the value handed to `tracing::warn!` for an unrecognized/missing scheme

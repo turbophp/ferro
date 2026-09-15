@@ -129,11 +129,20 @@ impl SqliteBackend {
         }
     }
 
-    /// Override the busy timeout — see [`DEFAULT_BUSY_TIMEOUT`] for the bound this should carry and
-    /// the C3-3e wiring debt.
+    /// Override the busy timeout — see [`DEFAULT_BUSY_TIMEOUT`]. Under `ferrod` this is ALWAYS
+    /// called, with the owning pool's `checkout_timeout` (C3-3e); the default applies only when the
+    /// backend is driven directly, as the tests here do.
     pub fn with_busy_timeout(mut self, busy_timeout: Duration) -> Self {
         self.busy_timeout = busy_timeout;
         self
+    }
+
+    /// The busy timeout this backend opens its connections with. Exists so the C3-3e wiring can be
+    /// asserted at the seam it crosses — the registry builds the backend, and without a reader the
+    /// only evidence that the pool's `checkout_timeout` arrived would be that a timing test passed,
+    /// which a wrong-but-similar value would also produce.
+    pub fn busy_timeout(&self) -> Duration {
+        self.busy_timeout
     }
 
     /// Run `f` on the blocking pool with the connection MOVED in and back out.
@@ -613,6 +622,19 @@ impl PoolBackend for SqliteBackend {
     type Conn = SqliteConn;
     type RowStream = SqliteRowStream;
     type CancelHandle = SqliteCancel;
+
+    /// **False until C3-5, and it MUST be stated rather than inherited.** The trait's default is
+    /// `true`, and `ferrod`'s EXEC handler reads exactly this one method as the single authority for
+    /// the streaming capability (M1-S8a) so that a `fetch:stream` against a backend that cannot
+    /// stream is refused EARLY — before any checkout — instead of surfacing as an error part-way
+    /// through a result set the client has already begun consuming.
+    ///
+    /// Inheriting the default would therefore have been a live defect the moment C3-3e made a SQLite
+    /// pool reachable: the capability check would pass and `query_stream`'s `Unsupported` would
+    /// arrive mid-stream. It was unreachable before only because nothing could build such a pool.
+    fn supports_row_streaming(&self) -> bool {
+        false
+    }
 
     fn cancel_handle(&self, conn: &Self::Conn) -> Self::CancelHandle {
         // A connection with no live handle still yields a handle-shaped value the pool can hold;

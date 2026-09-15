@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use ferro_backend_mysql::MysqlBackend;
 use ferro_backend_pg::PgBackend;
+use ferro_backend_sqlite::SqliteBackend;
 use ferro_pool::backend::{Cancel, PoolBackend};
 use ferro_pool::config::PoolConfig;
 use ferro_pool::pool::Pool;
@@ -31,12 +32,17 @@ use ferro_proto::value::Value;
 
 use crate::config::{Config, PoolKind, PoolSpec};
 
-/// One resolved pool of either supported backend. The SQL/TX handlers `match` on this and call the
-/// same generic handler body with the concrete `Pool<B>` — both arms monomorphize, and the request
+/// One resolved pool of any supported backend. The SQL/TX handlers `match` on this and call the
+/// same generic handler body with the concrete `Pool<B>` — every arm monomorphizes, and the request
 /// terminal is declared via the `Responder` (no typed return), so the arms unify cleanly.
 pub enum AnyPool {
     Pg(Pool<PgBackend>),
     Mysql(Pool<MysqlBackend>),
+    /// C3-3e. The third arm, and the first one whose backend is a LIBRARY rather than a wire
+    /// protocol: every `PoolBackend` method crosses `spawn_blocking` (SPEC §22.2 (bd)). Nothing
+    /// about the registry changes for it — which is the point, and the check the `PoolBackend`
+    /// seam has to pass to be worth having.
+    Sqlite(Pool<SqliteBackend>),
 }
 
 /// Daemon per-pool defaults (M0). Deliberately modest, not tuned: correctness over throughput
@@ -107,11 +113,24 @@ const VERSION_CANCEL_BUDGET: Duration = Duration::from_secs(2);
 /// rather than handing a mid-protocol session to the next tenant (charter rule 6).
 const VERSION_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
-/// The version statement. Works VERBATIM on PostgreSQL, MySQL and MariaDB (function names are
-/// case-insensitive in the MySQL family), so no per-backend method is needed — and it is a plain
-/// leading `SELECT`, which the S2 assist lexer's safe-list accepts, so the probe does not taint the
-/// connection it borrows.
+/// The version statement for the two WIRE backends. Works VERBATIM on PostgreSQL, MySQL and MariaDB
+/// (function names are case-insensitive in the MySQL family) — and it is a plain leading `SELECT`,
+/// which the S2 assist lexer's safe-list accepts, so the probe does not taint the connection it
+/// borrows.
+///
+/// **It does NOT work on the third backend, and that premise was MEASURED, not assumed** (C3-3e).
+/// This comment used to read "so no per-backend method is needed"; SQLite has no `version()` at all
+/// and answers `SELECT version()` with `no such function` (extended code 1). Had the SQLite arm
+/// shipped without [`SQLITE_VERSION_SQL`], every probe on such a pool would have failed and
+/// `HELLO_ACK` would have advertised a nil `server_version` — safe, because both driver tiers refuse
+/// a nil version loudly by naming the pool (D-S8b-1), but it would have surfaced at C3-6 as a
+/// mystery rather than here as a one-line difference.
 const VERSION_SQL: &str = "SELECT version()";
+
+/// The version statement for SQLite. See [`VERSION_SQL`] for why there are two: the function is
+/// spelled differently, not merely aliased. Still a plain leading `SELECT`, so the safe-list
+/// property that keeps the probe from tainting its borrowed connection carries over unchanged.
+const SQLITE_VERSION_SQL: &str = "SELECT sqlite_version()";
 
 /// Every knob the version probe is bounded by, in ONE value.
 ///
@@ -125,8 +144,13 @@ const VERSION_SQL: &str = "SELECT version()";
 /// the same code the daemon runs.
 #[derive(Clone, Debug)]
 struct ProbeTuning {
-    /// See [`VERSION_SQL`].
+    /// See [`VERSION_SQL`]. Used for the PostgreSQL and MySQL-family arms.
     version_sql: String,
+    /// See [`SQLITE_VERSION_SQL`]. Separate field rather than a branch inside the probe so a test
+    /// can drive EITHER statement — a single overridable field would have left the SQLite arm
+    /// permanently un-steerable, which is how the arm nobody can exercise becomes the arm nobody
+    /// notices is wrong.
+    sqlite_version_sql: String,
     /// See [`VERSION_TTL`].
     ttl: Duration,
     /// See [`VERSION_RETRY_BACKOFF`].
@@ -161,6 +185,7 @@ impl Default for ProbeTuning {
     fn default() -> Self {
         Self {
             version_sql: VERSION_SQL.to_string(),
+            sqlite_version_sql: SQLITE_VERSION_SQL.to_string(),
             ttl: VERSION_TTL,
             backoff: VERSION_RETRY_BACKOFF,
             call_budget: VERSION_PROBE_BUDGET,
@@ -257,6 +282,17 @@ impl PoolRegistry {
                 PoolKind::Mysql => {
                     AnyPool::Mysql(Pool::new(MysqlBackend::new(spec.dsn.clone()), cfg))
                 }
+                // C3-3a's wiring debt, discharged: the backend gets the pool's ACTUAL
+                // `checkout_timeout` as its `busy_timeout` rather than the standalone default it
+                // carries when driven directly. The two must agree or the pool misbehaves in one of
+                // two ways — a busy wait LONGER than the checkout timeout parks a tenant past the
+                // deadline that was supposed to bound it, and a SHORTER one gives up on contention
+                // the pool was still willing to wait out. `Duration` is `Copy`, so this reads the
+                // value before `cfg` moves into `Pool::new`.
+                PoolKind::Sqlite => AnyPool::Sqlite(Pool::new(
+                    SqliteBackend::new(spec.dsn.clone()).with_busy_timeout(cfg.checkout_timeout),
+                    cfg,
+                )),
             };
             tracing::info!(pool = %spec.name, kind = ?spec.kind, "ferrod: built connection pool");
             by_name.insert(
@@ -519,8 +555,9 @@ async fn probe_version(pool: &AnyPool, tuning: &ProbeTuning) -> Probed {
         panic!("ferrod test fault: the server-version probe panicked");
     }
     match pool {
-        AnyPool::Pg(p) => probe_version_on(p, tuning).await,
-        AnyPool::Mysql(p) => probe_version_on(p, tuning).await,
+        AnyPool::Pg(p) => probe_version_on(p, tuning, &tuning.version_sql).await,
+        AnyPool::Mysql(p) => probe_version_on(p, tuning, &tuning.version_sql).await,
+        AnyPool::Sqlite(p) => probe_version_on(p, tuning, &tuning.sqlite_version_sql).await,
     }
 }
 
@@ -544,7 +581,11 @@ async fn probe_version(pool: &AnyPool, tuning: &ProbeTuning) -> Probed {
 /// a probe that never returns is what seals a pool permanently un-probeable. Two of those awaits
 /// (the dial and the cancel) can be DROPPED safely: neither has a pooled connection in hand. The
 /// drain cannot, so when it is the one that expires the checkout is force-TAINTED before release.
-async fn probe_version_on<B: PoolBackend>(pool: &Pool<B>, tuning: &ProbeTuning) -> Probed {
+async fn probe_version_on<B: PoolBackend>(
+    pool: &Pool<B>,
+    tuning: &ProbeTuning,
+    version_sql: &str,
+) -> Probed {
     // A dial failure surfaces immediately (`Pool::checkout` has no hidden retry loop); a black-holed
     // host would otherwise never return, hence the bound. Dropping THIS future is safe: no
     // connection has been handed out and the semaphore permit releases with it.
@@ -569,7 +610,7 @@ async fn probe_version_on<B: PoolBackend>(pool: &Pool<B>, tuning: &ProbeTuning) 
         // Captured BEFORE the mutable query borrow: it returns an OWNED handle, so this borrow ends
         // immediately and does not conflict with the `&mut co` the query future then holds.
         let cancel_handle = co.cancel_handle();
-        let fut = co.query(&tuning.version_sql, &[]);
+        let fut = co.query(version_sql, &[]);
         tokio::pin!(fut);
         tokio::select! {
             biased;
@@ -667,14 +708,50 @@ mod tests {
             pools: vec![
                 spec("pg", "postgres://user@127.0.0.1:5432/app"),
                 spec("my", "mysql://user@127.0.0.1:3306/app"),
+                spec("lite", "sqlite:///tmp/ferro-never-dialed.db"),
             ],
             ..Config::default()
         };
         let registry = PoolRegistry::build(&config);
-        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.len(), 3);
         assert!(matches!(registry.get("pg"), Some(AnyPool::Pg(_))));
         assert!(matches!(registry.get("my"), Some(AnyPool::Mysql(_))));
+        assert!(matches!(registry.get("lite"), Some(AnyPool::Sqlite(_))));
         assert!(registry.get("nope").is_none());
+    }
+
+    /// C3-3a's wiring debt at the seam it crosses: the registry hands the SQLite backend the pool's
+    /// `checkout_timeout` as its `busy_timeout`.
+    ///
+    /// **What this proves and what it does NOT, stated rather than left to be discovered.**
+    /// `ferro_backend_sqlite::DEFAULT_BUSY_TIMEOUT` and [`DEFAULT_POOL_CHECKOUT_TIMEOUT`] are both
+    /// 5 s today, so numerically this assertion would hold even if `build_with` never called
+    /// `with_busy_timeout` at all. It pins the INTENT — and it stops silently passing the moment
+    /// either constant moves, which is exactly when a stale wiring would start doing damage. The
+    /// behavioural half, which genuinely distinguishes wired from defaulted, is
+    /// `tests/sqlite_begin_lockstep_it.rs`'s
+    /// `the_pools_checkout_timeout_becomes_the_connections_busy_timeout`, run at 250 ms against the
+    /// 5 s default.
+    ///
+    /// Closing the gap entirely needs a per-pool `checkout_timeout` knob, which `daemon_pool_config`
+    /// does not have (every pool gets the same constant). That is a config change, not this slice's.
+    #[tokio::test]
+    async fn sqlite_pool_takes_its_busy_timeout_from_the_pool_config() {
+        let spec = spec("lite", "sqlite:///tmp/ferro-never-dialed.db");
+        let expected = daemon_pool_config(&spec).checkout_timeout;
+        let config = Config {
+            pools: vec![spec],
+            ..Config::default()
+        };
+        let registry = PoolRegistry::build(&config);
+        let Some(AnyPool::Sqlite(pool)) = registry.get("lite") else {
+            panic!("a sqlite:// DSN must build the Sqlite variant");
+        };
+        assert_eq!(
+            pool.backend().busy_timeout(),
+            expected,
+            "the backend must open its connections with the pool's own checkout timeout"
+        );
     }
 
     /// Three pools whose kinds are INFERRED from their DSN schemes (never hard-set), pointed at
@@ -962,6 +1039,53 @@ mod tests {
         }
     }
 
+    /// **The SQLite version probe reaches a real answer, and the wrong statement is proven wrong.**
+    ///
+    /// This arm exists because [`VERSION_SQL`]'s own comment used to claim no per-backend statement
+    /// was needed. SQLite has no `version()` at all, so without [`SQLITE_VERSION_SQL`] every probe
+    /// on such a pool fails and `HELLO_ACK` advertises a nil `server_version` — which both driver
+    /// tiers turn into a loud refusal naming the pool (D-S8b-1), so it is safe, but it would have
+    /// surfaced at C3-6 as a mystery.
+    ///
+    /// Unlike the other probe tests this one runs against a REAL backend, because SQLite needs no
+    /// server: the pool dials a temp file and answers. The second half re-runs the identical
+    /// registry with the PostgreSQL statement substituted, which is what makes the first half a
+    /// measurement rather than an assumption — it is the same code path, differing only in the
+    /// string, and it comes back with no version at all.
+    #[tokio::test]
+    async fn sqlite_pool_probes_its_own_version_function() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dsn = format!("sqlite://{}", dir.path().join("probe.db").display());
+
+        let registry = PoolRegistry::build_tuned(&one_pool("lite", &dsn), inert_tuning());
+        let info = registry.pool_info().await;
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].kind, "sqlite");
+        let version = info[0]
+            .server_version
+            .as_deref()
+            .expect("a SQLite pool must report a server version");
+        assert!(
+            version.starts_with('3'),
+            "expected a SQLite 3.x version string, got {version:?}"
+        );
+
+        // The control: the same registry, the same file, the PG/MySQL statement. `version()` does
+        // not exist in SQLite (`no such function`), so the probe fails and nothing is advertised.
+        let registry = PoolRegistry::build_tuned(
+            &one_pool("lite", &dsn),
+            ProbeTuning {
+                sqlite_version_sql: VERSION_SQL.to_string(),
+                ..inert_tuning()
+            },
+        );
+        let info = registry.pool_info().await;
+        assert_eq!(
+            info[0].server_version, None,
+            "`SELECT version()` must NOT accidentally work on SQLite — if it does, the per-backend              statement this test defends is unnecessary and the reasoning behind it is wrong"
+        );
+    }
+
     fn one_pool(name: &str, dsn: &str) -> Config {
         Config {
             pools: vec![spec(name, dsn)],
@@ -979,6 +1103,7 @@ mod tests {
         match pool {
             AnyPool::Pg(p) => p.poison_idle_for_test(|_| seen = true),
             AnyPool::Mysql(p) => p.poison_idle_for_test(|_| seen = true),
+            AnyPool::Sqlite(p) => p.poison_idle_for_test(|_| seen = true),
         }
         seen
     }
