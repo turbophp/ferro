@@ -1,6 +1,6 @@
 # Follow-up: the PG bind matrix is narrower than libpq in the `I64 → text/bool` direction
 
-> **RESOLVED (M1-S9, 2026-09-09).** Both widenings shipped in `PgInt`, SPEC §22.2 (af):
+> **STATUS: RESOLVED** (M1-S9, 2026-09-09). Both widenings shipped in `PgInt`, SPEC §22.2 (af):
 > `I64 → text` (`Type::TEXT` only — the measured target; decimal rendering, `Format::Text`) and
 > `I64 → bool` with the explicit decision this doc demanded made in favour of a **value gate** —
 > only 0 and 1 bind (exactly what Doctrine's `BooleanType` emits), every other integer is refused

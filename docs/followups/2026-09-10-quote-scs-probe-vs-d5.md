@@ -1,5 +1,9 @@
 # Follow-up: `quote()`'s `standard_conforming_strings` probe is a round trip, and D5 says there is none
 
+> **STATUS: RESOLVED** (M2, C2g, SPEC §22.2 (at)). `HELLO_ACK` advertises `literals_are_standard`
+> per pool at `protocol_version` 3, learned from a `GUC_REPORT` `ParameterStatus` at zero cost, so
+> `quote()` sends nothing and D5 is satisfied rather than merely noted.
+
 **Status: RESOLVED in M2-C2g** (SPEC §22.2 (at)). `HELLO_ACK` advertises `literals_are_standard`
 per pool; `FerroPdoShim::quote()` reads it from `poolInfo()` and sends nothing on the wire, asserted
 on the session's own sent-frame record. The rest of this document is kept as the record of how the

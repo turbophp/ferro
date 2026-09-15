@@ -1,6 +1,6 @@
 # Follow-up: one missing PG catalog type (`int2vector`) blocks the whole stock schema manager
 
-> **RESOLVED (M1-S9, 2026-09-08).** `int2vector` (22) and `oidvector` (30) are admitted on the
+> **STATUS: RESOLVED** (M1-S9, 2026-09-08). `int2vector` (22) and `oidvector` (30) are admitted on the
 > read path as `TAG_TEXT`, rendering PG's own space-separated text, proven live byte-for-byte
 > against the `::text` oracle on real `pg_index.indkey` / `pg_proc.proargtypes` cells. All three
 > open questions below are answered in SPEC §22.2 (ae): the text form matches `pdo_pgsql` exactly

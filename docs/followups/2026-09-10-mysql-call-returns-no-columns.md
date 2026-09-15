@@ -1,5 +1,11 @@
 # Spike: the MySQL `CALL` blind spot is where Ferro READS the column metadata
 
+> **STATUS: RESOLVED** (M2, SPEC §22.2 (av) buffered + (aw) streamed). A MySQL `CALL` returns real
+> cells: `cols` falls back to the EXECUTED result set's metadata when the PREPARED statement
+> declares none. **This closes the defect, not the whole of C1a**: the `/proto` multi-result-set
+> change is separately DEFERRED below, on the different and stated ground that no tier can reach a
+> second result set today.
+
 **Status: SPIKE ANSWERED.** `engine/crates/ferro-backend-mysql/tests/call_columns_spike_it.rs` ran
 green against live MySQL in CI's `integration` lane (run 34466153085, job 102835108802,
 2026-09-10). Its output is recorded below, and **the diagnosis is confirmed exactly**. Every claim below is marked **VERIFIED (source)** — read out of this

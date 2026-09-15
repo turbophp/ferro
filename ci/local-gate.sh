@@ -69,5 +69,8 @@ if [ "$live" = 1 ]; then
 fi
 echo "== php(dbal): phpstan ==" ; (cd php/doctrine-dbal && ./vendor/bin/phpstan analyse src --level 9)
 echo "== d12 gate ==" ; ./ci/check-d12-recorded.sh
+# The §14–15 incompatibilities page: its citations must still resolve. A file check, so it costs
+# nothing and runs in both modes — and it is in ci.yml, which this script may never be weaker than.
+echo "== incompatibilities doc gate ==" ; ./ci/check-incompatibilities-doc.sh
 if [ "$live" = 1 ]; then echo "ALL GATES GREEN (live: pg + mysql + mariadb + php live tier)"
 else echo "ALL GATES GREEN (OFFLINE — live suites skipped; re-run with --live before pushing)"; fi

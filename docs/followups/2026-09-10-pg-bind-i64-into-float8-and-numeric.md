@@ -1,6 +1,6 @@
 # Follow-up: the PG bind matrix refuses `I64 → float8` and `I64 → numeric`
 
-> **RESOLVED (M2-C2b, 2026-09-10).** Both widenings shipped in `PgInt`, SPEC §22.2 (an), exactly as
+> **STATUS: RESOLVED** (M2-C2b, 2026-09-10). Both widenings shipped in `PgInt`, SPEC §22.2 (an), exactly as
 > designed below: `NUMERIC` with **no value gate** (arbitrary-precision, so an `i64`'s decimal
 > rendering is exact at every magnitude, sent `Format::Text`) and `FLOAT8` **gated on exact
 > representability** (refused pre-send otherwise, naming both routes out). `FLOAT4` was deliberately

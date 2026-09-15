@@ -1,5 +1,10 @@
 # Follow-up: an `I64` at or above 2^32 is unreadable by `php/client`, on every value policy
 
+> **STATUS: RESOLVED** (M1-S9 / m1-s8c). The whole int64 range reads, on every backend and every
+> value policy, with an ext-vs-pure packer conformance test beside it. The product claim — a
+> `bigint` column is readable — is pinned live by `php/client/tests/Live/I64RangeLiveTest.php`,
+> which round-trips each boundary through a real `int8`/`BIGINT` COLUMN rather than only a literal.
+
 **Found:** first as M1-S8b Task 7 finding F2 (journalled, not fixed — the task was the bind
 direction). **Independently re-measured at the M1-S8b Task 14 acceptance gate**, twice: by the
 upstream `Types\BigIntTypeTest::testSelectBigInt` on **all three backends**, and by a standalone
