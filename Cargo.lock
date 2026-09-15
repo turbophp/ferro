@@ -324,6 +324,7 @@ name = "ferro-backend-sqlite"
 version = "0.0.0"
 dependencies = [
  "ferro-pool",
+ "ferro-proto",
  "rusqlite",
  "tempfile",
  "tokio",

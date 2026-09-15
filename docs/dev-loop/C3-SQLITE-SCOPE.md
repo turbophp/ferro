@@ -208,6 +208,7 @@ five storage classes.
 - **C3-3b** — `tx_status` (via `is_autocommit`), `reset`/`clean_reset_profile`, `simple_query`.
   **DONE 2026-09-15** — see §12.
 - **C3-3c** — `query` + the row/value mapping (SQLite's five storage classes → the §9 tags).
+  **DONE 2026-09-15** — see §13.
 - **C3-3d** — `cancel_handle` off `InterruptHandle`, and the `error_map` fate table.
 - **C3-3e** — the third `AnyPool` arm: the backend becomes reachable at runtime here, and ONLY
   here. Everything above is unit-testable in-crate; nothing before this point changes `ferrod`.
@@ -506,3 +507,68 @@ statement does not lose the handle — only a panicking blocking task does. It w
 actually verifies, and the real contract moved to a unit test where the private blocking bridge is
 reachable. A test whose name and body disagree is worse than no test: the name is what a later
 reader greps for.
+
+---
+
+## 13. C3-3c: `query` and the storage-class mapping (2026-09-15) — DONE
+
+**The mapping keys on the VALUE's storage class, not the column's declared type.** Measured first:
+
+```text
+DECL: i:INTEGER | r:REAL | tx:TEXT | b:BLOB | n:NUMERIC | none_col:<NONE>
+ROW1: INT       | REAL   | TEXT    | BLOB   | INT       | INT
+ROW2: TEXT      | TEXT   | TEXT    | TEXT   | TEXT      | TEXT
+```
+
+Two facts rule out a per-column mapping between them: **a single column's storage class changes
+between rows**, and **every expression column reports no declared type** (`1+1`, `'lit'`,
+`count(*)` all `<NONE>`) — a large, ordinary class of queries for which the declared type carries
+nothing at all.
+
+### The objection, and why it dissolves
+
+Per-value tagging would make the `cols` header a lie for a heterogeneous column — except
+**`ColMeta.tag` has no consumer**. The PHP client drops it deliberately in BOTH paths and says so
+(`Connection.php`, F25/hazard 47): *"The decode authority is the PER-CELL tag … not the column
+metadata."* Nothing in `ferrod` reads it. Every cell is self-describing on the wire, so per-cell
+tagging is what the client already relies on rather than a compromise.
+
+`ColMeta.tag` is filled from the first row's storage class (NULL for an empty result) — describing
+the data returned rather than a declaration SQLite does not enforce — and documented as advisory.
+
+*This corrects the framing this slice was handed*, which posed the header as the central cost. It
+is not, and checking for a consumer before designing around it is the same discipline that stopped
+C3-3 building a seam nothing would read.
+
+### Nine of fourteen §9 tags are unreachable BY CONSTRUCTION
+
+| tag | why |
+| --- | --- |
+| `BOOL` | No boolean type; `0`/`1` read back `I64`. A column declared `BOOLEAN` is not enforced. |
+| `U64` | INTEGER is SIGNED 64-bit. |
+| `DECIMAL` | NUMERIC affinity stores INTEGER or REAL — `42` arrives as INTEGER. |
+| `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ` | No date-time storage class; dates are TEXT/INTEGER/REAL by convention. |
+| `UUID` | No UUID type. |
+| `JSON` | The JSON functions operate on TEXT. |
+
+Named rather than filled with an invented mapping, per S7's `UUID` precedent. **Drop-in
+consequence for C3-6:** a SQLite column holding an ISO date reads back as `TEXT`, not a §9 `Date` —
+what PDO's SQLite driver also does, but a real asymmetry against the other two backends.
+
+The BIND direction is deliberately not symmetric: all fourteen bind, with the canonical-text tags
+landing in TEXT. `U64` above `i64::MAX` is refused pre-send rather than wrapped (§9.1).
+
+### `last_insert_rowid()` is sticky too
+
+Exactly like `changes()` — after a SELECT it still reports the previous INSERT's rowid. So it is
+reported only when the statement actually MOVED it; carrying it over would be a silently wrong key,
+which §22.2 (m) already records (from PG's `lastval()`) as strictly worse than no key. Residual: an
+INSERT explicitly reusing the previous rowid reports `None`, erring safe. Mutation-proven, as is
+the `U64` refusal.
+
+### Process note
+
+The `column_decltype` feature was enabled to run the probe and **removed again once the decision
+went the other way** — an unused feature flag is dependency surface with no caller. Also: the
+mutation round briefly corrupted `rowmap.rs` because it was still UNTRACKED, so `git checkout`
+could not restore it. **`git add` new files before mutation testing**, or the safety net is not there.
