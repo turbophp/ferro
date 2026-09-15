@@ -582,6 +582,7 @@ pub fn exec_server(url: String) -> TestServer {
             kind,
             pin_functions: Vec::new(),
             pin_on_unknown: true,
+            allow_dir: None,
         }],
         ..Config::default()
     };
@@ -616,6 +617,7 @@ pub fn pools_server(pools: &[(&str, &str)]) -> (TestServer, Arc<PoolRegistry>) {
                 kind: ferrod::config::infer_pool_kind(dsn),
                 pin_functions: Vec::new(),
                 pin_on_unknown: true,
+                allow_dir: None,
             })
             .collect(),
         ..Config::default()
@@ -656,6 +658,7 @@ pub fn stream_server(url: String, credit_frames: u32) -> TestServer {
             kind,
             pin_functions: Vec::new(),
             pin_on_unknown: true,
+            allow_dir: None,
         }],
         ..Config::default()
     };

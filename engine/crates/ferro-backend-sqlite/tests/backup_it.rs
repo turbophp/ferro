@@ -29,6 +29,8 @@ use ferro_proto::value::Value;
 /// Spelled out rather than taken from `rusqlite`'s `ErrorCode`, whose discriminants are declaration
 /// order and not SQLite's codes (the C3-1 trap: `DatabaseBusy` is 3, `SQLITE_BUSY` is 5).
 const SQLITE_READONLY: i32 = 8;
+/// `SQLITE_AUTH` — what the D14 path guard's `Deny` produces.
+const SQLITE_AUTH: i32 = 23;
 
 fn pool_on(path: &std::path::Path, max_size: usize) -> Pool<SqliteBackend> {
     let config = PoolConfig {
@@ -42,6 +44,24 @@ fn pool_on(path: &std::path::Path, max_size: usize) -> Pool<SqliteBackend> {
     Pool::new(
         SqliteBackend::new(format!("sqlite://{}", path.display()))
             .with_busy_timeout(config.checkout_timeout),
+        config,
+    )
+}
+
+/// Same pool, with D14's allowed directory WIDENED by the operator.
+fn pool_allowing(path: &std::path::Path, allow: &std::path::Path) -> Pool<SqliteBackend> {
+    let config = PoolConfig {
+        max_size: 1,
+        checkout_timeout: Duration::from_secs(5),
+        max_lifetime: Duration::from_secs(60),
+        reap_interval: None,
+        pin_functions: Vec::new(),
+        pin_on_unknown: true,
+    };
+    Pool::new(
+        SqliteBackend::new(format!("sqlite://{}", path.display()))
+            .with_busy_timeout(config.checkout_timeout)
+            .with_allow_dir(allow),
         config,
     )
 }
@@ -225,27 +245,18 @@ async fn a_declared_readonly_checkout_cannot_take_a_snapshot() {
     assert_eq!(rows_in_snapshot(&snap), 10);
 }
 
-/// **TRIPWIRE, and it is green on purpose: a tenant can ALREADY write a copy of the database to any
-/// path the daemon can write, with no `VACUUM INTO` involved.**
+/// **THE BOUNDARY IS CLOSED — SPEC D14, and this test was a TRIPWIRE until it was.**
 ///
-/// This test asserts a capability rather than a guarantee, which is unusual and deliberate — the
-/// C3-6a `foreign_keys` precedent. While scoping C3-7 it looked as though `VACUUM INTO` introduced
-/// a §12/D8 hole: the engine owns the database file precisely so PHP never learns its path, yet the
-/// statement lets the CLIENT name a path the engine will write. Refusing it was the obvious fix.
+/// C3-7a found that a tenant could write a copy of the whole database to any path the daemon can
+/// write, and deliberately asserted that CAPABILITY, green, so the open decision could not be
+/// forgotten. D14 answered it, so the assertion inverts: the same statements are now refused.
 ///
-/// It would have been security theatre, and only a measurement showed that. `ATTACH` is permitted
-/// by design (C3-3b's hygiene list exists to DETACH it afterwards), and inside one transaction —
-/// where the pool pins every statement to one connection — `ATTACH` plus an ordinary
-/// `CREATE TABLE … AS SELECT` writes exactly the same copy to exactly the same arbitrary path.
-/// Outside a transaction it does not: the attachment is gone by the next checkout, because `ATTACH`
-/// taints unconditionally (§22.2 (bm)). So the boundary is real but general, it predates C3-7, and
-/// closing it means deciding whether a tenant statement may name a filesystem path AT ALL — a §21
-/// question raised for the owner, not something to patch one verb at a time.
-///
-/// If that decision closes the boundary, this test goes RED and must be rewritten deliberately.
-/// That is the point of it.
+/// Refusing `VACUUM INTO` by name would have been security theatre — this shape, `ATTACH` plus an
+/// ordinary `CREATE TABLE … AS SELECT` inside one transaction, produced the identical copy. Both
+/// verbs reach SQLite's authorizer as the SAME `SQLITE_ATTACH` event, which is why one guard closes
+/// both without parsing any SQL.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tripwire_a_tenant_can_already_copy_the_database_to_an_arbitrary_path() {
+async fn a_tenant_cannot_copy_the_database_outside_the_allowed_directory() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pool = pool_on(&dir.path().join("main.db"), 1);
     seed(&pool, 30).await;
@@ -254,28 +265,95 @@ async fn tripwire_a_tenant_can_already_copy_the_database_to_an_arbitrary_path() 
     let elsewhere = tempfile::tempdir().expect("second tempdir");
     let side = elsewhere.path().join("copy.db");
 
+    let mut co = pool.checkout().await.expect("checkout");
+    co.begin_tx_with(TxId(7), "BEGIN IMMEDIATE")
+        .await
+        .expect("begin");
+    let err = co
+        .exec(&format!("ATTACH DATABASE '{}' AS side", side.display()))
+        .await
+        .expect_err("D14 must refuse a file outside the allowed directory");
+
+    assert_eq!(
+        errno_of(&err),
+        Some(SQLITE_AUTH),
+        "expected SQLITE_AUTH, got {err:?}"
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("allow_dir"),
+        "the refusal must say what to do about it, got {msg}"
+    );
+    assert!(!side.exists(), "a refused ATTACH still created the file");
+
+    co.rollback_tx().await.expect("rollback");
+}
+
+/// The same for `VACUUM INTO`, because the whole argument for the authorizer is that ONE guard
+/// covers both verbs. A denial here creates NO file at all — unlike the declared-readonly refusal
+/// above, which leaves a zero-byte one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_outside_the_allowed_directory_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = pool_on(&dir.path().join("main.db"), 1);
+    seed(&pool, 10).await;
+
+    let elsewhere = tempfile::tempdir().expect("second tempdir");
+    let snap = elsewhere.path().join("snap.db");
+
+    let mut co = pool.checkout().await.expect("checkout");
+    let err = co
+        .exec(&format!("VACUUM INTO '{}'", snap.display()))
+        .await
+        .expect_err("D14 must refuse a snapshot outside the allowed directory");
+
+    assert_eq!(
+        errno_of(&err),
+        Some(SQLITE_AUTH),
+        "expected SQLITE_AUTH, got {err:?}"
+    );
+    assert!(!snap.exists(), "a refused snapshot created a file anyway");
+}
+
+/// **The operator knob, and the reason D14 is not merely a refusal.** Pointing snapshots at a
+/// backup volume is the legitimate case, and it must work — otherwise the decision would have made
+/// the §7.6 feature unreachable rather than safe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_operator_configured_directory_is_allowed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backups = tempfile::tempdir().expect("backup volume");
+    let pool = pool_allowing(&dir.path().join("main.db"), backups.path());
+    seed(&pool, 40).await;
+
+    let snap = backups.path().join("snap.db");
     {
         let mut co = pool.checkout().await.expect("checkout");
-        co.begin_tx_with(TxId(7), "BEGIN IMMEDIATE")
+        co.exec(&format!("VACUUM INTO '{}'", snap.display()))
             .await
-            .expect("begin");
-        co.exec(&format!("ATTACH DATABASE '{}' AS side", side.display()))
-            .await
-            .expect("ATTACH is permitted by design");
-        co.exec("CREATE TABLE side.copy AS SELECT * FROM t")
-            .await
-            .expect("an ordinary statement");
-        co.commit_tx().await.expect("commit");
+            .expect("the operator widened the directory, so this must succeed");
     }
+    assert_eq!(rows_in_snapshot(&snap), 40);
+}
 
-    let conn = rusqlite::Connection::open(&side).expect("open the side database");
-    let n: i64 = conn
-        .query_row("SELECT count(*) FROM copy", [], |r| r.get(0))
-        .expect("read the copy outside the engine");
-    assert_eq!(
-        n, 30,
-        "the copy is readable outside the engine — this is the open boundary, not a bug in the test"
-    );
+/// **Widening is not the same as opening.** A pool configured with a backup directory must still
+/// refuse everywhere else — otherwise `with_allow_dir` would read as "turn the guard off".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn widening_the_directory_does_not_disable_the_guard() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backups = tempfile::tempdir().expect("backup volume");
+    let elsewhere = tempfile::tempdir().expect("third place");
+    let pool = pool_allowing(&dir.path().join("main.db"), backups.path());
+    seed(&pool, 5).await;
+
+    let mut co = pool.checkout().await.expect("checkout");
+    let err = co
+        .exec(&format!(
+            "VACUUM INTO '{}'",
+            elsewhere.path().join("snap.db").display()
+        ))
+        .await
+        .expect_err("a widened pool must still refuse a third directory");
+    assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "got {err:?}");
 }
 
 /// The `ATTACH` half of the tripwire above, WITHOUT a transaction — the control that shows the
@@ -287,8 +365,9 @@ async fn an_attachment_does_not_survive_to_the_next_statement() {
     let pool = pool_on(&dir.path().join("main.db"), 1);
     seed(&pool, 5).await;
 
-    let elsewhere = tempfile::tempdir().expect("second tempdir");
-    let side = elsewhere.path().join("side.db");
+    // INSIDE the allowed directory now (D14), so this test still measures what it always did —
+    // the pooling contract — rather than silently becoming a second copy of the guard test.
+    let side = dir.path().join("side.db");
 
     {
         let mut co = pool.checkout().await.expect("checkout");
@@ -308,6 +387,70 @@ async fn an_attachment_does_not_survive_to_the_next_statement() {
             "expected 'unknown database side', got {msg}"
         );
     }
+}
+
+/// **`..` must not walk out, which is why the root is canonicalised once at dial.**
+///
+/// A guard that compared path STRINGS would pass every other test in this file and fall to this
+/// one line. The check resolves the candidate's parent before comparing, so a traversal that lands
+/// outside the root is refused however it is spelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dot_dot_traversal_does_not_escape_the_allowed_directory() {
+    let outer = tempfile::tempdir().expect("tempdir");
+    let inner = outer.path().join("db");
+    std::fs::create_dir(&inner).expect("mkdir");
+    let pool = pool_on(&inner.join("main.db"), 1);
+    seed(&pool, 5).await;
+
+    // Spelled relative to the allowed directory, resolving to its PARENT.
+    let escape = inner.join("..").join("escape.db");
+    let mut co = pool.checkout().await.expect("checkout");
+    let err = co
+        .exec(&format!("VACUUM INTO '{}'", escape.display()))
+        .await
+        .expect_err("a `..` traversal must not escape the allowed directory");
+
+    assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "got {err:?}");
+    assert!(
+        !outer.path().join("escape.db").exists(),
+        "the traversal created a file outside the allowed directory"
+    );
+}
+
+/// **The guard must survive a RECYCLE, and that is not automatic.**
+///
+/// §22.2 (bm) made `ResetProfile::Full` a close-and-reopen, so a tainted connection is served by a
+/// connection `open_configured` built a second time. If the guard were installed only on the
+/// fresh-dial path, enforcement would depend on POOL OCCUPANCY — exactly the C3-4 failure, green in
+/// any test that does not recycle first.
+///
+/// `max_size` is 1 so "the next tenant" is necessarily the same connection recycled, and the taint
+/// is a `PRAGMA` (which taints unconditionally) applied on a SUCCEEDING statement — a setup step
+/// that ended in a FAILED one would silently convert this into a fresh-dial test (the C3-4 lesson).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_guard_survives_a_recycle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = pool_on(&dir.path().join("main.db"), 1);
+    seed(&pool, 5).await;
+
+    // Tenant 1 taints the connection, so tenant 2 gets the FULL reset — a reopen.
+    {
+        let mut co = pool.checkout().await.expect("checkout 1");
+        co.exec("PRAGMA cache_size = 1000")
+            .await
+            .expect("a succeeding statement that taints");
+    }
+
+    let elsewhere = tempfile::tempdir().expect("second tempdir");
+    let snap = elsewhere.path().join("snap.db");
+    let mut co = pool.checkout().await.expect("checkout 2 — recycled");
+    let err = co
+        .exec(&format!("VACUUM INTO '{}'", snap.display()))
+        .await
+        .expect_err("the guard must be installed on the reopened connection too");
+
+    assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "got {err:?}");
+    assert!(!snap.exists());
 }
 
 /// Plain `VACUUM` — no `INTO` — must keep working, because Laravel's `dropAllTables()` ends with it

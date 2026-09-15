@@ -169,7 +169,11 @@ pub fn map(err: &rusqlite::Error) -> PoolError {
                 // SQLite has no SQLSTATE — the mirror image of PostgreSQL, which has no errno.
                 sqlstate: None,
                 errno: Some(extended),
-                message: if extended == SQLITE_BUSY_SNAPSHOT {
+                message: if extended == SQLITE_AUTH {
+                    format!(
+                        "{message} (SQLITE_AUTH: the statement asked the engine to open a database                          file outside this pool's allowed directory. Under SPEC D14 the engine                          confines every file it opens on a client's behalf — ATTACH and                          VACUUM INTO — to one directory, which defaults to the database's own.                          Name a path inside it, or have the operator widen the pool's allow_dir)"
+                    )
+                } else if extended == SQLITE_BUSY_SNAPSHOT {
                     format!(
                         "{message} (SQLITE_BUSY_SNAPSHOT: this transaction holds a stale read \
                          snapshot and cannot upgrade to a writer. Under SPEC D13 that is reachable \

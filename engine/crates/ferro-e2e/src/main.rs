@@ -57,6 +57,7 @@ async fn main() -> Result<(), BoxErr> {
             kind,
             pin_functions: Vec::new(),
             pin_on_unknown: true,
+            allow_dir: None,
         }],
         ..Config::default()
     };

@@ -289,10 +289,19 @@ impl PoolRegistry {
                 // deadline that was supposed to bound it, and a SHORTER one gives up on contention
                 // the pool was still willing to wait out. `Duration` is `Copy`, so this reads the
                 // value before `cfg` moves into `Pool::new`.
-                PoolKind::Sqlite => AnyPool::Sqlite(Pool::new(
-                    SqliteBackend::new(spec.dsn.clone()).with_busy_timeout(cfg.checkout_timeout),
-                    cfg,
-                )),
+                //
+                // SPEC D14: the operator's `FERRO_POOL_<NAME>_ALLOW_DIR`, when set, widens the
+                // directory the engine may open files in on a client's behalf. Unset leaves the
+                // backend's default — the database file's own directory — which is why the guard
+                // needs no configuration to be safe.
+                PoolKind::Sqlite => {
+                    let mut backend = SqliteBackend::new(spec.dsn.clone())
+                        .with_busy_timeout(cfg.checkout_timeout);
+                    if let Some(dir) = spec.allow_dir.as_ref() {
+                        backend = backend.with_allow_dir(dir);
+                    }
+                    AnyPool::Sqlite(Pool::new(backend, cfg))
+                }
             };
             tracing::info!(pool = %spec.name, kind = ?spec.kind, "ferrod: built connection pool");
             by_name.insert(
@@ -683,6 +692,7 @@ mod tests {
             kind: crate::config::infer_pool_kind(dsn),
             pin_functions: Vec::new(),
             pin_on_unknown: true,
+            allow_dir: None,
         }
     }
 
@@ -752,6 +762,50 @@ mod tests {
             expected,
             "the backend must open its connections with the pool's own checkout timeout"
         );
+    }
+
+    /// **SPEC D14's operator knob, end to end through the registry.**
+    ///
+    /// Behavioural rather than an intent assertion, because the wiring it covers is a conditional
+    /// (`if let Some(dir) = spec.allow_dir`) whose failure mode is silence: a dropped call leaves
+    /// the backend's default — the database's own directory — which every other test in the tree is
+    /// happy with. So this checks the thing an operator actually buys: a snapshot lands on the
+    /// backup volume, and a third directory is still refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_configured_allow_dir_reaches_the_sqlite_backend() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let backups = tempfile::tempdir().expect("backup volume");
+        let elsewhere = tempfile::tempdir().expect("third place");
+        let db = home.path().join("main.db");
+
+        let mut spec = spec("lite", &format!("sqlite://{}", db.display()));
+        spec.allow_dir = Some(backups.path().display().to_string());
+        let config = Config {
+            pools: vec![spec],
+            ..Config::default()
+        };
+        let registry = PoolRegistry::build(&config);
+        let Some(AnyPool::Sqlite(pool)) = registry.get("lite") else {
+            panic!("a sqlite:// DSN must build the Sqlite variant");
+        };
+
+        let mut co = pool.checkout().await.expect("checkout");
+        co.exec("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("fixture");
+
+        let snap = backups.path().join("snap.db");
+        co.exec(&format!("VACUUM INTO '{}'", snap.display()))
+            .await
+            .expect("the operator's directory must be usable");
+        assert!(snap.exists(), "no snapshot on the configured backup volume");
+
+        co.exec(&format!(
+            "VACUUM INTO '{}'",
+            elsewhere.path().join("nope.db").display()
+        ))
+        .await
+        .expect_err("widening one directory must not disable the guard everywhere else");
     }
 
     /// Three pools whose kinds are INFERRED from their DSN schemes (never hard-set), pointed at
