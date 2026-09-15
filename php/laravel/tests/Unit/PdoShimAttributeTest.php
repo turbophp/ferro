@@ -23,7 +23,7 @@ final class PdoShimAttributeTest extends TestCase
     {
         // `Ferro\Client\Connection` is FINAL, so it is built for real over a FakeSession rather
         // than doubled — the same pattern the sibling package's unit tests use.
-        $shim = new FerroPdoShim(new FerroClient(new FakeSession(), 'main'));
+        $shim = new FerroPdoShim(new FerroClient(new FakeSession(), 'main'), static fn (): null => null);
 
         try {
             $shim->getAttribute(\PDO::ATTR_DRIVER_NAME);
@@ -44,7 +44,7 @@ final class PdoShimAttributeTest extends TestCase
     {
         $session = new FakeSession();
         $session->poolInfo = [new PoolInfo('main', 'postgres', null)];
-        $shim = new FerroPdoShim(new FerroClient($session, 'main'));
+        $shim = new FerroPdoShim(new FerroClient($session, 'main'), static fn (): null => null);
 
         $this->expectException(\LogicException::class);
         $this->expectExceptionMessageMatches('/no server_version for pool "main"/');

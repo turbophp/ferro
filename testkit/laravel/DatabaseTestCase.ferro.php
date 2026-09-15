@@ -71,23 +71,36 @@ abstract class DatabaseTestCase extends TestCase
         // through Ferro, or a Ferro column that quietly ran through PDO, would each be worse than
         // no control at all. Note this mode is the ONE place PHP holds database credentials, which
         // §12/D8 otherwise forbids — inherent to being PDO, and a measurement-only path.
+        // C3-6b adds the SQLite FAMILY alongside PostgreSQL. The column set per family is the same
+        // shape: the Ferro driver under its own name, the same engine under the stock name (the
+        // opt-in alias), and the stock driver itself as THE CONTROL.
         $driver = getenv('FERRO_LARAVEL_DRIVER') ?: 'ferro-pgsql';
-        if (!in_array($driver, ['ferro-pgsql', 'pgsql', 'stock-pgsql'], true)) {
-            throw new \RuntimeException(sprintf(
-                'FERRO_LARAVEL_DRIVER="%s" is not one of: ferro-pgsql, pgsql, stock-pgsql.',
-                $driver,
-            ));
-        }
+        $family = self::familyOf($driver);
 
-        if ($driver === 'stock-pgsql') {
-            $app['config']->set('database.connections.pgsql', self::controlConfigForBootstrap());
-            $app['config']->set('database.default', 'pgsql');
+        if (str_starts_with($driver, 'stock-')) {
+            $stock = substr($driver, strlen('stock-'));
+            $app['config']->set("database.connections.$stock", self::controlConfigForBootstrap());
+            $app['config']->set('database.default', $stock);
             $connection = $app['config']->get('database.default');
             $this->driver = $app['config']->get("database.connections.$connection.driver");
             return;
         }
 
-        FerroConnections::register(['pgsql' => 'ferro-pgsql']);
+        // THE ALIAS IS REGISTERED ONLY BY THE COLUMN THAT RUNS UNDER IT.
+        //
+        // `register()` documents that an alias hijacks EVERY connection in the application whose
+        // `driver` is that name, and on SQLite that stopped being theoretical: testbench configures
+        // a stock `sqlite` connection, and upstream tests reach for it BY NAME
+        // (`DatabaseCacheStoreTest::testResolvingSQLiteConnectionDoesNotThrowExceptions` points
+        // `database.connections.sqlite.database` at a deliberately missing file and asserts a stock
+        // `SQLiteConnection` comes back). Registering the alias while measuring the `ferro-sqlite`
+        // column hijacked that entry too — 40 errors, none of them about the configuration under
+        // test. The `ferro-*` columns are §15's one-word config change and need no alias at all.
+        if ($driver === $family) {
+            FerroConnections::register([$family => "ferro-$family"]);
+        } else {
+            FerroConnections::register();
+        }
 
         $sock = getenv('FERRO_LARAVEL_SOCK');
         if ($sock === false || $sock === '') {
@@ -121,6 +134,9 @@ abstract class DatabaseTestCase extends TestCase
             // messages, the migration repository — never a selector: the pool's DSN chooses the
             // upstream database. (`prefix` IS defaulted by `parseConfig()`, so it is optional.)
             'database' => getenv('FERRO_LARAVEL_DB') ?: 'laravel_tests',
+            // §12/D8 keeps the SQLite PATH in the engine, so the value above stays a LABEL on this
+            // family too. That is exactly what breaks `SQLiteBuilder::dropAllTables()`, which
+            // `file_put_contents()`es it — see `FerroSQLiteBuilder`.
             'ferro_socket' => $sock,
             'pool' => getenv('FERRO_LARAVEL_POOL') ?: 'default',
         ]);
@@ -130,6 +146,24 @@ abstract class DatabaseTestCase extends TestCase
         $connection = $app['config']->get('database.default');
 
         $this->driver = $app['config']->get("database.connections.$connection.driver");
+    }
+
+    /**
+     * Which database FAMILY a `FERRO_LARAVEL_DRIVER` value belongs to, and the only place the
+     * accepted set is written down. Three names per family: the Ferro driver, the stock NAME the
+     * alias registers it under, and the `stock-` control.
+     */
+    public static function familyOf(string $driver): string
+    {
+        return match ($driver) {
+            'ferro-pgsql', 'pgsql', 'stock-pgsql' => 'pgsql',
+            'ferro-sqlite', 'sqlite', 'stock-sqlite' => 'sqlite',
+            default => throw new \RuntimeException(sprintf(
+                'FERRO_LARAVEL_DRIVER="%s" is not one of: ferro-pgsql, pgsql, stock-pgsql, '
+                . 'ferro-sqlite, sqlite, stock-sqlite.',
+                $driver,
+            )),
+        };
     }
 
     /**
@@ -156,6 +190,36 @@ abstract class DatabaseTestCase extends TestCase
         if ($dsn === false || $dsn === '') {
             throw new \RuntimeException('FERRO_LARAVEL_DSN is unset; the control column has nothing to dial.');
         }
+
+        // ---------------------------------------------------------------------------------------
+        // THE SQLITE CONTROL. Same file, opened directly by upstream's own `pdo_sqlite`, with no
+        // daemon anywhere (the runner starts none for this column).
+        //
+        // `foreign_key_constraints => true` is a DELIBERATE control configuration, not a copy of
+        // pdo_sqlite's default. Ferro's SQLite backend sets and reads back `foreign_keys=ON` at dial
+        // (§22.2 (bl)), while `pdo_sqlite` leaves it OFF — and Illuminate only issues the pragma
+        // when this key is present at all. Leaving it unset would make the two columns differ in
+        // TWO ways at once (the driver, and whether foreign keys are enforced), so any difference
+        // between them would be uninterpretable. Setting it isolates the variable under test.
+        // ---------------------------------------------------------------------------------------
+        if (str_starts_with($dsn, 'sqlite:')) {
+            // From the RUNNER. Not parsed here: the engine's rule is `strip_prefix("sqlite://")`,
+            // and PHP's `parse_url()` returns FALSE for `sqlite:///abs/path` (measured), so the
+            // obvious URL parse would refuse every valid DSN.
+            $path = getenv('FERRO_LARAVEL_SQLITE_DB') ?: '';
+            if ($path === '') {
+                throw new \RuntimeException('FERRO_LARAVEL_SQLITE_DB is unset; the control has no file to open.');
+            }
+            return [
+                'driver' => 'sqlite',
+                // A real filesystem PATH here, unlike the Ferro column's label — this connection
+                // really does open the file itself.
+                'database' => $path,
+                'prefix' => '',
+                'foreign_key_constraints' => true,
+            ];
+        }
+
         $u = parse_url($dsn);
         if (!is_array($u) || !isset($u['host'])) {
             throw new \RuntimeException('FERRO_LARAVEL_DSN is not a parseable URL.');

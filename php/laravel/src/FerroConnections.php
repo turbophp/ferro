@@ -23,6 +23,7 @@ final class FerroConnections
     /** The `driver` values this package answers to, mapped to their connection classes. */
     private const DRIVERS = [
         'ferro-pgsql' => FerroPostgresConnection::class,
+        'ferro-sqlite' => FerroSQLiteConnection::class,
     ];
 
     /**

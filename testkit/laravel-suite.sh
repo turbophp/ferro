@@ -20,9 +20,27 @@ pool="${FERRO_LARAVEL_POOL:-default}"
 # without it those cases fail, with it they pass. Note Laravel ALSO needs the config key, because
 # `PostgresBuilder::getSchemas()` reads it from the config array and never asks the server — so a
 # Ferro app using a non-default schema needs it in BOTH places (§22.2).
-dsn="${FERRO_LARAVEL_DSN:-postgres://ferro:ferro@127.0.0.1:55432/laravel_tests?options=-csearch_path%3Dpublic,my_schema}"
 svc="${FERRO_LARAVEL_SVC:-pg}"
 work="${FERRO_LARAVEL_WORK:-$root/.laravel-suite}"
+# SQLite is the odd one out in every direction, exactly as it is in testkit/dbal-suite.sh: the
+# "server" is a FILE, so the reset is `rm` rather than SQL, it must run BEFORE the daemon opens that
+# file, and the control column starts no ferrod at all. The path is a runner concern because §12/D8
+# keeps it out of PHP — the Ferro column's Laravel config carries a LABEL, not this.
+sqlite_db="${FERRO_LARAVEL_SQLITE_DB:-$work/laravel_tests.sqlite}"
+if [ "$svc" = sqlite ]; then
+  dsn="${FERRO_LARAVEL_DSN:-sqlite://$sqlite_db}"
+  # THE PATH IS DERIVED FROM THE DSN WITH THE ENGINE'S OWN RULE — `strip_prefix("sqlite://")`,
+  # nothing more (see `ferro-backend-sqlite`'s `resolve_path`). It is derived rather than kept
+  # separately so a caller-supplied DSN cannot point the daemon at one file while the reset deletes
+  # another. And it is derived HERE rather than in PHP because the two would not agree: PHP's
+  # `parse_url()` returns FALSE outright for `sqlite:///abs/path` (measured), so a harness that
+  # reached for the obvious URL parser would refuse every valid DSN the engine accepts.
+  sqlite_db="${dsn#sqlite://}"
+  export FERRO_LARAVEL_SQLITE_DB="$sqlite_db"
+else
+  dsn="${FERRO_LARAVEL_DSN:-postgres://ferro:ferro@127.0.0.1:55432/laravel_tests?options=-csearch_path%3Dpublic,my_schema}"
+fi
+export FERRO_LARAVEL_DSN="$dsn"   # the control column and the SQLite contact assertion both read it
 # WHICH allowlist, so a second SET of tests can be recorded as its own column instead of being
 # folded into the main one. `allowlist.txt` is the driver-agnostic tree, which all three driver
 # columns run and can therefore be compared across; `allowlist-postgres.txt` is upstream's
@@ -40,6 +58,16 @@ driver="${FERRO_LARAVEL_DRIVER:-ferro-pgsql}"
 # be attributed to Ferro or to the framework/server pair instead of guessed at. It is never the
 # default, and bootstrap.php's contact assertion INVERTS for it (it refuses to run if the connection
 # turns out to be a Ferro one).
+# THE DRIVER AND THE SERVICE MUST NAME THE SAME FAMILY. Nothing else catches the mismatch: a
+# `stock-pgsql` driver against `FERRO_LARAVEL_SVC=sqlite` would build a control from a `sqlite://`
+# DSN and then probe it with `version()`, which SQLite does not have — a run that fails for a reason
+# with nothing to do with what it was measuring.
+case "$svc:$driver" in
+  sqlite:ferro-sqlite|sqlite:sqlite|sqlite:stock-sqlite) ;;
+  pg:ferro-pgsql|pg:pgsql|pg:stock-pgsql|psql:ferro-pgsql|psql:pgsql|psql:stock-pgsql) ;;
+  *) echo "::error:: FERRO_LARAVEL_SVC=$svc and FERRO_LARAVEL_DRIVER=$driver name different families"; exit 1 ;;
+esac
+
 src="$work/laravel-$tag"
 reset=1
 args=()
@@ -80,15 +108,45 @@ grep -q 'FerroConnections::register' "$src/tests/Integration/Database/DatabaseTe
   || { echo "::error:: DatabaseTestCase patch did not apply"; exit 1; }
 
 # 4. ONE ferrod for the whole run, not one per test.
-cargo build -p ferrod --manifest-path "$root/Cargo.toml"
-sock="$(mktemp -u /tmp/ferro-laravel-XXXXXX.sock)"
-env FERRO_SOCK="$sock" FERRO_POOLS="$pool" \
-    "FERRO_POOL_$(echo "$pool" | tr '[:lower:]-' '[:upper:]_')_DSN=$dsn" \
-    "$root/target/debug/ferrod" >"$work/ferrod.log" 2>&1 &
-ferrod_pid=$!
-trap 'kill "$ferrod_pid" 2>/dev/null || true; rm -f "$sock"' EXIT   # ONLY our own daemon.
-for _ in $(seq 1 100); do [ -S "$sock" ] && break; sleep 0.1; done
-[ -S "$sock" ] || { echo "::error:: ferrod did not create $sock"; cat "$work/ferrod.log"; exit 1; }
+#
+#    SQLITE RESETS FIRST, and the ordering is load-bearing rather than tidy: the daemon below OPENS
+#    the database file and holds it for the whole run, so deleting it afterwards (where the SQL
+#    resets live, at step 6) would pull the file out from under a live pool instead of giving it a
+#    fresh one. The `-wal`/`-shm` sidecars go with it — every Ferro SQLite connection is in WAL mode
+#    (verified at dial, §22.2 (bd)), and a stale WAL beside a deleted database is how a "reset"
+#    silently restores the rows it was meant to remove.
+if [ "$reset" = 1 ] && [ "$svc" = sqlite ]; then
+  rm -f "$sqlite_db" "$sqlite_db-wal" "$sqlite_db-shm"
+  mkdir -p "$(dirname "$sqlite_db")"
+  # Recreated EMPTY rather than left absent, because the CONTROL column cannot open a missing file:
+  # Illuminate's `SQLiteConnector::connect()` does `realpath($database) ?: realpath(base_path(…))`
+  # and throws `SQLiteDatabaseDoesNotExistException` when both fail — measured, and in the bootstrap
+  # it fails even earlier, since `base_path()` needs an application container the probe has no
+  # reason to build. A zero-byte file IS a valid empty SQLite database, and it is exactly what
+  # upstream's own `refreshDatabaseFile()` leaves behind, so both columns start from the same state.
+  : > "$sqlite_db"
+  echo "[ferro] reset: sqlite $sqlite_db recreated empty (old file + -wal/-shm removed)"
+fi
+
+#    THE CONTROL COLUMN STARTS NO DAEMON AT ALL on SQLite: it opens the same file through upstream's
+#    own pdo_sqlite. That is stronger than merely pointing it elsewhere — a control with no Ferro to
+#    reach cannot quietly route through one, whatever a mis-set variable says. (The PostgreSQL
+#    control still starts one, because its `$dsn` is also what the control's own PDO config is
+#    derived from and the daemon is harmless there.)
+sock=""
+if [ "$svc" = sqlite ] && [ "$driver" = stock-sqlite ]; then
+  echo "[control] no ferrod started; pdo_sqlite will open $sqlite_db directly"
+else
+  cargo build -p ferrod --manifest-path "$root/Cargo.toml"
+  sock="$(mktemp -u /tmp/ferro-laravel-XXXXXX.sock)"
+  env FERRO_SOCK="$sock" FERRO_POOLS="$pool" \
+      "FERRO_POOL_$(echo "$pool" | tr '[:lower:]-' '[:upper:]_')_DSN=$dsn" \
+      "$root/target/debug/ferrod" >"$work/ferrod.log" 2>&1 &
+  ferrod_pid=$!
+  trap 'kill "$ferrod_pid" 2>/dev/null || true; rm -f "$sock"' EXIT   # ONLY our own daemon.
+  for _ in $(seq 1 100); do [ -S "$sock" ] && break; sleep 0.1; done
+  [ -S "$sock" ] || { echo "::error:: ferrod did not create $sock"; cat "$work/ferrod.log"; exit 1; }
+fi
 
 # 5. The phpunit config, generated from the allowlist so that file stays the single source of truth.
 cfg="$work/phpunit.generated.xml"
@@ -108,7 +166,8 @@ cfg="$work/phpunit.generated.xml"
 # 6. THE RESET — the suite's only source of idempotence, and a hard precondition of recording a
 #    number. It runs container-side with no PHP credentials at all (SPEC §12/D8). The sibling
 #    MEASURED what skipping it costs: consecutive runs of the same command drifted 23 -> 33 errors.
-if [ "$reset" = 1 ]; then
+#    The SQLite arm is NOT here — it runs at step 4, before the daemon opens the file.
+if [ "$reset" = 1 ] && [ "$svc" != sqlite ]; then
   case "$svc" in
     pg)
       docker compose -f "$root/testkit/docker-compose.yml" exec -T pg \
@@ -125,9 +184,9 @@ if [ "$reset" = 1 ]; then
       psql -v ON_ERROR_STOP=1 -q -d "$dsn" -f "$root/testkit/laravel/reset-pg.sql"
       echo "[ferro] reset: local psql against \$FERRO_LARAVEL_DSN from testkit/laravel/reset-pg.sql"
       ;;
-    *) echo "::error:: unknown FERRO_LARAVEL_SVC=$svc (wired: pg | psql — the tier registers ferro-pgsql only)"; exit 1 ;;
+    *) echo "::error:: unknown FERRO_LARAVEL_SVC=$svc (wired: pg | psql | sqlite)"; exit 1 ;;
   esac
-else
+elif [ "$reset" != 1 ]; then
   echo "[ferro] reset: SKIPPED (--no-reset) — this run's numbers MUST NOT be recorded"
 fi
 
