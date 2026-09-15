@@ -25,6 +25,10 @@ jobs:
       # The script existed since M0 but was wired into no workflow, so deleting the recorded
       # measurement would have been green. It needs no toolchain or backend — it is a file check.
       - run: ./ci/check-d12-recorded.sh
+      # The published incompatibilities page (SPEC §14–15) rots in the direction that hurts most:
+      # it kept telling readers a FIXED defect was still broken. Prose can't be checked, citations
+      # can — see the script's header. Also a file check, no toolchain, no backend.
+      - run: ./ci/check-incompatibilities-doc.sh
 
   # The LIVE acceptance lane. It must be able to FAIL: every live suite in this repo is
   # `skip`-if-unconfigured by design, so a DSN this lane forgets to export turns its whole tier

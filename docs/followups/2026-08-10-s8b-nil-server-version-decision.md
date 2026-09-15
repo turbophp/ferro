@@ -1,5 +1,10 @@
 # Follow-up (DECISION REQUIRED before M1-S8b): what a DBAL driver does with `server_version: nil`
 
+> **STATUS: RESOLVED** — the decision was taken and shipped as D-S8b-1 (M1-S8b). A nil
+> `server_version` DEFERS, then resolves with one `SELECT version()`, then FAILS LOUDLY naming the
+> pool: `Ferro\DBAL\Exception\ServerVersionUnavailable`, never a defaulted platform, because a
+> wrong platform is a silently wrong SQL dialect.
+
 **Found:** M1-S8a Task 12 declared it as a carry; the S8a whole-branch review found the *consumer*
 half recorded nowhere durable (finding F19b).
 **Belongs to:** M1-S8b (the Doctrine DBAL-4 driver tier). Nothing in `php/client/src` reads

@@ -1,14 +1,32 @@
 # Ferro drop-in: known incompatibilities
 
-Ferro is a drop-in for **Doctrine DBAL 4** by CONFIGURATION: `driverClass` + `driverOptions`, with
-Grammar/Processor, the DBAL platforms and the stock schema managers untouched. These are the places
-where a real application can still notice the difference. Each one is a deliberate consequence of the
-engine's model — a per-host daemon that pools upstream connections in **transaction mode** and holds
-the only database credentials — not a defect waiting to be fixed quietly. Every entry below was
-MEASURED during M1-S8b; the acceptance numbers behind them are in
-[`docs/dbal-suite/2026-08-11-results.md`](dbal-suite/2026-08-11-results.md).
+Ferro is a drop-in by CONFIGURATION for two framework tiers:
 
-SPEC §14 budgets the full per-package catalogue for M2. This is the page it grows from.
+- **`ferro/doctrine-dbal-driver`** — Doctrine DBAL 4, via `driverClass` + `driverOptions`, with
+  Grammar/Processor, the DBAL platforms and the stock schema managers untouched (SPEC §14).
+- **`ferro/laravel`** — Illuminate's `Connection` execution layer, via one driver name in the
+  connection config, with the stock Grammar, Processor and Schema builder untouched (SPEC §15).
+
+These are the places where a real application can still notice the difference. Almost every one is a
+deliberate consequence of the engine's model — a per-host daemon that pools upstream connections in
+**transaction mode** and holds the only database credentials — rather than a defect waiting to be
+fixed quietly; the few that are defects say so in those words.
+
+**How to read this page.** Every entry carries a citation: a SPEC §22.2 changelog letter, a recorded
+acceptance-suite run under `docs/dbal-suite/` or `docs/laravel-suite/`, a named test, or a follow-up
+document. That is a contract, not a style: `ci/check-incompatibilities-doc.sh` runs in CI and fails
+the build when a citation stops resolving, when a follow-up loses its status, or when this page cites
+a follow-up that has since been RESOLVED.
+
+The gate exists because this page had already rotted in the way that matters most. It told readers
+that a `bigint` at or above 2^32 could not be read — a **fixed** defect, with a live test proving the
+whole int64 range — and that a dead backend could wedge a query for two minutes, which had been
+bounded a milestone earlier. A stale "this is broken" is worse than a stale README: people believe it
+and build workarounds. So an entry whose defect is fixed is **rewritten in place and kept**, marked
+FIXED with the milestone that closed it, rather than quietly deleted.
+
+Sections are shared unless their heading names a package. Where a behaviour differs by tier, both
+answers are given.
 
 ---
 
@@ -69,8 +87,9 @@ Where DBAL has one bucket, Ferro has two, because the difference is the whole po
 | the statement's fate is **unknown** | `Ferro\DBAL\IndeterminateWriteException` (deliberately NOT retryable) | retry could apply it twice |
 
 Neither extends `ConnectionLost`, on purpose: frameworks treat `ConnectionLost` as
-reconnect-and-retry. Measured at the acceptance gate — upstream's `TransactionTest::testCommitFailure`
-and friends kill the backend session and expect `ConnectionLost`; under Ferro they get the refined
+reconnect-and-retry. Measured at the acceptance gate — upstream's own
+`Doctrine\DBAL\Tests\Functional\TransactionTest::testCommitFailure` and friends kill the backend
+session and expect `ConnectionLost`; under Ferro they get the refined
 answer instead. **If your application catches `ConnectionLost`, catch `Doctrine\DBAL\Exception\DriverException`
 instead and branch on the two Ferro classes.**
 
@@ -87,7 +106,7 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
 
 ---
 
-## Connection object
+## Connection object (Doctrine DBAL)
 
 - **`getNativeConnection()` returns a `Ferro\Client\Connection`, not a `PDO`.** Anything calling
   `pg_escape_string($native, …)`, `$native->real_escape_string()` or a `PDO::` method will fatal.
@@ -109,13 +128,17 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   `Ferro\DBAL\Exception\ServerVersionUnavailable` naming the pool — never a silently-defaulted
   platform, because a wrong platform is a wrong SQL dialect. Pin `'serverVersion' => '17.10'` in the
   DBAL params if you want a zero-round-trip answer.
-- **The first query against a backend that is DOWN can block for the OS connect timeout**
-  (~127 s measured) rather than failing fast. Tracked in
-  `docs/followups/2026-08-10-unbounded-backend-dial.md`.
+- **A backend that is DOWN fails within `checkout_timeout`, not the OS connect timeout.** This page
+  used to record the opposite — an unbounded dial that could wedge a first query for the ~127 s the
+  OS takes to give up. `Pool::checkout` has bounded `backend.connect()` with `checkout_timeout`
+  since M1 Phase B, and both backends bound their out-of-band cancel side-connection dial at a fixed
+  2 s (SPEC §22.2 (aj)). TCP keepalive on an already-established connection was then closed as
+  WONTFIX-as-code (§22.2 (au)): it is a pool-DSN parameter on both families, PostgreSQL defaults it
+  ON at 7200 s and MySQL defaults it OFF, and hardcoding either would remove an operator knob.
 
 ---
 
-## Identity and keys
+## Identity and keys (Doctrine DBAL, and the ORM)
 
 - **`lastInsertId()` throws on PostgreSQL, always.** PG's protocol carries no such field and Ferro
   refuses to emulate it with `SELECT lastval()`, because on a transaction-mode pool the follow-up
@@ -202,11 +225,14 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
 - **An integer parameter above `PHP_INT_MAX` is refused client-side**, not silently saturated
   (a PHP `(int)` cast saturates rather than wrapping). Bind it as a string against a `numeric`
   column, or keep it in `bigint` range.
-- **A `bigint` at or above 2^32 currently cannot be READ.** `SELECT 4294967296::bigint` raises
-  `ProtocolException: value tag 2: expected a int payload, got string` — on every backend, on every
-  value policy, with or without `ext-msgpack`. This is a **defect**, not a policy: it affects any
-  `bigint` PK past 4.29e9 and every epoch-milliseconds column. Tracked in
-  `docs/followups/2026-08-11-i64-above-2e32-unreadable-in-php-client.md`.
+- **FIXED at M1-S9 — a `bigint` at or above 2^32 reads.** This page used to say it did not, and it
+  said so for a month after the fix shipped, which is why this page now has a gate (see *How to read
+  this page*). The defect was real: `SELECT 4294967296::bigint` raised
+  `ProtocolException: value tag 2: expected a int payload, got string` on every backend and every
+  value policy, taking every `bigint` PK past 4.29e9 and every epoch-milliseconds column with it.
+  The whole int64 range reads as of M1-S9 (m1-s8c), pinned live by `I64RangeLiveTest`, which
+  round-trips each boundary through a real `int8`/`BIGINT` **column** rather than only a literal.
+  Kept rather than deleted because the entry was public long enough to be believed.
 - **A `LARGE_OBJECT` bind is materialised in memory** and is bounded by the 16 MiB maximum frame
   payload. A chunked bind would be a protocol change.
 - **`BINARY` / `LARGE_OBJECT` are the only route to binary.** Every bare PHP string binds as text;
@@ -214,6 +240,30 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
 - **MySQL/MariaDB sessions run at `time_zone = '+00:00'`.** `NOW()`, `CURDATE()` and `CURTIME()`
   return UTC on every Ferro MySQL connection. Doctrine and Laravel make the same choice; pooling
   determinism requires it.
+
+---
+
+## Files and paths
+
+- **A statement may only name a file inside the pool's allowed directory (SQLite).** SQLite is the
+  one family where an ordinary statement can make the engine open a file the client named —
+  `VACUUM INTO '<path>'`, and `ATTACH DATABASE '<path>'` inside a transaction. The write happens as
+  the daemon's user, not PHP-FPM's, which is a confused deputy: SPEC §12/D8 keeps the database path
+  in the engine precisely so PHP never learns it. **SPEC D14** confines it. The allowed directory
+  defaults to the database file's own directory, so `VACUUM INTO 'snapshot.db'` beside the database
+  works with no configuration; an operator widens it per pool with `FERRO_POOL_<NAME>_ALLOW_DIR`.
+  Outside it, the statement is refused with SQLite's own `SQLITE_AUTH` (errno 23) and **no file is
+  created**.
+
+  The enforcement point is SQLite's own authorizer, not a list of verbs: `VACUUM INTO` attaches its
+  destination, so one guard covers both spellings and any future one. Nothing is parsed or rewritten
+  — SQLite states which file it is about to open and the engine answers, so charter rule 6 never
+  arises. Plain `VACUUM`, which stock Laravel's `dropAllTables()` ends in, opens no file and is
+  untouched. SPEC §21 D14, §22.2 (bp).
+- **On PostgreSQL and MySQL the question does not arise**, because neither dialect lets a statement
+  name a path the engine would write — server-side `COPY TO '<file>'` and `SELECT … INTO OUTFILE`
+  are the backend's own privileged operations, executed by the *database server* under its own
+  privilege checks, not by `ferrod`.
 
 ---
 
@@ -254,7 +304,7 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
 
 ---
 
-## Performance and shape
+## Performance and shape (Doctrine DBAL)
 
 - **`iterateAssociative()` streams — on every family and on both the parameterless and the
   parameterised path.** This entry has been narrowed twice as its two stated causes were removed.
@@ -293,6 +343,127 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   (SQLite3 keeps its count, PgSQL answers `0`); ours is a choice.
 - **`Ferro\Pg\Copy`** — the first-class replacement for `pdo_pgsql` COPY hacks named in SPEC §14 —
   does not exist yet. Deferred.
+
+---
+
+## Laravel / Eloquent (`ferro/laravel`)
+
+Everything above applies to this tier too, because it sits on the same engine and the same client.
+What follows is what is different about reaching it through Illuminate. The numbers come from
+upstream `laravel/framework` v11.51.0's own integration tests, run against a real server through one
+`ferrod`, each column reproduced twice and each against a CONTROL running the identical tests through
+upstream's own PDO driver:
+[`docs/laravel-suite/2026-09-10-c2-results.md`](laravel-suite/2026-09-10-c2-results.md) and
+[`docs/laravel-suite/2026-09-15-c3-6b-sqlite-results.md`](laravel-suite/2026-09-15-c3-6b-sqlite-results.md).
+
+### Getting in
+
+- **Two driver names are registered: `ferro-pgsql` and `ferro-sqlite`.** `FerroConnections::register()`
+  wires them through Illuminate's own `Connection::resolverFor()` map, and adoption is the one-word
+  `driver` change in the connection config that SPEC §15 asks for. **MySQL/MariaDB is not
+  registered at all** — the engine has supported it since M1-S6, but this tier has no
+  `FerroMySqlConnection`, so §15's acceptance bar, which names MySQL, is **not met**. Said here
+  rather than left to be discovered.
+- **The driver NAME is part of your application's behaviour, and it is the single largest source of
+  difference.** Illuminate resolves connections by name, and upstream's own tests — plus plenty of
+  third-party packages — branch on `$connection->getDriverName()`. Measured on PostgreSQL over 633
+  driver-agnostic cases: under the opt-in stock-name alias Ferro is **indistinguishable from
+  `pdo_pgsql`** (605/607 on both, identical ordered failure sets, and the two remaining reproduce
+  through stock PDO, so they are upstream's own). Under `ferro-pgsql` it is 570/579, and every one of
+  those nine differences was positively identified in upstream source as code branching on
+  `$this->driver`: an `expectException` never armed, a `match` picking the wrong expected type, a
+  `markTestSkipped` that never fires. SPEC §22.2 (am), (ar).
+- **The alias is opt-in because it hijacks every connection of that name.** `register(['pgsql' =>
+  'ferro-pgsql'])` makes name-branching code take its PostgreSQL path — and also captures any
+  connection in the application that was meant to dial PostgreSQL directly. An application with a
+  mixed setup should rename those connections' driver instead.
+- **On SQLite the alias is NOT the same escape hatch, and that asymmetry is structural.** Upstream's
+  own tests open throwaway SQLite connections regardless of the family under test, none of them
+  carrying a `ferro_socket`, so registering the alias costs **42 extra errors** for the two
+  name-gated skips it buys. SPEC §22.2 (bn).
+
+### The PDO shim
+
+- **`getPdo()` returns a `Ferro\Laravel\FerroPdoShim`, not a `PDO`.** It implements what Illuminate
+  actually calls; anything else fails loudly rather than silently returning something plausible. The
+  shim is the seam transactions run through, which is why `ManagesTransactions` — Laravel's
+  transaction counter, savepoint naming, events and `attempts:` retry loop — is inherited unchanged
+  rather than reimplemented.
+- **`DB::escape()`, `toRawSql()` and `->dd()` work on PostgreSQL and are REFUSED on SQLite.**
+  `quote()` is client-side with **no engine round trip** (SPEC §21 D5), so it is gated on the per-pool
+  `literals_are_standard` bit that `HELLO_ACK` advertises — and today only the PostgreSQL backend
+  advertises it. On a SQLite pool the value is `null`, which is **fail-closed**: it is never read as
+  false (that would claim backslashes are escapes) and never as true. The refusal names the pool.
+  SPEC §22.2 (as), (at).
+- **`lastInsertId()` is sticky on the connection, exactly as PDO's is** — and that is a deliberate
+  divergence from the client underneath it. The client's value is per-STATEMENT and cleared on the
+  way in to every request, which is right for a pooled engine: a statement can land on another
+  backend connection and a carried-over key would be silently wrong. PDO's belongs to the handle.
+  `Processor::processInsertGetId()` looks like it reads the id immediately, but `Connection::insert()`
+  fires `QueryExecuted` first and any listener that runs a query clears the client's value in
+  between — measured as **182 of 225 errors on one line** before the shim remembered it. So the
+  connection remembers each non-null key from its own writes and never clears it, which is what
+  `pdo_sqlite` returns in every case, including after a rollback. SPEC §22.2 (bn).
+
+### Values
+
+- **Rows arrive as driver-native strings, not as the SPEC §9 value objects.** The tier hands
+  Illuminate what PDO hands it, because Illuminate's own helpers index into the result —
+  `Builder::pluck($col, $key)` breaks outright on a value object. This is the same `RawStringValuePolicy`
+  hand-off the Doctrine tier takes.
+- **One deliberate divergence from PDO is kept, because it is safer.** A `TIMESTAMPTZ` arrives as
+  canonical RFC3339, which Illuminate's `Date::parse` fallback reads as UTC. PDO's `+00` form is
+  silently reinterpreted in the application timezone. SPEC §22.2 (al).
+- **A `bigint` at or above 2^32 reads** — see *Values* above; the defect that page-entry records was
+  fixed at M1-S9 and affected this tier too.
+
+### Errors and transactions
+
+- **`FerroQueryException` puts SQLSTATE in `getCode()`** — PDO's convention, and the *opposite* of
+  the sibling Doctrine tier's errno convention. It is not cosmetic: with the sibling's convention a
+  real PostgreSQL `40001` propagates out of `DB::transaction(attempts: 3)` instead of being retried,
+  which is mutation-proven live.
+- **`select()` is fate-declared a WRITE**, so the cancelled-`SELECT` entry at the top of this page
+  applies here too. It is not a conservative guess that could be tightened: `PostgresProcessor::processInsertGetId`
+  runs `insert … returning id` through `selectFromWriteConnection()`, so treating `select()` as a
+  read would mis-declare the commonest Eloquent write on PostgreSQL.
+
+### Schema and migrations
+
+- **`search_path` belongs in TWO places on PostgreSQL** — on the `ferrod` pool DSN, because the
+  session is pooled and a `SET search_path` from PHP would not survive to the next statement; and in
+  the Laravel connection config as well, because `PostgresBuilder::getSchemas()` reads it from the
+  config array and never asks the server. SPEC §22.2 (aq).
+- **`Schema::dropAllTables()` on SQLite goes through `Ferro\Laravel\Schema\FerroSQLiteBuilder`.**
+  Upstream takes a statement branch only for an in-memory database; for a file one it calls
+  `refreshDatabaseFile()`, which is `file_put_contents($connection->getDatabaseName(), '')` — and
+  under Ferro that name is the config **label**, not a path (SPEC §12/D8). Left alone it creates and
+  truncates a junk file named after your connection while every table survives; that is not
+  hypothetical, it produced two such files in this repository's root during a mutation run. The
+  override takes the statement branch unconditionally, runs the four **stock-grammar** statements in
+  one transaction (`PRAGMA writable_schema` is connection-scoped) with `vacuum` after the commit, and
+  makes `refreshDatabaseFile()` throw. No SQL is generated here. SPEC §22.2 (bn).
+- **A SQLite `ALTER TABLE` that drops or changes a column referenced by a foreign key is refused, and
+  there is no execution-layer remedy.** `SQLiteGrammar::compileAlter()` emits six statements and
+  `Blueprint::build()` runs them as six checkouts, so its leading `PRAGMA foreign_keys = OFF` never
+  reaches the `drop table` and the child row refuses it (errno 787). Three remedies were ruled out by
+  measurement, not by argument: as Illuminate runs it → refused; all six inside **one** transaction →
+  still refused, because that pragma is a no-op inside a transaction; transaction plus the
+  transaction-legal `PRAGMA defer_foreign_keys` → still refused. Inventing a fourth would mean the
+  tier substituting SQL the stock grammar did not emit. Drop the constraint, alter, re-add — or use
+  PostgreSQL. SPEC §22.2 (bn).
+- **`selectResultSets()` returns one result set.** `ExecOk` carries exactly one `cols`+`rows`, and
+  carrying N of them is a breaking wire change; it is deferred on the ground that no tier can reach a
+  second result set today (DBAL 4's driver `Result` has no `nextRowset`, and the only Illuminate
+  consumer would be a MySQL tier that does not exist). The MySQL `CALL` blind spot that used to sit
+  underneath it — a prepared `CALL` declaring zero result columns, so rows came back cell-less — is
+  **fixed**: `cols` falls back to the executed result set's metadata. SPEC §22.2 (av), (aw).
+
+### Not established
+
+§15's acceptance bar names PostgreSQL, MySQL and SQLite. **MySQL is not run**, because this tier does
+not register it; SQLite and PostgreSQL are, with controls. The Eloquent ORM's own test suite is not
+run on any family.
 
 ---
 

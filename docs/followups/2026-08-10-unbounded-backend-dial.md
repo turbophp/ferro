@@ -1,12 +1,11 @@
 # Follow-up: the backend DIAL is unbounded — `checkout_timeout` does not cover it
 
-> **STATUS: FIXED (M1 Phase B, B5) for the two dials that hold something.** `Pool::checkout` now
-> bounds `backend.connect()` with `checkout_timeout` (fix direction 1, reusing the existing knob —
-> see the decision below), and both backends' out-of-band `Cancel::cancel()` bound their SIDE-connection
-> dial with a fixed `CANCEL_DIAL_BUDGET` (2 s). **Still open:** fix direction 3 (TCP keepalive on
-> established connections), which is a different hazard — a connection going silent AFTER it is up,
-> which no dial bound can reach.
-
+> **STATUS: RESOLVED.** Fix direction 1 shipped at M1 Phase B (B5, SPEC §22.2 (aj)): `Pool::checkout`
+> bounds `backend.connect()` with `checkout_timeout`, and both backends bound their out-of-band
+> cancel side-connection dial at a fixed 2 s. Fix direction 3 (TCP keepalive) was then closed as
+> **WONTFIX-as-code** at SPEC §22.2 (au), which also corrects this document: PostgreSQL defaults
+> keepalive ON at 7200 s and MySQL defaults it OFF, so "keepalive is off" was half wrong. Both are
+> pool-DSN parameters needing no Ferro code.
 **Found:** M1-S8a Task 12 (the server-version probe) self-declared it as a carry; the S8a
 whole-branch review verified it against the code and promoted it out of the task report.
 **Belongs to:** M0 / M1-S3 (`ferro-pool`'s checkout path) — **not an S8a regression.** S8a is only

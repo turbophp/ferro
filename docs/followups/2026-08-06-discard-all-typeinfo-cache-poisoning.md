@@ -1,5 +1,12 @@
 # Follow-up: `DISCARD ALL` poisons tokio-postgres's typeinfo statement cache
 
+> **STATUS: RESOLVED** (M1-S8a review round, SPEC §22.2 (m)). A third vendored `tokio-postgres`
+> accessor, `clear_typeinfo_statement_cache()`, is called on BOTH reset profiles — `Targeted`
+> included, because `ferro-classify` safe-lists a USER-issued `DISCARD ALL`, so such a connection
+> recycles NON-tainted carrying the same dead handles. Verified in `ferro-backend-pg/src/conn.rs`.
+> One residual, recorded there and not here: a user statement that deallocates WITHIN one checkout
+> still poisons that checkout.
+
 **Status: RESOLVED 2026-08-10** (M1-S8a whole-branch review, finding F1). Kept as the standing
 record of the defect, the two false claims it carried, and the one residual window the fix does not
 close. See "Resolution" at the bottom.
