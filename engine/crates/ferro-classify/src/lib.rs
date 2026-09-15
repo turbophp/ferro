@@ -452,7 +452,14 @@ mod tests {
         assert_eq!(classify("SELECT '", Dialect::Postgres, &[], true), None);
     }
 
-    // ---- SQLite stub (not wired to a live backend; sanity-only) ---------------------------------
+    // ---- SQLite dialect (LIVE via `ferro-backend-sqlite` since C3-3e) ---------------------------
+    //
+    // It was a sanity-only stub when it was written and this comment said so. It is not one now:
+    // SQLite has no session-mutation AUTHORITY to fall back on — no RFQ byte, no OK-packet tracker
+    // — so for `PRAGMA`/`ATTACH` this classifier is the ONLY signal, and the backend's hygiene
+    // depends on it. A connection it fails to taint is recycled with the previous tenant's pragmas
+    // still in force (measured: `foreign_keys=OFF` and `writable_schema=1` both survive a clean
+    // recycle), which is why the two triggers below are unconditional.
 
     #[test]
     fn sqlite_attach_triggers_set() {
@@ -478,6 +485,32 @@ mod tests {
     #[test]
     fn sqlite_plain_select_is_safe() {
         assert_eq!(classify("SELECT 1", Dialect::Sqlite, &[], true), None);
+    }
+
+    /// **The two SQLite triggers fire even under `pin_on_unknown = false`, and that is the gate the
+    /// backend's hygiene rests on.**
+    ///
+    /// `SqliteBackend::clean_reset_profile` answers `Targeted` — the cheap list — on the argument
+    /// that a connection reaching it cannot have set a pragma, because `PRAGMA` and `ATTACH` always
+    /// taint. If either were merely an "unknown leading keyword", an operator setting
+    /// `pin_on_unknown = false` would silently turn the cross-tenant pragma leak back on, with no
+    /// test anywhere going red. Same shape as MySQL's unconditional `CALL`/`DO` backstop.
+    #[test]
+    fn sqlite_pragma_and_attach_taint_even_when_unknown_statements_do_not() {
+        assert_eq!(
+            classify("PRAGMA foreign_keys=OFF", Dialect::Sqlite, &[], false),
+            Some(PinTrigger::Set),
+        );
+        assert_eq!(
+            classify("ATTACH DATABASE 'x.db' AS x", Dialect::Sqlite, &[], false),
+            Some(PinTrigger::Set),
+        );
+        // The control: with `pin_on_unknown` off, a genuinely unknown statement does NOT taint —
+        // so the two above are not passing merely because the flag is being ignored.
+        assert_eq!(
+            classify("FLUFF nonsense", Dialect::Sqlite, &[], false),
+            None
+        );
     }
 
     // ---- MySQL dialect (M1-S6 task 6, LIVE via `ferro-backend-mysql`) ----------------------------

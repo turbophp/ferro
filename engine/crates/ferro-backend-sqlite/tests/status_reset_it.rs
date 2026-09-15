@@ -261,19 +261,30 @@ async fn reset_rolls_back_disarms_detaches_and_drops_temp() {
 }
 
 /// Reset on an already-clean connection is a no-op that succeeds — the recycle path runs it on
-/// every reused connection, so it must not error when there is nothing to undo.
+/// every reused connection, so it must not error when there is nothing to undo. Asserted on BOTH
+/// profiles, since they stopped being the same thing: `Full` closes and reopens the connection
+/// (§22.2 (bm)) and `Targeted` runs the explicit list, and a repeated no-op has to hold for each.
 #[tokio::test(flavor = "multi_thread")]
 async fn reset_on_a_clean_connection_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
     let backend = backend_on(&dir, "clean.db");
     let mut conn = backend.connect().await.expect("connect");
 
-    for _ in 0..3 {
-        backend
-            .reset(&mut conn, ResetProfile::Full)
-            .await
-            .expect("reset on a clean conn must not error (ROLLBACK with no open tx would)");
+    for profile in [ResetProfile::Full, ResetProfile::Targeted] {
+        for _ in 0..3 {
+            backend
+                .reset(&mut conn, profile)
+                .await
+                .expect("reset on a clean conn must not error (ROLLBACK with no open tx would)");
+        }
+        assert_eq!(backend.tx_status(&conn), TxStatus::Idle);
     }
-    assert_eq!(backend.tx_status(&conn), TxStatus::Idle);
-    assert_eq!(backend.clean_reset_profile(), Some(ResetProfile::Full));
+
+    // C3-3b answered `Some(Full)` here on the argument that the two profiles were interchangeable
+    // "because SQLite's reset is in-process and destroys no prepared statements". That stopped
+    // being true when `Full` became a close-and-reopen, measured at ~250 µs against §16's
+    // p50 < 60 µs boundary target — so the clean path takes the cheap profile, and it is safe to
+    // because `PRAGMA`/`ATTACH` (the only statements that leave connection-scoped state) taint
+    // unconditionally. See §22.2 (bm).
+    assert_eq!(backend.clean_reset_profile(), Some(ResetProfile::Targeted));
 }

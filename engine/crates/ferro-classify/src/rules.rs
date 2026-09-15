@@ -9,8 +9,10 @@
 //! `classify_one_pg` is wired to a live backend in M1-S2 (`Dialect::Postgres`, via
 //! `ferro-backend-pg`); `classify_one_mysql` is wired to a live backend in M1-S6 (`Dialect::MySql`,
 //! via `ferro-backend-mysql`) as defense-in-depth ASSIST alongside that slice's session-tracker
-//! AUTHORITY (`PoolBackend::take_session_mutated`); `classify_one_sqlite` remains a stub for a
-//! future slice.
+//! AUTHORITY (`PoolBackend::take_session_mutated`). `classify_one_sqlite` was a stub when this line
+//! was written; it is LIVE since C3-3e, and it is the SOLE session-mutation signal on that dialect
+//! — SQLite has neither an RFQ byte nor a session tracker, so `SqliteBackend`'s hygiene profile is
+//! chosen from this classifier alone.
 
 use crate::PinTrigger;
 use crate::scan;

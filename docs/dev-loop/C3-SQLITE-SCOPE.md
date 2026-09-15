@@ -489,12 +489,18 @@ Four things a pooled SQLite connection can carry into the next tenant, and what 
 4. **Temp objects** → dropped. `CREATE TEMP TABLE` lives in the per-connection `temp` schema and
    survives until the CONNECTION closes, so it outlives the checkout that made it.
 
-**Both profiles do the same thing, and that is stated rather than hidden.** PostgreSQL uses
-`Targeted` to avoid `DISCARD ALL` destroying its prepared statements; SQLite's reset is in-process,
-issues no round trip, and destroys no prepared statements, so a `Targeted` differing from `Full`
-would be a distinction with no behaviour behind it. `clean_reset_profile` is `Some(Full)`. `None`
-(skip hygiene) is NOT taken even though SQLite has no stored procedures and therefore none of the
-§7.4 function-body blind spot — that is the same optimization still deferred for MySQL (R2).
+**SUPERSEDED 2026-09-15 — see §19.** This slice shipped both profiles as the same list, on the
+argument that SQLite's reset "is in-process, issues no round trip, and destroys no prepared
+statements, so a `Targeted` differing from `Full` would be a distinction with no behaviour behind
+it", with `clean_reset_profile` answering `Some(Full)`. The list itself is still the `Targeted`
+profile and is unchanged. What was wrong is the four items' COMPLETENESS: they were derived from
+what the ENGINE leaves on a connection, and a tenant's `PRAGMA` — which is connection-scoped and
+survives all four — was never considered. `Full` is now a close-and-reopen and
+`clean_reset_profile` is `Some(Targeted)`.
+
+`None` (skip hygiene) is still NOT taken even though SQLite has no stored procedures and therefore
+none of the §7.4 function-body blind spot — that is the same optimization still deferred for MySQL
+(R2).
 
 ### `impl PoolBackend` — still absent, but the line is now drawn
 
@@ -946,3 +952,92 @@ the rows it was meant to remove.
 - The `foreign_keys` answer above is the DBAL half only. Laravel's SQLite connector sets the pragma
   itself and its suite may depend on enforcement; the pool-level guarantee already satisfies it, but
   that has to be measured rather than assumed.
+
+
+---
+
+## 19. The cross-tenant PRAGMA leak (2026-09-15) — FOUND while scoping C3-6b, FIXED
+
+**Found by asking why something SUCCEEDED.** The iteration set out to scope the Illuminate SQLite
+column and began by probing how Laravel's `SQLiteBuilder::dropAllTables()` behaves through Ferro. It
+runs `PRAGMA writable_schema = 1` and then `DELETE FROM sqlite_master` as SEPARATE
+`executeStatement()` calls, which on a transaction-mode pool are separate checkouts — so the second
+should have been refused, exactly as C3-6a's `__temp__` finding predicted. It was not.
+
+### What leaks
+
+SQLite pragmas are CONNECTION-scoped, and §12's four-item list clears none of them. Probed through a
+real pool, one pragma per tenant pair, **17 of 23 survived a recycle**:
+
+| pragma | what the next tenant inherits |
+| --- | --- |
+| `foreign_keys=OFF` | the integrity guarantee §18 made a DECLARED one, silently disarmed for everyone afterwards |
+| `writable_schema=1` | the ability to `DELETE FROM sqlite_master` — schema destruction — without ever asking for it |
+| `trusted_schema=0`, `ignore_check_constraints=1`, `cell_size_check` | constraint and safety semantics |
+| `read_uncommitted=1`, `recursive_triggers`, `legacy_alter_table`, `automatic_index=0`, `reverse_unordered_selects` | query and DDL semantics |
+| `synchronous=0`, `fullfsync`, `checkpoint_fullfsync`, `secure_delete` | DURABILITY |
+| `busy_timeout` | the pool's own checkout bound (§15) |
+| `cache_size`, `hard_heap_limit`, `analysis_limit`, `threads` | resource limits |
+
+It was reproduced first through two real PHP client sessions, which is what "cross-tenant" means to
+a user, and then at pool level where the mechanism lives.
+
+### Why the fix is not a longer list
+
+SQLite has around sixty pragmas and gains more with each release, so a hand-kept list rots silently
+— the same failure §18 found in `foreign_keys` resting on a build flag nobody had decided. The right
+analogue is the one the MySQL backend already uses: `COM_RESET_CONNECTION` (M1-S6). SQLite has no
+such command, but it also has no server to reconnect to, so **`ResetProfile::Full` closes the
+connection and opens a fresh one**. That is complete by construction, and it additionally
+RE-APPLIES the declared setup (`open_configured`: WAL verified, the pool's `busy_timeout`,
+`foreign_keys` on and read back) — something an enumeration could not do, because the backend has no
+"default" `busy_timeout` that is not the pool's.
+
+### What that cost, and why the clean profile narrowed
+
+A reopen measured at **~250 µs** (debug build) against §16's p50 < 60 µs boundary target, so paying
+it on every recycled checkout would blow the latency budget on hygiene alone. `clean_reset_profile`
+is `Some(Targeted)` now.
+
+**Narrowing is safe because the gate is sound**: the only statements that can set connection-scoped
+state are `PRAGMA` and `ATTACH`, and `classify_one_sqlite` taints both UNCONDITIONALLY — ahead of
+its safe-list and independent of `pin_on_unknown`, the same shape as MySQL's `CALL`/`DO` backstop.
+That property was load-bearing and had no test; it has one now, with a control proving the flag
+really is off in the same call. **Nothing was weakened**: a clean connection gets exactly the reset
+it got before, a tainted one strictly more.
+
+### Two hazards checked rather than assumed
+
+* `PRAGMA journal_mode=WAL` cannot switch a database while another connection holds a lock (§15
+  found that with a failing test) and `open_configured` treats a non-WAL answer as a hard connect
+  error — so a reopen under a sibling's write lock could have made hygiene fail. Measured: on an
+  ALREADY-WAL database it returns `"wal"` under another connection's write lock. §15's failure was
+  the rollback→WAL *switch*, which a live pool's reopen never performs.
+* A failed reopen leaves the connection DEAD rather than half-reset, by construction: the handle is
+  parked first and restored only on the success arm — the contract `with_conn`'s panic arm relies on.
+
+### The test that distinguishes a reopen from a scrub
+
+`last_insert_rowid()` is per-connection and sticky (§13), so it is an identity probe: a scrubbed
+connection still answers the previous tenant's rowid, a reopened one answers 0. Without it, an
+implementation that enumerated a handful of pragmas would pass every other test in the file while
+carrying the other fifty forward — which is exactly the outcome being ruled out. A second test
+asserts the opposite direction on a CLEAN recycle so the two profiles cannot collapse back into one,
+and a third guards a SAFETY hole rather than an inefficiency: `apply_readonly` short-circuits on a
+tracked flag (§16), so a reopen leaving it `true` would make the next declared-readonly checkout arm
+nothing at all.
+
+### C3-6b scoping produced while here, recorded rather than met at run time
+
+- **The Laravel tier's execution layer is entirely family-agnostic** apart from
+  `extends PostgresConnection` — `select`, `cursor`, `statement`, `affectingStatement`,
+  `unprepared`, the binding normalisation and the hydration are all shared. A SQLite column wants
+  that body extracted into a trait, not copied.
+- **`SQLiteBuilder::dropAllTables()` calls `refreshDatabaseFile()`**, which does
+  `file_put_contents($connection->getDatabaseName(), '')`. Under Ferro `getDatabaseName()` is the
+  config LABEL, not a path (§12/D8 keeps the path in the engine), so `migrate:fresh` would silently
+  truncate a junk file in the CWD and leave every table in place — and every test after the first
+  would fail on "table already exists". Its other branch (the `:memory:` one) is four stock-grammar
+  statements that DO work through Ferro, but only because `PRAGMA writable_schema` persisted, which
+  is the leak this section closes. **After the fix that branch will need a transaction around it**,
+  which is C3-6a's verified remedy applied again. This is C3-6b's real first problem.
