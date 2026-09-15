@@ -623,3 +623,106 @@ awaited. Copying the constant would bound nothing and imply a hazard that does n
 Every extended code (`1555`, `2067`, `1299`, `275`, `787`, `517`, `8`, `9`) is proven against an
 error a real SQLite produced. A companion test demonstrates the trap: `ErrorCode::DatabaseBusy as
 i32` is **3**, while `SQLITE_BUSY` is **5**.
+
+## 15. C3-3e: the third `AnyPool` arm (2026-09-15) — DONE
+
+The SQLite pool is reachable from `ferrod`. `sqlite://` infers `PoolKind::Sqlite`, the registry
+builds `AnyPool::Sqlite(Pool<SqliteBackend>)`, and the SQL/TX services dispatch to the same generic
+bodies they already had. SPEC §22.2 (bh).
+
+### The seam held, which is the point of the slice
+
+Nothing about the registry's shape changed to take a backend that is a LIBRARY rather than a wire
+protocol. `run_exec_on_pool` and `begin_on_pool` were already generic over `B: PoolBackend`; the arm
+is three `match` lines and a constructor. That is the check `PoolBackend` had to pass to have been
+worth defining, and both previous backends were wire protocols, so it had never been tested against
+anything else.
+
+### `sqlite://` is required, and the narrowing is deliberate
+
+`resolve_path` also accepts a bare filesystem path, but a bare path carries no scheme and so lands in
+`infer_pool_kind`'s warn-and-default arm. Widening to "looks like a path" is the repair NOT taken: it
+is inference rather than declaration, and it would swallow precisely the typo'd DSNs that arm exists
+to surface. Asserted as its own case, so the narrowing is a decision on the record rather than an
+omission.
+
+### The two debts, discharged
+
+**C3-3a's wiring debt.** The pool's `checkout_timeout` is now the connection's `busy_timeout`. The
+two fail in opposite directions if they disagree — a longer busy wait parks a tenant past the
+deadline meant to bound it, a shorter one gives up on contention the pool would still wait out.
+
+The registry-level equality assertion is **vacuous today and says so**: `DEFAULT_BUSY_TIMEOUT` and
+`DEFAULT_POOL_CHECKOUT_TIMEOUT` are both 5 s, so it would pass whether or not the wiring existed. It
+pins intent and breaks the moment either constant moves. The proof is behavioural — 250 ms against
+the 5 s default, a twentyfold gap — and mutation-proven: dropping `.with_busy_timeout(...)` parks for
+5.01 s and fails the ceiling. **Follow-up, recorded not smuggled:** closing the gap outright needs a
+per-pool `checkout_timeout` knob, which `daemon_pool_config` does not have.
+
+**C3-2's lockstep debt.** See below — it is the more interesting half.
+
+### A premise from M1-S6, measured false
+
+`VERSION_SQL`'s comment read *"so no per-backend method is needed"*. SQLite has no `version()`:
+`SELECT version()` answers `no such function` (extended code 1). The probe is now per-family, in a
+SEPARATE tuning field rather than a branch, so a test can steer either statement — a single field
+would have left the SQLite arm permanently un-steerable, which is how the arm nobody can exercise
+becomes the arm nobody notices is wrong.
+
+Without it every probe on a SQLite pool fails and `HELLO_ACK` advertises a nil `server_version`.
+Safe — both driver tiers refuse a nil version loudly by naming the pool (D-S8b-1) — but it would have
+surfaced at C3-6 as a mystery. The test asserts the real version and re-runs the identical registry
+with `SELECT version()` substituted, so the claim is measured, not argued.
+
+### The lockstep test was green under the mutation it existed to catch
+
+This is the slice's lesson, and it is lesson (12) landing on a test written *specifically* to be a
+mechanism proof.
+
+The first version ran the composed BEGIN, then issued a write inside the transaction, then asked a
+raw side connection whether the writer lock was held. Respelling the undeclared arm to a bare
+`BEGIN` — the exact string C3-2 replaced — left it **passing**.
+
+Why: a write inside a DEFERRED transaction UPGRADES it to a writer, and succeeds when nothing else
+is contending at that instant. After any statement has run, both spellings hold the writer lock. The
+observation could not distinguish them.
+
+**D13's claim is not "the transaction ends up holding the lock" — it is that the lock is taken AT
+BEGIN**, so no upgrade is ever needed and `SQLITE_BUSY_SNAPSHOT` is unreachable by construction. That
+is visible only in the window between BEGIN and the first statement. The side connection now looks
+there, the write moved to after the observation (where it also shows the writer never upgrades), and
+both arms are mutation-proven:
+
+| mutation | arm that fails |
+|---|---|
+| undeclared → `"BEGIN"` | `engines_undeclared_begin_holds_the_writer_lock` |
+| readonly → `"BEGIN IMMEDIATE"` | `engines_declared_readonly_begin_leaves_the_writer_lock_free` |
+
+The test names no BEGIN string: dialect from the pool, string from the composer, run through the same
+`Checkout::begin_tx_with` the TX service uses. A respelling changes what is emitted and the
+observation changes with it.
+
+### Found by a failing test: WAL cannot be switched under a lock
+
+`PRAGMA journal_mode=WAL` cannot change a database's journal mode while another connection holds a
+lock on it. When the side connection created the file as a rollback-journal database and took the
+writer lock before the pool had dialled, the backend's WAL verification failed and the checkout
+returned `ConnectionLost` rather than parking.
+
+Not a hazard in the ordinary case — an already-WAL database does not hit it, and a pool dials at
+startup with contention arriving later — but a SQLite pool's FIRST connection should not be raced
+against an external writer, and it is why the timeout test warms the pool before contending.
+
+### The adversarial pass earned its keep: a defect this arm made reachable
+
+`PoolBackend::supports_row_streaming` defaults to **`true`**, and `SqliteBackend` was inheriting it
+while its `query_stream` is `Unsupported` until C3-5.
+
+`ferrod` reads that single method as the streaming-capability authority (M1-S8a) so a `fetch:stream`
+against a backend that cannot stream is refused BEFORE any checkout, rather than surfacing as an
+error part-way through a result set the client has already started consuming. Inheriting the default
+would therefore have turned a clean refusal into a mid-stream one — live from the moment this slice
+made a SQLite pool constructible, and unreachable before only because nothing could build one.
+
+Overridden to `false`, with the capability/`query_stream` pairing asserted and mutation-proven
+(deleting the override fails the test). Both halves flip together at C3-5, and the test says so.

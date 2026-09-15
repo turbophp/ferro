@@ -15,6 +15,7 @@ ferro-proto = { path = "../ferro-proto" }
 ferro-pool = { path = "../ferro-pool" }
 ferro-backend-pg = { path = "../ferro-backend-pg" }
 ferro-backend-mysql = { path = "../ferro-backend-mysql" }
+ferro-backend-sqlite = { path = "../ferro-backend-sqlite" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "signal", "macros", "io-util", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
@@ -41,3 +42,9 @@ tokio-postgres = "0.7"
 # before firing an external kill/CANCEL. Resolves to the SAME vendored fork `ferro-backend-mysql`
 # uses (workspace `[patch.crates-io]`), so no second copy of the driver is compiled in.
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
+# The SQLite BEGIN lockstep test (C3-3e, `tests/sqlite_begin_lockstep_it.rs`) needs a RAW side
+# connection to the same database file — independent of ferrod's own pool — to attempt the competing
+# writer lock. Same role the two raw drivers above play for the chaos suites, and it resolves to the
+# SAME rusqlite `ferro-backend-sqlite` uses, so no second copy of the driver is compiled in.
+rusqlite = { version = "0.40", features = ["bundled"] }
+tempfile = "3"
