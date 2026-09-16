@@ -11,8 +11,11 @@
 //! reports the highest-precedence trigger found, so `Checkout::exec`'s `batch_execute` path is
 //! covered, not just the leading statement).
 
+mod fingerprint;
 mod rules;
 mod scan;
+
+pub use fingerprint::{Fingerprint, fingerprint};
 
 /// The upstream SQL dialect being classified against. [`Dialect::Postgres`] is wired to a live
 /// backend in M1-S2; [`Dialect::MySql`] is wired to a live backend in M1-S6 (as defense-in-depth
