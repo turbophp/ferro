@@ -45,6 +45,23 @@ pub enum AnyPool {
     Sqlite(Pool<SqliteBackend>),
 }
 
+impl AnyPool {
+    /// This pool's SPEC §13 pin-cause counters, every cause including the zeroes (M2-C4b).
+    ///
+    /// The three arms are identical by construction — `pin_metrics` lives on `Pool`, not on the
+    /// backend — which is the same property C3-3e checked when the SQLite arm landed: a backend
+    /// that is a synchronous library counts pins exactly like a wire protocol does.
+    pub fn pin_metrics_snapshot(
+        &self,
+    ) -> [(ferro_pool::pin::PinCause, u64); ferro_pool::pin::PinCause::COUNT] {
+        match self {
+            AnyPool::Pg(p) => p.pin_metrics().snapshot(),
+            AnyPool::Mysql(p) => p.pin_metrics().snapshot(),
+            AnyPool::Sqlite(p) => p.pin_metrics().snapshot(),
+        }
+    }
+}
+
 /// Daemon per-pool defaults (M0). Deliberately modest, not tuned: correctness over throughput
 /// until the D12 bench (charter rule 5). The reaper IS enabled (`Some`) so a backend killed out
 /// from under an idle connection is evicted rather than handed to the next tenant.

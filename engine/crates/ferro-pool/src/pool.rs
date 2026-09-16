@@ -17,7 +17,7 @@ use ferro_proto::value::Value;
 use crate::backend::{BackendRows, PoolBackend, QueryResult, Reclaimed, ResetProfile, TxStatus};
 use crate::config::PoolConfig;
 use crate::error::PoolError;
-use crate::pin::{self, PinCause, PinState, TxId};
+use crate::pin::{self, PinCause, PinCauseCell, PinMetrics, PinState, TxId};
 
 /// A connection sitting idle in the pool, plus the bookkeeping needed to recycle it safely on
 /// the next checkout.
@@ -58,6 +58,10 @@ pub(crate) struct PoolInner<B: PoolBackend> {
     pub(crate) config: PoolConfig,
     pub(crate) semaphore: Arc<Semaphore>,
     pub(crate) idle: Mutex<Vec<IdleConn<B>>>,
+    /// SPEC §13's pin-cause counters for THIS pool. Lives on the shared inner so every `Checkout`
+    /// and every clone of the handle counts into the same place, and so a scrape reads one pool's
+    /// numbers without walking its checkouts.
+    pub(crate) pin_metrics: PinMetrics,
 }
 
 /// A cloneable handle to a pool. Cloning shares the same underlying connections/semaphore/idle
@@ -75,6 +79,11 @@ impl<B: PoolBackend> Clone for Pool<B> {
 }
 
 impl<B: PoolBackend> Pool<B> {
+    /// This pool's SPEC §13 pin-cause counters (M2-C4b).
+    pub fn pin_metrics(&self) -> &PinMetrics {
+        &self.inner.pin_metrics
+    }
+
     /// Builds a pool over `backend` with `config`. Spawns the background liveness reaper (Task 3,
     /// `health::spawn_reaper`) iff `config.reap_interval` is `Some`; a `None` interval leaves the
     /// pool exactly as reaper-less as Task 2 left it (needed for deterministic `start_paused`
@@ -87,6 +96,7 @@ impl<B: PoolBackend> Pool<B> {
             config,
             semaphore,
             idle: Mutex::new(Vec::new()),
+            pin_metrics: PinMetrics::default(),
         });
         if let Some(interval) = reap_interval {
             crate::health::spawn_reaper(&inner, interval);
@@ -339,7 +349,7 @@ pub struct Checkout<B: PoolBackend> {
     /// `Some(PinCause::Tx)` from the RFQ tx-authority path (`apply_tx_status`, M1-S1); any of the
     /// other seven assist causes (`Listen`/`AdvisoryLock`/`Prepare`/`Temp`/`Set`/`PinFunction`/
     /// `Unknown`) from the classifier (`apply_classify`, M1-S2).
-    last_pin_cause: Option<PinCause>,
+    last_pin_cause: PinCauseCell,
     /// **FB-3b — the pool's own "never recycle this connection" latch.** Once set, `Drop` discards
     /// the connection instead of pushing it onto the idle stack, WITHOUT consulting the backend.
     ///
@@ -370,7 +380,7 @@ impl<B: PoolBackend> Checkout<B> {
             tx_open: false,
             tainted: false,
             pin: PinState::Unpinned,
-            last_pin_cause: None,
+            last_pin_cause: PinCauseCell::default(),
             discard: false,
         }
     }
@@ -459,7 +469,8 @@ impl<B: PoolBackend> Checkout<B> {
         // replacement of the manual pin).
         if r.is_ok() {
             self.pin = PinState::PinnedTx(tx_id);
-            self.last_pin_cause = Some(PinCause::Tx);
+            self.last_pin_cause
+                .set(PinCause::Tx, &self.pool.pin_metrics);
             self.tx_open = true;
         }
         let st = pool.backend.tx_status(self.conn());
@@ -644,7 +655,7 @@ impl<B: PoolBackend> Checkout<B> {
     /// the assist lexer (`apply_classify`, M1-S2) can additionally set any of `Listen`,
     /// `AdvisoryLock`, `Prepare`, `Temp`, `Set`, `PinFunction`, or `Unknown`.
     pub fn last_pin_cause(&self) -> Option<PinCause> {
-        self.last_pin_cause
+        self.last_pin_cause.get()
     }
 
     /// The tx-control guard shared by [`Checkout::exec`], [`Checkout::query`] and
@@ -932,7 +943,8 @@ impl<B: PoolBackend> Checkout<B> {
             self.tainted = true;
         }
         if matches!(st, TxStatus::InTx | TxStatus::Failed) {
-            self.last_pin_cause = Some(PinCause::Tx);
+            self.last_pin_cause
+                .set(PinCause::Tx, &self.pool.pin_metrics);
         }
         // NOTE: `self.pin` is intentionally NOT written here — never clobber a real `TxId`, never
         // fabricate a sentinel. See the doc comment above.
@@ -961,8 +973,9 @@ impl<B: PoolBackend> Checkout<B> {
             self.tainted = true;
             // Never clobber the RFQ's authoritative `Tx` label (set by the preceding
             // `apply_tx_status`); otherwise record `SessionTracker` as the observed cause.
-            if !matches!(self.last_pin_cause, Some(PinCause::Tx)) {
-                self.last_pin_cause = Some(PinCause::SessionTracker);
+            if !self.last_pin_cause.is(PinCause::Tx) {
+                self.last_pin_cause
+                    .set(PinCause::SessionTracker, &self.pool.pin_metrics);
             }
         }
     }
@@ -1015,7 +1028,8 @@ impl<B: PoolBackend> Checkout<B> {
             self.pool.config.pin_on_unknown,
         ) {
             self.tainted = true;
-            self.last_pin_cause = Some(PinCause::from(trigger));
+            self.last_pin_cause
+                .set(PinCause::from(trigger), &self.pool.pin_metrics);
         }
     }
 
