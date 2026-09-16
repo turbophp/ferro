@@ -62,6 +62,41 @@ async fn main() -> anyhow::Result<()> {
     let drain = Drain::new();
     spawn_signal_watchers(drain.clone())?;
 
+    // SPEC §13's Prometheus endpoint (M2-C4b), only when the operator asked for it. Binding is
+    // fallible and must NOT take the daemon down: the engine's job is on the UDS, and refusing to
+    // start because a metrics port is already taken would turn an observability problem into an
+    // outage. It is logged loudly instead, at `error`, because a silently absent endpoint is the
+    // failure mode an operator discovers from an empty dashboard days later.
+    let metrics_shutdown = if let Some(addr) = config.metrics_addr.clone() {
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => {
+                let bound = l.local_addr().ok();
+                // product-vision §5: admin/metrics bind loopback/UDS by default, and anything
+                // crossing hosts wants mTLS/bearer — which this endpoint does not have. It carries
+                // no DSNs and no SQL (only pool NAMES and counters), but pool names and pin causes
+                // still describe an operator's topology, so a non-loopback bind is said out loud
+                // rather than quietly honoured.
+                if bound.is_some_and(|a| !a.ip().is_loopback()) {
+                    tracing::warn!(
+                        addr = ?bound,
+                        "ferrod: metrics endpoint is NOT on loopback and is unauthenticated \
+                         (product-vision §5) — put it behind a proxy or bind it to localhost",
+                    );
+                }
+                tracing::info!(addr = ?bound, "ferrod: metrics endpoint listening");
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                tokio::spawn(ferrod::metrics::serve(l, registry.clone(), epoch.0, rx));
+                Some(tx)
+            }
+            Err(e) => {
+                tracing::error!(%addr, error = %e, "ferrod: metrics endpoint failed to bind");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     serve(
         listener,
         config,
@@ -73,6 +108,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
+    if let Some(tx) = metrics_shutdown {
+        let _ = tx.send(true);
+    }
     tracing::info!("ferrod exiting");
     Ok(())
 }

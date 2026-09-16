@@ -275,6 +275,14 @@ pub struct Config {
     /// How much of a slow statement's parameters the slow log may carry. From `FERRO_LOG_PARAMS`,
     /// default [`LogParams::Never`].
     pub log_params: LogParams,
+    /// Where SPEC §13's Prometheus endpoint listens, or `None` to not bind it at all (M2-C4b).
+    ///
+    /// **Opt-in, and that is a deliberate reading of product-vision §5.** §5 says admin/metrics
+    /// "bind loopback/UDS by default", which governs WHERE the endpoint binds once an operator
+    /// asks for it — not WHETHER a daemon that never had a second listener starts opening one on
+    /// upgrade. A port appearing on a host because a package was updated is the kind of surprise an
+    /// operator should authorise, so the default is off and the documented value is a loopback one.
+    pub metrics_addr: Option<String>,
     /// Configured upstream connection pools (S5). Each `PoolSpec` names a pool and carries its DSN
     /// (§12 server-side secret — never sent to the client, never logged). Default: empty (the EXEC
     /// handler then answers every request with `Unsupported: unknown pool`). From `FERRO_POOLS`
@@ -298,6 +306,7 @@ impl Default for Config {
             tx_teardown_timeout: DEFAULT_TX_TEARDOWN_TIMEOUT,
             slow_log_ms: None,
             log_params: LogParams::Never,
+            metrics_addr: None,
             pools: Vec::new(),
         }
     }
@@ -329,6 +338,17 @@ impl Config {
         }
         if let Ok(raw) = std::env::var("FERRO_LOG_PARAMS") {
             cfg.log_params = LogParams::parse(&raw);
+        }
+        if let Ok(raw) = std::env::var("FERRO_METRICS_ADDR") {
+            // A BLANK value reads as unset rather than as an empty address — the same rule D14's
+            // `allow_dir` uses, so `FERRO_METRICS_ADDR=` in a unit file disables rather than
+            // failing to bind.
+            let t = raw.trim();
+            cfg.metrics_addr = if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            };
         }
 
         cfg

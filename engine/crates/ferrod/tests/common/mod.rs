@@ -571,6 +571,43 @@ pub fn mariadb_url() -> Option<String> {
 /// pointing at `url`. Uses `TestServer::spawn_with_factory` (no peercred gate) with the real
 /// `sql::make_handler` + a shared `Arc<TxRegistry>` — built exactly as `main` builds it — so this
 /// is a genuine client→ferrod→pool→PG round trip.
+/// A SQLite-backed [`TestServer`] plus a BOUND metrics endpoint, for the §13 scrape e2e.
+///
+/// Port 0 so the OS picks a free one — a fixed port would make the test fail under `--jobs` or
+/// beside anything else on the runner, and the address is returned rather than assumed.
+pub async fn exec_server_with_metrics() -> (
+    TestServer,
+    std::net::SocketAddr,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let path = std::env::temp_dir().join(format!(
+        "ferro-metrics-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let _ = std::fs::remove_file(&path);
+    let (server, registry) = exec_server_configured(
+        format!("sqlite://{}", path.display()),
+        None,
+        ferrod::config::LogParams::Never,
+    );
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind an ephemeral loopback port");
+    let addr = listener.local_addr().expect("the bound address");
+    // **The sender is RETURNED, not dropped.** `serve`'s `shutdown.changed()` resolves with an
+    // error the moment the last sender goes away, so a helper that dropped it here left the
+    // endpoint listening for exactly zero requests — which is how the first version of this
+    // helper failed, with a `ConnectionRefused` that looked like a bind problem.
+    tokio::spawn(ferrod::metrics::serve(listener, registry, 7, rx));
+    (server, addr, tx)
+}
+
 /// [`exec_server`] with the SPEC §13 slow-log settings applied — the seam the slow-log e2e needs,
 /// since the threshold and `log_params` are resolved into the `PoolRegistry` at build time.
 pub fn exec_server_with_slow_log(
@@ -578,18 +615,18 @@ pub fn exec_server_with_slow_log(
     slow_log_ms: Option<u64>,
     log_params: ferrod::config::LogParams,
 ) -> TestServer {
-    exec_server_configured(url, slow_log_ms, log_params)
+    exec_server_configured(url, slow_log_ms, log_params).0
 }
 
 pub fn exec_server(url: String) -> TestServer {
-    exec_server_configured(url, None, ferrod::config::LogParams::Never)
+    exec_server_configured(url, None, ferrod::config::LogParams::Never).0
 }
 
 fn exec_server_configured(
     url: String,
     slow_log_ms: Option<u64>,
     log_params: ferrod::config::LogParams,
-) -> TestServer {
+) -> (TestServer, Arc<PoolRegistry>) {
     // Kind is inferred from the DSN scheme (M1-S6), so `exec_server(mysql_url())` builds a MySQL
     // pool and `exec_server(pg_url())` a Postgres one — the SAME helper drives both dialects.
     let kind = ferrod::config::infer_pool_kind(&url);
@@ -615,7 +652,9 @@ fn exec_server_configured(
         config.max_tx,
         config.tx_teardown_timeout,
     );
-    TestServer::spawn_with_factory(BootEpoch(1), registry, tx_registry, factory)
+    let server =
+        TestServer::spawn_with_factory(BootEpoch(1), registry.clone(), tx_registry, factory);
+    (server, registry)
 }
 
 /// A live `ferrod` session server over a registry of N named pools. The N-pool sibling of

@@ -15,6 +15,8 @@
 //! that invariant falls out of the existing checkout/Drop mechanics rather than needing separate
 //! enforcement here.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::backend::TxStatus;
 
 /// Identifies a transaction for pinning purposes. Opaque to the pool — the TX service (S6) is the
@@ -68,6 +70,68 @@ pub enum PinCause {
     SessionTracker,
 }
 
+impl PinCause {
+    /// How many causes there are. The pin-cause counter array is sized by this.
+    pub const COUNT: usize = 9;
+
+    /// Every cause, once. The metrics exporter walks this so a counter that is never incremented
+    /// still exports as `0` — a Prometheus series that only appears after the first event is one an
+    /// operator cannot alert on ("no data" and "none happened" must not look the same).
+    pub const ALL: [PinCause; Self::COUNT] = [
+        PinCause::Tx,
+        PinCause::Listen,
+        PinCause::AdvisoryLock,
+        PinCause::Prepare,
+        PinCause::Temp,
+        PinCause::Set,
+        PinCause::PinFunction,
+        PinCause::Unknown,
+        PinCause::SessionTracker,
+    ];
+
+    /// This cause's slot in the counter array.
+    ///
+    /// **This match is the anti-rot mechanism, and it is why the counters are indexed rather than
+    /// held in a map.** A new variant fails to compile here until it is given a slot; a slot at or
+    /// past [`COUNT`](Self::COUNT) fails `every_cause_has_a_distinct_slot_within_count`; a variant
+    /// missing from [`ALL`](Self::ALL) fails the same test's coverage half; and a label absent from
+    /// SPEC §13 fails `the_spec_13_label_vocabulary_is_exactly_this_enum`. FB-7 — `SessionTracker`
+    /// reaching `PinCause` at M1-S6 and never reaching §13's list — is the failure all four exist
+    /// to stop repeating, and it went unnoticed because the old vocabulary was a hand-kept list.
+    pub const fn index(self) -> usize {
+        match self {
+            PinCause::Tx => 0,
+            PinCause::Listen => 1,
+            PinCause::AdvisoryLock => 2,
+            PinCause::Prepare => 3,
+            PinCause::Temp => 4,
+            PinCause::Set => 5,
+            PinCause::PinFunction => 6,
+            PinCause::Unknown => 7,
+            PinCause::SessionTracker => 8,
+        }
+    }
+
+    /// This cause's Prometheus label value (SPEC §13's closed `cause` vocabulary).
+    ///
+    /// product-vision §5 requires CLOSED label vocabularies — no free-text labels, so no PII drift
+    /// and no cardinality explosion — which is why this is a total function over the enum and not a
+    /// `Debug` rendering that would silently track a variant rename into the operator's alerts.
+    pub const fn label(self) -> &'static str {
+        match self {
+            PinCause::Tx => "tx",
+            PinCause::Listen => "listen",
+            PinCause::AdvisoryLock => "lock",
+            PinCause::Prepare => "prepare",
+            PinCause::Temp => "temp",
+            PinCause::Set => "set",
+            PinCause::PinFunction => "pin_function",
+            PinCause::Unknown => "unknown",
+            PinCause::SessionTracker => "session_tracker",
+        }
+    }
+}
+
 impl From<ferro_classify::PinTrigger> for PinCause {
     /// Same-named 1:1 mapping from the assist lexer's trigger to the pool's pin-cause label.
     fn from(trigger: ferro_classify::PinTrigger) -> Self {
@@ -80,6 +144,68 @@ impl From<ferro_classify::PinTrigger> for PinCause {
             ferro_classify::PinTrigger::PinFunction => PinCause::PinFunction,
             ferro_classify::PinTrigger::Unknown => PinCause::Unknown,
         }
+    }
+}
+
+/// SPEC §13's pin-cause counters: how many times each cause tainted or pinned a connection.
+///
+/// **It counts the EVENT, not the state.** `Checkout::last_pin_cause` is a snapshot of the most
+/// recent cause and is overwritten in place, so a gauge over it would answer "what pinned this
+/// connection" and never "how often does `LISTEN` pin connections in this pool" — which is the
+/// question an operator tuning `pin_on_unknown` or hunting a pool-exhaustion cause actually has.
+///
+/// Relaxed ordering throughout: these are counters read by a scrape, so a reader may observe two
+/// causes from slightly different instants. That is what every Prometheus counter already is, and
+/// paying for `SeqCst` on the hot checkout path to make a scrape self-consistent would buy nothing
+/// an operator can use.
+#[derive(Debug, Default)]
+pub struct PinMetrics {
+    by_cause: [AtomicU64; PinCause::COUNT],
+}
+
+impl PinMetrics {
+    /// Record one pin/taint attributed to `cause`.
+    pub fn record(&self, cause: PinCause) {
+        self.by_cause[cause.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The count for one cause.
+    pub fn get(&self, cause: PinCause) -> u64 {
+        self.by_cause[cause.index()].load(Ordering::Relaxed)
+    }
+
+    /// Every cause and its count, in [`PinCause::ALL`] order — including the zeroes.
+    pub fn snapshot(&self) -> [(PinCause, u64); PinCause::COUNT] {
+        PinCause::ALL.map(|c| (c, self.get(c)))
+    }
+}
+
+/// A `Checkout`'s most recent pin cause — and the ONLY way to set one.
+///
+/// The field it replaces was a plain `Option<PinCause>` assigned at four sites. Counting the cause
+/// at each of those sites would work until someone adds a fifth, which is exactly how FB-7 happened
+/// one level up. Here the inner `Option` is private to this module, so `pool.rs` cannot write a
+/// cause without going through [`set`](Self::set) — **a pin site that forgets the counter does not
+/// compile**, which is the C4a `Fingerprint` lesson applied to a different contract.
+#[derive(Debug, Default)]
+pub(crate) struct PinCauseCell(Option<PinCause>);
+
+impl PinCauseCell {
+    /// The cause, if any.
+    pub(crate) fn get(&self) -> Option<PinCause> {
+        self.0
+    }
+
+    /// Whether the current cause is `cause` — the `SessionTracker` arm's "never clobber the
+    /// authoritative `Tx` label" check, spelled without handing out a writable reference.
+    pub(crate) fn is(&self, cause: PinCause) -> bool {
+        self.0 == Some(cause)
+    }
+
+    /// Record `cause` and COUNT it. There is no other way to write this cell.
+    pub(crate) fn set(&mut self, cause: PinCause, metrics: &PinMetrics) {
+        self.0 = Some(cause);
+        metrics.record(cause);
     }
 }
 
@@ -325,11 +451,109 @@ pub(crate) fn tx_status_bits(st: TxStatus) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PinCause, TxControlClass, TxVerb, is_bare_tx_control, is_lone_statement, leading_tx_verb,
-        tx_control_class, tx_status_bits,
+        PinCause, PinMetrics, TxControlClass, TxVerb, is_bare_tx_control, is_lone_statement,
+        leading_tx_verb, tx_control_class, tx_status_bits,
     };
     use crate::backend::TxStatus;
+
     use ferro_classify::PinTrigger;
+
+    /// **The slot mechanism, proven on all three of its failure paths at once.**
+    ///
+    /// A new `PinCause` variant cannot reach production silently: `index()`'s match stops
+    /// compiling, and if it is then given a slot outside `COUNT` or left out of `ALL`, this test
+    /// fails. That is the rot FB-7 actually was — `SessionTracker` was added to the enum at M1-S6
+    /// and no list that named causes learned about it.
+    #[test]
+    fn every_cause_has_a_distinct_slot_within_count() {
+        let mut seen = [false; PinCause::COUNT];
+        for cause in PinCause::ALL {
+            let i = cause.index();
+            assert!(
+                i < PinCause::COUNT,
+                "{cause:?} has slot {i}, outside COUNT={}",
+                PinCause::COUNT,
+            );
+            assert!(
+                !seen[i],
+                "slot {i} is claimed by two causes, one of them {cause:?}"
+            );
+            seen[i] = true;
+        }
+        // The coverage half: every slot is claimed, so no variant is missing from ALL.
+        for (i, hit) in seen.iter().enumerate() {
+            assert!(
+                hit,
+                "slot {i} belongs to a cause that is missing from PinCause::ALL"
+            );
+        }
+    }
+
+    /// Labels are distinct, or two causes would silently share one Prometheus series.
+    #[test]
+    fn every_cause_has_a_distinct_label() {
+        let mut labels: Vec<&str> = PinCause::ALL.iter().map(|c| c.label()).collect();
+        let before = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), before, "two causes share a label: {labels:?}");
+    }
+
+    /// **FB-7's gate.** SPEC §13 declares the `cause` vocabulary CLOSED, so the document and the
+    /// enum must agree — and the way that claim rotted was that nothing checked it. This reads the
+    /// spec's own sentence, so §13 cannot drift from the code in either direction.
+    #[test]
+    fn the_spec_13_label_vocabulary_is_exactly_this_enum() {
+        let spec = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../ferro-spec-v0.2.md"
+        ))
+        .expect("the spec sits at the repo root");
+        let marker = "pin-cause counters** (labels: ";
+        let start = spec
+            .find(marker)
+            .expect("§13 still names the pin-cause counters")
+            + marker.len();
+        let rest = &spec[start..];
+        let end = rest.find(')').expect("the label list is parenthesised");
+        let mut documented: Vec<&str> = rest[..end]
+            .trim()
+            .trim_matches('`')
+            .split(',')
+            .map(|t| t.trim().trim_matches('`'))
+            .collect();
+
+        let mut actual: Vec<&str> = PinCause::ALL.iter().map(|c| c.label()).collect();
+        documented.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(
+            documented, actual,
+            "SPEC §13's closed pin-cause vocabulary and PinCause have drifted apart",
+        );
+    }
+
+    /// The counters count EVENTS — repeated causes accumulate, and an untouched cause reports 0
+    /// rather than being absent (an operator cannot alert on a series that does not exist yet).
+    #[test]
+    fn pin_metrics_count_events_and_report_untouched_causes_as_zero() {
+        let m = PinMetrics::default();
+        assert_eq!(m.snapshot().len(), PinCause::COUNT);
+        assert!(m.snapshot().iter().all(|&(_, n)| n == 0));
+
+        m.record(PinCause::Listen);
+        m.record(PinCause::Listen);
+        m.record(PinCause::SessionTracker);
+
+        assert_eq!(m.get(PinCause::Listen), 2, "a repeated cause accumulates");
+        assert_eq!(m.get(PinCause::SessionTracker), 1);
+        assert_eq!(
+            m.get(PinCause::Tx),
+            0,
+            "an untouched cause is 0, not missing"
+        );
+        // Every cause is present in the snapshot regardless of whether it ever fired.
+        assert_eq!(m.snapshot().len(), PinCause::COUNT);
+    }
 
     // ---- PinCause::from(PinTrigger) — M1-S2 Task 2 --------------------------------------------
 
