@@ -17,12 +17,21 @@ use ferrod::tx::TxRegistry;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // product-vision §5 wants the SPEC §13 slow log as "structured JSON to stdout/journald".
+    // `FERRO_LOG_FORMAT=json` selects it for the whole stream rather than for one target, because
+    // a single `fmt` subscriber has one formatter — and a log stream that is JSON for some lines
+    // and prose for others is worse to parse than either. Default stays TEXT: an operator reading
+    // a terminal should not have to opt out of machine output.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if std::env::var("FERRO_LOG_FORMAT").is_ok_and(|v| v.trim().eq_ignore_ascii_case("json")) {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     let config = Config::from_env();
     config.validate()?;

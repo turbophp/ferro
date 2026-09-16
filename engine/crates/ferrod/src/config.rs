@@ -207,6 +207,34 @@ pub enum ConfigError {
     },
 }
 
+/// SPEC §13 / product-vision §5: how much of a slow statement's PARAMETERS the slow log may carry.
+///
+/// The vocabulary is §13's, verbatim and closed — `never | on_error | always` — and the default is
+/// the safe end. Parameters are the one field in a slow-log record that is a VALUE rather than a
+/// shape, so this is the only knob that can turn the log into a place secrets land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogParams {
+    /// Never log parameters. The default, and the only setting that cannot leak a value.
+    #[default]
+    Never,
+    /// Log parameters only for a statement that FAILED — the case where they are diagnostic.
+    OnError,
+    /// Always log parameters. Debugging only; says so in the docs and means it.
+    Always,
+}
+
+impl LogParams {
+    /// Parse §13's closed vocabulary. An unrecognised value falls back to the SAFE end rather than
+    /// failing the daemon's startup: a typo in one env var must not be able to widen redaction.
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "on_error" => Self::OnError,
+            "always" => Self::Always,
+            _ => Self::Never,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// UDS bind path. From `FERRO_SOCK`, default `/run/ferro/dev.sock`.
@@ -239,6 +267,14 @@ pub struct Config {
     /// on abort/deadline the pinned conn is rolled back before release; if that hangs, the conn is
     /// tainted + dropped rather than held (with its pool permit) until an OS TCP timeout.
     pub tx_teardown_timeout: Duration,
+    /// SPEC §13 slow log: statements at or above this wall time are logged, once each, with a
+    /// normalized fingerprint and never raw SQL. `None` — the default — means the slow log is OFF,
+    /// because an operator who has not asked for it should not silently gain a new log stream.
+    /// From `FERRO_SLOW_LOG_MS`.
+    pub slow_log_ms: Option<u64>,
+    /// How much of a slow statement's parameters the slow log may carry. From `FERRO_LOG_PARAMS`,
+    /// default [`LogParams::Never`].
+    pub log_params: LogParams,
     /// Configured upstream connection pools (S5). Each `PoolSpec` names a pool and carries its DSN
     /// (§12 server-side secret — never sent to the client, never logged). Default: empty (the EXEC
     /// handler then answers every request with `Unsupported: unknown pool`). From `FERRO_POOLS`
@@ -260,6 +296,8 @@ impl Default for Config {
             idle_in_tx: DEFAULT_IDLE_IN_TX,
             max_tx: DEFAULT_MAX_TX,
             tx_teardown_timeout: DEFAULT_TX_TEARDOWN_TIMEOUT,
+            slow_log_ms: None,
+            log_params: LogParams::Never,
             pools: Vec::new(),
         }
     }
@@ -281,6 +319,16 @@ impl Config {
 
         if let Ok(names) = std::env::var("FERRO_POOLS") {
             cfg.pools = parse_pools(&names, &|k| std::env::var(k).ok());
+        }
+
+        // SPEC §13 slow log. A value that does not parse leaves it OFF rather than guessing a
+        // threshold: a mistyped `FERRO_SLOW_LOG_MS` should not quietly start logging every
+        // statement, and `0` is a legitimate "log everything" the operator may actually want.
+        if let Ok(raw) = std::env::var("FERRO_SLOW_LOG_MS") {
+            cfg.slow_log_ms = raw.trim().parse::<u64>().ok();
+        }
+        if let Ok(raw) = std::env::var("FERRO_LOG_PARAMS") {
+            cfg.log_params = LogParams::parse(&raw);
         }
 
         cfg
@@ -691,6 +739,29 @@ mod tests {
     /// SPEC D14's knob: set, unset, and BLANK. The blank case is the one worth a test — treating
     /// `""` as a configured value would resolve to the empty path and refuse everything, turning a
     /// stray `export FERRO_POOL_X_ALLOW_DIR=` into a pool that cannot ATTACH at all.
+    /// §13's `log_params` vocabulary is CLOSED, and an unrecognised value falls back to the SAFE
+    /// end. A typo in one env var must not be able to widen redaction — which is the direction
+    /// that matters, since the other direction merely loses a debugging aid.
+    #[test]
+    fn log_params_parses_the_closed_vocabulary_and_fails_safe() {
+        assert_eq!(LogParams::parse("never"), LogParams::Never);
+        assert_eq!(LogParams::parse("on_error"), LogParams::OnError);
+        assert_eq!(LogParams::parse("always"), LogParams::Always);
+        assert_eq!(LogParams::parse("  ALWAYS  "), LogParams::Always);
+        assert_eq!(LogParams::parse("On_Error"), LogParams::OnError);
+        // Anything else — a typo, an empty string, a value from a different product's vocabulary.
+        for junk in [
+            "", "  ", "yes", "true", "all", "alwyas", "on-error", "verbose",
+        ] {
+            assert_eq!(
+                LogParams::parse(junk),
+                LogParams::Never,
+                "{junk:?} must fall back to the safe end",
+            );
+        }
+        assert_eq!(LogParams::default(), LogParams::Never);
+    }
+
     #[test]
     fn allow_dir_parses_set_unset_and_blank() {
         let set = map_lookup(&[("FERRO_POOL_MAIN_ALLOW_DIR", "  /srv/backups  ")]);

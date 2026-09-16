@@ -8,4 +8,5 @@ pub mod serve;
 pub mod services;
 pub mod session;
 pub mod shutdown;
+pub mod slow_log;
 pub mod tx;

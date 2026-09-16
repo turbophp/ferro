@@ -87,12 +87,37 @@ enum Region {
     DollarQuote,
 }
 
+/// What a hidden span was, for the consumers that need to tell them apart.
+///
+/// The masked copy blanks both to spaces, which is all the pin lexer needs; the slow-log
+/// FINGERPRINT needs the difference, because a literal becomes a `?` placeholder while a comment
+/// is dropped entirely. Deriving that from `masked` alone is impossible — a space INSIDE a string
+/// literal is byte-identical to a space in code — so the one region pass records it instead of a
+/// second lexer guessing at it later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hidden {
+    /// A `'...'` string literal or a `$tag$...$tag$` dollar-quoted body: a VALUE.
+    Literal,
+    /// A `-- ...` or `/* ... */` comment: not a value, and not part of the statement's shape.
+    Comment,
+}
+
 /// Output of [`scan`]: a same-byte-length masked copy of the input (hidden-region bytes replaced
-/// by ASCII spaces, one-for-one, so byte offsets are preserved) plus the byte offsets of every
-/// top-level (Code-region) `;`.
+/// by ASCII spaces, one-for-one, so byte offsets are preserved), the byte offsets of every
+/// top-level (Code-region) `;`, and the half-open byte span of every hidden region with its kind.
+///
+/// `hidden` is in ascending, non-overlapping start order (the scan is one left-to-right pass), and
+/// an UNTERMINATED region runs to `sql.len()` — the same total-on-any-input guarantee `masked` has.
 struct ScanResult {
     masked: String,
     semicolons: Vec<usize>,
+    hidden: Vec<(usize, usize, Hidden)>,
+}
+
+/// The hidden spans of `sql` — every string literal, dollar-quoted body and comment, with its
+/// kind, in ascending byte order. The fingerprint's view of the ONE region pass.
+pub(crate) fn hidden_spans(sql: &str) -> Vec<(usize, usize, Hidden)> {
+    scan(sql).hidden
 }
 
 /// The single region-tracking pass. Total (never panics) on any input, including empty,
@@ -104,12 +129,20 @@ fn scan(sql: &str) -> ScanResult {
     let mut region = Region::Code;
     let mut dollar_tag: &str = "";
     let mut i = 0usize;
+    // The hidden span currently open, as (start byte, kind). Closed on every transition BACK to
+    // Code, and flushed after the loop so an unterminated region still reports a span.
+    let mut hidden: Vec<(usize, usize, Hidden)> = Vec::new();
+    let mut open_hidden: Option<(usize, Hidden)> = None;
 
     while i < bytes.len() {
         match region {
             Region::Code => match bytes[i] {
                 b'\'' => {
                     let e_string = is_e_string_prefix(sql, i);
+                    // The `E` of an E-string is part of the LITERAL for fingerprinting purposes:
+                    // leaving it in the code stream renders `E'x'` as `E?`, which reads like a
+                    // typo. `is_e_string_prefix` already proved a preceding byte exists.
+                    open_hidden = Some((if e_string { i - 1 } else { i }, Hidden::Literal));
                     push_hidden_char(&mut masked, sql, &mut i);
                     region = Region::SingleQuote { e_string };
                 }
@@ -118,17 +151,20 @@ fn scan(sql: &str) -> ScanResult {
                     region = Region::DoubleQuote;
                 }
                 b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                    open_hidden = Some((i, Hidden::Comment));
                     push_hidden_char(&mut masked, sql, &mut i);
                     push_hidden_char(&mut masked, sql, &mut i);
                     region = Region::LineComment;
                 }
                 b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    open_hidden = Some((i, Hidden::Comment));
                     push_hidden_char(&mut masked, sql, &mut i);
                     push_hidden_char(&mut masked, sql, &mut i);
                     region = Region::BlockComment { depth: 1 };
                 }
                 b'$' => {
                     if let Some((tag, tag_end)) = dollar_quote_tag(sql, i) {
+                        open_hidden = Some((i, Hidden::Literal));
                         while i < tag_end {
                             push_hidden_char(&mut masked, sql, &mut i);
                         }
@@ -169,6 +205,7 @@ fn scan(sql: &str) -> ScanResult {
                 }
                 b'\'' => {
                     push_hidden_char(&mut masked, sql, &mut i);
+                    close_hidden(&mut hidden, &mut open_hidden, i);
                     region = Region::Code;
                 }
                 _ => push_hidden_char(&mut masked, sql, &mut i),
@@ -176,6 +213,7 @@ fn scan(sql: &str) -> ScanResult {
             Region::LineComment => match bytes[i] {
                 b'\n' => {
                     push_hidden_char(&mut masked, sql, &mut i);
+                    close_hidden(&mut hidden, &mut open_hidden, i);
                     region = Region::Code;
                 }
                 _ => push_hidden_char(&mut masked, sql, &mut i),
@@ -189,6 +227,7 @@ fn scan(sql: &str) -> ScanResult {
                     push_hidden_char(&mut masked, sql, &mut i);
                     push_hidden_char(&mut masked, sql, &mut i);
                     region = if depth <= 1 {
+                        close_hidden(&mut hidden, &mut open_hidden, i);
                         Region::Code
                     } else {
                         Region::BlockComment { depth: depth - 1 }
@@ -203,6 +242,7 @@ fn scan(sql: &str) -> ScanResult {
                     while i < end {
                         push_hidden_char(&mut masked, sql, &mut i);
                     }
+                    close_hidden(&mut hidden, &mut open_hidden, i);
                     region = Region::Code;
                 } else {
                     push_hidden_char(&mut masked, sql, &mut i);
@@ -211,7 +251,27 @@ fn scan(sql: &str) -> ScanResult {
         }
     }
 
-    ScanResult { masked, semicolons }
+    // An UNTERMINATED hidden region (string, comment or dollar-quote running to EOF) still gets a
+    // span, to `sql.len()`. Without this the fingerprint would emit the unterminated literal's
+    // bytes as code — i.e. leak exactly the value the mask exists to hide.
+    close_hidden(&mut hidden, &mut open_hidden, bytes.len());
+
+    ScanResult {
+        masked,
+        semicolons,
+        hidden,
+    }
+}
+
+/// Closes the open hidden span at `end`, if one is open. Idempotent when none is.
+fn close_hidden(
+    hidden: &mut Vec<(usize, usize, Hidden)>,
+    open_hidden: &mut Option<(usize, Hidden)>,
+    end: usize,
+) {
+    if let Some((start, kind)) = open_hidden.take() {
+        hidden.push((start, end, kind));
+    }
 }
 
 /// Copies the char at `sql[*i..]` into `masked` unchanged (it is CODE) and advances `*i` past it.

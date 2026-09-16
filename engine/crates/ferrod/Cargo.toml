@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 ferro-proto = { path = "../ferro-proto" }
 ferro-pool = { path = "../ferro-pool" }
+ferro-classify = { path = "../ferro-classify" }
 ferro-backend-pg = { path = "../ferro-backend-pg" }
 ferro-backend-mysql = { path = "../ferro-backend-mysql" }
 ferro-backend-sqlite = { path = "../ferro-backend-sqlite" }
@@ -21,7 +22,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
 futures = "0.3"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 anyhow = "1"
 getrandom = "0.2"

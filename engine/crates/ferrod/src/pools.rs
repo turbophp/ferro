@@ -244,8 +244,23 @@ pub struct PoolEntry {
 /// The set of live pools the SQL EXEC handler resolves by name. Cheap to clone-share behind an
 /// `Arc` (each `Pool` is itself an `Arc` handle — cloning shares connections, it does not fork a
 /// second pool).
+/// The SPEC §13 slow-log settings, resolved once at startup and carried beside the pools.
+///
+/// They live on the registry because that is the object `Config` is already turned into and that
+/// every EXEC path already holds — threading two more arguments down from `main` would touch every
+/// session signature to deliver a value that never changes for the life of the process.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SlowLogConfig {
+    /// `None` means the slow log is OFF. See `Config::slow_log_ms`.
+    pub threshold_ms: Option<u64>,
+    /// See `Config::log_params`.
+    pub log_params: crate::config::LogParams,
+}
+
 pub struct PoolRegistry {
     by_name: HashMap<String, Arc<PoolEntry>>,
+    /// SPEC §13, resolved from `Config` at build time.
+    slow_log: SlowLogConfig,
     /// Monotonic count of version probes ISSUED. See [`PoolRegistry::probes_issued`] — it exists so
     /// the "learned once" claim can be ASSERTED rather than assumed: "the second handshake reports
     /// the same string" proves stability, not caching, and a design that re-probed every time would
@@ -260,6 +275,11 @@ impl PoolRegistry {
     /// per `spec.kind` (inferred from the DSN scheme, `config::infer_pool_kind`). MUST be called
     /// with a tokio runtime already running (see the module docs — the pool's reaper `tokio::spawn`s).
     /// Logs only the pool NAME (+ kind), never the DSN (§12).
+    /// The SPEC §13 slow-log settings this daemon was started with.
+    pub fn slow_log(&self) -> SlowLogConfig {
+        self.slow_log
+    }
+
     pub fn build(config: &Config) -> Arc<Self> {
         Self::build_with(config, ProbeTuning::default())
     }
@@ -273,6 +293,10 @@ impl PoolRegistry {
     }
 
     fn build_with(config: &Config, tuning: ProbeTuning) -> Arc<Self> {
+        let slow_log = SlowLogConfig {
+            threshold_ms: config.slow_log_ms,
+            log_params: config.log_params,
+        };
         let tuning = Arc::new(tuning);
         let mut by_name = HashMap::with_capacity(config.pools.len());
         for spec in &config.pools {
@@ -319,6 +343,7 @@ impl PoolRegistry {
         }
         Arc::new(Self {
             by_name,
+            slow_log,
             probes_issued: AtomicU64::new(0),
             tuning,
         })

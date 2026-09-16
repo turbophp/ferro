@@ -348,6 +348,7 @@ async fn handle_exec(
         // ---- autocommit EXEC: the S5 path (M1-S4 timeout_ms + CANCEL), dispatched over the
         //      heterogeneous pool registry (M1-S6) ----
         None => {
+            let slow = registry.slow_log();
             let Some(pool) = registry.get(&req.pool) else {
                 responder.end_error(unsupported(format!("unknown pool {:?}", req.pool)));
                 return;
@@ -373,9 +374,9 @@ async fn handle_exec(
             // `Responder` (no typed return), so the arms unify. PG's path is byte-for-byte the
             // pre-M1-S6 inline body.
             match pool {
-                AnyPool::Pg(p) => run_exec_on_pool(p, responder, &req, sql, cancel).await,
-                AnyPool::Mysql(p) => run_exec_on_pool(p, responder, &req, sql, cancel).await,
-                AnyPool::Sqlite(p) => run_exec_on_pool(p, responder, &req, sql, cancel).await,
+                AnyPool::Pg(p) => run_exec_on_pool(p, responder, &req, sql, cancel, slow).await,
+                AnyPool::Mysql(p) => run_exec_on_pool(p, responder, &req, sql, cancel, slow).await,
+                AnyPool::Sqlite(p) => run_exec_on_pool(p, responder, &req, sql, cancel, slow).await,
             }
         }
     }
@@ -393,6 +394,7 @@ async fn run_exec_on_pool<B: PoolBackend>(
     req: &ExecRequest,
     sql: &str,
     cancel: CancellationToken,
+    slow: crate::pools::SlowLogConfig,
 ) {
     // M1-S5 Task 4b: a streamed fetch runs the incremental HEAD + DATA×N producer under the credit
     // window instead of buffering the whole result into the terminal (D-S5-1). The buffered
@@ -449,6 +451,40 @@ async fn run_exec_on_pool<B: PoolBackend>(
     // unconditional Err-arm fail-safe ALREADY taints regardless of the RFQ byte — so `co` is never
     // handed back dirty; the next checkout's S3 recycle DISCARD-ALLs it before the next tenant.
     drop(co);
+
+    // SPEC §13 slow log. Emitted HERE — after the connection is released and before the terminal
+    // is framed — because this is the one point that has both halves of the §13 `queue_us`/
+    // `exec_us` split AND the statement's outcome. It is off unless the operator set a threshold,
+    // and it never sees `sql`: `fingerprint_of` is the only thing the raw statement is handed to,
+    // and it returns a type that cannot hold raw SQL (product-vision §5).
+    if slow.threshold_ms.is_some() {
+        let (rows, error) = match &result {
+            // A read reports rows RETURNED, a write rows AFFECTED — `rows.len()` alone would log
+            // `0` for every INSERT/UPDATE/DELETE, which is the number an operator most wants.
+            Ok(qr) => (
+                if qr.rows.is_empty() {
+                    qr.affected
+                } else {
+                    qr.rows.len() as u64
+                },
+                None,
+            ),
+            Err(e) => (0, Some(crate::slow_log::error_label(e))),
+        };
+        crate::slow_log::record(
+            &crate::slow_log::SlowStatement {
+                fingerprint: crate::slow_log::fingerprint_of(sql),
+                pool: &req.pool,
+                queue_us,
+                exec_us,
+                rows,
+                params: &req.params,
+                error: error.as_deref(),
+            },
+            slow.threshold_ms,
+            slow.log_params,
+        );
+    }
 
     // (5)+(6) Ok → the real success terminal, even if a cancel/timeout raced it and lost
     // (§5.2/§19.3 — never fabricate an error for a statement that actually completed); Err →

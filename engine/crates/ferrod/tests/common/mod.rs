@@ -571,7 +571,25 @@ pub fn mariadb_url() -> Option<String> {
 /// pointing at `url`. Uses `TestServer::spawn_with_factory` (no peercred gate) with the real
 /// `sql::make_handler` + a shared `Arc<TxRegistry>` — built exactly as `main` builds it — so this
 /// is a genuine client→ferrod→pool→PG round trip.
+/// [`exec_server`] with the SPEC §13 slow-log settings applied — the seam the slow-log e2e needs,
+/// since the threshold and `log_params` are resolved into the `PoolRegistry` at build time.
+pub fn exec_server_with_slow_log(
+    url: String,
+    slow_log_ms: Option<u64>,
+    log_params: ferrod::config::LogParams,
+) -> TestServer {
+    exec_server_configured(url, slow_log_ms, log_params)
+}
+
 pub fn exec_server(url: String) -> TestServer {
+    exec_server_configured(url, None, ferrod::config::LogParams::Never)
+}
+
+fn exec_server_configured(
+    url: String,
+    slow_log_ms: Option<u64>,
+    log_params: ferrod::config::LogParams,
+) -> TestServer {
     // Kind is inferred from the DSN scheme (M1-S6), so `exec_server(mysql_url())` builds a MySQL
     // pool and `exec_server(pg_url())` a Postgres one — the SAME helper drives both dialects.
     let kind = ferrod::config::infer_pool_kind(&url);
@@ -584,6 +602,8 @@ pub fn exec_server(url: String) -> TestServer {
             pin_on_unknown: true,
             allow_dir: None,
         }],
+        slow_log_ms,
+        log_params,
         ..Config::default()
     };
     let registry = PoolRegistry::build(&config);
