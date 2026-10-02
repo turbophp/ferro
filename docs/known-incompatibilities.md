@@ -143,6 +143,13 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   cannot fail and `testInheritCharsetFromPrimary` reports the engine's `utf8mb4` rather than the
   requested `latin1`. Tooling that shells out to `pg_dump`/`mysqldump` with the application's config
   cannot work; ops provisions separate dump credentials.
+- **DBAL 3's `SqliteSchemaManager::createDatabase($path)` creates no file.** That method (deprecated
+  upstream) opens a second connection with `path` set to the argument; a Ferro connection ignores
+  `path`, because the database is the engine pool's (SPEC §12 / D8, and D14 confines every file the
+  engine opens), so it reaches the pool's existing database and returns without error. Measured
+  through upstream's `SqliteSchemaManagerTest::testCreateAndDropDatabase`, which asserts the file
+  exists. Provision a database as a pool instead. DBAL 4 has no such method
+  (`docs/dbal-suite/2026-10-02-c5b-dbal3-results.md`).
 - **A pool whose BACKEND is unreachable fails at `getDatabasePlatform()`, not at connect.**
   Connecting succeeds because the Ferro handshake never depends on backend availability; the platform
   needs the server version, which does. The failure is a loud
