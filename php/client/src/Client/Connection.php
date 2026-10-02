@@ -168,6 +168,39 @@ final class Connection
     }
 
     /**
+     * The session a NEW request should go out on — the live one, replaced first if a transport
+     * failure already closed it.
+     *
+     * A poisoned session can carry nothing more ({@see SessionInterface::isPoisoned}). With a
+     * reconnect loop, replace it BEFORE the request — not a retry of anything, since the request
+     * about to go out has been sent nowhere. Without this the reconnect loop only ran on a read
+     * RETRY, so a write-only caller (a queue worker) was told `Retryable` "not sent" forever after
+     * an engine restart (M2-C1e-3 review F4). Never while a transaction is open: its session IS the
+     * transaction, and replacing it would silently move the next statement out of it.
+     *
+     * A failed reconnect still sent nothing, so it is classified as `sent: false` — the caller gets
+     * the typed `Retryable`, never a raw transport error. Deliberately NOT inside the public
+     * {@see session} getter, which {@see poolInfo} and {@see currentEpoch} read: a getter must not
+     * dial.
+     */
+    private function requestSession(OpKind $kind, bool $readonly): SessionInterface
+    {
+        if ($this->reconnect !== null && $this->tx === null && $this->reconnect->session()->isPoisoned()) {
+            try {
+                $this->reconnect->reconnect();
+            } catch (TransportException | ConnectionLostException $e) {
+                throw $this->fate->classifyLoss(
+                    $kind,
+                    $readonly,
+                    'reconnecting a session closed by an earlier failure failed: ' . $e->getMessage(),
+                    sent: false,
+                );
+            }
+        }
+        return $this->session();
+    }
+
+    /**
      * This connection's OWN pool metadata from `HELLO_ACK` — or null if the engine does not
      * advertise a pool by that name.
      *
@@ -422,7 +455,7 @@ final class Connection
         // `session()` (the reconnect loop's CURRENT one). They are the same object today because
         // nothing reconnects while a transaction is open — but "today" is not an invariant, and the
         // failure if they ever diverge is the engine refusing a tx_id it does not own.
-        $session = $this->tx?->session() ?? $this->session();
+        $session = $this->tx?->session() ?? $this->requestSession(OpKind::Read, true);
         if (!$session instanceof StreamingSessionInterface) {
             throw new ProtocolException(
                 'stream() requires a session implementing StreamingSessionInterface (the concrete Session)',
@@ -442,7 +475,7 @@ final class Connection
         // producer carries no `last_insert_id` field at all, so `null` is the honest value.
         $this->lastInsertId = null;
 
-        $opened = $session->openStream(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
+        $opened = $this->openStreamClassified($session, $payload, true);
         if ($opened['type'] === 'end') {
             // A known fate decided before any HEAD/DATA went out (e.g. a checkout failure) — no
             // stream was ever really opened, so there's nothing to cancel/drain.
@@ -527,7 +560,7 @@ final class Connection
      */
     public function streamRaw(string $sql, array $params = [], bool $readonly = false): RawStream
     {
-        $session = $this->tx?->session() ?? $this->session();
+        $session = $this->tx?->session() ?? $this->requestSession($readonly ? OpKind::Read : OpKind::Write, $readonly);
         if (!$session instanceof StreamingSessionInterface) {
             throw new ProtocolException(
                 'streamRaw() requires a session implementing StreamingSessionInterface (the concrete Session)',
@@ -551,7 +584,7 @@ final class Connection
         // statement really has been issued by the time we return.
         $this->lastInsertId = null;
 
-        $opened = $session->openStream(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
+        $opened = $this->openStreamClassified($session, $payload, $readonly);
         if ($opened['type'] === 'end') {
             // A known fate decided before any HEAD/DATA went out (e.g. a checkout failure). Throws
             // on an error terminal; otherwise there is genuinely nothing to read and — the reason
@@ -704,7 +737,7 @@ final class Connection
                     . '(use SAVEPOINT SQL, which passes through inside an open transaction)',
             );
         }
-        $session = $this->session();
+        $session = $this->requestSession(OpKind::TxBegin, true);
         // The ENUM CASE, not `$isolation?->value`. `BeginRequest::encode` has an
         // `$iso instanceof Isolation` arm precisely so the enum rides a byte-locked path
         // (`IsolationCrossLanguageTest`, SPEC §22.2 (w)); unwrapping it here would route around the
@@ -730,6 +763,7 @@ final class Connection
                 'BEGIN lost: ' . $e->getMessage(),
                 $e instanceof ConnectionLostException ? $e->errorPayload() : null,
                 $this->reconnect?->lastEpochChanged() ?? false,
+                sent: self::wasSent($e),
             );
         } catch (CodecException $e) {
             throw new ProtocolException('failed to decode BEGIN terminal: ' . $e->getMessage(), 0, $e);
@@ -754,7 +788,9 @@ final class Connection
      * COMMIT the transaction opened by {@see begin}.
      *
      * A lost COMMIT is the §19.3 Indeterminate carve-out and propagates as
-     * {@see IndeterminateException} — it is NEVER retried, here or anywhere. The handle is cleared
+     * {@see IndeterminateException} — it is NEVER retried, here or anywhere. The carve-out is for a
+     * COMMIT frame that was SENT: one that failed while still being written cannot have committed,
+     * and propagates as {@see RetryableException} (M2-C1e-3). The handle is cleared
      * BEFORE the exception escapes so a failed commit cannot leave this Connection wedged in a
      * transaction that no longer exists engine-side.
      */
@@ -771,6 +807,7 @@ final class Connection
                 'COMMIT lost: ' . $e->getMessage(),
                 null,
                 $this->reconnect?->lastEpochChanged() ?? false,
+                sent: self::wasSent($e),
             );
         }
     }
@@ -893,7 +930,7 @@ final class Connection
         $attempt = 0;
 
         while (true) {
-            $session = $this->session();
+            $session = $this->requestSession(OpKind::TxBegin, true);
 
             // ---- 1. BEGIN ----
             try {
@@ -909,6 +946,7 @@ final class Connection
                     true,
                     'BEGIN lost: ' . $e->getMessage(),
                     $e instanceof ConnectionLostException ? $e->errorPayload() : null,
+                    sent: self::wasSent($e),
                 );
                 if ($this->reconnect !== null && $attempt + 1 < $policy->maxAttempts) {
                     $this->reconnect->reconnect();
@@ -973,7 +1011,9 @@ final class Connection
             } catch (ConnectionLostException | TransportException $e) {
                 // §19.3 carve-out: a lost COMMIT is the ONE transactional Indeterminate. The session's
                 // last in-flight frame is TX/COMMIT (the frame we just failed on) — NEVER re-run the
-                // closure. classifyLoss(TxCommit, …) is unconditional Indeterminate regardless. The
+                // closure. classifyLoss(TxCommit, …) is Indeterminate for a COMMIT that was SENT; one
+                // whose frame never fully left the client is Retryable (it cannot have committed —
+                // M2-C1e-3) and is surfaced, not re-run, since this session is dead. The
                 // `cause()` on that exception is CAUSE_ENGINE_RESTART iff a reconnect (any earlier one
                 // in this connection's life) has already observed a changed `boot_epoch`, else the
                 // honest generic CAUSE_LINK_LOST — a client-side inference only, never a wire signal.
@@ -983,6 +1023,7 @@ final class Connection
                     'COMMIT lost: ' . $e->getMessage(),
                     null,
                     $this->reconnect?->lastEpochChanged() ?? false,
+                    sent: self::wasSent($e),
                 );
             } catch (IndeterminateException | NonRetryableException $e) {
                 throw $e; // server gave a definite fate — propagate (Indeterminate is never retried).
@@ -1062,7 +1103,7 @@ final class Connection
 
         while (true) {
             try {
-                $outcome = $this->session()->sendRequest(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
+                $outcome = $this->requestSession($opKind, $readonly)->sendRequest(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
             } catch (ConnectionLostException | TransportException $e) {
                 // No response / dead transport → classify per §19.1 (a lost write is Indeterminate).
                 // The `cause()` this yields (when Indeterminate) is CAUSE_ENGINE_RESTART iff a
@@ -1075,6 +1116,7 @@ final class Connection
                     $e->getMessage(),
                     $server,
                     $this->reconnect?->lastEpochChanged() ?? false,
+                    sent: self::wasSent($e),
                 );
                 if ($this->reconnect !== null
                     && $attempt + 1 < $this->policy->maxAttempts
@@ -1111,6 +1153,44 @@ final class Connection
             }
             throw $ex;
         }
+    }
+
+    /**
+     * Open a stream, turning a transport/link loss into its FATE the way every buffered path does.
+     *
+     * It used to surface the raw `TransportException`/`ConnectionLostException` — the one request
+     * path with no {@see FateClassifier::classifyLoss}, so a caller deciding by type (the Laravel
+     * tier's lost-connection guard) could not tell a not-sent stream from one whose write was in
+     * flight (M2-C1e-2 review finding F6, fixed at its source in C1e-3). The kind follows the same
+     * rule as the buffered paths: an in-transaction statement's loss kills the transaction
+     * (`TxStatement`), otherwise the declaration decides.
+     *
+     * @return array{type:'head', requestId:int, cols:list<array{name:string,tag:int}>}|array{type:'end', requestId:int, outcome:Outcome}
+     */
+    private function openStreamClassified(StreamingSessionInterface $session, string $payload, bool $readonly): array
+    {
+        try {
+            return $session->openStream(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
+        } catch (ConnectionLostException | TransportException $e) {
+            throw $this->fate->classifyLoss(
+                $this->tx !== null ? OpKind::TxStatement : ($readonly ? OpKind::Read : OpKind::Write),
+                $readonly,
+                'stream open lost: ' . $e->getMessage(),
+                $e instanceof ConnectionLostException ? $e->errorPayload() : null,
+                $this->reconnect?->lastEpochChanged() ?? false,
+                sent: self::wasSent($e),
+            );
+        }
+    }
+
+    /**
+     * Whether a transport/link failure happened AFTER the request frame was completely written.
+     * False only for {@see TransportException::requestNotSent}, which the session raises when the
+     * frame never fully left the client — the one loss whose fate is known (M2-C1e-3).
+     */
+    private static function wasSent(ConnectionLostException|TransportException $e): bool
+    {
+        return !($e instanceof TransportException && $e->requestUnsent());
     }
 
     /** Whether — and how — a closure failure lets the WHOLE transaction re-run (§19.1). */

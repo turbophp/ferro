@@ -97,7 +97,9 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
     public function sendRequest(int $service, int $method, string $payload): Outcome
     {
         if ($this->dead) {
-            throw new ConnectionLostException('fake session is dead (a prior send lost the connection)');
+            // Mirrors the real Session since M2-C1e-3: a session a transport failure closed refuses
+            // BEFORE writing, so the request was not sent (SPEC §22.2 (bx)).
+            throw TransportException::requestNotSent('not sent: fake session is dead (a prior send lost the connection)');
         }
         $this->sent[] = [$service, $method, $payload];
         $this->lastInFlight = [$service, $method];
@@ -147,6 +149,9 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
     public function poolInfo(): array { return $this->poolInfo; }
 
     public function close(): void { $this->closed = true; }
+
+    /** The fake's own model of a poisoned session: dead after a transport/link failure. */
+    public function isPoisoned(): bool { return $this->dead; }
 
     /** Count of sends recorded so far. */
     public function sendCount(): int { return count($this->sent); }
@@ -293,7 +298,9 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
     public function openStream(int $service, int $method, string $payload): array
     {
         if ($this->dead) {
-            throw new ConnectionLostException('fake session is dead (a prior send lost the connection)');
+            // Mirrors the real Session since M2-C1e-3: a session a transport failure closed refuses
+            // BEFORE writing, so the request was not sent (SPEC §22.2 (bx)).
+            throw TransportException::requestNotSent('not sent: fake session is dead (a prior send lost the connection)');
         }
         $this->sent[] = [$service, $method, $payload];
         $this->lastInFlight = [$service, $method];

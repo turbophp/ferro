@@ -169,12 +169,14 @@ trait FerroConnectionBody
      * So, walking the exception chain, the FIRST Ferro-relevant link decides:
      * - {@see ConnectFailed} — the client could not be dialled, so nothing was sent: TRUE, the same
      *   reconnect-and-retry PDO gets after a connect failure;
-     * - {@see RetryableException} carrying `ERR_CONNECTION_LOST` — the engine itself classified the
-     *   loss as known-fate (the statement was never transmitted, or it was inside a transaction,
-     *   where Illuminate does not retry anyway): TRUE, by type, whatever its text;
+     * - {@see RetryableException} carrying `ERR_CONNECTION_LOST` — the loss was classified known-fate,
+     *   by the engine or by the client (the statement was never transmitted — including a request
+     *   whose frame never left the client, M2-C1e-3 — or it was inside a transaction, where
+     *   Illuminate does not retry anyway): TRUE, by type, whatever its text;
      * - any other {@see RetryableException} — the stock detector decides, as it would for PDO;
      * - ANY OTHER Ferro failure (`IndeterminateException`, a raw `ConnectionLostException` or
-     *   `TransportException` — `cursor()`'s stream-open path can surface those unclassified —,
+     *   `TransportException` — before M2-C1e-3 `cursor()`'s stream-open path surfaced those
+     *   unclassified; the client now classifies it, and this arm stays as defence in depth —,
      *   `NonRetryableException`, …): FALSE, whatever its text. Its fate is not known-safe, and a
      *   wrong "yes" re-sends a write.
      *

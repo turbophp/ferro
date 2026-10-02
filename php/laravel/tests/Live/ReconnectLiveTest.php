@@ -265,6 +265,64 @@ final class ReconnectLiveTest extends LaravelLiveTestCase
             'one connection\'s rollback must neither discard nor depend on the other\'s autocommitted write');
     }
 
+    /**
+     * C1e-3: a long-lived connection RECOVERS by itself after `ferrod` restarts — which is what an
+     * Octane or queue worker depends on.
+     *
+     * Before C1e-3 every statement after the restart failed `Indeterminate` ("write failed after 0
+     * of 47 bytes"), so Illuminate's lost-connection retry was — correctly — refused for each, and
+     * the connection stayed broken until something called `DB::reconnect()`. Now the dead session's
+     * write fails NOT SENT, the client reports `Retryable` connection-lost, the tier's type guard
+     * lets Illuminate reconnect (dialling a fresh session) and re-run, and the statement succeeds —
+     * once, because it never reached the engine the first time.
+     */
+    public function testALongLivedConnectionRecoversAfterAnEngineRestart(): void
+    {
+        $t = 'c1e3_engine_restart';
+        $conn = $this->managed();
+        $this->table($conn, $t);
+
+        $this->restartFerrod();
+
+        self::assertTrue($conn->insert("insert into {$t} (id) values (1)"),
+            'the first write after an engine restart must be reconnected and re-run, not fail');
+        self::assertSame(1, (int) $conn->select('select 1 as one')[0]->one);
+        self::assertSame([1], $this->committed($t), 'the re-run write must be applied exactly once');
+    }
+
+    /**
+     * C1e-3 review F5: the engine restarts WHILE A CURSOR IS STREAMING. The cursor must fail, and
+     * the very next write must still recover — reconnected and re-run once.
+     *
+     * Reproduced live by the review before the fix: the transport failure left the session's
+     * "stream open" guard set, so every later request was refused `ProtocolException` ("a stream is
+     * open on this session") instead of "not sent", which nothing above can recognise as a dead
+     * session — the connection never recovered. Poisoning now clears the guard.
+     */
+    public function testAConnectionRecoversAfterAnEngineRestartMidCursor(): void
+    {
+        $t = 'c1e3_restart_mid_cursor';
+        $conn = $this->managed();
+        $this->table($conn, $t);
+
+        $seen = 0;
+        $failed = null;
+        try {
+            foreach ($conn->cursor('select g from generate_series(1, 2000000) g') as $_) {
+                if (++$seen === 10) {
+                    $this->restartFerrod();
+                }
+            }
+        } catch (\Throwable $e) {
+            $failed = $e;
+        }
+        self::assertNotNull($failed, 'a cursor whose engine restarted under it must fail, not complete');
+
+        self::assertTrue($conn->insert("insert into {$t} (id) values (1)"),
+            'the first write after a restart mid-cursor must be reconnected and re-run');
+        self::assertSame([1], $this->committed($t), 'applied exactly once');
+    }
+
     /** The plain case: reconnect, then autocommit statements keep working and are visible. */
     public function testStatementsAfterAReconnectAreCommitted(): void
     {
