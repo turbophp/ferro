@@ -114,6 +114,10 @@ jobs:
         if: always()
         with:
           name: laravel-suite-logs
+          # `.laravel-suite/` is a HIDDEN path, which upload-artifact@v4 skips by default — so the
+          # ferrod.log listed below was silently never uploaded until this line (found at C1f, when
+          # the MySQL job's artifact came back without it).
+          include-hidden-files: true
           path: |
             ferro-pgsql-run1.log
             ferro-pgsql-run2.log
@@ -197,6 +201,7 @@ jobs:
         if: always()
         with:
           name: laravel-suite-${{ matrix.svc }}-logs
+          include-hidden-files: true   # for .laravel-suite/ferrod.log — see the PG job
           path: |
             *-run1.log
             *-run2.log

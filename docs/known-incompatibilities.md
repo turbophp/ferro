@@ -301,8 +301,15 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
 - **`BINARY` / `LARGE_OBJECT` are the only route to binary.** Every bare PHP string binds as text;
   the driver wraps those two `ParameterType`s in `Ferro\Bytes` for you.
 - **MySQL/MariaDB sessions run at `time_zone = '+00:00'`.** `NOW()`, `CURDATE()` and `CURTIME()`
-  return UTC on every Ferro MySQL connection. Doctrine and Laravel make the same choice; pooling
-  determinism requires it.
+  return UTC on every Ferro MySQL connection; pooling determinism requires one fixed zone. Neither
+  framework pins it by default — Laravel does only when the connection config sets `timezone`, a key
+  this engine never sees (see the Laravel section) — so **a `TIMESTAMP` written through a non-UTC
+  session reads back in UTC after adoption.** The stored INSTANT is unchanged (MySQL keeps
+  `TIMESTAMP` in UTC and renders it in the session's zone); its rendering is not, and code that
+  reads the naive string as a wall clock — Eloquent does — sees it shifted (measured: written as
+  `13:14:15` in a `+02:00` session, read as `11:14:15`). `DATETIME` has no zone and is unaffected.
+  Check the server's `time_zone`, and the application's own, before adopting. (Corrected in M2-C1f:
+  this entry used to say "Doctrine and Laravel make the same choice", which neither does.)
 
 ---
 
@@ -434,11 +441,42 @@ upstream's own PDO driver:
 
 ### Getting in
 
-- **Three driver names are registered: `ferro-pgsql`, `ferro-sqlite` and `ferro-mysql`** (MySQL
-  and MariaDB both, since M2-C1f — `isMaria()` reads the version through the shim, which passes
-  `-MariaDB` through untouched). `FerroConnections::register()` wires them through Illuminate's own
+- **Four driver names are registered: `ferro-pgsql`, `ferro-sqlite`, `ferro-mysql` and
+  `ferro-mariadb`.** One per Laravel family: Laravel 11 resolves MariaDB through its OWN `mariadb`
+  driver (`MariaDbConnection`, `MariaDbGrammar`, `MariaDbBuilder`), so a MariaDB application's
+  one-word change is `mariadb` → `ferro-mariadb`. `ferro-mysql` against a MariaDB server is what
+  stock `mysql` against MariaDB is — the MySQL grammar, which Laravel 10 applications still run —
+  and it differs: `castAsJson()` compiles to `cast(? as json)`, a syntax error on MariaDB, and
+  `threadCount()` answers `null` (measured through stock `pdo_mysql` too, so it is the grammar's,
+  not Ferro's). `FerroConnections::register()` wires them through Illuminate's own
   `Connection::resolverFor()` map, and adoption is the one-word `driver` change in the connection
   config that SPEC §15 asks for. SPEC §22.2 (cb).
+- **`ferro_socket` is the only socket key read.** A stock MySQL config carries `unix_socket`
+  (Laravel's `DB_SOCKET`) naming mysqld's OWN socket; it is ignored like `host`, `username` and
+  `password`, because it describes a server the application no longer dials. (Before the C1f review
+  it was read as the ferrod socket, so a leftover `DB_SOCKET` dialled the database server and failed
+  with a wire-magic error naming neither key.)
+- **On MySQL/MariaDB, the `database` key must name the pool's database.** On PostgreSQL and SQLite it
+  is a label — the pool's DSN chooses the database — but `MySqlBuilder` passes it into every
+  `information_schema` query (`table_schema = ?`) behind `hasTable()`, `getTables()`,
+  `getColumns()`, `dropAllTables()` and `migrate`, so a label that differs from the pool's database
+  makes the schema builder look at the wrong schema: `hasTable()` false for a table that exists,
+  `migrate` re-creating its own repository table, `migrate:fresh` dropping nothing — or, if the label
+  names ANOTHER schema, listing that schema's tables and dropping same-named ones in the real
+  database. The tier compares it with `select database()` the first time the schema builder is
+  asked for and refuses a mismatch, naming both. SPEC §22.2 (cb).
+- **Laravel's MySQL session keys are ignored: `strict`, `modes`, `isolation_level`, `timezone`,
+  `charset` and `collation`.** Stock `MySqlConnector::configureConnection()` turns them into
+  `SET SESSION sql_mode`, `SET SESSION TRANSACTION ISOLATION LEVEL`, `SET time_zone` and
+  `SET NAMES … COLLATE …` on every connect. Under Ferro the pool owns the session, the connector
+  never runs, and a pooled session is reset between tenants, so there is nowhere for a per-connection
+  setting to live: the SERVER's defaults apply instead (and `time_zone` is pinned to UTC, above).
+  Measured on MariaDB 10.11 with Laravel's shipped `'strict' => true`: stock gets
+  `ONLY_FULL_GROUP_BY`/`NO_ZERO_DATE` in `sql_mode`, `utf8mb4_unicode_ci` and the configured
+  isolation; Ferro gets the server's `sql_mode` without them, the server's default `utf8mb4`
+  collation and `REPEATABLE READ`. Either direction can bite: an app relying on strict mode loses
+  it on a lenient server, and a `'strict' => false` app gets `1055` errors on a strict one. Put
+  these in the server's global configuration.
 - **The driver NAME is part of your application's behaviour, and it is the single largest source of
   difference.** Illuminate resolves connections by name, and upstream's own tests — plus plenty of
   third-party packages — branch on `$connection->getDriverName()`. Measured on PostgreSQL over 633
@@ -447,10 +485,14 @@ upstream's own PDO driver:
   through stock PDO, so they are upstream's own). Under `ferro-pgsql` it is 570/579, and every one of
   those nine differences was positively identified in upstream source as code branching on
   `$this->driver`: an `expectException` never armed, a `match` picking the wrong expected type, a
-  `markTestSkipped` that never fires. SPEC §22.2 (am), (ar). **The same holds on MySQL**: under the
-  `mysql` alias the column is identical to `pdo_mysql`'s, skip set and failure set alike, while
-  `ferro-mysql` skips 8 tests carrying `#[RequiresDatabase(['mysql', 'mariadb'])]` — testbench
-  resolves that from the driver name — and fails one `match ($this->driver)`. SPEC §22.2 (cb).
+  `markTestSkipped` that never fires. SPEC §22.2 (am), (ar). **The same artifact appears on the MySQL
+  family**, where `ferro-mysql` SKIPS 8 tests the control runs — `#[RequiresDatabase]` resolves from
+  the driver name (4 name `['mysql', 'mariadb']`, 3 data sets `['sqlite', 'mysql', 'mariadb']`, 1
+  `['mysql', 'mariadb', 'pgsql']`; `ferro-mariadb` adds one `'mariadb'`-only test, 9) — and fails one
+  `match ($this->driver)`. Under the alias the skip sets are identical to the control's, **but the
+  alias column is not indistinguishable from PDO there, as it is on PostgreSQL**: two
+  `testBasicUpdateForJson` cases fail through Ferro on the `quote()` refusal below (Laravel's own
+  `castAsJson()` testing helper reaches it) and pass through PDO. SPEC §22.2 (cb).
 - **The alias is opt-in because it hijacks every connection of that name.** `register(['pgsql' =>
   'ferro-pgsql'])` makes name-branching code take its PostgreSQL path — and also captures any
   connection in the application that was meant to dial PostgreSQL directly. An application with a
@@ -472,8 +514,10 @@ upstream's own PDO driver:
   shim is the seam transactions run through, which is why `ManagesTransactions` — Laravel's
   transaction counter, savepoint naming, events and `attempts:` retry loop — is inherited unchanged
   rather than reimplemented.
-- **`DB::escape()`, `toRawSql()` and `->dd()` work on PostgreSQL and are REFUSED on SQLite and
-  MySQL.**
+- **`DB::escape()`, `toRawSql()`, `->dd()`, `castAsJson()` and `DB::pretend()` with string
+  bindings work on PostgreSQL and are REFUSED on SQLite and MySQL/MariaDB** — every one of them reaches
+  `quote()` (`pretend()` through `Grammar::substituteBindingsIntoRawSql()`, to log the statement it
+  did not run).
   `quote()` is client-side with **no engine round trip** (SPEC §21 D5), so it is gated on the per-pool
   `literals_are_standard` bit that `HELLO_ACK` advertises — and today only the PostgreSQL backend
   advertises it. On a SQLite or MySQL pool the value is `null`, which is **fail-closed**: it is never read as
@@ -491,13 +535,16 @@ upstream's own PDO driver:
   with no key, as PDO's does. One divergence: where `pdo_sqlite` answers `"0"` for a handle that has
   generated nothing, this tier THROWS, since `"0"` is indistinguishable from a key. SPEC §22.2 (bn),
   (bw).
-- **On MySQL, `lastInsertId` is the STATEMENT's key, as `pdo_mysql`'s is** — the opposite of the
-  sticky handle above, because the two PDO drivers differ: `pdo_mysql` answers the statement just
-  executed and `"0"` after one that generated none, a `SELECT` or an `UPDATE` (measured), and stock
-  `MySqlConnection::insert()` stores it on the connection inside the statement's own run, before
-  `QueryExecuted`. `FerroMySqlConnection::insert()` does exactly that, with the engine's
-  per-statement key — so `insertGetId()` on a table without an auto-increment answers `0`, as on PDO.
-  SPEC §22.2 (cb).
+- **On MySQL/MariaDB, `lastInsertId` is the STATEMENT's key, as `pdo_mysql`'s is** — the opposite
+  of the sticky handle above, because the two PDO drivers differ: `pdo_mysql` answers the statement
+  just executed and `"0"` after one that generated none, a `SELECT`, an `UPDATE` or a rollback
+  (measured). Both readers follow it: stock `MySqlConnection::insert()` stores the key on the
+  connection inside the statement's own run, before `QueryExecuted`, and `FerroMySqlConnection::insert()`
+  does exactly that with the engine's per-statement key — so `insertGetId()` on a table without an
+  auto-increment answers `0`, as on PDO; and `DB::getPdo()->lastInsertId()` answers the last
+  statement's key or `"0"`. (The C1f review caught that second reader still returning the SQLite
+  handle's sticky key on a MySQL pool — a STALE key after a keyless insert, a `SELECT` or an
+  `INSERT IGNORE`; a wrong key is worse than none, §22.2 (m).) SPEC §22.2 (cb).
 
 ### Values
 
@@ -508,12 +555,19 @@ upstream's own PDO driver:
 - **One deliberate divergence from PDO is kept on PostgreSQL, because it is safer there.** A
   `TIMESTAMPTZ` arrives as canonical RFC3339, which Illuminate's `Date::parse` fallback reads as UTC.
   PDO's `+00` form is silently reinterpreted in the application timezone. SPEC §22.2 (al).
-- **On MySQL the same tag arrives exactly as `pdo_mysql` returns it**: a `TIMESTAMP` column — what
-  `$table->timestamps()` creates — reads back as the naive UTC wall clock (`2017-11-12 13:14:15`),
-  every Ferro MySQL session being pinned to `+00:00`. Eloquent WRITES naive strings, which the server
-  reads in that session, so only a naive read makes the round trip byte-stable; RFC3339 here would
-  make Illuminate read a UTC instant where it wrote a wall clock — a silent shift for any app not
-  running in UTC. SPEC §22.2 (cb).
+- **On MySQL the same tag arrives as `pdo_mysql` returns it — to the second**: a `TIMESTAMP` column
+  — what `$table->timestamps()` creates — reads back as the naive UTC wall clock
+  (`2017-11-12 13:14:15`), every Ferro MySQL session being pinned to `+00:00`. Eloquent WRITES naive
+  strings, which the server reads in that session, so a naive read is what makes the round trip
+  stable; RFC3339 here would make Illuminate read a UTC instant where it wrote a wall clock — a silent
+  shift for any app not running in UTC. SPEC §22.2 (cb). **A FRACTIONAL column renders differently**:
+  the canonical wire text carries no fraction when it is zero and exactly six digits otherwise, while
+  `pdo_mysql` pads to the column's own precision — `TIMESTAMP(3)` holding `.25` is `.250` there and
+  `.250000` here, and a whole second in `TIMESTAMP(6)` is `.000000` there and nothing here. Same
+  instant, and Illuminate's date casts parse both; a consumer comparing the raw string of such a
+  column (`pluck()` keys, `getRawOriginal()`) sees the difference. The column's precision is not on
+  the wire for any tag. Pinned live by
+  `MySqlConnectionLiveTest::testAFractionalTimestampRendersTheCanonicalFractionNotTheColumnsPrecision`.
 - **A `bigint` at or above 2^32 reads** — see *Values* above; the defect that page-entry records was
   fixed at M1-S9 and affected this tier too.
 
@@ -523,7 +577,7 @@ upstream's own PDO driver:
   `MySqlConnection::isUniqueConstraintError()` matches the message text `Integrity constraint
   violation: 1062`, which a Ferro error does not carry (it carries the server's own message, with the
   errno and SQLSTATE as fields), so before C1f `createOrFirst()` re-threw the duplicate it exists to
-  catch — 8 framework-suite failures. `FerroMySqlConnection` decides it from the errno, the same
+  catch — 9 framework-suite errors. `FerroMySqlConnection` decides it from the errno, the same
   "by type, not by wording" rule this tier applies to lost connections and concurrency errors.
   **Application code that matches on that exact phrase in the message will not find it**; code that
   catches `UniqueConstraintViolationException`, as Laravel's own does, works. SPEC §22.2 (cb).
@@ -558,6 +612,21 @@ upstream's own PDO driver:
 
 ### Schema and migrations
 
+- **On MySQL/MariaDB, `Schema::withoutForeignKeyConstraints()` and `dropAllTables()` run on ONE
+  pinned connection, and a bare `Schema::disableForeignKeyConstraints()` outside a transaction is
+  REFUSED.** `SET FOREIGN_KEY_CHECKS=0` is session state, and each statement is its own checkout, so
+  stock's sequence — the `SET`, then the `DROP`s — ran the `DROP`s on a connection where checks were
+  back on: `migrate:fresh`, `db:wipe` and `RefreshDatabase` failed with `1451` on any schema where a
+  parent table sorts before its child (`MySqlBuilder` drops in name order), and the seeder idiom
+  `disableForeignKeyConstraints(); Parent::truncate();` failed too. Found by the C1f review; the
+  framework suite never saw it because its own FK schemas sort child-first. `Ferro\Laravel\Schema\FerroMySqlBuilder`
+  (and `FerroMariaDbBuilder`) now run both inside one transaction — DDL's implicit commit happens on
+  the PINNED connection, after the `SET` — and refuse the bare call rather than silently doing
+  nothing, since its only effect would be on a connection the next statement does not reach. Inside
+  `DB::transaction()` it works, for the same reason. **Cost:** `withoutForeignKeyConstraints(fn)`
+  runs `fn` in a transaction, so a non-DDL statement inside it is rolled back if `fn` throws, which
+  stock does not do. Use `withoutForeignKeyConstraints()` or wrap the block in `DB::transaction()`.
+  SPEC §22.2 (cb).
 - **`search_path` belongs in TWO places on PostgreSQL** — on the `ferrod` pool DSN, because the
   session is pooled and a `SET search_path` from PHP would not survive to the next statement; and in
   the Laravel connection config as well, because `PostgresBuilder::getSchemas()` reads it from the
@@ -589,10 +658,13 @@ upstream's own PDO driver:
 
 ### Not established
 
-§15's acceptance bar names PostgreSQL, MySQL and SQLite; all three now run with controls. The
-MySQL family's RECORDED numbers come from the `laravel-suite` workflow (MySQL 8.4, MariaDB 11.8) —
-see the C1f results doc for whether they have landed. The Eloquent ORM's own test suite is not run on
-any family.
+**§15's acceptance bar is NOT met.** It asks for the `illuminate/database` integration suite
+GREEN on MySQL, PostgreSQL and SQLite, plus a Laravel demo app. What exists is a curated 89-file
+subset run on all three families against controls: green on none of them through the `ferro-*` name
+(the driver-name artifact above); under the alias, indistinguishable from the control on
+PostgreSQL (whose own two failures reproduce through `pdo_pgsql`) and short of it on the MySQL family
+by the `quote()` refusal. No demo app exists, and the Eloquent ORM's own test suite is not
+run on any family. The recorded MySQL-family numbers are in the C1f results doc.
 
 ---
 

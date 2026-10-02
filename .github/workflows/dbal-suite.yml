@@ -131,3 +131,5 @@ jobs:
             run2.log
             .dbal-suite/ferrod.log
           if-no-files-found: warn
+          # A hidden path, which upload-artifact@v4 skips by default (found at M2-C1f).
+          include-hidden-files: true

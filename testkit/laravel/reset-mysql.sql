@@ -4,8 +4,9 @@
 -- from the same empty schema — the precondition of recording a number. No GRANT here, on purpose:
 -- MySQL and MariaDB store a database-level grant by NAME (`mysql.db`), so the one
 -- testkit/mysql-init.sql made survives the DROP, and the suite's own user — which holds ALL on
--- `laravel_tests`.* and nothing more — can run this file as well as root can. That is what lets the
--- runner's `mysql-local` arm reset with the DSN's credentials.
+-- `laravel_tests`.* (and on the other suites' databases, which this file never touches) — can run
+-- this file as well as root can. That is what lets the runner's `mysql-local` arm reset with the
+-- DSN's credentials.
 --
 -- The character set is EXPLICIT because the server defaults differ (MySQL 8.4 and MariaDB 11.8
 -- default to utf8mb4, MariaDB 10.11 to latin1), and a column whose default collation depended on
