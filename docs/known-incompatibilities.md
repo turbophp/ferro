@@ -306,6 +306,15 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   (`0.00499999999999999` into `numeric(10,2)`: Ferro `0.00` — the correct rounding of that float — PDO
   `0.01`, a double rounding through `0.005`). Deliberate: Ferro stores what the application holds. Bind
   a decimal as a STRING to control the digits exactly (SPEC §22.2 (ci)).
+- **On MySQL 8, a parameter's type can be fixed by the statement around it — server-side prepares.**
+  Ferro executes every statement as a SERVER-side prepared statement, and MySQL 8 derives each
+  parameter's type when the statement is prepared, then converts the bound value to it: measured on
+  MySQL 8.4, `SELECT COALESCE(?, 1)` bound to `'x'` answers `0`, because the other argument made the
+  parameter an integer. `pdo_mysql` emulates prepares by default, sending the value inlined as a
+  literal, so the same call answers `'x'` there. MariaDB keeps the string. Ordinary comparisons and
+  inserts are unaffected; a parameter inside an expression whose other operands fix its type is what
+  differs. Cast the parameter (`COALESCE(CAST(? AS CHAR), 1)`) to state the type you mean
+  (SPEC §22.2 (ci)).
 - **On MySQL/MariaDB, a NULL-typed select-list column is refused before execution** — `SELECT NULL`,
   and, on MariaDB, a bare parameter in the select list (`SELECT ? AS p`), which MariaDB declares the
   same way when the statement is prepared. Admitting the type from that metadata would let the

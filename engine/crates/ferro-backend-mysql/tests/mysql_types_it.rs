@@ -955,7 +955,14 @@ async fn prepared_refuses_and_executed_describes(url: &str, label: &str) {
         (
             "SELECT COALESCE(?, 1) AS p",
             vec![Value::Text("x".into())],
-            vec![Value::Text("x".into())],
+            // MySQL 8 DERIVES the parameter's type at prepare (INT, from the other argument) and
+            // coerces the bound 'x' server-side to 0 — measured on CI's 8.4. That is the server's
+            // answer, read faithfully (HEAD and cell agree); MariaDB keeps the string.
+            if mariadb {
+                vec![Value::Text("x".into())]
+            } else {
+                vec![Value::Text("x".into()), Value::I64(0)]
+            },
             !mariadb,
         ),
         (
