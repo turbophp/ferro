@@ -1,0 +1,16 @@
+{
+  "frame_hex": "f7040200050001002800000012000000920093cf000000012a05f2000cce000b3331",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 40,
+    "service": 5
+  },
+  "message": {
+    "bytes": 5000000000,
+    "exec_us": 734001,
+    "queue_us": 12,
+    "status": 0
+  },
+  "name": "admin_backup_response"
+}

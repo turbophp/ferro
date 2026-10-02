@@ -619,24 +619,28 @@ async fn window_update_through_live_session_survives_unknown_target() {
 
 #[tokio::test]
 async fn unknown_service_method_is_per_request_unsupported() {
-    // ADMIN has no route at all in this build (no admin handlers exist yet, and it is never a
-    // request-bearing service) — `dispatch::route` sends it straight to `Route::Unsupported`,
-    // which produces a per-request `Unsupported` error `END` directly, without ever touching the
-    // registry (nothing was spawned for it).
+    // Two shapes have no route in this build: an ADMIN method id it does not serve, and a service id
+    // it does not know. `dispatch::route` sends both straight to `Route::Unsupported`, which produces
+    // a per-request `Unsupported` error `END` directly, without touching the registry (nothing was
+    // spawned for it). An UNSERVED admin method is `Unsupported`, not `Forbidden`: the D15 gate only
+    // ever sees a verb this build serves (M2-C3-7b — ADMIN method 1 is `BACKUP` now, and its refusal
+    // is pinned in `admin_it.rs`).
     let server = TestServer::spawn(BootEpoch(1));
     let mut client = server.connect().await;
     client.hello(1).await;
 
-    client
-        .send_request(77, service::ADMIN, SOME_METHOD, vec![])
-        .await;
+    for (rid, svc, method) in [(77, service::ADMIN, 0x7FFF), (78, 0xBEEF, SOME_METHOD)] {
+        client.send_request(rid, svc, method, vec![]).await;
 
-    let terminal = client.recv().await;
-    assert_eq!(terminal.header.request_id, 77);
-    assert_eq!(terminal.header.flags, flags::END);
-    match Outcome::decode(&terminal.payload).expect("decode Outcome") {
-        Outcome::Error(ep) => assert_eq!(ep.code, errc::UNSUPPORTED),
-        other => panic!("expected Outcome::Error, got {other:?}"),
+        let terminal = client.recv().await;
+        assert_eq!(terminal.header.request_id, rid);
+        assert_eq!(terminal.header.flags, flags::END);
+        match Outcome::decode(&terminal.payload).expect("decode Outcome") {
+            Outcome::Error(ep) => {
+                assert_eq!(ep.code, errc::UNSUPPORTED, "service {svc} method {method}")
+            }
+            other => panic!("expected Outcome::Error, got {other:?}"),
+        }
     }
 
     // The session survived: PING still gets a PONG.

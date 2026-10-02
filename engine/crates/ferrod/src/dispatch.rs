@@ -4,8 +4,12 @@
 //! exactly-one-`END` path, `session::mod`'s `handle_request_frame`), or something this build has
 //! no route for at all.
 //!
-//! `Unsupported` covers ADMIN (no admin handlers exist yet), any other unrecognized service, and
-//! any CORE method that isn't one of the three control methods this build understands
+//! `Admin` covers an `ADMIN` method this build serves (M2-C3-7b): it goes through the SAME request
+//! lifecycle as SQL/TX/STREAM, but only after the session's D15 gate (`crate::admin::authorize`)
+//! admits the peer — so the routing decision carries the verb, and the verb carries its class.
+//!
+//! `Unsupported` covers an `ADMIN` method this build does not serve, any other unrecognized service,
+//! and any CORE method that isn't one of the three control methods this build understands
 //! (`HELLO`/`HELLO_ACK` are handshake-only — settled before the reader loop ever starts, and
 //! deliberately not a `Route` here at all). An `Unsupported` route never touches the in-flight
 //! registry: nothing is spawned, so there is no request lifecycle to guard — the caller sends a
@@ -13,6 +17,8 @@
 //! session survives (SPEC's per-request set, not the session-fatal one).
 
 use ferro_proto::consts::{method_core, service};
+
+use crate::admin::AdminVerb;
 
 /// The core control/liveness methods the reader loop answers synchronously: no registry entry,
 /// no terminal `END` (these are non-terminal `flags=0` replies, or — for `GOODBYE` — a drain
@@ -35,7 +41,10 @@ pub enum Route {
     /// `Unsupported` for all of them. That is a HANDLER decision, not a dispatch one: dispatch's
     /// job here is only "this belongs to the request lifecycle", not "this method exists".
     Request,
-    /// No route at all in this build: ADMIN, an unrecognized service, or a CORE method this
+    /// An admin verb this build serves (M2-C3-7b). The session authorizes it under SPEC D15 BEFORE it
+    /// enters the request lifecycle; an authorized one is then handled exactly like `Request`.
+    Admin(AdminVerb),
+    /// No route at all in this build: an ADMIN method it does not serve, an unrecognized service, or a CORE method this
     /// build doesn't recognize. Produces a per-request `Unsupported` error `END` directly —
     /// there is no request lifecycle to guard because nothing is ever spawned for it.
     Unsupported,
@@ -54,6 +63,9 @@ pub fn route(service: u16, method: u16) -> Route {
     }
     if service == service::SQL || service == service::TX || service == service::STREAM {
         return Route::Request;
+    }
+    if service == service::ADMIN {
+        return AdminVerb::from_method(method).map_or(Route::Unsupported, Route::Admin);
     }
     Route::Unsupported
 }
@@ -97,8 +109,19 @@ mod tests {
     }
 
     #[test]
-    fn admin_and_unknown_services_are_unsupported() {
-        assert_eq!(route(service::ADMIN, 1), Route::Unsupported);
+    fn a_served_admin_method_routes_to_its_verb_and_any_other_is_unsupported() {
+        use ferro_proto::consts::method_admin;
+        assert_eq!(
+            route(service::ADMIN, method_admin::BACKUP),
+            Route::Admin(AdminVerb::Backup)
+        );
+        // An ADMIN method id this build does not serve never reaches a handler (or the D15 gate).
+        assert_eq!(route(service::ADMIN, 0), Route::Unsupported);
+        assert_eq!(route(service::ADMIN, 0xFFFF), Route::Unsupported);
+    }
+
+    #[test]
+    fn unknown_services_are_unsupported() {
         assert_eq!(route(0xBEEF, 1), Route::Unsupported);
     }
 }

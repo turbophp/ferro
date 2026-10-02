@@ -1,0 +1,22 @@
+{
+  "frame_hex": "f704020001000000290000004f000000920197cd300c03c0c0d94261646d696e2076657262204241434b555020697320616e204f504552415445207665726220616e6420464552524f5f41444d494e5f5549445320697320656d707479c0c0",
+  "header": {
+    "flags": 2,
+    "method": 0,
+    "request_id": 41,
+    "service": 1
+  },
+  "message": {
+    "error": {
+      "branch": 3,
+      "code": 12300,
+      "detail": null,
+      "errno": null,
+      "message": "admin verb BACKUP is an OPERATE verb and FERRO_ADMIN_UIDS is empty",
+      "retry_after_ms": null,
+      "sqlstate": null
+    },
+    "status": 1
+  },
+  "name": "error_forbidden"
+}

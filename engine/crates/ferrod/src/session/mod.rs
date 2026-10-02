@@ -262,6 +262,20 @@ impl Session {
         let session_id = tx_registry.next_session_id();
         let handler = factory(session_id);
 
+        // SPEC D15: the peer's KERNEL-ATTESTED uid, read from this session's own socket — never from
+        // anything the client sends — once, before the stream is split. `SO_PEERCRED` reports the
+        // credentials of the process that created the connection and does not change for the
+        // socket's life, so one read is the per-verb answer too. `None` (the kernel could not attest
+        // one) refuses every admin verb; it changes nothing else, since `serve`'s accept gate has
+        // already decided whether this peer may connect at all.
+        let peer_uid = match crate::peercred::peer_uid(&stream) {
+            Ok(uid) => Some(uid),
+            Err(e) => {
+                tracing::warn!(error = %e, "peercred unreadable for this session: admin verbs will be refused");
+                None
+            }
+        };
+
         let framed = Framed::new(stream, FrameCodec);
         let (sink, mut reader) = framed.split();
 
@@ -476,8 +490,47 @@ impl Session {
                         break;
                     }
                 }
+                Route::Admin(verb) => {
+                    // SPEC D15, decided HERE — before the request lifecycle, so a refused verb never
+                    // spawns a handler, checks out a connection or touches the filesystem. A refusal
+                    // is one per-request `Forbidden` END on this frame's id, the same shape (and the
+                    // same no-registry-entry reasoning) as `Unsupported` below; an authorized verb
+                    // is then exactly a `Request`.
+                    match crate::admin::authorize(peer_uid, &config, verb) {
+                        Ok(()) => {
+                            if !handle_request_frame(
+                                frame,
+                                &registry,
+                                &control_tx,
+                                &session_cap,
+                                &handler,
+                                &config,
+                                &mut supervisors,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                verb = verb.name(),
+                                peer_uid,
+                                "admin verb refused (SPEC D15)"
+                            );
+                            let refused = SessionError::PerRequest {
+                                rid: frame.header.request_id,
+                                err,
+                            }
+                            .into_out_frame();
+                            if control_tx.send(ControlMsg::bare(refused)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
                 Route::Unsupported => {
-                    // No route in this build: ADMIN, an unknown service, or a CORE method this
+                    // No route in this build: an ADMIN method it does not serve, an unknown service, or a CORE method this
                     // build doesn't recognize. Nothing was ever spawned for it, so there is no
                     // registry entry to guard — send the per-request diagnostic directly.
                     let unsupported = SessionError::PerRequest {

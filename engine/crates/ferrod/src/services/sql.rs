@@ -51,7 +51,7 @@ use tokio_util::sync::CancellationToken;
 use ferro_pool::backend::{Cancel, PoolBackend, QueryResult};
 use ferro_pool::error::PoolError;
 use ferro_pool::pool::{Checkout, Pool, RowStreamHandle};
-use ferro_proto::consts::{MAX_FRAME_PAYLOAD, errc, method_sql, method_tx, service};
+use ferro_proto::consts::{MAX_FRAME_PAYLOAD, errc, method_admin, method_sql, method_tx, service};
 use ferro_proto::messages::ErrorPayload;
 use ferro_proto::messages::sql::{ExecOk, ExecRequest, Stats};
 use ferro_proto::messages::tx::{BeginRequest, BeginResponse, SavepointRequest, TxControl};
@@ -181,6 +181,10 @@ async fn handle(
                 SpKind::RollbackTo,
             )
             .await
+        }
+        // ADMIN (M2-C3-7b): reached only for a verb the session's D15 gate already admitted.
+        (service::ADMIN, method_admin::BACKUP) => {
+            crate::services::admin::handle_backup(frame, responder, registry, cancel).await
         }
         // Any other routed frame (an unrecognized SQL/TX method, or STREAM) → one END, session lives.
         _ => responder.end_error(unsupported("service/method not yet implemented")),
@@ -545,7 +549,7 @@ async fn run_exec_on_pool<B: PoolBackend>(
 ///
 /// Returns `(drained result, exec_us)`; `exec_us` measures only this call, matching the
 /// pre-existing `build_terminal_body` stats contract.
-async fn run_autocommit_exec<B: PoolBackend>(
+pub(crate) async fn run_autocommit_exec<B: PoolBackend>(
     co: &mut Checkout<B>,
     sql: &str,
     params: &[Value],
@@ -1792,7 +1796,7 @@ pub fn stream_unsupported() -> ErrorPayload {
     )
 }
 
-fn unsupported(message: impl Into<String>) -> ErrorPayload {
+pub(crate) fn unsupported(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: errc::UNSUPPORTED,
         branch: errc::UNSUPPORTED_BRANCH,

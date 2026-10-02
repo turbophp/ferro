@@ -26,6 +26,7 @@ final class Constants
     public const SERVICE_STREAM = 4;
     public const SERVICE_TX = 3;
 
+    public const METHOD_ADMIN_BACKUP = 1;
     public const METHOD_CORE_GOODBYE = 5;
     public const METHOD_CORE_HELLO = 1;
     public const METHOD_CORE_HELLO_ACK = 2;
@@ -85,6 +86,8 @@ final class Constants
     public const ERR_CONNECTION_LOST_BRANCH = 1;
     public const ERR_DEADLOCK = 4100;
     public const ERR_DEADLOCK_BRANCH = 1;
+    public const ERR_FORBIDDEN = 12300;
+    public const ERR_FORBIDDEN_BRANCH = 3;
     public const ERR_FOREIGN_KEY = 12291;
     public const ERR_FOREIGN_KEY_BRANCH = 3;
     public const ERR_NOT_NULL = 12292;
@@ -112,5 +115,5 @@ final class Constants
     public const ERR_WRITE_UNCONFIRMED = 8193;
     public const ERR_WRITE_UNCONFIRMED_BRANCH = 2;
 
-    public const TYPE_REGISTRY_HASH = '1d3dda9f279116a9';
+    public const TYPE_REGISTRY_HASH = 'f88f5878e3799ce4';
 }

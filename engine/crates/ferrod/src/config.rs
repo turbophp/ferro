@@ -242,6 +242,12 @@ pub struct Config {
     /// Peer-uid allow-list for `SO_PEERCRED` gating. Empty means "allow only the daemon's own
     /// uid" (see `uid_allowed`). From `FERRO_ALLOW_UIDS` (comma-separated), default empty.
     pub peer_allow_uids: Vec<u32>,
+    /// SPEC D15: the uids allowed to run admin OPERATE verbs (`BACKUP`), from `FERRO_ADMIN_UIDS`
+    /// (comma-separated). **Empty — the default — DISABLES every OPERATE verb**: there is no implicit
+    /// member, not even the daemon's own uid (unlike `peer_allow_uids`), because by default that uid
+    /// is also every same-uid PHP worker's. An OPERATE uid must also pass `peer_allow_uids` to connect
+    /// at all. Checked per verb by `crate::admin::authorize`.
+    pub admin_uids: Vec<u32>,
     /// Default per-request credit, in frames.
     pub credit_frames: u32,
     /// Default per-request credit, in bytes.
@@ -299,6 +305,7 @@ impl Default for Config {
         Config {
             socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
             peer_allow_uids: Vec::new(),
+            admin_uids: Vec::new(),
             credit_frames: ferro_proto::consts::DEFAULT_CREDIT_FRAMES,
             credit_bytes: ferro_proto::consts::DEFAULT_CREDIT_BYTES,
             session_cap_bytes: DEFAULT_SESSION_CAP_BYTES,
@@ -328,7 +335,10 @@ impl Config {
         }
 
         if let Ok(list) = std::env::var("FERRO_ALLOW_UIDS") {
-            cfg.peer_allow_uids = parse_allow_uids(&list);
+            cfg.peer_allow_uids = parse_allow_uids(&list, "FERRO_ALLOW_UIDS");
+        }
+        if let Ok(list) = std::env::var("FERRO_ADMIN_UIDS") {
+            cfg.admin_uids = parse_allow_uids(&list, "FERRO_ADMIN_UIDS");
         }
 
         if let Ok(names) = std::env::var("FERRO_POOLS") {
@@ -414,7 +424,7 @@ impl Config {
 /// security-relevant surprise for an operator who intended to allow those other uids. Parsing
 /// continues past a bad token (fail-fast is not required here, per the charter's "when uncertain"
 /// guidance — a warn is the minimum).
-fn parse_allow_uids(list: &str) -> Vec<u32> {
+fn parse_allow_uids(list: &str, var: &str) -> Vec<u32> {
     list.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -422,9 +432,10 @@ fn parse_allow_uids(list: &str) -> Vec<u32> {
             Ok(uid) => Some(uid),
             Err(err) => {
                 tracing::warn!(
+                    var,
                     token = s,
                     error = %err,
-                    "FERRO_ALLOW_UIDS: skipping unparseable uid token"
+                    "skipping unparseable uid token"
                 );
                 None
             }
@@ -732,18 +743,21 @@ mod tests {
         // "33;44" is a single token with the wrong delimiter -- not parseable as a u32 -- and
         // must not silently swallow the whole list: 55 and 66 on either side of it still make it
         // into the result.
-        let uids = parse_allow_uids("55, 33;44 ,66,not-a-uid,");
+        let uids = parse_allow_uids("55, 33;44 ,66,not-a-uid,", "FERRO_ALLOW_UIDS");
         assert_eq!(uids, vec![55, 66]);
     }
 
     #[test]
     fn parse_allow_uids_all_malformed_yields_empty_not_a_panic() {
-        assert_eq!(parse_allow_uids("nope;nope"), Vec::<u32>::new());
+        assert_eq!(
+            parse_allow_uids("nope;nope", "FERRO_ADMIN_UIDS"),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
     fn parse_allow_uids_empty_string_yields_empty() {
-        assert_eq!(parse_allow_uids(""), Vec::<u32>::new());
+        assert_eq!(parse_allow_uids("", "FERRO_ADMIN_UIDS"), Vec::<u32>::new());
     }
 
     // -----------------------------------------------------------------------------------------

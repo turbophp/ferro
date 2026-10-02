@@ -139,6 +139,7 @@ async fn real_traffic_moves_the_hygiene_error_and_pool_series() {
     const SKIPPED: &str = "ferro_hygiene_total{pool=\"default\",profile=\"skipped_clean\"}";
     const UNSUPPORTED: &str = "ferro_errors_total{code=\"Unsupported\",branch=\"NonRetryable\"}";
     const PROTOCOL: &str = "ferro_errors_total{code=\"Protocol\",branch=\"NonRetryable\"}";
+    const FORBIDDEN: &str = "ferro_errors_total{code=\"Forbidden\",branch=\"NonRetryable\"}";
     const SYNTAX: &str = "ferro_errors_total{code=\"Syntax\",branch=\"NonRetryable\"}";
     const UNCONFIRMED: &str =
         "ferro_errors_total{code=\"WriteUnconfirmed\",branch=\"Indeterminate\"}";
@@ -158,6 +159,7 @@ async fn real_traffic_moves_the_hygiene_error_and_pool_series() {
         SKIPPED,
         UNSUPPORTED,
         PROTOCOL,
+        FORBIDDEN,
         SYNTAX,
         UNCONFIRMED,
         INDETERMINATE,
@@ -177,9 +179,24 @@ async fn real_traffic_moves_the_hygiene_error_and_pool_series() {
     c.send(OutFrame {
         header: Header {
             flags: 0,
+            // An ADMIN method this build does NOT serve: the dispatch-path `Unsupported`. (Method 1 is
+            // `BACKUP` since M2-C3-7b, and would be the D15 path below instead.)
             service: service::ADMIN,
-            method: 1,
+            method: 0x7FFF,
             request_id: 6,
+            payload_len: 0,
+        },
+        payload: Bytes::new(),
+    })
+    .await;
+    let _ = c.recv().await;
+    // The D15 path: `BACKUP` with FERRO_ADMIN_UIDS empty, refused by the session before any handler.
+    c.send(OutFrame {
+        header: Header {
+            flags: 0,
+            service: service::ADMIN,
+            method: ferro_proto::consts::method_admin::BACKUP,
+            request_id: 10,
             payload_len: 0,
         },
         payload: Bytes::new(),
@@ -237,6 +254,10 @@ async fn real_traffic_moves_the_hygiene_error_and_pool_series() {
     assert!(
         moved(UNSUPPORTED) >= 1,
         "the dispatch-path error was not counted:\n{after}"
+    );
+    assert!(
+        moved(FORBIDDEN) >= 1,
+        "the D15 refusal (a session-built terminal) was not counted:\n{after}"
     );
     assert!(
         moved(PROTOCOL) >= 1,

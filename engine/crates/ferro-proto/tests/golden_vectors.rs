@@ -140,7 +140,7 @@ fn message_payloads_are_canonical_and_byte_stable() {
     // level), and that decode->encode is a fixpoint. This is the Rust half of the cross-language
     // byte lock; the PHP half asserts PurePacker re-encodes to these same bytes (Task 9).
     use ferro_proto::consts::{
-        flags, method_core as mc, method_sql, method_stream, method_tx, service,
+        flags, method_admin, method_core as mc, method_sql, method_stream, method_tx, service,
     };
     use ferro_proto::messages::*;
     for entry in fs::read_dir(vectors_dir()).unwrap() {
@@ -217,6 +217,29 @@ fn message_payloads_are_canonical_and_byte_stable() {
                         BeginResponse::decode(body).unwrap().encode(),
                         *body,
                         "BeginResponse body for {:?} is not canonical / byte-stable",
+                        p.file_name().unwrap()
+                    );
+                }
+                outcome.encode()
+            }
+            // ADMIN BACKUP (M2-C3-7b): the request has no END flag; the response rides the same
+            // (service, method) pair as an `Outcome`. CRACK an Ok body so Rust independently
+            // arbitrates the BackupResponse layout; an Error body (error_forbidden) is re-encoded
+            // whole by the outer assertion like every other error vector.
+            (s, m)
+                if s == service::ADMIN
+                    && m == method_admin::BACKUP
+                    && (h.flags & flags::END) == 0 =>
+            {
+                BackupRequest::decode(payload).unwrap().encode()
+            }
+            (s, m) if s == service::ADMIN && m == method_admin::BACKUP => {
+                let outcome = Outcome::decode(payload).unwrap();
+                if let Outcome::Ok(body) = &outcome {
+                    assert_eq!(
+                        BackupResponse::decode(body).unwrap().encode(),
+                        *body,
+                        "BackupResponse body for {:?} is not canonical / byte-stable",
                         p.file_name().unwrap()
                     );
                 }

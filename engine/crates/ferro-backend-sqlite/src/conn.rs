@@ -175,6 +175,16 @@ impl SqliteBackend {
         self
     }
 
+    /// SPEC D14's allowed directory for this pool, CANONICALISED — the operator's `allow_dir`, or the
+    /// database file's own directory by default. The same resolution the path guard uses at dial
+    /// (it calls [`resolve_allowed_root`] too), so an admin verb that places a file "in the pool's
+    /// allowed directory" (M2-C3-7b's `BACKUP`) and the guard that later authorizes SQLite opening
+    /// it cannot disagree about which directory that is. Blocking (`canonicalize`); cheap.
+    pub fn allowed_root(&self) -> Result<PathBuf, PoolError> {
+        let path = resolve_path(&self.dsn)?;
+        resolve_allowed_root(&path, self.allow_dir.clone())
+    }
+
     /// The busy timeout this backend opens its connections with. Exists so the C3-3e wiring can be
     /// asserted at the seam it crosses — the registry builds the backend, and without a reader the
     /// only evidence that the pool's `checkout_timeout` arrived would be that a timing test passed,
@@ -775,22 +785,7 @@ fn install_path_guard(
     db_path: &Path,
     allow_dir: Option<PathBuf>,
 ) -> Result<(), PoolError> {
-    // The DEFAULT is the database's own directory, which is why D14 needs no configuration to be
-    // safe: `VACUUM INTO 'snap.db'` beside the database works out of the box, and reaching outside
-    // it is an operator decision.
-    let root = match allow_dir {
-        Some(d) => d,
-        None => db_path.parent().map(Path::to_path_buf).unwrap_or_default(),
-    };
-    // Canonicalised ONCE, here, because the comparison below must not be defeated by `..` or by a
-    // symlink — and because a root that does not exist would silently allow nothing, which is a
-    // failure worth surfacing at dial rather than on a tenant's first ATTACH.
-    let root = root.canonicalize().map_err(|e| {
-        tracing::warn!(error = %e, "ferro-backend-sqlite: allow_dir does not resolve");
-        PoolError::Backend(format!(
-            "the pool's allowed directory for engine-opened files does not resolve: {e}"
-        ))
-    })?;
+    let root = resolve_allowed_root(db_path, allow_dir)?;
 
     conn.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
         AuthAction::Attach { filename } => {
@@ -810,6 +805,29 @@ fn install_path_guard(
     .map_err(|e| {
         tracing::warn!(error = %e, "ferro-backend-sqlite: could not install the D14 path guard");
         PoolError::Backend(format!("path guard install failed: {e}"))
+    })
+}
+
+/// D14's allowed root for a database at `db_path`: the operator's `allow_dir`, or the database's own
+/// directory — canonicalised.
+///
+/// The DEFAULT is the database's own directory, which is why D14 needs no configuration to be safe:
+/// reaching outside it is an operator decision. Canonicalised because the guard's comparison must
+/// not be defeated by `..` or by a symlink — and because a root that does not exist would silently
+/// allow nothing, which is a failure worth surfacing at dial rather than on a tenant's first ATTACH.
+pub(crate) fn resolve_allowed_root(
+    db_path: &Path,
+    allow_dir: Option<PathBuf>,
+) -> Result<PathBuf, PoolError> {
+    let root = match allow_dir {
+        Some(d) => d,
+        None => db_path.parent().map(Path::to_path_buf).unwrap_or_default(),
+    };
+    root.canonicalize().map_err(|e| {
+        tracing::warn!(error = %e, "ferro-backend-sqlite: allow_dir does not resolve");
+        PoolError::Backend(format!(
+            "the pool's allowed directory for engine-opened files does not resolve: {e}"
+        ))
     })
 }
 
@@ -838,12 +856,23 @@ fn attach_is_allowed(filename: &str, root: &Path) -> bool {
     let Some(parent) = absolute.parent() else {
         return false;
     };
-    match parent.canonicalize() {
+    let parent_inside = match parent.canonicalize() {
         Ok(p) => p.starts_with(root),
         // A parent that does not exist cannot be inside the allowed root by any reading, and
         // SQLite would fail to create the file there anyway.
         Err(_) => false,
-    }
+    };
+    // The FILE itself must not be a symlink (M2-C3-7b, measured). Canonicalising only the parent
+    // left a hole: a DANGLING symlink inside the root, pointing outside it, passed the parent check
+    // and SQLite then followed it — `VACUUM INTO '<root>/link.db'` created `<outside>/escaped.db`.
+    // A symlink to an EXISTING file is refused by SQLite's own existing-target rule, but a dangling
+    // one is a fresh file at the link's destination. `symlink_metadata` does not follow the link;
+    // "cannot stat" is the normal case (the target does not exist yet) and is not a symlink.
+    let is_symlink = absolute
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    parent_inside && !is_symlink
 }
 
 /// The out-of-band cancel handle (C3-3d). An owned `InterruptHandle`, which `p3` proved is

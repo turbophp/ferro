@@ -473,3 +473,110 @@ async fn plain_vacuum_still_works() {
         Some(&Value::I64(10))
     );
 }
+
+/// **A dangling symlink inside the allowed directory must not redirect a snapshot outside it**
+/// (M2-C3-7b, found by measuring the admin verb's destination policy before building it).
+///
+/// The guard canonicalised only the target's PARENT, because a snapshot's target does not exist yet.
+/// A dangling symlink defeats exactly that: its parent IS the allowed directory, and SQLite then
+/// follows the link and creates the file at the link's destination — measured, `VACUUM INTO
+/// '<root>/link.db'` produced `<outside>/escaped.db`. The CONTROL is the same statement on a plain
+/// name in the same directory, which must still succeed: the fix refuses the LINK, not the directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dangling_symlink_cannot_redirect_a_snapshot_outside_the_allowed_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = pool_on(&dir.path().join("main.db"), 1);
+    seed(&pool, 10).await;
+
+    let outside = tempfile::tempdir().expect("second tempdir");
+    let escaped = outside.path().join("escaped.db");
+    let link = dir.path().join("link.db");
+    std::os::unix::fs::symlink(&escaped, &link).expect("plant the dangling symlink");
+
+    let mut co = pool.checkout().await.expect("checkout");
+    let err = co
+        .query("VACUUM INTO ?1", &[Value::Text(link.display().to_string())])
+        .await
+        .expect_err("a snapshot through a dangling symlink must be refused");
+    assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "got {err:?}");
+    assert!(
+        !escaped.exists(),
+        "the snapshot escaped through the symlink"
+    );
+
+    // CONTROL: a plain name beside it is still allowed.
+    let plain = dir.path().join("plain.db");
+    co.query(
+        "VACUUM INTO ?1",
+        &[Value::Text(plain.display().to_string())],
+    )
+    .await
+    .expect("a plain name in the allowed directory still works");
+    assert_eq!(rows_in_snapshot(&plain), 10);
+}
+
+/// **The destination can be a BOUND PARAMETER** (M2-C3-7b premise). The admin `BACKUP` verb relies
+/// on this so that no path is ever spliced into SQL text: the engine binds the target, SQLite
+/// resolves it, and the D14 authorizer still sees the resolved filename.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vacuum_into_takes_its_target_as_a_bound_parameter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = pool_on(&dir.path().join("main.db"), 1);
+    seed(&pool, 25).await;
+
+    let snap = dir.path().join("bound.db");
+    let mut co = pool.checkout().await.expect("checkout");
+    co.query("VACUUM INTO ?1", &[Value::Text(snap.display().to_string())])
+        .await
+        .expect("VACUUM INTO accepts a bound target");
+    assert_eq!(rows_in_snapshot(&snap), 25);
+
+    // And the guard still applies to a BOUND target — it is not something only a literal reaches.
+    let elsewhere = tempfile::tempdir().expect("second tempdir");
+    let outside = elsewhere.path().join("bound.db");
+    let err = co
+        .query(
+            "VACUUM INTO ?1",
+            &[Value::Text(outside.display().to_string())],
+        )
+        .await
+        .expect_err("D14 must refuse a bound target outside the allowed directory");
+    assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "got {err:?}");
+    assert!(!outside.exists());
+}
+
+/// **A RELATIVE target resolves against the DAEMON's working directory, not the database's** —
+/// which corrects D14's own text (M2-C3-7b, measured). D14 said "`VACUUM INTO 'snap.db'` beside the
+/// database works out of the box"; it does only when `ferrod`'s working directory IS the database's
+/// directory. SQLite resolves a relative filename against the process's cwd, and the guard (rightly)
+/// resolves it the same way, so under any other cwd the relative snapshot is REFUSED as outside the
+/// allowed directory — the safe direction, but not the documented behaviour. The admin `BACKUP` verb
+/// does not depend on cwd at all: it binds an absolute path inside the allowed root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relative_target_resolves_against_the_working_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = pool_on(&dir.path().join("main.db"), 1);
+    seed(&pool, 3).await;
+    let cwd = std::env::current_dir().expect("cwd");
+    assert_ne!(
+        cwd.canonicalize().unwrap(),
+        dir.path().canonicalize().unwrap(),
+        "the premise needs a cwd that is not the database's directory"
+    );
+
+    let mut co = pool.checkout().await.expect("checkout");
+    let err = co
+        .exec("VACUUM INTO 'ferro_relative_probe.db'")
+        .await
+        .expect_err("a relative target outside the allowed directory is refused");
+    assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "got {err:?}");
+    assert!(!dir.path().join("ferro_relative_probe.db").exists());
+    assert!(!cwd.join("ferro_relative_probe.db").exists());
+
+    // CONTROL: the same name, absolute and inside the database's directory, is allowed.
+    let beside = dir.path().join("ferro_relative_probe.db");
+    co.exec(&format!("VACUUM INTO '{}'", beside.display()))
+        .await
+        .expect("the absolute spelling beside the database is allowed");
+    assert_eq!(rows_in_snapshot(&beside), 3);
+}

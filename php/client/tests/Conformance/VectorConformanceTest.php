@@ -1,6 +1,8 @@
 <?php // /php/client/tests/Conformance/VectorConformanceTest.php
 declare(strict_types=1);
 namespace Ferro\Tests\Conformance;
+use Ferro\Protocol\BackupRequest;
+use Ferro\Protocol\BackupResponse;
 use Ferro\Protocol\BeginRequest;
 use Ferro\Protocol\BeginResponse;
 use Ferro\Protocol\ErrorPayload;
@@ -432,6 +434,93 @@ final class VectorConformanceTest extends TestCase
         $this->assertSame($protoFields['branch'], $errorFields['branch'],
             'both are NonRetryable — the split is in the code, which is why keying on the branch '
             . 'alone could never have worked');
+    }
+
+    /**
+     * `admin_backup_request` (M2-C3-7b): the ADMIN BACKUP request, Value-free positional fixarray(4).
+     * PHP must (a) re-encode the "message" JSON to the exact Rust-produced bytes, (b) decode them
+     * back with full consumption, (c) round-trip. The `timeout_ms` arm rides as a u32, not a nil, so
+     * the populated arm is the one locked; the nil arm is the same `packNil()` every TX nullable uses.
+     */
+    public function testAdminBackupRequestVectorByteMatchesBothDirections(): void
+    {
+        $v = self::loadVector('admin_backup_request.json');
+        $message = is_array($v['message']) ? $v['message'] : [];
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $p = new PurePacker();
+        $this->assertSame(C::SERVICE_ADMIN, $v['header']['service'] ?? null);
+        $this->assertSame(C::METHOD_ADMIN_BACKUP, $v['header']['method'] ?? null);
+
+        $this->assertSame(bin2hex($payload), bin2hex(BackupRequest::encode($message, $p)),
+            'PHP BackupRequest encode must byte-match admin_backup_request');
+
+        $off = 0;
+        $wire = $p->unpack($payload, $off);
+        $this->assertSame(strlen($payload), $off, 'consumed all BackupRequest bytes');
+        $this->assertIsArray($wire);
+        $decoded = BackupRequest::mapFromWire($wire);
+        $this->assertEquals($message, $decoded, 'PHP BackupRequest decode==value (the vector JSON is key-sorted)');
+
+        $this->assertSame(bin2hex($payload), bin2hex(BackupRequest::encode($decoded, $p)),
+            'admin_backup_request decode->encode fixpoint');
+    }
+
+    /**
+     * `admin_backup_response`: the terminal `Outcome::Ok(BackupResponse)`. `bytes` is above 2^32 in
+     * the vector, so this locks the u64 width rather than a fixint that any width would pass.
+     */
+    public function testAdminBackupResponseVectorByteMatchesBothDirections(): void
+    {
+        $v = self::loadVector('admin_backup_response.json');
+        $message = is_array($v['message']) ? $v['message'] : [];
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $p = new PurePacker();
+
+        $this->assertSame(bin2hex($payload), bin2hex(Outcome::ok(BackupResponse::encode($message, $p))->encode($p)),
+            'PHP Outcome::Ok(BackupResponse) encode must byte-match admin_backup_response');
+
+        $outcome = Outcome::decode($payload, $p);
+        $this->assertTrue($outcome->isOk(), 'admin_backup_response is an Outcome::Ok');
+        $off = 0;
+        $bodyWire = $p->unpack($outcome->body(), $off);
+        $this->assertSame(strlen($outcome->body()), $off, 'consumed all BackupResponse body bytes');
+        $this->assertIsArray($bodyWire);
+        $resp = BackupResponse::mapFromWire($bodyWire);
+        $this->assertSame($message['bytes'], $resp['bytes'], 'decoded bytes matches vector');
+        $this->assertGreaterThan(0xFFFFFFFF, $resp['bytes'], 'the vector locks a value past u32');
+        $this->assertSame($message['queue_us'], $resp['queue_us']);
+        $this->assertSame($message['exec_us'], $resp['exec_us']);
+
+        $this->assertSame(bin2hex($payload), bin2hex(Outcome::ok(BackupResponse::encode($resp, $p))->encode($p)),
+            'admin_backup_response decode->encode fixpoint');
+    }
+
+    /**
+     * `error_forbidden`: the D15 refusal — `Forbidden` (NonRetryable), distinct on the wire from
+     * `Auth`, which means the BACKEND refused the pool's credentials. A client that conflated the two
+     * would tell an operator "check the database password" for a missing `FERRO_ADMIN_UIDS` entry.
+     */
+    public function testErrorForbiddenVectorIsItsOwnNonRetryableCode(): void
+    {
+        $v = self::loadVector('error_forbidden.json');
+        $message = is_array($v['message']) ? $v['message'] : [];
+        $errorFields = is_array($message['error'] ?? null) ? $message['error'] : [];
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $p = new PurePacker();
+
+        $this->assertSame(bin2hex($payload), bin2hex(Outcome::error(ErrorPayload::fromArray($errorFields))->encode($p)),
+            'PHP Outcome::Error(ErrorPayload) encode must byte-match error_forbidden');
+
+        $outcome = Outcome::decode($payload, $p);
+        $this->assertTrue($outcome->isError(), 'error_forbidden is an Outcome::Error');
+        $err = $outcome->errorPayload();
+        $this->assertSame(C::ERR_FORBIDDEN, $err->code, 'decoded code is the generated FORBIDDEN');
+        $this->assertSame(C::BRANCH_NON_RETRYABLE, $err->branch, 'Forbidden is NonRetryable');
+        $this->assertNotSame(C::ERR_AUTH, $err->code, 'an access-policy refusal is not a backend auth failure');
+        $this->assertEquals($errorFields, $err->toArray(), 'PHP ErrorPayload decode==value for error_forbidden');
+
+        $this->assertSame(bin2hex($payload), bin2hex(Outcome::error($err)->encode($p)),
+            'error_forbidden decode->encode fixpoint');
     }
 
     /**
