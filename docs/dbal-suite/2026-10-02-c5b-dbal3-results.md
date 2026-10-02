@@ -129,8 +129,13 @@ refusal, as on SQLite: `testDispatchEventWhenDatabasePlatformIsExplicitlyPassed`
 incompatibility, below. The other six are S8b's categories, unchanged from DBAL 4:
 
 - **(b) PostgreSQL reports no generated key**, and the driver will not emulate `lastInsertId()` with
-  a follow-up query, which on a transaction-mode pool would run on another connection and return a
-  wrong key (D-S8b-5): `WriteTest::testLastInsertId`, `testEmptyIdentityInsert`, and the DBAL-3-only
+  a follow-up query OUTSIDE a transaction, which on a transaction-mode pool would run on another
+  connection and return a wrong key (D-S8b-5). *[Corrected at the M2 exit (SPEC §22.2 (ci)): since
+  the ORM-suite slice, the driver DOES answer inside a transaction (`lastval()`, or
+  `currval(name)` on DBAL 3), on the pinned connection. These tests insert with no transaction
+  open, so they still fail, for the reason above. Re-measured on `main` at `7902867` (run
+  37069678072 for 3.10.6, 37069674974 for 4.4.4): every column of both majors reproduces this
+  document's numbers exactly.]* `WriteTest::testLastInsertId`, `testEmptyIdentityInsert`, and the DBAL-3-only
   `testLastInsertIdSequence` (the deprecated sequence-name form, `currval()` behind the scenes).
 - **(c) No credentials in PHP** (SPEC §12 / D8): `ExceptionTest::testInvalidUserName`,
   `testInvalidPassword`, `testInvalidHost`.
