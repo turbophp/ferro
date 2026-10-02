@@ -3,6 +3,7 @@ pub mod dispatch;
 pub mod epoch;
 pub mod listener;
 pub mod metrics;
+pub mod otlp;
 pub mod peercred;
 pub mod pools;
 pub mod serve;

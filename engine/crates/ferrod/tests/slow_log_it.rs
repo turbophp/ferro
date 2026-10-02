@@ -152,7 +152,20 @@ async fn a_statement_is_logged_by_fingerprint_and_its_literal_never_appears() {
     )
     .await;
 
+    // C4c-2 review F1: SQLite's DQS fallback makes this `"…"` a STRING, so the slow log must read the
+    // statement in the pool's dialect — the PostgreSQL reading kept it as an identifier, verbatim.
+    exec_ok(
+        &mut c,
+        7,
+        &req("select 1 where 'x' <> \"hunter3-dq-literal\""),
+    )
+    .await;
+
     let log = capture.contents();
+    assert!(
+        !log.contains("hunter3-dq-literal"),
+        "a SQLite double-quoted literal reached the slow log:\n{log}",
+    );
 
     // (0) The traced statement's record carries both ids, as the fields a log query filters on.
     let traced = log

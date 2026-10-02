@@ -264,6 +264,30 @@ pub fn render(registry: &PoolRegistry, boot_epoch: u64) -> String {
         "ferro_traceparent_invalid_total {}",
         crate::trace::invalid_total()
     );
+    // SPEC §13 OTLP export (M2-C4c-2). Present — as zeroes — when export is off, like every other
+    // series here: "no data" and "nothing happened" must not be the same observation to an alert.
+    let otlp = &crate::otlp::COUNTERS;
+    for (name, help, value) in [
+        (
+            "ferro_otlp_spans_exported_total",
+            "Spans an OTLP collector accepted (SPEC §13).",
+            otlp.exported(),
+        ),
+        (
+            "ferro_otlp_spans_dropped_total",
+            "Spans dropped because the export queue was full; the statement was never delayed (SPEC §13).",
+            otlp.dropped(),
+        ),
+        (
+            "ferro_otlp_spans_failed_total",
+            "Spans in an OTLP export that was refused, unreachable or timed out (SPEC §13).",
+            otlp.failed(),
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        let _ = writeln!(out, "{name} {value}");
+    }
     out
 }
 
@@ -437,6 +461,45 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three OTLP export series (M2-C4c-2) are rendered — present at zero, with HELP and TYPE —
+    /// and carry the export counters' live values. The C4c-2 review renamed one and zeroed another,
+    /// and both survived, because nothing rendered them.
+    #[tokio::test]
+    async fn the_otlp_export_series_are_rendered_with_their_values() {
+        let registry = PoolRegistry::build(&crate::config::Config::default());
+        let body = render(&registry, 1);
+        let c = &crate::otlp::COUNTERS;
+        for (name, value) in [
+            ("ferro_otlp_spans_exported_total", c.exported()),
+            ("ferro_otlp_spans_dropped_total", c.dropped()),
+            ("ferro_otlp_spans_failed_total", c.failed()),
+        ] {
+            assert!(
+                body.contains(&format!("# TYPE {name} counter\n")),
+                "{name}:\n{body}"
+            );
+            // The counters are process-wide and other tests may move them, so the value is read
+            // AFTER rendering and must not be below what the body says.
+            let line = body
+                .lines()
+                .find(|l| l.starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name} missing:\n{body}"));
+            let rendered: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+            assert!(rendered <= value, "{line} vs {value}");
+        }
+        crate::otlp::COUNTERS.test_bump_exported(7);
+        let after = render(&registry, 1);
+        let line = after
+            .lines()
+            .find(|l| l.starts_with("ferro_otlp_spans_exported_total "))
+            .unwrap();
+        let rendered: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!(
+            rendered >= 7,
+            "the exported counter is rendered from its live value: {line}"
+        );
+    }
 
     /// Bounds and sums render in SECONDS. A known snapshot pins the exact lines, so a render that
     /// printed microseconds (or any other unit) cannot pass by merely producing the series.

@@ -331,6 +331,9 @@ pub struct PoolRegistry {
     probes_issued: AtomicU64,
     /// See [`ProbeTuning`]. Always [`ProbeTuning::default`] in production.
     tuning: Arc<ProbeTuning>,
+    /// SPEC §13's OTLP exporter (M2-C4c-2), when the operator configured one. Here for the same
+    /// reason as `slow_log`: every EXEC path already holds the registry.
+    tracer: Option<crate::otlp::Tracer>,
 }
 
 impl PoolRegistry {
@@ -341,6 +344,16 @@ impl PoolRegistry {
     /// The SPEC §13 slow-log settings this daemon was started with.
     pub fn slow_log(&self) -> SlowLogConfig {
         self.slow_log
+    }
+
+    /// The OTLP exporter, when trace export is on.
+    pub fn tracer(&self) -> Option<&crate::otlp::Tracer> {
+        self.tracer.as_ref()
+    }
+
+    /// The backend family of a configured pool, by name.
+    pub fn kind(&self, name: &str) -> Option<PoolKind> {
+        self.by_name.get(name).map(|entry| entry.kind)
     }
 
     pub fn build(config: &Config) -> Arc<Self> {
@@ -409,6 +422,7 @@ impl PoolRegistry {
             slow_log,
             probes_issued: AtomicU64::new(0),
             tuning,
+            tracer: config.otlp.clone().map(crate::otlp::Tracer::start),
         })
     }
 
