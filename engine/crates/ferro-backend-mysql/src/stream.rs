@@ -309,6 +309,28 @@ pub async fn open(
         // The owned conn was consumed by the failed run and is gone; the wrapper stays parked.
         Err(e) => return Err(conn.map_stmt_error(&e)),
     };
+
+    // **Refuse from the prepared metadata (step 2), DESCRIBE from the executed metadata** — the
+    // buffered path's rule (SPEC §22.2 (ci)): MySQL 8.4 declares a bare `?` in the select list as a
+    // STRING at prepare time while the executed cell is whatever was bound, so `cols` and the cell
+    // mapping follow the EXECUTED set, read here before HEAD is ever built. A type admitted at
+    // prepare but out of scope once executed is refused after the send — the (av) trade, known-fate,
+    // with the connection recovered clean where possible, exactly as the `CALL` arm above does.
+    let executed: Vec<Column> = qr.columns_ref().to_vec();
+    let (cols, columns) = if executed.is_empty() {
+        (cols, columns)
+    } else {
+        match build_cols(&executed) {
+            Ok(c) => (c, executed),
+            Err(e) => {
+                if let Ok(recovered) = qr.into_conn().await {
+                    conn.unpark(recovered);
+                    conn.record_session_mutation();
+                }
+                return Err(e);
+            }
+        }
+    };
     let stream = match qr.stream_and_drop::<Row>().await {
         Ok(Some(s)) => s,
         // Unreachable: we only take this route when the prepared statement HAS result columns.

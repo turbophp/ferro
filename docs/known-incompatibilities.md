@@ -308,9 +308,11 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   a decimal as a STRING to control the digits exactly (SPEC §22.2 (ci)).
 - **On MySQL/MariaDB, a NULL-typed select-list column is refused before execution** — `SELECT NULL`,
   and, on MariaDB, a bare parameter in the select list (`SELECT ? AS p`), which MariaDB declares the
-  same way when the statement is prepared. Classified from that metadata, admitting the type would let
-  the statement run and then fail to read its value — a write applied and reported as a failure — so
-  it is refused with the statement never sent (SPEC §22.2 (ci)). Cast it (`CAST(NULL AS CHAR)`,
+  same way when the statement is prepared. Admitting the type from that metadata would let the
+  statement run and then fail to read its value — a write applied and reported as a failure — so it
+  is refused with the statement never sent (SPEC §22.2 (ci)). On MySQL 8.4 a bare parameter is
+  declared as a string instead and is ANSWERED: its cells are read with the executed result's
+  metadata. Cast it (`CAST(NULL AS CHAR)`,
   `CAST(? AS SIGNED)`) to give the column a type.
 - **An integer parameter above `PHP_INT_MAX` is refused client-side**, not silently saturated
   (a PHP `(int)` cast saturates rather than wrapping). Bind it as a string against a `numeric`

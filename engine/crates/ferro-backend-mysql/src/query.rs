@@ -110,12 +110,21 @@ pub async fn run(
     // declares no columns for, which is precisely the `CALL` shape that returned cell-less rows
     // before this. The refusal is still KNOWN-FATE and never `Indeterminate` — it is raised here,
     // after a FULL drain, so the outcome is settled and the conn is clean and reusable.
-    let (cols, columns): (Vec<ColMeta>, &[Column]) = match pre_cols {
-        Some(cols) => (cols, &prepared),
-        None => {
-            let executed = executed.as_deref().unwrap_or(&[]);
-            (build_cols(executed)?, executed)
-        }
+    //
+    // **Refuse from the prepared metadata, DESCRIBE from the executed metadata** (SPEC §22.2 (ci)).
+    // The prepared list is what lets an out-of-scope column be refused before anything is sent —
+    // but it does not always describe the cells: MySQL 8.4 declares a bare `?` in the select list
+    // (`SELECT ? AS p`) as a STRING at prepare time while the executed cell is whatever was bound,
+    // so decoding against it ran the statement and then refused an `Int` cell (measured on CI; the
+    // adversarial review measured the same class on MariaDB through `MYSQL_TYPE_NULL`). When the
+    // executed set carries metadata it describes these rows, so it is what `cols` and the mapping
+    // use. A type admitted at prepare but out of scope once executed is still refused — after the
+    // send, the narrow (av) trade, and still known-fate.
+    let executed = executed.as_deref().filter(|e| !e.is_empty());
+    let (cols, columns): (Vec<ColMeta>, &[Column]) = match (executed, pre_cols) {
+        (Some(executed), _) => (build_cols(executed)?, executed),
+        (None, Some(cols)) => (cols, &prepared),
+        (None, None) => (Vec::new(), &[]),
     };
 
     // Map each cell through the SAME classifier `cols` used, so rows and cols never disagree.

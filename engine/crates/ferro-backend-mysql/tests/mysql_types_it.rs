@@ -39,7 +39,7 @@
 //!
 //! Binding is Task 8: every value here is written with a text literal through `simple_query`.
 
-use ferro_pool::backend::PoolBackend;
+use ferro_pool::backend::{BackendRows, PoolBackend};
 use ferro_pool::error::PoolError;
 use ferro_proto::consts::{branch, errc, tag};
 use ferro_proto::value::Value;
@@ -947,6 +947,47 @@ async fn null_typed_select_lists_are_refused_before_execution(url: &str, label: 
             Err(e) => {
                 panic!("[{label}] `{sql}` must be refused before execution or answered: {e:?}")
             }
+        }
+
+        // The STREAM path, held to the same rule: it builds HEAD and maps cells on its own route.
+        let before = executes(&mut conn).await;
+        match backend.query_stream(&mut conn, sql, &params).await {
+            Err(PoolError::Unsupported(msg)) => {
+                assert!(
+                    msg.contains("NULL-typed"),
+                    "[{label}] stream `{sql}`: {msg}"
+                );
+                assert_eq!(
+                    executes(&mut conn).await,
+                    before,
+                    "[{label}] stream `{sql}` was refused AFTER it executed"
+                );
+            }
+            Ok((cols, mut rows)) => {
+                let mut got = Vec::new();
+                while let Some(row) = rows.next().await {
+                    got.push(row.unwrap_or_else(|e| {
+                        panic!("[{label}] stream `{sql}` executed, then failed mid-stream: {e:?}")
+                    }));
+                }
+                backend
+                    .reclaim_stream(&mut conn, rows)
+                    .await
+                    .expect("reclaim");
+                assert_eq!(
+                    got,
+                    vec![vec![want.clone()]],
+                    "[{label}] stream `{sql}` answered wrongly"
+                );
+                assert_eq!(
+                    cols[0].tag,
+                    want.tag(),
+                    "[{label}] HEAD vs cell for stream `{sql}`"
+                );
+            }
+            Err(e) => panic!(
+                "[{label}] stream `{sql}` must be refused before execution or answered: {e:?}"
+            ),
         }
     }
     conn.disconnect().await;
