@@ -23,7 +23,8 @@ use Ferro\Protocol\Generated\Constants as C;
  *     The ONLY yes: a `Retryable` (branch 1) READ (`readonly=true`), and only when `retryReads`.
  *
  *  2. {@see classifyLoss} — turn a no-response / dead-transport failure into its fate exception per
- *     the §19.1 matrix. The lost-COMMIT carve-out lives here and is checked FIRST: a lost COMMIT is
+ *     the §19.1 matrix. A request that was NEVER SENT is checked first and is `Retryable` whatever its
+ *     kind (§19.3; M2-C1e-3). Then the lost-COMMIT carve-out: a COMMIT that WAS sent and lost is
  *     ALWAYS `Indeterminate`, never reclassified down to Retryable even by a (misbehaving) server hint.
  */
 final class FateClassifier
@@ -81,8 +82,9 @@ final class FateClassifier
     }
 
     /**
-     * Classify a no-response / dead-transport loss into its fate exception (§19.1 matrix). The
-     * lost-COMMIT carve-out is checked FIRST and is unconditional. When the engine actually sent a
+     * Classify a no-response / dead-transport loss into its fate exception (§19.1 matrix). An
+     * UNSENT request (`$sent === false`) is checked first and is `Retryable` for every kind; for a
+     * request that was sent, the lost-COMMIT carve-out comes next and is unconditional. When the engine actually sent a
      * session-fatal `Outcome::Error` (`$server`), its branch is trusted for the non-COMMIT cases (the
      * engine already applied the dispatched-vs-not classification).
      *
@@ -100,7 +102,24 @@ final class FateClassifier
         string $reason,
         ?ErrorPayload $server = null,
         bool $epochChanged = false,
+        bool $sent = true,
     ): FerroException {
+        // NOT SENT is checked first, and it decides for every op kind, the COMMIT included: a request
+        // whose frame never completely reached the engine was never dispatched, so it cannot have
+        // applied — §19.3's engine-side "not-yet-dispatched → Retryable", applied to the client's
+        // half of the link, and the carve-out below is worded for a COMMIT frame that was SENT.
+        // `$sent` is false only for a {@see TransportException::requestNotSent}, which only the
+        // session raises, because only it knows which frame was being written (M2-C1e-3). Retryable
+        // licenses the CALLER, not this client: {@see mayRetry} still never re-issues a write.
+        if (!$sent) {
+            return new RetryableException(self::payload(
+                C::ERR_CONNECTION_LOST,
+                C::BRANCH_RETRYABLE,
+                'request not sent — the connection failed before its frame was completely written, so '
+                    . 'it cannot have executed (Retryable): ' . $reason,
+            ));
+        }
+
         $noResponseCause = $epochChanged
             ? IndeterminateException::CAUSE_ENGINE_RESTART
             : IndeterminateException::CAUSE_LINK_LOST;

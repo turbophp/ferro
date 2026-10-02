@@ -443,11 +443,18 @@ upstream's own PDO driver:
   `select()` is declared a write (above), a SELECT lost mid-flight is reported rather than silently
   retried, which PDO would do. The same type rule stops `DB::transaction(attempts:)` re-running a
   transaction whose COMMIT reply was lost. SPEC §22.2 (bw).
-- **After a `ferrod` restart, a long-lived connection does NOT recover by itself.** Every statement on
-  it fails as an indeterminate write until the application calls `DB::reconnect()` (or the worker
-  restarts) — which matters for Octane and queue workers. Root cause: the client classifies a request
-  that failed while still being WRITTEN as indeterminate, although an incompletely-written frame
-  cannot have executed; being fixed as the next slice. SPEC §22.2 (bw).
+- **FIXED — a long-lived connection now recovers by itself after a `ferrod` restart.** Until M2-C1e-3
+  every statement on such a connection failed as an indeterminate write until the application called
+  `DB::reconnect()` or the worker restarted — which mattered for Octane and queue workers — because
+  the client classified a request that failed while still being WRITTEN ("write failed after 0 of 47
+  bytes") as fate-unknown. A frame that never fully left the client cannot have executed, so it is
+  now `Retryable`, and Illuminate's lost-connection retry reconnects and re-runs the statement once —
+  including when the restart lands in the middle of a `cursor()`. A statement whose reply was lost
+  AFTER it was sent still surfaces, as it must, and that is the one case recovery is not immediate:
+  over TCP, or while an engine is draining, the kernel can still accept the first write after a
+  restart, so that statement surfaces as an indeterminate write and the NEXT one recovers. The
+  native client and the Doctrine tier recover too: a session a failure closed is replaced before the
+  next request. SPEC §22.2 (bw), (bx).
 
 ### Schema and migrations
 

@@ -62,4 +62,11 @@ interface SessionInterface
 
     /** Best-effort GOODBYE, then close the transport. Idempotent. */
     public function close(): void;
+
+    /**
+     * Whether a transport failure has closed this session, so it can carry no further request.
+     * {@see Connection} replaces a poisoned session before sending when it has a reconnect loop —
+     * not a retry: the request has not been sent anywhere yet (M2-C1e-3, SPEC §22.2 (bx)).
+     */
+    public function isPoisoned(): bool;
 }

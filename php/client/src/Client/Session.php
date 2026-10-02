@@ -5,6 +5,7 @@ namespace Ferro\Client;
 use Ferro\Client\Error\ConnectionLostException;
 use Ferro\Client\Error\HandshakeException;
 use Ferro\Client\Error\ProtocolException;
+use Ferro\Client\Error\TransportException;
 use Ferro\Protocol\Codec;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Header;
@@ -48,8 +49,9 @@ final class Session implements SessionInterface, StreamingSessionInterface
     private bool $handshakeDone = false;
 
     /**
-     * The `(service, method)` of the last frame {@see sendRequest} put on the wire (the §19.3
-     * lost-COMMIT carve-out reads this).
+     * The `(service, method)` of the last request frame put on the wire, exposed through
+     * {@see lastInFlight}. Diagnostic only: the fate rules do not read it — each call site passes its
+     * own `OpKind` to {@see FateClassifier::classifyLoss}, which is what decides a lost COMMIT.
      *
      * @var array{0:int,1:int}|null
      */
@@ -63,6 +65,19 @@ final class Session implements SessionInterface, StreamingSessionInterface
      */
     private bool $streamOpen = false;
     private ?int $streamRequestId = null;
+
+    /**
+     * Set by the first transport failure; the session is unusable from then on (M2-C1e-3).
+     *
+     * After a failure the framing is unknown in BOTH directions: a failed write may have left a
+     * PARTIAL frame on the wire, which the next frame's bytes would complete — so the engine could
+     * decode a request built from two of them — and a failed read leaves an unknown amount unread,
+     * which the next request would read as its own reply. So the first failure closes the socket
+     * (the engine sees EOF and discards any partial frame) and every later frame is refused BEFORE
+     * a byte is written, as {@see TransportException::requestNotSent}. That refusal is what makes
+     * "an unsent request cannot have executed" true rather than hopeful.
+     */
+    private ?string $poisoned = null;
 
     public function __construct(
         private readonly TransportInterface $transport,
@@ -92,7 +107,7 @@ final class Session implements SessionInterface, StreamingSessionInterface
             features: 0,
         );
         $payload = $hello->encode($this->encodePacker);
-        $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_HELLO, $payload);
+        $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_HELLO, $payload, 0, true);
 
         [$header, $body] = $this->readFrame();
         $isEnd = ($header->flags & C::FLAG_END) !== 0;
@@ -141,10 +156,9 @@ final class Session implements SessionInterface, StreamingSessionInterface
     {
         $this->assertNoOpenStream();
         $rid = $this->ids->next();
-        // Record BEFORE the write so that if the write (or the terminal read) dies, the carve-out can
-        // read exactly which (service, method) was in flight — e.g. TX/COMMIT ⇒ Indeterminate (§19.3).
+        // Record BEFORE the write, so it names the request even when the write itself dies.
         $this->lastInFlight = [$service, $method];
-        $this->writeFrame(0, $service, $method, $payload, $rid);
+        $this->writeFrame(0, $service, $method, $payload, $rid, true);
 
         [$header, $body] = $this->readFrame();
         $isEnd = ($header->flags & C::FLAG_END) !== 0;
@@ -247,7 +261,7 @@ final class Session implements SessionInterface, StreamingSessionInterface
         $this->assertNoOpenStream();
         $rid = $this->ids->next();
         $this->lastInFlight = [$service, $method];
-        $this->writeFrame(0, $service, $method, $payload, $rid);
+        $this->writeFrame(0, $service, $method, $payload, $rid, true);
 
         [$header, $body] = $this->readFrame();
         $isEnd = ($header->flags & C::FLAG_END) !== 0;
@@ -343,8 +357,13 @@ final class Session implements SessionInterface, StreamingSessionInterface
 
     public function abandonStream(int $requestId): void
     {
+        // Also covers a POISONED session: `poison()` clears the guard, because a closed socket has
+        // nothing to drain and nothing to CANCEL on (the engine tears the stream down at EOF). That
+        // matters because abandonment usually runs from a `finally` carrying the REAL error, which a
+        // throw here would replace (M2-C1e-3 review F5/F2; the dedicated early return this once had
+        // was dead code under exactly this guard, and was removed when a mutation showed it).
         if (!$this->streamOpen || $this->streamRequestId !== $requestId) {
-            return; // already closed (normal completion) or not this stream — nothing to drain.
+            return; // already closed (normal completion), poisoned, or not this stream.
         }
         $this->sendCancel($requestId);
         while ($this->streamOpen) {
@@ -352,19 +371,87 @@ final class Session implements SessionInterface, StreamingSessionInterface
         }
     }
 
-    private function writeFrame(int $flags, int $service, int $method, string $payload, int $requestId = 0): void
-    {
+    /**
+     * Write one frame. A failure here means the frame was NOT completely written — the transport
+     * contract ({@see TransportInterface::writeAll}) — and the session is poisoned so nothing can
+     * ever complete the partial frame.
+     *
+     * **Only a REQUEST frame (`$isRequest`: HELLO, a buffered request, a stream open) surfaces as
+     * {@see TransportException::requestNotSent}**, because only for a request does "this frame
+     * never arrived" mean "this statement never executed". A CONTROL frame — PING, GOODBYE,
+     * WINDOW_UPDATE, CANCEL — is about a request that may well have run already (a WINDOW_UPDATE
+     * mid-stream follows rows the engine has produced), so its failure is a plain
+     * `TransportException`, and a caller that trusted the flag there would be told a lie (M2-C1e-3
+     * review F2).
+     */
+    private function writeFrame(
+        int $flags,
+        int $service,
+        int $method,
+        string $payload,
+        int $requestId = 0,
+        bool $isRequest = false,
+    ): void {
+        if ($this->poisoned !== null) {
+            $why = 'this session was closed after an earlier transport failure (' . $this->poisoned . ')';
+            throw $isRequest
+                ? TransportException::requestNotSent('not sent: ' . $why)
+                : new TransportException($why);
+        }
         $header = new Header($flags, $service, $method, $requestId, strlen($payload));
-        $this->transport->writeAll($this->codec->encodeFrame($header, $payload));
+        try {
+            $this->transport->writeAll($this->codec->encodeFrame($header, $payload));
+        } catch (TransportException $e) {
+            $this->poison($e);
+            throw $isRequest ? TransportException::requestNotSent($e->getMessage(), $e) : $e;
+        }
+    }
+
+    /**
+     * Whether a transport failure has closed this session ({@see poison}). A poisoned session can
+     * carry no further request; {@see Connection} replaces it before a request when it has a
+     * reconnect loop to do so (M2-C1e-3 review F4).
+     */
+    public function isPoisoned(): bool
+    {
+        return $this->poisoned !== null;
     }
 
     /** @return array{0:Header,1:string} the decoded header + its exact-length payload. */
     private function readFrame(): array
     {
-        $head = $this->transport->readExact(16);
-        $header = Header::decode($head);
-        $payload = $header->payloadLen > 0 ? $this->transport->readExact($header->payloadLen) : '';
+        try {
+            $head = $this->transport->readExact(16);
+            $header = Header::decode($head);
+            $payload = $header->payloadLen > 0 ? $this->transport->readExact($header->payloadLen) : '';
+        } catch (TransportException $e) {
+            // The request (if any) WAS fully written, so its fate is the caller's to classify; the
+            // session is unusable either way, because what is left unread is unknown.
+            $this->poison($e);
+            throw $e;
+        }
         return [$header, $payload];
+    }
+
+    /** Close the socket on the first transport failure and remember why. Idempotent. */
+    private function poison(TransportException $e): void
+    {
+        if ($this->poisoned !== null) {
+            return;
+        }
+        $this->poisoned = $e->getMessage();
+        // The stream guard exists to stop a request interleaving with an open stream's unread
+        // frames. On a closed socket there are no frames left to interleave with, and leaving the
+        // guard set made every later request fail `ProtocolException` ("a stream is open")
+        // instead of `requestNotSent` — so nothing above could tell the session was dead and
+        // reconnect (M2-C1e-3 review F5, reproduced live with a `cursor()` across a restart).
+        $this->streamOpen = false;
+        $this->streamRequestId = null;
+        try {
+            $this->transport->close();
+        } catch (\Throwable) {
+            // Best-effort: the point is that nothing more is WRITTEN, which the flag guarantees.
+        }
     }
 
     /** @throws ProtocolException if a stream is currently open on this session. */

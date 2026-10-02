@@ -15,7 +15,11 @@ interface TransportInterface
      */
     public function readExact(int $n): string;
 
-    /** Write the whole buffer, looping over partial writes. Throws on error/short write. */
+    /**
+     * Write the whole buffer, looping over partial writes — every byte, or throw {@see \Ferro\Client\Error\TransportException}. **Throws ONLY when
+     * the bytes were not all written** — the session relies on that to report a request as
+     * not-sent (SPEC §22.2 (bx)).
+     */
     public function writeAll(string $bytes): void;
 
     /** Close the underlying transport. Idempotent. */

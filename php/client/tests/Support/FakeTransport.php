@@ -38,8 +38,24 @@ final class FakeTransport implements TransportInterface
         return $slice;
     }
 
+    /**
+     * Arms the NEXT `writeAll()` to fail the way a real short write does: throwing, with nothing of
+     * the frame recorded as written (the {@see TransportInterface::writeAll} contract — it throws
+     * only when the bytes were not all written). One-shot.
+     */
+    public ?TransportException $failNextWrite = null;
+
+    /** Every `writeAll()` call, including a failed one — so a test can prove a call never happened. */
+    public int $writeCalls = 0;
+
     public function writeAll(string $bytes): void
     {
+        ++$this->writeCalls;
+        if ($this->failNextWrite !== null) {
+            $e = $this->failNextWrite;
+            $this->failNextWrite = null;
+            throw $e;
+        }
         $this->written .= $bytes;
     }
 
