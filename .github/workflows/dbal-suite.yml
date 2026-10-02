@@ -21,6 +21,13 @@ on:
         type: choice
         options: [all, pg, mysql, mariadb, sqlite, sqlite-control]
         default: all
+      dbal:
+        # M2-C5b: WHICH upstream suite — and therefore which driverClass and which of the driver
+        # package's vendor trees. The runner derives the major from this tag; nothing else selects it.
+        description: "Pinned doctrine/dbal tag (the suite AND the code under test)"
+        type: choice
+        options: ["4.4.4", "3.10.6"]
+        default: "4.4.4"
 
 jobs:
   measure:
@@ -73,17 +80,19 @@ jobs:
           echo "FERRO_DBAL_DSN=$dsn" >> "$GITHUB_ENV"
           echo "FERRO_DBAL_SVC=$svc" >> "$GITHUB_ENV"
           echo "FERRO_DBAL_CONTROL=$control" >> "$GITHUB_ENV"
+          echo "FERRO_DBAL_TAG=${{ inputs.dbal }}" >> "$GITHUB_ENV"
           # An EMPTY FERRO_DBAL_DSN is the same as an unset one here — the script reads it with
           # `${FERRO_DBAL_DSN:-…}`, whose `:-` treats empty as absent — so the SQLite columns pass
           # it empty and get the runner's own file path.
           FERRO_DBAL_SVC="$svc" FERRO_DBAL_CONTROL="$control" FERRO_DBAL_DSN="$dsn" \
+            FERRO_DBAL_TAG="${{ inputs.dbal }}" \
             ./testkit/dbal-suite.sh 2>&1 | tee run1.log
           echo "exit=$?" >> "$GITHUB_OUTPUT"
       - name: suite, run 2 of 2 (reproducibility)
         run: |
           set -o pipefail +e
           FERRO_DBAL_SVC="$FERRO_DBAL_SVC" FERRO_DBAL_CONTROL="$FERRO_DBAL_CONTROL" \
-            FERRO_DBAL_DSN="$FERRO_DBAL_DSN" \
+            FERRO_DBAL_DSN="$FERRO_DBAL_DSN" FERRO_DBAL_TAG="$FERRO_DBAL_TAG" \
             ./testkit/dbal-suite.sh 2>&1 | tee run2.log
           echo "exit=$?" >> "$GITHUB_OUTPUT"
       - name: result lines + broken-run gate
@@ -99,7 +108,7 @@ jobs:
             fi
           done
           {
-            echo "## dbal-suite · ${{ matrix.family }}"
+            echo "## dbal-suite · doctrine/dbal ${{ inputs.dbal }} · ${{ matrix.family }}"
             echo '```'
             echo "run 1: $(grep -E '^(Tests: |OK)' run1.log | tail -1)"
             echo "run 2: $(grep -E '^(Tests: |OK)' run2.log | tail -1)"
@@ -116,7 +125,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: dbal-suite-${{ matrix.family }}-${{ github.run_id }}
+          name: dbal-suite-${{ inputs.dbal }}-${{ matrix.family }}-${{ github.run_id }}
           path: |
             run1.log
             run2.log

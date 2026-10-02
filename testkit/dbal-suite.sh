@@ -8,6 +8,18 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tag="${FERRO_DBAL_TAG:-4.4.4}"
+# THE MAJOR (M2-C5b) is derived from the pinned tag, never configured beside it, so the tests and
+# the code under test cannot name different majors. Everything major-specific hangs off it: the
+# driver package's VENDOR TREE (DBAL 3 lives in vendor-dbal3/, installed from composer.dbal3.json —
+# the package's own DBAL 3 lane), the replacement TestUtil (3.10.6's public surface differs from
+# 4.4.4's), and the driverClass.
+major="${tag%%.*}"
+pkg="$root/php/doctrine-dbal"
+case "$major" in
+  4) vendor="$pkg/vendor";       composer_file=composer.json;       testutil=TestUtil.ferro.php;       driver_class='Ferro\DBAL\Driver' ;;
+  3) vendor="$pkg/vendor-dbal3"; composer_file=composer.dbal3.json; testutil=TestUtil.ferro.dbal3.php; driver_class='Ferro\DBAL\Dbal3\Driver' ;;
+  *) echo "::error:: FERRO_DBAL_TAG=$tag names DBAL major $major; the driver serves 3 and 4"; exit 1 ;;
+esac
 pool="${FERRO_DBAL_POOL:-default}"
 # Which container to reset, and how. `--no-reset` exists for fast iteration; a RECORDED run must not
 # use it (see the results file's environment manifest).
@@ -73,22 +85,23 @@ if [ ! -d "$src" ]; then
   git clone --depth 1 --branch "$tag" https://github.com/doctrine/dbal.git "$src"
 fi
 
-# 3. The driver package must be installed (its vendor/ is its own, and is the ONLY one this run uses).
-(cd "$root/php/doctrine-dbal" && composer install --no-interaction --no-progress --quiet)
+# 3. The driver package must be installed (its vendor tree for THIS major is the ONLY one this run
+#    uses — vendor/ for DBAL 4, vendor-dbal3/ for DBAL 3).
+(cd "$pkg" && COMPOSER="$composer_file" composer install --no-interaction --no-progress --quiet)
 
 # 1b. …which means the tests come from the clone at $tag and the code under test comes from the
 #     driver package's vendor. If those two versions ever diverge the suite silently tests the wrong
 #     source, so assert they are equal.
-installed="$(cd "$root/php/doctrine-dbal" && composer show doctrine/dbal 2>/dev/null | awk '$1=="versions" {print $NF}')"
+installed="$(cd "$pkg" && COMPOSER="$composer_file" composer show doctrine/dbal 2>/dev/null | awk '$1=="versions" {print $NF}')"
 if [ "$installed" != "$tag" ]; then
-  echo "::error:: doctrine/dbal in php/doctrine-dbal/vendor is '$installed' but the test tree is pinned at '$tag'."
+  echo "::error:: doctrine/dbal in ${vendor#$root/} is '$installed' but the test tree is pinned at '$tag'."
   echo "          The suite would run $tag's tests against $installed's source. Pin one to the other."
   exit 1
 fi
 
 # 2. The patched TestUtil, copied over the upstream one, and VERIFIED — a silently-failed patch is
 #    exactly how this suite goes green against SQLite.
-cp "$root/testkit/dbal/TestUtil.ferro.php" "$src/tests/TestUtil.php"
+cp "$root/testkit/dbal/$testutil" "$src/tests/TestUtil.php"
 grep -q 'neither db_driverClass nor db_driver is set' "$src/tests/TestUtil.php" \
   || { echo "::error:: TestUtil patch did not apply"; exit 1; }
 
@@ -189,7 +202,7 @@ cfg="$work/phpunit.generated.xml"
     echo '    <var name="db_driver" value="pdo_sqlite"/>'
     echo '    <var name="db_path" value="'"$sqlite_db"'"/>'
   else
-    echo '    <var name="db_driverClass" value="Ferro\DBAL\Driver"/>'
+    echo '    <var name="db_driverClass" value="'"$driver_class"'"/>'
     echo '    <var name="db_unix_socket" value="'"$sock"'"/>'
     echo '    <var name="db_driver_options" value="{&quot;pool&quot;:&quot;'"$pool"'&quot;}"/>'
   fi
@@ -206,5 +219,5 @@ fi
 # 7. Run it, with the DRIVER package's phpunit (see step 1 — one vendor tree, no version collision).
 #    The bootstrap's contact assertion runs first and exits non-zero if the connection is not a
 #    Ferro one.
-FERRO_DBAL_SRC="$src" FERRO_DBAL_CONTROL="$control" \
-  "$root/php/doctrine-dbal/vendor/bin/phpunit" -c "$cfg" "${args[@]+"${args[@]}"}"
+FERRO_DBAL_SRC="$src" FERRO_DBAL_CONTROL="$control" FERRO_DBAL_VENDOR="$vendor" \
+  "$vendor/bin/phpunit" -c "$cfg" "${args[@]+"${args[@]}"}"
