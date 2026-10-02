@@ -5,9 +5,14 @@ namespace Ferro\DBAL\Tests\Unit;
 use Doctrine\DBAL\Platforms\MySQL84Platform;
 use Doctrine\DBAL\Platforms\PostgreSQL120Platform;
 use Doctrine\DBAL\TransactionIsolationLevel;
+use Ferro\Client\Connection as FerroClientConnection;
+use Ferro\DBAL\Connection;
 use Ferro\DBAL\Exception\UnsupportedStatement;
+use Ferro\DBAL\IsolationStatement;
+use Ferro\DBAL\PlatformVersion;
 use Ferro\DBAL\Wrapper\FerroConnection;
 use Ferro\Protocol\Isolation;
+use Ferro\Tests\Support\FakeSession;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -34,7 +39,7 @@ final class IsolationRefusalTest extends TestCase
     public function testEveryStockIsolationStatementIsRecognised(string $sql): void
     {
         self::assertTrue(
-            FerroConnection::isIsolationStatement($sql),
+            IsolationStatement::matches($sql),
             "the driver must recognise the statement Doctrine actually emits: $sql",
         );
     }
@@ -48,15 +53,28 @@ final class IsolationRefusalTest extends TestCase
             'SET LOCAL statement_timeout = 100',
             "INSERT INTO log (msg) VALUES ('SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED')",
         ] as $sql) {
-            self::assertFalse(FerroConnection::isIsolationStatement($sql), "must NOT match: $sql");
+            self::assertFalse(IsolationStatement::matches($sql), "must NOT match: $sql");
         }
     }
 
-    public function testTheRefusalNamesTheWrapperAsTheFix(): void
+    /**
+     * The refusal raised by the DBAL **4** connection names the DBAL **4** wrapper. Driven through a
+     * real `Connection` rather than the factory, because since M2-C5 the factory is told WHICH
+     * wrapper to name and a test of the factory alone would only prove it repeats its argument —
+     * the DBAL 3 lane pins the other half (its connection names the DBAL 3 wrapper).
+     */
+    public function testTheRefusalNamesThisMajorsWrapperAsTheFix(): void
     {
-        $e = UnsupportedStatement::isolation('SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE');
-        self::assertStringContainsString('wrapperClass', $e->getMessage());
-        self::assertStringContainsString(FerroConnection::class, $e->getMessage());
+        $session = new FakeSession();
+        $conn = new Connection(new FerroClientConnection($session, 'default'), 'p', PlatformVersion::KIND_POSTGRES, false);
+        try {
+            $conn->exec('SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+            self::fail('the isolation statement must be refused');
+        } catch (UnsupportedStatement $e) {
+            self::assertStringContainsString('wrapperClass', $e->getMessage());
+            self::assertStringContainsString(FerroConnection::class, $e->getMessage());
+        }
+        self::assertSame(0, $session->sendCount(), 'refused before anything reached the wire');
     }
 
     /**
@@ -80,5 +98,28 @@ final class IsolationRefusalTest extends TestCase
             self::assertArrayHasKey($case->name, $expected, "unmapped TransactionIsolationLevel::{$case->name}");
             self::assertSame($expected[$case->name], FerroConnection::toFerroIsolation($case));
         }
+    }
+
+    /**
+     * The refusal on the two OTHER statement entry points — `query()` (the parameterless read path,
+     * which streams) and the prepared path — where no offline test reached it before (M2-C5 review:
+     * a mutation deleting it from `runPrepared()` survived every test, CI included).
+     */
+    public function testTheRefusalCoversTheQueryAndPreparedPathsOffline(): void
+    {
+        $sql = 'SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE';
+        $session = new FakeSession();
+        $conn = new Connection(new FerroClientConnection($session, 'default'), 'p', PlatformVersion::KIND_POSTGRES, false);
+        foreach ([
+            'query' => static fn () => $conn->query($sql),
+            'prepared' => static fn () => $conn->prepare($sql)->execute(),
+        ] as $path => $run) {
+            try {
+                $run();
+                self::fail("the $path path must refuse the isolation statement");
+            } catch (UnsupportedStatement) {
+            }
+        }
+        self::assertSame(0, $session->sendCount(), 'refused before anything reached the wire');
     }
 }

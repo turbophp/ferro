@@ -2,8 +2,9 @@
 
 Ferro is a drop-in by CONFIGURATION for two framework tiers:
 
-- **`ferro/doctrine-dbal-driver`** — Doctrine DBAL 4, via `driverClass` + `driverOptions`, with
-  Grammar/Processor, the DBAL platforms and the stock schema managers untouched (SPEC §14).
+- **`ferro/doctrine-dbal-driver`** — Doctrine DBAL 4, and DBAL 3.8+ through a second
+  `driverClass`, via `driverClass` + `driverOptions`, with Grammar/Processor, the DBAL platforms and
+  the stock schema managers untouched (SPEC §14).
 - **`ferro/laravel`** — Illuminate's `Connection` execution layer, via one driver name in the
   connection config, with the stock Grammar, Processor and Schema builder untouched (SPEC §15).
 
@@ -116,6 +117,26 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   sub-second `timestamptz`, open a connection of your OWN through `Ferro\Ferro::connect()` (default
   `M1ValuePolicy`, or `RawStringValuePolicy` for the raw canonical text). The refusal is a
   **driver-tier policy**, not an engine limitation.
+- **On DBAL 3 the `driverClass` is `Ferro\DBAL\Dbal3\Driver`, and naming the other major's class
+  is a fatal error.** DBAL 3 connects to learn the server version before choosing a platform only for
+  a driver implementing `VersionAwarePlatformDriver`, which DBAL 4 deleted, and the two majors
+  declare `quote()`, `lastInsertId()` and the transaction methods with signatures one class cannot
+  both satisfy — PHP rejects that when the class is declared, which happens as soon as
+  `DriverManager::getConnection()` loads it, before any connection opens. The isolation
+  `wrapperClass` is per major too (`Ferro\DBAL\Dbal3\FerroConnection`). Behaviour is otherwise the
+  same on both: one connection core, one binder, one value policy and one exception converter serve
+  both, and the package's live suite runs unchanged against each (SPEC §22.2 (by);
+  `Dbal3DriverTest::testItIsVersionAwareSoDbal3ConnectsBeforeChoosingAPlatform`).
+- **Under Symfony's DoctrineBundle, set `charset` on the connection (any value — it is inert for
+  Ferro) and do not set `dbname_suffix`.** DoctrineBundle 2's `ConnectionFactory` asks the driver for
+  a platform BEFORE anything connects whenever `charset` is unset or `dbname_suffix` is set, only to
+  default the charset — version-less on DBAL 3, with `serverVersion ?? ''` on DBAL 4. Before a
+  connection the driver does not know even the backend family, so both majors refuse rather than
+  guess a SQL dialect, and the message names this fix. Ferro has no client-side database name, so
+  there is nothing for `dbname_suffix` (the `when@test` recipe default) to suffix. On a MySQL-family
+  pool, setting `charset` also skips DoctrineBundle's default table collation
+  (`utf8mb4_unicode_ci`); set `default_table_options` yourself to keep the DDL a `pdo_mysql` app
+  would emit (SPEC §22.2 (by)).
 - **No database credentials exist in PHP.** The DSN lives in the engine (SPEC §12 / D8). The DBAL
   `user`, `password`, `host`, `dbname` and `charset` parameters are therefore inert — measured at the
   acceptance gate, where upstream's `testInvalidUserName` / `testInvalidPassword` / `testInvalidHost`
@@ -126,7 +147,7 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   Connecting succeeds because the Ferro handshake never depends on backend availability; the platform
   needs the server version, which does. The failure is a loud
   `Ferro\DBAL\Exception\ServerVersionUnavailable` naming the pool — never a silently-defaulted
-  platform, because a wrong platform is a wrong SQL dialect. Pin `'serverVersion' => '17.10'` in the
+  platform, because a wrong platform is a wrong SQL dialect. Pin `'serverVersion' => 'PostgreSQL 17.10'` in the
   DBAL params if you want a zero-round-trip answer.
 - **A backend that is DOWN fails within `checkout_timeout`, not the OS connect timeout.** This page
   used to record the opposite — an unbounded dial that could wedge a first query for the ~127 s the
@@ -146,7 +167,17 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   The thrown class is the SPI's own `Doctrine\DBAL\Driver\Exception\NoIdentityValue`, wrapped by DBAL
   into a `DriverException` as usual.
 - **`lastInsertId()` has no sequence-name argument.** DBAL 4 removed the overload; this is upstream,
-  not Ferro.
+  not Ferro. On **DBAL 3**, which still has it, the name is accepted and **not used** on any family.
+  On PostgreSQL its only use would be a follow-up `currval()`: outside a transaction that is the
+  cross-connection hazard of the entry above; inside one — where Doctrine ORM 2's identity generator
+  runs — it would be correct, and is deferred to the ORM-suite slice for both majors (SPEC §22.2 (by)).
+- **On DBAL 3, `lastInsertId()` throws where DBAL 3's SPI allows `false`.** `false` is a silently
+  WRONG key in Doctrine ORM 2: its `IdentityGenerator` casts the answer with `(int)`, so `false`
+  becomes the primary key `0`. The throw is a `Doctrine\DBAL\Driver\Exception` (DBAL 3 has no
+  `NoIdentityValue`), which DBAL 3's wrapper converts to a `DriverException` as usual. DBAL 3's own
+  upstream test of the `false` return is skipped on all three families Ferro serves, since each
+  supports identity columns (SPEC §22.2 (by);
+  `Dbal3ConnectionTest::testNoKeyThrowsADriverExceptionNeverFalse`).
 - **`lastInsertId()` is cleared by a failed statement** — a deliberate divergence from PDO. Read it
   immediately after the successful INSERT.
 - **Doctrine ORM + PostgreSQL + the default IDENTITY strategy cannot insert.**
@@ -179,6 +210,23 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   hygiene before the next `BEGIN`, and your application silently gets the pool default while
   `getTransactionIsolation()` keeps reporting the level it asked for. With the wrapper, the level is
   captured as a typed enum above the SQL layer and rides `BEGIN` on the next transaction.
+- **On DBAL 3, nested transactions use savepoints only if the application asks.** DBAL 3.8–3.10
+  default `nestTransactionsWithSavepoints` to false for every driver, so a nested
+  `beginTransaction()` emits no `SAVEPOINT` and an inner `rollBack()` only marks the whole
+  transaction rollback-only. Call `$conn->setNestTransactionsWithSavepoints(true)`; DBAL 4 always
+  nests with savepoints. Upstream behaviour, not Ferro's — listed because it decides whether the
+  savepoint guarantees on this page apply (SPEC §22.2 (by);
+  `TransactionLiveTest::testDbalNestedTransactionsUseSavepointsOnThePinnedTransaction`).
+- **Through Doctrine's `transactional()`, an indeterminate COMMIT is MASKED under "There is no active
+  transaction."** — on both majors (DBAL 3 from 3.9.4). `commit()` resets the nesting level even
+  when it fails, so `transactional()`'s own rollback throws `ConnectionException` and PHP chains the
+  real `Ferro\DBAL\IndeterminateWriteException` beneath it as `getPrevious()`. Nothing retryable
+  reaches the top, so a retry loop does not replay the transaction; but `catch
+  (IndeterminateWriteException)` around `transactional()` does not match — walk the chain, or use
+  `beginTransaction()`/`commit()`, whose `commit()` throws the class itself. An upstream defect no
+  driver can reach (the wrapper throws first); pinned by a tripwire on each major, with the one-line
+  upstream remedy in [`docs/followups/2026-10-02-transactional-masks-a-failed-commit.md`](followups/2026-10-02-transactional-masks-a-failed-commit.md)
+  (`TransactionalCommitFailureTest::testTransactionalMasksAnIndeterminateCommitUnderNoActiveTransaction`).
 - **`READ UNCOMMITTED` is upgraded to `READ COMMITTED`** — never weakened. PostgreSQL treats them as
   the same level; on MySQL this is a genuine, documented **tightening**.
 - **`setAutoCommit(false)` must be configured before the first connect**, on
@@ -208,6 +256,13 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
 
 The driver's type boundary is a **conversion step the driver owns**, not SQL rewriting. It exists
 because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting calendar parser.
+
+- **On DBAL 3, `quote()` refuses a `BINARY` or `LARGE_OBJECT` value.** Both stock PostgreSQL drivers
+  escape it as `bytea` there, so quoting it as TEXT would store different bytes — measured, `"\\x41"`
+  stored one byte where `pdo_pgsql` stores four. A binary literal's syntax depends on the backend and
+  the column type, so the driver points at the bound parameter, which carries the bytes intact. DBAL
+  4's `quote()` takes no type, so the case does not arise there (SPEC §22.2 (by);
+  `Dbal3ConnectionTest::testQuoteRefusesBinaryTypes`).
 
 - **A value Doctrine would parse INCORRECTLY is refused, not converted.** Measured, with **no
   exception raised** by stock DBAL: `date '2026-00-05'` → `DateTime(2025-12-05)`;

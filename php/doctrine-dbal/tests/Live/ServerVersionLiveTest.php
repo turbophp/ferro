@@ -33,7 +33,7 @@ final class ServerVersionLiveTest extends DbalLiveTestCase
         self::assertInstanceOf(PostgreSQL120Platform::class, $c->getDatabasePlatform());
         self::assertStringContainsString(
             'PostgreSQL',
-            $c->getServerVersion(),
+            self::serverVersionOf($c),
             'the VERBATIM engine string reaches the driver; normalisation happens inside PlatformVersion',
         );
     }
@@ -54,7 +54,7 @@ final class ServerVersionLiveTest extends DbalLiveTestCase
     public function testAPoolWhoseBackendIsDownFailsLOUDLYAndNamesItself(): void
     {
         $healthy = $this->dbal();
-        self::assertStringContainsString('PostgreSQL', $healthy->getServerVersion());
+        self::assertStringContainsString('PostgreSQL', self::serverVersionOf($healthy));
 
         $c = $this->dbal('dead');
         self::assertInstanceOf(\Ferro\Client\Connection::class, $c->getNativeConnection());
@@ -62,7 +62,16 @@ final class ServerVersionLiveTest extends DbalLiveTestCase
         try {
             $c->getDatabasePlatform();
             self::fail('a nil server_version must not silently produce a default platform');
-        } catch (ServerVersionUnavailable $e) {
+        } catch (ServerVersionUnavailable | \Doctrine\DBAL\Exception\DriverException $e) {
+            if (self::isDbal3()) {
+                // DBAL 3's `Connection::getServerVersion()` converts every driver exception raised
+                // while detecting the platform, so the driver's exception arrives as the PREVIOUS
+                // of a stock `DriverException` — still loud, still naming the pool. DBAL 4 lets it
+                // through unconverted (M2-C5).
+                self::assertInstanceOf(\Doctrine\DBAL\Exception\DriverException::class, $e);
+                $e = $e->getPrevious();
+            }
+            self::assertInstanceOf(ServerVersionUnavailable::class, $e, 'the driver\'s own refusal, not a guess');
             self::assertStringContainsString('"dead"', $e->getMessage(), 'name the pool that failed');
             self::assertStringContainsString('serverVersion', $e->getMessage(), 'name the escape hatch');
             self::assertStringContainsString('transient', $e->getMessage(), 'nil is a normal state');
@@ -83,7 +92,7 @@ final class ServerVersionLiveTest extends DbalLiveTestCase
     public function testTheServerVersionParamShortCircuitsTheWholeProblem(): void
     {
         $c = DriverManager::getConnection([
-            'driverClass' => \Ferro\DBAL\Driver::class,
+            'driverClass' => self::driverClass(),
             'unix_socket' => $this->socketPath,
             'driverOptions' => ['pool' => 'dead'],
             'serverVersion' => 'PostgreSQL 17.10',

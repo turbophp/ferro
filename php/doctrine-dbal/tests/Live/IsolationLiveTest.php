@@ -9,7 +9,6 @@ use Doctrine\DBAL\Exception\RetryableException;
 use Doctrine\DBAL\TransactionIsolationLevel;
 use Ferro\DBAL\Exception\UnsupportedStatement;
 use Ferro\DBAL\IndeterminateWriteException;
-use Ferro\DBAL\Wrapper\FerroConnection;
 
 /**
  * M1-S8b Task 13, live.
@@ -22,16 +21,70 @@ use Ferro\DBAL\Wrapper\FerroConnection;
  */
 final class IsolationLiveTest extends DbalLiveTestCase
 {
-    private function wrapped(string $pool = 'default'): DbalConnection
+    private function wrapped(string $pool = 'default', ?\Doctrine\DBAL\Configuration $config = null): DbalConnection
     {
         $c = DriverManager::getConnection([
-            'driverClass' => \Ferro\DBAL\Driver::class,
-            'wrapperClass' => FerroConnection::class,
+            'driverClass' => self::driverClass(),
+            'wrapperClass' => self::wrapperClass(),
             'unix_socket' => $this->socketPath,
             'driverOptions' => ['pool' => $pool],
-        ]);
+        ], $config);
         self::assertInstanceOf(\Ferro\Client\Connection::class, $c->getNativeConnection());
         return $c;
+    }
+
+    /**
+     * A pass-through driver middleware that also wraps the CONNECTION — the shape of DoctrineBundle's
+     * default `IdleConnectionMiddleware` and of its logging/profiling middlewares.
+     */
+    private static function passThroughMiddleware(): \Doctrine\DBAL\Configuration
+    {
+        $mw = new class implements \Doctrine\DBAL\Driver\Middleware {
+            public function wrap(\Doctrine\DBAL\Driver $driver): \Doctrine\DBAL\Driver
+            {
+                return new class ($driver) extends \Doctrine\DBAL\Driver\Middleware\AbstractDriverMiddleware {
+                    /** @param array<string,mixed> $params */
+                    public function connect(#[\SensitiveParameter] array $params): \Doctrine\DBAL\Driver\Connection
+                    {
+                        return new class (parent::connect($params)) extends \Doctrine\DBAL\Driver\Middleware\AbstractConnectionMiddleware {
+                        };
+                    }
+                };
+            }
+        };
+        return (new \Doctrine\DBAL\Configuration())->setMiddlewares([$mw]);
+    }
+
+    /**
+     * The wrapper behind a driver MIDDLEWARE (M2-C5 review F8; pre-existing on DBAL 4 since
+     * M1-S8b). The wrapper used to recognise a Ferro connection by `instanceof` on its outermost
+     * driver connection, which any middleware replaces — so in a stock Symfony app, where
+     * DoctrineBundle installs one on every connection, `setTransactionIsolation()` fell back to
+     * DBAL's own `SET SESSION`, was refused, and told the user to configure the wrapper they had
+     * configured. The first assertion is the CONTROL: it proves the middleware really is the
+     * outermost layer, without which this test would pass for the old code too.
+     */
+    public function testTheWrapperWorksBehindADriverMiddleware(): void
+    {
+        $c = $this->wrapped('default', self::passThroughMiddleware());
+        self::assertNotInstanceOf(
+            \Ferro\DBAL\AbstractConnection::class,
+            self::outermostDriverConnection($c),
+            'control: the middleware must be the outermost driver connection, or nothing is tested',
+        );
+
+        $ret = $c->setTransactionIsolation(TransactionIsolationLevel::SERIALIZABLE);
+        if (self::isDbal3()) {
+            // DBAL 3 returns the SET statement's affected count; Ferro sends no statement.
+            self::assertSame(0, $ret);
+        }
+        $c->beginTransaction();
+        self::assertSame(
+            'serializable',
+            $c->fetchOne("SELECT current_setting('transaction_isolation')"),
+            'the level captured through the middleware stack must reach the BEGIN',
+        );
+        $c->commit();
     }
 
     public function testTheWrapperMakesSetTransactionIsolationTakeEffect(): void

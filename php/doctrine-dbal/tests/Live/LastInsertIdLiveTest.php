@@ -46,7 +46,10 @@ final class LastInsertIdLiveTest extends DbalLiveTestCase
             self::fail('PostgreSQL reports no generated key; the SPI requires a throw');
         } catch (\Doctrine\DBAL\Exception\DriverException $e) {
             $prev = $e->getPrevious();
-            self::assertInstanceOf(NoIdentityValue::class, $prev);
+            // The SPI's own "no identity value" signal, per major: DBAL 4 defines
+            // `NoIdentityValue`; DBAL 3 has no such class, and its driver throws a plain
+            // `Driver\Exception` — never `false`, which ORM 2 would cast to the key 0 (M2-C5).
+            self::assertInstanceOf(self::isDbal3() ? \Ferro\DBAL\Exception\DriverException::class : NoIdentityValue::class, $prev);
             self::assertStringContainsString('RETURNING', $prev->getMessage());
             self::assertStringContainsString('SEQUENCE', $prev->getMessage());
         }

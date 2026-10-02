@@ -3,7 +3,6 @@ declare(strict_types=1);
 namespace Ferro\DBAL\Exception;
 
 use Doctrine\DBAL\Driver\AbstractException;
-use Ferro\DBAL\Wrapper\FerroConnection;
 
 /**
  * A statement Ferro refuses to run, because running it would SUCCEED and do nothing.
@@ -20,7 +19,12 @@ use Ferro\DBAL\Wrapper\FerroConnection;
  */
 final class UnsupportedStatement extends AbstractException
 {
-    public static function isolation(string $sql): self
+    /**
+     * @param class-string $wrapperClass the major-specific `wrapperClass` to name in the fix — the
+     *   DBAL 4 and DBAL 3 wrappers are different classes, and naming the wrong one would turn the
+     *   one-line fix into a fatal error.
+     */
+    public static function isolation(string $sql, string $wrapperClass): self
     {
         return new self(sprintf(
             'Ferro refuses this statement: %s. On a transaction-mode pool a session-level isolation '
@@ -33,7 +37,7 @@ final class UnsupportedStatement extends AbstractException
             . 'beginTransaction(). Refused rather than ignored because a silently wrong isolation '
             . 'level is the failure this engine exists to prevent.',
             $sql,
-            FerroConnection::class,
+            $wrapperClass,
         ));
     }
 }

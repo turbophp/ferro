@@ -1,0 +1,19 @@
+# The DBAL 3 lane: run with vendor-dbal3/bin/phpstan so the autoloader is DBAL 3's (M2-C5).
+#   COMPOSER=composer.dbal3.json composer install
+#   COMPOSER=composer.dbal3.json ./vendor-dbal3/bin/phpstan analyse -c phpstan.dbal3.neon
+# COMPOSER= is LOAD-BEARING: PHPStan builds its class locator from the composer file in the working
+# directory, so without it this run silently reflects DBAL 4 types (measured: 17 bogus errors).
+# Everything NOT excluded below is the shared core, and is therefore analysed against BOTH majors.
+parameters:
+    level: 9
+    paths:
+        - src
+    excludePaths:
+        # DBAL 4-only: DBAL 4's SPI signatures, its ParameterType / TransactionIsolationLevel enums,
+        # and ServerVersionProvider (absent from DBAL 3).
+        - src/Driver.php
+        - src/Connection.php
+        - src/Statement.php
+        - src/ParameterBinder.php
+        - src/FixedVersion.php
+        - src/Wrapper

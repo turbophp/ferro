@@ -115,6 +115,25 @@ jobs:
       - run: (cd php/doctrine-dbal && ./vendor/bin/phpunit)
       - run: (cd php/doctrine-dbal && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
       - run: (cd php/doctrine-dbal && ./vendor/bin/phpstan analyse src --level 9)
+      # M2-C5: the SAME package against doctrine/dbal 3.x — the `^3.8` bridge. Its own vendor tree
+      # (vendor-dbal3/, from composer.dbal3.json) so both majors are installed side by side and
+      # neither lane can quietly test the other's classes. The live suite is the SHARED one: every
+      # live test drives whichever major's driverClass is installed, so DBAL 3 is held to exactly
+      # the assertions DBAL 4 is. `--fail-on-skipped` on the whole run is right here (unlike the
+      # DBAL 4 lane's first step): phpunit.dbal3.xml has no conformance tier that skips by design.
+      # PHPStan's COMPOSER= is load-bearing — without it PHPStan reflects the DBAL 4 tree.
+      - run: (cd php/doctrine-dbal && COMPOSER=composer.dbal3.json composer install --no-interaction)
+      - run: (cd php/doctrine-dbal && ./vendor-dbal3/bin/phpunit -c phpunit.dbal3.xml --fail-on-skipped)
+      - run: (cd php/doctrine-dbal && COMPOSER=composer.dbal3.json ./vendor-dbal3/bin/phpstan analyse -c phpstan.dbal3.neon)
+      # …and the `^3.8` FLOOR. The lock pins 3.10.x, which proves nothing about 3.8.0; this
+      # downgrades doctrine/dbal in place (the workspace lock only — nothing is committed) and
+      # re-runs the two checks that would catch the driver using an API newer than the floor:
+      # PHPStan against 3.8.0's types (every DBAL symbol the driver names, the shared core
+      # included), and the DBAL 3 shells' unit tests. Not the live suite: what differs between
+      # 3.8 and 3.10 is DBAL's own internals, which the driver does not reach into.
+      - run: (cd php/doctrine-dbal && COMPOSER=composer.dbal3.json composer update doctrine/dbal --with doctrine/dbal:3.8.0 --no-interaction)
+      - run: (cd php/doctrine-dbal && ./vendor-dbal3/bin/phpunit -c phpunit.dbal3.xml tests/Dbal3)
+      - run: (cd php/doctrine-dbal && COMPOSER=composer.dbal3.json ./vendor-dbal3/bin/phpstan analyse -c phpstan.dbal3.neon)
       # C1b: the Eloquent tier. Same shape as the Doctrine lanes above and for the same reason —
       # its own vendor/, so without these three lines the whole package is a silent no-op in CI.
       # The live re-run under `--fail-on-skipped` is what makes "10 tests passed" mean the engine

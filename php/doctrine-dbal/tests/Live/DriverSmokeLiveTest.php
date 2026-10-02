@@ -97,13 +97,19 @@ final class DriverSmokeLiveTest extends DbalLiveTestCase
         $config = new \Doctrine\DBAL\Configuration();
         $config->setMiddlewares([$middleware]);
         $c = \Doctrine\DBAL\DriverManager::getConnection([
-            'driverClass' => \Ferro\DBAL\Driver::class,
+            'driverClass' => self::driverClass(),
             'unix_socket' => $this->socketPath,
             'driverOptions' => ['pool' => 'default'],
         ], $config);
 
         self::assertSame([[1]], $c->fetchAllNumeric('SELECT 1'));
         self::assertSame(['connect'], $seen, 'the middleware really wrapped the driver');
+        if (self::isDbal3()) {
+            // DBAL 3's Result has no getColumnName() (DBAL 4 added it), so on DBAL 3 the claim is
+            // the plainer one: a Result that travelled through the middleware stack still reads.
+            self::assertSame(['one' => 1], $c->executeQuery('SELECT 1 AS one')->fetchAssociative());
+            return;
+        }
         // The Result travelled through the middleware stack, so getColumnName() was forwarded
         // through its method_exists guard rather than throwing a LogicException.
         self::assertSame('one', $c->executeQuery('SELECT 1 AS one')->getColumnName(0));

@@ -7,6 +7,8 @@
     <testsuites>
         <testsuite name="ferro-doctrine-dbal">
             <directory>tests</directory>
+            <!-- The DBAL 3 lane's own tests (phpunit.dbal3.xml): they name DBAL 3-only classes. -->
+            <exclude>tests/Dbal3</exclude>
         </testsuite>
     </testsuites>
 </phpunit>

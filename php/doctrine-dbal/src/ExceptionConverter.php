@@ -57,6 +57,17 @@ final class ExceptionConverter implements ExceptionConverterInterface
 
     public function convert(DriverExceptionInterface $exception, ?Query $query): DbalDriverException
     {
+        // ALREADY CONVERTED → returned unchanged. Both majors' `Doctrine\DBAL\Exception\DriverException`
+        // implements `Driver\Exception`, so one can reach here a second time — and on DBAL 3 it
+        // does: the DBAL 3 connection converts its own BEGIN/COMMIT/ROLLBACK failures (DBAL 3's
+        // wrapper never does — M2-C5), and `transactional()` then hands that same exception back to
+        // this converter to decide whether to roll back. Re-converting would lose the class: an
+        // `IndeterminateWriteException` carries no Ferro branch of its own, so it would come out a
+        // bare `DriverException`.
+        if ($exception instanceof DbalDriverException) {
+            return $exception;
+        }
+
         $branch = $exception instanceof FerroDriverException ? $exception->branch() : null;
 
         if ($branch === C::BRANCH_INDETERMINATE) {

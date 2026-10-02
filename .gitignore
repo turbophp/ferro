@@ -10,6 +10,8 @@ Cargo.lock.orig
 # PHP (narrowed to php/** so the repo-root `vendor/` — the M1 tokio-postgres fork — is NOT
 # ignored; see M1-S1 task 1)
 php/**/vendor
+# The DBAL 3 lane of php/doctrine-dbal (composer.dbal3.json, M2-C5).
+php/**/vendor-dbal3
 **/.phpunit.cache
 **/.phpunit.result.cache
 **/composer.lock.orig
