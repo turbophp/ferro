@@ -82,7 +82,18 @@ fn main() {
     }
     emit_mod_u8(&mut o, "outcome", &reg.outcome);
     emit_mod_u8(&mut o, "tag", &reg.tags);
-    emit_mod_u8(&mut o, "branch", &reg.branches);
+    // `branch` additionally carries `ALL` — `(registry name, value)` — for the same reason as
+    // `errc::ALL` below: the error-taxonomy metrics label by branch NAME and must not hand-keep it.
+    writeln!(o, "pub mod branch {{").unwrap();
+    for (k, v) in &reg.branches {
+        writeln!(o, "    pub const {}: u8 = {};", screaming(k), v).unwrap();
+    }
+    writeln!(o, "    pub const ALL: &[(&str, u8)] = &[").unwrap();
+    for (k, v) in &reg.branches {
+        writeln!(o, "        (\"{k}\", {v}),").unwrap();
+    }
+    writeln!(o, "    ];").unwrap();
+    writeln!(o, "}}").unwrap();
 
     writeln!(o, "pub mod errc {{").unwrap();
     for (name, ec) in &reg.codes {
@@ -101,6 +112,16 @@ fn main() {
         )
         .unwrap();
     }
+    // Every registered code as `(registry name, code, branch)`, in the registry table's order —
+    // alphabetical by name, since it is a `BTreeMap` (M2-C4b-2).
+    // Generated from the SAME table as the constants above, so a consumer that walks it — the
+    // Prometheus error-taxonomy counters are the first — cannot fall out of step with the
+    // registry the way a hand-kept list does (the §13 pin-cause vocabulary is the precedent).
+    writeln!(o, "    pub const ALL: &[(&str, u16, u8)] = &[").unwrap();
+    for (name, ec) in &reg.codes {
+        writeln!(o, "        (\"{name}\", 0x{:04X}, {}),", ec.code, ec.branch).unwrap();
+    }
+    writeln!(o, "    ];").unwrap();
     writeln!(o, "}}").unwrap();
 
     // A stable hex fingerprint of the committed registry.lock.json bytes. Sent in HELLO/HELLO_ACK

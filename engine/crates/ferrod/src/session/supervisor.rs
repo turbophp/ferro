@@ -111,6 +111,13 @@ pub(crate) fn build_terminal_frame(
     request_id: u32,
     outcome: Outcome,
 ) -> OutFrame {
+    // SPEC §13's error-taxonomy counters (M2-C4b-2a) are recorded HERE because this is the one
+    // place a terminal frame is built — `session::error`'s fatal/per-request frames delegate to it
+    // too — so every error `END` the daemon sends is counted exactly once, by construction
+    // (`metrics::tests::only_one_site_builds_an_end_frame` holds the "one place" claim).
+    if let Outcome::Error(ep) = &outcome {
+        crate::metrics::ERRORS.record(ep.code, ep.branch);
+    }
     let payload = outcome.encode();
     OutFrame {
         header: Header {

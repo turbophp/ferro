@@ -60,6 +60,26 @@ impl AnyPool {
             AnyPool::Sqlite(p) => p.pin_metrics().snapshot(),
         }
     }
+
+    /// This pool's SPEC §13 hygiene counters, every outcome including the zeroes (M2-C4b-2a).
+    pub fn hygiene_snapshot(
+        &self,
+    ) -> [(ferro_pool::pin::HygieneOutcome, u64); ferro_pool::pin::HygieneOutcome::COUNT] {
+        match self {
+            AnyPool::Pg(p) => p.hygiene_metrics().snapshot(),
+            AnyPool::Mysql(p) => p.hygiene_metrics().snapshot(),
+            AnyPool::Sqlite(p) => p.hygiene_metrics().snapshot(),
+        }
+    }
+
+    /// This pool's SPEC §13 size gauges, read now (M2-C4b-2a).
+    pub fn gauges(&self) -> ferro_pool::pool::PoolGauges {
+        match self {
+            AnyPool::Pg(p) => p.gauges(),
+            AnyPool::Mysql(p) => p.gauges(),
+            AnyPool::Sqlite(p) => p.gauges(),
+        }
+    }
 }
 
 /// Daemon per-pool defaults (M0). Deliberately modest, not tuned: correctness over throughput

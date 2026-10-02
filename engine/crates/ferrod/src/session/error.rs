@@ -4,8 +4,7 @@
 //! `ferro_proto::messages::Outcome` — never a bare `ErrorPayload` — so there is exactly one
 //! encoding path (`into_out_frame` below) for both cases.
 
-use ferro_proto::consts::{errc, flags, service};
-use ferro_proto::header::Header;
+use ferro_proto::consts::{errc, service};
 use ferro_proto::messages::{ErrorPayload, Outcome};
 
 use super::codec::OutFrame;
@@ -72,22 +71,15 @@ pub(crate) fn error_payload(code: u16, branch: u8, detail: impl Into<String>) ->
 }
 
 fn terminal_frame(request_id: u32, ep: ErrorPayload) -> OutFrame {
-    let payload = Outcome::Error(ep).encode();
-    OutFrame {
-        header: Header {
-            flags: flags::END,
-            service: service::CORE,
-            method: 0,
-            request_id,
-            payload_len: payload.len() as u32,
-        },
-        payload: payload.into(),
-    }
+    // Delegates rather than building its own frame, so `build_terminal_frame` is the ONE place an
+    // `END` is constructed and §13's error counters, recorded there, see session errors too.
+    super::supervisor::build_terminal_frame(service::CORE, 0, request_id, Outcome::Error(ep))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferro_proto::consts::flags;
 
     #[test]
     fn fatal_frame_is_core_rid0_end_outcome_error() {

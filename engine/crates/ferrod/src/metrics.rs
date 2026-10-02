@@ -12,6 +12,10 @@
 
 use std::fmt::Write as _;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use ferro_proto::consts::{branch, errc};
+
 use crate::pools::PoolRegistry;
 
 /// The `Content-Type` Prometheus expects for the text exposition format.
@@ -20,6 +24,94 @@ const EXPOSITION_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 /// The largest request head we will read before giving up. A scrape's request is a few hundred
 /// bytes; this bounds a peer that opens a connection and streams headers forever.
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
+
+/// SPEC §13's error-taxonomy counters (M2-C4b-2a): every error TERMINAL the daemon produces, by
+/// registered code, plus the `indeterminate_total` §13 names explicitly.
+///
+/// **Process-wide, not per pool, and counted at the one place every `END` is built**
+/// (`session::supervisor::build_terminal_frame`) — not at `classify_fate`, whose call sites are
+/// spread across `services/sql.rs` and which never sees session-level errors (a codec fault, an
+/// unknown flag bit, an unrouted service, a peercred denial). Counting at the chokepoint makes the
+/// counter total by construction; counting at the classifier would make it total only for as long
+/// as nobody adds a caller.
+///
+/// **Counted when the terminal is BUILT, not when it is written.** A terminal for a client that
+/// has already disconnected is built, counted, and then dropped by the closed channel — so these
+/// are terminals PRODUCED, not delivered. That is the reading an operator wants: the counter
+/// measures the engine's own classification.
+///
+/// **The label vocabulary is GENERATED, never hand-kept:** `errc::ALL` and `branch::ALL` are
+/// emitted by `ferro-proto`'s build script from `/proto/registry.lock.json` — itself generated
+/// from `/proto/errors.toml` — so a code added to the registry appears here on the next build with
+/// no edit to this file (charter rule 2; the C4b-1 pin-cause vocabulary is the precedent for what
+/// a hand-kept list does instead).
+pub struct ErrorMetrics {
+    by_code: [AtomicU64; errc::ALL.len()],
+    /// A terminal whose code is NOT in the registry. Should read 0 forever; any other value is a
+    /// hand-written protocol constant somewhere, which charter rule 2 calls a defect.
+    unregistered: AtomicU64,
+    /// Terminals whose WIRE branch is `Indeterminate` — counted from the branch the client was
+    /// actually told, not inferred from the code, because the §19.3 fate is what was SENT.
+    indeterminate: AtomicU64,
+}
+
+/// The daemon's one error-taxonomy counter set.
+pub static ERRORS: ErrorMetrics = ErrorMetrics::new();
+
+impl ErrorMetrics {
+    const fn new() -> Self {
+        Self {
+            by_code: [const { AtomicU64::new(0) }; errc::ALL.len()],
+            unregistered: AtomicU64::new(0),
+            indeterminate: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one error terminal.
+    pub fn record(&self, code: u16, wire_branch: u8) {
+        match errc::ALL.iter().position(|&(_, c, _)| c == code) {
+            Some(i) => self.by_code[i].fetch_add(1, Ordering::Relaxed),
+            None => self.unregistered.fetch_add(1, Ordering::Relaxed),
+        };
+        if wire_branch == branch::INDETERMINATE {
+            self.indeterminate.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(code name, registry branch name, count)` for every registered code, zeroes included.
+    pub fn by_code(&self) -> Vec<(&'static str, &'static str, u64)> {
+        errc::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, _, b))| {
+                (
+                    name,
+                    branch_name(b),
+                    self.by_code[i].load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
+    /// Terminals whose code is not in the registry.
+    pub fn unregistered(&self) -> u64 {
+        self.unregistered.load(Ordering::Relaxed)
+    }
+
+    /// Terminals sent with the `Indeterminate` branch.
+    pub fn indeterminate(&self) -> u64 {
+        self.indeterminate.load(Ordering::Relaxed)
+    }
+}
+
+/// A branch value's registry name. A value outside the registry renders as `"unregistered"` — it
+/// cannot happen for a code in `errc::ALL`, whose branches come from the same table.
+fn branch_name(b: u8) -> &'static str {
+    branch::ALL
+        .iter()
+        .find(|&&(_, v)| v == b)
+        .map_or("unregistered", |&(n, _)| n)
+}
 
 /// Render the whole exposition body.
 ///
@@ -41,7 +133,7 @@ pub fn render(registry: &PoolRegistry, boot_epoch: u64) -> String {
     // negligible cost, and Prometheus itself does not care about order.
     let mut names: Vec<&str> = registry.names().collect();
     names.sort_unstable();
-    for name in names {
+    for name in &names {
         let Some(pool) = registry.get(name) else {
             continue;
         };
@@ -55,6 +147,83 @@ pub fn render(registry: &PoolRegistry, boot_epoch: u64) -> String {
             );
         }
     }
+    out.push_str(
+        "# HELP ferro_hygiene_total Recycled connections by the hygiene they received (SPEC §13).\n",
+    );
+    out.push_str("# TYPE ferro_hygiene_total counter\n");
+    for name in &names {
+        let Some(pool) = registry.get(name) else {
+            continue;
+        };
+        for (outcome, count) in pool.hygiene_snapshot() {
+            let _ = writeln!(
+                out,
+                "ferro_hygiene_total{{pool=\"{}\",profile=\"{}\"}} {}",
+                escape_label(name),
+                outcome.label(),
+                count,
+            );
+        }
+    }
+
+    // Three gauges, one family each, so each can carry its own HELP and be summed or ratioed in
+    // PromQL (`in_use / max`) without a label that means three different things.
+    for (metric, help, pick) in [
+        (
+            "ferro_pool_max_connections",
+            "The pool's configured connection ceiling.",
+            (|g: ferro_pool::pool::PoolGauges| g.max_size) as fn(_) -> usize,
+        ),
+        (
+            "ferro_pool_in_use_connections",
+            "Connections handed out, being dialled, or held by the liveness reaper.",
+            |g: ferro_pool::pool::PoolGauges| g.in_use,
+        ),
+        (
+            "ferro_pool_idle_connections",
+            "Connections parked and ready for reuse.",
+            |g: ferro_pool::pool::PoolGauges| g.idle,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {metric} {help}");
+        let _ = writeln!(out, "# TYPE {metric} gauge");
+        for name in &names {
+            let Some(pool) = registry.get(name) else {
+                continue;
+            };
+            let _ = writeln!(
+                out,
+                "{metric}{{pool=\"{}\"}} {}",
+                escape_label(name),
+                pick(pool.gauges()),
+            );
+        }
+    }
+
+    out.push_str(
+        "# HELP ferro_errors_total Error terminals produced, by registered code (SPEC §13).\n",
+    );
+    out.push_str("# TYPE ferro_errors_total counter\n");
+    for (code, branch, count) in ERRORS.by_code() {
+        let _ = writeln!(
+            out,
+            "ferro_errors_total{{code=\"{code}\",branch=\"{branch}\"}} {count}"
+        );
+    }
+    out.push_str(
+        "# HELP ferro_errors_unregistered_total Error terminals whose code is not in /proto (a defect if nonzero).\n",
+    );
+    out.push_str("# TYPE ferro_errors_unregistered_total counter\n");
+    let _ = writeln!(
+        out,
+        "ferro_errors_unregistered_total {}",
+        ERRORS.unregistered()
+    );
+    out.push_str(
+        "# HELP ferro_indeterminate_total Error terminals produced with the Indeterminate branch (SPEC §13, §19.3).\n",
+    );
+    out.push_str("# TYPE ferro_indeterminate_total counter\n");
+    let _ = writeln!(out, "ferro_indeterminate_total {}", ERRORS.indeterminate());
     out
 }
 
@@ -217,6 +386,154 @@ mod tests {
 
         assert!(respond("", body).starts_with("HTTP/1.1 400"));
         assert!(respond("GARBAGE\r\n\r\n", body).starts_with("HTTP/1.1 400"));
+    }
+
+    /// The error counter on a LOCAL instance — the global `ERRORS` is shared by every test in
+    /// this binary, so exact counts are asserted only where nothing else can move them.
+    #[test]
+    fn error_metrics_count_by_registered_code_and_wire_branch() {
+        let m = ErrorMetrics::new();
+        m.record(errc::SYNTAX, errc::SYNTAX_BRANCH);
+        m.record(errc::SYNTAX, errc::SYNTAX_BRANCH);
+        m.record(errc::WRITE_UNCONFIRMED, errc::WRITE_UNCONFIRMED_BRANCH);
+        let by = m.by_code();
+        let syntax = by
+            .iter()
+            .find(|&&(n, _, _)| n == "Syntax")
+            .expect("Syntax is registered");
+        assert_eq!(syntax.2, 2);
+        assert_eq!(
+            syntax.1, "NonRetryable",
+            "the label is the REGISTRY branch name"
+        );
+        assert_eq!(
+            m.indeterminate(),
+            1,
+            "WriteUnconfirmed is sent Indeterminate (§19.3)"
+        );
+        assert_eq!(m.unregistered(), 0);
+
+        // A code nobody registered is not dropped and not mis-filed: it has its own counter,
+        // because a nonzero value there is a hand-written protocol constant (charter rule 2).
+        m.record(0x7FFF, branch::NON_RETRYABLE);
+        assert_eq!(m.unregistered(), 1);
+
+        // The indeterminate count follows the branch that was SENT, not the code's usual one.
+        m.record(errc::SYNTAX, branch::INDETERMINATE);
+        assert_eq!(m.indeterminate(), 2);
+    }
+
+    /// Every registered code exports exactly once, zeroes included, so `errc::ALL` and the
+    /// exposition cannot disagree about which series exist.
+    #[test]
+    fn every_registered_code_is_exported_once() {
+        let m = ErrorMetrics::new();
+        let by = m.by_code();
+        assert_eq!(by.len(), errc::ALL.len());
+        let mut names: Vec<&str> = by.iter().map(|&(n, _, _)| n).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), errc::ALL.len(), "two codes share a name");
+        assert!(
+            by.iter().all(|&(_, b, _)| b != "unregistered"),
+            "a registered code has an unregistered branch"
+        );
+    }
+
+    /// A production line that USES the `END` flag: `flags::END` under any path, or an import that
+    /// brings a bare `END` (or every flag) into scope. Comments and assertions are not uses.
+    ///
+    /// **History, because each version was proven too narrow by a mutation.** v1 matched one exact
+    /// spelling (`flags: flags::END`), and a fully qualified path slipped past it. v2 matched any
+    /// `flags:` FIELD INITIALISER carrying the token, and the adversarial review then built an END
+    /// frame with `header.flags |= flags::END` — not a field initialiser — which v2 did not see either.
+    /// This version does not care HOW the flag is applied, only that it is named; the one sanctioned
+    /// naming is inside `build_terminal_frame`.
+    fn uses_end_flag(line: &str) -> bool {
+        let t = line.trim_start();
+        if t.starts_with("//") || t.contains("assert") {
+            return false;
+        }
+        // Pieces, so this function's own source never matches itself.
+        let qualified = concat!("flags", "::", "END");
+        let named = t.match_indices(qualified).any(|(at, _)| {
+            let after = t.as_bytes().get(at + qualified.len()).copied();
+            !after.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        });
+        let imports_bare = t.starts_with("use ")
+            && t.contains(concat!("flags", "::"))
+            && (t.contains(concat!("flags", "::*"))
+                || t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|tok| tok == concat!("E", "ND")));
+        named || imports_bare
+    }
+
+    #[test]
+    fn the_end_flag_matcher_sees_every_use_and_nothing_else() {
+        // `\x3a\x3a` is `::` — escaped so these literals are not themselves uses to the scan below.
+        for yes in [
+            "        flags: flags\x3a\x3aEND,",
+            "        flags: ferro_proto\x3a\x3aconsts\x3a\x3aflags\x3a\x3aEND,",
+            "        header.flags |= flags\x3a\x3aEND;",
+            "        frame.header.flags = flags\x3a\x3aEND | flags\x3a\x3aSTREAM;",
+            "const END_FLAGS: u16 = flags\x3a\x3aEND;",
+            "use ferro_proto\x3a\x3aconsts\x3a\x3aflags\x3a\x3aEND;",
+            "use ferro_proto\x3a\x3aconsts\x3a\x3aflags\x3a\x3a{END, STREAM};",
+            "use ferro_proto\x3a\x3aconsts\x3a\x3aflags\x3a\x3a*;",
+        ] {
+            assert!(uses_end_flag(yes), "missed {yes:?}");
+        }
+        for no in [
+            "        flags: 0,",
+            "        flags: flags\x3a\x3aSTREAM,",
+            "        assert_eq!(frame.header.flags, flags\x3a\x3aEND);",
+            "    // flags\x3a\x3aEND in a comment",
+            "        flags: flags\x3a\x3aEND_OF_SOMETHING,",
+            "use ferro_proto\x3a\x3aconsts\x3a\x3a{errc, flags, service};",
+        ] {
+            assert!(!uses_end_flag(no), "false positive on {no:?}");
+        }
+    }
+
+    /// **The claim that makes the error counter total: exactly ONE place builds an `END` frame.**
+    /// A second construction site would send error terminals the counter never sees, and nothing
+    /// else would notice. This scans `ferrod`'s own non-test source for the construction spelling;
+    /// assertions in tests compare `flags::END` with `==`/`assert_eq!` and do not match it.
+    #[test]
+    fn only_one_site_builds_an_end_frame() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("readable src dir") {
+                let p = e.expect("dir entry").path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &mut files,
+        );
+        let mut sites = Vec::new();
+        for f in files {
+            let text = std::fs::read_to_string(&f).expect("readable source");
+            // The WHOLE file, tests included: splitting at the first `#[cfg(test)]` would hide any
+            // production code after an early test-only item. A test that ever builds an END frame
+            // this way trips the guard — a loud false positive, which is the safe direction.
+            for (n, line) in text.lines().enumerate() {
+                if uses_end_flag(line) {
+                    sites.push(format!("{}:{}", f.display(), n + 1));
+                }
+            }
+        }
+        assert_eq!(
+            sites.len(),
+            1,
+            "expected exactly one use of the END flag in production code (supervisor::build_terminal_frame), found {sites:?}",
+        );
+        assert!(sites[0].contains("supervisor.rs"), "{sites:?}");
     }
 
     /// A pool name is operator-supplied, so it is the one label value that could otherwise break

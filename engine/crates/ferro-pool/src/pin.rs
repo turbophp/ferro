@@ -180,6 +180,94 @@ impl PinMetrics {
     }
 }
 
+/// What hygiene a RECYCLED connection received at checkout — SPEC §13's `hygiene` vocabulary
+/// (`skipped_clean, targeted, full`), M2-C4b-2a.
+///
+/// A fresh dial is not a hygiene event and is not counted: there is no previous tenant to clean
+/// up after. The mapping from the pool's actual decision (`Option<ResetProfile>`) is
+/// [`HygieneOutcome::of`], an exhaustive match, so a new `ResetProfile` cannot reach the pool
+/// without a label.
+///
+/// **`SkippedClean` is unreachable on every backend that exists today**, and the counter says so by
+/// reading 0 rather than by being absent: PostgreSQL and SQLite report `Some(Targeted)` for a clean
+/// connection and MySQL `Some(Full)`. The skip is the §16 optimisation SPEC §7.2 defers (R2/B7)
+/// until a backend can PROVE a connection clean; the series exists now so that the day it fires,
+/// an operator sees it move instead of seeing a new metric appear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HygieneOutcome {
+    /// No reset PROFILE ran: the connection was not tainted and its backend reported that a clean
+    /// connection needs none. A defensive `ROLLBACK` of a still-open transaction may still have run
+    /// — that is transaction cleanup, which the tx authority owns, not session hygiene — and such a
+    /// recycle is counted here (pinned by `a_rollback_only_recycle_is_skipped_clean_by_definition`).
+    SkippedClean,
+    /// The backend's narrower clean-connection profile.
+    Targeted,
+    /// The full reset a tainted connection gets.
+    Full,
+}
+
+impl HygieneOutcome {
+    /// How many outcomes there are.
+    pub const COUNT: usize = 3;
+
+    /// Every outcome, once, in export order.
+    pub const ALL: [HygieneOutcome; Self::COUNT] = [
+        HygieneOutcome::SkippedClean,
+        HygieneOutcome::Targeted,
+        HygieneOutcome::Full,
+    ];
+
+    /// The pool's decision, as a label. Exhaustive over `ResetProfile` on purpose.
+    pub const fn of(profile: Option<crate::backend::ResetProfile>) -> Self {
+        match profile {
+            None => HygieneOutcome::SkippedClean,
+            Some(crate::backend::ResetProfile::Targeted) => HygieneOutcome::Targeted,
+            Some(crate::backend::ResetProfile::Full) => HygieneOutcome::Full,
+        }
+    }
+
+    /// This outcome's counter slot (the C4b-1 anti-rot shape: a new variant does not compile).
+    pub const fn index(self) -> usize {
+        match self {
+            HygieneOutcome::SkippedClean => 0,
+            HygieneOutcome::Targeted => 1,
+            HygieneOutcome::Full => 2,
+        }
+    }
+
+    /// This outcome's Prometheus label value (SPEC §13's closed `profile` vocabulary).
+    pub const fn label(self) -> &'static str {
+        match self {
+            HygieneOutcome::SkippedClean => "skipped_clean",
+            HygieneOutcome::Targeted => "targeted",
+            HygieneOutcome::Full => "full",
+        }
+    }
+}
+
+/// SPEC §13's hygiene counters for one pool: recycles by the hygiene they received.
+#[derive(Debug, Default)]
+pub struct HygieneMetrics {
+    by_outcome: [AtomicU64; HygieneOutcome::COUNT],
+}
+
+impl HygieneMetrics {
+    /// Record one recycle that received `outcome`.
+    pub fn record(&self, outcome: HygieneOutcome) {
+        self.by_outcome[outcome.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The count for one outcome.
+    pub fn get(&self, outcome: HygieneOutcome) -> u64 {
+        self.by_outcome[outcome.index()].load(Ordering::Relaxed)
+    }
+
+    /// Every outcome and its count, in [`HygieneOutcome::ALL`] order — including the zeroes.
+    pub fn snapshot(&self) -> [(HygieneOutcome, u64); HygieneOutcome::COUNT] {
+        HygieneOutcome::ALL.map(|o| (o, self.get(o)))
+    }
+}
+
 /// A `Checkout`'s most recent pin cause — and the ONLY way to set one.
 ///
 /// The field it replaces was a plain `Option<PinCause>` assigned at four sites. Counting the cause
@@ -451,8 +539,8 @@ pub(crate) fn tx_status_bits(st: TxStatus) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PinCause, PinMetrics, TxControlClass, TxVerb, is_bare_tx_control, is_lone_statement,
-        leading_tx_verb, tx_control_class, tx_status_bits,
+        HygieneMetrics, HygieneOutcome, PinCause, PinMetrics, TxControlClass, TxVerb,
+        is_bare_tx_control, is_lone_statement, leading_tx_verb, tx_control_class, tx_status_bits,
     };
     use crate::backend::TxStatus;
 
@@ -530,6 +618,95 @@ mod tests {
             documented, actual,
             "SPEC §13's closed pin-cause vocabulary and PinCause have drifted apart",
         );
+    }
+
+    /// The hygiene vocabulary on the same three failure paths as the pin-cause one.
+    #[test]
+    fn every_hygiene_outcome_has_a_distinct_slot_and_label() {
+        let mut seen = [false; HygieneOutcome::COUNT];
+        for o in HygieneOutcome::ALL {
+            let i = o.index();
+            assert!(
+                i < HygieneOutcome::COUNT,
+                "{o:?} has slot {i} outside COUNT"
+            );
+            assert!(!seen[i], "slot {i} claimed twice");
+            seen[i] = true;
+        }
+        assert!(
+            seen.iter().all(|&h| h),
+            "an outcome is missing from HygieneOutcome::ALL"
+        );
+        let mut labels: Vec<&str> = HygieneOutcome::ALL.iter().map(|o| o.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            HygieneOutcome::COUNT,
+            "two outcomes share a label"
+        );
+    }
+
+    /// The pool's decision maps onto the label it should — exhaustively, both profiles and none.
+    #[test]
+    fn hygiene_outcome_of_maps_every_profile() {
+        use crate::backend::ResetProfile;
+        assert_eq!(HygieneOutcome::of(None), HygieneOutcome::SkippedClean);
+        assert_eq!(
+            HygieneOutcome::of(Some(ResetProfile::Targeted)),
+            HygieneOutcome::Targeted
+        );
+        assert_eq!(
+            HygieneOutcome::of(Some(ResetProfile::Full)),
+            HygieneOutcome::Full
+        );
+    }
+
+    /// SPEC §13 declares the hygiene vocabulary in its own sentence; it and the enum cannot drift.
+    #[test]
+    fn the_spec_13_hygiene_vocabulary_is_exactly_this_enum() {
+        let spec = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../ferro-spec-v0.2.md"
+        ))
+        .expect("the spec sits at the repo root");
+        let marker = "**hygiene counters** (";
+        let start = spec
+            .find(marker)
+            .expect("§13 still names the hygiene counters")
+            + marker.len();
+        let rest = &spec[start..];
+        let end = rest.find(')').expect("the hygiene list is parenthesised");
+        let mut documented: Vec<&str> = rest[..end]
+            .trim()
+            .trim_matches('`')
+            .split(',')
+            .map(|t| t.trim().trim_matches('`'))
+            .collect();
+        let mut actual: Vec<&str> = HygieneOutcome::ALL.iter().map(|o| o.label()).collect();
+        documented.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(
+            documented, actual,
+            "SPEC §13's hygiene vocabulary and HygieneOutcome drifted"
+        );
+    }
+
+    #[test]
+    fn hygiene_metrics_count_and_report_zeroes() {
+        let m = HygieneMetrics::default();
+        assert!(m.snapshot().iter().all(|&(_, n)| n == 0));
+        m.record(HygieneOutcome::Targeted);
+        m.record(HygieneOutcome::Targeted);
+        m.record(HygieneOutcome::Full);
+        assert_eq!(m.get(HygieneOutcome::Targeted), 2);
+        assert_eq!(m.get(HygieneOutcome::Full), 1);
+        assert_eq!(
+            m.get(HygieneOutcome::SkippedClean),
+            0,
+            "untouched reads 0, not missing"
+        );
+        assert_eq!(m.snapshot().len(), HygieneOutcome::COUNT);
     }
 
     /// The counters count EVENTS — repeated causes accumulate, and an untouched cause reports 0
