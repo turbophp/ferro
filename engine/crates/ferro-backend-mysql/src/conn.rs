@@ -361,21 +361,19 @@ impl PoolBackend for MysqlBackend {
     /// M2-C1g: read `SERVER_STATUS_NO_BACKSLASH_ESCAPES` off the last OK packet — synchronous and
     /// free, as the trait requires, because the server reports it on EVERY OK packet and the
     /// driver keeps the last one. It is the MySQL spelling of the trait's one question (is a
-    /// backslash an ordinary character inside a literal?), and on this family the answer is
-    /// usually NO: `NO_BACKSLASH_ESCAPES` is absent from every default `sql_mode`, so a MySQL pool
-    /// ordinarily advertises `Some(false)` — which is what lets a client that knows MySQL's
-    /// backslash-escaping rule build a literal at all, where `None` refused it outright.
+    /// backslash an ordinary character inside a literal?); a default `sql_mode` answers `false`.
     ///
     /// `None` — never a guess — when there is no OK packet to read: a parked connection (no
     /// handle), or one whose last packet was an ERR (the driver clears `last_ok_packet` on an
-    /// error). On the probe's path neither happens in practice — a checkout has just run the
-    /// connect-time setup statements or `COM_RESET_CONNECTION` + their re-run, each ending in an OK
-    /// — but the arm is there because the trait's contract is "unknown, never a guess".
+    /// error).
     ///
-    /// **It reports the SESSION's mode, and the probe reads a freshly set-up or freshly reset
-    /// session**, so the pool advertises the server's default. A tenant that changes its own
-    /// `sql_mode` mid-session is tracked as a session mutation and reset before the next tenant;
-    /// the advertised bit never described that tenant's private session.
+    /// **It is the PROBED session's mode, and on MySQL that is not always every session's** — the
+    /// C1g review measured it (SPEC §22.2 (cc)): an `init_connect` that sets `sql_mode` runs on a
+    /// fresh dial but NOT after `COM_RESET_CONNECTION`, so a pool whose probe happened to see a
+    /// fresh dial advertises one mode while its recycled leases run the other; and a tenant can
+    /// change its own session's mode inside a transaction. That is why no shipped tier builds a
+    /// literal from this value (the trait doc says so); it is advertised because it is true of the
+    /// connection it was read from, and `nil` would claim not to know.
     fn literals_are_standard(&self, conn: &Self::Conn) -> Option<bool> {
         conn.mysql
             .as_ref()?

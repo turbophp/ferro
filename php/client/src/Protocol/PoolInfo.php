@@ -17,12 +17,14 @@ namespace Ferro\Protocol;
  * literal an ORDINARY CHARACTER on this backend? — which is exactly the question "is doubling `'`
  * the whole quoting rule?". It is deliberately not named for either family's own setting
  * (PostgreSQL's `standard_conforming_strings`, MySQL's `NO_BACKSLASH_ESCAPES`), so a client need not
- * know which spelling to look for. **`null` means UNKNOWN and a caller must REFUSE to build a
- * literal on it** — never treat it as false, and never as true: an escaping rule is not a place for
- * a default. `false` is a real answer only to a caller that implements that FAMILY's backslash
- * rule (the Laravel tier does for MySQL, M2-C1g). It costs the engine no round trip on any family —
- * a `GUC_REPORT` `ParameterStatus` on PostgreSQL, an OK-packet status flag on MySQL, a constant on
- * SQLite; SPEC §21 D5 is why that matters.
+ * know which spelling to look for. **`null` means UNKNOWN** — never treat it as false, and never as
+ * true. **And a known value describes the PROBED session, not necessarily the one a statement will
+ * run on** (it is cached per pool, and an operator, a tenant or a MySQL `init_connect` can make them
+ * differ), so it is informational rather than a quoting rule: build literals with forms whose meaning
+ * does not depend on the mode, as `Ferro\Laravel\FerroPdoShim::quote()` does (M2-C1g,
+ * `/proto/PROTOCOL.md` §4). It costs the engine no round trip on any family — a `GUC_REPORT`
+ * `ParameterStatus` on PostgreSQL, an OK-packet status flag on MySQL, a constant on SQLite; SPEC §21
+ * D5 is why that matters.
  */
 final class PoolInfo
 {

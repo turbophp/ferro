@@ -241,15 +241,6 @@ pub trait PoolBackend: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Can this backend produce an INCREMENTAL row stream ([`PoolBackend::query_stream`]) at all?
-    ///
-    /// The ONE authority for the `fetch:stream` capability. It exists because the SQL service has
-    /// TWO dispatch arms (autocommit and tx-scoped) and, before M1-S8a, only the autocommit one
-    /// carried a hand-written `matches!(pool, AnyPool::Mysql(_))` check — so a tx-scoped stream
-    /// refused LATE (after checkout + BEGIN), force-tainting the pinned connection on the way out
-    /// (`Checkout::query_stream`'s Err arm). Both arms now read THIS method, so a backend that
-    /// gains streaming flips one line and both arms follow.
-    ///
     /// Is a backslash inside a single-quoted string literal an ORDINARY CHARACTER on this
     /// connection's backend? `None` when the backend cannot answer without a round trip it has not
     /// made — never a guess.
@@ -261,19 +252,34 @@ pub trait PoolBackend: Send + Sync + 'static {
     /// reports `SERVER_STATUS_NO_BACKSLASH_ESCAPES` on every OK packet (M2-C1g); and SQLite's answer
     /// is a constant of the library (M2-C1g).
     ///
-    /// **Why the trait says nothing about `standard_conforming_strings`.** The question a client
-    /// asks is whether doubling `'` is the whole quoting rule, and two families answer it under
-    /// different names (`standard_conforming_strings`; MySQL's `NO_BACKSLASH_ESCAPES` in
-    /// `sql_mode`). Naming either here would push one backend's vocabulary through the pool and out
-    /// onto the wire. See `/proto/PROTOCOL.md` §4 (M2-C2g).
+    /// **It describes the PROBED connection, which is not every connection** (M2-C1g review,
+    /// SPEC §22.2 (cc)): the value is cached per pool, an operator can change a server's global mode
+    /// under it, and on MySQL an `init_connect` applies to a fresh dial but not after
+    /// `COM_RESET_CONNECTION`, so fresh and recycled sessions can genuinely differ. It is therefore
+    /// INFORMATIONAL: no shipped tier builds a string literal from it — the Laravel tier's `quote()`
+    /// uses forms whose meaning does not depend on the mode.
     ///
-    /// **The default is `None`, and that is the safe direction**: a client that cannot get an
-    /// unambiguous `true` refuses to build a literal. A backend that guessed `Some(true)` would
-    /// hand a caller an escaping rule the server does not honour.
+    /// **Why the trait says nothing about `standard_conforming_strings`.** The question is whether
+    /// doubling `'` is the whole quoting rule, and two families answer it under different names
+    /// (`standard_conforming_strings`; MySQL's `NO_BACKSLASH_ESCAPES` in `sql_mode`). Naming either
+    /// here would push one backend's vocabulary through the pool and out onto the wire. See
+    /// `/proto/PROTOCOL.md` §4 (M2-C2g).
+    ///
+    /// **The default is `None`**: a backend that guessed `Some(true)` would advertise a quoting rule
+    /// the server does not honour.
     fn literals_are_standard(&self, _conn: &Self::Conn) -> Option<bool> {
         None
     }
 
+    /// Can this backend produce an INCREMENTAL row stream ([`PoolBackend::query_stream`]) at all?
+    ///
+    /// The ONE authority for the `fetch:stream` capability. It exists because the SQL service has
+    /// TWO dispatch arms (autocommit and tx-scoped) and, before M1-S8a, only the autocommit one
+    /// carried a hand-written `matches!(pool, AnyPool::Mysql(_))` check — so a tx-scoped stream
+    /// refused LATE (after checkout + BEGIN), force-tainting the pinned connection on the way out
+    /// (`Checkout::query_stream`'s Err arm). Both arms now read THIS method, so a backend that
+    /// gains streaming flips one line and both arms follow.
+    ///
     /// **Default `true`** — Postgres and the `FakeBackend` stream today and are unchanged.
     fn supports_row_streaming(&self) -> bool {
         true

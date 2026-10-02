@@ -529,8 +529,10 @@ impl PoolEntry {
 
     /// Whether a backslash is an ordinary character inside a literal on this pool's backend, as of
     /// the last probe. `None` on an unknown/expired cache, exactly like [`cached_version`], and
-    /// `None` too when the probe ran but the BACKEND could not answer for free (the MySQL arm
-    /// today) — a client cannot tell those apart and must not: both mean "do not build a literal".
+    /// `None` too when the probe ran but the BACKEND could not answer for free (every backend
+    /// answers since M2-C1g; a parked or errored MySQL connection still cannot). A client cannot
+    /// tell those apart and must not: both mean UNKNOWN. And a known value describes the PROBED
+    /// session only, which is why no shipped tier builds a literal from it (SPEC §22.2 (cc)).
     fn cached_literals_are_standard(&self) -> Option<bool> {
         self.cached().and_then(|(_, l)| l)
     }

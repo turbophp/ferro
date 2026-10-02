@@ -194,8 +194,12 @@ jobs:
                 || { echo "::error:: $f has no phpunit result line — the run died before measuring"; tail -40 "$f"; exit 1; }
               grep -q "\[ferro\] connection=.* driver=$drv " "$f" \
                 || { echo "::error:: $f did not run under driver $drv"; exit 1; }
+              grep -q '\[ferro\] reset: ' "$f" \
+                || { echo "::error:: $f has no reset line"; exit 1; }
             done
           done
+          grep -q "\[ferro\] connection=Illuminate.Database.${{ matrix.conn }} driver=stock-${{ matrix.family }} " "spec-stock-${{ matrix.family }}-run1.log" \
+            || { echo "::error:: the family-specific control did not resolve the STOCK ${{ matrix.conn }}"; exit 1; }
           for drv in ferro-${{ matrix.family }} ${{ matrix.family }} stock-${{ matrix.family }}; do
             for run in 1 2; do
               f="$drv-run$run.log"
@@ -223,11 +227,26 @@ jobs:
             done
             echo "== family-specific: $f vs stock-$f (run 1)"
             php testkit/dbal/compare-columns.php "spec-$f-run1.xml" "spec-stock-$f-run1.xml" || true
-            for drv in "ferro-$f" "$f" "stock-$f" "spec-$f" "spec-stock-$f"; do
-              echo "== reproducibility: $drv run 2 vs run 1"
-              php testkit/dbal/compare-columns.php "$drv-run2.xml" "$drv-run1.xml" | grep -E '^(skip|fail):' || true
-            done
           } | tee compare.txt
+      # A recorded number is two runs that AGREE. Each column's run 2 against its run 1, as sets: the
+      # same skips and the same failures. This one FAILS the job — the comparison above only reports,
+      # because a Ferro column differing from its control is a finding, not a broken lane, while a
+      # column differing from ITSELF means the measurement is not reproducible.
+      - name: each column's run 2 equals its run 1
+        run: |
+          f=${{ matrix.family }}
+          rc=0
+          for drv in "ferro-$f" "$f" "stock-$f" "spec-$f" "spec-stock-$f"; do
+            php testkit/dbal/compare-columns.php "$drv-run2.xml" "$drv-run1.xml" > "repro-$drv.txt" || true
+            a=$(grep -E '^skip:' "repro-$drv.txt"); b=$(grep -E '^fail:' "repro-$drv.txt")
+            echo "$drv: $a | $b"
+            # Equal sets print the same digest on both sides of each line.
+            for line in "$a" "$b"; do
+              d=$(echo "$line" | grep -oE 'sha256 [0-9a-f]+' | sort -u | wc -l)
+              [ "$d" = 1 ] || { echo "::error:: $drv: run 2 differs from run 1 ($line)"; rc=1; }
+            done
+          done
+          exit $rc
       - uses: actions/upload-artifact@v4
         if: always()
         with:

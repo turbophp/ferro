@@ -16,6 +16,11 @@ use PHPUnit\Framework\Attributes\DataProvider;
  * The corpus is chosen for the two shapes that break naive escaping under the wrong
  * `standard_conforming_strings`: a backslash immediately before a quote, and a quote immediately
  * before a backslash.
+ *
+ * **M2-C1g: every literal must read back EXACTLY under BOTH settings.** The shim no longer quotes by
+ * the pool's advertised `literals_are_standard` — a cached pool-level bit can describe a different
+ * session (C1g review, SPEC §22.2 (cc)) — so a string with a backslash takes the `E'…'` form, which
+ * reads the same whatever the session's `standard_conforming_strings` is.
  */
 final class EscapeLiveTest extends LaravelLiveTestCase
 {
@@ -45,14 +50,41 @@ final class EscapeLiveTest extends LaravelLiveTestCase
 
         $literal = $conn->escape($raw);
 
-        // (1) the shape: PostgreSQL's own rule under standard_conforming_strings=on.
-        self::assertSame("'" . str_replace("'", "''", $raw) . "'", $literal);
+        // (1) the shape: doubling `'` — `pdo_pgsql`'s own bytes — for a string with no backslash; the
+        // mode-independent `E'…'` form for one with a backslash.
+        self::assertSame(
+            str_contains($raw, '\\')
+                ? "E'" . str_replace(['\\', "'"], ['\\\\', "''"], $raw) . "'"
+                : "'" . str_replace("'", "''", $raw) . "'",
+            $literal,
+        );
 
         // (2) THE ONE THAT MATTERS: PostgreSQL's parser must give the bytes back unchanged, which is
         // what "correctly escaped" actually means. A rule that merely looked plausible would pass
         // (1) and fail here.
         $back = $conn->select("select {$literal} as v")[0]->v;
         self::assertSame($raw, $back, 'the literal did not parse back to the original bytes');
+    }
+
+    /**
+     * THE OTHER SETTING: the same literal, run inside a transaction that turned
+     * `standard_conforming_strings` OFF (where a backslash in an ordinary literal IS an escape), must
+     * read back as exactly the same bytes. Doubling `'` with a raw backslash — C2g's rule — breaks out
+     * here on `backslash-then-quote`.
+     */
+    #[DataProvider('nastyStrings')]
+    public function testTheSameLiteralReadsBackExactlyWithStandardConformingStringsOff(string $raw): void
+    {
+        $conn = $this->connection();
+        $literal = $conn->escape($raw);
+
+        $rows = $conn->transaction(function ($c) use ($literal): array {
+            $c->statement('set local standard_conforming_strings = off');
+            return $c->select("select {$literal} as v");
+        });
+
+        self::assertCount(1, $rows);
+        self::assertSame($raw, $rows[0]->v, 'the literal read differently with standard_conforming_strings off');
     }
 
     /**

@@ -489,10 +489,10 @@ upstream's own PDO driver:
   family**, where `ferro-mysql` SKIPS 8 tests the control runs — `#[RequiresDatabase]` resolves from
   the driver name (4 name `['mysql', 'mariadb']`, 3 data sets `['sqlite', 'mysql', 'mariadb']`, 1
   `['mysql', 'mariadb', 'pgsql']`; `ferro-mariadb` adds one `'mariadb'`-only test, 9) — and fails one
-  `match ($this->driver)`. Under the alias the skip sets are identical to the control's, **but the
-  alias column is not indistinguishable from PDO there, as it is on PostgreSQL**: two
-  `testBasicUpdateForJson` cases fail through Ferro on the `quote()` refusal below (Laravel's own
-  `castAsJson()` testing helper reaches it) and pass through PDO. SPEC §22.2 (cb).
+  `match ($this->driver)`. **Under the alias the MySQL family is indistinguishable from `pdo_mysql`
+  on all 633 driver-agnostic cases** — MySQL 8.4 587/587 and MariaDB 11.8 588/588 on both sides,
+  identical skip sets, no failures. (C1f recorded two errors per alias column, Laravel's
+  `castAsJson()` reaching a `quote()` that refused; C1g closed it.) SPEC §22.2 (cb), (cc).
 - **The alias is opt-in because it hijacks every connection of that name.** `register(['pgsql' =>
   'ferro-pgsql'])` makes name-branching code take its PostgreSQL path — and also captures any
   connection in the application that was meant to dial PostgreSQL directly. An application with a
@@ -515,26 +515,34 @@ upstream's own PDO driver:
   transaction counter, savepoint naming, events and `attempts:` retry loop — is inherited unchanged
   rather than reimplemented.
 - **`DB::escape()`, `toRawSql()`, `->dd()`, `castAsJson()` and `DB::pretend()` with string
-  bindings work on every family, by the rule the family's own PDO driver applies** — each of them
-  reaches `quote()` (`pretend()` through `Grammar::substituteBindingsIntoRawSql()`, to log the
-  statement it did not run). **FIXED in M2-C1g for MySQL/MariaDB and SQLite**, where all five used to
-  be refused. `quote()` is client-side with **no engine round trip** (SPEC §21 D5), so the rule comes
-  from the per-pool `literals_are_standard` bit `HELLO_ACK` advertises, which the engine learns for
-  free on every family: `true` → double `'` (PostgreSQL under its default
-  `standard_conforming_strings = on`; SQLite always; MySQL under `NO_BACKSLASH_ESCAPES`), and `false`
-  on a MySQL pool — every default `sql_mode` — → `mysql_real_escape_string()`'s backslash rule,
-  byte-identical to `pdo_mysql`'s `quote()` (measured on the same server, each literal round-tripped
-  through Ferro). Still **REFUSED**, fail-closed and naming the pool: `null` on any family (the engine
-  has not learned the rule — e.g. an unreachable backend), and `false` on PostgreSQL
-  (`standard_conforming_strings = off`, whose escaping this driver does not implement). **Two
-  residual differences from `pdo_mysql`:** the bit is the POOL's default, so a tenant that changes
-  its own session's `sql_mode` mid-transaction keeps the pool's quoting rule (with `''` → `\'` the
-  difference is a mis-rendered literal, never a broken-out one, in either direction except one:
-  quoting under the backslash rule and then running the literal in a session that turned
-  `NO_BACKSLASH_ESCAPES` ON — don't change `sql_mode` inside the session you quote for); and the
-  rule assumes the `utf8mb4` connection charset Ferro always negotiates, so a tenant's own
-  `SET NAMES gbk` has the exposure it has under `pdo_mysql` after the same statement.
-  SPEC §22.2 (as), (at), (cc).
+  bindings work on every family** — each of them reaches `quote()` (`pretend()` through
+  `Grammar::substituteBindingsIntoRawSql()`, to log the statement it did not run). **FIXED in M2-C1g
+  for MySQL/MariaDB and SQLite**, where all five used to be refused. `quote()` is client-side with no
+  engine round trip (SPEC §21 D5). **The literal it builds is NOT always `pdo_*`'s bytes, on
+  purpose.** A PDO driver escapes by the LIVE escape mode of the connection it is about to send on;
+  this shim has no connection, and the only mode it could read is the pool's advertised
+  `literals_are_standard` — one probed session's value, cached. C1g's adversarial review showed that
+  value describing a DIFFERENT session three ways on MySQL (an application changing its own
+  `sql_mode` inside a transaction, an operator changing the server's global mode, and an
+  `init_connect` that applies to a fresh dial but not after `COM_RESET_CONNECTION`), and a literal
+  built from it broke out each time. So the shim uses forms that mean the same bytes in EVERY mode:
+  a string with no backslash — the only mode-dependent character — is quoted by doubling `'`
+  (byte-identical to `pdo_pgsql` and `pdo_sqlite`); a string with a backslash becomes `E'…'` on
+  PostgreSQL and `_utf8mb4 X'<hex>'` on MySQL/MariaDB. Measured: every case reads back exactly
+  under both escape modes on MySQL/MariaDB and both `standard_conforming_strings` settings on
+  PostgreSQL, and a GBK connection charset (reachable through `init_connect`, where `pdo_mysql`
+  itself breaks out) cannot break the hex form. **What you will see:** on MySQL
+  `DB::escape("O'Brien")` is `'O''Brien'` where `pdo_mysql` returns `'O\'Brien'` (the same string
+  to the server — upstream's `MySql/EscapeTest::testEscapeString` compares the bytes and records
+  it), and a value containing a backslash renders as `E'…'` or hex in `toRawSql()` output. It
+  refuses only when the pool's backend FAMILY is unknown. SPEC §22.2 (as), (at), (cc).
+- **`DB::getPdo()->query()` and `prepare()` are refused.** There is no PDO underneath and a
+  `PDOStatement` cannot be built without one, so code that reaches past Illuminate to the raw handle
+  must use `DB::select()`/`DB::statement()` instead. Measured by upstream's
+  `MySql/DatabaseMySqlConnectionTest::testLastInsertIdIsPreserved`, which runs
+  `DB::getPdo()->query('SELECT 1')` inside a `QueryExecuted` listener — the property that test
+  exists for (the key survives a query in between) holds; only the call it makes to prove it is
+  refused. SPEC §22.2 (cc).
 - **`lastInsertId()` is sticky on the HANDLE, exactly as PDO's is** — and that is a deliberate
   divergence from the client underneath it. The client's value is per-STATEMENT and cleared on the
   way in to every request, which is right for a pooled engine: a statement can land on another
@@ -676,9 +684,11 @@ upstream's own PDO driver:
 GREEN on MySQL, PostgreSQL and SQLite, plus a Laravel demo app. What exists is a curated 89-file
 subset run on all three families against controls: green on none of them through the `ferro-*` name
 (the driver-name artifact above); under the alias, indistinguishable from the control on
-PostgreSQL (whose own two failures reproduce through `pdo_pgsql`) and short of it on the MySQL family
-by the `quote()` refusal. No demo app exists, and the Eloquent ORM's own test suite is not
-run on any family. The recorded MySQL-family numbers are in the C1f results doc.
+PostgreSQL (whose own two failures reproduce through `pdo_pgsql`) and on the MySQL family (since
+C1g). Upstream's family-SPECIFIC directories run under the alias only, short of their controls by
+the deliberate `''` rendering and the refused `getPdo()->query()` above. No demo app exists, and the
+Eloquent ORM's own test suite is not run on any family. The recorded MySQL-family numbers are in the
+C1f and C1g results docs.
 
 ---
 

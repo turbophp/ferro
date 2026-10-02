@@ -287,20 +287,25 @@ It costs no round trip in any family. PostgreSQL reports `standard_conforming_st
 `GUC_REPORT` parameter, so it arrives in the startup `ParameterStatus` stream and again on every
 change, and the M1-S1 vendored fork already mirrors it (`Client::parameter`). MySQL and MariaDB
 report it on EVERY OK packet, as the `SERVER_STATUS_NO_BACKSLASH_ESCAPES` status flag, and the
-engine reads it off the last OK packet the probe's checkout already holds — a freshly set-up or
-freshly reset session, so the value is the server's default (M2-C1g). SQLite's answer is a constant
+engine reads it off the last OK packet the probe's checkout already holds (M2-C1g). SQLite's answer is a constant
 `true`: its literal has no backslash escape mode at all (M2-C1g). It rides the same lazy,
 concurrent, TTL'd per-pool probe as `server_version`, so it inherits that probe's `nil` contract
 exactly: `nil` may mean never learned, learned then expired, or not learned yet, and all three are
 one thing to a client — **unknown**.
 
-**What a client may do with each value.** `true`: doubling `'` is the whole rule, on every family.
-`false`: backslashes ARE escapes — a client may build a literal only if it implements THAT family's
-escaping rule, and must refuse otherwise (the Laravel tier implements MySQL's, which is what
-`pdo_mysql` applies, and refuses `false` on PostgreSQL). `nil`: refuse, always; an escaping rule is
-not a place for a default. (Before M2-C1g every non-PostgreSQL pool advertised `nil`, so a MySQL or
-SQLite `quote()` could only refuse. No wire change: the field and its three states are as they were
-at `protocol_version` 3.)
+**It describes the PROBED session, and that is why it must not be a quoting rule** (M2-C1g,
+SPEC §22.2 (cc)). The value is cached per pool for the probe's TTL; an operator can change a
+server's global mode under it; a tenant can change its own session's mode inside a transaction; and
+on MySQL an `init_connect` applies to a fresh dial but not after `COM_RESET_CONNECTION`, so a pool's
+fresh and recycled sessions can genuinely differ. C1g's adversarial review turned each of those into
+a live breakout against a literal built from the advertised bit. **A client that builds SQL string
+literals should therefore use forms whose meaning does not depend on the mode** — the Laravel tier
+doubles `'` for a string without a backslash (the backslash is the only mode-dependent character)
+and uses PostgreSQL's `E'…'` or MySQL's `_utf8mb4 X'<hex>'` for one with a backslash — and treat
+this field as INFORMATIONAL. A client that does use it must refuse on `nil` and on any value whose
+rule it does not implement. (C2g designed the field as the quoting authority; C1g withdrew that
+role after the review. No wire change: the field and its three states are as they were at
+`protocol_version` 3, and before C1g every non-PostgreSQL pool advertised `nil`.)
 
 The DSN is **never** on the wire (SPEC §12 — it is a server-side secret), and `pools` is ordered by
 `name` so two connections to one engine see the identical list.
