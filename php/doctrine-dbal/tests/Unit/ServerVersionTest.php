@@ -46,6 +46,9 @@ final class ServerVersionTest extends TestCase
     /** The live PG string, verbatim as `ferrod` caches it (plan hazard 43). */
     private const PG_LIVE = 'PostgreSQL 17.10 (Debian 17.10-1.pgdg13+1) on x86_64-pc-linux-gnu';
 
+    /** What `getServerVersion()` answers for it since M2-C5b: the product name stripped. */
+    private const PG_NORMALISED = '17.10 (Debian 17.10-1.pgdg13+1) on x86_64-pc-linux-gnu';
+
     /**
      * Decode a recorded `ExecRequest` payload back to its field map — the established idiom
      * (`ConnectionFateFlagTest`, `RawFetchTest`). `PurePacker`, never `ExtPacker`: the latter
@@ -124,15 +127,22 @@ final class ServerVersionTest extends TestCase
     // ---- B. resolution happens, exactly once, as a declared READ ---------------------------------
 
     /**
-     * The handshake already knew it: hand it back VERBATIM (normalisation is
-     * {@see PlatformVersion}'s job and is asymmetric) and touch the wire not at all.
+     * The handshake already knew it: hand it back NORMALISED and touch the wire not at all.
+     *
+     * NORMALISED, since M2-C5b, because this is a public answer that consumers `version_compare()`:
+     * the verbatim banner reads as OLDER than every version, and upstream's own suite skipped a test
+     * under Ferro on exactly that (`PostgreSQLSchemaManagerTest::
+     * testListTableColumnsOidConflictWithNonTableObject`). The comparison is asserted, not only the
+     * string, because the comparison is the contract.
      */
-    public function testAnAdvertisedVersionIsUsedVerbatimAndCostsNoRoundTrip(): void
+    public function testAnAdvertisedVersionIsNormalisedAndCostsNoRoundTrip(): void
     {
         $session = new FakeSession();
         $c = self::conn($session, self::PG_LIVE);
 
-        self::assertSame(self::PG_LIVE, $c->getServerVersion());
+        self::assertSame(self::PG_NORMALISED, $c->getServerVersion());
+        self::assertFalse(version_compare($c->getServerVersion(), '12.0', '<'), 'a PostgreSQL 17 must not compare older than 12');
+        self::assertTrue(version_compare(self::PG_LIVE, '12.0', '<'), 'the CONTROL: the verbatim banner does');
         self::assertSame(0, $session->sendCount(), 'the advertised version needs no statement');
     }
 
@@ -152,7 +162,7 @@ final class ServerVersionTest extends TestCase
         $session = (new FakeSession())->push(self::versionRow(self::PG_LIVE), [C::SERVICE_SQL, C::METHOD_SQL_EXEC]);
         $c = self::conn($session, null);
 
-        self::assertSame(self::PG_LIVE, $c->getServerVersion());
+        self::assertSame(self::PG_NORMALISED, $c->getServerVersion());
         self::assertSame(1, $session->sendCount());
 
         $req = self::decodeExec($session->lastRequest()['payload']);
@@ -172,7 +182,7 @@ final class ServerVersionTest extends TestCase
         $session = (new FakeSession())->push(self::versionRow(self::PG_LIVE), [C::SERVICE_SQL, C::METHOD_SQL_EXEC]);
         $c = self::conn($session, '');
 
-        self::assertSame(self::PG_LIVE, $c->getServerVersion());
+        self::assertSame(self::PG_NORMALISED, $c->getServerVersion());
         self::assertSame(1, $session->sendCount());
     }
 
@@ -182,8 +192,8 @@ final class ServerVersionTest extends TestCase
         $session = (new FakeSession())->push(self::versionRow(self::PG_LIVE), [C::SERVICE_SQL, C::METHOD_SQL_EXEC]);
         $c = self::conn($session, null);
 
-        self::assertSame(self::PG_LIVE, $c->getServerVersion());
-        self::assertSame(self::PG_LIVE, $c->getServerVersion());
+        self::assertSame(self::PG_NORMALISED, $c->getServerVersion());
+        self::assertSame(self::PG_NORMALISED, $c->getServerVersion());
         self::assertSame(1, $session->sendCount(), 'the second call must not reach the wire');
     }
 
@@ -254,7 +264,7 @@ final class ServerVersionTest extends TestCase
     public function testTheCacheIsPerConnectionNotShared(): void
     {
         $a = self::conn(new FakeSession(), self::PG_LIVE, 'a');
-        self::assertSame(self::PG_LIVE, $a->getServerVersion());
+        self::assertSame(self::PG_NORMALISED, $a->getServerVersion());
 
         $bSession = (new FakeSession())->push(
             new TransportException('pool b cannot be reached'),

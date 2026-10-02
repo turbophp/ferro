@@ -494,9 +494,23 @@ abstract class AbstractConnection
     }
 
     /**
-     * The backend's own `version()` string, VERBATIM — normalisation is {@see PlatformVersion}'s
-     * job, and it is asymmetric (mandatory on PostgreSQL, forbidden on the MySQL family, where the
-     * `-MariaDB` suffix is the ONLY thing separating two different SQL dialects).
+     * The backend's own `version()` string, NORMALISED by {@see PlatformVersion::normalise} — which
+     * is asymmetric: on PostgreSQL it strips the leading product name, and on the MySQL family it
+     * changes nothing, because the `-MariaDB` suffix is the ONLY thing separating two different SQL
+     * dialects.
+     *
+     * **Normalised here, not only inside platform selection (M2-C5b).** Until C5b this returned the
+     * VERBATIM banner, `PostgreSQL 17.10 (…) on x86_64-…`, on the reasoning that normalising was
+     * platform selection's job. But this is a PUBLIC answer with consumers of its own — DBAL 3's
+     * `ServerInfoAwareConnection::getServerVersion()` and DBAL 4's `Connection::getServerVersion()` —
+     * and PHP's `version_compare()` reads a string beginning with a word as OLDER than every
+     * version. Measured through upstream's own suite on both majors:
+     * `PostgreSQLSchemaManagerTest::testListTableColumnsOidConflictWithNonTableObject` gates itself on
+     * `version_compare($conn->getServerVersion(), '12.0', '<')`, and SKIPPED under Ferro while
+     * running under `pdo_pgsql` — silently, since a skip is not a failure. It is the defect C2c found
+     * in the Laravel tier (§22.2 (ao)), which adopted this same rule. The stock PostgreSQL drivers
+     * answer the server's `server_version` (`17.10 (Debian …)`); this answers the same prefix, with
+     * the banner's `on <platform>, compiled by …` tail kept rather than guessed away.
      *
      * **The SPEC §14 nil-version decision, implemented: DEFER, resolve ONCE, then FAIL LOUDLY.**
      * The return type is a non-nullable `string`, so "unknown" cannot be represented — the only
@@ -541,7 +555,7 @@ abstract class AbstractConnection
 
         $advertised = $this->ferro->poolInfo()?->serverVersion;
         if ($advertised !== null && $advertised !== '') {
-            return $this->serverVersion = $advertised;
+            return $this->serverVersion = PlatformVersion::normalise($this->poolKind, $advertised);
         }
 
         // The resolution below reaches the WIRE, so an open streamed result has to be settled
@@ -559,7 +573,7 @@ abstract class AbstractConnection
         if (!is_string($v) || $v === '') {
             throw ServerVersionUnavailable::forPool($this->poolName, $this->poolKind, null);
         }
-        return $this->serverVersion = $v;
+        return $this->serverVersion = PlatformVersion::normalise($this->poolKind, $v);
     }
 
     /**
