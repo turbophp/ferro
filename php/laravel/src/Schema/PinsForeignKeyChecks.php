@@ -11,10 +11,12 @@ use Closure;
  * `SET FOREIGN_KEY_CHECKS=0` is SESSION state, and on a transaction-mode pool every statement
  * outside a transaction is its own checkout: the `SET` taints its connection, hygiene
  * (`COM_RESET_CONNECTION`) restores the default, and the next statement — the `DROP`, the
- * `TRUNCATE` — runs with checks ON (SPEC §7.4). Measured through `ferro-mysql`: stock
+ * `TRUNCATE` — runs with checks ON (SPEC §7.4). Measured through `ferro-mysql`: on MariaDB stock
  * `dropAllTables()` failed `1451 Cannot delete or update a parent row` on an ordinary parent/child
- * schema (it sorts tables by name, so any parent named before its child), which is `migrate:fresh`,
- * `db:wipe` and `RefreshDatabase`; `pdo_mysql` drops the same schema cleanly.
+ * schema (it drops in name order, so any parent named before its child), which is `migrate:fresh`,
+ * `db:wipe` and `RefreshDatabase`; `pdo_mysql` drops the same schema cleanly. MySQL 8.4 accepts that
+ * one multi-table `DROP` with checks on (measured in CI), but refuses the shapes stock users write
+ * inside the toggles — truncating a referenced parent, dropping it alone (`3730`) — on both.
  *
  * **A Ferro transaction pins ONE connection to a `tx_id`, and that pin survives MySQL's implicit
  * commit** — measured: after `DROP TABLE` inside a transaction, `@@foreign_key_checks` still reads 0

@@ -151,7 +151,9 @@ by the table above, which also carries the review's code changes.
 - **§15's bar.** It asks for the integration suite green; neither MySQL-family Ferro column is, and
   the alias column is short of its control by the `quote()` refusal (C1g).
 - What the framework suite cannot see, because its own fixtures avoid it — the review found two by
-  hand: `dropAllTables()` on a schema whose FK parent sorts before its child (fixed, live-tested in
+  hand: foreign-key toggling that never reached the statements it toggled — `dropAllTables()` on
+  MariaDB on a schema whose FK parent sorts before its child, and truncating or dropping a
+  referenced parent on both servers (fixed, live-tested in
   `MySqlSchemaLiveTest`), and the MySQL session keys Laravel's connector would have issued
   (`strict`, `isolation_level`, `timezone`, `charset`/`collation`), which the control does not set
   and which Ferro ignores (documented in `docs/known-incompatibilities.md`).

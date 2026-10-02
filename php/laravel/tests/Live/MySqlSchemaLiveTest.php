@@ -11,8 +11,9 @@ use Ferro\Laravel\Schema\FerroMySqlBuilder;
  * M2-C1f review: the MySQL family's schema builder, on the dedicated `laravel_tests` pool.
  *
  * F14 — foreign-key toggling is SESSION state, so outside a transaction it has no effect on a pooled
- * connection; stock `dropAllTables()` therefore failed 1451 on any parent whose name sorts before its
- * child. F12 — the `database` label is what `MySqlBuilder` queries `information_schema` with.
+ * connection; stock `dropAllTables()` therefore failed 1451 on MariaDB on any parent whose name sorts
+ * before its child, and dropping or truncating a referenced parent inside the toggles fails on both
+ * servers. F12 — the `database` label is what `MySqlBuilder` queries `information_schema` with.
  */
 final class MySqlSchemaLiveTest extends MySqlLiveTestCase
 {
@@ -51,9 +52,16 @@ final class MySqlSchemaLiveTest extends MySqlLiveTestCase
     }
 
     /**
-     * `migrate:fresh`, `db:wipe` and `RefreshDatabase` all end here. The CONTROL is the pin itself:
-     * the same three statements, issued one by one outside a transaction, fail 1451 — which is what
-     * stock did.
+     * `migrate:fresh`, `db:wipe` and `RefreshDatabase` all end here.
+     *
+     * THE CONTROL is the pin itself — an unpinned `SET` cannot reach the next statement — and it
+     * drops the PARENT ALONE, deliberately. The first version dropped `categories, products` in one
+     * statement, as `MySqlBuilder::dropAllTables()` does, and that control failed on MySQL 8.4 in
+     * CI: MySQL accepts a single `DROP TABLE` naming a parent together with its child even with
+     * checks ON, where MariaDB refuses it (1451, measured on 10.11). So stock `dropAllTables()`
+     * itself fails only on MariaDB; the parent-alone drop is refused on both (MySQL 8.4 `3730`,
+     * MariaDB `1451`), which is the shape `withoutForeignKeyConstraints(fn () => Schema::drop(…))`
+     * produces on either server.
      */
     public function testDropAllTablesDropsAParentNamedBeforeItsChild(): void
     {
@@ -62,10 +70,10 @@ final class MySqlSchemaLiveTest extends MySqlLiveTestCase
 
         try {
             $c->statement('set foreign_key_checks=0');
-            $c->statement('drop table `categories`,`products`');
+            $c->statement('drop table `categories`');
             self::fail('the control: an unpinned SET cannot reach the DROP on a pooled connection');
         } catch (\Illuminate\Database\QueryException $e) {
-            self::assertStringContainsString('1451', $e->getMessage());
+            self::assertMatchesRegularExpression('/\b(1451|3730)\b/', $e->getMessage());
         }
 
         $c->getSchemaBuilder()->dropAllTables();
