@@ -181,7 +181,12 @@ in the dev container (SQLite 3.53.2 bundled), twice per column, with `compare-co
 - `ferro-sqlite`: `Tests: 633, Assertions: 2058, Errors: 3, Failures: 1, Skipped: 54, Risky: 1`
   → **575 / 579**, the same in both runs (identical fail and skip sets by sha256).
 - `stock-sqlite` (control): `Tests: 633, Errors: 2, Skipped: 45, Risky: 1` → **586 / 588**, the
-  same sets in both runs. The assertion count differs between the two control runs (2103 against
+  same sets in both runs.
+- `sqlite` (the alias): `Tests: 633, Assertions: 1994 / 1991, Errors: 43, Failures: 1, Skipped: 38,
+  Risky: 1` → **551 / 595**, identical sets in both runs. That is two errors fewer than this
+  document's 549 / 595. This document's run kept no junit file, so the two tests that changed are
+  not identified. The 44 remaining non-passes are the alias hijack described above, plus one shared
+  with the control under a different exception type. The assertion count differs between the two control runs (2103 against
   2101), with the same outcomes.
 
 The four Ferro-only non-passes are:
@@ -200,8 +205,19 @@ The four Ferro-only non-passes are:
 - Eight are in `SchemaBuilderTest` and carry `#[RequiresDatabase('sqlite')]`.
 - Three are `testBasicUpdateForJson` data sets, which carry `#[RequiresDatabase(['sqlite', 'mysql', 'mariadb'])]`.
 
-The skips are name-caused, but **these 11 tests are UNMEASURED through Ferro**. The eight `SchemaBuilderTest`
-cases are table-rebuild and ALTER paths, which is where this column's one real incompatibility
-lives. The alias column cannot show them passing, because upstream's own SQLite connections are
-hijacked there.
+The skips are name-caused. **The alias column runs all 11**, and its junit (re-measured at the M2 exit) shows:
+
+- **7 pass.**
+- **`testSetJournalModeOnSqlite` fails in the control too.** The pool pins WAL.
+- **3 fail through Ferro only:** `testAddForeignKeysOnSqlite`, `testDropForeignKeysOnSqlite` and
+  `testAddAndDropPrimaryOnSqlite`. Each fails with `foreign key mismatch - "__temp__posts" referencing
+  "users"` at the rebuild's `insert into "__temp__posts" … select … from "posts"`.
+
+Those 3 are the SAME incompatibility as `testAlteringTableWithForeignKeyConstraintsEnabled` above,
+not new ones. The rebuild relies on `PRAGMA foreign_keys = OFF` sent as a separate statement. That
+pragma does not reach the copy on a pooled connection, and the copy then meets a foreign key on a
+non-unique parent column, which SQLite refuses only with enforcement on.
+
+This document's alias column counted all three under "the alias hijack". That was wrong in
+attribution, though the count was right.
 

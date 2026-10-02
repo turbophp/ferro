@@ -1206,7 +1206,7 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
 - `dbal-suite` 37069674974 (4.4.4) and 37069678072 (3.10.6)
 - `laravel-suite` 37069681124
 
-The Laravel SQLite columns ran in the dev container, because the workflow has no SQLite option. All of these reproduced the previously recorded numbers exactly, except the ORM row, which is new. The suites run from on-demand workflows, not nightly (§20.3, amended). The per-push `ci` workflow carries the engine, client, tier and demo-app gates.
+The Laravel SQLite columns ran in the dev container, because the workflow has no SQLite option. All of these reproduced the previously recorded numbers exactly, with two exceptions. The ORM row is new. The Laravel SQLite alias column moved from C3-6b's 549 / 595 to 551 / 595 (two fewer errors, reproduced in both runs); C3-6b kept no junit file, so the two tests that changed are not identified. The suites run from on-demand workflows, not nightly (§20.3, amended). The per-push `ci` workflow carries the engine, client, tier and demo-app gates.
 
 **§17's M2 bullet, item by item:**
 
@@ -1271,7 +1271,7 @@ Each cell is passed / executed:
 | Driver-agnostic subset | PostgreSQL 17 | MySQL 8.4 | MariaDB 11.8 | SQLite 3.53 (dev container) |
 |---|---|---|---|---|
 | Ferro driver name (`ferro-*`) | 570 / 579 | 578 / 579 | 578 / 579 | 575 / 579 |
-| Stock name (opt-in alias) | 605 / 607 | 587 / 587 | 588 / 588 | 549 / 595 |
+| Stock name (opt-in alias) | 605 / 607 | 587 / 587 | 588 / 588 | 551 / 595 |
 | `pdo_*` control | 605 / 607 | 587 / 587 | 588 / 588 | 586 / 588 |
 
 The family-specific directories run as separate columns. Their base classes require the stock driver name, so they run under the alias and the control only:
@@ -1289,8 +1289,13 @@ How the Ferro-named non-passes break down:
   - The MySQL-family workflow lists the Ferro-only skips by name (8 on MySQL, 9 on MariaDB).
   - **The PostgreSQL job has no skip comparison, so its Ferro-only skips (54 skipped against the control's 26) are not listed by name.** They are attributed from upstream source: the class-level `['pgsql','sqlsrv']` gate on `SchemaBuilderSchemaNameTest`, and `RequiresDatabase('pgsql')` cases.
 - **On SQLite, the same is true of the non-passes except one real incompatibility**: `compileAlter()`'s foreign-key toggle (§22.2 (bn)). C3-6b's triage named the wrong test for another non-pass, and its results doc is corrected.
-  - **The 11 Ferro-only skips on SQLite are name-caused but UNMEASURED through Ferro.** They are eight `SchemaBuilderTest` table-rebuild and ALTER cases, all `RequiresDatabase('sqlite')`, and three `testBasicUpdateForJson` data sets (`RequiresDatabase(['sqlite','mysql','mariadb'])`).
-  - These paths are where the one real SQLite incompatibility lives. The alias column cannot show them passing, because upstream's own SQLite connections are hijacked there. Upstream's `Sqlite/` directory is not run either.
+- **SQLite's 11 Ferro-only skips are name-caused**: eight `SchemaBuilderTest` table-rebuild cases, `RequiresDatabase('sqlite')`, and three `testBasicUpdateForJson` data sets, `RequiresDatabase(['sqlite','mysql','mariadb'])`. The alias column runs all 11:
+  - 7 pass.
+  - `testSetJournalModeOnSqlite` fails in the control too, because the pool pins WAL.
+  - **3 fail through Ferro only**: `testAddForeignKeysOnSqlite`, `testDropForeignKeysOnSqlite` and `testAddAndDropPrimaryOnSqlite`. Each fails with `foreign key mismatch - "__temp__posts"` at the rebuild's copy step.
+- **Those 3 are the same incompatibility as the one above, not new ones.** The rebuild relies on a `PRAGMA foreign_keys = OFF` sent as a separate statement, which does not survive to the copy on a pooled connection.
+- **So that one SQLite incompatibility shows up in 4 tests, 3 of them visible only through the alias column**, which C3-6b had counted as hijack errors.
+- Upstream's `Sqlite/` directory is not run.
 - The alias column is the proof for every case except SQLite. On SQLite the alias is not an escape hatch, because upstream's own throwaway connections carry no `ferro_socket`.
 
 **Demo app: met, as amended by §22.2 (ch).**
