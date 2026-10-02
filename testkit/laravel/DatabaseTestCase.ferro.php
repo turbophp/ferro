@@ -159,9 +159,15 @@ abstract class DatabaseTestCase extends TestCase
             'ferro-pgsql', 'pgsql', 'stock-pgsql' => 'pgsql',
             'ferro-sqlite', 'sqlite', 'stock-sqlite' => 'sqlite',
             'ferro-mysql', 'mysql', 'stock-mysql' => 'mysql',
+            // Laravel 11 resolves MariaDB through its OWN driver name (`MariaDbConnection`,
+            // `MariaDbGrammar`, `MariaDbBuilder`), so it is its own family here — an application
+            // upgraded from Laravel 10 may still run `mysql` against MariaDB, which is why the
+            // runner also accepts the `mysql` family on a MariaDB server.
+            'ferro-mariadb', 'mariadb', 'stock-mariadb' => 'mariadb',
             default => throw new \RuntimeException(sprintf(
                 'FERRO_LARAVEL_DRIVER="%s" is not one of: ferro-pgsql, pgsql, stock-pgsql, '
-                . 'ferro-sqlite, sqlite, stock-sqlite, ferro-mysql, mysql, stock-mysql.',
+                . 'ferro-sqlite, sqlite, stock-sqlite, ferro-mysql, mysql, stock-mysql, '
+                . 'ferro-mariadb, mariadb, stock-mariadb.',
                 $driver,
             )),
         };
@@ -233,8 +239,12 @@ abstract class DatabaseTestCase extends TestCase
         // reset), and leaving the control on the server's default would make the two columns
         // differ in two variables at once.
         if (in_array($u['scheme'] ?? '', ['mysql', 'mariadb'], true)) {
+            // Which stock DRIVER the control runs under follows the column being controlled, not
+            // the URL scheme: the scheme names the wire protocol (one for both servers), the driver
+            // names the Grammar/Builder pair, and a `stock-mariadb` control must use MariaDB's.
+            $family = self::familyOf(getenv('FERRO_LARAVEL_DRIVER') ?: 'stock-mysql');
             return [
-                'driver' => 'mysql',
+                'driver' => $family === 'mariadb' ? 'mariadb' : 'mysql',
                 'host' => $u['host'],
                 'port' => $u['port'] ?? 3306,
                 'database' => ltrim($u['path'] ?? '', '/') ?: 'laravel_tests',

@@ -206,4 +206,30 @@ final class MySqlConnectionLiveTest extends MySqlLiveTestCase
         self::assertSame('2017-11-12 13:14:15.250000', $row->at6);
         self::assertSame('2017-11-12 13:14:15', $row->dt, 'DATETIME (naive TIMESTAMP tag) is unchanged — the control');
     }
+
+    /**
+     * PINNED DIVERGENCE, not a pass: a FRACTIONAL column's rendering is the canonical wire text's
+     * (no fraction when it is zero, otherwise exactly six digits — PROTOCOL.md §3.2), not
+     * `pdo_mysql`'s, which pads to the column's own precision. The test above asserts only the two
+     * points where the forms coincide (`TIMESTAMP(0)`, and a six-digit fraction in `TIMESTAMP(6)`),
+     * which is how the first version of this slice came to call the rendering "byte-for-byte"
+     * (M2-C1f review). The instant is the same in every row; only the raw string differs. If this
+     * starts failing because the strings now match `pdo_mysql`, update SPEC §22.2 (cb) and the
+     * incompatibilities page — it means the precision reached the wire.
+     */
+    public function testAFractionalTimestampRendersTheCanonicalFractionNotTheColumnsPrecision(): void
+    {
+        $c = $this->conn();
+        $c->statement('drop table if exists c1f_fsp');
+        $c->statement('create table c1f_fsp (id int primary key, at3 timestamp(3) null, at6 timestamp(6) null)');
+        $c->table('c1f_fsp')->insert([
+            ['id' => 1, 'at3' => '2017-11-12 13:14:15.250', 'at6' => '2017-11-12 13:14:15.000000'],
+        ]);
+        $row = $c->table('c1f_fsp')->where('id', 1)->first();
+        self::assertNotNull($row);
+        // pdo_mysql: '2017-11-12 13:14:15.250' and '2017-11-12 13:14:15.000000'.
+        self::assertSame('2017-11-12 13:14:15.250000', $row->at3, 'TIMESTAMP(3): six digits, not the column\'s three');
+        self::assertSame('2017-11-12 13:14:15', $row->at6, 'TIMESTAMP(6) at a whole second: no fraction at all');
+        $c->statement('drop table c1f_fsp');
+    }
 }

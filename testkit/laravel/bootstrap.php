@@ -112,7 +112,11 @@ $probeServer = static function (Illuminate\Database\Connection $conn) use ($fami
     // A MySQL-family `version()` is a bare `8.4.11` or `11.8.8-MariaDB-…`, with no product name to
     // test for, so the family check is `@@version_comment` — which SQLite (the trap) does not have
     // and PostgreSQL does not either.
-    if ($family === 'mysql') {
+    //
+    // The check is on version() AND the comment together, because neither alone is reliable: an
+    // Ubuntu-packaged MariaDB 10.11 answers `@@version_comment = 'Ubuntu 24.04'` (measured, in this
+    // project's dev container), and its `version()` is what names it.
+    if ($family === 'mysql' || $family === 'mariadb') {
         $c = $conn->select('select @@version_comment as c');
         $comment = (string) ($c[0]->c ?? '');
         if ($comment === '' || preg_match('/mysql|mariadb/i', $comment . ' ' . $v) !== 1) {
@@ -120,6 +124,20 @@ $probeServer = static function (Illuminate\Database\Connection $conn) use ($fami
                 "CONTACT ASSERTION FAILED: something answered, but it was not MySQL/MariaDB (%s / %s).\n",
                 $v,
                 $comment,
+            ));
+            exit(1);
+        }
+        // AND THE SERVER IS THE ONE THE COLUMN CLAIMS. MySQL 8.4 and MariaDB 11.8 sit on adjacent
+        // ports (33060, 33061) speaking the same protocol, so a column labelled MariaDB that
+        // reached MySQL would record a perfectly plausible number for the wrong server. The runner
+        // states which server it started; `mysql-local` states nothing and is not checked.
+        $isMaria = stripos($v, 'mariadb') !== false;
+        $server = getenv('FERRO_LARAVEL_SERVER_FAMILY') ?: '';
+        if (($server === 'mariadb' && ! $isMaria) || ($server === 'mysql' && $isMaria)) {
+            fwrite(STDERR, sprintf(
+                "CONTACT ASSERTION FAILED: the column was started against %s, but %s answered.\n",
+                $server,
+                $v,
             ));
             exit(1);
         }
@@ -156,11 +174,10 @@ if (str_starts_with($driver, 'stock-')) {
     $conn = (new Illuminate\Database\Connectors\ConnectionFactory(new Illuminate\Container\Container()))
         ->make(Illuminate\Tests\Integration\Database\DatabaseTestCase::controlConfigForBootstrap(), 'control');
 
-    // Checked against the Ferro BASE, not one family's class, so adding a family cannot silently
-    // leave the inversion unenforced for it.
-    if ($conn instanceof Ferro\Laravel\FerroPostgresConnection
-        || $conn instanceof Ferro\Laravel\FerroSQLiteConnection
-        || $conn instanceof Ferro\Laravel\FerroMySqlConnection) {
+    // Checked against the trait EVERY Ferro connection uses for its execution layer, not a list
+    // of family classes — the list this replaced had to be extended by hand for each new family,
+    // and `ferro-mariadb` arrived without being added to it. A trait check cannot be left behind.
+    if (in_array(Ferro\Laravel\FerroConnectionBody::class, class_uses_recursive($conn), true)) {
         fwrite(STDERR, "CONTROL ASSERTION FAILED: the control column resolved a FERRO connection.\n"
             . "Refusing to run: it would report Ferro's behaviour as upstream's baseline.\n");
         exit(1);
@@ -203,6 +220,7 @@ $conn = $resolver(null, 'laravel_tests', '', [
 $want = match ($family) {
     'sqlite' => Ferro\Laravel\FerroSQLiteConnection::class,
     'mysql' => Ferro\Laravel\FerroMySqlConnection::class,
+    'mariadb' => Ferro\Laravel\FerroMariaDbConnection::class,
     default => Ferro\Laravel\FerroPostgresConnection::class,
 };
 if (! $conn instanceof $want) {

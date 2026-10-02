@@ -21,12 +21,33 @@ final class MySqlValuePolicyTest extends TestCase
         self::assertSame('0001-01-01 00:00:00', $p->decode(C::TAG_TIMESTAMPTZ, '0001-01-01T00:00:00Z'));
     }
 
-    /** The MySQL zero sentinel is already naive; anything that is not canonical RFC3339 passes through. */
-    public function testSentinelsAndNonCanonicalTextPassThrough(): void
+    /** The canonical sentinels are carried verbatim: the MySQL zero `TIMESTAMP` is already naive. */
+    public function testSentinelsPassThrough(): void
     {
         $p = new MySqlValuePolicy();
         self::assertSame('0000-00-00 00:00:00', $p->decode(C::TAG_TIMESTAMPTZ, '0000-00-00 00:00:00'));
-        self::assertSame('2017-11-12T13:14:15+02:00', $p->decode(C::TAG_TIMESTAMPTZ, '2017-11-12T13:14:15+02:00'));
+        self::assertSame('infinity', $p->decode(C::TAG_TIMESTAMPTZ, 'infinity'));
+    }
+
+    /**
+     * FAIL CLOSED (M2-C1f review): a non-canonical `TIMESTAMPTZ` is a wire fault. The first version
+     * handed it up unconverted, which is the RFC3339 shape Illuminate shifts silently.
+     *
+     * @return iterable<string,array{string}>
+     */
+    public static function nonCanonical(): iterable
+    {
+        yield 'offset form' => ['2017-11-12T13:14:15+02:00'];
+        yield 'explicit +00:00' => ['2017-11-12T13:14:15+00:00'];
+        yield 'trimmed fraction' => ['2017-11-12T13:14:15.25Z'];
+        yield 'space separator' => ['2017-11-12 13:14:15Z'];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('nonCanonical')]
+    public function testANonCanonicalTimestampTzIsAProtocolFault(string $text): void
+    {
+        $this->expectException(\Ferro\Client\Error\ProtocolException::class);
+        (new MySqlValuePolicy())->decode(C::TAG_TIMESTAMPTZ, $text);
     }
 
     /** Every OTHER tag is the raw policy's answer, byte for byte — the CONTROL for the one change. */

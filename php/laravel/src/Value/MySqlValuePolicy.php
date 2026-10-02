@@ -2,6 +2,8 @@
 declare(strict_types=1);
 namespace Ferro\Laravel\Value;
 
+use Ferro\Client\Error\ProtocolException;
+use Ferro\Client\Value\CanonicalText;
 use Ferro\Client\Value\RawStringValuePolicy;
 use Ferro\Client\Value\ValuePolicy;
 use Ferro\Protocol\Generated\Constants as C;
@@ -29,7 +31,20 @@ use Ferro\Protocol\Generated\Constants as C;
  * failed on the `T` (§22.2 (cb)).
  *
  * The MySQL zero sentinel `0000-00-00 00:00:00` is already naive and passes through, as does every
- * other tag. Precision is kept: a fraction the wire carries is kept.
+ * other tag. Precision is kept: a fraction the wire carries is kept — **but it is not `pdo_mysql`'s
+ * rendering of it.** The canonical wire text has no fraction when the sub-second part is zero and
+ * exactly six digits otherwise (PROTOCOL.md §3.2), while `pdo_mysql` renders the column's own
+ * precision: a `TIMESTAMP(3)` holding `.25` is `.250` there and `.250000` here, and one holding a
+ * whole second is `.000` there and nothing here. The INSTANT is identical and Illuminate's date
+ * casts parse both; a consumer comparing the raw STRING of a fractional column (`pluck()` keys,
+ * `getRawOriginal()`) sees the difference. The column's precision is not on the wire for any tag,
+ * so matching it would need a protocol change; the divergence is pinned by a live test instead
+ * (SPEC §22.2 (cb)).
+ *
+ * **It fails CLOSED.** A `TIMESTAMPTZ` payload that is neither a canonical instant nor a canonical
+ * sentinel is a wire fault, and is raised as one (the client's own validator, the same one the
+ * typed policy uses) rather than handed up unconverted: the unconverted RFC3339 text is precisely
+ * the shape the paragraph above shows Illuminate shifting silently.
  */
 final class MySqlValuePolicy implements ValuePolicy
 {
@@ -40,15 +55,18 @@ final class MySqlValuePolicy implements ValuePolicy
         $this->raw = new RawStringValuePolicy();
     }
 
+    /** @throws ProtocolException a `TIMESTAMPTZ` payload that is not canonical */
     public function decode(int $tag, mixed $data): mixed
     {
         $value = $this->raw->decode($tag, $data);
-        if ($tag === C::TAG_TIMESTAMPTZ
-            && is_string($value)
-            && preg_match('/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)Z$/', $value, $m) === 1
-        ) {
-            return $m[1] . ' ' . $m[2];
+        if ($tag !== C::TAG_TIMESTAMPTZ || !is_string($value)) {
+            return $value;
         }
-        return $value;
+        CanonicalText::timestamptz($value);   // throws ProtocolException on a non-canonical payload
+        if (!CanonicalText::timestamptzIsInstant($value)) {
+            return $value;                     // a sentinel: carried verbatim, never parsed
+        }
+        // Validated above, so the instant form is exactly `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`.
+        return str_replace('T', ' ', substr($value, 0, -1));
     }
 }

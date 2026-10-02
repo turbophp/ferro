@@ -25,7 +25,7 @@
 # That is the silent-no-op class the runner exists to refuse.
 #
 # PostgreSQL (job `measure`) and the MySQL family (job `measure-mysql`, M2-C1f: MySQL 8.4 and
-# MariaDB 11.8, the tier's `ferro-mysql`) run here. SQLite needs no server and is measured in the
+# MariaDB 11.8, under `ferro-mysql` and `ferro-mariadb` respectively) run here. SQLite needs no server and is measured in the
 # dev container (docs/laravel-suite/2026-09-15-c3-6b-sqlite-results.md). Report which columns ran
 # and which could not — never restate the bar as if met.
 name: laravel-suite
@@ -140,8 +140,14 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
+      # Each server is measured under ITS OWN Laravel family. Laravel 11 resolves MariaDB through a
+      # separate `mariadb` driver (MariaDbConnection / MariaDbGrammar / MariaDbBuilder), which is the
+      # one a Laravel 11 application on MariaDB runs; measuring MariaDB under `mysql` would record
+      # the MySQL grammar against it instead.
       matrix:
-        svc: [mysql, mariadb]
+        include:
+          - { svc: mysql, family: mysql, conn: MySqlConnection, ferro: FerroMySqlConnection }
+          - { svc: mariadb, family: mariadb, conn: MariaDbConnection, ferro: FerroMariaDbConnection }
     steps:
       - uses: actions/checkout@v4
       - uses: shivammathur/setup-php@v2
@@ -154,7 +160,7 @@ jobs:
       - name: measure every driver-name column, twice each
         run: |
           set -o pipefail +e
-          for drv in ferro-mysql mysql stock-mysql; do
+          for drv in ferro-${{ matrix.family }} ${{ matrix.family }} stock-${{ matrix.family }}; do
             for run in 1 2; do
               FERRO_LARAVEL_DRIVER="$drv" FERRO_LARAVEL_SVC=${{ matrix.svc }} \
                 bash testkit/laravel-suite.sh --log-junit "$drv-run$run.xml" 2>&1 | tee "$drv-run$run.log"
@@ -163,7 +169,7 @@ jobs:
           done
       - name: assert every run actually measured, under the name it claims
         run: |
-          for drv in ferro-mysql mysql stock-mysql; do
+          for drv in ferro-${{ matrix.family }} ${{ matrix.family }} stock-${{ matrix.family }}; do
             for run in 1 2; do
               f="$drv-run$run.log"
               grep -qE '^(OK|FAILURES!|ERRORS!|Tests: )' "$f" \
@@ -174,16 +180,18 @@ jobs:
                 || { echo "::error:: $f has no reset line"; exit 1; }
             done
           done
-          grep -q '\[ferro\] connection=Illuminate.Database.MySqlConnection driver=stock-mysql ' stock-mysql-run1.log \
-            || { echo "::error:: the control column did not resolve the STOCK MySqlConnection"; exit 1; }
-          grep -q '\[ferro\] connection=Ferro.Laravel.FerroMySqlConnection driver=ferro-mysql ' ferro-mysql-run1.log \
-            || { echo "::error:: the ferro-mysql column did not resolve FerroMySqlConnection"; exit 1; }
+          f=${{ matrix.family }}
+          grep -q "\[ferro\] connection=Illuminate.Database.${{ matrix.conn }} driver=stock-$f " "stock-$f-run1.log" \
+            || { echo "::error:: the control column did not resolve the STOCK ${{ matrix.conn }}"; exit 1; }
+          grep -q "\[ferro\] connection=Ferro.Laravel.${{ matrix.ferro }} driver=ferro-$f " "ferro-$f-run1.log" \
+            || { echo "::error:: the ferro-$f column did not resolve ${{ matrix.ferro }}"; exit 1; }
       - name: compare each Ferro column with the control, as SETS (SPEC §22.2 (bz))
         if: always()
         run: |
-          for drv in ferro-mysql mysql; do
-            echo "== $drv vs stock-mysql (run 1)"
-            php testkit/dbal/compare-columns.php "$drv-run1.xml" stock-mysql-run1.xml || true
+          f=${{ matrix.family }}
+          for drv in "ferro-$f" "$f"; do
+            echo "== $drv vs stock-$f (run 1)"
+            php testkit/dbal/compare-columns.php "$drv-run1.xml" "stock-$f-run1.xml" || true
           done | tee compare.txt
       - uses: actions/upload-artifact@v4
         if: always()
@@ -195,3 +203,4 @@ jobs:
             *-run1.xml
             *-run2.xml
             compare.txt
+            .laravel-suite/ferrod.log
