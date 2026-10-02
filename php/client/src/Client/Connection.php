@@ -15,6 +15,8 @@ use Ferro\Client\Hydration\PlanCache;
 use Ferro\Client\Value\M1ValuePolicy;
 use Ferro\Client\Value\TypePolicyOptions;
 use Ferro\Client\Value\ValuePolicy;
+use Ferro\Protocol\BackupRequest;
+use Ferro\Protocol\BackupResponse;
 use Ferro\Protocol\BeginRequest;
 use Ferro\Protocol\BeginResponse;
 use Ferro\Protocol\CodecException;
@@ -686,6 +688,95 @@ final class Connection
                 $session->abandonStream($rid);
             }
         }
+    }
+
+    // ---- admin service (SPEC §7.6, D15) -----------------------------------------------------------
+
+    /**
+     * Take a consistent online snapshot of this connection's SQLite pool — `ADMIN`/`BACKUP` (SPEC
+     * §7.6; `/proto/PROTOCOL.md` §11).
+     *
+     * `$file` is a plain FILE NAME (`[A-Za-z0-9._-]`, 1..200 bytes, not starting with `.`); the
+     * engine writes it into the pool's allowed directory, which the operator configures and the
+     * application never sees. Without `$replace` an existing name is refused; with it, the new
+     * snapshot is swapped in atomically and a failed backup leaves the previous one intact. The
+     * snapshot is mode 0600, owned by the engine's user.
+     *
+     * **This is an OPERATE verb (SPEC D15):** the engine runs it only for a process whose uid is in
+     * `FERRO_ADMIN_UIDS`, and an empty list — the default — disables it for everyone. A refusal is a
+     * {@see NonRetryableException} with code {@see C::ERR_FORBIDDEN}; so is a name the policy refuses
+     * and, by design, the name of a live database file. A non-SQLite pool is
+     * {@see C::ERR_UNSUPPORTED}: a server database is backed up with its own tooling.
+     *
+     * **Fate — a lost backup is UNCONFIRMED, not retryable.** A backup never writes the source
+     * database, but it does publish a FILE, and a reply lost after the request went out says nothing
+     * about whether it was published: the C3-7b-2 review measured a backup the client had given up
+     * on appear 500 ms later (the engine's interrupt cannot stop a `VACUUM INTO` that has not
+     * started yet, and the engine then publishes). So a sent-then-lost backup is classified as a
+     * lost WRITE — {@see IndeterminateException} — which no retry loop here re-issues, including
+     * {@see transaction()}'s re-run; one that was provably never sent is {@see RetryableException}.
+     * An engine-reported failure (cancel, timeout, a refused name) is a KNOWN fate: the engine
+     * removes its own temporary before answering.
+     *
+     * **The connection's read timeout bounds a backup too.** The reply is awaited like any other, so
+     * a snapshot that takes longer than the `ioTimeout` this connection was opened with (5 s by
+     * default in {@see Ferro::connect}) cannot be confirmed — it ends in the Indeterminate above, and
+     * the engine, seeing the session die, cancels it. Open the connection that takes backups with an
+     * `ioTimeout` above the expected snapshot time; `$timeoutMs` beyond it has no effect.
+     *
+     * @param int|null $timeoutMs engine-side bound on the snapshot statement (u32); null leaves it
+     *                            bounded only by this connection's read timeout (see above)
+     */
+    public function backup(string $file, bool $replace = false, ?int $timeoutMs = null): BackupResult
+    {
+        if ($timeoutMs !== null && ($timeoutMs < 0 || $timeoutMs > 0xFFFFFFFF)) {
+            throw new \InvalidArgumentException('timeoutMs must be null or a u32 (0..4294967295)');
+        }
+        // A wire precondition, not the engine's name policy (which the engine owns): a non-UTF-8
+        // string cannot ride the `str` field, and sent anyway it came back as `ERR_PROTOCOL` — a
+        // WIRE fault, which §22.2 (ai) reserves for genuine codec defects (C3-7b-2 review F5).
+        // `preg_match` with `/u` fails on invalid UTF-8 and needs no extension (charter rule 7).
+        if (preg_match('//u', $file) !== 1) {
+            throw new \InvalidArgumentException('backup file name must be valid UTF-8');
+        }
+        $session = $this->requestSession(OpKind::Write, false);
+        $payload = BackupRequest::encode(
+            ['pool' => $this->pool, 'file' => $file, 'replace' => $replace, 'timeout_ms' => $timeoutMs],
+            $this->encodePacker,
+        );
+        try {
+            $outcome = $session->sendRequest(C::SERVICE_ADMIN, C::METHOD_ADMIN_BACKUP, $payload);
+        } catch (ConnectionLostException | TransportException $e) {
+            // A lost WRITE (see the docblock): whether the snapshot was published is unconfirmed.
+            throw $this->fate->classifyLoss(
+                OpKind::Write,
+                false,
+                'BACKUP lost — whether the snapshot was published is unconfirmed: ' . $e->getMessage(),
+                $e instanceof ConnectionLostException ? $e->errorPayload() : null,
+                $this->reconnect?->lastEpochChanged() ?? false,
+                sent: self::wasSent($e),
+            );
+        } catch (CodecException $e) {
+            throw new ProtocolException('failed to decode BACKUP terminal: ' . $e->getMessage(), 0, $e);
+        }
+        if (!$outcome->isOk()) {
+            throw ErrorMapper::fromOutcome($outcome);
+        }
+        try {
+            $off = 0;
+            $body = $outcome->body();
+            $w = $this->decodePacker->unpack($body, $off);
+            if (!is_array($w)) {
+                throw new CodecException('BackupResponse body is not an array');
+            }
+            if ($off !== strlen($body)) {
+                throw new CodecException('BackupResponse body has trailing bytes');
+            }
+            $r = BackupResponse::mapFromWire(array_values($w));
+        } catch (CodecException $e) {
+            throw new ProtocolException('failed to decode BACKUP response: ' . $e->getMessage(), 0, $e);
+        }
+        return new BackupResult($r['bytes'], $r['queue_us'], $r['exec_us']);
     }
 
     // ---- imperative transaction (the DBAL shape) -------------------------------------------------
