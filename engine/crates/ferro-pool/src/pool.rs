@@ -17,7 +17,9 @@ use ferro_proto::value::Value;
 use crate::backend::{BackendRows, PoolBackend, QueryResult, Reclaimed, ResetProfile, TxStatus};
 use crate::config::PoolConfig;
 use crate::error::PoolError;
-use crate::pin::{self, PinCause, PinCauseCell, PinMetrics, PinState, TxId};
+use crate::pin::{
+    self, HygieneMetrics, HygieneOutcome, PinCause, PinCauseCell, PinMetrics, PinState, TxId,
+};
 
 /// A connection sitting idle in the pool, plus the bookkeeping needed to recycle it safely on
 /// the next checkout.
@@ -62,6 +64,19 @@ pub(crate) struct PoolInner<B: PoolBackend> {
     /// and every clone of the handle counts into the same place, and so a scrape reads one pool's
     /// numbers without walking its checkouts.
     pub(crate) pin_metrics: PinMetrics,
+    /// SPEC §13's hygiene counters for THIS pool (M2-C4b-2a): recycles by the reset they received.
+    pub(crate) hygiene_metrics: HygieneMetrics,
+}
+
+/// SPEC §13's pool-size gauges for one pool. See [`Pool::gauges`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolGauges {
+    /// The configured ceiling.
+    pub max_size: usize,
+    /// Connections handed out, being dialled, or held by the liveness reaper.
+    pub in_use: usize,
+    /// Connections parked and ready.
+    pub idle: usize,
 }
 
 /// A cloneable handle to a pool. Cloning shares the same underlying connections/semaphore/idle
@@ -79,6 +94,29 @@ impl<B: PoolBackend> Clone for Pool<B> {
 }
 
 impl<B: PoolBackend> Pool<B> {
+    /// SPEC §13's pool-size gauges, read at scrape time (M2-C4b-2a).
+    ///
+    /// `in_use` is permits currently held, which counts a connection being DIALLED, one handed out,
+    /// and one the liveness reaper is pinging — all capacity no checkout can have at that instant,
+    /// which is the question a pool-exhaustion alert asks. `idle` is the parked stack's length. They are read at two instants,
+    /// so a scrape racing a checkout can see a connection in neither or both; a gauge pair has no
+    /// atomic snapshot to offer and an operator reads them as a trend, not a ledger.
+    pub fn gauges(&self) -> PoolGauges {
+        let max_size = self.inner.config.max_size;
+        let in_use = max_size.saturating_sub(self.inner.semaphore.available_permits());
+        let idle = self.inner.idle.lock().map(|v| v.len()).unwrap_or(0);
+        PoolGauges {
+            max_size,
+            in_use,
+            idle,
+        }
+    }
+
+    /// This pool's SPEC §13 hygiene counters (M2-C4b-2a).
+    pub fn hygiene_metrics(&self) -> &HygieneMetrics {
+        &self.inner.hygiene_metrics
+    }
+
     /// This pool's SPEC §13 pin-cause counters (M2-C4b).
     pub fn pin_metrics(&self) -> &PinMetrics {
         &self.inner.pin_metrics
@@ -97,6 +135,7 @@ impl<B: PoolBackend> Pool<B> {
             semaphore,
             idle: Mutex::new(Vec::new()),
             pin_metrics: PinMetrics::default(),
+            hygiene_metrics: HygieneMetrics::default(),
         });
         if let Some(interval) = reap_interval {
             crate::health::spawn_reaper(&inner, interval);
@@ -237,10 +276,19 @@ impl<B: PoolBackend> Pool<B> {
             // so the guard widens to `tx_open || tainted || clean_reset_profile().is_some()`. A
             // backend that reports `None` (a future MySQL known-clean tracker) still SKIPS the
             // timeout wrapper entirely when there is genuinely nothing to do.
-            if idle_conn.tx_open
-                || idle_conn.tainted
-                || self.inner.backend.clean_reset_profile().is_some()
-            {
+            // §7.2 conditional profile: a tainted conn (detected session mutation / error /
+            // aborted tx) gets the FULL reset; a non-tainted recycled conn gets the backend's
+            // clean profile (PG: Targeted — the §7.4 blind-spot backstop; MySQL later: None when
+            // the tracker says clean). Decided ONCE, before the guard, so the same value both
+            // drives the cleanup and is what §13's hygiene counter records (M2-C4b-2a) — the
+            // guard below is the old `tx_open || tainted || clean_profile.is_some()`, since
+            // `tainted` always yields `Some(Full)`.
+            let profile = if idle_conn.tainted {
+                Some(ResetProfile::Full)
+            } else {
+                self.inner.backend.clean_reset_profile()
+            };
+            if idle_conn.tx_open || profile.is_some() {
                 let cleanup = async {
                     if idle_conn.tx_open {
                         self.inner
@@ -249,15 +297,6 @@ impl<B: PoolBackend> Pool<B> {
                             .await?;
                         idle_conn.tx_open = false;
                     }
-                    // §7.2 conditional profile: a tainted conn (detected session mutation / error /
-                    // aborted tx) gets the FULL reset; a non-tainted recycled conn gets the
-                    // backend's clean profile (PG: Targeted — the §7.4 blind-spot backstop; MySQL
-                    // later: None when the tracker says clean).
-                    let profile = if idle_conn.tainted {
-                        Some(ResetProfile::Full)
-                    } else {
-                        self.inner.backend.clean_reset_profile()
-                    };
                     if let Some(p) = profile {
                         self.inner.backend.reset(&mut idle_conn.conn, p).await?;
                         idle_conn.tainted = false;
@@ -270,7 +309,6 @@ impl<B: PoolBackend> Pool<B> {
                     Err(_) => continue,     // cleanup timed out: evict (drop) + try again
                 }
             }
-
             // EXIT 2 of 2: a recycled connection, and this MUST come after the cleanup block
             // above — the reset is what disarms the previous tenant's arming, so applying first
             // would be undone silently. An arming failure EVICTS and retries, matching what the
@@ -286,6 +324,13 @@ impl<B: PoolBackend> Pool<B> {
                 continue;
             }
 
+            // §13's hygiene counter, recorded at the last point before the hand-out (M2-C4b-2a): a
+            // connection evicted by a failed cleanup OR a failed `apply_readonly` received no
+            // hygiene anyone will run on, so it is not a recycle — and counting earlier let one
+            // checkout record two events (adversarial review F3).
+            self.inner
+                .hygiene_metrics
+                .record(HygieneOutcome::of(profile));
             let queue_us = start.elapsed().as_micros() as u64;
             return Ok(Checkout::new(
                 idle_conn.conn,
