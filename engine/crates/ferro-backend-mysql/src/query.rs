@@ -15,8 +15,10 @@
 //!    an empty one yielded rows with ZERO CELLS. Measured live before this was written:
 //!    `call_columns_spike_it.rs` (prepare-time 0, execution-time 2, row cells `Some(2)`).
 //!
-//!    The prepare-time list stays PREFERRED wherever the server provides one, and that is a fate
-//!    decision rather than an optimization — see the §19.3 note on `run` itself.
+//!    Since SPEC §22.2 (ci) the prepare-time list is the pre-send REFUSAL check only (plus
+//!    [`rowmap::refuse_prepared_null`]); the rows are DESCRIBED by the executed set's metadata
+//!    whenever it carries any, because the prepared list does not always describe the cells (a bare
+//!    `?` in the select list) — see the §19.3 note on `run` itself.
 //! 3. **Bind pre-flight**, both halves BEFORE anything is sent: the arity check
 //!    ([`bind::validate_arity`], `params.len()` vs the statement's `num_params()`) and the per-param
 //!    canonical-shape check ([`bind::to_params`]). Either failure is a KNOWN-FATE
@@ -26,7 +28,7 @@
 //! 4. Bind + `exec_iter`, fully draining the single result set (BUFFERED — constant-memory streaming
 //!    is S7). Each cell maps through [`rowmap::extract_value`]. `affected` and `last_insert_id` come
 //!    off THIS statement's OK packet and both land on the returned `QueryResult` (M1-S8a).
-//!    The executed set's own column metadata is read here too, and it is the fallback for step 2.
+//!    The executed set's own column metadata is read here too, and it is what DESCRIBES the rows.
 //!    It MUST be read before the drain — see the ordering note in [`drain`], which points the
 //!    OPPOSITE way from the one governing `affected`/`last_insert_id` two lines below it.
 //!
@@ -77,6 +79,7 @@ pub async fn run(
         // whose columns MySQL reports only at execution time. Resolved after the drain, below.
         None
     } else {
+        rowmap::refuse_prepared_null(&prepared)?;
         Some(build_cols(&prepared)?)
     };
 
@@ -103,13 +106,12 @@ pub async fn run(
     // (4a) Resolve which column list describes these rows. `cols` and the mapping list below are
     // produced together and are ALWAYS the same list — that is what keeps rows and cols in step.
     //
-    // §19.3 / SPEC §22.2: on the `None` arm the out-of-scope-column refusal necessarily lands AFTER
-    // the statement has run, because the metadata does not exist until then — "never sent" becomes
-    // "sent, then refused". That is why the prepared list stays preferred rather than being dropped
-    // for one uniform post-drain read: it confines the changed fate to statements the server
-    // declares no columns for, which is precisely the `CALL` shape that returned cell-less rows
-    // before this. The refusal is still KNOWN-FATE and never `Indeterminate` — it is raised here,
-    // after a FULL drain, so the outcome is settled and the conn is clean and reusable.
+    // §19.3 / SPEC §22.2 (av): a refusal raised from the EXECUTED list necessarily lands AFTER the
+    // statement has run — "never sent" becomes "sent, then refused". That is why the prepared list
+    // still runs the refusal check BEFORE the send (step 2): it keeps the changed fate to columns
+    // the prepared list could not see — a `CALL`'s, and the rare type admitted at prepare but out of
+    // scope once executed. The refusal is still KNOWN-FATE and never `Indeterminate` — it is raised
+    // here, after a FULL drain, so the outcome is settled and the conn is clean and reusable.
     //
     // **Refuse from the prepared metadata, DESCRIBE from the executed metadata** (SPEC §22.2 (ci)).
     // The prepared list is what lets an out-of-scope column be refused before anything is sent —

@@ -895,16 +895,32 @@ async fn deferred_column_types_are_refused_before_execution(url: &str, label: &s
     conn.disconnect().await;
 }
 
-/// **§22.2 (ci): a NULL-typed select list is refused BEFORE execution, never after.** MariaDB
-/// declares a bare `?` in the select list as `MYSQL_TYPE_NULL` at prepare time, so admitting that
-/// type from prepared metadata let `SELECT ?` run and then fail to decode its non-NULL cell — a
-/// statement that had RUN reported as a known failure (the adversarial review measured a write
-/// applied that way). The property pinned here is the FATE: each shape is either refused with the
-/// statement never executed (`Com_stmt_execute` unchanged on the same session), or — where a
-/// server declares a real type — answered correctly. Never executed-then-refused.
-async fn null_typed_select_lists_are_refused_before_execution(url: &str, label: &str) {
+/// **§22.2 (ci): refuse from the PREPARED metadata, describe from the EXECUTED metadata.**
+///
+/// Two failure shapes motivated it, both "the statement RAN, then its cell was refused": MariaDB
+/// declares a bare `?` in the select list NULL-typed at prepare time (the review measured
+/// `SELECT bump(), ?` applying its write and reporting a known failure), and MySQL 8.4 declares the
+/// same `?` a STRING (CI measured `SELECT ? AS p` refusing its `Int`). The FATE is pinned:
+///
+/// * the REFUSE-OR-ANSWER shapes are either refused with the statement never executed
+///   (`Com_stmt_execute` unchanged on the session) or answered correctly — never executed and then
+///   refused;
+/// * the MUST-ANSWER shapes have prepared metadata that DIFFERS from the executed metadata (measured
+///   on MariaDB 10.11: `COALESCE(?, 1)` prepares LONG and executes VAR_STRING; `? + 0` prepares
+///   DOUBLE and executes LONGLONG), so they fail if either path decodes against the prepared list.
+///
+/// **Every case runs on a FRESH connection per path.** `mysql_async` caches each statement's
+/// EXECUTED metadata and hands it back as the "prepared" list on the next `prep` of the same SQL on
+/// that connection, so a second run on a warm connection cannot tell the two lists apart — the first
+/// version of this test ran the buffered path first and its stream half could not fail (review).
+async fn prepared_refuses_and_executed_describes(url: &str, label: &str) {
     let backend = MysqlBackend::new(url);
-    let mut conn = backend.connect().await.expect("connect");
+    let mariadb = {
+        let mut c = backend.connect().await.expect("connect");
+        let m = is_mariadb(&mut c).await;
+        c.disconnect().await;
+        m
+    };
     async fn executes(conn: &mut MysqlConn) -> u64 {
         let row: (String, String) = conn
             .driver_mut()
@@ -914,83 +930,121 @@ async fn null_typed_select_lists_are_refused_before_execution(url: &str, label: 
             .expect("Com_stmt_execute row");
         row.1.parse().expect("a counter")
     }
-    for (sql, params, want) in [
-        ("SELECT NULL AS n", vec![], Value::Null),
-        ("SELECT ? AS p", vec![Value::I64(5)], Value::I64(5)),
-        // A STRING into the same shape: any classifier that GUESSES a type for a NULL-typed column
-        // (rather than refusing it) runs the statement and then mis-decodes one of these two.
+    // (sql, params, the answers accepted, may it be refused before execution?)
+    let cases: Vec<(&str, Vec<Value>, Vec<Value>, bool)> = vec![
+        ("SELECT NULL AS n", vec![], vec![Value::Null], true),
         (
-            "SELECT ? AS s",
-            vec![Value::Text("x".into())],
-            Value::Text("x".into()),
+            "SELECT ? AS p",
+            vec![Value::I64(5)],
+            vec![Value::I64(5)],
+            true,
         ),
-    ] {
-        let before = executes(&mut conn).await;
-        match backend.query(&mut conn, sql, &params).await {
-            Err(PoolError::Unsupported(msg)) => {
-                assert!(msg.contains("NULL-typed"), "[{label}] `{sql}`: {msg}");
-                assert_eq!(
-                    executes(&mut conn).await,
-                    before,
-                    "[{label}] `{sql}` was refused AFTER it executed — the refusal must come first"
-                );
-                println!("  [{label}] `{sql}` -> refused before execution");
-            }
-            Ok(r) => {
-                assert_eq!(
-                    r.rows,
-                    vec![vec![want.clone()]],
-                    "[{label}] `{sql}` answered wrongly"
-                );
-                println!("  [{label}] `{sql}` -> answered (the server declared a real type)");
-            }
-            Err(e) => {
-                panic!("[{label}] `{sql}` must be refused before execution or answered: {e:?}")
-            }
-        }
-
-        // The STREAM path, held to the same rule: it builds HEAD and maps cells on its own route.
-        let before = executes(&mut conn).await;
-        match backend.query_stream(&mut conn, sql, &params).await {
-            Err(PoolError::Unsupported(msg)) => {
-                assert!(
-                    msg.contains("NULL-typed"),
-                    "[{label}] stream `{sql}`: {msg}"
-                );
-                assert_eq!(
-                    executes(&mut conn).await,
-                    before,
-                    "[{label}] stream `{sql}` was refused AFTER it executed"
-                );
-            }
-            Ok((cols, mut rows)) => {
-                let mut got = Vec::new();
-                while let Some(row) = rows.next().await {
-                    got.push(row.unwrap_or_else(|e| {
-                        panic!("[{label}] stream `{sql}` executed, then failed mid-stream: {e:?}")
-                    }));
+        (
+            "SELECT ? AS p",
+            vec![Value::Text("x".into())],
+            vec![Value::Text("x".into())],
+            true,
+        ),
+        ("SELECT ? AS p", vec![Value::Null], vec![Value::Null], true),
+        (
+            "SELECT ? AS p",
+            vec![Value::F64(1.5)],
+            vec![Value::F64(1.5)],
+            true,
+        ),
+        (
+            "SELECT COALESCE(?, 1) AS p",
+            vec![Value::Text("x".into())],
+            vec![Value::Text("x".into())],
+            !mariadb,
+        ),
+        (
+            "SELECT ? + 0 AS p",
+            vec![Value::I64(5)],
+            // MariaDB executes it as LONGLONG (measured); MySQL may type it DOUBLE.
+            if mariadb {
+                vec![Value::I64(5)]
+            } else {
+                vec![Value::I64(5), Value::F64(5.0)]
+            },
+            !mariadb,
+        ),
+    ];
+    for (sql, params, accept, may_refuse) in &cases {
+        for stream in [false, true] {
+            let path = if stream { "stream" } else { "buffered" };
+            let mut conn = backend.connect().await.expect("connect");
+            let before = executes(&mut conn).await;
+            let got = if stream {
+                match backend.query_stream(&mut conn, sql, params).await {
+                    Ok((cols, mut rows)) => {
+                        let mut out = Vec::new();
+                        while let Some(row) = rows.next().await {
+                            out.push(row.unwrap_or_else(|e| {
+                                panic!("[{label}] {path} `{sql}` executed, then failed mid-stream: {e:?}")
+                            }));
+                        }
+                        backend
+                            .reclaim_stream(&mut conn, rows)
+                            .await
+                            .expect("reclaim");
+                        Ok((cols, out))
+                    }
+                    Err(e) => Err(e),
                 }
+            } else {
                 backend
-                    .reclaim_stream(&mut conn, rows)
+                    .query(&mut conn, sql, params)
                     .await
-                    .expect("reclaim");
-                assert_eq!(
-                    got,
-                    vec![vec![want.clone()]],
-                    "[{label}] stream `{sql}` answered wrongly"
-                );
-                assert_eq!(
-                    cols[0].tag,
-                    want.tag(),
-                    "[{label}] HEAD vs cell for stream `{sql}`"
-                );
+                    .map(|r| (r.cols, r.rows))
+            };
+            match got {
+                Ok((cols, rows)) => {
+                    assert_eq!(
+                        rows.len(),
+                        1,
+                        "[{label}] {path} `{sql}` {params:?}: one row"
+                    );
+                    let v = &rows[0][0];
+                    assert!(
+                        accept.contains(v),
+                        "[{label}] {path} `{sql}` {params:?} answered {v:?}, expected one of {accept:?}"
+                    );
+                    if *v != Value::Null {
+                        assert_eq!(
+                            cols[0].tag,
+                            v.tag(),
+                            "[{label}] {path} `{sql}`: HEAD vs cell"
+                        );
+                    }
+                    println!("  [{label}] {path:<8} `{sql}` {params:?} -> {v:?}");
+                }
+                Err(PoolError::Unsupported(msg)) if *may_refuse => {
+                    assert!(
+                        msg.contains("NULL-typed"),
+                        "[{label}] {path} `{sql}`: {msg}"
+                    );
+                    assert_eq!(
+                        executes(&mut conn).await,
+                        before,
+                        "[{label}] {path} `{sql}` was refused AFTER it executed"
+                    );
+                    println!(
+                        "  [{label}] {path:<8} `{sql}` {params:?} -> refused before execution"
+                    );
+                }
+                Err(e) => panic!(
+                    "[{label}] {path} `{sql}` {params:?} must be answered{}: {e:?}",
+                    if *may_refuse {
+                        " or refused before execution"
+                    } else {
+                        ""
+                    }
+                ),
             }
-            Err(e) => panic!(
-                "[{label}] stream `{sql}` must be refused before execution or answered: {e:?}"
-            ),
+            conn.disconnect().await;
         }
     }
-    conn.disconnect().await;
 }
 
 /// **MariaDB's extended types, MEASURED and recorded (hazard 25).** MariaDB 10.7+ has a native
@@ -1701,9 +1755,9 @@ both_engines!(
 );
 
 both_engines!(
-    null_typed_select_lists_are_refused_before_execution,
-    mysql_null_typed_select_lists_are_refused_before_execution,
-    mariadb_null_typed_select_lists_are_refused_before_execution
+    prepared_refuses_and_executed_describes,
+    mysql_prepared_refuses_and_executed_describes,
+    mariadb_prepared_refuses_and_executed_describes
 );
 
 /// MariaDB-only (the types do not exist on MySQL 8).

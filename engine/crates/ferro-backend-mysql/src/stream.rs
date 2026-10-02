@@ -39,9 +39,10 @@
 //! exit for a statement that produced no result set. Without it, guessing wrong ate the connection.
 //!
 //! **S3 closed the `CALL` blind spot on this path; S2 closed it on the buffered one** (SPEC §22.2
-//! (av)). Both pay the same narrow §19.3 trade, and only on the empty-prepared-list arm: the
-//! metadata does not exist until the statement has run, so an out-of-scope column type is refused
-//! AFTER the send rather than before it. The refusal stays KNOWN-FATE, never `Indeterminate`, and
+//! (av)). Both pay the same narrow §19.3 trade: where the prepared list could not see a column (a
+//! `CALL`'s), or admitted a type the executed set turns out not to (SPEC §22.2 (ci) — every arm now
+//! DESCRIBES rows from the executed metadata), an out-of-scope column type is refused AFTER the send
+//! rather than before it. The refusal stays KNOWN-FATE, never `Indeterminate`, and
 //! the connection is handed back clean rather than discarded. `ferro-classify` pins unconditionally
 //! on `CALL`/`DO` regardless, so the SESSION is safe on every arm.
 //!
@@ -207,6 +208,7 @@ pub async fn open(
     // (2) cols from the prepared statement (correct even for a zero-row result); an out-of-scope
     // column type is a loud `Unsupported` HERE, before anything runs, with the conn still clean.
     let columns: Vec<Column> = stmt.columns().to_vec();
+    crate::rowmap::refuse_prepared_null(&columns)?;
     let cols = build_cols(&columns)?;
 
     // (3) bind PRE-FLIGHT, both halves before anything is sent, both KNOWN-FATE (never
@@ -267,9 +269,16 @@ pub async fn open(
                 // On an `Err` here the conn cannot be recovered, so it is left PARKED and the
                 // pool discards the husk. Either way the caller sees the `Unsupported`, which is
                 // the more informative of the two errors and the one that is actionable.
-                if let Ok(recovered) = qr.into_conn().await {
-                    conn.unpark(recovered);
-                    conn.record_session_mutation();
+                // The statement HAS run. If handing the connection back also fails, the link is
+                // the news, not the column: map it through the fate table (§19.3) rather than
+                // report a known-fate `Unsupported` for a statement whose outcome is now unknown
+                // (review F2).
+                match qr.into_conn().await {
+                    Ok(recovered) => {
+                        conn.unpark(recovered);
+                        conn.record_session_mutation();
+                    }
+                    Err(drain) => return Err(crate::error_map::map(&drain)),
                 }
                 return Err(e);
             }
@@ -323,9 +332,16 @@ pub async fn open(
         match build_cols(&executed) {
             Ok(c) => (c, executed),
             Err(e) => {
-                if let Ok(recovered) = qr.into_conn().await {
-                    conn.unpark(recovered);
-                    conn.record_session_mutation();
+                // The statement HAS run. If handing the connection back also fails, the link is
+                // the news, not the column: map it through the fate table (§19.3) rather than
+                // report a known-fate `Unsupported` for a statement whose outcome is now unknown
+                // (review F2).
+                match qr.into_conn().await {
+                    Ok(recovered) => {
+                        conn.unpark(recovered);
+                        conn.record_session_mutation();
+                    }
+                    Err(drain) => return Err(crate::error_map::map(&drain)),
                 }
                 return Err(e);
             }
