@@ -1,0 +1,3 @@
+# The SPEC §15 demo app (M2) — testkit/laravel-demo/, copied into the clone by laravel-suite.sh.
+# Its own column: it is not upstream's suite and must not be folded into the upstream numbers.
+tests/Integration/Database/FerroDemo
