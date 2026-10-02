@@ -103,7 +103,11 @@ final class FerroConnections
             sprintf('Ferro: unknown driver "%s"; this package registers %s.', $driver, implode(', ', self::drivers())),
         );
         $o = ConnectionOptions::fromConfig($config);
-        return new $class(self::client($o), $database, $prefix, $config);
+        // A DIALLER, not a dialled client: nothing connects until Illuminate first resolves the
+        // PDO, and every resolution dials its own session — the semantics of the PDO closure
+        // `ConnectionFactory` hands a stock connection (M2-C1e-2, SPEC §22.2 (bw)). The config is
+        // still validated HERE, so a misconfigured connection fails at `DB::connection()` as before.
+        return new $class(static fn (): FerroClient => self::client($o), $database, $prefix, $config);
     }
 
     /**
