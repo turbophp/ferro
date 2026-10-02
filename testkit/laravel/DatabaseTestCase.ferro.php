@@ -158,9 +158,10 @@ abstract class DatabaseTestCase extends TestCase
         return match ($driver) {
             'ferro-pgsql', 'pgsql', 'stock-pgsql' => 'pgsql',
             'ferro-sqlite', 'sqlite', 'stock-sqlite' => 'sqlite',
+            'ferro-mysql', 'mysql', 'stock-mysql' => 'mysql',
             default => throw new \RuntimeException(sprintf(
                 'FERRO_LARAVEL_DRIVER="%s" is not one of: ferro-pgsql, pgsql, stock-pgsql, '
-                . 'ferro-sqlite, sqlite, stock-sqlite.',
+                . 'ferro-sqlite, sqlite, stock-sqlite, ferro-mysql, mysql, stock-mysql.',
                 $driver,
             )),
         };
@@ -223,6 +224,27 @@ abstract class DatabaseTestCase extends TestCase
         $u = parse_url($dsn);
         if (!is_array($u) || !isset($u['host'])) {
             throw new \RuntimeException('FERRO_LARAVEL_DSN is not a parseable URL.');
+        }
+
+        // THE MYSQL-FAMILY CONTROL (M2-C1f): stock `pdo_mysql` at the same server and database the
+        // pool dials. `timezone => '+00:00'` is a DELIBERATE control configuration for the same
+        // reason the SQLite control sets `foreign_key_constraints`: Ferro pins every MySQL-family
+        // session to UTC (SPEC §22.2, M1-S7 — `time_zone = '+00:00'`, re-applied after every
+        // reset), and leaving the control on the server's default would make the two columns
+        // differ in two variables at once.
+        if (in_array($u['scheme'] ?? '', ['mysql', 'mariadb'], true)) {
+            return [
+                'driver' => 'mysql',
+                'host' => $u['host'],
+                'port' => $u['port'] ?? 3306,
+                'database' => ltrim($u['path'] ?? '', '/') ?: 'laravel_tests',
+                'username' => isset($u['user']) ? rawurldecode($u['user']) : '',
+                'password' => isset($u['pass']) ? rawurldecode($u['pass']) : '',
+                'charset' => 'utf8mb4',
+                'collation' => 'utf8mb4_unicode_ci',
+                'prefix' => '',
+                'timezone' => '+00:00',
+            ];
         }
         parse_str($u['query'] ?? '', $q);
         $searchPath = 'public';

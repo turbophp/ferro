@@ -24,6 +24,7 @@ final class FerroConnections
     private const DRIVERS = [
         'ferro-pgsql' => FerroPostgresConnection::class,
         'ferro-sqlite' => FerroSQLiteConnection::class,
+        'ferro-mysql' => FerroMySqlConnection::class,
     ];
 
     /**

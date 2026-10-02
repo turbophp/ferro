@@ -49,4 +49,9 @@ DELIMITER ;
 --    errored 1057 of 1077 functional tests with `1044 Access denied … to database 'doctrine_tests'`.
 CREATE DATABASE IF NOT EXISTS doctrine_tests;
 GRANT ALL PRIVILEGES ON doctrine_tests.* TO 'ferro'@'%';
+-- The Laravel framework suite's own database (M2-C1f), for the same reason as `doctrine_tests`:
+-- `migrate:fresh` drops everything in the default connection's database before every test, so it
+-- must never be the shared `ferro` one. testkit/laravel/reset-mysql.sql recreates it.
+CREATE DATABASE IF NOT EXISTS laravel_tests CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+GRANT ALL PRIVILEGES ON laravel_tests.* TO 'ferro'@'%';
 FLUSH PRIVILEGES;

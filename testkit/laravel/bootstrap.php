@@ -109,6 +109,23 @@ $probeServer = static function (Illuminate\Database\Connection $conn) use ($fami
         return 'SQLite ' . $v;
     }
 
+    // A MySQL-family `version()` is a bare `8.4.11` or `11.8.8-MariaDB-…`, with no product name to
+    // test for, so the family check is `@@version_comment` — which SQLite (the trap) does not have
+    // and PostgreSQL does not either.
+    if ($family === 'mysql') {
+        $c = $conn->select('select @@version_comment as c');
+        $comment = (string) ($c[0]->c ?? '');
+        if ($comment === '' || preg_match('/mysql|mariadb/i', $comment . ' ' . $v) !== 1) {
+            fwrite(STDERR, sprintf(
+                "CONTACT ASSERTION FAILED: something answered, but it was not MySQL/MariaDB (%s / %s).\n",
+                $v,
+                $comment,
+            ));
+            exit(1);
+        }
+        return $v . ' (' . $comment . ')';
+    }
+
     if (! str_contains($v, 'PostgreSQL')) {
         fwrite(STDERR, sprintf(
             "CONTACT ASSERTION FAILED: something answered, but it was not PostgreSQL (%s).\n"
@@ -141,7 +158,9 @@ if (str_starts_with($driver, 'stock-')) {
 
     // Checked against the Ferro BASE, not one family's class, so adding a family cannot silently
     // leave the inversion unenforced for it.
-    if ($conn instanceof Ferro\Laravel\FerroPostgresConnection || $conn instanceof Ferro\Laravel\FerroSQLiteConnection) {
+    if ($conn instanceof Ferro\Laravel\FerroPostgresConnection
+        || $conn instanceof Ferro\Laravel\FerroSQLiteConnection
+        || $conn instanceof Ferro\Laravel\FerroMySqlConnection) {
         fwrite(STDERR, "CONTROL ASSERTION FAILED: the control column resolved a FERRO connection.\n"
             . "Refusing to run: it would report Ferro's behaviour as upstream's baseline.\n");
         exit(1);
@@ -181,9 +200,11 @@ $conn = $resolver(null, 'laravel_tests', '', [
     'pool' => getenv('FERRO_LARAVEL_POOL') ?: 'default',
 ]);
 
-$want = $family === 'sqlite'
-    ? Ferro\Laravel\FerroSQLiteConnection::class
-    : Ferro\Laravel\FerroPostgresConnection::class;
+$want = match ($family) {
+    'sqlite' => Ferro\Laravel\FerroSQLiteConnection::class,
+    'mysql' => Ferro\Laravel\FerroMySqlConnection::class,
+    default => Ferro\Laravel\FerroPostgresConnection::class,
+};
 if (! $conn instanceof $want) {
     fwrite(STDERR, sprintf(
         "FERRO CONTACT ASSERTION FAILED: the connection is a %s, not a %s.\n"
