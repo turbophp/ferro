@@ -580,3 +580,82 @@ async fn c2d_i64_binds_varchar_and_text_binds_ints_live() {
     let rows = co.query("SELECT 1", &[]).await.expect("still usable");
     assert_eq!(rows.rows[0][0], Value::I64(1));
 }
+
+/// **M2-C5b: an `I64` binds an `oid` slot, live, and an OID read back can be written back.**
+///
+/// The READ path has mapped `oid` → `I64` since M1-S8a; the bind path refused it, so the round trip
+/// upstream doctrine/dbal's own `testListTableColumnsOidConflictWithNonTableObject` performs —
+/// read `pg_class.oid`, then `… WHERE oid = ?` with it — failed `canonical I64 cannot bind to PG
+/// type oid`. PG is the oracle: every bound value is read back through `::text` in the statement.
+#[tokio::test(flavor = "multi_thread")]
+async fn c5b_i64_binds_oid_live_and_an_oid_read_back_binds_back() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    // Both boundaries. 4294967295 is past int4's range, so an int4-shaped bind cannot pass this.
+    let rows = co
+        .query(
+            "SELECT ($1::oid)::text, ($2::oid)::text",
+            &[Value::I64(0), Value::I64(i64::from(u32::MAX))],
+        )
+        .await
+        .expect("I64 must bind an oid slot since M2-C5b");
+    assert_eq!(
+        rows.rows[0],
+        vec![Value::Text("0".into()), Value::Text("4294967295".into())]
+    );
+
+    // The round trip the DBAL test performs: READ an oid (it comes back I64), BIND it back.
+    let read = co
+        .query("SELECT oid FROM pg_class WHERE relname = 'pg_class'", &[])
+        .await
+        .expect("read pg_class.oid");
+    let oid = read.rows[0][0].clone();
+    assert_eq!(oid, Value::I64(1259), "pg_class's oid is fixed at 1259");
+    let back = co
+        .query("SELECT relname::text FROM pg_class WHERE oid = $1", &[oid])
+        .await
+        .expect("an oid read back must bind back");
+    assert_eq!(back.rows, vec![vec![Value::Text("pg_class".into())]]);
+
+    // The VALUE gate, live. PostgreSQL itself would WRAP -1 to 4294967295 (measured:
+    // `SELECT '-1'::oid` → 4294967295), i.e. a different object id than the one written; refused
+    // pre-send instead, as is 2^32. Known fate, and the connection is untouched.
+    for n in [-1_i64, i64::from(u32::MAX) + 1] {
+        let err = co
+            .query("SELECT ($1::oid)::text", &[Value::I64(n)])
+            .await
+            .expect_err("an out-of-range oid must be refused");
+        match err {
+            PoolError::Sql {
+                ref message,
+                ref sqlstate,
+                ..
+            } => {
+                assert!(
+                    message.contains("out of range for PG type oid")
+                        && message.contains("pre-send"),
+                    "a pre-send refusal naming the target: {message}"
+                );
+                assert_eq!(sqlstate, &None, "pre-send: no server ever answered");
+            }
+            other => panic!("expected a known-fate pre-send refusal, got {other:?}"),
+        }
+    }
+
+    // `regclass` reads back as I64 too, but nothing binds an integer into one (§22.2 (af)).
+    let err = co
+        .query("SELECT ($1::regclass)::text", &[Value::I64(1259)])
+        .await
+        .expect_err("regclass stays out of the I64 arm");
+    assert!(
+        format!("{err:?}").contains("cannot bind to PG type regclass"),
+        "{err:?}"
+    );
+
+    let rows = co.query("SELECT 1", &[]).await.expect("still usable");
+    assert_eq!(rows.rows[0][0], Value::I64(1));
+}

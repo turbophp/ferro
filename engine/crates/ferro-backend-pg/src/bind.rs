@@ -447,6 +447,11 @@ impl ToSql for PgInt {
             i32::try_from(self.0)?.to_sql(base, out)
         } else if *base == Type::INT8 {
             self.0.to_sql(base, out)
+        } else if *base == Type::OID {
+            // M2-C5b: PG's `oid` is an UNSIGNED 32-bit integer, and `<u32 as ToSql>` writes its
+            // native binary form (it accepts `Type::OID` and nothing else). The pre-flight already
+            // refused a negative or > u32::MAX value; this `try_from` is the totality backstop.
+            u32::try_from(self.0)?.to_sql(base, out)
         } else if *base == Type::TEXT || *base == Type::VARCHAR {
             // M1-S9 (`text`) / M2-C2d (`varchar`): the decimal rendering, verbatim, in TEXT format
             // (see `encode_format`).
@@ -506,6 +511,14 @@ impl ToSql for PgInt {
             // stays out: `char(n)` PADS, so a read-back would not equal what was written — a
             // difference in SEMANTICS, which is what the membership rule is really about.
             Type::VARCHAR,
+            // M2-C5b: `oid`, VALUE-gated to `0..=u32::MAX` in [`check_range`]. The READ path has
+            // mapped `oid` → `I64` since M1-S8a, so before this an OID read back could not be
+            // bound back — readable-but-not-bindable, the asymmetry §22.2 (g) closed for domains.
+            // Measured caller: upstream doctrine/dbal's own
+            // `testListTableColumnsOidConflictWithNonTableObject` (3.10.6 AND 4.4.4), which reads
+            // `pg_class.oid` and writes it into `UPDATE pg_class SET oid = ? WHERE oid = ?`.
+            // `regclass`/`regtype` (also read as `I64`) stay OUT: no measured caller, §22.2 (af).
+            Type::OID,
         ]
         .contains(base)
     }
@@ -831,6 +844,18 @@ fn check_range(v: &Value, ty: &Type) -> Result<(), String> {
                      representable as an f64 (|n| > 2^53), so the write would silently round — \
                      bind an F64 if that rounding is intended, or use a numeric/decimal column if \
                      it is not (pre-send rejection: the statement was never executed)"
+                ));
+            }
+            // M2-C5b: the VALUE half of the I64→oid widening. STRICTER than `pdo_pgsql`, for the
+            // §9.1 reason the float8 gate above gives: PostgreSQL's `oidin` accepts a NEGATIVE
+            // integer and silently WRAPS it (`'-1'::oid` is 4294967295, measured), so PDO's text
+            // bind of `-1` lands on a different object id than the one written. Refused pre-send,
+            // fate KNOWN, along with anything past u32::MAX (which PG would refuse server-side).
+            if *ty == Type::OID && u32::try_from(*n).is_err() {
+                return Err(format!(
+                    "canonical I64 value {n} is out of range for PG type oid (an unsigned 32-bit \
+                     integer, 0..=4294967295; PostgreSQL would silently wrap a negative value) \
+                     (pre-send rejection: the statement was never executed)"
                 ));
             }
             if *ty == Type::BOOL && *n != 0 && *n != 1 {
@@ -1186,6 +1211,66 @@ mod tests {
             b"42",
             "and the text goes to an int slot verbatim too"
         );
+    }
+
+    /// **M2-C5b: `I64 → oid`, value-gated to `0..=u32::MAX`.** The READ path has returned an `oid`
+    /// as `I64` since M1-S8a, so before this an OID read back could not be written back. Measured
+    /// caller: upstream doctrine/dbal's own `testListTableColumnsOidConflictWithNonTableObject`,
+    /// which reads `pg_class.oid` and binds it into `UPDATE pg_class SET oid = ? WHERE oid = ?`.
+    #[test]
+    fn c5b_i64_binds_oid_inside_the_unsigned_32_bit_range() {
+        // The accept side, both boundaries — `u32::MAX` is past int4's range, so an arm that
+        // quietly reused the int4 encoder would fail here.
+        for n in [0_i64, 1259, i64::from(i32::MAX) + 1, i64::from(u32::MAX)] {
+            assert!(accepts(&Value::I64(n), &Type::OID), "{n} is a valid oid");
+            check_param(&Value::I64(n), &Type::OID).expect("in range");
+        }
+
+        // The VALUE gate: negative (which PG's `oidin` would silently WRAP) and past u32::MAX are
+        // refused PRE-SEND, naming the value and the range — and the boxed impl refuses them as
+        // well, so the pre-flight is EQUAL to the impl here, never looser (§19.3's direction).
+        for n in [
+            -1_i64,
+            i64::from(i32::MIN),
+            i64::from(u32::MAX) + 1,
+            i64::MAX,
+        ] {
+            let err = check_param(&Value::I64(n), &Type::OID).expect_err("out of range");
+            assert!(err.contains(&n.to_string()), "must name the value: {err}");
+            assert!(err.contains("oid"), "must name the type: {err}");
+            assert!(
+                err.contains("pre-send"),
+                "must say it never executed: {err}"
+            );
+            let mut buf = tokio_postgres::types::private::BytesMut::new();
+            assert!(
+                value_to_boxed(&Value::I64(n))
+                    .to_sql_checked(&Type::OID, &mut buf)
+                    .is_err(),
+                "the impl backstop must refuse {n} into oid as well"
+            );
+            assert!(buf.is_empty(), "a refused bind must write no bytes");
+        }
+
+        // Membership stays MEASURED: `regclass`/`regtype` read back as `I64` too, but nothing
+        // binds an integer into one, so they stay refused (§22.2 (af)).
+        for ty in [Type::REGCLASS, Type::REGTYPE] {
+            assert!(!accepts(&Value::I64(1259), &ty), "I64 must not bind {ty:?}");
+        }
+
+        // The wire form: PG's native 4-byte big-endian unsigned oid, BINARY format.
+        let mut buf = tokio_postgres::types::private::BytesMut::new();
+        PgInt(i64::from(u32::MAX))
+            .to_sql(&Type::OID, &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..], [0xff, 0xff, 0xff, 0xff]);
+        let mut buf = tokio_postgres::types::private::BytesMut::new();
+        PgInt(1259).to_sql(&Type::OID, &mut buf).unwrap();
+        assert_eq!(&buf[..], 1259_u32.to_be_bytes());
+        assert!(matches!(
+            PgInt(1259).encode_format(&Type::OID),
+            Format::Binary
+        ));
     }
 
     /// The exactness predicate itself, and specifically the trap it is written to avoid: Rust's
@@ -1658,6 +1743,13 @@ mod tests {
             // saturating `as i64` round trip — see `i64_is_exact_as_f64`.)
             Value::I64(1_i64 << 53),
             Value::I64((1_i64 << 53) + 1),
+            // M2-C5b: the two boundaries of the I64→oid VALUE gate, for the same structural reason
+            // as the entries above — `u32::MAX` is the largest value that binds (and is past
+            // `int4`'s range, so it also proves the oid arm is not an int4 bind in disguise),
+            // `u32::MAX + 1` the smallest that is refused pre-send. `-200` above is the negative
+            // side, which PostgreSQL itself would silently WRAP.
+            Value::I64(i64::from(u32::MAX)),
+            Value::I64(i64::from(u32::MAX) + 1),
             Value::F64(1.5),
             Value::F64(1e39),
             // The UNDERFLOW magnitude (Task 4 review). NB it cannot catch the semantic hole it was
@@ -1733,6 +1825,10 @@ mod tests {
             Type::INT2,
             Type::INT4,
             Type::INT8,
+            // M2-C5b: the I64 arm admits `oid`; `regclass` rides along as the NEGATIVE control —
+            // the same 4-byte unsigned payload on the read path, deliberately NOT admitted here.
+            Type::OID,
+            Type::REGCLASS,
             Type::FLOAT4,
             Type::FLOAT8,
             Type::TEXT,
