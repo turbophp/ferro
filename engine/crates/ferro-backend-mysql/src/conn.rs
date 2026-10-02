@@ -358,6 +358,29 @@ impl PoolBackend for MysqlBackend {
         true
     }
 
+    /// M2-C1g: read `SERVER_STATUS_NO_BACKSLASH_ESCAPES` off the last OK packet — synchronous and
+    /// free, as the trait requires, because the server reports it on EVERY OK packet and the
+    /// driver keeps the last one. It is the MySQL spelling of the trait's one question (is a
+    /// backslash an ordinary character inside a literal?); a default `sql_mode` answers `false`.
+    ///
+    /// `None` — never a guess — when there is no OK packet to read: a parked connection (no
+    /// handle), or one whose last packet was an ERR (the driver clears `last_ok_packet` on an
+    /// error).
+    ///
+    /// **It is the PROBED session's mode, and on MySQL that is not always every session's** — the
+    /// C1g review measured it (SPEC §22.2 (cc)): an `init_connect` that sets `sql_mode` runs on a
+    /// fresh dial but NOT after `COM_RESET_CONNECTION`, so a pool whose probe happened to see a
+    /// fresh dial advertises one mode while its recycled leases run the other; and a tenant can
+    /// change its own session's mode inside a transaction. That is why no shipped tier builds a
+    /// literal from this value (the trait doc says so); it is advertised because it is true of the
+    /// connection it was read from, and `nil` would claim not to know.
+    fn literals_are_standard(&self, conn: &Self::Conn) -> Option<bool> {
+        conn.mysql
+            .as_ref()?
+            .last_ok_packet()
+            .map(crate::literals_are_standard)
+    }
+
     /// The transaction AUTHORITY (SPEC §7.1): reads `SERVER_STATUS_IN_TRANS` off the last OK packet.
     /// NEVER returns `Failed` — MySQL/MariaDB have no aborted-open-tx state (see [`crate::tracker`]).
     fn tx_status(&self, conn: &Self::Conn) -> TxStatus {

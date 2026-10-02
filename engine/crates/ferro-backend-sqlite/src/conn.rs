@@ -917,6 +917,22 @@ impl PoolBackend for SqliteBackend {
         self.set_query_only(conn, readonly).await
     }
 
+    /// M2-C1g: **always `Some(true)`, a property of the LIBRARY rather than of a connection.**
+    /// SQLite's string literal has exactly one escape — a doubled `'` — and no mode in which a
+    /// backslash means anything (there is no `standard_conforming_strings` and no
+    /// `NO_BACKSLASH_ESCAPES` to flip, and no pragma either). So the trait's one question has a
+    /// constant answer, and returning it costs nothing even on a parked connection, where the
+    /// "unknown, never a guess" rule would otherwise apply: nothing about the answer is unknown.
+    /// `literals_are_standard_is_a_constant_of_the_library` checks the property itself, not the
+    /// return value alone.
+    ///
+    /// Before this, a SQLite pool advertised `None` (the trait default), and the Laravel tier's
+    /// `quote()` — so `DB::escape()`, `toRawSql()`, `castAsJson()` and `DB::pretend()` with string
+    /// bindings — refused on every SQLite pool.
+    fn literals_are_standard(&self, _conn: &Self::Conn) -> Option<bool> {
+        Some(true)
+    }
+
     fn cancel_handle(&self, conn: &Self::Conn) -> Self::CancelHandle {
         // A connection with no live handle still yields a handle-shaped value the pool can hold;
         // there is nothing to interrupt, and firing it is the documented no-op.

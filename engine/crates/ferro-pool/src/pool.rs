@@ -650,11 +650,6 @@ impl<B: PoolBackend> Checkout<B> {
         r
     }
 
-    /// An out-of-band handle to cancel this connection's in-flight server statement (S6), WITHOUT
-    /// borrowing the `Checkout` while a query future is live. Grab it BEFORE starting an
-    /// interruptible statement (it borrows nothing the query future needs) and move it into a
-    /// separate task/`select!` arm that fires the cancel on a deadline/abort. For Postgres it is a
-    /// `tokio_postgres::CancelToken` that cancels via a SIDE connection; the pool stays
     /// Whether a backslash inside a single-quoted literal is an ordinary character on this
     /// connection's backend — `None` when unknown. Delegates to
     /// [`PoolBackend::literals_are_standard`]; synchronous and free (see that method).
@@ -663,6 +658,11 @@ impl<B: PoolBackend> Checkout<B> {
         self.pool.backend.literals_are_standard(conn)
     }
 
+    /// An out-of-band handle to cancel this connection's in-flight server statement (S6), WITHOUT
+    /// borrowing the `Checkout` while a query future is live. Grab it BEFORE starting an
+    /// interruptible statement (it borrows nothing the query future needs) and move it into a
+    /// separate task/`select!` arm that fires the cancel on a deadline/abort. For Postgres it is a
+    /// `tokio_postgres::CancelToken` that cancels via a SIDE connection; the pool stays
     /// backend-agnostic (returns `B::CancelHandle`).
     pub fn cancel_handle(&self) -> B::CancelHandle {
         let conn = self.conn.as_ref().expect("Checkout conn taken before Drop");

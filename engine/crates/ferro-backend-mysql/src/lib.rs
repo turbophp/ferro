@@ -53,6 +53,13 @@ pub const DIALECT: Dialect = Dialect::MySql;
 pub const SERVER_STATUS_IN_TRANS: mysql_common::constants::StatusFlags =
     mysql_common::constants::StatusFlags::SERVER_STATUS_IN_TRANS;
 
+/// The MySQL OK-packet `SERVER_STATUS_NO_BACKSLASH_ESCAPES` flag (0x0200) — set while the
+/// session's `sql_mode` contains `NO_BACKSLASH_ESCAPES`, i.e. while a backslash inside a string
+/// literal is an ORDINARY character. The server reports it on EVERY OK packet, so it costs no
+/// statement to read (M2-C1g: the MySQL arm of `PoolBackend::literals_are_standard`).
+pub const SERVER_STATUS_NO_BACKSLASH_ESCAPES: mysql_common::constants::StatusFlags =
+    mysql_common::constants::StatusFlags::SERVER_STATUS_NO_BACKSLASH_ESCAPES;
+
 /// Decode every session-state tracker on an OK packet into typed [`SessionStateChange`] values.
 ///
 /// On the FORKED (`CLIENT_SESSION_TRACK`-negotiating) build this is non-empty after a session
@@ -66,6 +73,13 @@ pub fn session_state_changes(ok: &OkPacket<'_>) -> Vec<SessionStateChange<'stati
         .iter()
         .filter_map(|info| info.decode().ok().map(SessionStateChange::into_owned))
         .collect()
+}
+
+/// True iff this OK packet reports that a backslash inside a string literal is an ordinary
+/// character (`SERVER_STATUS_NO_BACKSLASH_ESCAPES`).
+pub fn literals_are_standard(ok: &OkPacket<'_>) -> bool {
+    ok.status_flags()
+        .contains(SERVER_STATUS_NO_BACKSLASH_ESCAPES)
 }
 
 /// True iff this OK packet reports an open transaction block (`SERVER_STATUS_IN_TRANS`).

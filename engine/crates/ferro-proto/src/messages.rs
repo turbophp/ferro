@@ -75,9 +75,11 @@ msg!(
     /// 9.1, MySQL defaults to the unsafe one.
     ///
     /// It costs no round trip: PG reports the GUC via `ParameterStatus` (the M1-S1 fork mirrors it
-    /// in `Client::parameter`), and it rides the SAME per-pool probe as `server_version`, inheriting
-    /// that probe's `nil` contract exactly. A client that cannot get an unambiguous `true` must
-    /// REFUSE to build a literal rather than assume — an escaping rule is not a place for a default.
+    /// in `Client::parameter`), MySQL reports it as an OK-packet status flag, and SQLite's answer is
+    /// a constant (M2-C1g); it rides the SAME per-pool probe as `server_version`, inheriting that
+    /// probe's `nil` contract exactly. **It describes the PROBED session, so it is informational,
+    /// not a quoting rule** (M2-C1g review: a cached pool-level bit can describe a different
+    /// session, and a literal built from it broke out) — see `/proto/PROTOCOL.md` §4.
     ///
     /// Still NEVER exposed: the DSN (§12 server secret).
     PoolInfo {

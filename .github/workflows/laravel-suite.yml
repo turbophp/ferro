@@ -171,8 +171,35 @@ jobs:
               echo "phpunit exit: $?"
             done
           done
+      # Upstream's FAMILY-SPECIFIC directory (MySql/ or MariaDb/), as its own column — the C2f shape
+      # (allowlist-postgres.txt). Its base class carries #[RequiresDatabase('<family>')], so it runs
+      # only under the stock NAME: the alias and the control, the pair that attributes a non-pass.
+      - name: measure the family-specific column, twice each
+        run: |
+          set -o pipefail +e
+          for drv in ${{ matrix.family }} stock-${{ matrix.family }}; do
+            for run in 1 2; do
+              FERRO_LARAVEL_ALLOWLIST="$PWD/testkit/laravel/allowlist-${{ matrix.family }}.txt" \
+                FERRO_LARAVEL_DRIVER="$drv" FERRO_LARAVEL_SVC=${{ matrix.svc }} \
+                bash testkit/laravel-suite.sh --log-junit "spec-$drv-run$run.xml" 2>&1 | tee "spec-$drv-run$run.log"
+              echo "phpunit exit: $?"
+            done
+          done
       - name: assert every run actually measured, under the name it claims
         run: |
+          for drv in ${{ matrix.family }} stock-${{ matrix.family }}; do
+            for run in 1 2; do
+              f="spec-$drv-run$run.log"
+              grep -qE '^(OK|FAILURES!|ERRORS!|Tests: )' "$f" \
+                || { echo "::error:: $f has no phpunit result line — the run died before measuring"; tail -40 "$f"; exit 1; }
+              grep -q "\[ferro\] connection=.* driver=$drv " "$f" \
+                || { echo "::error:: $f did not run under driver $drv"; exit 1; }
+              grep -q '\[ferro\] reset: ' "$f" \
+                || { echo "::error:: $f has no reset line"; exit 1; }
+            done
+          done
+          grep -q "\[ferro\] connection=Illuminate.Database.${{ matrix.conn }} driver=stock-${{ matrix.family }} " "spec-stock-${{ matrix.family }}-run1.log" \
+            || { echo "::error:: the family-specific control did not resolve the STOCK ${{ matrix.conn }}"; exit 1; }
           for drv in ferro-${{ matrix.family }} ${{ matrix.family }} stock-${{ matrix.family }}; do
             for run in 1 2; do
               f="$drv-run$run.log"
@@ -193,10 +220,33 @@ jobs:
         if: always()
         run: |
           f=${{ matrix.family }}
-          for drv in "ferro-$f" "$f"; do
-            echo "== $drv vs stock-$f (run 1)"
-            php testkit/dbal/compare-columns.php "$drv-run1.xml" "stock-$f-run1.xml" || true
-          done | tee compare.txt
+          {
+            for drv in "ferro-$f" "$f"; do
+              echo "== $drv vs stock-$f (run 1)"
+              php testkit/dbal/compare-columns.php "$drv-run1.xml" "stock-$f-run1.xml" || true
+            done
+            echo "== family-specific: $f vs stock-$f (run 1)"
+            php testkit/dbal/compare-columns.php "spec-$f-run1.xml" "spec-stock-$f-run1.xml" || true
+          } | tee compare.txt
+      # A recorded number is two runs that AGREE. Each column's run 2 against its run 1, as sets: the
+      # same skips and the same failures. This one FAILS the job — the comparison above only reports,
+      # because a Ferro column differing from its control is a finding, not a broken lane, while a
+      # column differing from ITSELF means the measurement is not reproducible.
+      - name: each column's run 2 equals its run 1
+        run: |
+          f=${{ matrix.family }}
+          rc=0
+          for drv in "ferro-$f" "$f" "stock-$f" "spec-$f" "spec-stock-$f"; do
+            php testkit/dbal/compare-columns.php "$drv-run2.xml" "$drv-run1.xml" > "repro-$drv.txt" || true
+            a=$(grep -E '^skip:' "repro-$drv.txt"); b=$(grep -E '^fail:' "repro-$drv.txt")
+            echo "$drv: $a | $b"
+            # Equal sets print the same digest on both sides of each line.
+            for line in "$a" "$b"; do
+              d=$(echo "$line" | grep -oE 'sha256 [0-9a-f]+' | sort -u | wc -l)
+              [ "$d" = 1 ] || { echo "::error:: $drv: run 2 differs from run 1 ($line)"; rc=1; }
+            done
+          done
+          exit $rc
       - uses: actions/upload-artifact@v4
         if: always()
         with:

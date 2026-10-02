@@ -1,0 +1,8 @@
+# testkit/laravel/allowlist-mysql.txt — upstream's MySql-SPECIFIC tests (M2-C1g), recorded as their
+# OWN column. Select with FERRO_LARAVEL_ALLOWLIST=testkit/laravel/allowlist-mysql.txt.
+#
+# Separate from allowlist.txt for the reason allowlist-postgres.txt gives: every class here extends
+# `MySql\MySqlTestCase`, which carries `#[RequiresDatabase('mysql')]`, so under `ferro-mysql` the
+# whole directory SKIPS and it has no default-name column by construction. It runs under `mysql`
+# (the opt-in alias) and `stock-mysql` (the control) — the pair that attributes any non-pass.
+tests/Integration/Database/MySql

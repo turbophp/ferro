@@ -529,8 +529,10 @@ impl PoolEntry {
 
     /// Whether a backslash is an ordinary character inside a literal on this pool's backend, as of
     /// the last probe. `None` on an unknown/expired cache, exactly like [`cached_version`], and
-    /// `None` too when the probe ran but the BACKEND could not answer for free (the MySQL arm
-    /// today) — a client cannot tell those apart and must not: both mean "do not build a literal".
+    /// `None` too when the probe ran but the BACKEND could not answer for free (every backend
+    /// answers since M2-C1g; a parked or errored MySQL connection still cannot). A client cannot
+    /// tell those apart and must not: both mean UNKNOWN. And a known value describes the PROBED
+    /// session only, which is why no shipped tier builds a literal from it (SPEC §22.2 (cc)).
     fn cached_literals_are_standard(&self) -> Option<bool> {
         self.cached().and_then(|(_, l)| l)
     }
@@ -918,10 +920,6 @@ mod tests {
         }
     }
 
-    /// The `HELLO_ACK` metadata: each pool's backend FAMILY rides the wire beside its name, sorted
-    /// by name — and an UNREACHABLE backend still gets its name and family advertised, with
-    /// `server_version: None`. This runs the REAL `pool_info` path (probe attempted, probe failed),
-    /// which is what makes "the handshake never depends on backend availability" a property of the
     /// M2-C2g: an UNREACHABLE pool advertises `literals_are_standard: None`, and that arm matters
     /// more than the reachable one — it is what a client's fail-closed refusal hangs off. Asserted
     /// here rather than only live because "unreachable" is the state a live test cannot stage
@@ -971,6 +969,53 @@ mod tests {
         );
     }
 
+    /// M2-C1g, the MySQL arm, live: the bit is read off the OK packet the probe's checkout already
+    /// holds (`SERVER_STATUS_NO_BACKSLASH_ESCAPES`), so it costs no statement — and on a MySQL pool
+    /// it is ordinarily `Some(false)`, because no default `sql_mode` contains
+    /// `NO_BACKSLASH_ESCAPES`. That is the case the C2g design called out as mattering MORE than
+    /// PostgreSQL's: before C1g a MySQL pool advertised `None`, so a client could not build a literal
+    /// at all, rather than learning that backslashes are escapes. The backend's own `literals_it`
+    /// checks the value against `@@sql_mode` and against a literal's semantics in both states; this
+    /// checks that the registry carries it to the handshake.
+    #[tokio::test]
+    async fn a_reachable_mysql_pool_advertises_that_backslashes_are_escapes() {
+        let Some(url) = env_url("FERRO_TEST_MYSQL_URL") else {
+            return;
+        };
+        let registry = PoolRegistry::build(&one_pool("default", &url));
+        let info = registry.pool_info().await;
+
+        let p = info.first().expect("one pool");
+        assert_eq!(
+            p.literals_are_standard,
+            Some(false),
+            "no MySQL or MariaDB default sql_mode contains NO_BACKSLASH_ESCAPES, so a backslash \
+             IS an escape on a default server — and the engine must say so rather than nil"
+        );
+        assert!(
+            p.server_version.is_some(),
+            "both values ride the same probe; a missing version means the pairing broke"
+        );
+    }
+
+    /// M2-C1g, the SQLite arm: a constant of the library (SQLite has no backslash escape mode), and
+    /// the one family whose reachable arm needs no server — so it runs offline, everywhere.
+    #[tokio::test]
+    async fn a_sqlite_pool_advertises_standard_literals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dsn = format!("sqlite://{}", dir.path().join("lit.db").display());
+        let registry = PoolRegistry::build(&one_pool("default", &dsn));
+        let info = registry.pool_info().await;
+
+        let p = info.first().expect("one pool");
+        assert_eq!(p.kind, "sqlite");
+        assert_eq!(p.literals_are_standard, Some(true));
+    }
+
+    /// The `HELLO_ACK` metadata: each pool's backend FAMILY rides the wire beside its name, sorted
+    /// by name — and an UNREACHABLE backend still gets its name and family advertised, with
+    /// `server_version: None`. This runs the REAL `pool_info` path (probe attempted, probe failed),
+    /// which is what makes "the handshake never depends on backend availability" a property of the
     /// production code rather than of a config-only shortcut.
     #[tokio::test]
     async fn pool_info_carries_the_backend_family_even_when_the_backend_is_unreachable() {

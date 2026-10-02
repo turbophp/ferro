@@ -90,6 +90,13 @@ and a bare `Schema::disableForeignKeyConstraints()` outside a transaction is ref
 tier can reach a second one today. (The MySQL `CALL` defect that used to sit underneath it is fixed:
 §22.2 (av), (aw).)
 
-**`DB::escape()`, `toRawSql()`, `castAsJson()` and `DB::pretend()` with string bindings need a pool
-that advertises `literals_are_standard`.** PostgreSQL pools do; SQLite and MySQL / MariaDB pools do
-not yet, and the shim refuses rather than guesses the escaping rule (§21 D5, §22.2 (at)).
+**`DB::escape()`, `toRawSql()`, `castAsJson()` and `DB::pretend()` with string bindings work on every
+family — but the literal is not always PDO's bytes, on purpose.** A PDO driver escapes by the live
+escape mode of its connection; this tier has no connection to read, and the pool-level mode the
+engine advertises can describe a different session (SPEC §22.2 (cc)). So it uses forms that mean the
+same bytes in every mode: a string without a backslash is quoted by doubling `'` (on MySQL that is
+`'O''Brien'` where `pdo_mysql` writes `'O\'Brien'` — the same string to the server), and a string
+with a backslash becomes `E'…'` on PostgreSQL and `_utf8mb4 X'<hex>'` on MySQL / MariaDB.
+
+**`DB::getPdo()->query()` and `prepare()` are refused** — there is no PDO underneath. Use
+`DB::select()` / `DB::statement()`.
