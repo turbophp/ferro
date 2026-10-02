@@ -687,7 +687,17 @@ fn exec_server_with_config(
 /// `registry.probes_issued()` — the counter that makes "learned once" observable rather than merely
 /// plausible.
 pub fn pools_server(pools: &[(&str, &str)]) -> (TestServer, Arc<PoolRegistry>) {
+    pools_server_with_otlp(pools, None)
+}
+
+/// [`pools_server`] with SPEC §13's OTLP export configured (M2-C4c-2) — the multi-pool fixture the
+/// "a tx span's pool is the one it was pinned to" test needs.
+pub fn pools_server_with_otlp(
+    pools: &[(&str, &str)],
+    otlp: Option<ferrod::otlp::OtlpConfig>,
+) -> (TestServer, Arc<PoolRegistry>) {
     let config = Config {
+        otlp,
         pools: pools
             .iter()
             .map(|(name, dsn)| PoolSpec {

@@ -64,7 +64,12 @@ jobs:
       # version AND checksum in ONE script shared with `ci/local-gate.sh`. Without it the test
       # prints `skip:` and the no-skip gate below fails the lane.
       - name: fetch the OpenTelemetry Collector (the OTLP e2e's consumer)
-        run: echo "FERRO_TEST_OTELCOL=$(./ci/fetch-otelcol.sh /tmp/otelcol)" >> "$GITHUB_ENV"
+        # The assignment is its OWN command so a failed fetch fails the step: inside `echo "X=$(…)"`
+        # a failing substitution is masked and the test would die later on an empty path.
+        run: |
+          bin="$(./ci/fetch-otelcol.sh /tmp/otelcol)"
+          test -x "$bin"
+          echo "FERRO_TEST_OTELCOL=$bin" >> "$GITHUB_ENV"
       - name: live suite (all three engines)
         run: |
           set -o pipefail

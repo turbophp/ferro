@@ -215,11 +215,11 @@ async fn handle_exec(
     // refused for its shape is a span too: one EXEC, one END, one span. It rides the `Responder`,
     // whose `end_*` finishes it whatever path declares the terminal. `begin` returns `None` for an
     // unsampled statement (or when export is off), and only a sampled one pays for its fingerprint.
-    let responder = responder.with_span(
-        registry
-            .tracer()
-            .and_then(|t| t.begin(trace, || exec_span_attrs(registry, &req))),
-    );
+    let responder = responder.with_span(registry.tracer().and_then(|t| {
+        t.begin(trace, || {
+            exec_span_attrs(registry, tx_registry, session_id, &req)
+        })
+    }));
 
     // (2) reject not-yet-supported request shapes (each: one END, session survives).
     if req.query_id.is_some() {
@@ -492,7 +492,7 @@ async fn run_exec_on_pool<B: PoolBackend>(
         };
         crate::slow_log::record(
             &crate::slow_log::SlowStatement {
-                fingerprint: crate::slow_log::fingerprint_of(sql),
+                fingerprint: crate::slow_log::fingerprint_of(sql, pool.backend().dialect()),
                 pool: &req.pool,
                 queue_us,
                 exec_us,
@@ -653,26 +653,49 @@ fn declare_buffered_ok(
 /// The attributes of an EXEC's OTLP span (M2-C4c-2) — the slow log's redaction contract, applied
 /// to a span: the FINGERPRINT and never raw SQL, measurements, closed labels.
 ///
-/// The pool name and family are recorded only for a pool the REGISTRY knows. For an unknown pool
-/// the name is text the client chose — on the tx path it is not even read — and a span is no place
-/// for client-chosen text; the error code says what happened.
-fn exec_span_attrs(registry: &PoolRegistry, req: &ExecRequest) -> Vec<crate::otlp::Attr> {
+/// The pool and its dialect come from the ENGINE, never from the request: an autocommit EXEC's
+/// pool must be one the registry knows, and a tx-scoped EXEC IGNORES its `pool` field, so its pool
+/// is the one the transaction was pinned to at BEGIN (C4c-2 review F5: a tx EXEC claiming another
+/// pool's name had its span report that pool's family). Where neither resolves — an unknown pool,
+/// an unknown `tx_id` — there is no pool, no family and NO QUERY TEXT: the dialect decides where a
+/// literal ends, so without it the fingerprint cannot be trusted to hide one (review F1).
+fn exec_span_attrs(
+    registry: &PoolRegistry,
+    tx_registry: &TxRegistry,
+    session_id: SessionId,
+    req: &ExecRequest,
+) -> Vec<crate::otlp::Attr> {
     use crate::otlp::AttrValue::{Bool, Str};
+    use ferro_classify::Dialect;
     let mut attrs = Vec::with_capacity(11);
-    if let Some(kind) = registry.kind(&req.pool) {
-        let system = match kind {
-            crate::config::PoolKind::Postgres => "postgresql",
-            crate::config::PoolKind::Mysql => "mysql",
-            crate::config::PoolKind::Sqlite => "sqlite",
+    let resolved: Option<(String, Dialect)> = match req.tx_id {
+        None => registry.kind(&req.pool).map(|kind| {
+            let dialect = match kind {
+                crate::config::PoolKind::Postgres => Dialect::Postgres,
+                crate::config::PoolKind::Mysql => Dialect::MySql,
+                crate::config::PoolKind::Sqlite => Dialect::Sqlite,
+            };
+            (req.pool.clone(), dialect)
+        }),
+        Some(tx_id) => tx_registry
+            .lookup(tx_id, session_id)
+            .ok()
+            .map(|h| (h.pool.to_string(), h.dialect)),
+    };
+    if let Some((pool, dialect)) = resolved {
+        let system = match dialect {
+            Dialect::Postgres => "postgresql",
+            Dialect::MySql => "mysql",
+            Dialect::Sqlite => "sqlite",
         };
         attrs.push(("db.system.name", Str(system.to_string())));
-        attrs.push(("ferro.pool", Str(req.pool.clone())));
-    }
-    if let Some(sql) = req.sql.as_deref() {
-        attrs.push((
-            "db.query.text",
-            Str(crate::slow_log::fingerprint_of(sql).to_string()),
-        ));
+        attrs.push(("ferro.pool", Str(pool)));
+        if let Some(sql) = req.sql.as_deref() {
+            attrs.push((
+                "db.query.text",
+                Str(crate::slow_log::fingerprint_of(sql, dialect).to_string()),
+            ));
+        }
     }
     let fetch = match req.fetch {
         FETCH_ROWS => "rows",
@@ -1489,6 +1512,8 @@ async fn begin_on_pool<B: PoolBackend>(
             // Captured at BEGIN from the ONE authority, so the (backend-agnostic) forwarding
             // handler can refuse a tx-scoped `fetch:stream` WITHOUT touching the pinned conn.
             streaming: pool.backend().supports_row_streaming(),
+            pool: req.pool.as_str().into(),
+            dialect: pool.backend().dialect(),
         },
     );
     tokio::spawn(actor::run(
@@ -1997,6 +2022,8 @@ mod tests {
             // These fixtures only exercise `resolve_active`'s lookup states, never a streamed
             // fetch; `true` is the trait default (PG's real value).
             streaming: true,
+            pool: "default".into(),
+            dialect: ferro_classify::Dialect::Postgres,
         }
     }
 

@@ -922,6 +922,8 @@ mod tests {
                 // Derived from the ONE authority, exactly as `begin_on_pool` does (FakeBackend
                 // inherits the `true` default) — never a literal restated here.
                 streaming: pool.backend().supports_row_streaming(),
+                pool: "default".into(),
+                dialect: pool.backend().dialect(),
             },
         );
         tokio::spawn(run(
@@ -1496,6 +1498,8 @@ mod tests {
                 done: done_rx,
                 // Derived from the ONE authority, exactly as `begin_on_pool` does.
                 streaming: pool.backend().supports_row_streaming(),
+                pool: "default".into(),
+                dialect: pool.backend().dialect(),
             },
         );
         // A SHORT teardown bound: the blocked ROLLBACK is abandoned at 50ms, not held forever.

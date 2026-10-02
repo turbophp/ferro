@@ -32,7 +32,9 @@ if [ "$live" = 1 ]; then
   export FERRO_TEST_MYSQL_URL="mysql://ferro:ferro@127.0.0.1:33060/ferro"
   export FERRO_TEST_MARIADB_URL="mysql://ferro:ferro@127.0.0.1:33061/ferro"
   # The OTLP e2e's consumer, a real collector (M2-C4c-2) — the same pinned binary CI uses.
-  FERRO_TEST_OTELCOL="${FERRO_TEST_OTELCOL:-$(./ci/fetch-otelcol.sh "$root/target/otelcol")}"
+  if [ -z "${FERRO_TEST_OTELCOL:-}" ]; then
+    FERRO_TEST_OTELCOL="$(./ci/fetch-otelcol.sh "$root/target/otelcol")"
+  fi
   export FERRO_TEST_OTELCOL
 fi
 

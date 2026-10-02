@@ -73,6 +73,9 @@ pub const MAX_BATCH: usize = 512;
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// The bound on one whole export request: connect, write, read the status line.
 pub const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The most bytes one export request carries. A quarter of otelcol's default receiver limit
+/// (20 MiB), so a collector configured below its default still accepts it.
+pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// The most response bytes read while looking for the status line.
 const MAX_RESPONSE_HEAD: usize = 8 * 1024;
 /// A failed export is logged at most this often, so a down collector cannot flood the log.
@@ -117,6 +120,10 @@ impl ExportCounters {
     pub fn failed(&self) -> u64 {
         self.failed.load(Ordering::Relaxed)
     }
+    #[cfg(test)]
+    pub(crate) fn test_bump_exported(&self, n: u64) {
+        self.exported.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 /// The daemon's one set of export counters.
@@ -136,45 +143,56 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// Parse an `http://host[:port][/path]` URL. `https://` is refused by name rather than sent in
-    /// the clear; userinfo is refused because a credential in a URL is one log line from a leak.
+    /// the clear; userinfo, a query and a fragment are refused because each is where a credential
+    /// lives in a URL.
+    ///
+    /// **No error ever contains the URL** (C4c-2 review F3): the refusal is logged, and the first
+    /// version echoed `http://user:s3cr3t@…` into that log line while refusing it BECAUSE a
+    /// credential in a URL is one log line from a leak — the M1-S6 `infer_pool_kind` class again.
+    /// Each error names the problem and the variable family, nothing the operator typed.
     pub fn parse(url: &str) -> Result<Self, String> {
         let rest = match url.strip_prefix("http://") {
             Some(r) => r,
             None if url.starts_with("https://") => {
-                return Err(format!(
-                    "{url:?}: https is not supported — export to a collector agent on this host \
-                     over http (OTLP/HTTP, normally port 4318)"
-                ));
+                return Err(
+                    "the OTLP endpoint is https, which is not supported — export to a \
+                     collector agent on this host over http (OTLP/HTTP, normally port 4318)"
+                        .to_string(),
+                );
             }
-            None => return Err(format!("{url:?} is not an http:// URL")),
+            None => return Err("the OTLP endpoint is not an http:// URL".to_string()),
         };
-        let (authority, path) = match rest.find(['/', '?', '#']) {
+        if rest.contains(['?', '#']) {
+            return Err(
+                "the OTLP endpoint carries a query or fragment, which is not supported".to_string(),
+            );
+        }
+        let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
         };
-        if path.starts_with(['?', '#']) {
-            return Err(format!("{url:?}: a query or fragment is not supported"));
-        }
         if authority.contains('@') {
-            return Err(format!("{url:?}: credentials in the URL are not supported"));
+            return Err(
+                "the OTLP endpoint carries credentials, which are not supported".to_string(),
+            );
         }
         let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
             let end = v6
                 .find(']')
-                .ok_or_else(|| format!("{url:?}: unterminated IPv6 literal"))?;
+                .ok_or("the OTLP endpoint has an unterminated IPv6 literal")?;
             let port = match &v6[end + 1..] {
                 "" => 80,
-                p => parse_port(p.strip_prefix(':').unwrap_or("x"), url)?,
+                p => parse_port(p.strip_prefix(':').unwrap_or("x"))?,
             };
             (&v6[..end], port)
         } else {
             match authority.rsplit_once(':') {
-                Some((h, p)) => (h, parse_port(p, url)?),
+                Some((h, p)) => (h, parse_port(p)?),
                 None => (authority, 80),
             }
         };
         if host.is_empty() {
-            return Err(format!("{url:?}: no host"));
+            return Err("the OTLP endpoint has no host".to_string());
         }
         Ok(Self {
             host: host.to_string(),
@@ -193,11 +211,11 @@ impl Endpoint {
     }
 }
 
-fn parse_port(p: &str, url: &str) -> Result<u16, String> {
+fn parse_port(p: &str) -> Result<u16, String> {
     p.parse::<u16>()
         .ok()
         .filter(|&n| n != 0)
-        .ok_or_else(|| format!("{url:?}: bad port {p:?}"))
+        .ok_or_else(|| "the OTLP endpoint has an invalid port".to_string())
 }
 
 /// What happens to a statement whose caller sent NO trace context. See the module doc.
@@ -230,6 +248,19 @@ pub fn config_from(get: &dyn Fn(&str) -> Option<String>) -> Result<Option<OtlpCo
 
     if var("OTEL_SDK_DISABLED").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
         return Ok(None);
+    }
+    // `none` turns the trace exporter off whatever endpoint is set (the OpenTelemetry environment
+    // specification); before the C4c-2 review it was never read, so `none` plus an endpoint
+    // EXPORTED — a fail-open. Anything but `otlp` is an exporter this daemon does not have.
+    match var("OTEL_TRACES_EXPORTER").as_deref() {
+        None | Some("otlp") => {}
+        Some("none") => return Ok(None),
+        Some(other) => {
+            return Err(format!(
+                "OTEL_TRACES_EXPORTER={other:?} is not supported — ferrod exports otlp, or \
+                 nothing with none"
+            ));
+        }
     }
     let url = match (
         var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"),
@@ -385,9 +416,11 @@ pub struct SpanRecord {
 /// An EXEC's span while the statement runs. It is carried by the request's `Responder` and finished
 /// by whichever `end_*` declares the ONE terminal — so one `END` is one span, by construction.
 ///
-/// **Dropped unfinished, it still exports**, as an error with `error.type = NoTerminal`: a handler
-/// that panics or returns without declaring a terminal gets a synthesized error `END` from the
-/// supervisor, and the span says what the client saw rather than disappearing.
+/// **Dropped unfinished, it still exports**, as the error the client was actually sent: a handler
+/// that panics or returns without declaring a terminal gets the supervisor's synthesized
+/// `errc::PROTOCOL` END, so the span reports that code (as the C4c-2 review asked — the first
+/// version invented a `NoTerminal` type no END ever carried) plus `ferro.no_terminal = true`, which
+/// is what tells an operator it was a handler bug rather than a wire fault.
 #[derive(Debug)]
 pub struct ExecSpan {
     inner: Option<Pending>,
@@ -437,7 +470,12 @@ impl ExecSpan {
 impl Drop for ExecSpan {
     fn drop(&mut self) {
         if let Some(p) = self.inner.take() {
-            p.emit(Some(("NoTerminal", None)));
+            let mut p = p;
+            p.attrs.push(("ferro.no_terminal", AttrValue::Bool(true)));
+            p.emit(Some((
+                code_name(errc::PROTOCOL),
+                Some(branch_name(errc::PROTOCOL_BRANCH)),
+            )));
         }
     }
 }
@@ -654,9 +692,47 @@ async fn flush(
     counters: &ExportCounters,
     last_warned: &mut Option<Instant>,
 ) {
-    let n = batch.len() as u64;
-    let body = render_request(service_name, batch);
-    batch.clear();
+    let spans = std::mem::take(batch);
+    // One request per CHUNK of at most MAX_BODY_BYTES (C4c-2 review F2): a collector refuses a
+    // whole request over its body limit (otelcol's default is 20 MiB), so one tenant's large spans
+    // in a count-sized batch blacked out every other tenant's spans sharing it.
+    for chunk in chunk_by_size(&spans, MAX_BODY_BYTES) {
+        export_chunk(endpoint, service_name, chunk, counters, last_warned).await;
+    }
+}
+
+/// Split `spans` into consecutive runs whose rendered size stays under `budget`. A single span is
+/// never split (it is bounded far below any budget by the fingerprint's input limit), so a run is
+/// never empty.
+fn chunk_by_size(spans: &[SpanRecord], budget: usize) -> Vec<&[SpanRecord]> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut size = 0usize;
+    for (i, s) in spans.iter().enumerate() {
+        let mut one = String::new();
+        render_span(&mut one, s);
+        if i > start && size + one.len() > budget {
+            chunks.push(&spans[start..i]);
+            start = i;
+            size = 0;
+        }
+        size += one.len() + 1;
+    }
+    if start < spans.len() {
+        chunks.push(&spans[start..]);
+    }
+    chunks
+}
+
+async fn export_chunk(
+    endpoint: &Endpoint,
+    service_name: &str,
+    spans: &[SpanRecord],
+    counters: &ExportCounters,
+    last_warned: &mut Option<Instant>,
+) {
+    let n = spans.len() as u64;
+    let body = render_request(service_name, spans);
     let failure = match post(endpoint, body.as_bytes(), EXPORT_TIMEOUT).await {
         Ok(status) if (200..300).contains(&status) => {
             counters.exported.fetch_add(n, Ordering::Relaxed);
@@ -701,23 +777,52 @@ pub async fn post(endpoint: &Endpoint, body: &[u8], budget: Duration) -> Result<
             .write_all(body)
             .await
             .map_err(|e| format!("write: {e}"))?;
-        let mut buf = Vec::with_capacity(256);
+        // The FINAL status line. An interim `1xx` response (a `100 Continue` some servers send
+        // unasked) ends at its own blank line and is skipped: reading it as the answer counted a
+        // successful export as failed (C4c-2 review F10).
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
         let mut chunk = [0u8; 512];
-        while !buf.windows(2).any(|w| w == b"\r\n") && buf.len() < MAX_RESPONSE_HEAD {
+        loop {
+            if let Some(status) = complete_status_line(&buf)? {
+                if !(100..200).contains(&status) {
+                    return Ok(status);
+                }
+                // Drop the interim head once it is complete, and look again.
+                match buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    Some(end) => {
+                        buf.drain(..end + 4);
+                        continue;
+                    }
+                    None if buf.len() >= MAX_RESPONSE_HEAD => {
+                        return Err("an interim response head too long".to_string());
+                    }
+                    None => {}
+                }
+            } else if buf.len() >= MAX_RESPONSE_HEAD {
+                return Err("no HTTP status line in the response".to_string());
+            }
             let n = stream
                 .read(&mut chunk)
                 .await
                 .map_err(|e| format!("read: {e}"))?;
             if n == 0 {
-                break;
+                return parse_status_line(&buf);
             }
             buf.extend_from_slice(&chunk[..n]);
         }
-        parse_status_line(&buf)
     };
     tokio::time::timeout(budget, exchange)
         .await
         .map_err(|_| format!("no response within {budget:?}"))?
+}
+
+/// `Some(status)` once `buf` holds a whole status line, `None` while it does not yet.
+fn complete_status_line(buf: &[u8]) -> Result<Option<u16>, String> {
+    if buf.windows(2).any(|w| w == b"\r\n") {
+        parse_status_line(buf).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn parse_status_line(buf: &[u8]) -> Result<u16, String> {
@@ -1052,7 +1157,14 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().error.as_deref(), Some("Cancelled"));
 
         drop(t.begin(parent, Vec::new).unwrap());
-        assert_eq!(rx.try_recv().unwrap().error.as_deref(), Some("NoTerminal"));
+        // Reported as the code the client was actually SENT (the supervisor's synthesized
+        // `Protocol` END), flagged as a handler bug.
+        let s = rx.try_recv().unwrap();
+        assert_eq!(s.error.as_deref(), Some("Protocol"));
+        assert!(
+            s.attrs
+                .contains(&("ferro.no_terminal", AttrValue::Bool(true)))
+        );
 
         assert!(rx.try_recv().is_err(), "exactly one span per EXEC");
     }
@@ -1189,5 +1301,194 @@ mod tests {
         let r = post(&ep, b"{}", Duration::from_millis(200)).await;
         assert!(r.is_err(), "{r:?}");
         assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    /// C4c-2 review F3: a refused endpoint is LOGGED, so no error may carry the URL — the credential
+    /// it was refused for would be in the log line.
+    #[test]
+    fn no_refusal_echoes_the_url() {
+        for url in [
+            "http://otel:s3cr3t-pass@collector:4318/v1/traces",
+            "https://ingest.example/v1/traces?api-key=s3cr3t-key",
+            "http://collector:4318/v1/traces?token=s3cr3t-tok",
+            "http://collector:4318/v1/traces#s3cr3t-frag",
+            "ftp://s3cr3t-host/x",
+            "http://s3cr3t-host:99999/x",
+            "http://[s3cr3t::1/x",
+        ] {
+            let e = Endpoint::parse(url).expect_err(url);
+            assert!(!e.contains("s3cr3t"), "{url} → {e}");
+            let e =
+                config_from(&env(&[("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", url)])).expect_err(url);
+            assert!(!e.contains("s3cr3t"), "{url} → {e}");
+        }
+    }
+
+    /// C4c-2 review F6: `OTEL_TRACES_EXPORTER=none` turns export OFF even with an endpoint set.
+    #[test]
+    fn the_traces_exporter_variable_is_honoured() {
+        let ep = ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318");
+        assert_eq!(
+            config_from(&env(&[ep, ("OTEL_TRACES_EXPORTER", "none")])),
+            Ok(None)
+        );
+        assert!(
+            config_from(&env(&[ep, ("OTEL_TRACES_EXPORTER", "otlp")]))
+                .unwrap()
+                .is_some()
+        );
+        let e = config_from(&env(&[ep, ("OTEL_TRACES_EXPORTER", "zipkin")])).unwrap_err();
+        assert!(e.contains("zipkin"), "{e}");
+    }
+
+    async fn stub_collector(response: &'static [u8]) -> Endpoint {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 65536];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s.write_all(response).await;
+                });
+            }
+        });
+        Endpoint::parse(&format!("http://{addr}/v1/traces")).unwrap()
+    }
+
+    /// C4c-2 review F10: an interim `100 Continue` is not the answer.
+    #[tokio::test]
+    async fn an_interim_response_is_skipped() {
+        let ep = stub_collector(
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert_eq!(post(&ep, b"{}", EXPORT_TIMEOUT).await, Ok(200));
+    }
+
+    fn record(attr_bytes: usize) -> SpanRecord {
+        SpanRecord {
+            trace_id: [1; 16],
+            span_id: [2; 8],
+            parent_span_id: None,
+            trace_flags: 1,
+            start_unix_nanos: 1,
+            end_unix_nanos: 2,
+            attrs: vec![("db.query.text", AttrValue::Str("x".repeat(attr_bytes)))],
+            error: None,
+        }
+    }
+
+    /// Exact counting, against counters this test owns: a 2xx counts every span EXPORTED, and a
+    /// collector that ANSWERS with an error counts every span FAILED and none exported (the
+    /// review's surviving mutation `l` counted a 503 as exported; `q` never counted at all).
+    #[tokio::test]
+    async fn a_collectors_answer_decides_exported_or_failed_exactly() {
+        let mut last = None;
+        let ok = stub_collector(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let c = leak();
+        let mut batch = vec![record(10), record(10), record(10)];
+        flush(&ok, "t", &mut batch, c, &mut last).await;
+        assert_eq!((c.exported(), c.failed()), (3, 0));
+        assert!(batch.is_empty(), "a flushed batch is emptied");
+
+        for status in [
+            &b"HTTP/1.1 503 Service Unavailable\r\n\r\n"[..],
+            b"HTTP/1.1 400 Bad Request\r\n\r\n",
+        ] {
+            let bad = stub_collector(status).await;
+            let c = leak();
+            let mut batch = vec![record(10), record(10)];
+            flush(&bad, "t", &mut batch, c, &mut last).await;
+            assert_eq!(
+                (c.exported(), c.failed()),
+                (0, 2),
+                "{}",
+                String::from_utf8_lossy(status)
+            );
+        }
+    }
+
+    /// C4c-2 review F2: requests are split by SIZE, so no request crosses the budget unless one span
+    /// alone does, and every span is sent exactly once, in order.
+    #[test]
+    fn chunks_respect_the_body_budget() {
+        let spans: Vec<SpanRecord> = (0..40).map(|_| record(1000)).collect();
+        let chunks = chunk_by_size(&spans, 5_000);
+        assert!(
+            chunks.len() > 1,
+            "40 one-KiB spans must not fit one 5 KB request"
+        );
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 40);
+        for c in &chunks {
+            let body = render_request("t", c);
+            assert!(
+                body.len() <= 5_000 + 512,
+                "a chunk of {} spans rendered {} bytes",
+                c.len(),
+                body.len()
+            );
+        }
+        let one_big = vec![record(10_000)];
+        assert_eq!(
+            chunk_by_size(&one_big, 5_000).len(),
+            1,
+            "a lone span is never split away"
+        );
+        assert!(chunk_by_size(&[], 5_000).is_empty());
+    }
+
+    /// `flush` itself splits by size — not only `chunk_by_size` in isolation: a batch over
+    /// [`MAX_BODY_BYTES`] reaches the collector as several requests, none over the budget.
+    #[tokio::test]
+    async fn flush_sends_an_oversized_batch_as_several_bounded_requests() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let sizes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let seen = sizes.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = vec![0u8; 65536];
+                    let (head_end, len) = loop {
+                        let n = s.read(&mut chunk).await.unwrap();
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..i]).to_string();
+                            let len: usize = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("Content-Length: "))
+                                .unwrap()
+                                .parse()
+                                .unwrap();
+                            break (i + 4, len);
+                        }
+                    };
+                    while buf.len() < head_end + len {
+                        let n = s.read(&mut chunk).await.unwrap();
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    seen.lock().unwrap().push(len);
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        let ep = Endpoint::parse(&format!("http://{addr}/v1/traces")).unwrap();
+        let c = leak();
+        let mut last = None;
+        // ~5.5 MiB of 4 KiB spans: over one request's budget.
+        let mut batch: Vec<SpanRecord> = (0..1400).map(|_| record(4096)).collect();
+        flush(&ep, "t", &mut batch, c, &mut last).await;
+        let sizes = sizes.lock().unwrap().clone();
+        assert!(sizes.len() >= 2, "one oversized request: {sizes:?}");
+        assert!(
+            sizes.iter().all(|&n| n <= MAX_BODY_BYTES + 1024),
+            "{sizes:?}"
+        );
+        assert_eq!(c.exported(), 1400);
     }
 }

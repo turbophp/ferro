@@ -23,7 +23,7 @@
 //! consenting on behalf of the data subject. A type and a length identify which bind went wrong —
 //! which is what the setting is FOR — without the log becoming a place secrets live.
 
-use ferro_classify::{Fingerprint, fingerprint};
+use ferro_classify::{Dialect, Fingerprint, fingerprint};
 use ferro_pool::error::PoolError;
 use ferro_proto::value::Value;
 
@@ -104,8 +104,10 @@ pub fn record(stmt: &SlowStatement<'_>, threshold_ms: Option<u64>, log_params: L
 /// Build the fingerprint for a statement about to be recorded.
 ///
 /// A thin re-export so the call sites never touch raw SQL for longer than this one expression.
-pub fn fingerprint_of(sql: &str) -> Fingerprint {
-    fingerprint(sql)
+/// `dialect` is the dialect the statement RUNS in: a literal's boundaries are dialect-specific, and
+/// reading a MySQL statement with PostgreSQL's rules exposes its `"…"` strings (C4c-2 review F1).
+pub fn fingerprint_of(sql: &str, dialect: Dialect) -> Fingerprint {
+    fingerprint(sql, dialect)
 }
 
 /// A failed statement's error as a CLOSED LABEL — the `PoolError` variant's name, never its
@@ -176,7 +178,10 @@ mod tests {
 
     fn stmt<'a>(params: &'a [Value], error: Option<&'a str>) -> SlowStatement<'a> {
         SlowStatement {
-            fingerprint: fingerprint_of("SELECT * FROM t WHERE email = 'alice@example.com'"),
+            fingerprint: fingerprint_of(
+                "SELECT * FROM t WHERE email = 'alice@example.com'",
+                Dialect::Postgres,
+            ),
             pool: "default",
             queue_us: 1_000,
             exec_us: 250_000,

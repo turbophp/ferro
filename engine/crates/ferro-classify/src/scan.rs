@@ -328,7 +328,7 @@ fn is_e_string_prefix(sql: &str, quote_pos: usize) -> bool {
 /// `[A-Za-z_][A-Za-z0-9_]*` or empty; a digit immediately after `$` (e.g. `$1`) is a positional
 /// param, NOT a dollar-quote, so this returns `None` and the `$` is ordinary Code. Ported from
 /// `placeholder.rs`'s `dollar_quote_tag_end` (`placeholder.rs:173-189`).
-fn dollar_quote_tag(sql: &str, start: usize) -> Option<(&str, usize)> {
+pub(crate) fn dollar_quote_tag(sql: &str, start: usize) -> Option<(&str, usize)> {
     let bytes = sql.as_bytes();
     debug_assert_eq!(bytes[start], b'$');
     let mut j = start + 1;

@@ -62,8 +62,19 @@ fn sqlite_url(tag: &str) -> (String, std::path::PathBuf) {
             .unwrap()
             .as_nanos(),
     ));
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
     (format!("sqlite://{}", path.display()), path)
+}
+
+/// Remove a test database AND its WAL sidecars — the C4c-2 review counted twelve `-wal`/`-shm`
+/// files left in the temp dir by every green run.
+fn remove_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    for suffix in ["-wal", "-shm"] {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 fn otlp_to(addr: std::net::SocketAddr, sampler: Sampler, flush: Duration) -> OtlpConfig {
@@ -326,6 +337,10 @@ async fn every_exec_path_exports_one_span_linked_to_the_callers_trace() {
     }
 
     let read = by_parent(&spans, 1);
+    for p in 1..=4 {
+        assert_full_shape(&by_parent(&spans, p), p, true);
+    }
+    assert_full_shape(&by_parent(&spans, 5), 5, false);
     let a = attrs(&read);
     assert_eq!(a["db.system.name"]["stringValue"], "sqlite");
     assert_eq!(a["ferro.pool"]["stringValue"], "default");
@@ -392,7 +407,7 @@ async fn every_exec_path_exports_one_span_linked_to_the_callers_trace() {
         "a statement's literal reached an exported span"
     );
     drop(c);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 /// The caller decides: an UNSAMPLED context gets no span, and neither does a statement with no
@@ -436,7 +451,7 @@ async fn only_a_sampled_caller_gets_a_span_by_default() {
     );
     assert_eq!(spans[0]["parentSpanId"], format!("{:016x}", 11));
     drop(c);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 /// `OTEL_TRACES_SAMPLER=parentbased_always_on` roots a NEW trace for a statement with no context —
@@ -473,7 +488,7 @@ async fn parentbased_always_on_roots_an_unparented_statement() {
     assert_ne!(trace, TRACE, "a new trace, not the unsampled caller's");
     assert_eq!(root["flags"], 1, "sampled, no remote parent");
     drop(c);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 /// A collector that is DOWN never fails, delays or blocks a statement — the spans are counted as
@@ -509,7 +524,7 @@ async fn an_unreachable_collector_never_fails_a_statement() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     drop(c);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 /// `main` calls `Tracer::shutdown` at exit: what is still queued is exported, not lost. The flush
@@ -548,7 +563,7 @@ async fn shutdown_exports_what_is_still_queued() {
     let spans = got.wait_for(1).await;
     by_parent(&spans, 41);
     drop(c);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 /// A child process that is killed when the test ends, however it ends.
@@ -685,13 +700,373 @@ async fn the_real_collector_accepts_and_exports_every_field() {
             .unwrap()
             .contains("<> ?")
     );
+    // Every field, in its type, after the collector's own parse and re-encode (review F7).
+    assert_full_shape(&read, 0x51, true);
     let failed = by_parent(&spans, 0x52);
+    assert_full_shape(&failed, 0x52, false);
     assert_eq!(failed["status"]["code"], 2);
     assert_eq!(failed["status"]["message"], "Syntax");
     assert_eq!(attrs(&failed)["error.type"]["stringValue"], "Syntax");
 
     drop(c);
     drop(collector);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Send one EXEC and return its decoded success terminal AND the terminal body's length — the span's
+/// `ferro.response_bytes` is pinned against that length, so the test needs the bytes, not just the
+/// decoded value. Streamed frames before the terminal are skipped and their payload bytes summed.
+async fn exec_measured(
+    c: &mut common::TestClient,
+    rid: u32,
+    r: &ExecRequest,
+) -> (ferro_proto::messages::sql::ExecOk, usize) {
+    use ferro_proto::consts::method_sql;
+    c.send_request(rid, service::SQL, method_sql::EXEC, r.encode())
+        .await;
+    loop {
+        let f = c.recv().await;
+        if f.header.flags & flags::END == flags::END {
+            match Outcome::decode(&f.payload).unwrap() {
+                Outcome::Ok(body) => {
+                    let ok = ferro_proto::messages::sql::ExecOk::decode(&body).unwrap();
+                    return (ok, body.len());
+                }
+                other => panic!("expected success: {other:?}"),
+            }
+        }
+    }
+}
+
+fn int_attr(a: &HashMap<String, Value>, k: &str) -> u64 {
+    a.get(k)
+        .and_then(|v| v["intValue"].as_str())
+        .unwrap_or_else(|| panic!("{k} missing or not an intValue string: {a:?}"))
+        .parse()
+        .unwrap()
+}
+
+/// Every field a span carries, in its OTLP/JSON type — shared by the in-test receiver and the REAL
+/// collector, so a field the collector silently drops fails here (the C4c-2 review renamed `flags`
+/// and both timestamps and the collector test stayed green, because it never asked for them).
+fn assert_full_shape(s: &Value, parent: u64, success: bool) {
+    assert_eq!(s["traceId"], TRACE, "{s}");
+    let span_id = s["spanId"].as_str().unwrap();
+    assert!(
+        span_id.len() == 16
+            && span_id != "0000000000000000"
+            && span_id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "{s}"
+    );
+    assert_eq!(s["parentSpanId"], format!("{parent:016x}"));
+    assert_eq!(s["flags"], 0x301, "sampled + parent remote: {s}");
+    assert_eq!(s["name"], "EXEC");
+    assert_eq!(s["kind"], 3);
+    let start: u64 = s["startTimeUnixNano"].as_str().unwrap().parse().unwrap();
+    let end: u64 = s["endTimeUnixNano"].as_str().unwrap().parse().unwrap();
+    assert!(start > 1_700_000_000_000_000_000 && end >= start, "{s}");
+    let a = attrs(s);
+    for k in [
+        "db.system.name",
+        "ferro.pool",
+        "db.query.text",
+        "ferro.fetch",
+    ] {
+        assert!(a[k]["stringValue"].is_string(), "{k}: {s}");
+    }
+    for k in ["ferro.in_tx", "ferro.readonly"] {
+        assert!(a[k]["boolValue"].is_boolean(), "{k}: {s}");
+    }
+    if success {
+        for k in [
+            "db.response.returned_rows",
+            "ferro.rows_affected",
+            "ferro.queue_us",
+            "ferro.exec_us",
+            "ferro.response_bytes",
+        ] {
+            int_attr(&a, k);
+        }
+        // UNSET: absent as this crate sends it, `{}` once a collector has re-encoded it.
+        let status = s.get("status");
+        assert!(
+            status.is_none_or(|st| st.get("code").is_none_or(|c| c == 0)),
+            "success leaves the status unset: {s}"
+        );
+    } else {
+        assert_eq!(s["status"]["code"], 2);
+        assert!(a["error.type"]["stringValue"].is_string());
+        assert!(a["ferro.error.branch"]["stringValue"].is_string());
+    }
+}
+
+/// **The span's measurements ARE the terminal's** — one read, not two (lesson 26). The review's
+/// surviving mutations swapped `queue_us`/`exec_us`, zeroed the span's duration, counted a
+/// `fetch:none` SELECT's rows as returned, dropped a stream's DATA bytes from `response_bytes` and
+/// pinned `readonly` to a constant; each now fails one of these equalities.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_measurement_on_a_span_equals_its_terminals() {
+    let (addr, got) = receiver().await;
+    let (url, path) = sqlite_url("measure");
+    let (server, _registry) = exec_server_with_otlp(
+        url,
+        otlp_to(
+            addr,
+            Sampler::ParentBasedAlwaysOff,
+            Duration::from_millis(50),
+        ),
+    );
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    exec_ok(&mut c, 2, &write("create table t (id integer primary key)")).await;
+    exec_ok(&mut c, 3, &write("insert into t (id) values (1), (2), (3)")).await;
+
+    // (1) A read with measurable execution time, declared readonly.
+    let heavy = "with recursive c(x) as (select 1 union all select x + 1 from c where x < 300000) \
+                 select count(*) from c";
+    let (read_ok, read_len) = exec_measured(&mut c, 10, &traced(1, req(heavy))).await;
+    // (2) A write, NOT readonly.
+    let (write_ok, write_len) = exec_measured(
+        &mut c,
+        11,
+        &traced(2, write("insert into t (id) values (4)")),
+    )
+    .await;
+    // (3) A SELECT under fetch:none: the client gets no rows, so neither does the span.
+    let none = ExecRequest {
+        fetch: 1,
+        ..traced(3, req("select id from t"))
+    };
+    let (none_ok, none_len) = exec_measured(&mut c, 12, &none).await;
+    // (4) A stream: HEAD and DATA bytes count, as well as the terminal's.
+    let st = ExecRequest {
+        fetch: 2,
+        ..traced(4, req("select id from t order by id"))
+    };
+    let (st_ok, st_len) = exec_measured(&mut c, 13, &st).await;
+
+    let spans = got.wait_for(4).await;
+    let check = |parent: u64,
+                 ok: &ferro_proto::messages::sql::ExecOk,
+                 response_bytes: u64,
+                 readonly: bool| {
+        let s = by_parent(&spans, parent);
+        assert_full_shape(&s, parent, true);
+        let a = attrs(&s);
+        assert_eq!(
+            int_attr(&a, "ferro.queue_us"),
+            ok.stats.queue_us,
+            "queue_us, parent {parent}"
+        );
+        assert_eq!(
+            int_attr(&a, "ferro.exec_us"),
+            ok.stats.exec_us,
+            "exec_us, parent {parent}"
+        );
+        assert_eq!(
+            int_attr(&a, "ferro.rows_affected"),
+            ok.affected,
+            "affected, parent {parent}"
+        );
+        assert_eq!(
+            int_attr(&a, "ferro.response_bytes"),
+            response_bytes,
+            "bytes, parent {parent}"
+        );
+        assert_eq!(
+            a["ferro.readonly"]["boolValue"], readonly,
+            "readonly, parent {parent}"
+        );
+        let start: u64 = s["startTimeUnixNano"].as_str().unwrap().parse().unwrap();
+        let end: u64 = s["endTimeUnixNano"].as_str().unwrap().parse().unwrap();
+        assert!(
+            end - start >= ok.stats.exec_us * 1000,
+            "the span must cover the execution: {s}"
+        );
+        a
+    };
+    let a = check(1, &read_ok, read_len as u64, true);
+    assert!(
+        read_ok.stats.exec_us > 1000,
+        "the fixture must take measurable time: {:?}",
+        read_ok.stats
+    );
+    assert!(
+        read_ok.stats.exec_us > read_ok.stats.queue_us,
+        "{:?}",
+        read_ok.stats
+    );
+    assert_eq!(int_attr(&a, "db.response.returned_rows"), 1);
+    let a = check(2, &write_ok, write_len as u64, false);
+    assert_eq!(int_attr(&a, "ferro.rows_affected"), 1);
+    let a = check(3, &none_ok, none_len as u64, true);
+    assert_eq!(
+        int_attr(&a, "db.response.returned_rows"),
+        0,
+        "fetch:none returns no rows"
+    );
+    assert_eq!(a["ferro.fetch"]["stringValue"], "none");
+    let a = check(4, &st_ok, st_ok.stats.bytes + st_len as u64, true);
+    assert_eq!(int_attr(&a, "db.response.returned_rows"), st_ok.stats.rows);
+    assert!(
+        st_ok.stats.bytes > 0,
+        "HEAD/DATA bytes are what this case exists to count"
+    );
+    drop(c);
+    remove_db(&path);
+}
+
+/// A request refused for its SHAPE — before any pool or backend — is a span too. The review's
+/// mutation `m` opened the span after the shape checks and survived, because the earlier "refused"
+/// case (an unknown pool) is refused AFTER them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_refused_for_its_shape_is_a_span() {
+    let (addr, got) = receiver().await;
+    let (url, path) = sqlite_url("shape");
+    let (server, _registry) = exec_server_with_otlp(
+        url,
+        otlp_to(
+            addr,
+            Sampler::ParentBasedAlwaysOff,
+            Duration::from_millis(50),
+        ),
+    );
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    exec_err(
+        &mut c,
+        2,
+        &ExecRequest {
+            query_id: Some("q".into()),
+            sql: None,
+            ..traced(1, req("x"))
+        },
+    )
+    .await;
+    exec_err(
+        &mut c,
+        3,
+        &ExecRequest {
+            fetch: 9,
+            ..traced(2, req("select 1"))
+        },
+    )
+    .await;
+    exec_err(
+        &mut c,
+        4,
+        &ExecRequest {
+            sql: None,
+            ..traced(3, req("x"))
+        },
+    )
+    .await;
+    let spans = got.wait_for(3).await;
+    for p in 1..=3 {
+        let s = by_parent(&spans, p);
+        assert_eq!(s["status"]["message"], "Unsupported", "{s}");
+    }
+    drop(c);
+    remove_db(&path);
+}
+
+/// C4c-2 review F5: a tx-scoped EXEC IGNORES its request's `pool`, so its span must name the pool
+/// the transaction was pinned to — not the one the client claims.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tx_spans_pool_is_the_one_it_was_pinned_to() {
+    let (addr, got) = receiver().await;
+    let (url_a, path_a) = sqlite_url("pin-a");
+    let (url_b, path_b) = sqlite_url("pin-b");
+    let (server, _registry) = common::pools_server_with_otlp(
+        &[("default", url_a.as_str()), ("other", url_b.as_str())],
+        Some(otlp_to(
+            addr,
+            Sampler::ParentBasedAlwaysOff,
+            Duration::from_millis(50),
+        )),
+    );
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    let tx_id = begin(&mut c, 2).await;
+    exec_ok(
+        &mut c,
+        3,
+        &ExecRequest {
+            tx_id: Some(tx_id),
+            pool: "other".into(),
+            ..traced(1, req("select 1"))
+        },
+    )
+    .await;
+    commit(&mut c, 4, tx_id).await;
+    let s = by_parent(&got.wait_for(1).await, 1);
+    assert_eq!(attrs(&s)["ferro.pool"]["stringValue"], "default", "{s}");
+    drop(c);
+    remove_db(&path_a);
+    remove_db(&path_b);
+}
+
+/// The server backends: each span names its FAMILY, and a literal written in that dialect's own
+/// quoting stays out of the span (C4c-2 review F1 — MySQL's `"…"` strings and `\'` escapes reached
+/// a collector). Runs where the integration lane provides the servers; prints `skip:` otherwise,
+/// which that lane's no-skip gate turns into a failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_backends_name_their_family_and_keep_their_literals_out() {
+    let cases: Vec<(String, &str, Vec<String>)> = [
+        (
+            common::pg_url(),
+            "postgresql",
+            vec![format!("select 'a\\', '{SECRET}' as x")],
+        ),
+        (
+            common::mysql_url(),
+            "mysql",
+            vec![
+                format!("select 1 from dual where 'x' <> \"{SECRET}\""),
+                format!("select 1 from dual where 'O\\'Brien' <> '{SECRET}'"),
+                format!("select 1 # {SECRET}\n from dual"),
+            ],
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(url, fam, stmts)| url.map(|u| (u, fam, stmts)))
+    .collect();
+    if cases.len() < 2 {
+        eprintln!(
+            "skip: FERRO_TEST_PG_URL / FERRO_TEST_MYSQL_URL unset — the server-backend OTLP spans did not run"
+        );
+        if cases.is_empty() {
+            return;
+        }
+    }
+    for (url, family, stmts) in cases {
+        let (addr, got) = receiver().await;
+        let (server, _registry) = exec_server_with_otlp(
+            url,
+            otlp_to(
+                addr,
+                Sampler::ParentBasedAlwaysOff,
+                Duration::from_millis(50),
+            ),
+        );
+        let mut c = server.connect().await;
+        c.hello(1).await;
+        for (i, sql) in stmts.iter().enumerate() {
+            exec_ok(&mut c, 10 + i as u32, &traced(100 + i as u64, req(sql))).await;
+        }
+        let spans = got.wait_for(stmts.len()).await;
+        for (i, _) in stmts.iter().enumerate() {
+            let s = by_parent(&spans, 100 + i as u64);
+            assert_eq!(attrs(&s)["db.system.name"]["stringValue"], family, "{s}");
+        }
+        assert!(
+            !got.bodies().contains(SECRET),
+            "{family}: a literal reached a span:\n{}",
+            got.bodies()
+        );
+        drop(c);
+    }
 }

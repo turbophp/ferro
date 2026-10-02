@@ -208,6 +208,12 @@ pub struct TxHandle {
     /// only be refused INSIDE the actor — i.e. after checkout + BEGIN, force-tainting the pinned
     /// connection.
     pub streaming: bool,
+    /// The pool this transaction is pinned to, and that pool's SQL dialect — captured at BEGIN.
+    /// The tx-scoped EXEC IGNORES its request's `pool` field, so anything that describes the
+    /// statement (the OTLP span's pool and family, the dialect its fingerprint is read in) must
+    /// come from here, not from the client's claim (C4c-2 review F5).
+    pub pool: std::sync::Arc<str>,
+    pub dialect: ferro_classify::Dialect,
 }
 
 /// The reason a [`TxRegistry::lookup`] failed.
@@ -417,6 +423,8 @@ mod tests {
             done: done_rx,
             // Registry/lookup fixtures only; `true` is the trait default (PG's real value).
             streaming: true,
+            pool: "default".into(),
+            dialect: ferro_classify::Dialect::Postgres,
         }
     }
 
