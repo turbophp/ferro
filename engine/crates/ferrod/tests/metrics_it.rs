@@ -456,3 +456,53 @@ async fn a_real_transaction_moves_the_pin_and_checkout_series() {
         "the abandoned transaction's pin must be observed exactly once",
     );
 }
+
+/// **M2-C4c-1: a malformed W3C `traceparent` is dropped and COUNTED — the statement still runs.**
+///
+/// An observability field must never be why a statement fails, and a provider emitting junk must
+/// still be visible to an operator. Only this test in this binary sends a `traceparent`, so the
+/// process-wide counter's deltas are exact here.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_traceparent_is_counted_and_never_fails_the_statement() {
+    const INVALID: &str = "ferro_traceparent_invalid_total";
+    let (server, metrics_addr, _metrics_guard) = exec_server_with_metrics().await;
+    let mut c = server.connect().await;
+    c.hello(1).await;
+
+    let before = scrape(metrics_addr).await;
+    let base = series(&before, INVALID).unwrap_or_else(|| panic!("{INVALID} missing:\n{before}"));
+
+    let traced = |tp: &str| ExecRequest {
+        traceparent: Some(tp.to_string()),
+        ..req("select 1")
+    };
+    // Valid, then three malformed shapes; every one must answer Ok with its row.
+    let valid = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let ok = exec_ok(&mut c, 2, &traced(valid)).await;
+    assert_eq!(ok.rows.len(), 1, "{ok:?}");
+    let mid = series(&scrape(metrics_addr).await, INVALID).unwrap();
+    assert_eq!(
+        mid, base,
+        "a VALID traceparent must not be counted as invalid"
+    );
+
+    let bad = [
+        "garbage",
+        "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01",
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+    ];
+    for (i, tp) in bad.iter().enumerate() {
+        let ok = exec_ok(&mut c, 3 + i as u32, &traced(tp)).await;
+        assert_eq!(
+            ok.rows.len(),
+            1,
+            "a malformed traceparent failed its statement: {tp}"
+        );
+    }
+    let after = series(&scrape(metrics_addr).await, INVALID).unwrap();
+    assert_eq!(
+        after - base,
+        bad.len() as u64,
+        "each malformed traceparent must be counted once"
+    );
+}

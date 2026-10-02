@@ -143,6 +143,7 @@ impl DemoClient {
             readonly,
             fetch,
             tx_id: None,
+            traceparent: None,
         };
         self.send(Self::frame(
             service::SQL,

@@ -111,6 +111,7 @@ fn exec_request_json(r: &ExecRequest) -> serde_json::Value {
         "readonly": r.readonly,
         "fetch": r.fetch,
         "tx_id": r.tx_id,
+        "traceparent": r.traceparent,
     })
 }
 fn exec_ok_json(ok: &ExecOk) -> serde_json::Value {
@@ -446,6 +447,7 @@ fn main() {
         readonly: true,
         fetch: 0,
         tx_id: None,
+        traceparent: None,
     };
     write_case(
         "sql_exec_request_select1",
@@ -475,6 +477,7 @@ fn main() {
         readonly: false,
         fetch: 0,
         tx_id: None,
+        traceparent: None,
     };
     write_case(
         "sql_exec_request_params",
@@ -498,6 +501,7 @@ fn main() {
         readonly: false,
         fetch: 0,
         tx_id: Some(7),
+        traceparent: None,
     };
     write_case(
         "sql_exec_request_intx",
@@ -507,6 +511,30 @@ fn main() {
         19,
         req_intx.encode(),
         exec_request_json(&req_intx),
+    );
+
+    // M2-C4c-1: field 9, a W3C `traceparent` (the spec's own example value), on an otherwise plain
+    // EXEC. Locks the opt-str `Some` arm of the ninth field in both codecs; every other request
+    // vector locks its `nil` arm.
+    let req_trace = ExecRequest {
+        pool: "main".into(),
+        sql: Some("SELECT 1".into()),
+        query_id: None,
+        params: vec![],
+        timeout_ms: None,
+        readonly: true,
+        fetch: 0,
+        tx_id: None,
+        traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+    };
+    write_case(
+        "sql_exec_request_traceparent",
+        0,
+        service::SQL,
+        method_sql::EXEC,
+        43,
+        req_trace.encode(),
+        exec_request_json(&req_trace),
     );
 
     let resp_select1 = ExecOk {

@@ -28,6 +28,7 @@ use ferro_pool::error::PoolError;
 use ferro_proto::value::Value;
 
 use crate::config::LogParams;
+use crate::trace::TraceParent;
 
 /// One statement's slow-log record. Every field is a SHAPE or a MEASUREMENT — never a value.
 #[derive(Debug)]
@@ -49,6 +50,11 @@ pub struct SlowStatement<'a> {
     pub params: &'a [Value],
     /// `None` for a statement that succeeded; the SQLSTATE-or-equivalent for one that did not.
     pub error: Option<&'a str>,
+    /// The caller's W3C trace context, when it sent a valid one (M2-C4c-1). Its ids are what join
+    /// this record to the application's trace: an operator reading a slow statement can open the
+    /// request that issued it. The ids are random identifiers chosen by the caller's tracer, not
+    /// data, so recording them does not touch the redaction contract.
+    pub trace: Option<&'a TraceParent>,
 }
 
 /// Emit `stmt` if it is at or above `threshold_ms`.
@@ -70,6 +76,13 @@ pub fn record(stmt: &SlowStatement<'_>, threshold_ms: Option<u64>, log_params: L
         _ => None,
     };
 
+    // Empty when the caller sent no (valid) context, so the field is always present and a log
+    // query can filter on it without first checking that it exists.
+    let (trace_id, parent_span_id) = stmt
+        .trace
+        .map(|t| (t.trace_id_hex(), t.parent_id_hex()))
+        .unwrap_or_default();
+
     tracing::info!(
         target: "ferro::slow_log",
         fingerprint = %stmt.fingerprint,
@@ -81,6 +94,8 @@ pub fn record(stmt: &SlowStatement<'_>, threshold_ms: Option<u64>, log_params: L
         param_count = stmt.params.len(),
         params = params.as_deref().unwrap_or(""),
         error = stmt.error.unwrap_or(""),
+        trace_id = %trace_id,
+        parent_span_id = %parent_span_id,
         "slow statement",
     );
     true
@@ -168,6 +183,7 @@ mod tests {
             rows: 3,
             params,
             error,
+            trace: None,
         }
     }
 

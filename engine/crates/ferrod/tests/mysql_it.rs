@@ -106,6 +106,7 @@ fn tx_req(tx_id: u64, sql: &str, readonly: bool, fetch: u8) -> ExecRequest {
         readonly,
         fetch,
         tx_id: Some(tx_id),
+        traceparent: None,
     }
 }
 

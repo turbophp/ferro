@@ -1,5 +1,9 @@
-protocol_version    = 3   # M2-C2g: PoolInfo gained a FOURTH element (`literals_are_standard`), and
-                          # both decoders reject any other arity, so an unbumped pair would fail deep
+protocol_version    = 4   # M2-C4c-1: ExecRequest gained a NINTH field (`traceparent`), and both
+                          # decoders enforce strict arity (PROTOCOL.md §8), so an unbumped pair would
+                          # fail inside ExecRequest::decode on the first EXEC instead of at the first
+                          # byte of the first frame. Previously bumped at M2-C2g (3), when PoolInfo
+                          # gained a FOURTH element (`literals_are_standard`), and for the same
+                          # reason: both decoders reject any other arity, so an unbumped pair would fail deep
                           # inside HelloAck::decode instead of at the FIRST BYTE of the FIRST FRAME
                           # (Header::decode -> BadVersion). The lock file carries no message SHAPES --
                           # only ids, codes and tags -- so nothing else moves on its own and this

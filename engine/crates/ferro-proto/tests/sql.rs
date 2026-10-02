@@ -36,8 +36,45 @@ fn exec_request_roundtrip_full() {
         readonly: false,
         fetch: 0,
         tx_id: Some(7),
+        traceparent: None,
     };
     assert_eq!(ExecRequest::decode(&r.encode()).unwrap(), r);
+}
+
+/// M2-C4c-1: the ninth field carries the caller's `traceparent` as bytes. The codec validates
+/// nothing past UTF-8 — a MALFORMED header must still decode, because refusing it would fail the
+/// statement over an observability field; `ferrod` parses, drops and counts it instead.
+#[test]
+fn exec_request_traceparent_roundtrips_and_is_not_validated_by_the_codec() {
+    for tp in [
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "not a traceparent at all",
+        "",
+    ] {
+        let r = ExecRequest {
+            pool: "main".into(),
+            sql: Some("SELECT 1".into()),
+            query_id: None,
+            params: vec![],
+            timeout_ms: None,
+            readonly: true,
+            fetch: 0,
+            tx_id: None,
+            traceparent: Some(tp.into()),
+        };
+        assert_eq!(ExecRequest::decode(&r.encode()).unwrap(), r, "{tp:?}");
+    }
+}
+
+/// The arity is strict, so a version-3 client's 8-field EXEC is refused rather than misread. That
+/// is why adding the field moved `protocol_version` to 4: the handshake refuses the pair first.
+#[test]
+fn exec_request_previous_arity_is_refused() {
+    // fixarray(8): pool "", sql nil, query_id nil, params [], timeout nil, readonly false,
+    // fetch 0, tx_id nil — a complete version-3 request.
+    let b = [0x98u8, 0xa0, 0xc0, 0xc0, 0x90, 0xc0, 0xc2, 0x00, 0xc0];
+    let err = ExecRequest::decode(&b).expect_err("an 8-field EXEC must not decode");
+    assert!(format!("{err:?}").contains("len 8 != 9"), "{err:?}");
 }
 
 #[test]
@@ -51,6 +88,7 @@ fn exec_request_roundtrip_minimal_options_absent() {
         readonly: true,
         fetch: 1,
         tx_id: None,
+        traceparent: None,
     };
     assert_eq!(ExecRequest::decode(&r.encode()).unwrap(), r);
 }
@@ -69,6 +107,7 @@ fn exec_request_tx_id_opt_u64_roundtrip_no_truncation() {
         readonly: true,
         fetch: 0,
         tx_id: None,
+        traceparent: None,
     };
     assert_eq!(
         none.encode().last(),
@@ -79,6 +118,7 @@ fn exec_request_tx_id_opt_u64_roundtrip_no_truncation() {
 
     let wide = ExecRequest {
         tx_id: Some(0x1_0000_0000), // > u32::MAX, < 2^63
+        traceparent: None,
         ..none.clone()
     };
     assert_eq!(ExecRequest::decode(&wide.encode()).unwrap(), wide);
@@ -97,6 +137,7 @@ fn exec_request_params_carry_divergent_range_ints() {
         readonly: true,
         fetch: 0,
         tx_id: None,
+        traceparent: None,
     };
     let bytes = r.encode();
     assert!(contains_subslice(&bytes, &[0xcc, 0xc8]), "I64(200) uint8");
@@ -201,6 +242,7 @@ fn exec_request_trailing_bytes_rejected() {
         readonly: true,
         fetch: 0,
         tx_id: None,
+        traceparent: None,
     };
     let mut b = r.encode();
     b.push(0xff);
@@ -235,11 +277,17 @@ fn exec_ok_trailing_bytes_rejected() {
 
 #[test]
 fn exec_request_oversized_params_len_refused() {
-    // fixarray(8), pool "", sql nil, query_id nil, params array32(u32::MAX). The leading byte MUST
-    // be 0x98 (arity 8): with the old 0x97 the decode would fail the `n != 8` arity check BEFORE
-    // reaching the params `bound_len` path this test exists to exercise (a vacuous pass).
-    let b = [0x98u8, 0xa0, 0xc0, 0xc0, 0xdd, 0xff, 0xff, 0xff, 0xff];
-    assert!(ExecRequest::decode(&b).is_err());
+    // fixarray(9), pool "", sql nil, query_id nil, params array32(u32::MAX). The leading byte MUST
+    // be the CURRENT arity — 0x99 since M2-C4c-1 added `traceparent` — or the decode fails the
+    // arity check BEFORE reaching the params `bound_len` path this test exists to exercise (a
+    // vacuous pass: the earlier 0x97→0x98 bump had exactly that effect, and so did 0x98→0x99). The
+    // error is asserted NOT to be the arity one, so the next bump fails here instead of passing.
+    let b = [0x99u8, 0xa0, 0xc0, 0xc0, 0xdd, 0xff, 0xff, 0xff, 0xff];
+    let err = ExecRequest::decode(&b).expect_err("a lying params length must be refused");
+    assert!(
+        !format!("{err:?}").contains("ExecRequest len"),
+        "refused by the ARITY check, so the bound_len path was never reached: {err:?}",
+    );
 }
 
 #[test]

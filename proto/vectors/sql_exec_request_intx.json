@@ -1,5 +1,5 @@
 {
-  "frame_hex": "f703000002000100130000001500000098a46d61696ea853454c4543542031c090c0c20007",
+  "frame_hex": "f704000002000100130000001600000099a46d61696ea853454c4543542031c090c0c20007c0",
   "header": {
     "flags": 0,
     "method": 1,
@@ -14,6 +14,7 @@
     "readonly": false,
     "sql": "SELECT 1",
     "timeout_ms": null,
+    "traceparent": null,
     "tx_id": 7
   },
   "name": "sql_exec_request_intx"

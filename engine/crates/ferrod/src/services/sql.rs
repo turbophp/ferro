@@ -206,6 +206,11 @@ async fn handle_exec(
         }
     };
 
+    // (1b) the caller's W3C trace context (M2-C4c-1). Interpreted ONCE, here, for every path —
+    // before any shape check, so a provider emitting junk is counted whatever the statement is.
+    // A malformed value is dropped and counted, never refused (see `crate::trace`).
+    let trace = crate::trace::from_request(req.traceparent.as_deref());
+
     // (2) reject not-yet-supported request shapes (each: one END, session survives).
     if req.query_id.is_some() {
         responder.end_error(unsupported(
@@ -374,9 +379,15 @@ async fn handle_exec(
             // `Responder` (no typed return), so the arms unify. PG's path is byte-for-byte the
             // pre-M1-S6 inline body.
             match pool {
-                AnyPool::Pg(p) => run_exec_on_pool(p, responder, &req, sql, cancel, slow).await,
-                AnyPool::Mysql(p) => run_exec_on_pool(p, responder, &req, sql, cancel, slow).await,
-                AnyPool::Sqlite(p) => run_exec_on_pool(p, responder, &req, sql, cancel, slow).await,
+                AnyPool::Pg(p) => {
+                    run_exec_on_pool(p, responder, &req, sql, cancel, slow, trace).await
+                }
+                AnyPool::Mysql(p) => {
+                    run_exec_on_pool(p, responder, &req, sql, cancel, slow, trace).await
+                }
+                AnyPool::Sqlite(p) => {
+                    run_exec_on_pool(p, responder, &req, sql, cancel, slow, trace).await
+                }
             }
         }
     }
@@ -395,6 +406,7 @@ async fn run_exec_on_pool<B: PoolBackend>(
     sql: &str,
     cancel: CancellationToken,
     slow: crate::pools::SlowLogConfig,
+    trace: Option<crate::trace::TraceParent>,
 ) {
     // M1-S5 Task 4b: a streamed fetch runs the incremental HEAD + DATA×N producer under the credit
     // window instead of buffering the whole result into the terminal (D-S5-1). The buffered
@@ -480,6 +492,7 @@ async fn run_exec_on_pool<B: PoolBackend>(
                 rows,
                 params: &req.params,
                 error: error.as_deref(),
+                trace: trace.as_ref(),
             },
             slow.threshold_ms,
             slow.log_params,

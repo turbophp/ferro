@@ -75,6 +75,9 @@ final class ExecCodec
             'readonly' => $readonly,
             'fetch' => $fetch,
             'tx_id' => $txId,
+            // The caller's W3C trace context (M2-C4c-1), read HERE — once per EXEC, in the fiber that
+            // issued it — so autocommit, tx-scoped and streamed statements all carry it. Never throws.
+            'traceparent' => TraceContext::current(),
         ], $this->encodePacker);
     }
 

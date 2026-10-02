@@ -24,7 +24,7 @@ alignment — the payload starts at byte 16.
 | offset | field | type | notes |
 |---|---|---|---|
 | 0 | `magic` | `u8` | always `0xF7` (`consts::MAGIC`) |
-| 1 | `version` | `u8` | protocol major version, currently `2` (`consts::PROTOCOL_VERSION`) |
+| 1 | `version` | `u8` | protocol major version, currently `4` (`consts::PROTOCOL_VERSION`) |
 | 2 | `flags` | `u16` | bitfield: `STREAM 0x01`, `END 0x02`, `CANCEL 0x04`, `OOB_FD 0x08`, `COMPRESSED 0x10` (reserved, unimplemented before post-M3) |
 | 4 | `service` | `u16` | `CORE 1`, `SQL 2`, `TX 3`, `STREAM 4`, `ADMIN 5` |
 | 6 | `method` | `u16` | per-service method id, registry `/proto/methods.toml` |
@@ -45,6 +45,12 @@ codes / type tags but **no message layouts**. Without the bump a skewed pair wou
 Bumping the version *also* changes the lock file, so the hash moves too — two independent tripwires,
 one of which fires first.
 
+It has moved twice more for the same reason. **`2` → `3` at M2-C2g**, when `HELLO_ACK`'s per-pool
+metadata gained `literals_are_standard` (§4). **`3` → `4` at M2-C4c-1**, when `ExecRequest` gained a
+ninth field, the caller's W3C `traceparent` (§8.1). Strict arity (§8) means a version-3 client's
+8-field `EXEC` would otherwise be refused deep in the SQL service as `Protocol`, one statement at a
+time; the bump moves that refusal to the first frame.
+
 **What the skew failure LOOKS like, honestly.** Byte 1 is checked in `Header::decode` on **both**
 sides — Rust `header.rs` and PHP `Header.php` — **before any payload is decoded**, so a mismatch is
 caught deterministically at the first byte pair of the first frame, in both directions (an old
@@ -59,8 +65,8 @@ row 1 (rid, `END`, code, branch, message, one-frame-then-EOF) and
 
 | what arrived | engine's terminal on `request_id=0` | message |
 |---|---|---|
-| a `HELLO` frame with version byte `1` | `errc::PROTOCOL` (`0x3009`) | `unsupported protocol version: expected 3, got 1` |
-| a well-formed v2 `HELLO` with a stale `type_registry_hash` | `errc::UNSUPPORTED` (`0x300A`) | `type_registry_hash mismatch: client sent …, engine is …` |
+| a `HELLO` frame with version byte `1` | `errc::PROTOCOL` (`0x3009`) | `unsupported protocol version: expected 4, got 1` |
+| a well-formed current-version `HELLO` with a stale `type_registry_hash` | `errc::UNSUPPORTED` (`0x300A`) | `type_registry_hash mismatch: client sent …, engine is …` |
 
 So: (1) the code is `PROTOCOL`, not `UNSUPPORTED` — anything keying on `errc::UNSUPPORTED` to mean
 "we disagree" will not fire on a version skew; (2) the engine's own log/terminal message *does* name
@@ -440,14 +446,14 @@ Three rules apply throughout §8:
 
 - **Strict arity.** Every positional array is fixed-shape, and a conforming decoder MUST read the
   declared array length and REJECT a mismatch (it MUST NOT read a fixed number of fields and ignore
-  the prefix). The required lengths: `ExecRequest` = 8, `ExecOk` = 5, `ColMeta` = 2 (`[name, tag]`),
+  the prefix). The required lengths: `ExecRequest` = 9 (8 before `protocol_version` 4), `ExecOk` = 5, `ColMeta` = 2 (`[name, tag]`),
   and each `Value` = 2 (`[tag, payload]`, §3). Both reference codecs enforce this; a lax third
   implementation that trusted a shorter/longer prefix would mis-frame every following field.
 - **`Option<Value>` peek rule.** An optional `Value` slot (`ExecOk.last_insert_id`) is a bare
   `nil` (`0xc0`) when absent, else the value's own `[tag, payload]` encoding. Decoders peek the
   first byte: `0xc0` ⇒ absent; anything else ⇒ decode a `Value`. This is unambiguous because a
   present `Value::Null` encodes as the fixarray `[NULL, nil]` (first byte `0x92`), never a bare
-  `0xc0`. (Optional scalars — `sql`, `query_id`, `timeout_ms`, `tx_id` — follow the same nil-vs-value rule.)
+  `0xc0`. (Optional scalars — `sql`, `query_id`, `timeout_ms`, `tx_id`, `traceparent` — follow the same nil-vs-value rule.)
 - **`array16` threshold.** Array length prefixes narrow by count: fixarray (`0x9_`) for ≤15
   elements, `array16` (`0xdc` + `u16` BE) for 16..=65535, `array32` (`0xdd` + `u32` BE) beyond.
   A result with ≥16 columns or ≥16 cells in a row therefore emits `0xdc`; both codecs must agree at
@@ -457,7 +463,7 @@ Three rules apply throughout §8:
 
 ### 8.1 `ExecRequest` (service `SQL`, method `EXEC` = 1) — client → server
 
-A positional fixarray of 8 fields in declaration order (payload of a non-`END` `EXEC` frame):
+A positional fixarray of 9 fields in declaration order (payload of a non-`END` `EXEC` frame):
 
 | # | field | type | notes |
 |---|---|---|---|
@@ -469,6 +475,7 @@ A positional fixarray of 8 fields in declaration order (payload of a non-`END` `
 | 6 | `readonly` | `bool` | client-declared; drives the write-loss → `Indeterminate` split (no engine inference) |
 | 7 | `fetch` | `u8` | `0` = rows, `1` = none (affected only), `2` = stream (§10's windowed `HEAD`/`DATA`/`END` producer, M1-S5) — a valid, wire-accepted value as of M1-S5 Task 1 (the codec never restricted it); the ferrod EXEC handler's `Unsupported` rejection of `2` is unchanged by that task and lifts in a later S5 task |
 | 8 | `tx_id` | `u64 \| nil` | S6: `nil` = autocommit; a value routes this EXEC to the actor pinning that tx's conn (§9). Bounded < 2^63 (native int, §2); the opt-u64 nil/value peek rule (below) applies |
+| 9 | `traceparent` | `str \| nil` | M2-C4c-1: the caller's W3C Trace Context `traceparent` header, as its own text. The codecs validate nothing past UTF-8. `ferrod` parses it against the W3C grammar and joins the statement's observability to that trace (the slow log's `trace_id`/`parent_span_id`). A value that does not parse is **ignored and counted** (`ferro_traceparent_invalid_total`), never refused: an observability field must not fail a statement. The PHP client fills it from `Ferro\Client\TraceContext`'s provider, read once per EXEC; it sends `nil` for a provider that throws, returns a non-string or empty string, or returns more than 512 bytes |
 
 ### 8.2 `ExecOk` — terminal `Outcome::Ok` body — server → client
 
@@ -501,7 +508,8 @@ cursor (a whole-slice decode would spuriously reject the trailing bytes that alw
 cross-language arbiter, including a `Bytes` whose first byte is the `0xc0` nil marker), and
 `sql_exec_request_intx` (a tx-scoped EXEC with `tx_id = Some(7)` — locks the field-8 opt-u64
 `Some` path; the regenerated `select1`/`params` request vectors lock the `None` path as a trailing
-bare `nil`).
+bare `nil`), and `sql_exec_request_traceparent` (field 9 `Some`: the W3C specification's own example
+header — every other request vector locks its `None` path as a second trailing bare `nil`).
 
 **M1-S7 canonical-tag response vectors** (§3.2), three of them, split deliberately:
 
