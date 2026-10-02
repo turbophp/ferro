@@ -29,6 +29,39 @@ fn test_url() -> Option<String> {
     }
 }
 
+/// Wait (bounded) for `tx_status` to reach `want`.
+///
+/// **The same race `pg_rfq_status_it.rs`'s `await_tx_status` documents, one layer up — and it turned
+/// a PR's `integration` lane red the same way.** An errored statement resolves at `ErrorResponse`,
+/// which the backend sends BEFORE the trailing `ReadyForQuery`; the fork's codec stores the status
+/// byte only when it decodes that `ReadyForQuery`, and it hands the caller a batch as soon as the
+/// next frame is incomplete. So when the two arrive in SEPARATE reads — rare on loopback (0 in 300
+/// local runs), seen on CI's Docker network — the `Err` reaches the test before the `E` byte is
+/// stored, and an immediate read returns the `T` the preceding `BEGIN` left. The engine is
+/// unaffected and knowingly so: `Checkout`'s Err arms force `tx_open`/`tainted` unconditionally
+/// because the byte is untrustworthy there (the M1-S1 Rule A fail-safe). Only a test that reads the
+/// byte on an Err path sees the window, and this one now waits for the protocol event instead of
+/// racing it. A status that never arrives still fails, naming what was seen.
+async fn await_tx_status(
+    pool: &Pool<PgBackend>,
+    co: &ferro_pool::pool::Checkout<PgBackend>,
+    want: TxStatus,
+    what: &str,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = pool.backend().tx_status(co.conn());
+        if got == want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: expected {want:?}, still {got:?} after 5s",
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 fn config(max_size: usize) -> PoolConfig {
     PoolConfig {
         max_size,
@@ -69,11 +102,13 @@ async fn pg_backend_tx_status_tracks_idle_in_tx_and_failed() {
         div_by_zero.is_err(),
         "division by zero must error the statement"
     );
-    assert_eq!(
-        pool.backend().tx_status(co.conn()),
+    await_tx_status(
+        &pool,
+        &co,
         TxStatus::Failed,
-        "a failed statement inside an open tx reports Failed"
-    );
+        "a failed statement inside an open tx reports Failed",
+    )
+    .await;
 
     co.rollback_tx().await.expect("ROLLBACK");
     assert_eq!(
