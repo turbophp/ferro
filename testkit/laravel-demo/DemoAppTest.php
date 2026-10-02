@@ -22,8 +22,12 @@ use function Orchestra\Testbench\load_migration_paths;
  * persist through ONE database connection — auth with database-backed sessions, password reset
  * tokens, the `database` queue (jobs, failed jobs, batches) and the `database` cache store.
  *
- * **"Only the config diff" is proven by construction, not asserted in prose.** This file is the
- * same for every column. WHICH connection it runs on is decided in exactly one place — the patched
+ * **"Only the config diff" is proven in two halves.** No PHP is needed to REGISTER the driver:
+ * `ferro/laravel` ships an auto-discovered `FerroServiceProvider`, and
+ * {@see testThePackageIsDiscoveredFromItsComposerJson} runs Laravel's own `PackageManifest` over the
+ * package's real composer.json. (The harness still calls `FerroConnections::register()` itself,
+ * because testbench disables package discovery and the framework suite needs the stock-name alias.)
+ * And no PHP is needed to RUN the app: this file is the same for every column. WHICH connection it runs on is decided in exactly one place — the patched
  * `DatabaseTestCase::defineEnvironment()` the framework suite already uses — and it differs between
  * the Ferro column and the stock-PDO control ONLY in the `database.connections.<name>` entry: the
  * driver name and `ferro_socket`/`pool` versus PDO's host/credentials. Every subsystem below is
@@ -32,11 +36,13 @@ use function Orchestra\Testbench\load_migration_paths;
  *
  * Horizon is not in it, and that is a finding rather than an omission: every Horizon repository is
  * Redis (`RedisJobRepository`, `RedisMetricsRepository`, …), so its "DB metrics" have no database
- * workload at all. Its one database read is the batches screen, which calls
- * {@see BatchRepository::get()}/`find()` — exercised directly in {@see testQueueBatches}.
+ * workload at all. Its database reads are the batches screen's: {@see BatchRepository::get()} and
+ * `find()`, plus (since Horizon 5.45) a direct `like` search over `job_batches` on the
+ * `queue.batching.database` connection — all three exercised in {@see testQueueBatches}.
  *
- * Requests are real HTTP requests through the `web` middleware group (cookies encrypted, session
- * started and saved by `StartSession`). Between requests {@see fresh()} drops every in-memory
+ * Requests go through Laravel's test client — the full HTTP kernel and the `web` middleware group
+ * (cookies encrypted, session started and saved by `StartSession`), in-process rather than over a
+ * socket, and with CSRF verification skipped as it always is under unit tests. Between requests {@see fresh()} drops every in-memory
  * session store and auth guard, so state can only survive by round-tripping through the database —
  * otherwise a test client sharing one application would pass this with sessions never stored.
  */
@@ -154,6 +160,31 @@ class DemoAppTest extends DatabaseTestCase
         $this->assertSame(! str_starts_with((string) getenv('FERRO_LARAVEL_DRIVER'), 'stock-'), $isFerro, DB::connection()::class);
     }
 
+    /**
+     * Laravel's OWN package discovery (`PackageManifest`, what `package:discover` runs on every
+     * `composer install`) finds `FerroServiceProvider` in the INSTALLED package's composer.json —
+     * so an application adds no PHP to register the driver. Testbench switches discovery off, so
+     * the manifest is built here over a vendor directory holding exactly that one package.
+     */
+    public function testThePackageIsDiscoveredFromItsComposerJson(): void
+    {
+        $composer = dirname((new \ReflectionClass(\Ferro\Laravel\FerroServiceProvider::class))->getFileName(), 2)
+            . '/composer.json';
+        $package = json_decode((string) file_get_contents($composer), true, 512, JSON_THROW_ON_ERROR);
+
+        $base = sys_get_temp_dir() . '/ferro-demo-discovery-' . bin2hex(random_bytes(6));
+        mkdir($base . '/vendor/composer', 0700, true);
+        try {
+            file_put_contents($base . '/vendor/composer/installed.json', json_encode(['packages' => [$package]]));
+            $manifest = new \Illuminate\Foundation\PackageManifest(
+                new \Illuminate\Filesystem\Filesystem(), $base, $base . '/packages.php',
+            );
+            $this->assertContains(\Ferro\Laravel\FerroServiceProvider::class, $manifest->providers());
+        } finally {
+            (new \Illuminate\Filesystem\Filesystem())->deleteDirectory($base);
+        }
+    }
+
     public function testRegisterLoginLogoutWithDatabaseSessions(): void
     {
         $cookie = config('session.cookie');
@@ -243,6 +274,17 @@ class DemoAppTest extends DatabaseTestCase
 
     public function testDatabaseQueueRunsAndFailsJobs(): void
     {
+        // The row lock the worker pops under is chosen from `PDO::ATTR_DRIVER_NAME` and the server
+        // version (§22.2 (ch)). A wrong driver name does not fail the pop — it silently DOWNGRADES
+        // `FOR UPDATE SKIP LOCKED` to a plain `FOR UPDATE`, serialising every worker behind one
+        // locked row — so it is asserted, not inferred from the jobs having run. Every testkit
+        // server is new enough for SKIP LOCKED (PG >= 9.5, MySQL >= 8.0.1, MariaDB >= 10.6).
+        $pop = new \ReflectionMethod(\Illuminate\Queue\DatabaseQueue::class, 'getLockForPopping');
+        $this->assertSame(
+            str_contains($this->driver, 'sqlite') ? true : 'FOR UPDATE SKIP LOCKED',
+            $pop->invoke(app('queue')->connection('database')),
+        );
+
         RecordEvent::dispatch('queued-1');
         RecordEvent::dispatch('queued-2');
         AlwaysFails::dispatch();
@@ -289,7 +331,14 @@ class DemoAppTest extends DatabaseTestCase
             DB::table('demo_events')->orderBy('id')->pluck('name')->all(),
         );
 
-        // Horizon's batches screen: `BatchesController::index()` / `show()` call exactly these.
+        // Horizon's batches screen (`BatchesController`): `index()` lists through the repository or,
+        // with a search term, runs a `like` over `job_batches` on the batching connection and
+        // `find()`s each hit; `show()` finds one.
+        $hits = DB::connection(config('queue.batching.database'))
+            ->table(config('queue.batching.table'))
+            ->where('name', 'like', '%demo%')
+            ->pluck('id');
+        $this->assertSame([$batch->id], $hits->all());
         $repository = $this->app->make(BatchRepository::class);
         $listed = $repository->get(50, null);
         $this->assertCount(1, $listed);

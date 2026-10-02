@@ -179,24 +179,28 @@ jobs:
             || { sleep 15; docker compose -f testkit/docker-compose.yml up -d --wait pg mysql mariadb; }
       - name: every family, Ferro and the stock control
         run: |
-          set -o pipefail
+          rc=0
           for col in pg:ferro-pgsql:FerroPostgresConnection pg:stock-pgsql:PostgresConnection \
                      mysql:ferro-mysql:FerroMySqlConnection mysql:stock-mysql:MySqlConnection \
                      mariadb:ferro-mariadb:FerroMariaDbConnection mariadb:stock-mariadb:MariaDbConnection \
                      sqlite:ferro-sqlite:FerroSQLiteConnection sqlite:stock-sqlite:SQLiteConnection; do
             IFS=: read -r svc drv cls <<<"$col"
             echo "::group::$drv on $svc"
+            # Written to a file, then printed: a pipe into `tee` would let `set -e`/`pipefail` end
+            # the step before the annotations below say WHICH column failed.
             FERRO_LARAVEL_SVC="$svc" FERRO_LARAVEL_DRIVER="$drv" \
               FERRO_LARAVEL_ALLOWLIST="$PWD/testkit/laravel/allowlist-demo.txt" \
-              bash testkit/laravel-suite.sh 2>&1 | tee "demo-$drv.log"
+              timeout 900 bash testkit/laravel-suite.sh > "demo-$drv.log" 2>&1 || true
+            cat "demo-$drv.log"
             echo "::endgroup::"
             # The contact line names the class that answered: a column that resolved the wrong
             # connection (a Ferro column through PDO, or the control through Ferro) proves nothing.
             grep -qE "\[ferro\] connection=(Ferro.Laravel|Illuminate.Database).$cls driver=$drv " "demo-$drv.log" \
-              || { echo "::error:: $drv did not resolve $cls"; exit 1; }
-            grep -qE '^OK \(6 tests' "demo-$drv.log" \
-              || { echo "::error:: the demo app did not pass in full under $drv"; exit 1; }
+              || { echo "::error:: $drv did not resolve $cls"; rc=1; }
+            grep -qE '^OK \(7 tests' "demo-$drv.log" \
+              || { echo "::error:: the demo app did not pass in full under $drv"; rc=1; }
           done
+          exit "$rc"
       - if: failure()
         run: docker compose -f testkit/docker-compose.yml logs --no-color --tail=80 pg mysql mariadb
 
