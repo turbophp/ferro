@@ -61,6 +61,16 @@ ROLLBACK_TO = 6
 HEAD = 1
 DATA = 2
 
+# ADMIN service (M2-C3-7b, SPEC §7.6 + D15). Served only on the engine's Unix socket and gated per
+# VERB by the peer's kernel-attested uid in the SESSION layer, before any handler runs: a READ verb
+# needs only an admitted peer, an OPERATE verb additionally needs the uid in `FERRO_ADMIN_UIDS`, and
+# an empty `FERRO_ADMIN_UIDS` disables every OPERATE verb. Each method's class is fixed in `ferrod`'s
+# `admin::AdminVerb` by an exhaustive match, so a new method cannot ship without one.
+# BACKUP (OPERATE): a consistent snapshot of a SQLite pool's database via `VACUUM INTO`, written as
+# a plain file name inside the pool's D14 allowed directory. (Service `ADMIN = 5` above.)
+[methods.admin]
+BACKUP = 1
+
 # Terminal outcome-envelope status discriminant (decision W-4). In /proto so both codecs
 # generate it rather than hand-writing 0/1/2 (charter rule 2).
 [outcome]

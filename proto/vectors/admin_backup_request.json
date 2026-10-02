@@ -1,0 +1,16 @@
+{
+  "frame_hex": "f704000005000100280000001500000094a46d61696eaa6e696768746c792e6462c3cd7530",
+  "header": {
+    "flags": 0,
+    "method": 1,
+    "request_id": 40,
+    "service": 5
+  },
+  "message": {
+    "file": "nightly.db",
+    "pool": "main",
+    "replace": true,
+    "timeout_ms": 30000
+  },
+  "name": "admin_backup_request"
+}

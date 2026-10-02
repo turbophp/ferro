@@ -1,7 +1,7 @@
 //! Emit deterministic golden vectors: for each case, build the full frame (header+payload),
 //! and write {name, header, message(json), frame_hex}. Also emit malformed negative .bin seeds.
 use ferro_proto::consts::{
-    self, flags, method_core, method_sql, method_stream, method_tx, service,
+    self, flags, method_admin, method_core, method_sql, method_stream, method_tx, service,
 };
 use ferro_proto::header::Header;
 use ferro_proto::messages::*;
@@ -894,6 +894,73 @@ fn main() {
         22,
         savepoint.encode(),
         serde_json::json!({ "tx_id": savepoint.tx_id, "name": savepoint.name }),
+    );
+
+    // --- ADMIN service vectors (M2-C3-7b; /proto/PROTOCOL.md §11). The request is the positional
+    // message payload (flags 0); the response is the terminal Outcome::Ok(BackupResponse) envelope
+    // (flag END), mirroring tx_begin_*. `bytes` is above 2^32 so the u64 width is locked, not just
+    // a fixint. error_forbidden is the D15 refusal a non-admin peer receives for that request. ---
+    let backup_req = BackupRequest {
+        pool: "main".into(),
+        file: "nightly.db".into(),
+        replace: true,
+        timeout_ms: Some(30_000),
+    };
+    write_case(
+        "admin_backup_request",
+        0,
+        service::ADMIN,
+        method_admin::BACKUP,
+        40,
+        backup_req.encode(),
+        serde_json::json!({
+            "pool": backup_req.pool,
+            "file": backup_req.file,
+            "replace": backup_req.replace,
+            "timeout_ms": backup_req.timeout_ms,
+        }),
+    );
+
+    let backup_resp = BackupResponse {
+        bytes: 5_000_000_000,
+        queue_us: 12,
+        exec_us: 734_001,
+    };
+    write_case(
+        "admin_backup_response",
+        flags::END,
+        service::ADMIN,
+        method_admin::BACKUP,
+        40,
+        Outcome::Ok(backup_resp.encode()).encode(),
+        serde_json::json!({ "status": consts::outcome::OK, "bytes": backup_resp.bytes,
+            "queue_us": backup_resp.queue_us, "exec_us": backup_resp.exec_us }),
+    );
+
+    let err_forbidden = ErrorPayload {
+        code: consts::errc::FORBIDDEN,
+        branch: consts::errc::FORBIDDEN_BRANCH,
+        sqlstate: None,
+        errno: None,
+        message: "admin verb BACKUP is an OPERATE verb and FERRO_ADMIN_UIDS is empty".into(),
+        detail: None,
+        retry_after_ms: None,
+    };
+    // The header is the one the engine ACTUALLY sends for a D15 refusal: the session layer refuses
+    // the verb before any handler runs, and a session-built per-request terminal is deliberately
+    // generic (`service=CORE, method=0`) — it is identified by its `request_id`, as error_protocol is.
+    write_case(
+        "error_forbidden",
+        flags::END,
+        service::CORE,
+        0,
+        41,
+        Outcome::Error(err_forbidden).encode(),
+        serde_json::json!({ "status": consts::outcome::ERROR, "error": {
+            "code": consts::errc::FORBIDDEN, "branch": consts::errc::FORBIDDEN_BRANCH,
+            "sqlstate":null, "errno":null,
+            "message":"admin verb BACKUP is an OPERATE verb and FERRO_ADMIN_UIDS is empty",
+            "detail":null, "retry_after_ms":null } }),
     );
 
     // Negative seeds (decoder must reject; also fuzz corpus).

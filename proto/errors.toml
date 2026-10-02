@@ -65,3 +65,12 @@ branch = 3
 [codes.TxNotFound]
 code = 0x300B
 branch = 3
+# Refused by the engine's own ACCESS POLICY rather than by the database: an admin verb the peer's
+# kernel-attested uid is not authorized for (SPEC D15 — including every OPERATE verb while
+# `FERRO_ADMIN_UIDS` is empty, and every admin verb on a connection with no attested uid), or an
+# admin destination outside the verb's policy (a backup target that is not a plain file name, or that
+# is a symlink). NonRetryable: retrying the same request as the same peer is refused the same way.
+# Distinct from `Auth`, which is the BACKEND refusing the pool's own credentials.
+[codes.Forbidden]
+code = 0x300C
+branch = 3

@@ -473,3 +473,274 @@ async fn plain_vacuum_still_works() {
         Some(&Value::I64(10))
     );
 }
+
+/// **A dangling symlink inside the allowed directory must not redirect a snapshot outside it**
+/// (M2-C3-7b, found by measuring the admin verb's destination policy before building it).
+///
+/// The guard canonicalised only the target's PARENT, because a snapshot's target does not exist yet.
+/// A dangling symlink defeats exactly that: its parent IS the allowed directory, and SQLite then
+/// follows the link and creates the file at the link's destination — measured, `VACUUM INTO
+/// '<root>/link.db'` produced `<outside>/escaped.db`. The CONTROL is the same statement on a plain
+/// name in the same directory, which must still succeed: the fix refuses the LINK, not the directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dangling_symlink_cannot_redirect_a_snapshot_outside_the_allowed_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = pool_on(&dir.path().join("main.db"), 1);
+    seed(&pool, 10).await;
+
+    let outside = tempfile::tempdir().expect("second tempdir");
+    let escaped = outside.path().join("escaped.db");
+    let link = dir.path().join("link.db");
+    std::os::unix::fs::symlink(&escaped, &link).expect("plant the dangling symlink");
+
+    let mut co = pool.checkout().await.expect("checkout");
+    let err = co
+        .query("VACUUM INTO ?1", &[Value::Text(link.display().to_string())])
+        .await
+        .expect_err("a snapshot through a dangling symlink must be refused");
+    assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "got {err:?}");
+    assert!(
+        !escaped.exists(),
+        "the snapshot escaped through the symlink"
+    );
+
+    // CONTROL: a plain name beside it is still allowed.
+    let plain = dir.path().join("plain.db");
+    co.query(
+        "VACUUM INTO ?1",
+        &[Value::Text(plain.display().to_string())],
+    )
+    .await
+    .expect("a plain name in the allowed directory still works");
+    assert_eq!(rows_in_snapshot(&plain), 10);
+}
+
+/// **The destination can be a BOUND PARAMETER** (M2-C3-7b premise). The admin `BACKUP` verb relies
+/// on this so that no path is ever spliced into SQL text: the engine binds the target, SQLite
+/// resolves it, and the D14 authorizer still sees the resolved filename.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vacuum_into_takes_its_target_as_a_bound_parameter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = pool_on(&dir.path().join("main.db"), 1);
+    seed(&pool, 25).await;
+
+    let snap = dir.path().join("bound.db");
+    let mut co = pool.checkout().await.expect("checkout");
+    co.query("VACUUM INTO ?1", &[Value::Text(snap.display().to_string())])
+        .await
+        .expect("VACUUM INTO accepts a bound target");
+    assert_eq!(rows_in_snapshot(&snap), 25);
+
+    // And the guard still applies to a BOUND target — it is not something only a literal reaches.
+    let elsewhere = tempfile::tempdir().expect("second tempdir");
+    let outside = elsewhere.path().join("bound.db");
+    let err = co
+        .query(
+            "VACUUM INTO ?1",
+            &[Value::Text(outside.display().to_string())],
+        )
+        .await
+        .expect_err("D14 must refuse a bound target outside the allowed directory");
+    assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "got {err:?}");
+    assert!(!outside.exists());
+}
+
+/// **A RELATIVE target resolves against the DAEMON's working directory, not the database's** —
+/// which corrects D14's own text (M2-C3-7b, measured). D14 said "`VACUUM INTO 'snap.db'` beside the
+/// database works out of the box"; it does only when `ferrod`'s working directory IS the database's
+/// directory. SQLite resolves a relative filename against the process's cwd, and the guard (rightly)
+/// resolves it the same way, so under any other cwd the relative snapshot is REFUSED as outside the
+/// allowed directory — the safe direction, but not the documented behaviour. The admin `BACKUP` verb
+/// does not depend on cwd at all: it binds an absolute path inside the allowed root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relative_target_resolves_against_the_working_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = pool_on(&dir.path().join("main.db"), 1);
+    seed(&pool, 3).await;
+    let cwd = std::env::current_dir().expect("cwd");
+    assert_ne!(
+        cwd.canonicalize().unwrap(),
+        dir.path().canonicalize().unwrap(),
+        "the premise needs a cwd that is not the database's directory"
+    );
+
+    let mut co = pool.checkout().await.expect("checkout");
+    let err = co
+        .exec("VACUUM INTO 'ferro_relative_probe.db'")
+        .await
+        .expect_err("a relative target outside the allowed directory is refused");
+    assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "got {err:?}");
+    assert!(!dir.path().join("ferro_relative_probe.db").exists());
+    assert!(!cwd.join("ferro_relative_probe.db").exists());
+
+    // CONTROL: the same name, absolute and inside the database's directory, is allowed.
+    let beside = dir.path().join("ferro_relative_probe.db");
+    co.exec(&format!("VACUUM INTO '{}'", beside.display()))
+        .await
+        .expect("the absolute spelling beside the database is allowed");
+    assert_eq!(rows_in_snapshot(&beside), 3);
+}
+
+/// **An ATTACH whose filename is not a literal is refused, wherever it points** (C3-7b review,
+/// reproduced: a bound `ATTACH ?1` to a path outside the allowed directory succeeded, and an ordinary
+/// `CREATE TABLE s1.copy AS SELECT …` then copied the data there). SQLite hands the authorizer the
+/// filename only for a string literal; for a bound parameter or any expression it passes NULL, and
+/// the guard used to allow what it could not see. The bound INSIDE path is refused too — that is the
+/// cost, stated: the refusal is about the target being unknowable, not about where it points. The
+/// CONTROL is `VACUUM INTO ?1`, which SQLite re-issues internally as a literal and so stays allowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_target_that_is_not_a_literal_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = pool_on(&dir.path().join("main.db"), 1);
+    seed(&pool, 4).await;
+    let outside = tempfile::tempdir().expect("second tempdir");
+
+    let mut co = pool.checkout().await.expect("checkout");
+    for target in [
+        outside.path().join("bound.db"),
+        dir.path().join("inside.db"),
+    ] {
+        let err = co
+            .query(
+                "ATTACH ?1 AS side",
+                &[Value::Text(target.display().to_string())],
+            )
+            .await
+            .expect_err("a bound ATTACH target is refused");
+        assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "{target:?}: {err:?}");
+        assert!(!target.exists());
+    }
+    let expr = outside.path().join("expr.db").display().to_string();
+    let (a, b) = expr.split_at(5);
+    let err = co
+        .exec(&format!("ATTACH '{a}' || '{b}' AS side"))
+        .await
+        .expect_err("an expression ATTACH target is refused");
+    assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "{err:?}");
+    assert!(!outside.path().join("expr.db").exists());
+
+    // CONTROL: a bound VACUUM INTO inside the directory is unaffected.
+    let snap = dir.path().join("bound-vacuum.db");
+    co.query("VACUUM INTO ?1", &[Value::Text(snap.display().to_string())])
+        .await
+        .expect("VACUUM INTO ?1 stays allowed");
+    assert_eq!(rows_in_snapshot(&snap), 4);
+}
+
+/// **A `file:` URI is refused** (C3-7b review, reproduced: with the daemon's cwd inside the allowed
+/// directory, `ATTACH 'file:%2Ftmp%2F…x.db'` read as a relative name and passed, and SQLite — built
+/// with `SQLITE_USE_URI`, so URIs are honoured whatever the open flags — decoded it and wrote
+/// `/tmp/…/x.db`). Refused by the scheme for both verbs — in ANY case, deliberately stricter than
+/// SQLite, which matches only lowercase `file:` (measured: an uppercase spelling became a literal
+/// file name rather than a decoded URI).
+///
+/// **The fixture must carry the precondition, or the test proves nothing** — and the first version
+/// did not: with the allowed directory a tempdir and the cwd elsewhere, a URI's "relative" reading
+/// already resolved OUTSIDE the root, so it was refused with the scheme check deleted (the mutation
+/// survived). Changing the process cwd would race every other test in the binary, so the pool's
+/// allowed directory is set to the CURRENT cwd instead: exactly the reviewer's configuration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_uri_is_refused_for_attach_and_vacuum_into() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cwd = std::env::current_dir().expect("cwd");
+    let pool = pool_allowing(&dir.path().join("main.db"), &cwd);
+    seed(&pool, 2).await;
+    let outside = tempfile::tempdir().expect("second tempdir");
+    let encoded = |name: &str| {
+        outside
+            .path()
+            .join(name)
+            .display()
+            .to_string()
+            .replace('/', "%2F")
+    };
+
+    let mut co = pool.checkout().await.expect("checkout");
+    for sql in [
+        format!("ATTACH 'file:{}' AS side", encoded("a.db")),
+        format!("ATTACH 'FILE:{}' AS side", encoded("b.db")),
+        format!("VACUUM INTO 'file:{}'", encoded("c.db")),
+        format!("VACUUM INTO 'File:{}'", encoded("d.db")),
+    ] {
+        let err = co.exec(&sql).await.expect_err("a file: URI is refused");
+        assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "{sql}: {err:?}");
+    }
+    for name in ["a.db", "b.db", "c.db", "d.db"] {
+        assert!(!outside.path().join(name).exists(), "{name} escaped");
+    }
+
+    // CONTROL: the same configuration admits a plain absolute name inside the allowed directory
+    // (the cwd), so the refusals above are the scheme and not a misconfigured root.
+    let inside = tempfile::Builder::new()
+        .prefix("ferro_uri_control")
+        .tempdir_in(&cwd)
+        .expect("a tempdir inside the cwd");
+    let snap = inside.path().join("plain.db");
+    co.exec(&format!("VACUUM INTO '{}'", snap.display()))
+        .await
+        .expect("a plain absolute name inside the allowed directory is allowed");
+    assert_eq!(rows_in_snapshot(&snap), 2);
+}
+
+/// **ATTACH through a symlink to an EXISTING outside database is refused** (C3-7b review: the symlink
+/// fix closed this too, but nothing tested it — a guard refusing only DANGLING links survived the
+/// whole suite, and the code's comment claimed SQLite's existing-target rule covered it, which is
+/// true of `VACUUM INTO` only). Without the fix the outside database's rows are READ back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_through_a_symlink_to_an_existing_outside_database_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = pool_on(&dir.path().join("main.db"), 1);
+    seed(&pool, 1).await;
+    let outside = tempfile::tempdir().expect("second tempdir");
+    let secret = outside.path().join("secret.db");
+    {
+        let c = rusqlite::Connection::open(&secret).unwrap();
+        c.execute_batch("CREATE TABLE s (v TEXT); INSERT INTO s VALUES ('outside-secret');")
+            .unwrap();
+    }
+    let link = dir.path().join("link.db");
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+    let mut co = pool.checkout().await.expect("checkout");
+    let err = co
+        .exec(&format!("ATTACH '{}' AS side", link.display()))
+        .await
+        .expect_err("ATTACH through a symlink is refused");
+    assert_eq!(errno_of(&err), Some(SQLITE_AUTH), "{err:?}");
+}
+
+/// **A statement whose named file cannot be opened is a KNOWN fate, not a lost connection** (C3-7b
+/// review: `SQLITE_CANTOPEN` was "handle-fatal", so `VACUUM INTO '<existing file>'` surfaced as
+/// `ConnectionLost` — Retryable, and as Indeterminate for an undeclared statement — though it
+/// provably wrote nothing). The connection stays usable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_target_that_cannot_be_opened_is_a_known_fate_and_keeps_the_connection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = pool_on(&dir.path().join("main.db"), 1);
+    seed(&pool, 3).await;
+    let existing = dir.path().join("existing.db");
+    std::fs::write(&existing, b"not empty").unwrap();
+
+    let mut co = pool.checkout().await.expect("checkout");
+    let err = co
+        .exec(&format!("VACUUM INTO '{}'", existing.display()))
+        .await
+        .expect_err("SQLite refuses a non-empty existing target");
+    match &err {
+        ferro_pool::error::PoolError::Sql { code, branch, .. } => {
+            assert_eq!(*code, ferro_proto::consts::errc::UNSUPPORTED, "{err:?}");
+            assert_eq!(*branch, ferro_proto::consts::branch::NON_RETRYABLE);
+        }
+        other => panic!("expected a known-fate Sql error, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&existing).unwrap(), b"not empty");
+    // The same connection keeps working.
+    let r = co
+        .query("SELECT count(*) FROM t", &[])
+        .await
+        .expect("count");
+    assert_eq!(
+        r.rows.first().and_then(|row| row.first()),
+        Some(&Value::I64(3))
+    );
+}

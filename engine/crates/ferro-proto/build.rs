@@ -156,6 +156,14 @@ fn emit_mod_u16(o: &mut String, name: &str, m: &BTreeMap<String, u16>) {
     for (k, v) in m {
         writeln!(o, "    pub const {}: u16 = {};", screaming(k), v).unwrap();
     }
+    // `ALL` — `(registry name, value)` — so a consumer can check its coverage of a table against the
+    // registry instead of a hand-kept list (M2-C3-7b: every `[methods.admin]` id must be a served,
+    // CLASSIFIED verb in `ferrod`). Same shape as `branch::ALL`/`errc::ALL`.
+    writeln!(o, "    pub const ALL: &[(&str, u16)] = &[").unwrap();
+    for (k, v) in m {
+        writeln!(o, "        (\"{k}\", {v}),").unwrap();
+    }
+    writeln!(o, "    ];").unwrap();
     writeln!(o, "}}").unwrap();
 }
 fn emit_mod_u8(o: &mut String, name: &str, m: &BTreeMap<String, u8>) {

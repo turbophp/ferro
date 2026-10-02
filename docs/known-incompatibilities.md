@@ -320,16 +320,25 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   `VACUUM INTO '<path>'`, and `ATTACH DATABASE '<path>'` inside a transaction. The write happens as
   the daemon's user, not PHP-FPM's, which is a confused deputy: SPEC §12/D8 keeps the database path
   in the engine precisely so PHP never learns it. **SPEC D14** confines it. The allowed directory
-  defaults to the database file's own directory, so `VACUUM INTO 'snapshot.db'` beside the database
-  works with no configuration; an operator widens it per pool with `FERRO_POOL_<NAME>_ALLOW_DIR`.
-  Outside it, the statement is refused with SQLite's own `SQLITE_AUTH` (errno 23) and **no file is
-  created**.
+  defaults to the database file's own directory, so a snapshot beside the database works with no
+  configuration — spelled as an ABSOLUTE path: a relative name resolves against the daemon's working
+  directory, not the database's, and is refused unless that directory is inside the allowed one. An
+  operator widens it per pool with `FERRO_POOL_<NAME>_ALLOW_DIR`. Outside it, the statement is refused
+  with SQLite's own `SQLITE_AUTH` (errno 23) and **no file is created**.
+
+  Three spellings are refused **wherever they point**, because the guard cannot check them
+  (SPEC §22.2 (cf)): an `ATTACH` whose target is a bound parameter or an expression (`ATTACH ?`,
+  `ATTACH 'a' || 'b'` — SQLite passes the guard no filename for those, so write the target as a
+  literal; `VACUUM INTO ?` is unaffected), a `file:` URI (SQLite decodes its percent-escapes after the
+  guard has looked), and a target that is itself a symlink. Taking a snapshot does not need any of
+  them: the admin service's `BACKUP` verb (SPEC §7.6, OPERATE under D15) writes one by plain file
+  name into the allowed directory and finalises it atomically.
 
   The enforcement point is SQLite's own authorizer, not a list of verbs: `VACUUM INTO` attaches its
   destination, so one guard covers both spellings and any future one. Nothing is parsed or rewritten
   — SQLite states which file it is about to open and the engine answers, so charter rule 6 never
   arises. Plain `VACUUM`, which stock Laravel's `dropAllTables()` ends in, opens no file and is
-  untouched. SPEC §21 D14, §22.2 (bp).
+  untouched. SPEC §21 D14, §22.2 (bp), (cf).
 - **On PostgreSQL and MySQL the question does not arise**, because neither dialect lets a statement
   name a path the engine would write — server-side `COPY TO '<file>'` and `SELECT … INTO OUTFILE`
   are the backend's own privileged operations, executed by the *database server* under its own

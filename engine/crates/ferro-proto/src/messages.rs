@@ -109,6 +109,9 @@ msg!(ErrorPayload {
 pub mod tx;
 pub use tx::{BeginRequest, BeginResponse, Isolation, SavepointRequest, TxControl};
 
+pub mod admin;
+pub use admin::{BackupRequest, BackupResponse};
+
 /// Terminal outcome envelope `[status, body]` (decision W-4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {

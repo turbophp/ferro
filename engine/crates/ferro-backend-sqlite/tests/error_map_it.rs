@@ -328,7 +328,9 @@ async fn a_client_side_rejection_is_known_fate_not_connection_lost() {
 fn handle_fatal_is_a_short_deliberate_list() {
     // In-process, so there is no "sent it and never heard back" class: only these leave the handle
     // or the database unusable.
-    for extended in [10, 11, 26, 14, 7] {
+    // NOTADB (26) and CANTOPEN (14) left this list at M2-C3-7b: on a statement they name a file the
+    // statement ATTACHed or wrote INTO, which provably did not apply (see `error_map`'s note).
+    for extended in [10, 11, 7] {
         assert!(
             matches!(
                 error_map::map_extended_for_test(extended),
@@ -337,7 +339,7 @@ fn handle_fatal_is_a_short_deliberate_list() {
             "extended {extended} must be handle-fatal"
         );
     }
-    for extended in [1, 5, 8, 9, 19, 517] {
+    for extended in [1, 5, 8, 9, 14, 19, 26, 517] {
         assert!(
             !matches!(
                 error_map::map_extended_for_test(extended),

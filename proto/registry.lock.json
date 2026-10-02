@@ -19,6 +19,9 @@
     "TX": 3
   },
   "methods": {
+    "admin": {
+      "BACKUP": 1
+    },
     "core": {
       "GOODBYE": 5,
       "HELLO": 1,
@@ -120,6 +123,10 @@
     "Deadlock": {
       "code": 4100,
       "branch": 1
+    },
+    "Forbidden": {
+      "code": 12300,
+      "branch": 3
     },
     "ForeignKey": {
       "code": 12291,

@@ -222,7 +222,7 @@ five storage classes.
   §20 and `docs/laravel-suite/2026-09-15-c3-6b-sqlite-results.md`.
 - **C3-7** — the online backup admin surface (§7.6's last sentence). **SPLIT 2026-09-15 after scoping (§21):**
   **C3-7a DONE** — the MECHANISM already works (`VACUUM INTO`, no engine code), and its four
-  properties are pinned as tests. **C3-7b NOT STARTED** — the admin service itself, which is a
+  properties are pinned as tests. **C3-7b-1 DONE (2026-10-02, SPEC §22.2 (cf)); C3-7b-2 (the client surface) next** — the admin service itself, which is a
   `/proto` change plus an authorization question.
 
 ### Why this order changed on 2026-09-15 (C3-3 planning)
@@ -1151,6 +1151,14 @@ purpose rather than discovered.
    session is equal. This is the part with no precedent in the tree.
 4. The destination policy, which is where the §21 decision above lands.
 5. A client/CLI surface (`ferro` CLI, D10) — and note §13's `ferro top` wants the same transport.
+
+**Status (2026-10-02, C3-7b-1 — SPEC §22.2 (cf)):** items 1–4 are DONE. (1) `[methods.admin] BACKUP = 1`
+and `errc::FORBIDDEN`, with three golden vectors and both codecs. (2) `Route::Admin(verb)`. (3) SPEC
+D15, enforced in the session layer on the kernel-attested uid before any handler runs. (4) A plain
+file name, placed in the pool's allowed root by the guard's own resolution and finalised atomically
+from a temporary — and measuring it found a dangling-symlink hole in the D14 guard, closed there.
+Item 5 is C3-7b-2: `ferro/client` gains the call (the `ferro` CLI of D10 is M3's schema tooling;
+`ferro top` is M4).
 
 
 ---

@@ -105,10 +105,13 @@
 //! `PING`/`GOODBYE`/`WINDOW_UPDATE` (answered as before); `Request` for SQL/TX/STREAM (goes
 //! through the registry/handler/supervisor mechanism above, regardless of the specific method id
 //! — no method is registered yet, so `default_handler` declares `Unsupported` for all of them);
-//! `Unsupported` for anything else (ADMIN, an unrecognized service, or a CORE method this build
-//! doesn't recognize) — which, like the reused-id/`max_inflight` diagnostics, sends a per-request
-//! `Unsupported` error `END` directly, without ever touching the registry (nothing was spawned
-//! for it, so there is no request lifecycle to guard).
+//! `Admin(verb)` for an ADMIN method this build serves (M2-C3-7b), authorized under SPEC D15 on
+//! the session's kernel-attested peer uid BEFORE it is treated as a `Request` — a refusal is one
+//! per-request `Forbidden` END sent directly; `Unsupported` for anything else (an ADMIN method this
+//! build does not serve, an unrecognized service, or a CORE method this build doesn't recognize) —
+//! which, like the reused-id/`max_inflight` diagnostics, sends a per-request `Unsupported` error
+//! `END` directly, without ever touching the registry (nothing was spawned for it, so there is no
+//! request lifecycle to guard).
 //!
 //! **Handshake hardening + per-session task ownership (S3 fix pass).** Three additions on top of
 //! the above, none of them weakening exactly-one-`END`:
@@ -262,6 +265,20 @@ impl Session {
         let session_id = tx_registry.next_session_id();
         let handler = factory(session_id);
 
+        // SPEC D15: the peer's KERNEL-ATTESTED uid, read from this session's own socket — never from
+        // anything the client sends — once, before the stream is split. `SO_PEERCRED` reports the
+        // credentials of the process that created the connection and does not change for the
+        // socket's life, so one read is the per-verb answer too. `None` (the kernel could not attest
+        // one) refuses every admin verb; it changes nothing else, since `serve`'s accept gate has
+        // already decided whether this peer may connect at all.
+        let peer_uid = match crate::peercred::peer_uid(&stream) {
+            Ok(uid) => Some(uid),
+            Err(e) => {
+                tracing::warn!(error = %e, "peercred unreadable for this session: admin verbs will be refused");
+                None
+            }
+        };
+
         let framed = Framed::new(stream, FrameCodec);
         let (sink, mut reader) = framed.split();
 
@@ -385,8 +402,9 @@ impl Session {
         // internally). Only a `Classification::Frame` ever reaches CANCEL-checking and
         // `dispatch::route`, the `(service, method) -> Route` table that decides between core
         // control traffic, the request-bearing registry/handler/supervisor mechanism, and a
-        // per-request `Unsupported` for anything else (ADMIN, an unknown service, or a CORE
-        // method this build doesn't recognize).
+        // per-request `Unsupported` for anything else (an ADMIN method this build does not serve,
+        // an unknown service, or a CORE method this build doesn't recognize). A SERVED admin verb
+        // is authorized under SPEC D15 here, before it enters the request lifecycle.
         let registry = Arc::new(Registry::new(config.max_inflight));
 
         // Owns every per-request supervisor task spawned below (S3 fix pass — see this module's
@@ -476,8 +494,43 @@ impl Session {
                         break;
                     }
                 }
+                Route::Admin(verb) => {
+                    // SPEC D15, decided HERE — before the request lifecycle, so a refused verb never
+                    // spawns a handler, checks out a connection or touches the filesystem. A refusal
+                    // is one per-request `Forbidden` END on this frame's id, the same shape (and the
+                    // same no-registry-entry reasoning) as `Unsupported` below; an authorized verb
+                    // is then exactly a `Request`.
+                    match crate::admin::authorize(peer_uid, &config, verb) {
+                        Ok(()) => {
+                            if !handle_request_frame(
+                                frame,
+                                &registry,
+                                &control_tx,
+                                &session_cap,
+                                &handler,
+                                &config,
+                                &mut supervisors,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            // `authorize` logged the reason; the peer gets only the payload.
+                            let refused = SessionError::PerRequest {
+                                rid: frame.header.request_id,
+                                err,
+                            }
+                            .into_out_frame();
+                            if control_tx.send(ControlMsg::bare(refused)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
                 Route::Unsupported => {
-                    // No route in this build: ADMIN, an unknown service, or a CORE method this
+                    // No route in this build: an ADMIN method it does not serve, an unknown service, or a CORE method this
                     // build doesn't recognize. Nothing was ever spawned for it, so there is no
                     // registry entry to guard — send the per-request diagnostic directly.
                     let unsupported = SessionError::PerRequest {

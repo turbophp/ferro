@@ -120,8 +120,9 @@ fn series(body: &str, name_and_labels: &str) -> Option<u64> {
 /// - a recycle of a clean SQLite connection is `targeted`, and the recycle after a `PRAGMA` (which
 ///   taints unconditionally, §22.2 (bm)) is `full`;
 /// - errors through BOTH terminal paths move `ferro_errors_total`: the SESSION path (`session::error`
-///   builds the per-request diagnostics — `ADMIN` has no route, so `Unsupported`; an unknown flag bit,
-///   so `Protocol`), and the HANDLER path (the supervisor's terminal for a real EXEC — a syntax error,
+///   builds the per-request diagnostics — an `ADMIN` method this build does not serve, so
+///   `Unsupported`; `BACKUP` refused by the D15 gate, so `Forbidden`; an unknown flag bit, so
+///   `Protocol`), and the HANDLER path (the supervisor's terminal for a real EXEC — a syntax error,
 ///   and a timed-out autocommit WRITE, which §19.3 sends `Indeterminate`). The adversarial review of
 ///   this slice found the first version exercised the session path TWICE and the handler path never,
 ///   so a second END builder on the handler path — where every SQL error and every `Indeterminate`
@@ -139,6 +140,7 @@ async fn real_traffic_moves_the_hygiene_error_and_pool_series() {
     const SKIPPED: &str = "ferro_hygiene_total{pool=\"default\",profile=\"skipped_clean\"}";
     const UNSUPPORTED: &str = "ferro_errors_total{code=\"Unsupported\",branch=\"NonRetryable\"}";
     const PROTOCOL: &str = "ferro_errors_total{code=\"Protocol\",branch=\"NonRetryable\"}";
+    const FORBIDDEN: &str = "ferro_errors_total{code=\"Forbidden\",branch=\"NonRetryable\"}";
     const SYNTAX: &str = "ferro_errors_total{code=\"Syntax\",branch=\"NonRetryable\"}";
     const UNCONFIRMED: &str =
         "ferro_errors_total{code=\"WriteUnconfirmed\",branch=\"Indeterminate\"}";
@@ -158,6 +160,7 @@ async fn real_traffic_moves_the_hygiene_error_and_pool_series() {
         SKIPPED,
         UNSUPPORTED,
         PROTOCOL,
+        FORBIDDEN,
         SYNTAX,
         UNCONFIRMED,
         INDETERMINATE,
@@ -177,9 +180,24 @@ async fn real_traffic_moves_the_hygiene_error_and_pool_series() {
     c.send(OutFrame {
         header: Header {
             flags: 0,
+            // An ADMIN method this build does NOT serve: the dispatch-path `Unsupported`. (Method 1 is
+            // `BACKUP` since M2-C3-7b, and would be the D15 path below instead.)
             service: service::ADMIN,
-            method: 1,
+            method: 0x7FFF,
             request_id: 6,
+            payload_len: 0,
+        },
+        payload: Bytes::new(),
+    })
+    .await;
+    let _ = c.recv().await;
+    // The D15 path: `BACKUP` with FERRO_ADMIN_UIDS empty, refused by the session before any handler.
+    c.send(OutFrame {
+        header: Header {
+            flags: 0,
+            service: service::ADMIN,
+            method: ferro_proto::consts::method_admin::BACKUP,
+            request_id: 10,
             payload_len: 0,
         },
         payload: Bytes::new(),
@@ -237,6 +255,14 @@ async fn real_traffic_moves_the_hygiene_error_and_pool_series() {
     assert!(
         moved(UNSUPPORTED) >= 1,
         "the dispatch-path error was not counted:\n{after}"
+    );
+    // EXACT, unlike its neighbours: no other test in this binary produces a `Forbidden`, so this
+    // test owns the series outright and a double count (or a refusal that never reached the
+    // builder) cannot hide behind `>=`.
+    assert_eq!(
+        moved(FORBIDDEN),
+        1,
+        "the D15 refusal (a session-built terminal) was not counted exactly once:\n{after}"
     );
     assert!(
         moved(PROTOCOL) >= 1,

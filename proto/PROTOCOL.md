@@ -405,7 +405,7 @@ NOT NULL violation (`1048`), so a consumer keyed on the SQLSTATE alone cannot te
 `errno` rides the §2 signed/unsigned narrowing ladder like any other integer field (`1062` ⇒
 `cd 04 26`, a `uint16`), NOT a fixed width.
 
-**Per-service indexes:** SQL `EXEC` → §8.3 · TX → §9.6 · STREAM `HEAD`/`DATA` → §10.3.
+**Per-service indexes:** SQL `EXEC` → §8.3 · TX → §9.6 · STREAM `HEAD`/`DATA` → §10.3 · ADMIN → §11.3.
 
 **Negative seeds:** `bad_magic.bin`, `bad_version.bin`, `oversize_len.bin`, `reserved_flag.bin`
 (the last has a structurally valid header and is rejected at the flags layer, not by
@@ -675,3 +675,68 @@ shape as `sql_exec_response_typedvalue`, §8.3).
 (§8.3), carried in a `DATA` frame. The streamed path decodes cells through the same per-cell
 TypedValue codec as the buffered one, so this byte-locks it **independently** rather than assuming
 the buffered vector covers it.
+
+## 11. ADMIN service messages (`BACKUP`)
+
+The ADMIN service (`SERVICE_ADMIN = 5`, M2-C3-7b; SPEC §7.6, D14, D15) carries operator verbs. Its
+methods are registry `methods.admin` (`/proto/registry.lock.json`): `BACKUP = 1`. Its messages are
+`Value`-free, so they ride the same `msg!`/rmp-serde positional layout as the TX messages (§9).
+
+**Authorization happens before any handler, in the session layer (SPEC D15).** Every admin method
+has a fixed class in `ferrod` — READ or OPERATE — and the session checks the peer's
+KERNEL-ATTESTED uid (`SO_PEERCRED` on the session's own Unix socket, never anything on the wire)
+before the request enters the request lifecycle: a READ verb needs only an admitted peer, an OPERATE
+verb additionally needs the uid in `FERRO_ADMIN_UIDS`, and **an empty `FERRO_ADMIN_UIDS` disables
+every OPERATE verb**. A connection whose uid the kernel cannot attest is refused every admin verb. A
+refusal is one terminal `Outcome::Error` with `code = errc::FORBIDDEN` (`0x300C`, NonRetryable) on
+the request's `request_id`; because the session — not a handler — sends it, its header is the generic
+session terminal (`service = CORE`, `method = 0`, `END`), the same shape as `error_protocol` (§7). A
+refused verb never reaches pool lookup, so a refusal is identical whether or not the named pool
+exists. An `ADMIN` method id this build does not serve is `Unsupported`, never a handler.
+
+`BACKUP` is an OPERATE verb.
+
+### 11.1 `BackupRequest` (service `ADMIN`, method `BACKUP` = 1) — client → server
+
+A positional fixarray of 4 fields:
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `pool` | `str` | the pool whose database is snapshotted — a SQLite pool; any other is `Unsupported` |
+| 2 | `file` | `str` | the snapshot's FILE NAME — `[A-Za-z0-9._-]`, 1..=200 bytes, not starting with `.` — placed in the pool's D14 allowed directory. **Not a path**: no directory crosses the wire in either direction (a failed snapshot's error text has the directory redacted), and anything else is `Forbidden`. A name that is any SQLite pool's live database in that directory, or one of its `-wal`/`-shm`/`-journal` sidecars, is `Forbidden` regardless of `replace` |
+| 3 | `replace` | `bool` | `true` swaps a new snapshot over an existing regular file of that name atomically (`rename`); `false` refuses an existing name (`Forbidden`) |
+| 4 | `timeout_ms` | `u32 \| nil` | bounds the snapshot statement; `nil` leaves it unbounded. A per-request `CANCEL` stops it either way |
+
+### 11.2 `BackupResponse` — terminal `Outcome::Ok` body — server → client
+
+`[OUTCOME_OK, <BackupResponse>]`, a positional fixarray of 3, composing into the envelope exactly as
+`BeginResponse` does (§9.3):
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `bytes` | `u64` | the finalised snapshot's size |
+| 2 | `queue_us` | `u64` | pool wait (SPEC §13's split) |
+| 3 | `exec_us` | `u64` | the snapshot statement itself |
+
+A failed `BACKUP` never leaves a file: the snapshot is written to a temporary the engine creates
+exclusively (mode `0600`, an unpredictable name) and only moved into place on success — and only if
+that temporary is still the engine's own file with a single link — and the previous snapshot
+survives a failed `replace`. The published snapshot is mode `0600`, owned by the engine's user. A cancelled or timed-out
+backup is `Cancelled`/`QueryTimeout` — never `Indeterminate`, since the source database is not
+written.
+
+### 11.3 ADMIN vector index
+
+`admin_backup_request` (`replace = true`, `timeout_ms = 30000` — the populated arm of the nullable),
+`admin_backup_response` (the terminal `Outcome::Ok(BackupResponse)`, with `bytes = 5000000000` so the
+u64 width is locked rather than a fixint every width would pass), and `error_forbidden` (the D15
+refusal, carrying the generic session-terminal header the engine actually sends — `CORE`/0 — and
+locking that `Forbidden` is a code distinct from `Auth`, which is the BACKEND refusing the pool's own
+credentials).
+
+**No `protocol_version` bump.** The registry hash (`TYPE_REGISTRY_HASH`, an FNV-1a over the whole
+lock file) already moved with these additions, and the engine refuses a client whose hash differs at
+the handshake — so a skewed pair fails at the first frame rather than mid-request. `protocol_version`
+moves when an EXISTING message changes shape (§1); these are new messages on a new method, and a new
+error code that an older decoder would classify correctly by its explicit `branch` (§5).
+

@@ -2,8 +2,8 @@
 //!
 //! Of §13's four observability bullets this is the one whose CONSUMER already exists. Prometheus
 //! needs a scrape endpoint and `ferro top` needs the admin service, and neither transport is built
-//! — the admin service is `ADMIN = 5`, a reserved `/proto` service id with no method table
-//! (§22.2 (bo)). A log line needs only the `tracing` subscriber the daemon has had since M0, which
+//! — the admin service was then `ADMIN = 5`, a reserved `/proto` service id with no method table
+//! (§22.2 (bo); it has one since M2-C3-7b, §22.2 (cf)). A log line needs only the `tracing` subscriber the daemon has had since M0, which
 //! is what product-vision §5 means by *"slow log as structured JSON to stdout/journald"*. So this
 //! ships first, and it ships the piece the other three will reuse: the fingerprint.
 //!

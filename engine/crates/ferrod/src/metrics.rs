@@ -3,7 +3,8 @@
 //! §13 lists four observability surfaces and C4a shipped the slow log first because its CONSUMER —
 //! the `tracing` subscriber — already existed. This is the second, and the reason it comes before
 //! `ferro top` is the same one: `ferro top` is "a live TUI over the admin service" in §13's own
-//! words, and `ADMIN = 5` still has no method table (§22.2 (bo)); a Prometheus scrape is an HTTP
+//! words, and `ADMIN = 5` had no method table then (§22.2 (bo); it has `BACKUP` since M2-C3-7b, and
+//! `ferro top` itself is M4); a Prometheus scrape is an HTTP
 //! GET, which needs no `/proto` surface at all.
 //!
 //! **The exposition text is built separately from the socket that serves it**, so the format — the
