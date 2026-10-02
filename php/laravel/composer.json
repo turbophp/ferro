@@ -23,5 +23,6 @@
         }
     },
     "scripts": { "test": "phpunit", "stan": "phpstan analyse src --level 9" },
-    "config": { "sort-packages": true }
+    "config": { "sort-packages": true },
+    "extra": { "laravel": { "providers": ["Ferro\\Laravel\\FerroServiceProvider"] } }
 }

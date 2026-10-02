@@ -725,8 +725,12 @@ subset run on all three families against controls: green on none of them through
 (the driver-name artifact above); under the alias, indistinguishable from the control on
 PostgreSQL (whose own two failures reproduce through `pdo_pgsql`) and on the MySQL family (since
 C1g). Upstream's family-SPECIFIC directories run under the alias only, short of their controls by
-the deliberate `''` rendering and the refused `getPdo()->query()` above. No demo app exists, and the
-Eloquent ORM's own test suite is not run on any family. The recorded MySQL-family numbers are in the
+the deliberate `''` rendering and the refused `getPdo()->query()` above. The demo app EXISTS
+(`testkit/laravel-demo/`, SPEC §22.2 (ch)) and is a per-PR CI gate, Ferro and stock control alike, on
+every family — but it is seven tests of one application's database surface (sessions, password
+resets, the `database` queue and batches, the `database` cache), not the suite. Its first run found
+the `database` queue worker processing nothing on any Ferro family (`PDO::ATTR_DRIVER_NAME`, fixed).
+The Eloquent ORM's own test suite is not run on any family. The recorded MySQL-family numbers are in the
 C1f and C1g results docs.
 
 ---

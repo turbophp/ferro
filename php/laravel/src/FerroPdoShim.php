@@ -239,6 +239,27 @@ final class FerroPdoShim
         return $this->guardValue(fn (): ?\Ferro\Protocol\PoolInfo => $this->ferro->poolInfo())?->kind;
     }
 
+    /**
+     * The name PDO's own driver reports for this pool's family (`PDO::ATTR_DRIVER_NAME`). An
+     * unknown or unadvertised family is LOUD: the one caller measured so far chooses its row-lock
+     * SQL from this, and a guessed name is a guessed dialect.
+     */
+    private function driverName(): string
+    {
+        $info = $this->ferro->poolInfo();
+
+        return match ($info?->kind) {
+            'postgres' => 'pgsql',
+            'mysql' => 'mysql',
+            'sqlite' => 'sqlite',
+            default => throw new \LogicException(sprintf(
+                'Ferro: cannot report PDO::ATTR_DRIVER_NAME for pool "%s": %s.',
+                $info->name ?? '(unknown)',
+                $info === null ? 'the engine advertised no metadata for it' : sprintf('family "%s" is not one this driver knows', $info->kind),
+            )),
+        };
+    }
+
     private function refuseUnknownFamily(): never
     {
         $info = $this->guardValue(fn (): ?\Ferro\Protocol\PoolInfo => $this->ferro->poolInfo());
@@ -272,19 +293,31 @@ final class FerroPdoShim
      * `version_compare` reads as older than any number, so the guard above passed while the branch
      * it protects still went the wrong way. Measured, and caught only by upstream's own suite.
      *
+     * **`PDO::ATTR_DRIVER_NAME` joined it at the §15 demo app (M2), measured the same way**: the
+     * `database` queue's `DatabaseQueue::getLockForPopping()` reads it on EVERY pop to decide
+     * between `FOR UPDATE SKIP LOCKED` and a plain lock, so while it refused, the worker's pop threw
+     * inside its transaction and the worker processed nothing — on every family. It answers what
+     * PDO answers for the family ({@see driverName()}); MariaDB is `mysql` there too, exactly as
+     * under `pdo_mysql`, and Illuminate tells it apart by the VERSION string, which reaches it
+     * unnormalised for the MySQL family ({@see ServerVersion}).
+     *
      * Every OTHER attribute still refuses by name. That is deliberate: the roster grows only as
-     * real framework code is measured needing it, which is exactly how this one arrived.
+     * real framework code is measured needing it, which is exactly how both of these arrived.
      */
     public function getAttribute(int $attribute): string
     {
+        if ($attribute === \PDO::ATTR_DRIVER_NAME) {
+            return $this->driverName();
+        }
         if ($attribute !== \PDO::ATTR_SERVER_VERSION) {
             throw new \LogicException(sprintf(
                 'Ferro: PDO::getAttribute(%d) is not implemented by FerroPdoShim. Only '
-                . 'ATTR_SERVER_VERSION (%d) is, because that is the one stock Illuminate code was '
-                . 'measured to need. If a package needs another, that is a scope decision — see '
-                . 'docs/dev-loop/PHASE-C-SCOPE.md.',
+                . 'ATTR_SERVER_VERSION (%d) and ATTR_DRIVER_NAME (%d) are, because those are the '
+                . 'ones stock Illuminate code was measured to need. If a package needs another, '
+                . 'that is a scope decision — see docs/dev-loop/PHASE-C-SCOPE.md.',
                 $attribute,
                 \PDO::ATTR_SERVER_VERSION,
+                \PDO::ATTR_DRIVER_NAME,
             ));
         }
 

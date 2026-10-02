@@ -26,11 +26,12 @@ final class PdoShimAttributeTest extends TestCase
         $shim = new FerroPdoShim(new FerroClient(new FakeSession(), 'main'));
 
         try {
-            $shim->getAttribute(\PDO::ATTR_DRIVER_NAME);
+            $shim->getAttribute(\PDO::ATTR_CLIENT_VERSION);
             $this->fail('an unimplemented attribute must refuse');
         } catch (\LogicException $e) {
-            self::assertStringContainsString((string) \PDO::ATTR_DRIVER_NAME, $e->getMessage());
+            self::assertStringContainsString((string) \PDO::ATTR_CLIENT_VERSION, $e->getMessage());
             self::assertStringContainsString((string) \PDO::ATTR_SERVER_VERSION, $e->getMessage());
+            self::assertStringContainsString((string) \PDO::ATTR_DRIVER_NAME, $e->getMessage());
         }
     }
 
@@ -49,5 +50,39 @@ final class PdoShimAttributeTest extends TestCase
         $this->expectException(\LogicException::class);
         $this->expectExceptionMessageMatches('/no server_version for pool "main"/');
         $shim->getAttribute(\PDO::ATTR_SERVER_VERSION);
+    }
+
+    /**
+     * `PDO::ATTR_DRIVER_NAME` answers what PDO's own driver answers for the family. Stock
+     * `DatabaseQueue::getLockForPopping()` reads it on every pop (measured by the §15 demo app:
+     * while it refused, the `database` queue worker processed nothing on any family).
+     */
+    public function testDriverNameIsPdosNameForTheFamily(): void
+    {
+        foreach (['postgres' => 'pgsql', 'mysql' => 'mysql', 'sqlite' => 'sqlite'] as $kind => $pdo) {
+            $session = new FakeSession();
+            $session->poolInfo = [new PoolInfo('main', $kind, '1.0')];
+            $shim = new FerroPdoShim(new FerroClient($session, 'main'));
+            self::assertSame($pdo, $shim->getAttribute(\PDO::ATTR_DRIVER_NAME), $kind);
+        }
+    }
+
+    /** An unknown or unadvertised family refuses rather than guessing a dialect. */
+    public function testDriverNameRefusesAnUnknownOrMissingFamily(): void
+    {
+        $session = new FakeSession();
+        $session->poolInfo = [new PoolInfo('main', 'mssql', '1.0')];
+        $shim = new FerroPdoShim(new FerroClient($session, 'main'));
+        try {
+            $shim->getAttribute(\PDO::ATTR_DRIVER_NAME);
+            $this->fail('an unknown family must refuse');
+        } catch (\LogicException $e) {
+            self::assertStringContainsString('family "mssql"', $e->getMessage());
+        }
+
+        $shim = new FerroPdoShim(new FerroClient(new FakeSession(), 'main'));
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessageMatches('/advertised no metadata/');
+        $shim->getAttribute(\PDO::ATTR_DRIVER_NAME);
     }
 }

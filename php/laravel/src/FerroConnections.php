@@ -14,10 +14,10 @@ use Illuminate\Database\Connection;
  *
  * `Illuminate\Database\Connection::resolverFor($driver, Closure)` is a static map the framework
  * consults when a config entry names a `driver` it does not know — which is the whole mechanism
- * behind "change `driver` and nothing else". A Laravel application calls {@see register} from a
- * service provider's `register()`; a plain Illuminate application (or a test) calls it directly.
- * It is deliberately a static registrar rather than a `ServiceProvider` subclass so that this
- * package depends only on `illuminate/database`, not on the full framework.
+ * behind "change `driver` and nothing else". In a Laravel application the auto-discovered
+ * {@see FerroServiceProvider} calls {@see register}; a plain Illuminate application (or a test), or
+ * one that disables package discovery, calls it directly. The registrar stays static so it works
+ * without the framework's container.
  */
 final class FerroConnections
 {
