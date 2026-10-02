@@ -31,10 +31,18 @@ final class BackupResponse
     {
         $w = array_values($w);
         if (count($w) !== 3) { throw new CodecException('BackupResponse arity != 3'); }
-        return [
-            'bytes' => SqlValueCodec::toInt($w[0]),
-            'queue_us' => SqlValueCodec::toInt($w[1]),
-            'exec_us' => SqlValueCodec::toInt($w[2]),
-        ];
+        // STRICT, unlike the coercing `SqlValueCodec::toInt` the TX codecs use: a size or a duration
+        // that is not a non-negative native int is a malformed reply, never a number to invent
+        // (C3-7b-2 review F3 measured `[nil,nil,nil]` decoding as a 0-byte success). A u64 above
+        // PHP_INT_MAX unpacks as a decimal string and is refused here too — no snapshot is that big.
+        $out = [];
+        foreach (['bytes', 'queue_us', 'exec_us'] as $i => $field) {
+            $v = $w[$i];
+            if (!is_int($v) || $v < 0) {
+                throw new CodecException("BackupResponse {$field} is not a non-negative integer");
+            }
+            $out[$field] = $v;
+        }
+        return ['bytes' => $out['bytes'], 'queue_us' => $out['queue_us'], 'exec_us' => $out['exec_us']];
     }
 }

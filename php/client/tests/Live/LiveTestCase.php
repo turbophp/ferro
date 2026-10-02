@@ -202,6 +202,20 @@ abstract class LiveTestCase extends TestCase
     }
 
     /**
+     * Extra `ferrod` environment for a subclass (M2-C3-7b-2: `FERRO_ADMIN_UIDS`). Empty by default,
+     * so every existing live test launches exactly the daemon it did before. Applied AFTER the
+     * harness's own variables, but it cannot set `FERRO_SOCK`, `FERRO_POOLS` or ANY `FERRO_POOL_*`
+     * key (a DSN, and also a pool's `_ALLOW_DIR` or size knobs) — all refused, so the pool set stays
+     * stated once ({@see launchFerrod}). A per-pool knob needs its own hook when a test needs it.
+     *
+     * @return array<string, string>
+     */
+    protected function extraEnv(): array
+    {
+        return [];
+    }
+
+    /**
      * The backend FAMILY this harness expects `HELLO_ACK` to advertise per pool (M1-S8a), DERIVED
      * from the DSN scheme the harness itself passed — mirroring `config::infer_pool_kind`, which is
      * the engine's only source for `PoolSpec.kind` (there is no `kind=` knob). Deriving it means a
@@ -217,6 +231,7 @@ abstract class LiveTestCase extends TestCase
             $scheme = strtolower((string) strstr($dsn, '://', true));
             $kinds[] = match ($scheme) {
                 'mysql', 'mariadb' => 'mysql',
+                'sqlite' => 'sqlite',
                 default => 'postgres',
             };
         }
@@ -275,6 +290,13 @@ abstract class LiveTestCase extends TestCase
             // Mirrors `ferrod`'s own env_name(): uppercase, every non-alphanumeric to `_`.
             $envName = strtoupper((string) preg_replace('/[^A-Za-z0-9]/', '_', $name));
             $env['FERRO_POOL_' . $envName . '_DSN'] = $dsn;
+        }
+
+        foreach ($this->extraEnv() as $key => $value) {
+            if ($key === 'FERRO_SOCK' || $key === 'FERRO_POOLS' || str_starts_with($key, 'FERRO_POOL_')) {
+                $this->fail("extraEnv() may not override the harness's own {$key}");
+            }
+            $env[$key] = $value;
         }
 
         $descriptors = [
