@@ -2,12 +2,16 @@
 declare(strict_types=1);
 namespace Ferro\Tests\Client;
 
+use Ferro\Client\Backoff;
 use Ferro\Client\Connection;
 use Ferro\Client\Error\ConnectionLostException;
+use Ferro\Client\Error\IndeterminateException;
 use Ferro\Client\Error\NonRetryableException;
 use Ferro\Client\Error\ProtocolException;
 use Ferro\Client\Error\RetryableException;
 use Ferro\Client\Error\TransportException;
+use Ferro\Client\ReconnectLoop;
+use Ferro\Client\RetryPolicy;
 use Ferro\Protocol\BackupRequest;
 use Ferro\Protocol\BackupResponse;
 use Ferro\Protocol\ErrorPayload;
@@ -95,15 +99,78 @@ final class ConnectionBackupTest extends TestCase
     }
 
     /**
-     * A link lost mid-BACKUP is a lost READ: Retryable, never Indeterminate — a backup writes nothing
-     * to the source database, and a retry without `replace` answers "already exists" if the first
-     * attempt had completed.
+     * A link lost after the BACKUP went out is UNCONFIRMED: the engine may still publish the snapshot
+     * (the C3-7b-2 review measured it, 500 ms after the client gave up), so it is a lost WRITE —
+     * Indeterminate — and never Retryable.
      */
-    public function testALostBackupIsRetryableNotIndeterminate(): void
+    public function testALostBackupIsIndeterminateNotRetryable(): void
     {
         $session = (new FakeSession())->push(new ConnectionLostException('peer closed'));
-        $this->expectException(RetryableException::class);
+        $this->expectException(IndeterminateException::class);
         (new Connection($session, 'lite'))->backup('a.db');
+    }
+
+    /**
+     * The client's own retry machinery never re-issues it: inside `transaction()` with the default
+     * policy and a reconnect loop — the shape that re-ran the closure, and so re-sent the BACKUP, in
+     * the review's probe — the backup goes out ONCE and the Indeterminate propagates.
+     */
+    public function testTransactionNeverReIssuesALostBackup(): void
+    {
+        $first = FakeSession::withTxBegin(1)->push(new ConnectionLostException('peer closed'));
+        $second = FakeSession::withTxBegin(2)->push(self::ok(1, 0, 1));
+        $loop = new ReconnectLoop($first, static fn (): FakeSession => $second, new Backoff(0, 0, rng: static fn (): float => 0.0, sleep: static function (float $_): void {}), 3);
+        $c = new Connection(session: $first, pool: 'lite', reconnect: $loop, policy: RetryPolicy::default());
+        try {
+            $c->transaction(static fn () => $c->backup('nightly.db', true));
+            self::fail('a lost backup must not be re-run');
+        } catch (IndeterminateException) {
+        }
+        $backups = 0;
+        foreach ([$first, $second] as $s) {
+            for ($i = 0; $i < $s->sendCount(); $i++) {
+                $backups += $s->sentAt($i)['service'] === C::SERVICE_ADMIN ? 1 : 0;
+            }
+        }
+        self::assertSame(1, $backups, 'the BACKUP was sent exactly once');
+    }
+
+    /** The engine spoke a definite fate before the link died — that fate is reported, not guessed. */
+    public function testAFateTheEngineReportedBeforeTheLinkDiedIsTrusted(): void
+    {
+        $session = (new FakeSession())->push(new ConnectionLostException('peer closed', new ErrorPayload(
+            C::ERR_FORBIDDEN,
+            C::BRANCH_NON_RETRYABLE,
+            null,
+            null,
+            'refused',
+            null,
+            null,
+        )));
+        try {
+            (new Connection($session, 'lite'))->backup('a.db');
+            self::fail('must throw');
+        } catch (NonRetryableException $e) {
+            self::assertSame(C::ERR_FORBIDDEN, $e->errorPayload()->code);
+        }
+    }
+
+    /** With a reconnect loop, a session a failure already closed is replaced BEFORE the backup is
+     * sent — not a retry: it goes out once, on the new session. */
+    public function testAPoisonedSessionIsReplacedBeforeTheBackup(): void
+    {
+        $first = (new FakeSession())->push(TransportException::requestNotSent('write failed after 0 bytes'));
+        $second = (new FakeSession())->push(self::ok(4096, 0, 1));
+        $loop = new ReconnectLoop($first, static fn (): FakeSession => $second, new Backoff(0, 0, rng: static fn (): float => 0.0, sleep: static function (float $_): void {}), 1);
+        $c = new Connection(session: $first, pool: 'lite', reconnect: $loop, policy: RetryPolicy::none());
+        try {
+            $c->backup('a.db');
+            self::fail('the first backup was not sent');
+        } catch (RetryableException) {
+        }
+        self::assertSame(4096, $c->backup('a.db')->bytes);
+        self::assertSame(1, $loop->reconnectCount());
+        self::assertSame(1, $second->sendCount());
     }
 
     public function testAnUnsentBackupIsRetryable(): void
@@ -121,6 +188,11 @@ final class ConnectionBackupTest extends TestCase
             'wrong arity' => $p->packArrayLen(2) . $p->packUint(1) . $p->packUint(2),
             'not an array' => $p->packUint(7),
             'trailing bytes' => BackupResponse::encode(['bytes' => 1, 'queue_us' => 0, 'exec_us' => 1], $p) . $p->packNil(),
+            // C3-7b-2 review F3: these used to decode as a success with invented numbers.
+            'nils' => $p->packArrayLen(3) . $p->packNil() . $p->packNil() . $p->packNil(),
+            'wrong types' => $p->packArrayLen(3) . $p->packStr('abc') . $p->packBool(true) . $p->packUint(1),
+            'negative size' => $p->packArrayLen(3) . $p->packInt(-5) . $p->packUint(0) . $p->packUint(0),
+            'u64 above PHP_INT_MAX' => $p->packArrayLen(3) . "\xcf\xff\xff\xff\xff\xff\xff\xff\xff" . $p->packUint(0) . $p->packUint(1),
         ] as $case => $body) {
             $session = (new FakeSession())->push(Outcome::ok($body));
             try {
@@ -129,6 +201,18 @@ final class ConnectionBackupTest extends TestCase
             } catch (ProtocolException) {
                 $this->addToAssertionCount(1);
             }
+        }
+    }
+
+    /** A non-UTF-8 name is the caller's error, refused before anything is sent — not a wire fault. */
+    public function testANonUtf8NameIsRefusedBeforeAnythingIsSent(): void
+    {
+        $session = new FakeSession();
+        try {
+            (new Connection($session, 'lite'))->backup("\xff.db");
+            self::fail('a non-UTF-8 name must be refused');
+        } catch (\InvalidArgumentException) {
+            self::assertSame(0, $session->sendCount());
         }
     }
 

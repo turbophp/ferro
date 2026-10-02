@@ -8,11 +8,21 @@ use Ferro\Protocol\Generated\Constants as C;
 /**
  * The DEFAULT deployment (SPEC D15): `FERRO_ADMIN_UIDS` unset, so OPERATE is disabled for every
  * peer — including the daemon's own uid, which this test process usually is. Same pool, same
- * request as {@see BackupLiveTest}'s success path; only the engine's configuration differs (this
- * class adds nothing to the base's empty {@see LiveTestCase::extraEnv}).
+ * request as {@see BackupLiveTest}'s success path; only the engine's configuration differs.
  */
 final class BackupForbiddenLiveTest extends BackupLiveTestCase
 {
+    /**
+     * PINNED blank, not merely left unset: the harness starts `ferrod` from this process's own
+     * environment, so an exported `FERRO_ADMIN_UIDS` would otherwise leak in and turn the "default
+     * configuration" into an admin one (C3-7b-2 review F1 — all three tests failed under
+     * `FERRO_ADMIN_UIDS=$(id -u)`). The engine reads a blank list as empty, i.e. OPERATE disabled.
+     */
+    protected function extraEnv(): array
+    {
+        return ['FERRO_ADMIN_UIDS' => ''];
+    }
+
     public function testTheDefaultConfigurationRefusesBackup(): void
     {
         $conn = $this->connectConnection(null, self::LITE_POOL);

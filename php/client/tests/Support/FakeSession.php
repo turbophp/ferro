@@ -168,6 +168,18 @@ final class FakeSession implements SessionInterface, StreamingSessionInterface
         return ['service' => $last[0], 'method' => $last[1], 'payload' => $last[2]];
     }
 
+    /**
+     * The `$i`-th request sent on this session, oldest first — for tests that must COUNT which kinds
+     * of request went out (M2-C3-7b-2: a BACKUP must be sent exactly once).
+     *
+     * @return array{service:int,method:int,payload:string}
+     */
+    public function sentAt(int $i): array
+    {
+        $at = $this->sent[$i] ?? throw new \LogicException("FakeSession: no request #{$i}");
+        return ['service' => $at[0], 'method' => $at[1], 'payload' => $at[2]];
+    }
+
     // ---- named constructors for the imperative-transaction tests (M1-S8a Task 9) ----------------
 
     /** A session whose FIRST send is a `TX/BEGIN` answered with `tx_id = $txId`. */

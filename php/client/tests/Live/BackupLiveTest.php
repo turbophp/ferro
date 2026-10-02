@@ -16,7 +16,7 @@ final class BackupLiveTest extends BackupLiveTestCase
         return ['FERRO_ADMIN_UIDS' => (string) self::ownUid()];
     }
 
-    public function testASnapshotIsTakenAndReplacedAtomically(): void
+    public function testASnapshotIsTakenAndReplaced(): void
     {
         $conn = $this->connectConnection(null, self::LITE_POOL);
         $conn->exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
@@ -43,7 +43,9 @@ final class BackupLiveTest extends BackupLiveTestCase
         }
         self::assertSame($before, (string) file_get_contents($snap));
 
-        // With it, a NEW snapshot (more rows → a different file) is swapped in.
+        // With it, a NEW snapshot (more rows → a different file) takes the name. That the swap is
+        // ATOMIC — a failed replace keeps the previous snapshot — is the engine's property, proven in
+        // `ferrod`'s `admin_it.rs`; this test shows only that `replace` reaches it.
         for ($i = 26; $i <= 2000; $i++) {
             $conn->exec('INSERT INTO t (v) VALUES (?)', [str_repeat('x', 50)]);
         }
@@ -54,6 +56,21 @@ final class BackupLiveTest extends BackupLiveTestCase
 
         // No temporary is left in the directory.
         self::assertSame([], glob($this->liteDir() . '/.*.ferro-backup-*') ?: []);
+    }
+
+    /**
+     * The harness's expectation of each pool's KIND matches what `HELLO_ACK` advertises — including
+     * the SQLite pool this class adds, which the harness had no mapping for until this slice (the
+     * review found the new `'sqlite'` arm unasserted: deleting it left the whole live tier green).
+     */
+    public function testTheAdvertisedPoolKindsMatchTheHarness(): void
+    {
+        foreach ($this->launchedPools() as $i => $pool) {
+            $info = $this->connectConnection(null, $pool)->poolInfo();
+            self::assertNotNull($info, "{$pool} is advertised");
+            self::assertSame($this->launchedPoolKinds()[$i], $info->kind, $pool);
+        }
+        self::assertContains('sqlite', $this->launchedPoolKinds());
     }
 
     /** The engine's destination policy reaches the client as `Forbidden`, and the live database's

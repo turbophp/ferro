@@ -204,8 +204,9 @@ abstract class LiveTestCase extends TestCase
     /**
      * Extra `ferrod` environment for a subclass (M2-C3-7b-2: `FERRO_ADMIN_UIDS`). Empty by default,
      * so every existing live test launches exactly the daemon it did before. Applied AFTER the
-     * harness's own variables, but it cannot replace `FERRO_SOCK`/`FERRO_POOLS`/a pool DSN — those
-     * keys are refused, so the single-source-of-truth rule {@see launchFerrod} states still holds.
+     * harness's own variables, but it cannot set `FERRO_SOCK`, `FERRO_POOLS` or ANY `FERRO_POOL_*`
+     * key (a DSN, and also a pool's `_ALLOW_DIR` or size knobs) — all refused, so the pool set stays
+     * stated once ({@see launchFerrod}). A per-pool knob needs its own hook when a test needs it.
      *
      * @return array<string, string>
      */

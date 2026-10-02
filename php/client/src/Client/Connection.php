@@ -708,20 +708,38 @@ final class Connection
      * and, by design, the name of a live database file. A non-SQLite pool is
      * {@see C::ERR_UNSUPPORTED}: a server database is backed up with its own tooling.
      *
-     * **Fate.** A backup never writes the source database, and the engine itself resolves the one
-     * file it creates (published or removed), so a lost or cancelled backup is never Indeterminate:
-     * a link lost mid-request is classified as a lost READ ({@see RetryableException}). Retrying is
-     * safe — without `$replace`, a backup that did complete before the link died answers the retry
-     * with "already exists" rather than duplicating anything.
+     * **Fate — a lost backup is UNCONFIRMED, not retryable.** A backup never writes the source
+     * database, but it does publish a FILE, and a reply lost after the request went out says nothing
+     * about whether it was published: the C3-7b-2 review measured a backup the client had given up
+     * on appear 500 ms later (the engine's interrupt cannot stop a `VACUUM INTO` that has not
+     * started yet, and the engine then publishes). So a sent-then-lost backup is classified as a
+     * lost WRITE — {@see IndeterminateException} — which no retry loop here re-issues, including
+     * {@see transaction()}'s re-run; one that was provably never sent is {@see RetryableException}.
+     * An engine-reported failure (cancel, timeout, a refused name) is a KNOWN fate: the engine
+     * removes its own temporary before answering.
      *
-     * @param int|null $timeoutMs bound on the snapshot statement (u32); null leaves it unbounded
+     * **The connection's read timeout bounds a backup too.** The reply is awaited like any other, so
+     * a snapshot that takes longer than the `ioTimeout` this connection was opened with (5 s by
+     * default in {@see Ferro::connect}) cannot be confirmed — it ends in the Indeterminate above, and
+     * the engine, seeing the session die, cancels it. Open the connection that takes backups with an
+     * `ioTimeout` above the expected snapshot time; `$timeoutMs` beyond it has no effect.
+     *
+     * @param int|null $timeoutMs engine-side bound on the snapshot statement (u32); null leaves it
+     *                            bounded only by this connection's read timeout (see above)
      */
     public function backup(string $file, bool $replace = false, ?int $timeoutMs = null): BackupResult
     {
         if ($timeoutMs !== null && ($timeoutMs < 0 || $timeoutMs > 0xFFFFFFFF)) {
             throw new \InvalidArgumentException('timeoutMs must be null or a u32 (0..4294967295)');
         }
-        $session = $this->requestSession(OpKind::Read, true);
+        // A wire precondition, not the engine's name policy (which the engine owns): a non-UTF-8
+        // string cannot ride the `str` field, and sent anyway it came back as `ERR_PROTOCOL` — a
+        // WIRE fault, which §22.2 (ai) reserves for genuine codec defects (C3-7b-2 review F5).
+        // `preg_match` with `/u` fails on invalid UTF-8 and needs no extension (charter rule 7).
+        if (preg_match('//u', $file) !== 1) {
+            throw new \InvalidArgumentException('backup file name must be valid UTF-8');
+        }
+        $session = $this->requestSession(OpKind::Write, false);
         $payload = BackupRequest::encode(
             ['pool' => $this->pool, 'file' => $file, 'replace' => $replace, 'timeout_ms' => $timeoutMs],
             $this->encodePacker,
@@ -729,10 +747,11 @@ final class Connection
         try {
             $outcome = $session->sendRequest(C::SERVICE_ADMIN, C::METHOD_ADMIN_BACKUP, $payload);
         } catch (ConnectionLostException | TransportException $e) {
+            // A lost WRITE (see the docblock): whether the snapshot was published is unconfirmed.
             throw $this->fate->classifyLoss(
-                OpKind::Read,
-                true,
-                'BACKUP lost: ' . $e->getMessage(),
+                OpKind::Write,
+                false,
+                'BACKUP lost — whether the snapshot was published is unconfirmed: ' . $e->getMessage(),
                 $e instanceof ConnectionLostException ? $e->errorPayload() : null,
                 $this->reconnect?->lastEpochChanged() ?? false,
                 sent: self::wasSent($e),
