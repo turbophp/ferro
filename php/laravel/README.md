@@ -24,7 +24,10 @@ Ferro connections for Laravel / Illuminate — the §15 Eloquent tier.
 ],
 ```
 
-Register the resolvers once, from a service provider's `register()` or an application bootstrap:
+That is the whole change in a Laravel application: the package ships `Ferro\Laravel\FerroServiceProvider`
+under `extra.laravel.providers`, so package discovery registers the `ferro-*` drivers. An
+application that disables discovery, or a plain Illuminate application without the framework,
+registers them once itself:
 
 ```php
 Ferro\Laravel\FerroConnections::register();

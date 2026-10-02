@@ -132,6 +132,15 @@ cp "$root/testkit/laravel/DatabaseTestCase.ferro.php" "$src/tests/Integration/Da
 grep -q 'FerroConnections::register' "$src/tests/Integration/Database/DatabaseTestCase.php" \
   || { echo "::error:: DatabaseTestCase patch did not apply"; exit 1; }
 
+# 3b. THE §15 DEMO APP (M2), copied into the clone beside the suite it reuses, so it runs under the
+#     SAME patched base class — and therefore the same per-family connection, the same stock-PDO
+#     control and the same contact assertion — as every upstream case. It is selected like any
+#     other set of tests: FERRO_LARAVEL_ALLOWLIST=testkit/laravel/allowlist-demo.txt.
+rm -rf "$src/tests/Integration/Database/FerroDemo"
+cp -R "$root/testkit/laravel-demo" "$src/tests/Integration/Database/FerroDemo"
+[ -f "$src/tests/Integration/Database/FerroDemo/DemoAppTest.php" ] \
+  || { echo "::error:: the demo app did not copy into the clone"; exit 1; }
+
 # 4. ONE ferrod for the whole run, not one per test.
 #
 #    SQLITE RESETS FIRST, and the ordering is load-bearing rather than tidy: the daemon below OPENS
