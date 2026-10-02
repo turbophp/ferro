@@ -58,13 +58,22 @@ final class Driver extends AbstractDriver implements VersionAwarePlatformDriver
      * (inert for Ferro, whose connection charset belongs to the engine's pool) and no
      * `dbname_suffix` (Ferro has no client-side database name to suffix). The DBAL 4 driver's
      * `BackendFamilyUnknown` gives DoctrineBundle's DBAL 4 call the same advice (M2-C5 review F11).
+     *
+     * **After a connect the refusal is a POLICY, not a necessity** (M2-C5b review F3): the family is
+     * known then, and the stock answer — the family's OLDEST platform — would be easy to give. It is
+     * still refused, because it is not the platform the connection itself uses (that one is chosen
+     * from the server version), and handing a caller a second, older dialect for the same database
+     * is the silently-wrong-dialect class this driver exists not to produce. Upstream's
+     * `testDispatchEventWhenDatabasePlatformIsExplicitlyPassed` makes exactly this call and is
+     * recorded as refused by design (SPEC §22.2 (bz)).
      */
     public function getDatabasePlatform(): AbstractPlatform
     {
         throw DriverException::local(
             'Ferro: a DBAL 3 platform needs the server version, and this call carries none — before a '
-            . 'connection opens the driver does not know even the backend family, so it will not guess '
-            . 'a SQL dialect. If this is Symfony\'s DoctrineBundle (its ConnectionFactory asks for a '
+            . 'connection opens the driver does not know even the backend family, and after one the '
+            . 'version-less answer would be an older dialect than the connection uses, so it will not '
+            . 'guess a SQL dialect. If this is Symfony\'s DoctrineBundle (its ConnectionFactory asks for a '
             . 'platform to choose a default charset), set `charset` on the connection — it is inert '
             . 'for Ferro — and remove `dbname_suffix`. Otherwise let Doctrine choose the platform: '
             . 'Connection::getDatabasePlatform() connects and asks the engine.',

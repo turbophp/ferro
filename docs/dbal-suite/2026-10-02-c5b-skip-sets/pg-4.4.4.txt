@@ -1,0 +1,28 @@
+# C5b skip-set comparison — doctrine/dbal 4.4.4, PostgreSQL 16.13 (dev container, LOCAL — not a recorded column)
+# Produced on 2026-10-02 from commit f080df4 + the C5b review fixes, by:
+#   FERRO_DBAL_TAG=4.4.4 FERRO_DBAL_SVC=pg FERRO_DBAL_DSN=postgres://ferro:ferro@127.0.0.1:55432/doctrine_tests \
+#     bash testkit/dbal-suite.sh --log-junit ferro.xml          # the Ferro column
+#   (the same with FERRO_DBAL_CONTROL=1 --log-junit control.xml)  # the stock-driver control
+#   php testkit/dbal/compare-columns.php ferro.xml control.xml
+# (the database was reset before each run; JUnit encodes an incomplete test as skipped, so
+#  'skip' counts Skipped + Incomplete from the phpunit result line)
+
+tests: ferro 729, control 729
+in only one column: 0
+skip: ferro 358 (sha256 e3df01ca1f69e105), control 358 (sha256 e3df01ca1f69e105)
+  skip under ferro, not under control: 0
+  skip under control, not under ferro: 0
+fail: ferro 10 (sha256 754d81215aff4043), control 0 (sha256 e3b0c44298fc1c14)
+  fail under ferro, not under control: 10
+  Doctrine\DBAL\Tests\Functional\ExceptionTest::testInvalidHost
+  Doctrine\DBAL\Tests\Functional\ExceptionTest::testInvalidPassword
+  Doctrine\DBAL\Tests\Functional\ExceptionTest::testInvalidUserName
+  Doctrine\DBAL\Tests\Functional\TransactionTest::testBeginTransactionFailure
+  Doctrine\DBAL\Tests\Functional\TransactionTest::testCommitFailure
+  Doctrine\DBAL\Tests\Functional\TransactionTest::testRollbackFailure
+  Doctrine\DBAL\Tests\Functional\TransactionTest::testTransactionalFailureDuringCallback
+  Doctrine\DBAL\Tests\Functional\TransactionTest::testTransactionalFailureDuringCommit
+  Doctrine\DBAL\Tests\Functional\WriteTest::testEmptyIdentityInsert
+  Doctrine\DBAL\Tests\Functional\WriteTest::testLastInsertId
+  fail under control, not under ferro: 0
+RESULT: no test the control runs is skipped under Ferro.

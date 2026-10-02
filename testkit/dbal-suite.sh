@@ -30,15 +30,19 @@ pool="${FERRO_DBAL_POOL:-default}"
 # is running, and the whole column therefore runs on a box with no database server at all — the
 # first of the three that does.
 svc="${FERRO_DBAL_SVC:-pg}"
-# THE CONTROL COLUMN (`FERRO_DBAL_CONTROL=1`, SQLite only): the identical tests, the identical
-# database file, run through upstream's OWN `pdo_sqlite` with no Ferro anywhere — no daemon is
-# started and no socket is passed. It is what turns "28 non-passes" into an attribution instead of
-# a guess, and `bootstrap.php`'s contact assertion INVERTS for it (it refuses to run if the
-# connection turns out to be a Ferro one). It is the C2e shape (SPEC §22.2 (ar)).
+# THE CONTROL COLUMN (`FERRO_DBAL_CONTROL=1`): the identical tests against the identical database,
+# run through upstream's OWN `pdo_sqlite` / `pdo_pgsql` / `pdo_mysql` with no Ferro anywhere — no
+# daemon is started and no socket is passed. It is what turns "28 non-passes" into an attribution
+# instead of a guess, and `bootstrap.php`'s contact assertion INVERTS for it (it refuses to run if
+# the connection turns out to be a Ferro one). It is the C2e shape (SPEC §22.2 (ar)).
 #
-# SQLite only, and that is a fact about the other two families rather than a limitation here: a
-# pdo_pgsql/pdo_mysql control would need credentials in PHP, which the whole point of §12/D8 is that
-# the suite does not have. SQLite's "credentials" are a file path.
+# The server families' control takes its credentials from `FERRO_DBAL_DSN` and writes them into the
+# GENERATED phpunit config (M2-C5b). That is not the §12/D8 boundary being crossed: D8 keeps
+# credentials out of the PRODUCT's PHP, and the control column is a harness that exists precisely to
+# measure the product against the stock driver, which cannot connect without them — the Laravel
+# runner's `stock-pgsql` column has done the same since C2e. It was added so the rule SPEC §22.2 (bz)
+# records — compare a column's SKIP set against a control, not only its failures — can be followed
+# from the repo for every family rather than with an ad-hoc config.
 control="${FERRO_DBAL_CONTROL:-0}"
 work="${FERRO_DBAL_WORK:-$root/.dbal-suite}"
 # The SQLite column's database file. Inside $work so it is discarded with the rest of the scratch
@@ -53,10 +57,26 @@ if [ "$svc" = sqlite ]; then
 else
   dsn="${FERRO_DBAL_DSN:-postgres://ferro:ferro@127.0.0.1:55432/doctrine_tests}"
 fi
-if [ "$control" = 1 ] && [ "$svc" != sqlite ]; then
-  echo "::error:: FERRO_DBAL_CONTROL=1 is SQLite-only (see the comment above): the other families'"
-  echo "          controls would need database credentials in PHP, which SPEC §12/D8 forbids."
-  exit 1
+# The control's stock driver, and — for a server family — the DSN taken apart into the five
+# parameters `TestUtil` reads. Refused rather than guessed when the DSN does not parse: a control
+# that quietly connected somewhere else would measure the wrong database.
+ctl_driver=""
+if [ "$control" = 1 ]; then
+  case "$svc" in
+    sqlite) ctl_driver=pdo_sqlite ;;
+    pg) ctl_driver=pdo_pgsql ;;
+    mysql|mariadb) ctl_driver=pdo_mysql ;;
+    *) echo "::error:: FERRO_DBAL_CONTROL=1 has no stock driver for FERRO_DBAL_SVC=$svc"; exit 1 ;;
+  esac
+  if [ "$svc" != sqlite ]; then
+    re='^[a-z]+://([^:@/]+):([^@/]*)@([^:/]+):([0-9]+)/([^/?]+)$'
+    if [[ ! "$dsn" =~ $re ]]; then
+      echo "::error:: the control needs FERRO_DBAL_DSN as scheme://user:password@host:port/dbname"
+      exit 1
+    fi
+    ctl_user="${BASH_REMATCH[1]}" ctl_pass="${BASH_REMATCH[2]}" ctl_host="${BASH_REMATCH[3]}"
+    ctl_port="${BASH_REMATCH[4]}" ctl_db="${BASH_REMATCH[5]}"
+  fi
 fi
 src="$work/dbal-$tag"
 reset=1
@@ -169,7 +189,11 @@ sock=""
 if [ "$control" = 1 ]; then
   # No daemon, no socket, no cargo build. The control must not merely AVOID using Ferro — it must
   # have no Ferro to use, so a mis-set variable cannot quietly route through one.
-  echo "[control] no ferrod started; pdo_sqlite will open $sqlite_db directly"
+  if [ "$svc" = sqlite ]; then
+    echo "[control] no ferrod started; pdo_sqlite will open $sqlite_db directly"
+  else
+    echo "[control] no ferrod started; $ctl_driver will connect to $ctl_host:$ctl_port/$ctl_db directly"
+  fi
 else
   cargo build -p ferrod --manifest-path "$root/Cargo.toml"
   sock="$(mktemp -u /tmp/ferro-dbal-XXXXXX.sock)"
@@ -199,8 +223,16 @@ cfg="$work/phpunit.generated.xml"
   if [ "$control" = 1 ]; then
     # `driver`/`path` and NOTHING else: TestUtil refuses a run that sets both `driver` and
     # `driverClass`, so the two columns cannot be blended by accident.
-    echo '    <var name="db_driver" value="pdo_sqlite"/>'
-    echo '    <var name="db_path" value="'"$sqlite_db"'"/>'
+    echo '    <var name="db_driver" value="'"$ctl_driver"'"/>'
+    if [ "$svc" = sqlite ]; then
+      echo '    <var name="db_path" value="'"$sqlite_db"'"/>'
+    else
+      echo '    <var name="db_host" value="'"$ctl_host"'"/>'
+      echo '    <var name="db_port" value="'"$ctl_port"'"/>'
+      echo '    <var name="db_user" value="'"$ctl_user"'"/>'
+      echo '    <var name="db_password" value="'"$ctl_pass"'"/>'
+      echo '    <var name="db_dbname" value="'"$ctl_db"'"/>'
+    fi
   else
     echo '    <var name="db_driverClass" value="'"$driver_class"'"/>'
     echo '    <var name="db_unix_socket" value="'"$sock"'"/>'

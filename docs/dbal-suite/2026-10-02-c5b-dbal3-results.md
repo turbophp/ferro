@@ -23,8 +23,15 @@ column in `docs/dbal-suite/2026-09-15-c3-6a-sqlite-results.md`, and its PG/MySQL
   are equal before running anything.
 - **PHPUnit 11.5.56** (the driver package's), not the 9.6 the 3.10.6 tree pins: the runner uses ONE
   vendor tree on purpose (two autoloaders answer for two PHPUnit builds — the M1-S8b measurement). The
-  tree runs under it unmodified; its 148 "PHPUnit Deprecations" are 3.10.6's doc-comment metadata
-  (`@dataProvider`), which PHPUnit 11 still honours. Every data provider in the tree is static.
+  tree's SOURCE runs unmodified; its 148 "PHPUnit Deprecations" are 3.10.6's doc-comment metadata
+  (`@dataProvider`), which PHPUnit 11 still honours, and every data provider in the tree is static.
+  **One behaviour does change, and it costs two tests (C5b review F2): test-METHOD ORDER.** PHPUnit
+  9.6 runs a class's own methods before the ones it inherits; PHPUnit 11 runs the inherited ones
+  first. 3.10.6's tree relies on the old order in two places — upstream's own comment on
+  `PostgreSQLSchemaManagerTest::testDropWithAutoincrement` says it *"needs to be executed before the
+  ones it conflicts with, so it has to be declared in the same class"* — and both fail under the
+  reversed order in the control as well as through Ferro (below). Each passes when run alone, and
+  fails when run after the inherited test it conflicts with, through the stock drivers; measured.
 - **PHP 8.4** from `setup-php` with `ext-msgpack` on the runners; the dev container's SQLite runs used
   PHP 8.4.19 with the pure-PHP packer, and the two produced identical results.
 - **SQLite libraries:** the Ferro column runs **3.53.2** (`rusqlite` `bundled`, inside `ferrod`), the
@@ -61,11 +68,13 @@ dispatch measured **313 / 304**: one test fewer executed, and that test was the 
 
 ## The SQLite column, triaged — 43 non-passes, none a driver defect
 
-**One is upstream's own, and the control proves it:** `SqliteSchemaManagerTest::
+**One is the HARNESS's, and the control shares it:** `SqliteSchemaManagerTest::
 testListForeignKeysFromExistingDatabase` fails identically through `pdo_sqlite` (`table user already
-exists`). Verified in the two trees rather than inferred: the shared base class's reserved-keyword
-introspection tests (`createReservedKeywordTables()`) create a `user` table and leave it, and 4.4.4's
-copy of this test begins with `DROP TABLE IF EXISTS user` — a line 3.10.6's copy does not have.
+exists`), because it runs AFTER the inherited `testIntrospectReservedKeywordTableViaListTables`, which
+creates a `user` table and leaves it. That is the PHPUnit 11 method-order reversal in the manifest:
+alone it passes, after that test it fails, through `pdo_sqlite`. (4.4.4's copy of the test begins with
+`DROP TABLE IF EXISTS user`, a line 3.10.6's lacks.) The control proves the failure is not Ferro's;
+it does not make it upstream's.
 
 The other 42 are Ferro-only, and fall into four groups:
 
@@ -83,13 +92,16 @@ identically). Recorded on the incompatibilities page since C6.
 `Multiple statements provided` — one statement per request is a uniform Ferro contract, refused
 identically on PostgreSQL (`42601`). C3-6a's group (B), unchanged.
 
-### (C) 1 test · the driver's version-less platform refusal, as designed
+### (C) 1 test · the driver's version-less platform refusal, a policy
 
 `SchemaManagerFunctionalTestCase::testDispatchEventWhenDatabasePlatformIsExplicitlyPassed` calls
-`$connection->getDriver()->getDatabasePlatform()` with no version. Before a connection exists the
-driver does not know even the backend family, so `Ferro\DBAL\Dbal3\Driver` refuses rather than guess
-a SQL dialect (SPEC §22.2 (by), review F11 — the same call DoctrineBundle makes, whose documented fix
-is `charset`). DBAL 4.4.4's tree has no such test.
+`$connection->getDriver()->getDatabasePlatform()` with no version, AFTER the shared connection has
+connected — so here the driver does know the backend family, and the refusal is a POLICY rather than
+a necessity (C5b review F3). The stock answer would be the family's OLDEST platform, which is not
+the one the connection uses (that is chosen from the server version); `Ferro\DBAL\Dbal3\Driver`
+will not hand a caller a second, older dialect for the same database, before a connect or after
+(SPEC §22.2 (by) F11, (bz); the same call DoctrineBundle makes before connecting, whose documented
+fix is `charset`). DBAL 4.4.4's tree has no such test.
 
 ### (D) 1 test · a database FILE at a client-chosen path
 
@@ -106,23 +118,37 @@ DBAL 4 one, does not install upstream's `EnableForeignKeys` middleware); Ferro's
 verifies `foreign_keys = ON` itself (SPEC §22.2 (bl)), so the violations are raised as upstream
 expects.
 
-## The server columns, triaged — none a driver defect
+## The server columns, triaged — no driver defect, and one real DBAL-3-only incompatibility
 
-**PostgreSQL's 9.** One is upstream's own: `testDropWithAutoincrement` fails identically through a
-`pdo_pgsql` control (`2BP01 cannot drop table test_table_for_view because other objects depend on
-it`: an earlier test in 3.10.6's tree leaves a view behind). One is the version-less platform
-refusal, as on SQLite: `testDispatchEventWhenDatabasePlatformIsExplicitlyPassed`. The other seven are
-S8b's categories, unchanged from DBAL 4:
+**PostgreSQL's 9.** One is the HARNESS's: `testDropWithAutoincrement` fails identically through a
+`pdo_pgsql` control — the recorded run's text is `2BP01 cannot drop table view_test_table because
+other objects depend on it` — because under PHPUnit 11 it runs after the inherited
+`testCreateAndListViews`, which leaves a view on that table; upstream's own comment says it must run
+first (see the manifest). Alone it passes, through `pdo_pgsql`. One is the version-less platform
+refusal, as on SQLite: `testDispatchEventWhenDatabasePlatformIsExplicitlyPassed`. One is a real
+incompatibility, below. The other six are S8b's categories, unchanged from DBAL 4:
 
 - **(b) PostgreSQL reports no generated key**, and the driver will not emulate `lastInsertId()` with
   a follow-up query, which on a transaction-mode pool would run on another connection and return a
   wrong key (D-S8b-5): `WriteTest::testLastInsertId`, `testEmptyIdentityInsert`, and the DBAL-3-only
   `testLastInsertIdSequence` (the deprecated sequence-name form, `currval()` behind the scenes).
 - **(c) No credentials in PHP** (SPEC §12 / D8): `ExceptionTest::testInvalidUserName`,
-  `testInvalidPassword`, `testInvalidHost`, and `PostgreSQLSchemaManagerTest::testGetSearchPath`.
-  That last one expects `['public']` and gets `['"$user"', 'public']`: DBAL 3's
-  `getSchemaSearchPaths()` substitutes the connection's `user` PARAMETER for `"$user"`, and a Ferro
-  connection has none.
+  `testInvalidPassword`, `testInvalidHost`.
+
+**The real one — `PostgreSQLSchemaManagerTest::testGetSearchPath` (C5b review F1).** It expects
+`['public']` and gets `['"$user"', 'public']`, and the first triage filed that under (c) as a test
+artifact. It is a DBAL-3-only SCHEMA bug. DBAL 3's PostgreSQL schema manager decides the CURRENT
+schema by substituting the connection's `user` PARAMETER for `"$user"` in `SHOW search_path` and
+taking the first schema that exists; a Ferro connection has no `user` param, so the literal
+`"$user"` matches nothing. When the role has a schema of its own name — PostgreSQL's documented
+secure-schema-usage pattern — DBAL 3 then believes the current schema is the next one in the path,
+names the role's tables schema-qualified and `public`'s unqualified, and the comparator plans a
+CREATE of the unqualified name plus a DROP of the qualified one: a destructive migration. DBAL 4
+asks the server (`SELECT current_schema()`) and is not affected. **Workaround:** set DBAL's `user`
+parameter to the backend role — it is inert for Ferro's own connection, which takes no credentials —
+or keep `"$user"` out of the pool's `search_path`. `SearchPathLiveTest` pins all three cells (DBAL 3
+without `user`: wrong; with it: right; DBAL 4: right) against PostgreSQL's own `current_schema()`;
+recorded on the incompatibilities page.
 
 **MySQL's and MariaDB's 7 — the same 7, in the same order.** `testDispatchEventWhenDatabase
 PlatformIsExplicitlyPassed` (the refusal); and category (c): `MySQLSchemaManagerTest::
@@ -164,13 +190,21 @@ Fixed in two steps, each exposing the next:
    the read had no bind mirror. It now passes on both majors.
 
 **After both fixes, measured locally against PostgreSQL 16 with a `pdo_pgsql` control on BOTH
-majors, the Ferro column's skip set is IDENTICAL to the control's** (3.10.6: 528 = 528; 4.4.4:
-356 = 356), the only failure the two share is upstream's `testDropWithAutoincrement` (3.10.6 only),
-and every Ferro-only failure is in the triage above.
+majors, the Ferro column's skip set is IDENTICAL to the control's** — compared as SETS, not counts,
+by `testkit/dbal/compare-columns.php` (3.10.6: 528 and 528, the same digest; 4.4.4: 358 and 358, the
+same digest, counting the 2 incomplete tests JUnit encodes as skipped). The only failure the two
+share is the harness's test-order artifact `testDropWithAutoincrement` (3.10.6 only), and every
+Ferro-only failure is in the triage above. The reports, with the exact invocation that produced
+each, are in `docs/dbal-suite/2026-10-02-c5b-skip-sets/`: the runner gained server-family controls
+for this (`FERRO_DBAL_CONTROL=1` with the family's DSN — the stock driver needs credentials, which a
+HARNESS column may hold, as the Laravel runner's `stock-pgsql` column has since C2e), and the
+comparison script exits non-zero when a test the control runs is skipped under Ferro. Fed the
+pre-fix Ferro column, it names `testListTableColumnsOidConflictWithNonTableObject` and exits 1.
 
 The MySQL family's version string was never transformed, so this class cannot occur there, and the
 same comparison against a local MariaDB 10.11 with a `pdo_mysql` control confirms it: **no test the
-control runs is skipped under Ferro, on either major** (3.10.6: 535 = 535). The one difference runs
+control runs is skipped under Ferro, on either major** (3.10.6: 535 and 535, the same digest). The
+one difference runs
 the other way: on 4.4.4 Ferro RUNS — and passes — `StatementTest::testExecWithRedundantParameters`,
 which upstream skips for `PDO\MySQL\Driver` because PDO's MySQL driver does not report a redundant
 parameter. Locally the control also fails two tests of its own: `testListDatabases` /
@@ -201,7 +235,7 @@ exactly as at C3-6a, and the 28 are C3-6a's two groups.
 
 - §14's bar for the bridge, as for DBAL 4, names SQLite and the ORM suite: SQLite runs (224/267
   against a control at 262/267), Doctrine ORM 2 has not been run through the bridge at all.
-- The MySQL-family skip comparison is against MariaDB 10.11 in the dev container, not the runner's
-  MySQL 8.4 / MariaDB 11.8 — there is no credential-free way to run a `pdo_mysql` control in the
-  workflow (SPEC §12 / D8 keeps credentials out of PHP, and the runner refuses a server-family
-  control for that reason).
+- The skip comparisons are LOCAL — PostgreSQL 16.13 and MariaDB 10.11 in the dev container — not the
+  runners' PostgreSQL 17.10 / MySQL 8.4 / MariaDB 11.8. The runner can now produce them for any
+  family (`FERRO_DBAL_CONTROL=1` with the family's DSN); the `dbal-suite` workflow does not yet run a
+  server-family control column.

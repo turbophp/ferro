@@ -516,7 +516,8 @@ impl ToSql for PgInt {
             // bound back — readable-but-not-bindable, the asymmetry §22.2 (g) closed for domains.
             // Measured caller: upstream doctrine/dbal's own
             // `testListTableColumnsOidConflictWithNonTableObject` (3.10.6 AND 4.4.4), which reads
-            // `pg_class.oid` and writes it into `UPDATE pg_class SET oid = ? WHERE oid = ?`.
+            // `pg_class.oid` and binds it back into oid columns, first
+            // `UPDATE pg_attribute SET attrelid = ? WHERE attrelid = ?`.
             // `regclass`/`regtype` (also read as `I64`) stay OUT: no measured caller, §22.2 (af).
             Type::OID,
         ]
@@ -1216,7 +1217,7 @@ mod tests {
     /// **M2-C5b: `I64 → oid`, value-gated to `0..=u32::MAX`.** The READ path has returned an `oid`
     /// as `I64` since M1-S8a, so before this an OID read back could not be written back. Measured
     /// caller: upstream doctrine/dbal's own `testListTableColumnsOidConflictWithNonTableObject`,
-    /// which reads `pg_class.oid` and binds it into `UPDATE pg_class SET oid = ? WHERE oid = ?`.
+    /// which reads `pg_class.oid` and binds it back into oid columns (`pg_attribute.attrelid` first).
     #[test]
     fn c5b_i64_binds_oid_inside_the_unsigned_32_bit_range() {
         // The accept side, both boundaries — `u32::MAX` is past int4's range, so an arm that

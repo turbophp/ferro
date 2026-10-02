@@ -1,0 +1,23 @@
+# C5b skip-set comparison — doctrine/dbal 3.10.6, MariaDB 10.11.14 (dev container, LOCAL — not a recorded column)
+# Produced on 2026-10-02 from commit f080df4 + the C5b review fixes, by:
+#   FERRO_DBAL_TAG=3.10.6 FERRO_DBAL_SVC=mysql FERRO_DBAL_DSN=mysql://ferro:ferro@127.0.0.1:33060/doctrine_tests \
+#     bash testkit/dbal-suite.sh --log-junit ferro.xml          # the Ferro column
+#   (the same with FERRO_DBAL_CONTROL=1 --log-junit control.xml)  # the stock-driver control
+#   php testkit/dbal/compare-columns.php ferro.xml control.xml
+# (the database was reset before each run; JUnit encodes an incomplete test as skipped, so
+#  'skip' counts Skipped + Incomplete from the phpunit result line)
+
+tests: ferro 842, control 842
+in only one column: 0
+skip: ferro 535 (sha256 77ef45ebbcec7bf6), control 535 (sha256 77ef45ebbcec7bf6)
+  skip under ferro, not under control: 0
+  skip under control, not under ferro: 0
+fail: ferro 7 (sha256 059e8bbd303ce1b9), control 2 (sha256 6349434b7ca73e96)
+  fail under ferro, not under control: 5
+  Doctrine\DBAL\Tests\Functional\ExceptionTest::testInvalidHost
+  Doctrine\DBAL\Tests\Functional\ExceptionTest::testInvalidPassword
+  Doctrine\DBAL\Tests\Functional\Schema\MySQLSchemaManagerTest::testDispatchEventWhenDatabasePlatformIsExplicitlyPassed
+  Doctrine\DBAL\Tests\Functional\TransactionTest::testCommitFalse
+  Doctrine\Tests\DBAL\Functional\PrimaryReadReplicaConnectionTest::testInheritCharsetFromPrimary
+  fail under control, not under ferro: 0
+RESULT: no test the control runs is skipped under Ferro.
