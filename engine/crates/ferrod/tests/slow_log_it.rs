@@ -126,7 +126,51 @@ async fn a_statement_is_logged_by_fingerprint_and_its_literal_never_appears() {
     )
     .await;
 
+    // M2-C4c-1: a statement carrying the caller's W3C trace context, and one carrying a MALFORMED
+    // context whose text is itself a would-be secret. The first must be joinable to the caller's
+    // trace; the second must run, and its raw text must never reach the log — the engine logs
+    // parsed ids only, so whatever a broken provider stuffs into the header stays out of it.
+    const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const PARENT: &str = "00f067aa0ba902b7";
+    const BAD_TRACE: &str = "00-hunter2-traceparent-swordfish";
+    exec_ok(
+        &mut c,
+        5,
+        &ExecRequest {
+            traceparent: Some(format!("00-{TRACE_ID}-{PARENT}-01")),
+            ..req("select count(*) from t where id > 41")
+        },
+    )
+    .await;
+    exec_ok(
+        &mut c,
+        6,
+        &ExecRequest {
+            traceparent: Some(BAD_TRACE.to_string()),
+            ..req("select count(*) from t where id > 42")
+        },
+    )
+    .await;
+
     let log = capture.contents();
+
+    // (0) The traced statement's record carries both ids, as the fields a log query filters on.
+    let traced = log
+        .lines()
+        .find(|l| l.contains("slow statement") && l.contains("id > ?"))
+        .unwrap_or_else(|| panic!("no record for the traced SELECT:\n{log}"));
+    assert!(
+        traced.contains(&format!("trace_id={TRACE_ID}")),
+        "the caller's trace id is not on its statement's record:\n{traced}",
+    );
+    assert!(
+        traced.contains(&format!("parent_span_id={PARENT}")),
+        "the caller's span id is not on its statement's record:\n{traced}",
+    );
+    assert!(
+        !log.contains(BAD_TRACE) && !log.contains("hunter2-traceparent"),
+        "a malformed traceparent's raw text reached the log:\n{log}",
+    );
 
     // (1) The record exists, and it is the INSERT's shape.
     assert!(

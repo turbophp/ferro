@@ -167,6 +167,19 @@ pub(crate) fn read_str(rd: &mut &[u8]) -> Result<String, CodecError> {
         .map_err(|e| CodecError::Malformed(format!("str body: {e:?}")))?;
     String::from_utf8(buf).map_err(|_| CodecError::Malformed("invalid utf8".into()))
 }
+/// [`read_str`] for the ONE field where a non-UTF-8 body must not fail the request: each invalid
+/// sequence becomes U+FFFD instead. The msgpack framing is still checked strictly (a non-`str`
+/// marker or a lying length is a wire fault and refused); only the BYTES are tolerated. See
+/// `ExecRequest::traceparent` for why that field is the exception.
+pub(crate) fn read_str_lossy(rd: &mut &[u8]) -> Result<String, CodecError> {
+    let len = dec::read_str_len(rd).map_err(|e| CodecError::Malformed(format!("str len: {e:?}")))?
+        as usize;
+    bound_len(len, rd.len())?;
+    let mut buf = vec![0u8; len];
+    rd.read_exact_buf(&mut buf)
+        .map_err(|e| CodecError::Malformed(format!("str body: {e:?}")))?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
 fn read_bin(rd: &mut &[u8]) -> Result<Vec<u8>, CodecError> {
     let len = dec::read_bin_len(rd).map_err(|e| CodecError::Malformed(format!("bin len: {e:?}")))?
         as usize;

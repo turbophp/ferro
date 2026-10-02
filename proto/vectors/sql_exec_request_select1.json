@@ -1,5 +1,5 @@
 {
-  "frame_hex": "f7030000020001000b0000001500000098a46d61696ea853454c4543542031c090c0c300c0",
+  "frame_hex": "f7040000020001000b0000001600000099a46d61696ea853454c4543542031c090c0c300c0c0",
   "header": {
     "flags": 0,
     "method": 1,
@@ -14,6 +14,7 @@
     "readonly": true,
     "sql": "SELECT 1",
     "timeout_ms": null,
+    "traceparent": null,
     "tx_id": null
   },
   "name": "sql_exec_request_select1"

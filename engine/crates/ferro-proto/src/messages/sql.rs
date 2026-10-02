@@ -29,7 +29,7 @@ use rmp::decode as dec;
 use rmp::encode as enc;
 use serde::{Deserialize, Serialize};
 
-/// `EXEC` request (service `SQL`, method `EXEC` = 1) — client → server. A positional fixarray of 8
+/// `EXEC` request (service `SQL`, method `EXEC` = 1) — client → server. A positional fixarray of 9
 /// fields in declaration order (`/proto/PROTOCOL.md` §8.1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecRequest {
@@ -49,12 +49,23 @@ pub struct ExecRequest {
     /// `None` is the autocommit path. Bounded < 2^63, so an opt-u64 native int (NOT the u32 opt
     /// helpers, which would truncate it).
     pub tx_id: Option<u64>,
+    /// The caller's W3C `traceparent` (M2-C4c-1, SPEC §13), so the engine's per-EXEC observability
+    /// links to the application's trace. Carried as the header's own text. `ferrod` parses it, and a
+    /// malformed value is IGNORED rather than refused — an observability field must never fail a
+    /// statement.
+    ///
+    /// **The one `str` field decoded LOSSILY.** Every other `str` refuses invalid UTF-8, and this one
+    /// did too until the C4c-1 review showed it failed the whole statement as `Protocol`: a client
+    /// that forwards an inbound HTTP `traceparent` verbatim hands an external caller that byte. So
+    /// invalid sequences become U+FFFD here, which the W3C grammar (ASCII only) then rejects and
+    /// `ferrod` counts. The framing stays strict — a non-`str` marker is still a wire fault.
+    pub traceparent: Option<String>,
 }
 
 impl ExecRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        enc::write_array_len(&mut out, 8).unwrap();
+        enc::write_array_len(&mut out, 9).unwrap();
         enc::write_str(&mut out, &self.pool).unwrap();
         write_opt_str(&mut out, &self.sql);
         write_opt_str(&mut out, &self.query_id);
@@ -67,6 +78,7 @@ impl ExecRequest {
         // fetch is unsigned; write_uint narrows 0/1/2 to a positive fixint (mirrors PHP packUint).
         enc::write_uint(&mut out, self.fetch as u64).unwrap();
         write_opt_u64(&mut out, &self.tx_id);
+        write_opt_str(&mut out, &self.traceparent);
         out
     }
 
@@ -74,8 +86,8 @@ impl ExecRequest {
         let mut rd: &[u8] = b;
         let n = dec::read_array_len(&mut rd)
             .map_err(|e| CodecError::Malformed(format!("ExecRequest array: {e:?}")))?;
-        if n != 8 {
-            return Err(CodecError::Malformed(format!("ExecRequest len {n} != 8")));
+        if n != 9 {
+            return Err(CodecError::Malformed(format!("ExecRequest len {n} != 9")));
         }
         let pool = read_str(&mut rd)?;
         let sql = read_opt_str(&mut rd)?;
@@ -93,6 +105,11 @@ impl ExecRequest {
         let fetch: u8 =
             dec::read_int(&mut rd).map_err(|e| CodecError::Malformed(format!("fetch: {e:?}")))?;
         let tx_id = read_opt_u64(&mut rd)?;
+        let traceparent = if peek_nil(&mut rd)? {
+            None
+        } else {
+            Some(crate::value::read_str_lossy(&mut rd)?)
+        };
         if !rd.is_empty() {
             return Err(CodecError::TrailingBytes(rd.len()));
         }
@@ -105,6 +122,7 @@ impl ExecRequest {
             readonly,
             fetch,
             tx_id,
+            traceparent,
         })
     }
 }

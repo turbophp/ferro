@@ -744,6 +744,7 @@ pub fn req(sql: &str) -> ExecRequest {
         readonly: true,
         fetch: 0,
         tx_id: None,
+        traceparent: None,
     }
 }
 

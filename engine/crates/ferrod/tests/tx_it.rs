@@ -121,6 +121,7 @@ fn tx_req(tx_id: u64, sql: &str, params: Vec<Value>, fetch: u8, readonly: bool) 
         readonly,
         fetch,
         tx_id: Some(tx_id),
+        traceparent: None,
     }
 }
 

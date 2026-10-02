@@ -1,0 +1,21 @@
+{
+  "frame_hex": "f7040000020001002b0000004e00000099a46d61696ea853454c4543542031c090c0c300c0d93730302d34626639326633353737623334646136613363653932396430653065343733362d303066303637616130626139303262372d3031",
+  "header": {
+    "flags": 0,
+    "method": 1,
+    "request_id": 43,
+    "service": 2
+  },
+  "message": {
+    "fetch": 0,
+    "params": [],
+    "pool": "main",
+    "query_id": null,
+    "readonly": true,
+    "sql": "SELECT 1",
+    "timeout_ms": null,
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tx_id": null
+  },
+  "name": "sql_exec_request_traceparent"
+}

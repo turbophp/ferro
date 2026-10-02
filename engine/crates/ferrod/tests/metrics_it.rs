@@ -14,7 +14,8 @@ mod common;
 
 use common::{exec_err, exec_ok, exec_server_with_metrics, req};
 use ferro_pool::histogram::{CHECKOUT_BOUNDS_US, PIN_BOUNDS_US};
-use ferro_proto::messages::sql::ExecRequest;
+use ferro_proto::messages::Outcome;
+use ferro_proto::messages::sql::{ExecOk, ExecRequest};
 
 fn write(sql: &str) -> ExecRequest {
     ExecRequest {
@@ -454,5 +455,235 @@ async fn a_real_transaction_moves_the_pin_and_checkout_series() {
         assert_histogram_shape(&released, PIN, &PIN_BOUNDS_US) - pins_after,
         1,
         "the abandoned transaction's pin must be observed exactly once",
+    );
+}
+
+/// Send one EXEC payload as raw bytes and return its terminal, skipping any HEAD/DATA frames a
+/// streamed request emits first. Raw because the reproduction below needs a field-9 byte sequence
+/// `ExecRequest::encode` cannot produce (it takes a `String`).
+async fn exec_raw(c: &mut common::TestClient, rid: u32, payload: Vec<u8>) -> Outcome {
+    use ferro_proto::consts::{flags, method_sql, service};
+    c.send_request(rid, service::SQL, method_sql::EXEC, payload)
+        .await;
+    loop {
+        let f = c.recv().await;
+        assert_eq!(f.header.request_id, rid, "a frame for another request");
+        if f.header.flags & flags::END == flags::END {
+            return Outcome::decode(&f.payload).expect("decode the terminal");
+        }
+    }
+}
+
+/// **M2-C4c-1: a malformed W3C `traceparent` is dropped and COUNTED on EVERY EXEC path — it never
+/// fails a statement.**
+///
+/// An observability field must never be why a statement fails, and a provider emitting junk must
+/// still be visible to an operator. The claim covers every path an EXEC can take, so this sends one
+/// down each: autocommit buffered, autocommit streamed, tx-scoped, and the three request shapes the
+/// handler refuses for reasons of their own (an unknown pool, a `query_id`, an unknown `tx_id`) —
+/// refused for THOSE reasons, and still counted, because the header is interpreted before any shape
+/// check. The C4c-1 review found every earlier test used the autocommit-buffered path alone, so
+/// counting there and nowhere else survived.
+///
+/// The header that is not even valid UTF-8 is the review's MAJOR finding: the codec refused the
+/// whole request as `Protocol`, failing the statement over its trace context. A provider that
+/// forwards an inbound HTTP header verbatim hands an external caller that byte.
+///
+/// Only this test in this binary sends a `traceparent`, so the counter's deltas are exact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_traceparent_is_counted_on_every_exec_path_and_never_fails_one() {
+    use ferro_proto::consts::{flags, method_tx, service};
+    use ferro_proto::messages::{BeginRequest, BeginResponse, TxControl};
+
+    const INVALID: &str = "ferro_traceparent_invalid_total";
+    const VALID: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let (server, metrics_addr, _metrics_guard) = exec_server_with_metrics().await;
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    exec_ok(
+        &mut c,
+        2,
+        &write("create table tp (id integer primary key)"),
+    )
+    .await;
+    exec_ok(
+        &mut c,
+        3,
+        &write("insert into tp (id) values (1), (2), (3)"),
+    )
+    .await;
+
+    let counted =
+        |body: &str| series(body, INVALID).unwrap_or_else(|| panic!("{INVALID} missing:\n{body}"));
+    let base = counted(&scrape(metrics_addr).await);
+
+    let with = |tp: &str, r: ExecRequest| ExecRequest {
+        traceparent: Some(tp.to_string()),
+        ..r
+    };
+    // A field-9 string whose LAST byte is not UTF-8: encode a placeholder, then patch it.
+    let non_utf8 = |r: ExecRequest| {
+        let mut p = with("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0Z", r).encode();
+        assert_eq!(p.last(), Some(&b'Z'), "traceparent is the last field");
+        *p.last_mut().unwrap() = 0xff;
+        p
+    };
+    let ok_rows = |o: Outcome| match o {
+        Outcome::Ok(body) => ExecOk::decode(&body).expect("decode ExecOk"),
+        other => panic!("a traceparent failed its statement: {other:?}"),
+    };
+    let mut bad = 0u64;
+
+    // (0) A VALID header is not counted.
+    assert_eq!(
+        exec_ok(&mut c, 10, &with(VALID, req("select 1")))
+            .await
+            .rows
+            .len(),
+        1
+    );
+    assert_eq!(
+        counted(&scrape(metrics_addr).await),
+        base,
+        "a VALID traceparent was counted"
+    );
+
+    // (1) Autocommit, buffered.
+    for (i, tp) in [
+        "garbage",
+        "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01",
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let ok = exec_ok(&mut c, 20 + i as u32, &with(tp, req("select 1"))).await;
+        assert_eq!(ok.rows.len(), 1, "{tp}");
+        bad += 1;
+    }
+    let ok = ok_rows(exec_raw(&mut c, 30, non_utf8(req("select 1"))).await);
+    assert_eq!(
+        ok.rows.len(),
+        1,
+        "a non-UTF-8 traceparent failed an autocommit statement"
+    );
+    bad += 1;
+
+    // (2) Autocommit, streamed: the terminal of a stream reports the rows it streamed.
+    let streamed = ExecRequest {
+        fetch: 2,
+        ..req("select id from tp order by id")
+    };
+    let end = ok_rows(exec_raw(&mut c, 40, non_utf8(streamed.clone())).await);
+    assert_eq!(
+        end.stats.rows, 3,
+        "a non-UTF-8 traceparent failed a streamed statement"
+    );
+    bad += 1;
+    let end = ok_rows(exec_raw(&mut c, 41, with("garbage", streamed).encode()).await);
+    assert_eq!(end.stats.rows, 3);
+    bad += 1;
+
+    // (3) Tx-scoped.
+    c.send_request(
+        50,
+        service::TX,
+        method_tx::BEGIN,
+        BeginRequest {
+            pool: "default".into(),
+            isolation: None,
+            readonly: false,
+        }
+        .encode(),
+    )
+    .await;
+    let t = c.recv().await;
+    let tx_id = match Outcome::decode(&t.payload).expect("BEGIN terminal") {
+        Outcome::Ok(body) => BeginResponse::decode(&body).expect("BeginResponse").tx_id,
+        other => panic!("BEGIN failed: {other:?}"),
+    };
+    let in_tx = |sql: &str| ExecRequest {
+        tx_id: Some(tx_id),
+        ..write(sql)
+    };
+    let ok = ok_rows(
+        exec_raw(
+            &mut c,
+            51,
+            non_utf8(in_tx("insert into tp (id) values (4)")),
+        )
+        .await,
+    );
+    assert_eq!(
+        ok.affected, 1,
+        "a non-UTF-8 traceparent failed a tx-scoped statement"
+    );
+    bad += 1;
+    let ok = exec_ok(
+        &mut c,
+        52,
+        &with("garbage", in_tx("select count(*) from tp")),
+    )
+    .await;
+    assert_eq!(ok.rows.len(), 1);
+    bad += 1;
+    c.send_request(
+        53,
+        service::TX,
+        method_tx::COMMIT,
+        TxControl { tx_id }.encode(),
+    )
+    .await;
+    let t = c.recv().await;
+    assert_eq!(t.header.flags & flags::END, flags::END);
+    assert!(
+        matches!(Outcome::decode(&t.payload), Ok(Outcome::Ok(_))),
+        "COMMIT failed"
+    );
+
+    // (4) Requests the handler refuses for reasons of their OWN — still counted, because the
+    // header is interpreted before any shape check. Each must be refused for that reason, not
+    // for its trace context.
+    let refused = |o: Outcome, why: &str| match o {
+        Outcome::Error(e) => assert!(
+            e.message.contains(why),
+            "refused for the wrong reason (wanted {why:?}): {e:?}"
+        ),
+        other => panic!("expected a refusal ({why}), got {other:?}"),
+    };
+    let unknown_pool = ExecRequest {
+        pool: "no-such-pool".into(),
+        ..req("select 1")
+    };
+    refused(
+        exec_raw(&mut c, 60, non_utf8(unknown_pool)).await,
+        "unknown pool",
+    );
+    bad += 1;
+    let manifest = ExecRequest {
+        sql: None,
+        query_id: Some("q1".into()),
+        ..req("select 1")
+    };
+    refused(
+        exec_raw(&mut c, 61, with("garbage", manifest).encode()).await,
+        "query_id",
+    );
+    bad += 1;
+    let dead_tx = ExecRequest {
+        tx_id: Some(987_654_321),
+        ..req("select 1")
+    };
+    match exec_raw(&mut c, 62, with("garbage", dead_tx).encode()).await {
+        Outcome::Error(e) => assert_eq!(e.code, ferro_proto::consts::errc::TX_NOT_FOUND, "{e:?}"),
+        other => panic!("an unknown tx_id must be refused: {other:?}"),
+    }
+    bad += 1;
+
+    let after = counted(&scrape(metrics_addr).await);
+    assert_eq!(
+        after - base,
+        bad,
+        "every malformed traceparent must be counted exactly once, on every path",
     );
 }

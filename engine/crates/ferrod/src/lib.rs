@@ -10,4 +10,5 @@ pub mod services;
 pub mod session;
 pub mod shutdown;
 pub mod slow_log;
+pub mod trace;
 pub mod tx;
