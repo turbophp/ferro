@@ -17,9 +17,12 @@ use ferro_proto::value::Value;
 use crate::backend::{BackendRows, PoolBackend, QueryResult, Reclaimed, ResetProfile, TxStatus};
 use crate::config::PoolConfig;
 use crate::error::PoolError;
+use crate::histogram::{CHECKOUT_BOUNDS_US, Histogram};
 use crate::pin::{
-    self, HygieneMetrics, HygieneOutcome, PinCause, PinCauseCell, PinMetrics, PinState, TxId,
+    self, HygieneMetrics, HygieneOutcome, PinCause, PinCauseCell, PinMetrics, PinSlot, PinState,
+    PinTimeMetrics, TxId,
 };
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 /// A connection sitting idle in the pool, plus the bookkeeping needed to recycle it safely on
 /// the next checkout.
@@ -66,6 +69,29 @@ pub(crate) struct PoolInner<B: PoolBackend> {
     pub(crate) pin_metrics: PinMetrics,
     /// SPEC §13's hygiene counters for THIS pool (M2-C4b-2a): recycles by the reset they received.
     pub(crate) hygiene_metrics: HygieneMetrics,
+    /// SPEC §13's pinned gauge + pin-duration histogram for THIS pool (M2-C4b-2b).
+    pub(crate) pin_time: Arc<PinTimeMetrics>,
+    /// SPEC §13 "checkout p50/p99": every checkout's `queue_us`, observed at the one place a
+    /// `Checkout` is constructed (M2-C4b-2b).
+    pub(crate) checkout_duration: Histogram<{ CHECKOUT_BOUNDS_US.len() }>,
+    /// SPEC §13 "queue depth": checkouts waiting for a permit right now (M2-C4b-2b).
+    pub(crate) waiting: AtomicUsize,
+}
+
+/// Counts one checkout as waiting for a permit for exactly as long as it is alive.
+struct WaitingGuard<'a>(&'a AtomicUsize);
+
+impl<'a> WaitingGuard<'a> {
+    fn new(n: &'a AtomicUsize) -> Self {
+        n.fetch_add(1, AtomicOrdering::Relaxed);
+        Self(n)
+    }
+}
+
+impl Drop for WaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
 }
 
 /// SPEC §13's pool-size gauges for one pool. See [`Pool::gauges`].
@@ -77,6 +103,10 @@ pub struct PoolGauges {
     pub in_use: usize,
     /// Connections parked and ready.
     pub idle: usize,
+    /// Connections pinned to an explicit transaction (M2-C4b-2b).
+    pub pinned: u64,
+    /// Checkouts waiting for a permit — §13's "queue depth" (M2-C4b-2b).
+    pub waiting: usize,
 }
 
 /// A cloneable handle to a pool. Cloning shares the same underlying connections/semaphore/idle
@@ -109,7 +139,19 @@ impl<B: PoolBackend> Pool<B> {
             max_size,
             in_use,
             idle,
+            pinned: self.inner.pin_time.pinned(),
+            waiting: self.inner.waiting.load(AtomicOrdering::Relaxed),
         }
+    }
+
+    /// This pool's SPEC §13 pinned gauge and pin-duration histogram (M2-C4b-2b).
+    pub fn pin_time(&self) -> &PinTimeMetrics {
+        &self.inner.pin_time
+    }
+
+    /// This pool's SPEC §13 checkout-duration histogram (M2-C4b-2b).
+    pub fn checkout_duration(&self) -> &Histogram<{ CHECKOUT_BOUNDS_US.len() }> {
+        &self.inner.checkout_duration
     }
 
     /// This pool's SPEC §13 hygiene counters (M2-C4b-2a).
@@ -136,6 +178,9 @@ impl<B: PoolBackend> Pool<B> {
             idle: Mutex::new(Vec::new()),
             pin_metrics: PinMetrics::default(),
             hygiene_metrics: HygieneMetrics::default(),
+            pin_time: Arc::new(PinTimeMetrics::default()),
+            checkout_duration: Histogram::new(CHECKOUT_BOUNDS_US),
+            waiting: AtomicUsize::new(0),
         });
         if let Some(interval) = reap_interval {
             crate::health::spawn_reaper(&inner, interval);
@@ -173,7 +218,14 @@ impl<B: PoolBackend> Pool<B> {
         let start = Instant::now();
 
         let acquire = Arc::clone(&self.inner.semaphore).acquire_owned();
-        let permit = match tokio::time::timeout(self.inner.config.checkout_timeout, acquire).await {
+        // §13 "queue depth" (M2-C4b-2b): counted for exactly as long as this checkout waits for a
+        // permit. An RAII guard rather than an increment and a decrement, because the wait can end
+        // three ways — a permit, a timeout, or the caller dropping this future (a CANCEL, a session
+        // teardown) — and only `Drop` sees all three.
+        let waiting = WaitingGuard::new(&self.inner.waiting);
+        let acquired = tokio::time::timeout(self.inner.config.checkout_timeout, acquire).await;
+        drop(waiting);
+        let permit = match acquired {
             Ok(Ok(permit)) => permit,
             // The semaphore is never explicitly closed in M0; treat it as a (non-retryable) pool
             // shutdown rather than panicking.
@@ -389,7 +441,7 @@ pub struct Checkout<B: PoolBackend> {
     /// stale `tx_open` flag) never inherits pin state from a previous holder. The M1-S1 RFQ
     /// authority (`apply_tx_status`) moves the reuse-safety bits (`tx_open`/`tainted`) but NEVER
     /// this identity field: it must not clobber a real `TxId`, nor fabricate one for an RFQ-only tx.
-    pin: PinState,
+    pin: PinSlot,
     /// The most recent pin cause observed on this `Checkout` (for the pin-cause DoD assertion).
     /// `Some(PinCause::Tx)` from the RFQ tx-authority path (`apply_tx_status`, M1-S1); any of the
     /// other seven assist causes (`Listen`/`AdvisoryLock`/`Prepare`/`Temp`/`Set`/`PinFunction`/
@@ -416,6 +468,11 @@ impl<B: PoolBackend> Checkout<B> {
         pool: Arc<PoolInner<B>>,
         queue_us: u64,
     ) -> Self {
+        // §13 "checkout p50/p99" (M2-C4b-2b): this is the one place a `Checkout` is constructed —
+        // both exits, fresh dial and recycled, return through it — so every checkout the pool
+        // hands out is observed once, with the `queue_us` the EXEC reply already carries.
+        pool.checkout_duration.observe_us(queue_us);
+        let pin = PinSlot::new(Arc::clone(&pool.pin_time));
         Self {
             conn: Some(conn),
             created_at,
@@ -424,7 +481,7 @@ impl<B: PoolBackend> Checkout<B> {
             queue_us,
             tx_open: false,
             tainted: false,
-            pin: PinState::Unpinned,
+            pin,
             last_pin_cause: PinCauseCell::default(),
             discard: false,
         }
@@ -513,7 +570,7 @@ impl<B: PoolBackend> Checkout<B> {
         // `tx_open` without clobbering the real `TxId` (RFQ is additive authority here, not a
         // replacement of the manual pin).
         if r.is_ok() {
-            self.pin = PinState::PinnedTx(tx_id);
+            self.pin.pin(tx_id);
             self.last_pin_cause
                 .set(PinCause::Tx, &self.pool.pin_metrics);
             self.tx_open = true;
@@ -621,7 +678,7 @@ impl<B: PoolBackend> Checkout<B> {
         // Defense-in-depth (kept): on a successful COMMIT, unpin + clear `tx_open` by hand; the RFQ
         // read below (`apply_tx_status(Idle)`) then CONFIRMS the conn is out of the tx.
         if r.is_ok() {
-            self.pin = PinState::Unpinned;
+            self.pin.release();
             self.tx_open = false;
         }
         let st = pool.backend.tx_status(self.conn());
@@ -662,7 +719,7 @@ impl<B: PoolBackend> Checkout<B> {
         // survives (a clean `Idle` does not clear it) — the next checkout eats one DISCARD-ALL
         // reset; safe/conservative.
         if r.is_ok() {
-            self.pin = PinState::Unpinned;
+            self.pin.release();
             self.tx_open = false;
         }
         let st = pool.backend.tx_status(self.conn());
@@ -692,7 +749,7 @@ impl<B: PoolBackend> Checkout<B> {
 
     /// Current pin state (`Unpinned` or `PinnedTx(tx_id)`).
     pub fn pin_state(&self) -> PinState {
-        self.pin
+        self.pin.state()
     }
 
     /// The most recent pin cause observed on this `Checkout` (the pin-cause DoD assertion).
@@ -1132,6 +1189,12 @@ impl<B: PoolBackend> Checkout<B> {
 
 impl<B: PoolBackend> Drop for Checkout<B> {
     fn drop(&mut self) {
+        // A pin ends here if nothing ended it earlier (a dropped transaction, a torn-down session):
+        // §13's pinned gauge and pin-duration histogram must see every pin end exactly once.
+        // `PinSlot`'s own `Drop` would end it a moment later anyway; releasing here keeps the end
+        // BEFORE the connection goes back on the idle stack, so a scrape never sees a connection
+        // both idle and pinned.
+        self.pin.release();
         if let Some(conn) = self.conn.take() {
             // Only return live connections to the idle stack; a connection the backend already
             // considers closed is simply dropped (the permit still releases below). `discard` is

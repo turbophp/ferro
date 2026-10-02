@@ -45,6 +45,13 @@ pub enum AnyPool {
     Sqlite(Pool<SqliteBackend>),
 }
 
+/// A histogram read for export — one pass, so `count` equals the `+Inf` bucket by construction.
+pub use ferro_pool::histogram::HistogramSnapshot;
+
+fn snapshot<const N: usize>(h: &ferro_pool::histogram::Histogram<N>) -> HistogramSnapshot {
+    h.snapshot()
+}
+
 impl AnyPool {
     /// This pool's SPEC §13 pin-cause counters, every cause including the zeroes (M2-C4b).
     ///
@@ -69,6 +76,25 @@ impl AnyPool {
             AnyPool::Pg(p) => p.hygiene_metrics().snapshot(),
             AnyPool::Mysql(p) => p.hygiene_metrics().snapshot(),
             AnyPool::Sqlite(p) => p.hygiene_metrics().snapshot(),
+        }
+    }
+
+    /// This pool's SPEC §13 checkout-duration histogram as `(cumulative buckets, sum µs, count)`
+    /// (M2-C4b-2b).
+    pub fn checkout_histogram(&self) -> HistogramSnapshot {
+        match self {
+            AnyPool::Pg(p) => snapshot(p.checkout_duration()),
+            AnyPool::Mysql(p) => snapshot(p.checkout_duration()),
+            AnyPool::Sqlite(p) => snapshot(p.checkout_duration()),
+        }
+    }
+
+    /// This pool's SPEC §13 pin-duration histogram, same shape (M2-C4b-2b).
+    pub fn pin_histogram(&self) -> HistogramSnapshot {
+        match self {
+            AnyPool::Pg(p) => snapshot(p.pin_time().duration()),
+            AnyPool::Mysql(p) => snapshot(p.pin_time().duration()),
+            AnyPool::Sqlite(p) => snapshot(p.pin_time().duration()),
         }
     }
 
