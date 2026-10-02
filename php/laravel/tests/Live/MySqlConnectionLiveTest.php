@@ -57,10 +57,10 @@ final class MySqlConnectionLiveTest extends MySqlLiveTestCase
     /**
      * `DB::pretend()` must log an insert, never execute it — the guard inside insert()'s callback.
      *
-     * The binding is an INTEGER on purpose: pretend mode logs the query with its bindings
-     * substituted (`substituteBindingsIntoRawSql` → `escape()`), and a STRING binding reaches
-     * `quote()`, which is refused on a MySQL pool until it advertises `literals_are_standard`
-     * (measured here; ledger C1g). An integer is substituted without quoting.
+     * The binding is an INTEGER because this test predates C1g: pretend mode logs the query with
+     * its bindings substituted (`substituteBindingsIntoRawSql` → `escape()`), and a STRING binding
+     * reaches `quote()`, which was refused on a MySQL pool until C1g. The string-binding case is
+     * `MySqlEscapeLiveTest::testPretendWithAStringBindingLogsTheRenderedStatement`.
      */
     public function testAnInsertUnderPretendIsNotExecuted(): void
     {

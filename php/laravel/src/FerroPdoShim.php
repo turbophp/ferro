@@ -158,16 +158,27 @@ final class FerroPdoShim
      *    It is also exactly what `pdo_mysql` emits under `NO_BACKSLASH_ESCAPES`
      *    (`mysql_real_escape_string_quote()` doubles the quote and nothing else there).
      *  - **`false` on a MySQL-family pool — backslashes ARE escapes, MySQL's default — so the rule
-     *    is `mysql_real_escape_string()`'s**: `\` `'` `"` NUL LF CR and Ctrl-Z, each escaped with a
-     *    backslash, which is what `pdo_mysql` emits (M2-C1g). Escaping BYTE-WISE is correct because
+     *    is `mysql_real_escape_string()`'s with ONE deliberate change**: `\` `"` NUL LF CR and
+     *    Ctrl-Z are escaped with a backslash, as `pdo_mysql` does, but `'` is DOUBLED rather than
+     *    backslash-escaped (M2-C1g, §22.2 (cc)). The reason is that this rule is the POOL's default,
+     *    not the live session's: `pdo_mysql` reads `SERVER_STATUS_NO_BACKSLASH_ESCAPES` off the
+     *    connection it is about to send on, while the shim reads the bit the engine advertised for a
+     *    freshly reset session. An application that turns `NO_BACKSLASH_ESCAPES` ON inside its own
+     *    transaction and then quotes would, under `\'`, get a literal whose backslash is ordinary
+     *    and whose quote ENDS the string — an injection. `''` means `'` in BOTH modes, and every
+     *    other escape can then only mis-render (`\\` reads as two backslashes there), never break
+     *    out. The cost is byte-identity with `pdo_mysql` for a string containing `'`
+     *    (`'O''Brien'` where it emits `'O\'Brien'`); MySQL reads the two identically in the
+     *    default mode, and upstream's `MySql/EscapeTest::testEscapeString`, which compares the
+     *    bytes, records it. Escaping BYTE-WISE is correct because
      *    every Ferro MySQL session is `utf8mb4`: `mysql_async` sends `utf8mb4_general_ci` in its
      *    handshake (not configurable from the DSN), and no UTF-8 multi-byte sequence contains a byte
      *    below 0x80 — the GBK/Big5/SJIS class, where a trailing `0x5c` makes byte-wise escaping
      *    unsafe, cannot be negotiated. A tenant that issues `SET NAMES gbk` is tracked as a session
      *    mutation and reset before the next tenant; inside its own session it has the same exposure
      *    `pdo_mysql` has after a `SET NAMES` (the client-side charset does not follow it either).
-     *    Measured byte-identical to `pdo_mysql`'s `quote()` on the same server, with each literal
-     *    round-tripped through Ferro (`MySqlEscapeLiveTest`).
+     *    Measured against `pdo_mysql` on the same server: byte-identical for every input without a
+     *    `'`, and every literal round-trips through Ferro in BOTH modes (`MySqlEscapeLiveTest`).
      *
      * `false` on any OTHER family refuses: on PostgreSQL it means `standard_conforming_strings =
      * off`, whose escaping (`E''` semantics, encoding-dependent) this driver does not implement.
@@ -208,13 +219,14 @@ final class FerroPdoShim
     }
 
     /**
-     * `mysql_real_escape_string()`'s table, for a `utf8mb4` connection — exactly what `pdo_mysql`'s
-     * `quote()` emits when backslashes are escapes. Single-byte keys, so `strtr()` applies each once
-     * and never re-escapes its own output.
+     * `mysql_real_escape_string()`'s table for a `utf8mb4` connection, except that `'` is DOUBLED —
+     * the one spelling that means `'` whether or not the session has `NO_BACKSLASH_ESCAPES` (see
+     * {@see quote}). Single-byte keys, so `strtr()` applies each once and never re-escapes its own
+     * output.
      */
     private const MYSQL_ESCAPES = [
         "\\" => "\\\\",
-        "'" => "\\'",
+        "'" => "''",
         '"' => '\\"',
         "\0" => '\\0',
         "\n" => '\\n',

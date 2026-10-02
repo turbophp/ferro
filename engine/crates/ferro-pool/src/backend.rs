@@ -257,7 +257,9 @@ pub trait PoolBackend: Send + Sync + 'static {
     /// **Synchronous and free, or `None`.** This is read while a probe already holds the checkout,
     /// so it must not cost a statement: PostgreSQL reports `standard_conforming_strings` as a
     /// `GUC_REPORT` parameter, which arrives in the startup `ParameterStatus` stream and again on
-    /// every change, so the M1-S1 fork's mirrored map answers it with no wire traffic at all.
+    /// every change, so the M1-S1 fork's mirrored map answers it with no wire traffic at all; MySQL
+    /// reports `SERVER_STATUS_NO_BACKSLASH_ESCAPES` on every OK packet (M2-C1g); and SQLite's answer
+    /// is a constant of the library (M2-C1g).
     ///
     /// **Why the trait says nothing about `standard_conforming_strings`.** The question a client
     /// asks is whether doubling `'` is the whole quoting rule, and two families answer it under

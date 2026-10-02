@@ -13,12 +13,14 @@ use PHPUnit\Framework\Attributes\DataProvider;
  *  1. **The ROUND TRIP**: the literal fed back through `SELECT` over Ferro must give the original
  *     BYTES. That is what "correctly escaped" means, and it is checked against the server's own
  *     parser rather than against this driver's opinion of itself.
- *  2. **`pdo_mysql`'s output, byte for byte**: the real driver's `quote()` on a connection to the
- *     SAME server. This is what makes the shim a drop-in for code that compares rendered SQL —
- *     upstream's own `MySql/EscapeTest` asserts `'Hello\'World'`.
- *  3. The server ADVERTISED the rule: a default `sql_mode` reports `false`, which is the arm this
- *     whole file exercises; a server configured with `NO_BACKSLASH_ESCAPES` would take the
- *     standard arm instead, and the unit tests cover it.
+ *  2. **Safety in the OTHER mode too**: the shim quotes by the POOL's advertised rule, not the live
+ *     session's, so the same literal must also stay one string in a session that turned
+ *     `NO_BACKSLASH_ESCAPES` ON inside its own transaction — the reason `'` is doubled rather than
+ *     backslash-escaped (§22.2 (cc)). There it may mis-render (`\\` reads as two characters), but
+ *     it must never break out.
+ *  3. **`pdo_mysql`'s output, byte for byte, for every input without a `'`** — the real driver's
+ *     `quote()` on a connection to the SAME server. With a `'` the shim deliberately emits `''`
+ *     where `pdo_mysql` emits `\'`; MySQL reads the two identically in the default mode.
  */
 final class MySqlEscapeLiveTest extends MySqlLiveTestCase
 {
@@ -87,7 +89,41 @@ final class MySqlEscapeLiveTest extends MySqlLiveTestCase
         $back = $conn->select("select {$quoted} as v")[0]->v;
         self::assertSame($raw, $back, 'the literal did not parse back to the original bytes');
 
-        self::assertSame(self::pdoMysql()->quote($raw), $quoted, 'pdo_mysql renders this literal differently');
+        if (!str_contains($raw, "'")) {
+            self::assertSame(self::pdoMysql()->quote($raw), $quoted, 'pdo_mysql renders this literal differently');
+        } else {
+            // The one deliberate divergence, asserted as the exact rewrite it is: pdo_mysql's `\'`
+            // becomes `''` and NOTHING else changes. A rule that diverged anywhere else would fail.
+            $pdo = self::pdoMysql()->quote($raw);
+            self::assertSame(
+                strtr(substr($pdo, 1, -1), ['\\\\' => '\\\\', "\\'" => "''"]),
+                substr($quoted, 1, -1),
+            );
+        }
+    }
+
+    /**
+     * THE CASE THE DOUBLED QUOTE EXISTS FOR. Inside one transaction (one pinned connection), the
+     * application turns `NO_BACKSLASH_ESCAPES` on, then runs a literal the shim built by the pool's
+     * BACKSLASH rule. Every byte of it must still be inside one string: the value read back is the
+     * literal's own content with `''` collapsed — backslash escapes read literally, the quote intact.
+     * Under `\'` the backslash would be ordinary there and the quote would END the literal; the
+     * injection payload's `union` would then run and add a row.
+     */
+    #[DataProvider('nastyStrings')]
+    public function testTheLiteralStaysOneStringInASessionThatTurnedNoBackslashEscapesOn(string $raw): void
+    {
+        $conn = $this->mysqlConnection();
+        $quoted = $conn->getPdo()->quote($raw);
+        $inner = str_replace("''", "'", substr($quoted, 1, -1));
+
+        $rows = $conn->transaction(function ($c) use ($quoted): array {
+            $c->statement("set session sql_mode = concat_ws(',', @@session.sql_mode, 'NO_BACKSLASH_ESCAPES')");
+            return $c->select("select {$quoted} as v");
+        });
+
+        self::assertCount(1, $rows);
+        self::assertSame($inner, $rows[0]->v, 'the literal was not read as one string under NO_BACKSLASH_ESCAPES');
     }
 
     /**
@@ -98,7 +134,9 @@ final class MySqlEscapeLiveTest extends MySqlLiveTestCase
     {
         $conn = $this->mysqlConnection();
 
-        self::assertSame("'Hello\\'World'", $conn->escape("Hello'World"));
+        // Upstream's MySql/EscapeTest expects pdo_mysql's `'Hello\'World'`; the shim doubles the
+        // quote instead (§22.2 (cc)) — the same string to MySQL, and safe in both modes.
+        self::assertSame("'Hello''World'", $conn->escape("Hello'World"));
         self::assertSame("'2147483647'", $conn->escape('2147483647'));
         self::assertSame('null', $conn->escape(null));
         self::assertSame('42', $conn->escape(42));
@@ -122,7 +160,7 @@ final class MySqlEscapeLiveTest extends MySqlLiveTestCase
     {
         $sql = $this->mysqlConnection()->query()->selectRaw('? as v', ["O'Brien"])->toRawSql();
 
-        self::assertStringContainsString("'O\\'Brien'", $sql);
+        self::assertStringContainsString("'O''Brien'", $sql);
     }
 
     /**
@@ -139,6 +177,6 @@ final class MySqlEscapeLiveTest extends MySqlLiveTestCase
         });
 
         self::assertCount(1, $log);
-        self::assertStringContainsString("'O\\'Brien'", $log[0]['query']);
+        self::assertStringContainsString("'O''Brien'", $log[0]['query']);
     }
 }

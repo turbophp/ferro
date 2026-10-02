@@ -283,13 +283,24 @@ for. **MySQL needs this bit more than PostgreSQL does**: PostgreSQL has defaulte
 since 9.1, while MySQL defaults to the UNSAFE one, so a MySQL `quote()` cannot be written at all
 without it.
 
-It costs no round trip in either family. PostgreSQL reports `standard_conforming_strings` as a
+It costs no round trip in any family. PostgreSQL reports `standard_conforming_strings` as a
 `GUC_REPORT` parameter, so it arrives in the startup `ParameterStatus` stream and again on every
-change, and the M1-S1 vendored fork already mirrors it (`Client::parameter`). It rides the same
-lazy, concurrent, TTL'd per-pool probe as `server_version`, so it inherits that probe's `nil`
-contract exactly: `nil` may mean never learned, learned then expired, or not learned yet, and all
-three are one thing to a client — **unknown**. A client that cannot get an unambiguous `true` must
-REFUSE to build a literal rather than assume; an escaping rule is not a place for a default.
+change, and the M1-S1 vendored fork already mirrors it (`Client::parameter`). MySQL and MariaDB
+report it on EVERY OK packet, as the `SERVER_STATUS_NO_BACKSLASH_ESCAPES` status flag, and the
+engine reads it off the last OK packet the probe's checkout already holds — a freshly set-up or
+freshly reset session, so the value is the server's default (M2-C1g). SQLite's answer is a constant
+`true`: its literal has no backslash escape mode at all (M2-C1g). It rides the same lazy,
+concurrent, TTL'd per-pool probe as `server_version`, so it inherits that probe's `nil` contract
+exactly: `nil` may mean never learned, learned then expired, or not learned yet, and all three are
+one thing to a client — **unknown**.
+
+**What a client may do with each value.** `true`: doubling `'` is the whole rule, on every family.
+`false`: backslashes ARE escapes — a client may build a literal only if it implements THAT family's
+escaping rule, and must refuse otherwise (the Laravel tier implements MySQL's, which is what
+`pdo_mysql` applies, and refuses `false` on PostgreSQL). `nil`: refuse, always; an escaping rule is
+not a place for a default. (Before M2-C1g every non-PostgreSQL pool advertised `nil`, so a MySQL or
+SQLite `quote()` could only refuse. No wire change: the field and its three states are as they were
+at `protocol_version` 3.)
 
 The DSN is **never** on the wire (SPEC §12 — it is a server-side secret), and `pools` is ordered by
 `name` so two connections to one engine see the identical list.

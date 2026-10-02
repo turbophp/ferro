@@ -73,18 +73,20 @@ final class PdoShimQuoteTest extends TestCase
     /**
      * M2-C1g: on a MySQL-family pool `false` is a rule this driver implements —
      * `mysql_real_escape_string()`'s, which `pdo_mysql` applies when backslashes are escapes (every
-     * default `sql_mode`). Each case is the byte string `pdo_mysql` emits; `MySqlEscapeLiveTest`
-     * proves the equality against the real driver and the round trip through a real server.
+     * default `sql_mode`), except that `'` is DOUBLED so the literal cannot be broken out of in a
+     * session that turned `NO_BACKSLASH_ESCAPES` on. Every case without a `'` is the byte string
+     * `pdo_mysql` emits; `MySqlEscapeLiveTest` proves that against the real driver, and the round
+     * trip through a real server in both modes.
      *
      * @return iterable<string,array{string,string}>
      */
     public static function mysqlBackslashCases(): iterable
     {
-        yield 'quote' => ["Hello'World", "'Hello\\'World'"];
+        yield 'quote (doubled, not \\\')' => ["Hello'World", "'Hello''World'"];
         yield 'double quote' => ['say "hi"', "'say \\\"hi\\\"'"];
         yield 'backslash' => ['a\\b', "'a\\\\b'"];
         yield 'trailing backslash' => ['a\\', "'a\\\\'"];
-        yield 'backslash then quote' => ["\\'", "'\\\\\\''"];
+        yield 'backslash then quote' => ["\\'", "'\\\\'''"];
         yield 'NUL' => ["a\0b", "'a\\0b'"];
         yield 'LF and CR' => ["a\nb\rc", "'a\\nb\\rc'"];
         yield 'Ctrl-Z' => ["a\x1ab", "'a\\Zb'"];

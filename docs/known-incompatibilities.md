@@ -515,14 +515,26 @@ upstream's own PDO driver:
   transaction counter, savepoint naming, events and `attempts:` retry loop — is inherited unchanged
   rather than reimplemented.
 - **`DB::escape()`, `toRawSql()`, `->dd()`, `castAsJson()` and `DB::pretend()` with string
-  bindings work on PostgreSQL and are REFUSED on SQLite and MySQL/MariaDB** — every one of them reaches
-  `quote()` (`pretend()` through `Grammar::substituteBindingsIntoRawSql()`, to log the statement it
-  did not run).
-  `quote()` is client-side with **no engine round trip** (SPEC §21 D5), so it is gated on the per-pool
-  `literals_are_standard` bit that `HELLO_ACK` advertises — and today only the PostgreSQL backend
-  advertises it. On a SQLite or MySQL pool the value is `null`, which is **fail-closed**: it is never read as
-  false (that would claim backslashes are escapes) and never as true. The refusal names the pool.
-  SPEC §22.2 (as), (at).
+  bindings work on every family, by the rule the family's own PDO driver applies** — each of them
+  reaches `quote()` (`pretend()` through `Grammar::substituteBindingsIntoRawSql()`, to log the
+  statement it did not run). **FIXED in M2-C1g for MySQL/MariaDB and SQLite**, where all five used to
+  be refused. `quote()` is client-side with **no engine round trip** (SPEC §21 D5), so the rule comes
+  from the per-pool `literals_are_standard` bit `HELLO_ACK` advertises, which the engine learns for
+  free on every family: `true` → double `'` (PostgreSQL under its default
+  `standard_conforming_strings = on`; SQLite always; MySQL under `NO_BACKSLASH_ESCAPES`), and `false`
+  on a MySQL pool — every default `sql_mode` — → `mysql_real_escape_string()`'s backslash rule,
+  byte-identical to `pdo_mysql`'s `quote()` (measured on the same server, each literal round-tripped
+  through Ferro). Still **REFUSED**, fail-closed and naming the pool: `null` on any family (the engine
+  has not learned the rule — e.g. an unreachable backend), and `false` on PostgreSQL
+  (`standard_conforming_strings = off`, whose escaping this driver does not implement). **Two
+  residual differences from `pdo_mysql`:** the bit is the POOL's default, so a tenant that changes
+  its own session's `sql_mode` mid-transaction keeps the pool's quoting rule (with `''` → `\'` the
+  difference is a mis-rendered literal, never a broken-out one, in either direction except one:
+  quoting under the backslash rule and then running the literal in a session that turned
+  `NO_BACKSLASH_ESCAPES` ON — don't change `sql_mode` inside the session you quote for); and the
+  rule assumes the `utf8mb4` connection charset Ferro always negotiates, so a tenant's own
+  `SET NAMES gbk` has the exposure it has under `pdo_mysql` after the same statement.
+  SPEC §22.2 (as), (at), (cc).
 - **`lastInsertId()` is sticky on the HANDLE, exactly as PDO's is** — and that is a deliberate
   divergence from the client underneath it. The client's value is per-STATEMENT and cleared on the
   way in to every request, which is right for a pooled engine: a statement can land on another
