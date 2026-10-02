@@ -428,17 +428,17 @@ What follows is what is different about reaching it through Illuminate. The numb
 upstream `laravel/framework` v11.51.0's own integration tests, run against a real server through one
 `ferrod`, each column reproduced twice and each against a CONTROL running the identical tests through
 upstream's own PDO driver:
-[`docs/laravel-suite/2026-09-10-c2-results.md`](laravel-suite/2026-09-10-c2-results.md) and
-[`docs/laravel-suite/2026-09-15-c3-6b-sqlite-results.md`](laravel-suite/2026-09-15-c3-6b-sqlite-results.md).
+[`docs/laravel-suite/2026-09-10-c2-results.md`](laravel-suite/2026-09-10-c2-results.md),
+[`docs/laravel-suite/2026-09-15-c3-6b-sqlite-results.md`](laravel-suite/2026-09-15-c3-6b-sqlite-results.md) and
+[`docs/laravel-suite/2026-10-02-c1f-mysql-results.md`](laravel-suite/2026-10-02-c1f-mysql-results.md).
 
 ### Getting in
 
-- **Two driver names are registered: `ferro-pgsql` and `ferro-sqlite`.** `FerroConnections::register()`
-  wires them through Illuminate's own `Connection::resolverFor()` map, and adoption is the one-word
-  `driver` change in the connection config that SPEC §15 asks for. **MySQL/MariaDB is not
-  registered at all** — the engine has supported it since M1-S6, but this tier has no
-  `FerroMySqlConnection`, so §15's acceptance bar, which names MySQL, is **not met**. Said here
-  rather than left to be discovered.
+- **Three driver names are registered: `ferro-pgsql`, `ferro-sqlite` and `ferro-mysql`** (MySQL
+  and MariaDB both, since M2-C1f — `isMaria()` reads the version through the shim, which passes
+  `-MariaDB` through untouched). `FerroConnections::register()` wires them through Illuminate's own
+  `Connection::resolverFor()` map, and adoption is the one-word `driver` change in the connection
+  config that SPEC §15 asks for. SPEC §22.2 (cb).
 - **The driver NAME is part of your application's behaviour, and it is the single largest source of
   difference.** Illuminate resolves connections by name, and upstream's own tests — plus plenty of
   third-party packages — branch on `$connection->getDriverName()`. Measured on PostgreSQL over 633
@@ -447,7 +447,10 @@ upstream's own PDO driver:
   through stock PDO, so they are upstream's own). Under `ferro-pgsql` it is 570/579, and every one of
   those nine differences was positively identified in upstream source as code branching on
   `$this->driver`: an `expectException` never armed, a `match` picking the wrong expected type, a
-  `markTestSkipped` that never fires. SPEC §22.2 (am), (ar).
+  `markTestSkipped` that never fires. SPEC §22.2 (am), (ar). **The same holds on MySQL**: under the
+  `mysql` alias the column is identical to `pdo_mysql`'s, skip set and failure set alike, while
+  `ferro-mysql` skips 8 tests carrying `#[RequiresDatabase(['mysql', 'mariadb'])]` — testbench
+  resolves that from the driver name — and fails one `match ($this->driver)`. SPEC §22.2 (cb).
 - **The alias is opt-in because it hijacks every connection of that name.** `register(['pgsql' =>
   'ferro-pgsql'])` makes name-branching code take its PostgreSQL path — and also captures any
   connection in the application that was meant to dial PostgreSQL directly. An application with a
@@ -469,10 +472,11 @@ upstream's own PDO driver:
   shim is the seam transactions run through, which is why `ManagesTransactions` — Laravel's
   transaction counter, savepoint naming, events and `attempts:` retry loop — is inherited unchanged
   rather than reimplemented.
-- **`DB::escape()`, `toRawSql()` and `->dd()` work on PostgreSQL and are REFUSED on SQLite.**
+- **`DB::escape()`, `toRawSql()` and `->dd()` work on PostgreSQL and are REFUSED on SQLite and
+  MySQL.**
   `quote()` is client-side with **no engine round trip** (SPEC §21 D5), so it is gated on the per-pool
   `literals_are_standard` bit that `HELLO_ACK` advertises — and today only the PostgreSQL backend
-  advertises it. On a SQLite pool the value is `null`, which is **fail-closed**: it is never read as
+  advertises it. On a SQLite or MySQL pool the value is `null`, which is **fail-closed**: it is never read as
   false (that would claim backslashes are escapes) and never as true. The refusal names the pool.
   SPEC §22.2 (as), (at).
 - **`lastInsertId()` is sticky on the HANDLE, exactly as PDO's is** — and that is a deliberate
@@ -487,6 +491,13 @@ upstream's own PDO driver:
   with no key, as PDO's does. One divergence: where `pdo_sqlite` answers `"0"` for a handle that has
   generated nothing, this tier THROWS, since `"0"` is indistinguishable from a key. SPEC §22.2 (bn),
   (bw).
+- **On MySQL, `lastInsertId` is the STATEMENT's key, as `pdo_mysql`'s is** — the opposite of the
+  sticky handle above, because the two PDO drivers differ: `pdo_mysql` answers the statement just
+  executed and `"0"` after one that generated none, a `SELECT` or an `UPDATE` (measured), and stock
+  `MySqlConnection::insert()` stores it on the connection inside the statement's own run, before
+  `QueryExecuted`. `FerroMySqlConnection::insert()` does exactly that, with the engine's
+  per-statement key — so `insertGetId()` on a table without an auto-increment answers `0`, as on PDO.
+  SPEC §22.2 (cb).
 
 ### Values
 
@@ -494,14 +505,28 @@ upstream's own PDO driver:
   Illuminate what PDO hands it, because Illuminate's own helpers index into the result —
   `Builder::pluck($col, $key)` breaks outright on a value object. This is the same `RawStringValuePolicy`
   hand-off the Doctrine tier takes.
-- **One deliberate divergence from PDO is kept, because it is safer.** A `TIMESTAMPTZ` arrives as
-  canonical RFC3339, which Illuminate's `Date::parse` fallback reads as UTC. PDO's `+00` form is
-  silently reinterpreted in the application timezone. SPEC §22.2 (al).
+- **One deliberate divergence from PDO is kept on PostgreSQL, because it is safer there.** A
+  `TIMESTAMPTZ` arrives as canonical RFC3339, which Illuminate's `Date::parse` fallback reads as UTC.
+  PDO's `+00` form is silently reinterpreted in the application timezone. SPEC §22.2 (al).
+- **On MySQL the same tag arrives exactly as `pdo_mysql` returns it**: a `TIMESTAMP` column — what
+  `$table->timestamps()` creates — reads back as the naive UTC wall clock (`2017-11-12 13:14:15`),
+  every Ferro MySQL session being pinned to `+00:00`. Eloquent WRITES naive strings, which the server
+  reads in that session, so only a naive read makes the round trip byte-stable; RFC3339 here would
+  make Illuminate read a UTC instant where it wrote a wall clock — a silent shift for any app not
+  running in UTC. SPEC §22.2 (cb).
 - **A `bigint` at or above 2^32 reads** — see *Values* above; the defect that page-entry records was
   fixed at M1-S9 and affected this tier too.
 
 ### Errors and transactions
 
+- **On MySQL a duplicate key is recognised by errno 1062, not by `pdo_mysql`'s wording.** Stock
+  `MySqlConnection::isUniqueConstraintError()` matches the message text `Integrity constraint
+  violation: 1062`, which a Ferro error does not carry (it carries the server's own message, with the
+  errno and SQLSTATE as fields), so before C1f `createOrFirst()` re-threw the duplicate it exists to
+  catch — 8 framework-suite failures. `FerroMySqlConnection` decides it from the errno, the same
+  "by type, not by wording" rule this tier applies to lost connections and concurrency errors.
+  **Application code that matches on that exact phrase in the message will not find it**; code that
+  catches `UniqueConstraintViolationException`, as Laravel's own does, works. SPEC §22.2 (cb).
 - **`FerroQueryException` puts SQLSTATE in `getCode()`** — PDO's convention, and the *opposite* of
   the sibling Doctrine tier's errno convention. It is not cosmetic: with the sibling's convention a
   real PostgreSQL `40001` propagates out of `DB::transaction(attempts: 3)` instead of being retried,
@@ -564,9 +589,10 @@ upstream's own PDO driver:
 
 ### Not established
 
-§15's acceptance bar names PostgreSQL, MySQL and SQLite. **MySQL is not run**, because this tier does
-not register it; SQLite and PostgreSQL are, with controls. The Eloquent ORM's own test suite is not
-run on any family.
+§15's acceptance bar names PostgreSQL, MySQL and SQLite; all three now run with controls. The
+MySQL family's RECORDED numbers come from the `laravel-suite` workflow (MySQL 8.4, MariaDB 11.8) —
+see the C1f results doc for whether they have landed. The Eloquent ORM's own test suite is not run on
+any family.
 
 ---
 

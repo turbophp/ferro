@@ -24,16 +24,23 @@
 # result line — the contact assertion, the base-class patch check, or a ferrod that never came up.
 # That is the silent-no-op class the runner exists to refuse.
 #
-# ONLY PostgreSQL is wired, and that is not an oversight: `ferro/laravel` registers `ferro-pgsql`
-# and nothing else today. §15's bar also names MySQL and SQLite; MySQL waits on the tier registering
-# a MySQL connection, and SQLite is unreachable until the SQLite backend (C3) exists at all. Report
-# which columns ran and which could not — never restate the bar as if met.
+# PostgreSQL (job `measure`) and the MySQL family (job `measure-mysql`, M2-C1f: MySQL 8.4 and
+# MariaDB 11.8, the tier's `ferro-mysql`) run here. SQLite needs no server and is measured in the
+# dev container (docs/laravel-suite/2026-09-15-c3-6b-sqlite-results.md). Report which columns ran
+# and which could not — never restate the bar as if met.
 name: laravel-suite
 on:
   workflow_dispatch:
+    inputs:
+      family:
+        description: which family's columns to measure
+        type: choice
+        options: [all, pg, mysql]
+        default: all
 
 jobs:
   measure:
+    if: inputs.family == 'all' || inputs.family == 'pg'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -121,3 +128,70 @@ jobs:
             .laravel-suite/ferrod.log
       - if: always()
         run: docker compose -f testkit/docker-compose.yml logs --no-color --tail=80 pg
+
+  # The MySQL family (M2-C1f): the same three columns per server — `ferro-mysql` (§15's one-word
+  # change), `mysql` (the opt-in stock-name alias) and `stock-mysql` (THE CONTROL: upstream's own
+  # pdo_mysql at UTC, like the engine's pinned sessions) — twice each. The alias column exists for the
+  # same reason as on PostgreSQL: upstream tests gate on the driver NAME (`#[RequiresDatabase(['mysql',
+  # 'mariadb'])]`, `match ($this->driver)`), so only the alias can show those are name artifacts.
+  measure-mysql:
+    if: inputs.family == 'all' || inputs.family == 'mysql'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        svc: [mysql, mariadb]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with: { php-version: "8.4", extensions: msgpack, tools: composer }
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=33060,33061
+      - run: |
+          docker compose -f testkit/docker-compose.yml up -d --wait ${{ matrix.svc }} \
+            || { sleep 15; docker compose -f testkit/docker-compose.yml up -d --wait ${{ matrix.svc }}; }
+      - name: measure every driver-name column, twice each
+        run: |
+          set -o pipefail +e
+          for drv in ferro-mysql mysql stock-mysql; do
+            for run in 1 2; do
+              FERRO_LARAVEL_DRIVER="$drv" FERRO_LARAVEL_SVC=${{ matrix.svc }} \
+                bash testkit/laravel-suite.sh --log-junit "$drv-run$run.xml" 2>&1 | tee "$drv-run$run.log"
+              echo "phpunit exit: $?"
+            done
+          done
+      - name: assert every run actually measured, under the name it claims
+        run: |
+          for drv in ferro-mysql mysql stock-mysql; do
+            for run in 1 2; do
+              f="$drv-run$run.log"
+              grep -qE '^(OK|FAILURES!|ERRORS!|Tests: )' "$f" \
+                || { echo "::error:: $f has no phpunit result line — the run died before measuring"; tail -40 "$f"; exit 1; }
+              grep -q "\[ferro\] connection=.* driver=$drv " "$f" \
+                || { echo "::error:: $f did not run under driver $drv"; exit 1; }
+              grep -q '\[ferro\] reset: ' "$f" \
+                || { echo "::error:: $f has no reset line"; exit 1; }
+            done
+          done
+          grep -q '\[ferro\] connection=Illuminate.Database.MySqlConnection driver=stock-mysql ' stock-mysql-run1.log \
+            || { echo "::error:: the control column did not resolve the STOCK MySqlConnection"; exit 1; }
+          grep -q '\[ferro\] connection=Ferro.Laravel.FerroMySqlConnection driver=ferro-mysql ' ferro-mysql-run1.log \
+            || { echo "::error:: the ferro-mysql column did not resolve FerroMySqlConnection"; exit 1; }
+      - name: compare each Ferro column with the control, as SETS (SPEC §22.2 (bz))
+        if: always()
+        run: |
+          for drv in ferro-mysql mysql; do
+            echo "== $drv vs stock-mysql (run 1)"
+            php testkit/dbal/compare-columns.php "$drv-run1.xml" stock-mysql-run1.xml || true
+          done | tee compare.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: laravel-suite-${{ matrix.svc }}-logs
+          path: |
+            *-run1.log
+            *-run2.log
+            *-run1.xml
+            *-run2.xml
+            compare.txt

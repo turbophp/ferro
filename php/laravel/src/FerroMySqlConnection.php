@@ -2,6 +2,11 @@
 declare(strict_types=1);
 namespace Ferro\Laravel;
 
+use Exception;
+use Ferro\Client\Error\IndeterminateException;
+use Ferro\Client\Error\NonRetryableException;
+use Ferro\Client\Error\RetryableException;
+use Ferro\Laravel\Exception\FerroQueryException;
 use Illuminate\Database\MySqlConnection;
 
 /**
@@ -52,5 +57,32 @@ class FerroMySqlConnection extends MySqlConnection
             $this->lastInsertId = $id === null ? '0' : (string) $id;
             return true;
         }));
+    }
+
+    /**
+     * MySQL's duplicate-key error is errno **1062**, decided from the error's STRUCTURE.
+     *
+     * Stock `MySqlConnection::isUniqueConstraintError()` matches the message text
+     * `Integrity constraint violation: 1062` — `pdo_mysql`'s wording, which a Ferro error does not
+     * carry (it carries the server's own message, plus the errno and SQLSTATE as fields). So under
+     * the stock detector `createOrFirst()` never recognised the duplicate it exists to catch and
+     * re-threw it: 8 of the framework suite's 13 non-passes on the first measured MySQL column
+     * (M2-C1f). This is the same rule the tier already applies to lost connections and concurrency
+     * errors (§22.2 (bw)): a classification Illuminate makes by wording is made here by type, and
+     * the stock detector still answers for anything that is not a Ferro error.
+     *
+     * 1062 alone, exactly the code the stock pattern names — not 1586 or 1022, which stock does not
+     * treat as a unique violation either.
+     */
+    protected function isUniqueConstraintError(Exception $exception)
+    {
+        $ferro = $exception instanceof FerroQueryException ? $exception->getPrevious() : null;
+        if ($ferro instanceof NonRetryableException
+            || $ferro instanceof RetryableException
+            || $ferro instanceof IndeterminateException
+        ) {
+            return $ferro->errno() === 1062;
+        }
+        return parent::isUniqueConstraintError($exception);
     }
 }
