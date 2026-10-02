@@ -616,9 +616,11 @@ upstream's own PDO driver:
   pinned connection, and a bare `Schema::disableForeignKeyConstraints()` outside a transaction is
   REFUSED.** `SET FOREIGN_KEY_CHECKS=0` is session state, and each statement is its own checkout, so
   stock's sequence — the `SET`, then the `DROP`s — ran the `DROP`s on a connection where checks were
-  back on: `migrate:fresh`, `db:wipe` and `RefreshDatabase` failed with `1451` on any schema where a
-  parent table sorts before its child (`MySqlBuilder` drops in name order), and the seeder idiom
-  `disableForeignKeyConstraints(); Parent::truncate();` failed too. Found by the C1f review; the
+  back on: on MariaDB `migrate:fresh`, `db:wipe` and `RefreshDatabase` failed with `1451` on any
+  schema where a parent table sorts before its child (`MySqlBuilder` drops in name order; MySQL 8.4
+  accepts that single multi-table `DROP`), and on both servers the seeder idiom
+  `disableForeignKeyConstraints(); Parent::truncate();` failed, as did dropping a referenced parent
+  alone. Found by the C1f review; the
   framework suite never saw it because its own FK schemas sort child-first. `Ferro\Laravel\Schema\FerroMySqlBuilder`
   (and `FerroMariaDbBuilder`) now run both inside one transaction — DDL's implicit commit happens on
   the PINNED connection, after the `SET` — and refuse the bare call rather than silently doing
