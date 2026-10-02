@@ -569,16 +569,62 @@ impl ToSql for PgFloat {
             (self.0 as f32).to_sql(base, out)
         } else if *base == Type::FLOAT8 {
             self.0.to_sql(base, out)
+        } else if *base == Type::NUMERIC {
+            // M2 (§22.2 (ci)): canonical text (see `encode_format`), rendered by [`f64_numeric_text`].
+            out.extend_from_slice(f64_numeric_text(self.0).as_bytes());
+            Ok(IsNull::No)
         } else {
             Err(format!("PgFloat cannot bind PG type {}", ty.name()).into())
         }
     }
 
+    /// `numeric` is a MEASURED target (the §22.2 (af) membership rule): Doctrine's `DecimalType`
+    /// binds under `ParameterType::STRING` but hands the driver whatever PHP value the entity holds,
+    /// and an entity that assigns a float to a `decimal` field reaches here as a canonical `F64` —
+    /// seven doctrine/orm functional tests (`TypeTest::testDecimal`, `DDC1884Test`, `GH9230Test`)
+    /// failed `F64 cannot bind numeric` where `pdo_pgsql` stringifies the float under `PARAM_STR`
+    /// (and what it stringifies TO differs — see [`f64_numeric_text`]).
+    /// The driver cannot stringify instead, because `FloatType` binds under `STRING` too and the
+    /// TEXT arm deliberately refuses the float widths (§22.2 (ap)).
     fn accepts(ty: &Type) -> bool {
-        [Type::FLOAT4, Type::FLOAT8].contains(resolve_domain(ty))
+        [Type::FLOAT4, Type::FLOAT8, Type::NUMERIC].contains(resolve_domain(ty))
+    }
+
+    /// TEXT for `numeric` (PostgreSQL parses the decimal rendering itself, as for `I64`); the float
+    /// widths keep the native binary form their delegated encoder writes. Domain-resolved, so the
+    /// format is decided by the encoder that actually runs (see [`PgText::encode_format`]).
+    fn encode_format(&self, ty: &Type) -> Format {
+        if *resolve_domain(ty) == Type::NUMERIC {
+            Format::Text
+        } else {
+            Format::Binary
+        }
     }
 
     to_sql_checked!();
+}
+
+/// An `f64` as `numeric` input text: the SHORTEST decimal that round-trips to the same `f64`
+/// (Rust's `Display`; PHP's `var_export`/`json_encode` form), so `numeric` receives exactly the
+/// value the application's float holds. **This is NOT what `pdo_pgsql` sends**, and the divergence
+/// is deliberate (SPEC §22.2 (ci), known-incompatibilities): PDO's `PARAM_STR` is PHP's `(string)`
+/// cast, which rounds to `precision = 14` significant digits first, so the two disagree for a float
+/// needing more digits (`0.1 + 0.2`: Ferro `0.30000000000000004`, PDO `0.3`) and at a rounding
+/// boundary of the column's scale (`0.00499999999999999` into `numeric(10,2)`: Ferro `0.00`, the
+/// correct rounding of that float; PDO `0.01`, a double rounding through `0.005`). Not PostgreSQL's
+/// own 15-digit `float8::numeric` cast either. The non-finite values use PostgreSQL's spelling:
+/// `NaN`, and `Infinity`/`-Infinity` (numeric accepts infinities from PG 14; an older server refuses
+/// with its own known-fate `22P02`).
+fn f64_numeric_text(f: f64) -> String {
+    if f.is_nan() {
+        "NaN".to_string()
+    } else if f == f64::INFINITY {
+        "Infinity".to_string()
+    } else if f == f64::NEG_INFINITY {
+        "-Infinity".to_string()
+    } else {
+        format!("{f}")
+    }
 }
 
 /// `U64` has **no** PG target type in S7 — PostgreSQL has no unsigned integer type, so there is
@@ -1043,9 +1089,10 @@ mod tests {
         }
         // M2-C2 REPOINTED `NUMERIC` out of the list above for the I64 half only, exactly as M1-S9
         // repointed `TEXT`/`BOOL` — see `c2_i64_binds_numeric_and_float8_like_libpq`. The F64 half
-        // is UNCHANGED here and in the `TEXT`/`BOOL` loop below, because no measured caller binds a
-        // float into any of the three and unmeasured widening is how a pre-flight rots.
-        for ty in [Type::TEXT, Type::BOOL, Type::NUMERIC] {
+        // of `NUMERIC` was repointed in its turn by the doctrine/orm suite (§22.2 (ci), see
+        // `orm_f64_binds_numeric_as_shortest_text`); `TEXT`/`BOOL` stay refused, because no
+        // measured caller binds a float into either and unmeasured widening is how a pre-flight rots.
+        for ty in [Type::TEXT, Type::BOOL] {
             assert!(!accepts(&Value::F64(1.5), &ty), "F64 must not bind {ty:?}");
         }
         // ...and the I64 arms stay narrow where nothing measured reaches: `float4` in particular.
@@ -1055,6 +1102,54 @@ mod tests {
             !accepts(&Value::I64(42), &Type::FLOAT4),
             "I64 must not bind float4 — no measured caller"
         );
+    }
+
+    /// **M2 (§22.2 (ci)): `F64 → numeric`**, as canonical TEXT in the shortest round-trip form
+    /// (Rust's `Display` — NOT PHP's 14-digit `(string)` cast, see [`f64_numeric_text`]) with
+    /// PostgreSQL's spellings of the non-finite values. The float widths keep their binary form, and
+    /// a DOMAIN over `numeric` takes the numeric arm (the format is decided on the resolved type).
+    #[test]
+    fn orm_f64_binds_numeric_as_shortest_text() {
+        assert!(accepts(&Value::F64(1.5), &Type::NUMERIC));
+        assert!(matches!(
+            PgFloat(1.5).encode_format(&Type::NUMERIC),
+            Format::Text
+        ));
+        assert!(matches!(
+            PgFloat(1.5).encode_format(&Type::FLOAT8),
+            Format::Binary
+        ));
+        assert!(matches!(
+            PgFloat(1.5).encode_format(&Type::FLOAT4),
+            Format::Binary
+        ));
+        // A DOMAIN over numeric must take the numeric arm — the format is decided on the RESOLVED
+        // type, or the text bytes would go out flagged binary (review F6).
+        let dom_numeric = Type::new(
+            "money_d".into(),
+            999_998,
+            tokio_postgres::types::Kind::Domain(Type::NUMERIC),
+            "public".into(),
+        );
+        assert!(accepts(&Value::F64(1.5), &dom_numeric));
+        assert!(matches!(
+            PgFloat(1.5).encode_format(&dom_numeric),
+            Format::Text
+        ));
+        for (f, text) in [
+            (1.5, "1.5"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (2.0, "2"),
+            (-12.25, "-12.25"),
+            (1e25, "10000000000000000000000000"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ] {
+            let mut out = tokio_postgres::types::private::BytesMut::new();
+            PgFloat(f).to_sql(&Type::NUMERIC, &mut out).unwrap();
+            assert_eq!(std::str::from_utf8(&out).unwrap(), text, "{f}");
+        }
     }
 
     /// **M2-C2: `I64 → numeric` and `I64 → float8`** — the last three non-passing tests in the
@@ -1894,7 +1989,7 @@ mod tests {
             Type::new(
                 "dom_numeric".to_string(),
                 900_002,
-                Kind::Domain(Type::NUMERIC),
+                tokio_postgres::types::Kind::Domain(Type::NUMERIC),
                 "public".to_string(),
             ),
             Type::new(

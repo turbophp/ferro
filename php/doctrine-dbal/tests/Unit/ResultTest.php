@@ -87,6 +87,26 @@ final class ResultTest extends TestCase
     }
 
     /**
+     * The same truncation one value over: a first cell that IS `false`. `FetchUtils`'
+     * `fetchFirstColumn()` loops on `fetchOne() !== false`, so a boolean column whose first value is
+     * false came back as `[]` — found by the doctrine/orm functional suite (`GH9230Test`), and the
+     * reason `fetchFirstColumn()` is no longer delegated (§22.2 (ci)). A `false` in the middle must
+     * not stop it either.
+     */
+    public function testFetchFirstColumnDoesNotStopAtAFalseCell(): void
+    {
+        self::assertSame(
+            [false, true, false],
+            Result::buffered(['b'], [[false], [true], [false]], 3)->fetchFirstColumn(),
+        );
+        self::assertSame(
+            [true, false, null, true],
+            Result::buffered(['b'], [[true], [false], [null], [true]], 4)->fetchFirstColumn(),
+        );
+        self::assertSame([], Result::buffered(['b'], [], 0)->fetchFirstColumn());
+    }
+
+    /**
      * `rowCount()` is the TERMINAL's `affected`, never `count($rows)`. The research spike shipped
      * `rowCount() === 0` for an `UPDATE` that changed one row precisely because it conflated them,
      * and `Doctrine\DBAL\Connection::executeStatement()` returns exactly this number.

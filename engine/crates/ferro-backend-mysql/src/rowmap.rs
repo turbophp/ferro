@@ -126,6 +126,13 @@ pub enum MyKind {
     /// **MySQL 8's** `MYSQL_TYPE_JSON` → `Value::Json` (the raw document text). MariaDB never emits
     /// this type code — its `JSON` is a `LONGTEXT` alias and classifies as [`MyKind::Text`].
     Json,
+    /// `MYSQL_TYPE_NULL` → `Value::Null`, **from EXECUTED metadata only** (SPEC §22.2 (ci)). The
+    /// executed set describes the cells it carries, so a NULL-typed column there holds only NULLs
+    /// (`SELECT NULL`, or a NULL-bound bare `?`). The PREPARED metadata is not trusted for it —
+    /// MariaDB declares a bare `?` in the select list NULL-typed whatever is bound — so
+    /// [`refuse_prepared_null`] refuses it at the pre-send check. A non-NULL cell under it is a
+    /// decode mismatch, never coerced.
+    Null,
 }
 
 /// The string/blob family's Text-vs-Bytes decision: the binary collation (63) means a byte string,
@@ -228,7 +235,11 @@ pub fn column_kind(col: &Column) -> Result<MyKind, PoolError> {
         ColumnType::MYSQL_TYPE_SET => Err(unsupported(col, "SET")),
         ColumnType::MYSQL_TYPE_GEOMETRY => Err(unsupported(col, "GEOMETRY")),
         ColumnType::MYSQL_TYPE_VECTOR => Err(unsupported(col, "VECTOR")),
-        // The NULL column type plus the server-internal codes (NEWDATE, DATETIME2, TIMESTAMP2,
+        // Admitted as NULL — but only ever DESCRIBES cells when it comes from EXECUTED metadata:
+        // the pre-send check refuses a NULL-typed PREPARED column ([`refuse_prepared_null`]),
+        // because MariaDB declares a bare `?` that way whatever is bound (SPEC §22.2 (ci)).
+        ColumnType::MYSQL_TYPE_NULL => Ok(MyKind::Null),
+        // The server-internal codes (NEWDATE, DATETIME2, TIMESTAMP2,
         // TIME2, TYPED_ARRAY, UNKNOWN) which no live server sends on the client protocol.
         _ => Err(unsupported(col, "out-of-scope column type")),
     }
@@ -255,7 +266,32 @@ pub fn column_to_tag(col: &Column) -> Result<u8, PoolError> {
         MyKind::Timestamp => tag::TIMESTAMP,
         MyKind::TimestampTz => tag::TIMESTAMPTZ,
         MyKind::Json => tag::JSON,
+        MyKind::Null => tag::NULL,
     })
+}
+
+/// **The pre-send refusal of a NULL-typed PREPARED column** (SPEC §22.2 (ci)). MariaDB declares a
+/// bare `?` in the select list (`SELECT ? AS p`) as `MYSQL_TYPE_NULL` at prepare time whatever is
+/// bound, and `SELECT NULL` is declared the same way, so the prepared list cannot say which one a
+/// statement is. Admitting it there once let `SELECT ? AS p` RUN and then fail to decode its bound
+/// value — the adversarial review measured `SELECT bump(), ?` applying its write and reporting a
+/// known failure. Refused here, before anything is sent. Called by both query paths on the prepared
+/// list only; EXECUTED metadata admits the type ([`MyKind::Null`]), because it describes real cells.
+///
+/// Why refuse at all, now that both paths describe rows from the executed set? Because that set is
+/// not always sent: the vendored driver negotiates MariaDB's `MARIADB_CLIENT_CACHE_METADATA`
+/// (`vendor/mysql-async/src/opts/mod.rs`), under which an execute may omit the column metadata and
+/// the driver substitutes the statement's CACHED list — for this shape, the NULL-typed one. No test
+/// can make the server skip it on demand, so the guard is the conservative side of an untestable
+/// path, and the cost is stated: a bare `?` in a MariaDB select list is refused (cast it).
+pub fn refuse_prepared_null(columns: &[Column]) -> Result<(), PoolError> {
+    match columns
+        .iter()
+        .find(|c| c.column_type() == ColumnType::MYSQL_TYPE_NULL)
+    {
+        Some(col) => Err(unsupported(col, "NULL-typed")),
+        None => Ok(()),
+    }
 }
 
 /// Extract a single binary-protocol cell (`value` for column `col`) into a canonical `Value`. A SQL
@@ -305,6 +341,11 @@ pub fn extract_value(value: &MyValue, col: &Column) -> Result<Value, PoolError> 
             mytext::timestamptz_to_text,
         )?)),
         MyKind::Json => Ok(Value::Json(render(col, value, mytext::json_to_text)?)),
+        // Every NULL cell returned above; anything else under a NULL-typed column is a mismatch.
+        MyKind::Null => Err(decode_err(
+            col,
+            "a non-NULL cell in a NULL-typed column".to_string(),
+        )),
     }
 }
 
@@ -742,7 +783,6 @@ mod tests {
             ),
             (ColumnType::MYSQL_TYPE_GEOMETRY, NO_FLAGS, 0, BIN),
             (ColumnType::MYSQL_TYPE_VECTOR, NO_FLAGS, 0, BIN),
-            (ColumnType::MYSQL_TYPE_NULL, NO_FLAGS, 0, BIN),
         ];
         for (ct, flags, len, charset) in cases {
             let c = col(ct, flags, len, charset);
@@ -916,6 +956,17 @@ mod tests {
                     MyValue::Bytes(br#"{"a": 1}"#.to_vec()),
                     Value::Json(r#"{"a": 1}"#.into()),
                 )],
+                // §22.2 (ci): executed metadata only; the one cell it can carry is NULL.
+                MyKind::Null => vec![(
+                    col(
+                        ColumnType::MYSQL_TYPE_NULL,
+                        ColumnFlags::BINARY_FLAG,
+                        0,
+                        BIN,
+                    ),
+                    MyValue::NULL,
+                    Value::Null,
+                )],
             }
         }
 
@@ -935,7 +986,8 @@ mod tests {
                 MyKind::Time => MyKind::Timestamp,
                 MyKind::Timestamp => MyKind::TimestampTz,
                 MyKind::TimestampTz => MyKind::Json,
-                MyKind::Json => return None,
+                MyKind::Json => MyKind::Null,
+                MyKind::Null => return None,
             })
         }
 
@@ -979,6 +1031,31 @@ mod tests {
                 assert_eq!(extract_value(&MyValue::NULL, c).unwrap(), Value::Null);
             }
         }
+    }
+
+    /// §22.2 (ci): a NULL-typed PREPARED column is refused (pre-send), naming it; any other list
+    /// passes; and a non-NULL cell under a NULL-typed column is a decode mismatch, never coerced.
+    #[test]
+    fn a_null_typed_prepared_column_is_refused_and_never_coerced() {
+        let null_col = col(
+            ColumnType::MYSQL_TYPE_NULL,
+            ColumnFlags::BINARY_FLAG,
+            0,
+            BIN,
+        )
+        .with_name(b"p");
+        let int_col = col(ColumnType::MYSQL_TYPE_LONGLONG, NO_FLAGS, 20, BIN);
+        match refuse_prepared_null(&[int_col.clone(), null_col.clone()]) {
+            Err(PoolError::Unsupported(m)) => {
+                assert!(m.contains("NULL-typed") && m.contains('p'), "{m}")
+            }
+            other => panic!("a NULL-typed prepared column must be refused, got {other:?}"),
+        }
+        assert!(refuse_prepared_null(&[int_col]).is_ok());
+        assert!(matches!(
+            extract_value(&MyValue::Int(5), &null_col),
+            Err(PoolError::Backend(_))
+        ));
     }
 
     /// **Carry C16.** `mytext::date_to_text` rejects a cell carrying a time part, which is the

@@ -420,6 +420,102 @@ async fn a_real_pg_server_error_carries_no_errno() {
     }
 }
 
+/// **M2 (§22.2 (ci)): an `F64` binds a `numeric` slot, against real PostgreSQL** — the shape seven
+/// doctrine/orm functional tests failed on (`DecimalType` binding a PHP float). PostgreSQL is the
+/// oracle: each value is read back through `::text` in the same statement, so a wrong wire FORMAT
+/// (binary float bytes under a numeric OID) cannot pass. The expected texts are the shortest
+/// round-trip rendering of each float — NOT PostgreSQL's own 15-digit `float8::numeric` cast (the
+/// last column shows it disagreeing), and NOT `pdo_pgsql`'s 14-digit PHP `(string)` cast either,
+/// which this deliberately diverges from (SPEC §22.2 (ci)).
+#[tokio::test(flavor = "multi_thread")]
+async fn orm_f64_binds_numeric_live() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    let rows = co
+        .query(
+            "SELECT ($1::numeric)::text, ($2::numeric)::text, ($3::numeric)::text, \
+             ($4::numeric)::text, ($2::float8::numeric)::text",
+            &[
+                Value::F64(1.5),
+                Value::F64(0.1 + 0.2),
+                Value::F64(f64::NAN),
+                Value::F64(-0.0),
+            ],
+        )
+        .await
+        .expect("an F64 must bind a numeric slot");
+    let r = &rows.rows[0];
+    assert_eq!(r[0], Value::Text("1.5".into()));
+    assert_eq!(
+        r[1],
+        Value::Text("0.30000000000000004".into()),
+        "the shortest round-trip form (pdo_pgsql would store 0.3 — a deliberate divergence)"
+    );
+    assert_eq!(r[2], Value::Text("NaN".into()));
+    assert_eq!(r[3], Value::Text("0".into()));
+    assert_eq!(
+        r[4],
+        Value::Text("0.3".into()),
+        "PostgreSQL's own cast rounds to 15 digits — which is why the bind does not use it"
+    );
+
+    // A real column, written and read back: the ORM's insert shape.
+    co.exec("CREATE TEMP TABLE orm_dec (d numeric(10,2))")
+        .await
+        .expect("temp table");
+    co.query("INSERT INTO orm_dec VALUES ($1)", &[Value::F64(12.345)])
+        .await
+        .expect("an F64 must insert into a numeric(10,2) column");
+    let rows = co
+        .query("SELECT d::text FROM orm_dec", &[])
+        .await
+        .expect("read back");
+    assert_eq!(
+        rows.rows[0][0],
+        Value::Text("12.35".into()),
+        "numeric(10,2) rounds the float's own value"
+    );
+    // At a rounding boundary the shortest form and PHP's 14-digit cast DISAGREE: this float is
+    // below 0.005, so it rounds to 0.00 here, where pdo_pgsql (sending "0.005") stores 0.01.
+    co.exec("DELETE FROM orm_dec").await.expect("clear");
+    co.query(
+        "INSERT INTO orm_dec VALUES ($1)",
+        &[Value::F64(0.004_999_999_999_999_99)],
+    )
+    .await
+    .expect("boundary insert");
+    let rows = co
+        .query("SELECT d::text FROM orm_dec", &[])
+        .await
+        .expect("read back");
+    assert_eq!(
+        rows.rows[0][0],
+        Value::Text("0.00".into()),
+        "the correct rounding of the float"
+    );
+    co.exec("DROP TABLE orm_dec").await.expect("drop");
+
+    // A DOMAIN over numeric: the format follows the RESOLVED type (review F6).
+    co.exec("DROP DOMAIN IF EXISTS orm_money_d")
+        .await
+        .expect("drop domain");
+    co.exec("CREATE DOMAIN orm_money_d AS numeric(12,4)")
+        .await
+        .expect("domain");
+    let rows = co
+        .query("SELECT ($1::orm_money_d)::text", &[Value::F64(1.25)])
+        .await
+        .expect("an F64 must bind a domain over numeric");
+    assert_eq!(rows.rows[0][0], Value::Text("1.2500".into()));
+    co.exec("DROP DOMAIN orm_money_d")
+        .await
+        .expect("drop domain");
+}
+
 /// **M2-C2: an `I64` binds a `numeric` and a `double precision` slot, against real PostgreSQL.**
 ///
 /// The two shapes are the last three non-passing tests of the `laravel/framework` v11.51.0

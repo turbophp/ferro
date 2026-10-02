@@ -27,6 +27,10 @@ php/**/vendor-dbal3
 # the harness vendor tree and the generated phpunit config. Same rule as /.dbal-suite: never commit
 # a vendored clone; the tag in the runner is the single source of truth.
 /.laravel-suite
+
+# M2: testkit/orm-suite.sh's work directory — a PINNED git clone of doctrine/orm with its OWN
+# vendor tree (path repositories into this checkout's php/). Same rule: never commit it.
+/.orm-suite
 testkit/laravel/vendor
 
 # Editors / OS

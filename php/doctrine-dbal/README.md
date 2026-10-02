@@ -113,9 +113,8 @@ Behaviour that is DBAL 3's own:
   transaction rollback-only. DBAL 4 always nests with savepoints.
 - **`lastInsertId()` throws when there is no key; it never returns `false`.** DBAL 3's SPI docblock
   allows `false`, but Doctrine ORM 2's `IdentityGenerator` casts it with `(int)`, so `false` would
-  become the primary key `0`. A sequence-name argument is accepted and not used on any family (on
-  PostgreSQL a follow-up `currval()` outside a transaction would run on another pooled connection;
-  inside one it would be correct, and is deferred to the ORM work).
+  become the primary key `0`. A sequence-name argument is used on PostgreSQL inside a transaction
+  (`currval(name)`) and ignored elsewhere, as PDO ignores it.
 - **BEGIN/COMMIT/ROLLBACK failures arrive as the same Doctrine exception classes as on DBAL 4** — a
   `40001` at COMMIT is a `DeadlockException` (`RetryableException`), an unconfirmed COMMIT an
   `IndeterminateWriteException`. DBAL 3's own wrapper never converts these, so the driver does.
@@ -251,8 +250,10 @@ numbers and their triage are in [`docs/dbal-suite/2026-09-09-a5-results.md`](../
 
 ## Known gaps
 
-- **`lastInsertId()` throws on PostgreSQL** by design; use `INSERT … RETURNING id`, and the ORM's
-  SEQUENCE identity strategy on PostgreSQL.
+- **`lastInsertId()` on PostgreSQL answers only inside a transaction** (`lastval()` on the pinned
+  connection — which is where Doctrine ORM inserts, so its default IDENTITY strategy works). Outside
+  one it throws; use `INSERT … RETURNING id`. An INSERT made BEFORE `beginTransaction()` is not
+  visible to a `lastInsertId()` inside it (PDO would answer it).
 - A **cancelled or timed-out `SELECT`** is reported as an indeterminate write unless the connection
   is declared `readonly` (see "Read-only connections").
 - Through Doctrine's **`transactional()`**, an indeterminate COMMIT reaches you as
