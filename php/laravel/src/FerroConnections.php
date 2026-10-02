@@ -26,6 +26,7 @@ final class FerroConnections
         'ferro-pgsql' => FerroPostgresConnection::class,
         'ferro-sqlite' => FerroSQLiteConnection::class,
         'ferro-mysql' => FerroMySqlConnection::class,
+        'ferro-mariadb' => FerroMariaDbConnection::class,
     ];
 
     /**
@@ -148,7 +149,9 @@ final class FerroConnections
         // The driver NAME is the family here (`make()` is called with the resolved `ferro-*`
         // name even under a stock-name alias). One family renders one tag differently — see
         // MySqlValuePolicy for why MySQL's TIMESTAMPTZ must come back naive.
-        $values = $driver === 'ferro-mysql' ? new MySqlValuePolicy() : new RawStringValuePolicy();
+        $values = in_array($driver, ['ferro-mysql', 'ferro-mariadb'], true)
+            ? new MySqlValuePolicy()
+            : new RawStringValuePolicy();
         return $o->socketPath !== null
             ? Ferro::connect($o->socketPath, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $values)
             : Ferro::connectTcp((string) $o->host, $o->port, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $values);

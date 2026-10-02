@@ -32,6 +32,48 @@ final class MySqlConnectionLiveTest extends MySqlLiveTestCase
         return $this->conn ??= $this->mysqlConnection();
     }
 
+    /**
+     * Review F1: on MySQL `getPdo()->lastInsertId()` follows `pdo_mysql` — the statement just run,
+     * `"0"` after a SELECT, an UPDATE or a key-less insert — not the handle-sticky key SQLite's PDO
+     * keeps (which would answer a STALE key here).
+     */
+    public function testThePdoLastInsertIdIsPerStatement(): void
+    {
+        $c = $this->conn();
+        $c->statement('drop table if exists c1f_ai');
+        $c->statement('drop table if exists c1f_plain');
+        $c->statement('create table c1f_ai (id int auto_increment primary key, v varchar(10))');
+        $c->statement('create table c1f_plain (v varchar(10))');
+
+        $c->table('c1f_ai')->insert(['v' => 'a']);
+        self::assertSame('1', $c->getPdo()->lastInsertId());
+        $c->select('select 1');
+        self::assertSame('0', $c->getPdo()->lastInsertId(), 'after a SELECT pdo_mysql answers "0"');
+        $c->table('c1f_ai')->insert(['v' => 'b']);
+        $c->table('c1f_plain')->insert(['v' => 'x']);
+        self::assertSame('0', $c->getPdo()->lastInsertId(), 'after a key-less insert pdo_mysql answers "0"');
+    }
+
+    /**
+     * `DB::pretend()` must log an insert, never execute it — the guard inside insert()'s callback.
+     *
+     * The binding is an INTEGER on purpose: pretend mode logs the query with its bindings
+     * substituted (`substituteBindingsIntoRawSql` → `escape()`), and a STRING binding reaches
+     * `quote()`, which is refused on a MySQL pool until it advertises `literals_are_standard`
+     * (measured here; ledger C1g). An integer is substituted without quoting.
+     */
+    public function testAnInsertUnderPretendIsNotExecuted(): void
+    {
+        $c = $this->conn();
+        $c->statement('drop table if exists c1f_ai');
+        $c->statement('create table c1f_ai (id int auto_increment primary key, n int)');
+        $log = $c->pretend(function () use ($c): void {
+            $c->table('c1f_ai')->insert(['n' => 5]);
+        });
+        self::assertCount(1, $log, 'the insert was logged');
+        self::assertSame(0, $c->table('c1f_ai')->count(), 'and not executed');
+    }
+
     /** `isMaria()` reads the version through the shim, which must pass `-MariaDB` through. */
     public function testIsMariaAgreesWithTheServer(): void
     {

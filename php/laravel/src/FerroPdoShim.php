@@ -311,11 +311,24 @@ final class FerroPdoShim
      * also still answers the rolled-back rowid. Nothing in the engine or the client changed, so the
      * Doctrine tier's stricter "read it immediately" contract is untouched.
      *
-     * The `$sequence` argument is accepted and IGNORED, which is exactly what `pdo_sqlite` does
-     * (it has no sequences). It is not silently ignored on other families: they cannot reach here.
+     * The `$sequence` argument is accepted and IGNORED, which is exactly what `pdo_sqlite` and
+     * `pdo_mysql` do. PostgreSQL never reaches here: `PostgresProcessor` uses `insert … returning`.
      */
     public function lastInsertId(?string $sequence = null): string
     {
+        // **The MySQL family follows `pdo_mysql`, which is PER-STATEMENT** (M2-C1f review F1):
+        // `mysql_insert_id()` answers the statement just executed and "0" after one that generated
+        // no key — measured, after a key-less insert, `INSERT IGNORE`, a `SELECT`, an `UPDATE` and a
+        // rollback. The client's value has exactly that shape (cleared on the way in to every
+        // request), so on this family the handle-sticky key below — `pdo_sqlite`'s semantics —
+        // would answer a STALE key where PDO answers "0". Read from the handshake's pool metadata:
+        // no round trip.
+        $info = $this->guardValue(fn (): ?\Ferro\Protocol\PoolInfo => $this->ferro->poolInfo());
+        if ($info?->kind === 'mysql') {
+            $current = $this->ferro->lastInsertId();
+            return $current === null ? '0' : (string) $current;
+        }
+
         $id = $this->lastInsertId;
         if ($id === null) {
             // `null` here means NO write through this handle has ever generated a key — the handle

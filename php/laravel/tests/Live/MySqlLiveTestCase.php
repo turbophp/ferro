@@ -4,62 +4,85 @@ namespace Ferro\Laravel\Tests\Live;
 
 use Ferro\Client\Connection as FerroClient;
 use Ferro\Laravel\FerroConnections;
+use Ferro\Laravel\FerroMariaDbConnection;
 use Ferro\Laravel\FerroMySqlConnection;
 use Illuminate\Database\Connection as IlluminateConnection;
 
 /**
- * Base for the Eloquent tier's MySQL / MariaDB live tests (M2-C1f).
+ * Base for the Eloquent tier's MySQL-family live tests (M2-C1f).
  *
- * A SECOND pool through {@see extraPoolDsns}, as the SQLite base does, so the shared `default`
- * PostgreSQL pool every other live test uses is untouched. It dials `FERRO_TEST_MYSQL_URL` — the
- * variable CI's `php` lane already provisions for the Doctrine tier — and SKIPS without it, which
- * that lane's `--fail-on-skipped` turns into a failure, so a lane that silently stopped reaching
- * MySQL would go red rather than green.
+ * The base harness already launches a `mysql` pool on `FERRO_TEST_MYSQL_URL` — the variable CI's
+ * `php` lane provisions — and {@see requireMysqlPool} SKIPS without it, which that lane's
+ * `--fail-on-skipped` turns into a failure. This class adds ONE more pool, `mysql_schema`, on the
+ * same server's `laravel_tests` database (testkit/mysql-init.sql), because the schema-builder tests
+ * call `dropAllTables()`, which drops EVERY table in its database and must never be pointed at the
+ * shared `ferro` one.
  */
 abstract class MySqlLiveTestCase extends LaravelLiveTestCase
 {
-    protected const MYSQL_POOL = 'mysql';
+    protected const SCHEMA_POOL = 'mysql_schema';
+    protected const SCHEMA_DATABASE = 'laravel_tests';
 
     /** @return array<string,string> */
     protected function extraPoolDsns(): array
     {
         $url = getenv('FERRO_TEST_MYSQL_URL');
-        if ($url === false || $url === '') {
-            self::markTestSkipped('FERRO_TEST_MYSQL_URL is unset');
+        if (!is_string($url) || $url === '') {
+            return [];
         }
-        return [self::MYSQL_POOL => $url];
+        $schemaUrl = preg_replace('#/[^/?]*(\?|$)#', '/' . self::SCHEMA_DATABASE . '$1', $url, 1);
+        return [self::SCHEMA_POOL => (string) $schemaUrl];
+    }
+
+    /** The database the base `mysql` pool's DSN names — what a `database` label must equal. */
+    protected static function mysqlDatabase(): string
+    {
+        $path = parse_url((string) getenv('FERRO_TEST_MYSQL_URL'), PHP_URL_PATH);
+        return is_string($path) && $path !== '/' ? ltrim($path, '/') : 'ferro';
     }
 
     /**
      * A MySQL-family connection built through Illuminate's OWN resolver map, with the sibling bases'
-     * contact discipline: an unguessable nonce must round-trip, and `@@version_comment` must name
-     * the family (a bare `version()` here is `8.4.11` — it names nothing).
+     * contact discipline: an unguessable nonce must round-trip, and the family's name must appear in
+     * `version()` or `@@version_comment` (a row for `@@version_comment` is itself a MySQL-family
+     * signal: PostgreSQL and SQLite refuse the name).
+     *
+     * @param 'ferro-mysql'|'ferro-mariadb' $driver
      */
-    protected function mysqlConnection(): FerroMySqlConnection
-    {
+    protected function mysqlConnection(
+        ?string $pool = null,
+        ?string $database = null,
+        string $driver = 'ferro-mysql',
+    ): FerroMySqlConnection|FerroMariaDbConnection {
+        $pool ??= $this->requireMysqlPool();
         FerroConnections::register();
 
-        $resolver = IlluminateConnection::getResolver('ferro-mysql');
-        self::assertNotNull($resolver, 'the ferro-mysql resolver is not registered');
+        $resolver = IlluminateConnection::getResolver($driver);
+        self::assertNotNull($resolver, "the {$driver} resolver is not registered");
 
-        $conn = $resolver(null, 'ferro_mysql_label', '', [
-            'driver' => 'ferro-mysql',
+        $conn = $resolver(null, $database ?? self::mysqlDatabase(), '', [
+            'driver' => $driver,
             'ferro_socket' => $this->socketPath,
-            'pool' => self::MYSQL_POOL,
+            'pool' => $pool,
         ]);
 
-        self::assertInstanceOf(FerroMySqlConnection::class, $conn, 'the resolver did not build a Ferro MySQL connection');
+        $want = $driver === 'ferro-mariadb' ? FerroMariaDbConnection::class : FerroMySqlConnection::class;
+        self::assertInstanceOf($want, $conn, "the resolver did not build a {$want}");
         self::assertInstanceOf(FerroClient::class, $conn->getFerroConnection());
 
         $nonce = bin2hex(random_bytes(8));
-        // `@@version_comment` is a syntax error on PostgreSQL and SQLite, so a row at all is the
-        // family signal; the name is in the comment on MySQL (`MySQL Community Server - GPL`) and
-        // only in `version()` on a distro MariaDB (comment `Ubuntu 24.04`, measured) — so both.
         $probe = $conn->select("select '{$nonce}' as nonce, version() as v, @@version_comment as c");
         self::assertCount(1, $probe, 'the contact probe returned no row — nothing was executed');
         self::assertSame($nonce, $probe[0]->nonce, 'the contact probe did not round-trip');
         self::assertMatchesRegularExpression('/mysql|mariadb/i', $probe[0]->v . ' ' . $probe[0]->c);
 
         return $conn;
+    }
+
+    /** A connection on the dedicated `laravel_tests` pool, labelled with that database. */
+    protected function schemaConnection(string $driver = 'ferro-mysql'): FerroMySqlConnection|FerroMariaDbConnection
+    {
+        $this->requireMysqlPool();
+        return $this->mysqlConnection(self::SCHEMA_POOL, self::SCHEMA_DATABASE, $driver);
     }
 }
