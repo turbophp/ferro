@@ -378,16 +378,9 @@ final class StreamingLiveTest extends DbalLiveTestCase
         $c->executeStatement('DROP TABLE s8b_nofetch');
     }
 
-    /**
-     * `Doctrine\DBAL\Connection::connect()` is `protected`, but `getNativeConnection()` hands back
-     * the `Ferro\Client\Connection`, not our driver `Connection` — so reach the driver connection
-     * the way DBAL's own tests do, through the wrapper's protected accessor.
-     */
-    private function driverConnection(\Doctrine\DBAL\Connection $c): \Ferro\DBAL\Connection
+    private function driverConnection(\Doctrine\DBAL\Connection $c): \Ferro\DBAL\AbstractConnection
     {
-        $driver = (new \ReflectionMethod($c, 'connect'))->invoke($c);
-        self::assertInstanceOf(\Ferro\DBAL\Connection::class, $driver);
-        return $driver;
+        return self::driverConnectionOf($c);
     }
 
     /**

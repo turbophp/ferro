@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The DBAL 3 lane (M2-C5): the same package, run against doctrine/dbal 3.x from vendor-dbal3/.
+    COMPOSER=composer.dbal3.json composer install
+    ./vendor-dbal3/bin/phpunit -c phpunit.dbal3.xml
+  The LIVE suite is the shared one (tests/Live): every test drives the driverClass of whichever
+  major is installed (DbalLiveTestCase::driverClass()). tests/Dbal3 holds the unit tests of the
+  DBAL 3-only SPI shells. tests/Unit is NOT here as a whole — most of it constructs the DBAL 4
+  classes, which cannot be declared under DBAL 3 at all — but the files listed below test only the
+  SHARED core, so they run in both lanes. (TemporalFormatTest is not one of them: its fixtures name
+  DBAL 4's platform classes; tests/Dbal3/Dbal3DriverTest holds its DBAL 3 twin.)
+-->
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor-dbal3/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor-dbal3/autoload.php"
+         colors="true"
+         cacheDirectory=".phpunit.cache/dbal3">
+    <testsuites>
+        <testsuite name="ferro-doctrine-dbal-3">
+            <directory>tests/Dbal3</directory>
+            <directory>tests/Live</directory>
+            <file>tests/Unit/ExceptionConverterTest.php</file>
+            <file>tests/Unit/StreamedResultTest.php</file>
+            <file>tests/Unit/DbalValuePolicyTest.php</file>
+            <file>tests/Unit/DriverOptionsTest.php</file>
+        </testsuite>
+    </testsuites>
+</phpunit>

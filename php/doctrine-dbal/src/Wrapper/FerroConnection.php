@@ -4,7 +4,7 @@ namespace Ferro\DBAL\Wrapper;
 
 use Doctrine\DBAL\Connection as DbalConnection;
 use Doctrine\DBAL\TransactionIsolationLevel;
-use Ferro\DBAL\Connection as FerroDriverConnection;
+use Ferro\DBAL\AbstractConnection;
 use Ferro\Protocol\Isolation;
 
 /**
@@ -31,6 +31,10 @@ use Ferro\Protocol\Isolation;
  * the correct PER-TRANSACTION form for the dialect (`BEGIN ISOLATION LEVEL …` on PostgreSQL, the
  * batched `SET TRANSACTION …; START TRANSACTION …` on MySQL). **No SQL is inspected, rewritten or
  * generated here** — charter rule 6 is untouched; the wrapper simply never emits the statement.
+ *
+ * DBAL **4** only. Its DBAL 3 twin is {@see \Ferro\DBAL\Dbal3\FerroConnection}: DBAL 3's
+ * `setTransactionIsolation($level)` takes an int and returns one, so this override cannot even be
+ * declared under DBAL 3 (SPEC §22.2 (by)).
  */
 class FerroConnection extends DbalConnection
 {
@@ -38,8 +42,11 @@ class FerroConnection extends DbalConnection
 
     public function setTransactionIsolation(TransactionIsolationLevel $level): void
     {
-        $inner = $this->connect();
-        if (!$inner instanceof FerroDriverConnection) {
+        // Through the NATIVE connection, not `connect()`'s: with any driver middleware configured
+        // (DoctrineBundle installs one by default) the latter is a middleware's wrapper — see
+        // AbstractConnection::forNativeConnection().
+        $inner = AbstractConnection::forNativeConnection($this->getNativeConnection());
+        if ($inner === null) {
             // Wrapping a non-Ferro driver: behave exactly like stock Doctrine.
             parent::setTransactionIsolation($level);
             return;
@@ -75,26 +82,5 @@ class FerroConnection extends DbalConnection
             TransactionIsolationLevel::REPEATABLE_READ => Isolation::RepeatableRead,
             TransactionIsolationLevel::SERIALIZABLE => Isolation::Serializable,
         };
-    }
-
-    /**
-     * Whether `$sql` is one of the two isolation statements Doctrine's platforms generate.
-     *
-     * A CLOSED, prefix-anchored test on the two fixed strings — not open-ended SQL parsing. It is
-     * anchored so a literal appearing inside an INSERT or a comparison cannot trip it, which
-     * matters: a refusal that fired on ordinary SQL would be far worse than the bug it prevents.
-     */
-    public static function isIsolationStatement(string $sql): bool
-    {
-        $t = ltrim($sql);
-        foreach ([
-            'SET SESSION TRANSACTION ISOLATION LEVEL',
-            'SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL',
-        ] as $prefix) {
-            if (strncasecmp($t, $prefix, strlen($prefix)) === 0) {
-                return true;
-            }
-        }
-        return false;
     }
 }

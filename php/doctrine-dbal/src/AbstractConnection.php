@@ -1,0 +1,574 @@
+<?php // /php/doctrine-dbal/src/AbstractConnection.php
+declare(strict_types=1);
+namespace Ferro\DBAL;
+
+use Doctrine\DBAL\Driver\Result as ResultInterface;
+use Ferro\Client\Connection as FerroConnection;
+use Ferro\Client\Error\FerroException;
+use Ferro\DBAL\Exception\DriverException;
+use Ferro\DBAL\Exception\ServerVersionUnavailable;
+use Ferro\DBAL\Exception\UnsupportedStatement;
+use Ferro\Protocol\Isolation;
+
+/**
+ * The EXECUTION layer, shared by both DBAL majors. Everything above it — Grammar, the platforms, the
+ * schema managers, the migrations runner — stays stock (charter rule 6); this class only decides HOW
+ * a statement reaches the engine.
+ *
+ * **Why it is abstract (M2-C5).** DBAL 3 and DBAL 4 name the same interface,
+ * `Doctrine\DBAL\Driver\Connection`, with signatures that cannot both be implemented by one class:
+ * DBAL 3's `quote($value, $type)` and `lastInsertId($name = null)` against DBAL 4's
+ * `quote(string $value)` and `lastInsertId()`, `bool` returns against `void` ones, and DBAL 3
+ * additionally needs `ServerInfoAwareConnection`, an interface DBAL 4 deleted. PHP checks all of
+ * that when the class is DECLARED, so the wrong-major method signature is a fatal error, not a
+ * branch. Everything with a signature both majors accept lives here; {@see Connection} (DBAL 4) and
+ * {@see \Ferro\DBAL\Dbal3\Connection} add only the methods whose SIGNATURE differs, and each
+ * forwards to a protected helper below — so the behaviour cannot drift between majors without a
+ * diff to this file.
+ *
+ * **Every statement is declared a WRITE for §19.3 fate purposes** unless the whole connection was
+ * configured `driverOptions.readonly`. Neither DBAL SPI carries a read/write signal — `executeQuery()`
+ * with no parameters reaches `query()`, `executeStatement()` with no parameters reaches `exec()`,
+ * and BOTH use the same `prepare()`+`execute()` path when parameters are present, so
+ * `executeQuery('INSERT … RETURNING id')` is indistinguishable from a SELECT — and charter rule 6
+ * forbids inferring one from the SQL text. Declaring "write" costs a lost READ its retryability
+ * (it is reported `Indeterminate` rather than `Retryable`); declaring "read" would cost a lost
+ * WRITE its honesty, which is the failure this project exists to refuse.
+ */
+abstract class AbstractConnection
+{
+    /**
+     * The `wrapperClass` that honours `setTransactionIsolation()` on THIS connection's DBAL major —
+     * named in the isolation refusal's message, so the one-line fix it gives is the right one.
+     *
+     * @return class-string
+     */
+    abstract protected function isolationWrapperClass(): string;
+
+    /**
+     * **The pool NAME is here from Task 5 on, not added later.** Nothing in this task reads it, but
+     * Task 6's `ServerVersionUnavailable` message must name the pool (a driver may serve several)
+     * and Tasks 7-13 all construct this class. Threading a parameter through afterwards would mean
+     * editing every call site those tasks wrote — and a 4-argument call against a 3-argument
+     * constructor does not fail where you would expect: PHP binds the first three and DISCARDS the
+     * fourth, so under `strict_types` it surfaces as a `TypeError` naming the WRONG parameter
+     * (hazard 81).
+     */
+    public function __construct(
+        private readonly FerroConnection $ferro,
+        private readonly string $poolName,
+        private readonly string $poolKind,
+        private readonly bool $readonly,
+    ) {
+        self::registry()[$ferro] = \WeakReference::create($this);
+    }
+
+    /**
+     * Ferro client → the driver connection built on it, held WEAKLY on both sides: a `WeakMap` key
+     * vanishes with its client, and the value is itself a `WeakReference`, because a strong value
+     * would hold this connection — and through it the client, the key — alive forever.
+     *
+     * @var \WeakMap<FerroConnection, \WeakReference<AbstractConnection>>|null
+     */
+    private static ?\WeakMap $byClient = null;
+
+    /** @return \WeakMap<FerroConnection, \WeakReference<AbstractConnection>> */
+    private static function registry(): \WeakMap
+    {
+        return self::$byClient ??= new \WeakMap();
+    }
+
+    /**
+     * The Ferro driver connection behind a wrapper's `getNativeConnection()`, or null when it is not
+     * a Ferro one.
+     *
+     * This is how the isolation `wrapperClass`es find the driver connection, and it is deliberately
+     * NOT the wrapper's own driver-connection handle: that is the OUTERMOST connection, which is a
+     * middleware's wrapper as soon as any driver middleware is configured — and DoctrineBundle
+     * configures one on every connection by default (`IdleConnectionMiddleware`, plus logging and
+     * profiling under `kernel.debug`). An `instanceof` test on it therefore failed in a stock Symfony
+     * app, fell back to DBAL's own `SET SESSION`, and was refused with a message telling the user to
+     * configure the wrapper they had already configured (M2-C5 review F8; pre-existing since M1-S8b
+     * on DBAL 4). Every middleware base class forwards `getNativeConnection()` to the connection it
+     * wraps, so the native client is what survives the stack.
+     */
+    public static function forNativeConnection(mixed $native): ?self
+    {
+        if (!$native instanceof FerroConnection) {
+            return null;
+        }
+        $map = self::registry();
+        return isset($map[$native]) ? $map[$native]->get() : null;
+    }
+
+    /**
+     * The resolved backend version, cached for the life of THIS connection — see
+     * {@see getServerVersion} for why it is an instance field and not a static.
+     */
+    private ?string $serverVersion = null;
+
+    /**
+     * A WEAK reference, and that is the entire abandonment design.
+     *
+     * A STRONG reference here would be the only thing keeping an abandoned stream alive:
+     * `Doctrine\DBAL\Connection::iterateAssociative()` returns
+     * `$this->executeQuery(…)->iterateAssociative()`, so the only other reference to the
+     * `Doctrine\DBAL\Result` — and through it to this driver `Result` — is the returned Generator's
+     * bound `$this`. `Doctrine\DBAL\Result` has no `__destruct` and DBAL never calls the driver's
+     * `free()` (hazard 80). So with a strong reference the driver can NEVER tell "the caller
+     * abandoned this" from "the caller may still fetch from this", and both end up draining the
+     * whole remainder on the next statement.
+     *
+     * Weakly: when the consumer stops iterating, the Generator dies, the DBAL `Result` dies, the
+     * driver `Result` becomes unreferenced, PHP frees it by refcount THERE AND THEN, and its
+     * `__destruct` sends the `CANCEL`. `get()` then returns null and {@see settleOpenStream} has
+     * nothing to do. When the consumer is still iterating, `get()` returns the live result and it
+     * materialises.
+     *
+     * **MEASURED LIMIT (PHP 8.4.18 + doctrine/dbal 4.4.4).** That is true when the generator is a
+     * TEMPORARY — `foreach ($conn->iterateAssociative($sql) as $row) { … break; }`, the canonical
+     * idiom — and NOT when it was bound first (`$it = $conn->iterateAssociative($sql); foreach ($it
+     * …) { break; }`), where `$it` keeps the result alive until it leaves scope or is `unset()`. A
+     * live reference is indistinguishable from a caller who may still fetch, so that shape
+     * materialises the remainder instead. It is a PHP refcount fact rather than a design choice;
+     * `StreamingLiveTest` pins BOTH shapes so nobody reads this as "abandonment always cancels".
+     *
+     * @var ?\WeakReference<Result> PHPStan level 9 will not infer the generic parameter.
+     */
+    private ?\WeakReference $openStream = null;
+
+    /** @see settledRowCount */
+    private int $settledRows = 0;
+
+    /**
+     * How many rows this connection has had to drain because a streamed result was still open when
+     * another statement was issued.
+     *
+     * **0 for pure iteration and 0 for a properly abandoned iteration**; non-zero only for the
+     * interleave idiom, where it is the size of the remainder that had to be buffered. It is what
+     * makes the two abandonment cases observable from a test — and it answers a real operator
+     * question, which is why it is a public accessor rather than test scaffolding.
+     */
+    public function settledRowCount(): int
+    {
+        return $this->settledRows;
+    }
+
+    /**
+     * Bring any open streamed `Result` into memory before this connection issues anything else.
+     *
+     * The Ferro session is strictly single-in-flight: `Session::assertNoOpenStream()` throws on any
+     * request while a stream is open. Rather than surface that as a `ProtocolException` — which
+     * would break `foreach ($conn->iterateAssociative(…)) { $conn->executeStatement(…); }`, an idiom
+     * every Doctrine codebase uses — the open result drains its remainder here. Pure iteration
+     * still never buffers; interleaving degrades to what PDO does unconditionally.
+     *
+     * A result whose caller is GONE is not drained: it has already cancelled itself on destruction.
+     */
+    private function settleOpenStream(): void
+    {
+        $ref = $this->openStream;
+        $this->openStream = null;
+        $open = $ref?->get();
+        if ($open instanceof Result) {
+            $this->settledRows += $open->materialize();
+        }
+    }
+
+    private ?Isolation $pendingIsolation = null;
+
+    /**
+     * The isolation level the NEXT {@see beginTransaction} will carry, set by
+     * {@see \Ferro\DBAL\Wrapper\FerroConnection::setTransactionIsolation}. Null means the pool
+     * default.
+     *
+     * It is sticky, matching Doctrine's own semantics: `setTransactionIsolation()` applies to every
+     * subsequent transaction, not just the next one.
+     */
+    public function setIsolation(?Isolation $isolation): void
+    {
+        $this->pendingIsolation = $isolation;
+    }
+
+    /**
+     * The refusal, raised from every statement entry point.
+     *
+     * Refused, not ignored and not rewritten. Left alone this statement SUCCEEDS and does nothing:
+     * it lands on an arbitrary pooled connection, taints it, and hygiene wipes the level before the
+     * next BEGIN — so the application asks for SERIALIZABLE and silently gets the pool default
+     * (SPEC §22.2 (s), which also records that the obvious "did the next tenant inherit it" test
+     * cannot fail, because hygiene masks it either way). The message names the one-line
+     * configuration fix.
+     *
+     * It sits in a helper called from THREE places rather than inline in two, because
+     * {@see query}'s PostgreSQL branch reaches the wire through `streamRaw()` and never touches
+     * {@see runPrepared} — so a guard on `exec()`/`runPrepared()` alone leaves
+     * `executeQuery('SET SESSION CHARACTERISTICS AS …')` unrefused on exactly one of the two
+     * families. Measured, not assumed: `IsolationLiveTest`'s
+     * `testTheRefusalAlsoCoversTheZeroParameterQueryPath` is RED against the two-site form.
+     */
+    private function refuseIsolationStatement(string $sql): void
+    {
+        if (IsolationStatement::matches($sql)) {
+            throw UnsupportedStatement::isolation($sql, $this->isolationWrapperClass());
+        }
+    }
+
+    /** The underlying Ferro client connection — also what {@see getNativeConnection} returns. */
+    public function ferro(): FerroConnection
+    {
+        return $this->ferro;
+    }
+
+    /** The `driverOptions.pool` this connection was opened against. */
+    public function poolName(): string
+    {
+        return $this->poolName;
+    }
+
+    /** `postgres` or `mysql`, from `HELLO_ACK`. Never nil. */
+    public function poolKind(): string
+    {
+        return $this->poolKind;
+    }
+
+    /**
+     * The ZERO-PARAMETER path — since M1-S9 B1b one of TWO places this driver streams on
+     * PostgreSQL ({@see runPrepared} is the other; `exec()` alone stays buffered, see its doc).
+     *
+     * The paragraph that used to sit here — "the prepared path does not stream because a streamed
+     * terminal carries no `affected`" — was MEASURED FALSE (§22.2 (ag)): the wire always carried
+     * the command-tag count; the client dropped it until B1a. With `RawStream::affected()` real,
+     * `Result::rowCount()` drains-then-answers (§22.2 (ah)) and the prepared path streams too.
+     *
+     * **Every family streams as of B2c.** MySQL/MariaDB used to buffer here because
+     * `PoolBackend::supports_row_streaming()` was false for them (SPEC §22.2 (n), controller
+     * decision D-S8b-2) and `streamRaw()` would have come back a clean `Unsupported`. The engine
+     * now streams both families, so the pool-kind gate is gone and this path no longer varies by
+     * backend.
+     *
+     * **The consequence, stated rather than assumed:** this now assumes EVERY Ferro backend can
+     * stream. Both shipped backends do. A future backend that cannot (a SQLite one, ledger C3)
+     * would make `streamRaw()` fail here instead of falling back — closing that needs either
+     * streaming in that backend or the streaming capability advertised on `HELLO_ACK`, since the
+     * client is told the pool's `kind`, never its capabilities.
+     *
+     * The returned result is the CALLER's alone; this connection keeps only a `\WeakReference`
+     * ({@see $openStream}). A caller that discards it — `$conn->query($sql);` in statement position —
+     * destroys it at the end of that statement and the stream is cancelled there, which is correct
+     * and is what the buffered path already does with its rows.
+     */
+    public function query(string $sql): ResultInterface
+    {
+        $this->settleOpenStream();
+        $this->refuseIsolationStatement($sql);
+        try {
+            $stream = $this->ferro->streamRaw($sql, [], $this->readonly);
+        } catch (FerroException $e) {
+            throw DriverException::fromFerro($e);
+        }
+        $result = Result::streamed($stream);
+        // WEAK on purpose — see the field's docblock. The caller's own reference (via
+        // `Doctrine\DBAL\Result`) is the one that decides whether this result is still alive.
+        $this->openStream = \WeakReference::create($result);
+        return $result;
+    }
+
+    /**
+     * The parameterless statement path — and, measured rather than assumed, **the one Doctrine's
+     * savepoints actually take**: `Doctrine\DBAL\Connection::executeStatement()` calls the driver's
+     * `exec()` whenever `count($params) === 0`, and `createSavepoint()`/`rollbackSavepoint()` pass
+     * no parameters. So the invariant documented on {@see runPrepared} is load-bearing HERE first.
+     */
+    public function exec(string $sql): int
+    {
+        $this->settleOpenStream();
+        $this->refuseIsolationStatement($sql);
+        // Deliberately NOT streamed even on PG (M1-S9 B1b streams query()+runPrepared): this
+        // method's CONTRACT is the affected count, so a stream would be opened and drained inside
+        // one call — the same wire cost as fetch:none with more moving parts, on the path
+        // Doctrine's own savepoints ride.
+        try {
+            return $this->ferro->fetchRaw($sql, [], $this->readonly, false)['affected'];
+        } catch (FerroException $e) {
+            throw DriverException::fromFerro($e);
+        }
+    }
+
+    /**
+     * The ONE place a statement WITH PARAMETERS reaches the engine (`Statement::execute()` and
+     * {@see query} both land here; {@see exec} is the parameterless twin). Both call
+     * `Ferro\Client\Connection::fetchRaw()`, which is what keeps the fate declaration and the
+     * pinned-transaction routing in a single place.
+     *
+     * **THE INVARIANT: while a transaction is open, this rides its pinned `tx_id`.** It does so
+     * because `Ferro\Client\Connection::dispatch()` — which `fetchRaw()` shares with every other
+     * statement method — forks on its own open transaction handle. That is not an optimisation
+     * detail: Doctrine nests transactions CLIENT-SIDE, so a nested `beginTransaction()` is an
+     * ordinary `executeStatement($platform->createSavePoint($name))` arriving right here — at
+     * {@see exec}, since it carries no parameters. A statement that did not carry the `tx_id` would
+     * be checked out onto a DIFFERENT backend connection, and Doctrine would hold a rollback point
+     * that exists in no session.
+     *
+     * Two guards at two vantage points, so neither can rot into decoration:
+     * `TransactionLiveTest::testDbalNestedTransactionsUseSavepointsOnThePinnedTransaction` drives
+     * Doctrine's REAL nesting API against both live backends and proves the CONSEQUENCE (the inner
+     * rollback undoes only the inner write); `TransactionRoutingTest` proves the MECHANISM by
+     * reading the `tx_id` back off the ENCODED `ExecRequest` that carried the stock platform's own
+     * `SAVEPOINT …` text.
+     *
+     * @param list<mixed> $params
+     */
+    public function runPrepared(string $sql, array $params): ResultInterface
+    {
+        $this->settleOpenStream();
+        $this->refuseIsolationStatement($sql);
+        // M1-S9 B1b: the prepared path STREAMS — on EVERY family since B2c, exactly as {@see query}
+        // does (the MySQL fallback D-S8b-2 required is gone now that the engine streams there). The
+        // blocker (ac) recorded was measured false in (ag), and Result::rowCount() now
+        // drains-then-answers (§22.2 (ah)), so `executeStatement()`'s
+        // `$stmt->execute()->rowCount()` gets the REAL command-tag count: a parameterized WRITE
+        // produces no DATA frames, so its "drain" is just reading the terminal that was arriving
+        // anyway. The tx_id routing invariant above is untouched — `streamRaw()` rides the open
+        // transaction's session and tx_id exactly as `fetchRaw()` does (its own doc: "either half
+        // missing is a silent wrong answer"), and TransactionRoutingTest reads the tx_id off the
+        // encoded request either way.
+        try {
+            $stream = $this->ferro->streamRaw($sql, $params, $this->readonly);
+        } catch (FerroException $e) {
+            throw DriverException::fromFerro($e);
+        }
+        $result = Result::streamed($stream);
+        $this->openStream = \WeakReference::create($result);
+        return $result;
+    }
+
+    /**
+     * D5: present for compatibility, discouraged — parameters are the supported path.
+     *
+     * **It is per-FAMILY, and that is not cosmetic.** `AbstractPlatform::quoteStringLiteral()`
+     * doubles the single quote, but `AbstractMySQLPlatform` overrides it to escape BACKSLASHES
+     * first, because MySQL treats `\` as an escape character inside a string literal. Emitting the
+     * PostgreSQL form on a MySQL connection would mangle every value containing a backslash. The
+     * family is always known (`PoolInfo.kind` is never nil), so this needs no platform and
+     * therefore no server version — which matters, because `quote()` must keep working on a pool
+     * whose version is unknown. `DriverQuoteTest` locks both branches against the stock platform
+     * accessors, so a DBAL change to either goes red here.
+     *
+     * **SQLite takes the non-MySQL branch, and that is a decision rather than a fallthrough.**
+     * `SQLitePlatform` does not override `quoteStringLiteral()`, so doubling the single quote is
+     * exactly what the stock platform does; SQLite has no backslash-escape mode to detect (unlike
+     * MySQL's `NO_BACKSLASH_ESCAPES`, which is why `literals_are_standard` exists on the wire at
+     * all — C2g, §22.2 (at)). The same `DriverQuoteTest` lock covers this branch.
+     *
+     * Each major's public `quote()` forwards here; only their SIGNATURES differ (DBAL 3's takes a
+     * `$type` it never needed, since a string literal is a string literal).
+     */
+    protected function quoteString(string $value): string
+    {
+        if ($this->poolKind === PlatformVersion::KIND_MYSQL) {
+            $value = str_replace('\\', '\\\\', $value);
+        }
+        return "'" . str_replace("'", "''", $value) . "'";
+    }
+
+    /**
+     * The generated key of the MOST RECENT statement — never a stale one — or null when there is
+     * none. Each major's public `lastInsertId()` turns null into ITS SPI's "no identity value" signal
+     * with {@see noKeyMessage}'s text.
+     *
+     * DBAL 4's SPI is `lastInsertId(): int|string` with **no sequence-name argument** (that overload
+     * was removed in 4.0, which is why SPEC §14's "sequence-name argument supported for PG" is
+     * unimplementable), and it must THROW when there is no identity value rather than return a
+     * falsy placeholder — a caller cannot tell `0`/`''` from a key.
+     *
+     * On **PostgreSQL it always throws**: the wire carries no such field, and the client refuses to
+     * emulate it with a follow-up `lastval()` because on a transaction-mode pool that lands on a
+     * DIFFERENT connection and returns a silently wrong key. The message names both working answers
+     * (`INSERT … RETURNING`, or the ORM's SEQUENCE identity strategy — D-S8b-5).
+     *
+     * The thrown class is `Doctrine\DBAL\Driver\Exception\NoIdentityValue` — the SPI's own signal,
+     * which all six bundled drivers (PDO, PgSQL, Mysqli, SQLite3, SQLSrv, IBMDB2) throw here. S8b
+     * originally shipped a Ferro-owned class instead, and the upstream acceptance run measured the
+     * cost: `tests/Functional/WriteTest::testLastInsertIdNewConnection` asserts on the class of
+     * `getPrevious()`. Nothing in DBAL's `src/` CATCHES it, so the application-visible behaviour is
+     * identical either way — but there is no reason to invent a second class for a signal the SPI
+     * already defines, and the message (the part that is actually ours) is preserved verbatim.
+     *
+     * It is read from the CONNECTION, not from a `Result`, and it survives a statement run inside a
+     * transaction because `Ferro\Client\Connection::dispatch()` propagates the tx path's
+     * `last_insert_id` up to the connection (M1-S8a) — which is where nearly every real INSERT
+     * happens. `LastInsertIdLiveTest` pins all three: the MySQL key, the PG throw with its message,
+     * and the in-transaction read.
+     */
+    protected function generatedKey(): int|string|null
+    {
+        return $this->ferro->lastInsertId();
+    }
+
+    /** Why {@see generatedKey} answered null, per family — the text both majors throw with. */
+    protected function noKeyMessage(): string
+    {
+        return match ($this->poolKind) {
+            PlatformVersion::KIND_POSTGRES =>
+                'Ferro: PostgreSQL reports no generated key on the wire, and Ferro will not '
+                . 'emulate lastInsertId() with a follow-up query — on a transaction-mode pool '
+                . 'that runs on a different connection and returns a wrong key. Use '
+                . '`INSERT … RETURNING id`, or configure Doctrine ORM to use the SEQUENCE '
+                . 'identity strategy on PostgreSQL.',
+            // SQLite DOES report a key (`last_insert_rowid()`), so this arm is the genuine
+            // "nothing was generated" case rather than PostgreSQL's structural absence — but
+            // the counter is STICKY, so the engine reports it only when the statement actually
+            // MOVED it (SPEC §22.2 (bf)). A rowid an earlier INSERT set would be a silently
+            // wrong key, which §22.2 (m) already records as strictly worse than none.
+            PlatformVersion::KIND_SQLITE =>
+                'Ferro: the last statement generated no rowid. SQLite\'s last_insert_rowid() is '
+                . 'sticky — it still holds the PREVIOUS insert\'s value after any other '
+                . 'statement — so Ferro reports it only when the statement moved it, and never '
+                . 'carries a stale one over. Read it immediately after a successful INSERT, and '
+                . 'note that an INSERT which explicitly reuses the current rowid reports '
+                . 'nothing.',
+            default =>
+                'Ferro: the last statement reported no generated key. lastInsertId() reflects the '
+                . 'MOST RECENT statement and is cleared by a statement that fails, so read it '
+                . 'immediately after a successful INSERT into an AUTO_INCREMENT column.',
+        };
+    }
+
+    /**
+     * True from a COMMIT that FAILED and left the client with no open transaction until the next
+     * BEGIN or ROLLBACK — the one state in which a rollback has nothing to roll back.
+     */
+    private bool $commitEndedTheTransaction = false;
+
+    protected function doBegin(): void
+    {
+        $this->settleOpenStream();
+        $this->commitEndedTheTransaction = false;
+        try {
+            $this->ferro->begin($this->readonly, $this->pendingIsolation);
+        } catch (FerroException $e) {
+            throw DriverException::fromFerro($e);
+        }
+    }
+
+    protected function doCommit(): void
+    {
+        $this->settleOpenStream();
+        try {
+            $this->ferro->commit();
+        } catch (FerroException $e) {
+            // A COMMIT that failed has still ENDED the transaction — committed, rolled back, or
+            // unknown, which is what the exception being thrown reports — so record that a
+            // rollback now has nothing to do. See doRollBack().
+            $this->commitEndedTheTransaction = !$this->ferro->inTransaction();
+            throw DriverException::fromFerro($e);
+        }
+    }
+
+    /**
+     * **A rollback after a COMMIT that failed and ended the transaction is a NO-OP**, rather than
+     * the client's "rollBack() with no open transaction" error (M2-C5 review). The COMMIT's own
+     * exception already reports the transaction's fate; the rollback has nothing to undo; and the
+     * error would REPLACE that exception in the commonest caller of all — framework code that rolls
+     * back from a `catch` around the commit. Doctrine DBAL before 3.9.4 does exactly that inside
+     * `transactional()` (`catch (Throwable $e) { $this->rollBack(); throw $e; }`), so a PostgreSQL
+     * `40001` at COMMIT reached the application as a rollback error, its fate and retryability
+     * lost — measured on 3.8.0, and identical with `pdo_pgsql`, whose `rollBack()` also throws
+     * there. Any OTHER rollback with no open transaction still throws: it is a caller bug, not this
+     * case, and `testARollbackWithNoTransactionStillThrows` pins that control.
+     */
+    protected function doRollBack(): void
+    {
+        $this->settleOpenStream();
+        if ($this->commitEndedTheTransaction && !$this->ferro->inTransaction()) {
+            $this->commitEndedTheTransaction = false;
+            return;
+        }
+        $this->commitEndedTheTransaction = false;
+        try {
+            $this->ferro->rollBack();
+        } catch (FerroException $e) {
+            throw DriverException::fromFerro($e);
+        }
+    }
+
+    /**
+     * The backend's own `version()` string, VERBATIM — normalisation is {@see PlatformVersion}'s
+     * job, and it is asymmetric (mandatory on PostgreSQL, forbidden on the MySQL family, where the
+     * `-MariaDB` suffix is the ONLY thing separating two different SQL dialects).
+     *
+     * **The SPEC §14 nil-version decision, implemented: DEFER, resolve ONCE, then FAIL LOUDLY.**
+     * The return type is a non-nullable `string`, so "unknown" cannot be represented — the only
+     * honest options are to resolve it or to throw. `HELLO_ACK` carries `server_version` as
+     * `str | nil`, and `nil` is a NORMAL recurring value on a healthy system (a TTL expiry racing a
+     * re-probe, a probe failure inside its 5 s backoff, a backend that is down at connect), so it
+     * must never be treated as an error state by itself — failing at connect would turn a routine
+     * few-second window into an outage for every worker reconnecting during it (§19.1 boot_epoch
+     * storms make that concrete).
+     *
+     * Deferral is free: nothing here runs at connect. Doctrine resolves the platform lazily on
+     * first demand ({@see \Doctrine\DBAL\Connection::getDatabasePlatform}), which is typically well
+     * after connect — by which time the engine's detached probe has usually landed a value.
+     *
+     * When it has not, resolution is ONE `SELECT version()` through the ordinary SQL path. That is
+     * the same statement `ferrod`'s own probe issues (`ferrod/src/pools.rs`'s `VERSION_SQL`); it is
+     * a leading `SELECT`, so the assist lexer's safe-list leaves the connection unpinned and
+     * untainted; and it is the ONLY mechanism that can produce a NEW answer — re-reading
+     * `poolInfo()` cannot, because that is a snapshot taken once during this session's handshake.
+     * It is declared `readonly = true` because it is the DRIVER'S OWN statement: the
+     * connection-wide "declare write for everything" rule exists because the DBAL SPI hides the
+     * CALLER's intent, and here there is no caller to hide.
+     *
+     * The result is cached PER CONNECTION for the life of that connection: one round trip, ever.
+     * Per connection and not per process — two pools in one worker are two different backends, and
+     * a shared cache would hand one pool's version to the other, i.e. possibly MySQL's dialect to
+     * PostgreSQL.
+     *
+     * Note for the streaming task: this reaches the wire, so it must not be attempted while a
+     * streamed result is open (the session is strictly single-in-flight). In practice it cannot be:
+     * DBAL resolves the platform through this method before any statement runs, and the value is
+     * cached from then on.
+     *
+     * @throws ServerVersionUnavailable when the version is neither advertised nor resolvable. Never
+     *   a default platform: a wrong platform is a wrong SQL dialect for every statement that follows.
+     */
+    public function getServerVersion(): string
+    {
+        if ($this->serverVersion !== null) {
+            return $this->serverVersion;
+        }
+
+        $advertised = $this->ferro->poolInfo()?->serverVersion;
+        if ($advertised !== null && $advertised !== '') {
+            return $this->serverVersion = $advertised;
+        }
+
+        // The resolution below reaches the WIRE, so an open streamed result has to be settled
+        // first — the session is single-in-flight. In practice DBAL resolves the platform before
+        // any statement runs and the answer is cached from then on, but "in practice" is not an
+        // invariant and this method is public.
+        $this->settleOpenStream();
+        try {
+            $raw = $this->ferro->fetchRaw('SELECT version()', [], true);
+        } catch (FerroException $e) {
+            throw ServerVersionUnavailable::forPool($this->poolName, $this->poolKind, $e);
+        }
+
+        $v = $raw['rows'][0][0] ?? null;
+        if (!is_string($v) || $v === '') {
+            throw ServerVersionUnavailable::forPool($this->poolName, $this->poolKind, null);
+        }
+        return $this->serverVersion = $v;
+    }
+
+    /**
+     * SPEC §14's documented break: this is a `Ferro\Client\Connection`, not a `PDO`. Anything doing
+     * `pg_escape_string($native, …)` or `$native->real_escape_string()` will fatal — that is the
+     * incompatibility, and it is listed in `docs/known-incompatibilities.md`.
+     */
+    public function getNativeConnection(): FerroConnection
+    {
+        return $this->ferro;
+    }
+}

@@ -1,4 +1,10 @@
+# The DBAL 4 lane (vendor/). The DBAL 3 lane is phpstan.dbal3.neon over vendor-dbal3/ — the shared
+# core is analysed by BOTH, each against its own major's Doctrine types (M2-C5).
 parameters:
     level: 9
     paths:
         - src
+    excludePaths:
+        # DBAL 3-only: names interfaces DBAL 4 deleted (VersionAwarePlatformDriver,
+        # ServerInfoAwareConnection) and DBAL 3's int ParameterType / TransactionIsolationLevel.
+        - src/Dbal3

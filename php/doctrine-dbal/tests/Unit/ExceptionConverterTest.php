@@ -280,4 +280,22 @@ final class ExceptionConverterTest extends TestCase
         }
         return $out;
     }
+
+    /**
+     * An ALREADY-converted exception comes back unchanged (M2-C5). It can arrive here: both majors'
+     * `Doctrine\DBAL\Exception\DriverException` implements `Driver\Exception`, the DBAL 3 connection
+     * converts its own BEGIN/COMMIT/ROLLBACK failures, and DBAL's `transactional()` hands that
+     * exception back to the converter to decide whether to roll back. Re-converting would lose the
+     * class — an `IndeterminateWriteException` carries no Ferro branch of its own.
+     */
+    public function testAnAlreadyConvertedExceptionIsReturnedUnchanged(): void
+    {
+        $c = new ExceptionConverter(PlatformVersion::KIND_POSTGRES);
+        $once = $c->convert($this->ferro('08006', null, C::BRANCH_INDETERMINATE), null);
+        self::assertInstanceOf(IndeterminateWriteException::class, $once);
+        self::assertSame($once, $c->convert($once, null));
+
+        $deadlock = $c->convert($this->ferro('40001', null, C::BRANCH_RETRYABLE), null);
+        self::assertSame($deadlock, $c->convert($deadlock, null));
+    }
 }

@@ -39,7 +39,7 @@ final class PlatformVersionTest extends TestCase
     {
         self::assertInstanceOf(
             PostgreSQL120Platform::class,
-            PlatformVersion::platformFor(PlatformVersion::KIND_POSTGRES, self::PG_LIVE),
+            \Ferro\DBAL\Driver::platformFor(PlatformVersion::KIND_POSTGRES, self::PG_LIVE),
         );
     }
 
@@ -47,9 +47,9 @@ final class PlatformVersionTest extends TestCase
     {
         self::assertInstanceOf(
             MySQL84Platform::class,
-            PlatformVersion::platformFor(PlatformVersion::KIND_MYSQL, self::MYSQL_LIVE),
+            \Ferro\DBAL\Driver::platformFor(PlatformVersion::KIND_MYSQL, self::MYSQL_LIVE),
         );
-        $maria = PlatformVersion::platformFor(PlatformVersion::KIND_MYSQL, self::MARIADB_LIVE);
+        $maria = \Ferro\DBAL\Driver::platformFor(PlatformVersion::KIND_MYSQL, self::MARIADB_LIVE);
         self::assertInstanceOf(MariaDB110700Platform::class, $maria);
         self::assertNotInstanceOf(
             MySQL84Platform::class,
@@ -86,11 +86,11 @@ final class PlatformVersionTest extends TestCase
     {
         self::assertInstanceOf(
             SQLitePlatform::class,
-            PlatformVersion::platformFor(PlatformVersion::KIND_SQLITE, self::SQLITE_LIVE),
+            \Ferro\DBAL\Driver::platformFor(PlatformVersion::KIND_SQLITE, self::SQLITE_LIVE),
         );
         self::assertInstanceOf(
             SQLitePlatform::class,
-            PlatformVersion::platformFor(PlatformVersion::KIND_SQLITE, 'anything at all'),
+            \Ferro\DBAL\Driver::platformFor(PlatformVersion::KIND_SQLITE, 'anything at all'),
             'the SQLite platform is version-independent; a version ladder here would be invented',
         );
     }
@@ -105,7 +105,7 @@ final class PlatformVersionTest extends TestCase
     public function testAnUnknownFamilyThrows(): void
     {
         $this->expectException(BackendFamilyUnknown::class);
-        PlatformVersion::platformFor('mssql', '16.0');
+        \Ferro\DBAL\Driver::platformFor('mssql', '16.0');
     }
 
     /**
@@ -129,5 +129,22 @@ final class PlatformVersionTest extends TestCase
         // recognised and the caller fails loudly — the practical rule being "do not set
         // serverVersion on a MySQL or SQLite pool".
         self::assertNull(PlatformVersion::familyFromVersion(self::SQLITE_LIVE));
+    }
+
+    /**
+     * The handshake's FAMILY wins over the version string (M2-C5 review: only a MySQL-gated live test
+     * killed a mutation ignoring it). A bare `8.4.11` names no family, so without the handshake this
+     * throws `BackendFamilyUnknown` — which is exactly what the mutation produces.
+     */
+    public function testTheHandshakeFamilyDecidesWhenTheDriverHasConnected(): void
+    {
+        $driver = new \Ferro\DBAL\Driver();
+        (new \ReflectionProperty(\Ferro\DBAL\AbstractDriver::class, 'kind'))->setValue($driver, PlatformVersion::KIND_MYSQL);
+        self::assertInstanceOf(
+            MySQL84Platform::class,
+            $driver->getDatabasePlatform(new \Ferro\DBAL\FixedVersion(self::MYSQL_LIVE)),
+        );
+        (new \ReflectionProperty(\Ferro\DBAL\AbstractDriver::class, 'kind'))->setValue($driver, PlatformVersion::KIND_SQLITE);
+        self::assertInstanceOf(SQLitePlatform::class, $driver->getDatabasePlatform(new \Ferro\DBAL\FixedVersion(self::SQLITE_LIVE)));
     }
 }

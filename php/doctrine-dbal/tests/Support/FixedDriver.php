@@ -37,7 +37,7 @@ final class FixedDriver implements DriverInterface
 
     public function getDatabasePlatform(ServerVersionProvider $versionProvider): AbstractPlatform
     {
-        return PlatformVersion::platformFor($this->kind, $versionProvider->getServerVersion());
+        return \Ferro\DBAL\Driver::platformFor($this->kind, $versionProvider->getServerVersion());
     }
 
     public function getExceptionConverter(): ExceptionConverterInterface

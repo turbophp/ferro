@@ -1,6 +1,6 @@
 {
     "name": "ferro/doctrine-dbal-driver",
-    "description": "Ferro driver for Doctrine DBAL 4 and 3.8+ — config-only adoption of the Ferro engine",
+    "description": "The DBAL 3 LANE of ferro/doctrine-dbal-driver: the same package, resolved against doctrine/dbal 3.x into its own vendor tree (vendor-dbal3/). Install with COMPOSER=composer.dbal3.json.",
     "type": "library",
     "license": "Apache-2.0",
     "repositories": [
@@ -8,11 +8,11 @@
     ],
     "require": {
         "php": ">=8.2",
-        "doctrine/dbal": "^3.8 || ^4.0",
+        "doctrine/dbal": "^3.8",
         "ferro/client": "@dev"
     },
     "require-dev": {
-        "phpstan/phpstan": "^2.0",
+        "phpstan/phpstan": "2.2.8",
         "phpunit/phpunit": "^11.0"
     },
     "autoload": { "psr-4": { "Ferro\\DBAL\\": "src/" } },
@@ -22,6 +22,5 @@
             "Ferro\\Tests\\": "../client/tests/"
         }
     },
-    "scripts": { "test": "phpunit", "stan": "phpstan analyse src --level 9" },
-    "config": { "sort-packages": true }
+    "config": { "sort-packages": true, "vendor-dir": "vendor-dbal3" }
 }

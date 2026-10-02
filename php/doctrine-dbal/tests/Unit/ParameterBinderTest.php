@@ -207,4 +207,14 @@ final class ParameterBinderTest extends TestCase
         };
         self::assertSame('1.2500', ParameterBinder::toCanonical($v, ParameterType::STRING));
     }
+
+    /**
+     * `ParameterType::NULL` binds NULL whatever value it carries (M2-C5 review: no test pinned the
+     * arm, so a mutation passing the value through survived). PDO's `PARAM_NULL` does the same.
+     */
+    public function testTheNullTypeBindsNullWhateverItCarries(): void
+    {
+        self::assertNull(ParameterBinder::toCanonical(5, ParameterType::NULL));
+        self::assertNull(ParameterBinder::toCanonical('x', ParameterType::NULL));
+    }
 }

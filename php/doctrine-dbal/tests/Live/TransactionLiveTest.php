@@ -22,11 +22,19 @@ final class TransactionLiveTest extends DbalLiveTestCase
     {
         foreach ($this->families() as $kind => $pool) {
             $c = $this->dbal($pool);
-            // NO `setNestTransactionsWithSavepoints(true)` — READ from dbal 4.4.4's source, not
-            // assumed: in DBAL 4 savepoint nesting is UNCONDITIONAL (`beginTransaction()` calls
-            // `createSavepoint()` for every level > 1), the setter is `@deprecated … removed in 5.0`
-            // and THROWS when passed false. Calling it would configure nothing and would make this
-            // guard fail on DBAL 5 for a reason that has nothing to do with the invariant.
+            // On DBAL 4: NO `setNestTransactionsWithSavepoints(true)` — READ from dbal 4.4.4's
+            // source, not assumed: savepoint nesting is UNCONDITIONAL there (`beginTransaction()`
+            // calls `createSavepoint()` for every level > 1), the setter is `@deprecated … removed
+            // in 5.0` and THROWS when passed false. Calling it would configure nothing and would make
+            // this guard fail on DBAL 5 for a reason that has nothing to do with the invariant.
+            //
+            // On DBAL 3 the setter is REQUIRED (M2-C5 review F1): DBAL 3.8–3.10 default it to FALSE,
+            // so a nested `beginTransaction()` emits no SAVEPOINT at all and an inner `rollBack()`
+            // only marks the whole transaction rollback-only. That is upstream DBAL 3 behaviour for
+            // every driver, and it is why a DBAL 3 application that nests must opt in itself.
+            if (self::isDbal3()) {
+                $c->setNestTransactionsWithSavepoints(true);
+            }
             $c->executeStatement('DROP TABLE IF EXISTS s8b_tx');
             $c->executeStatement(
                 $kind === 'postgres'
@@ -154,7 +162,7 @@ final class TransactionLiveTest extends DbalLiveTestCase
         $config = new \Doctrine\DBAL\Configuration();
         $config->setAutoCommit(false);
         $c = \Doctrine\DBAL\DriverManager::getConnection([
-            'driverClass' => \Ferro\DBAL\Driver::class,
+            'driverClass' => self::driverClass(),
             'unix_socket' => $this->socketPath,
             'driverOptions' => ['pool' => 'default'],
         ], $config);

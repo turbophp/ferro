@@ -6,7 +6,6 @@ use Doctrine\DBAL\Driver\AbstractMySQLDriver;
 use Doctrine\DBAL\Driver\AbstractPostgreSQLDriver;
 use Doctrine\DBAL\Driver\AbstractSQLiteDriver;
 use Doctrine\DBAL\Driver\Connection as DriverConnection;
-use Doctrine\DBAL\Platforms\AbstractPlatform;
 use Ferro\DBAL\Exception\BackendFamilyUnknown;
 
 /**
@@ -17,8 +16,8 @@ use Ferro\DBAL\Exception\BackendFamilyUnknown;
  * live in DBAL's own abstract drivers and move between DBAL releases; restating them here would be
  * a second source of truth that silently rots. So this class delegates to
  * `AbstractPostgreSQLDriver::getDatabasePlatform()` / `AbstractMySQLDriver::getDatabasePlatform()`
- * through a platform-only anonymous subclass, and its whole job is the ONE transform those two
- * cannot do for themselves.
+ * through a platform-only anonymous subclass ({@see delegateFor}), and its whole job is the ONE
+ * transform those two cannot do for themselves.
  *
  * **That transform is asymmetric, and getting it uniform is the measured way to ship a wrong SQL
  * dialect.** `ferrod` caches the backend's own `version()` output VERBATIM (`pools.rs`'s
@@ -59,14 +58,24 @@ final class PlatformVersion
         return preg_replace('/^\s*PostgreSQL\s+/i', '', $raw) ?? $raw;
     }
 
-    /** @throws BackendFamilyUnknown */
-    public static function platformFor(string $kind, string $rawVersion): AbstractPlatform
+    /**
+     * The STOCK abstract driver for `$kind`, as a platform-only delegate that never connects.
+     *
+     * The delegates are the same objects on both DBAL majors — what differs is how a platform is
+     * ASKED of them: DBAL 4 calls `getDatabasePlatform(ServerVersionProvider)` and DBAL 3 calls
+     * `createDatabasePlatformForVersion(string)` (and, for SQLite, whose DBAL 3 driver is not
+     * version-aware, `getDatabasePlatform()`). So the ASKING lives in each major's `Driver`
+     * ({@see Driver::platformFor}, {@see \Ferro\DBAL\Dbal3\Driver::platformFor}), and this class
+     * keeps everything that is the same on both (M2-C5).
+     *
+     * @throws BackendFamilyUnknown
+     */
+    public static function delegateFor(string $kind): AbstractPostgreSQLDriver|AbstractMySQLDriver|AbstractSQLiteDriver
     {
-        $provider = new FixedVersion(self::normalise($kind, $rawVersion));
         return match ($kind) {
-            self::KIND_POSTGRES => self::postgres()->getDatabasePlatform($provider),
-            self::KIND_MYSQL => self::mysql()->getDatabasePlatform($provider),
-            self::KIND_SQLITE => self::sqlite()->getDatabasePlatform($provider),
+            self::KIND_POSTGRES => self::postgres(),
+            self::KIND_MYSQL => self::mysql(),
+            self::KIND_SQLITE => self::sqlite(),
             default => throw BackendFamilyUnknown::forKind($kind),
         };
     }

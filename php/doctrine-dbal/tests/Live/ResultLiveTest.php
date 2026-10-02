@@ -142,8 +142,14 @@ final class ResultLiveTest extends DbalLiveTestCase
 
             $r = $c->executeQuery('SELECT 11 AS a, 22 AS b');
             self::assertSame(2, $r->columnCount(), "[$kind] columnCount");
-            self::assertSame('a', $r->getColumnName(0), "[$kind] first column name");
-            self::assertSame('b', $r->getColumnName(1), "[$kind] second column name");
+            if (self::isDbal3()) {
+                // DBAL 3's `Result` has no `getColumnName()` (DBAL 4 added it), so on DBAL 3 the
+                // names are read the way a DBAL 3 application reads them (M2-C5 review F2).
+                self::assertSame(['a', 'b'], array_keys((array) $r->fetchAssociative()), "[$kind] column names");
+            } else {
+                self::assertSame('a', $r->getColumnName(0), "[$kind] first column name");
+                self::assertSame('b', $r->getColumnName(1), "[$kind] second column name");
+            }
 
             $dup = $c->executeQuery('SELECT 11 AS a, 22 AS a');
             self::assertSame([[11, 22]], $dup->fetchAllNumeric(), "[$kind] duplicates survive numerically");

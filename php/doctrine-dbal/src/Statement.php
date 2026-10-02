@@ -29,7 +29,7 @@ final class Statement implements StatementInterface
     private array $values = [];
 
     public function __construct(
-        private readonly Connection $conn,
+        private readonly AbstractConnection $conn,
         private readonly string $sql,
     ) {}
 

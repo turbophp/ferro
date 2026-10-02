@@ -32,7 +32,10 @@ final class BackendFamilyUnknown extends AbstractException
             . '"11.8.8-MariaDB"). Note that a bare MySQL version ("8.4.11") and a bare SQLite one '
             . '("3.53.2") are indistinguishable, so neither can be recognised here — on those two '
             . 'families the handshake is the only authority. No family is guessed: the three are '
-            . 'different SQL dialects.',
+            . 'different SQL dialects. If the version is EMPTY and this is Symfony\'s DoctrineBundle '
+            . '(its ConnectionFactory asks for a platform before connecting, to choose a default '
+            . 'charset), set `charset` on the connection — it is inert for Ferro — and remove '
+            . '`dbname_suffix`.',
             $version,
         ));
     }

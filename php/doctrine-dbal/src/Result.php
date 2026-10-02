@@ -365,7 +365,16 @@ final class Result implements ResultInterface
 
     public function getColumnName(int $index): string
     {
-        return $this->cols[$index] ?? throw InvalidColumnIndex::new($index);
+        if (isset($this->cols[$index])) {
+            return $this->cols[$index];
+        }
+        // `InvalidColumnIndex` is DBAL 4's. DBAL 3 (M2-C5) has neither the class nor this method on
+        // its SPI, so nothing in DBAL 3 calls it — but a direct call must still fail loudly rather
+        // than with "class not found".
+        if (class_exists(InvalidColumnIndex::class)) {
+            throw InvalidColumnIndex::new($index);
+        }
+        throw DriverException::local(sprintf('Ferro: column index %d does not exist in this result.', $index));
     }
 
     /**
