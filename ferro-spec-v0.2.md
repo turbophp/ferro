@@ -1217,9 +1217,9 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
 |---|---|---|---|---|
 | doctrine/dbal 4.4.4 (curated subset) | 365 / 375 | 374 / 385 | 373 / 384 | 333 / 361 (`pdo_sqlite` control 361 / 361) |
 | doctrine/dbal 3.10.6 (curated subset) | 305 / 314 | 296 / 303 | 300 / 307 | 224 / 267 (control 262 / 267) |
-| doctrine/orm 3.7.3 Functional, stock config | ORM_PG | ORM_MY | ORM_MA | not run |
+| doctrine/orm 3.7.3 Functional, stock config | 1571 / 1597 (`pdo_pgsql` control 1597 / 1597) | 1583 / 1594 (`pdo_mysql` control 1590 / 1594) | 1579 / 1586 (`pdo_mysql` control 1586 / 1586) | not run |
 
-Each ORM cell has its stock-PDO control beside it in `docs/orm-suite/`. **None of §14's suites is green.** Every DBAL non-pass is triaged in its results doc, and none is a driver defect. The ORM suite's Ferro-only non-passes are all documented incompatibilities: sub-second `TIMESTAMPTZ` at fetch (§22.2 (ab)), §7.4's TEMP tables across statements, `lastInsertId()` outside a transaction on PostgreSQL, and a NULL-typed select-list column on the MySQL family. The DBAL rows are curated subsets (§22.2 (z)), not upstream's whole suites. SQLite has no ORM column. The DBAL 3 lane of the ORM suite is not run.
+The ORM row is run 37067176160 (`docs/orm-suite/2026-10-02-ci-results.md`), and no test the control runs is skipped under Ferro on any family. **None of §14's suites is green.** Every DBAL non-pass is triaged in its results doc, and none is a driver defect. The ORM suite's Ferro-only non-passes are all documented incompatibilities: sub-second `TIMESTAMPTZ` at fetch (§22.2 (ab)), §7.4's TEMP tables across statements, `lastInsertId()` outside a transaction on PostgreSQL, and a NULL-typed select-list column on the MySQL family. The DBAL rows are curated subsets (§22.2 (z)), not upstream's whole suites. SQLite has no ORM column. The DBAL 3 lane of the ORM suite is not run.
 
 **§15's acceptance** ("the `illuminate/database` integration suite green on MySQL, PG, SQLite via Ferro connections; a Laravel demo app … runs with only the config diff; Octane supported in sync mode"):
 

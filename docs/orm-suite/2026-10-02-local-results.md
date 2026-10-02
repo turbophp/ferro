@@ -5,7 +5,8 @@ M1-S8b said it was **not run**. This is its first run. SPEC §22.2 (ci).
 
 **These are LOCAL numbers** (the dev container: PostgreSQL 16.13 and MariaDB 10.11.14, a debug
 `ferrod`), not the recorded CI columns. The on-demand `orm-suite` workflow measures PostgreSQL 17,
-MySQL 8.4 and MariaDB 11.8 twice per column; its numbers supersede these once dispatched on `main`.
+MySQL 8.4 and MariaDB 11.8 twice per column; its numbers supersede these, and are RECORDED in
+`2026-10-02-ci-results.md` (run 37067176160, the same Ferro-only non-passes by name).
 
 ## What ran
 
