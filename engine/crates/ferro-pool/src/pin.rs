@@ -268,6 +268,116 @@ impl HygieneMetrics {
     }
 }
 
+/// SPEC §13's "pinned" gauge and "pin duration" histogram for one pool (M2-C4b-2b).
+///
+/// "Pinned" here is exactly [`PinState::PinnedTx`]: a connection held by an explicit transaction
+/// across requests — the transaction-mode pooling sense, and the one that can starve a pool. A
+/// TAINTED connection is not pinned (it goes back to the pool and gets a full reset); that is the
+/// hygiene family's business.
+#[derive(Debug)]
+pub struct PinTimeMetrics {
+    pinned: AtomicU64,
+    duration: crate::histogram::Histogram<{ crate::histogram::PIN_BOUNDS_US.len() }>,
+}
+
+impl Default for PinTimeMetrics {
+    fn default() -> Self {
+        Self {
+            pinned: AtomicU64::new(0),
+            duration: crate::histogram::Histogram::new(crate::histogram::PIN_BOUNDS_US),
+        }
+    }
+}
+
+impl PinTimeMetrics {
+    /// Connections pinned to a transaction right now.
+    pub fn pinned(&self) -> u64 {
+        // Acquire pairs with `PinSlot::release`'s Release decrement: seeing a pin end implies
+        // seeing its duration observed.
+        self.pinned.load(Ordering::Acquire)
+    }
+
+    /// How long pins lasted, from pin to release, for every pin that has ended.
+    pub fn duration(
+        &self,
+    ) -> &crate::histogram::Histogram<{ crate::histogram::PIN_BOUNDS_US.len() }> {
+        &self.duration
+    }
+}
+
+/// A `Checkout`'s pin — and the ONLY way to change it (M2-C4b-2b).
+///
+/// The field it replaces was a plain `PinState` written at three sites, with a fourth way for a
+/// pin to end — the `Checkout` being dropped while still pinned — that wrote nothing at all. A
+/// gauge kept by increments and decrements at those sites would drift the first time a path was
+/// missed, and nothing would notice. Here the state is private to this module, so `pool.rs` cannot
+/// pin or unpin without going through [`pin`](Self::pin)/[`release`](Self::release).
+///
+/// **The slot holds its pool's metrics and releases in its OWN `Drop`**, which is what makes "every
+/// pin that starts ends exactly once" a property of the type rather than of `Checkout`'s `Drop`:
+/// dropping a `Checkout` drops the slot, and so does OVERWRITING it — `self.pin = PinSlot::new(..)`
+/// releases the old pin as it is replaced. The first version had `Default` and no `Drop`, and review
+/// showed that exact assignment compiled and silently leaked a pin (finding F8). There is no
+/// `Default` now, so a slot cannot be made without naming the metrics it reports to.
+#[derive(Debug)]
+pub(crate) struct PinSlot {
+    state: Option<(TxId, std::time::Instant)>,
+    metrics: std::sync::Arc<PinTimeMetrics>,
+}
+
+impl PinSlot {
+    /// An unpinned slot reporting to `metrics`.
+    pub(crate) fn new(metrics: std::sync::Arc<PinTimeMetrics>) -> Self {
+        Self {
+            state: None,
+            metrics,
+        }
+    }
+
+    /// The current pin, as the public state type.
+    pub(crate) fn state(&self) -> PinState {
+        match self.state {
+            Some((tx, _)) => PinState::PinnedTx(tx),
+            None => PinState::Unpinned,
+        }
+    }
+
+    /// Pin to `tx`. Re-pinning an already-pinned slot changes the id and keeps the ORIGINAL start
+    /// time: it is still one pin of one connection, so it neither counts twice nor restarts.
+    pub(crate) fn pin(&mut self, tx: TxId) {
+        match &mut self.state {
+            Some((id, _)) => *id = tx,
+            None => {
+                self.state = Some((tx, std::time::Instant::now()));
+                self.metrics.pinned.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// End the pin, if there is one: observe how long it lasted, THEN decrement the gauge. A no-op
+    /// when unpinned, so it is safe from `Drop` and from an explicit release alike.
+    ///
+    /// The order is load-bearing for a reader: the `Release` decrement publishes the observation, so
+    /// anyone who sees the gauge fall (with an `Acquire` load, as [`PinTimeMetrics::pinned`] does)
+    /// also sees the duration recorded. The reverse order let a scrape see `pinned == 0` with the
+    /// histogram not yet moved — reproduced in review with a 30 ms preemption between the two
+    /// lines (finding F5).
+    pub(crate) fn release(&mut self) {
+        if let Some((_, since)) = self.state.take() {
+            self.metrics
+                .duration
+                .observe_us(u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX));
+            self.metrics.pinned.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for PinSlot {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// A `Checkout`'s most recent pin cause — and the ONLY way to set one.
 ///
 /// The field it replaces was a plain `Option<PinCause>` assigned at four sites. Counting the cause

@@ -13,6 +13,7 @@
 mod common;
 
 use common::{exec_err, exec_ok, exec_server_with_metrics, req};
+use ferro_pool::histogram::{CHECKOUT_BOUNDS_US, PIN_BOUNDS_US};
 use ferro_proto::messages::sql::ExecRequest;
 
 fn write(sql: &str) -> ExecRequest {
@@ -270,5 +271,188 @@ async fn real_traffic_moves_the_hygiene_error_and_pool_series() {
     assert!(
         in_use + idle <= max,
         "in_use {in_use} + idle {idle} exceeds max {max}"
+    );
+}
+
+/// Every `{name}_bucket{pool="default",le=..}` line, in order, as `(le, count)`.
+fn buckets(body: &str, name: &str) -> Vec<(String, u64)> {
+    let prefix = format!("{name}_bucket{{pool=\"default\",le=\"");
+    body.lines()
+        .filter_map(|l| l.strip_prefix(prefix.as_str()))
+        .map(|rest| {
+            let (le, tail) = rest.split_once("\"}").expect("le label closes");
+            (
+                le.to_string(),
+                tail.trim().parse().expect("bucket count parses"),
+            )
+        })
+        .collect()
+}
+
+/// A histogram family is well-formed: its `le` labels are exactly `bounds` rendered in SECONDS then
+/// `+Inf`, its buckets are cumulative, and the `+Inf` count equals `_count`.
+///
+/// The `le` check is what catches a unit error: a render printing raw microseconds still produced
+/// cumulative buckets ending in `+Inf` and passed the first version of this helper (review F2).
+fn assert_histogram_shape(body: &str, name: &str, bounds: &[u64]) -> u64 {
+    let b = buckets(body, name);
+    assert!(!b.is_empty(), "{name} has no buckets:\n{body}");
+    let expected_le: Vec<String> = bounds
+        .iter()
+        .map(|&us| ferro_pool::histogram::fmt_seconds(us))
+        .chain(std::iter::once("+Inf".to_string()))
+        .collect();
+    let got_le: Vec<String> = b.iter().map(|(le, _)| le.clone()).collect();
+    assert_eq!(
+        got_le, expected_le,
+        "{name}'s le labels are not its bounds in seconds"
+    );
+    assert_eq!(
+        b.last().map(|(le, _)| le.as_str()),
+        Some("+Inf"),
+        "{name} must end in +Inf"
+    );
+    assert!(
+        b.windows(2).all(|w| w[0].1 <= w[1].1),
+        "{name} buckets are not cumulative: {b:?}",
+    );
+    let count = series(body, &format!("{name}_count{{pool=\"default\"}}")).expect("_count");
+    assert_eq!(
+        b.last().unwrap().1,
+        count,
+        "{name}: +Inf bucket must equal _count"
+    );
+    assert!(
+        body.contains(&format!("{name}_sum{{pool=\"default\"}} ")),
+        "{name} has no _sum"
+    );
+    count
+}
+
+/// **C4b-2b: the pinned gauge, the two histograms and queue depth, through a real daemon.**
+///
+/// Pins come from the TX service — a real BEGIN pins the connection for the life of the
+/// transaction — and the checkout histogram from ordinary EXECs. Queue depth is asserted only at
+/// rest here (0, and present): a deterministic wait needs the pool owned outright, which
+/// `ferro-pool`'s `pin_queue_metrics.rs` does for every way a wait can end.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_transaction_moves_the_pin_and_checkout_series() {
+    use ferro_proto::consts::{method_tx, service};
+    use ferro_proto::messages::Outcome;
+    use ferro_proto::messages::tx::{BeginRequest, BeginResponse, TxControl};
+
+    const PINNED: &str = "ferro_pool_pinned_connections{pool=\"default\"}";
+    const WAITING: &str = "ferro_pool_waiting_checkouts{pool=\"default\"}";
+    const PIN: &str = "ferro_pin_duration_seconds";
+    const CHECKOUT: &str = "ferro_checkout_duration_seconds";
+
+    let (server, metrics_addr, _metrics_guard) = exec_server_with_metrics().await;
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    exec_ok(&mut c, 2, &write("create table t (id integer primary key)")).await;
+
+    let before = scrape(metrics_addr).await;
+    let pins_before = assert_histogram_shape(&before, PIN, &PIN_BOUNDS_US);
+    let checkouts_before = assert_histogram_shape(&before, CHECKOUT, &CHECKOUT_BOUNDS_US);
+    assert_eq!(series(&before, PINNED), Some(0), "{before}");
+    assert_eq!(series(&before, WAITING), Some(0), "{before}");
+
+    // A real transaction: BEGIN pins a connection until COMMIT.
+    c.send_request(
+        3,
+        service::TX,
+        method_tx::BEGIN,
+        BeginRequest {
+            pool: "default".to_string(),
+            isolation: None,
+            readonly: false,
+        }
+        .encode(),
+    )
+    .await;
+    let tx_id = match Outcome::decode(&c.recv().await.payload).expect("BEGIN outcome") {
+        Outcome::Ok(body) => BeginResponse::decode(&body).expect("BeginResponse").tx_id,
+        other => panic!("BEGIN failed: {other:?}"),
+    };
+    let during = scrape(metrics_addr).await;
+    assert_eq!(
+        series(&during, PINNED),
+        Some(1),
+        "an open transaction pins one connection:\n{during}"
+    );
+
+    c.send_request(
+        4,
+        service::TX,
+        method_tx::COMMIT,
+        TxControl { tx_id }.encode(),
+    )
+    .await;
+    assert!(
+        matches!(Outcome::decode(&c.recv().await.payload), Ok(Outcome::Ok(_))),
+        "COMMIT failed"
+    );
+    exec_ok(&mut c, 5, &req("select 1")).await;
+
+    let after = scrape(metrics_addr).await;
+    assert_eq!(
+        series(&after, PINNED),
+        Some(0),
+        "COMMIT must release the pin:\n{after}"
+    );
+    let pins_after = assert_histogram_shape(&after, PIN, &PIN_BOUNDS_US);
+    let checkouts_after = assert_histogram_shape(&after, CHECKOUT, &CHECKOUT_BOUNDS_US);
+    assert_eq!(
+        pins_after - pins_before,
+        1,
+        "one transaction is one pin duration"
+    );
+    assert!(
+        checkouts_after > checkouts_before,
+        "the BEGIN and the EXEC are checkouts the histogram must see"
+    );
+    assert_eq!(series(&after, WAITING), Some(0));
+
+    // The OTHER way a pin ends in production: the client goes away mid-transaction. The session's
+    // teardown aborts it — the tx actor runs `rollback_tx()` under `tx_teardown_timeout`, so the pin
+    // ends at the ROLLBACK site, not in `Drop`. (A first version of this comment claimed `Drop`;
+    // deleting the `Drop` release left this test green, which is how that was found. `Drop` is the
+    // backstop for a teardown ROLLBACK that fails or times out — `ferro-pool`'s
+    // `a_pin_dropped_without_commit_or_rollback_still_ends_once` proves that path exactly.)
+    let mut gone = server.connect().await;
+    gone.hello(10).await;
+    gone.send_request(
+        11,
+        service::TX,
+        method_tx::BEGIN,
+        BeginRequest {
+            pool: "default".to_string(),
+            isolation: None,
+            readonly: false,
+        }
+        .encode(),
+    )
+    .await;
+    let _ = gone.recv().await;
+    assert_eq!(series(&scrape(metrics_addr).await, PINNED), Some(1));
+    drop(gone);
+    // Polled on the gauge, and the histogram is then asserted from the SAME scrape: the pin is
+    // observed BEFORE the gauge falls (`PinSlot::release`, Release/Acquire), so a scrape that
+    // reads the gauge at 0 must already see the duration. The first version decremented first,
+    // and a 30 ms preemption between the two lines failed this exact assertion (review F5).
+    let mut released = None;
+    for _ in 0..200 {
+        let body = scrape(metrics_addr).await;
+        if series(&body, PINNED) == Some(0) {
+            released = Some(body);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let released = released.expect("a disconnected client's transaction must release its pin");
+    assert_eq!(
+        assert_histogram_shape(&released, PIN, &PIN_BOUNDS_US) - pins_after,
+        1,
+        "the abandoned transaction's pin must be observed exactly once",
     );
 }

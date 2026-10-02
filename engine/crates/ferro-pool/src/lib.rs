@@ -3,5 +3,6 @@ pub mod config;
 pub mod error;
 pub mod fake;
 pub mod health;
+pub mod histogram;
 pub mod pin;
 pub mod pool;

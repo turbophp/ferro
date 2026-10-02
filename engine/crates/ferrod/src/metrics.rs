@@ -172,17 +172,27 @@ pub fn render(registry: &PoolRegistry, boot_epoch: u64) -> String {
         (
             "ferro_pool_max_connections",
             "The pool's configured connection ceiling.",
-            (|g: ferro_pool::pool::PoolGauges| g.max_size) as fn(_) -> usize,
+            (|g: ferro_pool::pool::PoolGauges| g.max_size as u64) as fn(_) -> u64,
         ),
         (
             "ferro_pool_in_use_connections",
             "Connections handed out, being dialled, or held by the liveness reaper.",
-            |g: ferro_pool::pool::PoolGauges| g.in_use,
+            |g: ferro_pool::pool::PoolGauges| g.in_use as u64,
         ),
         (
             "ferro_pool_idle_connections",
             "Connections parked and ready for reuse.",
-            |g: ferro_pool::pool::PoolGauges| g.idle,
+            |g: ferro_pool::pool::PoolGauges| g.idle as u64,
+        ),
+        (
+            "ferro_pool_pinned_connections",
+            "Connections pinned to an explicit transaction (SPEC §13).",
+            |g: ferro_pool::pool::PoolGauges| g.pinned,
+        ),
+        (
+            "ferro_pool_waiting_checkouts",
+            "Checkouts waiting for a connection permit: SPEC §13's queue depth.",
+            |g: ferro_pool::pool::PoolGauges| g.waiting as u64,
         ),
     ] {
         let _ = writeln!(out, "# HELP {metric} {help}");
@@ -199,6 +209,27 @@ pub fn render(registry: &PoolRegistry, boot_epoch: u64) -> String {
             );
         }
     }
+
+    // The histograms are read AFTER the gauges, and the pin pair depends on it: `PinSlot::release`
+    // observes the duration BEFORE it decrements `pinned` (Release/Acquire), so a scrape that has
+    // already read a pin's end off the gauge then reads its duration too. Reversing these blocks
+    // would let one scrape show `pinned` fallen with the histogram not yet moved.
+    render_histogram(
+        &mut out,
+        "ferro_checkout_duration_seconds",
+        "Time to obtain a connection: permit wait plus recycle hygiene or a fresh dial (SPEC §13 checkout p50/p99).",
+        registry,
+        &names,
+        |p| p.checkout_histogram(),
+    );
+    render_histogram(
+        &mut out,
+        "ferro_pin_duration_seconds",
+        "How long a connection stayed pinned to a transaction, from pin to release (SPEC §13).",
+        registry,
+        &names,
+        |p| p.pin_histogram(),
+    );
 
     out.push_str(
         "# HELP ferro_errors_total Error terminals produced, by registered code (SPEC §13).\n",
@@ -225,6 +256,52 @@ pub fn render(registry: &PoolRegistry, boot_epoch: u64) -> String {
     out.push_str("# TYPE ferro_indeterminate_total counter\n");
     let _ = writeln!(out, "ferro_indeterminate_total {}", ERRORS.indeterminate());
     out
+}
+
+/// One histogram family in the exposition format: `_bucket{pool,le}` (cumulative, ending in
+/// `+Inf`), `_sum` and `_count`, per pool, in seconds.
+fn render_histogram(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    registry: &PoolRegistry,
+    names: &[&str],
+    read: impl Fn(&crate::pools::AnyPool) -> crate::pools::HistogramSnapshot,
+) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} histogram");
+    for pool_name in names {
+        let Some(pool) = registry.get(pool_name) else {
+            continue;
+        };
+        write_histogram_series(out, name, &escape_label(pool_name), &read(pool));
+    }
+}
+
+/// One pool's `_bucket`/`_sum`/`_count` lines. Split from [`render_histogram`] so the UNITS can be
+/// pinned by a test with a known snapshot: the histogram records microseconds and the exposition
+/// wants seconds, and a render that printed the raw µs — a 10⁶× error on every bound and every sum
+/// — passed every test that only checked the series existed (review finding F2).
+fn write_histogram_series(
+    out: &mut String,
+    name: &str,
+    pool_label: &str,
+    snap: &crate::pools::HistogramSnapshot,
+) {
+    use ferro_pool::histogram::fmt_seconds;
+    for &(le, cum) in &snap.buckets {
+        let le = le.map_or_else(|| "+Inf".to_string(), fmt_seconds);
+        let _ = writeln!(
+            out,
+            "{name}_bucket{{pool=\"{pool_label}\",le=\"{le}\"}} {cum}"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "{name}_sum{{pool=\"{pool_label}\"}} {}",
+        fmt_seconds(snap.sum_us)
+    );
+    let _ = writeln!(out, "{name}_count{{pool=\"{pool_label}\"}} {}", snap.count);
 }
 
 /// Escape a label VALUE per the exposition format: backslash, double quote, newline.
@@ -351,6 +428,27 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bounds and sums render in SECONDS. A known snapshot pins the exact lines, so a render that
+    /// printed microseconds (or any other unit) cannot pass by merely producing the series.
+    #[test]
+    fn histogram_series_render_in_seconds_with_count_from_the_inf_bucket() {
+        let snap = crate::pools::HistogramSnapshot {
+            buckets: vec![(Some(25), 1), (Some(1_500_000), 3), (None, 4)],
+            sum_us: 2_000_075,
+            count: 4,
+        };
+        let mut out = String::new();
+        write_histogram_series(&mut out, "ferro_x_seconds", "p", &snap);
+        assert_eq!(
+            out,
+            "ferro_x_seconds_bucket{pool=\"p\",le=\"0.000025\"} 1\n\
+             ferro_x_seconds_bucket{pool=\"p\",le=\"1.5\"} 3\n\
+             ferro_x_seconds_bucket{pool=\"p\",le=\"+Inf\"} 4\n\
+             ferro_x_seconds_sum{pool=\"p\"} 2.000075\n\
+             ferro_x_seconds_count{pool=\"p\"} 4\n",
+        );
+    }
 
     /// Only `GET /metrics` is the endpoint; everything else has a defined, boring answer.
     #[test]
