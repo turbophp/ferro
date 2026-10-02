@@ -30,6 +30,10 @@ final class TraceContextLiveTest extends LiveTestCase
         yield 'valid' => [static fn (): string => self::VALID];
         yield 'malformed (engine drops and counts it)' => [static fn (): string => 'not-a-traceparent'];
         yield 'uppercase (refused by the W3C grammar)' => [static fn (): string => strtoupper(self::VALID)];
+        // C4c-1 review F1: this failed every statement with a `Protocol` error before the fix.
+        yield 'a non-UTF-8 byte (the client drops it)' => [
+            static fn (): string => substr(self::VALID, 0, 54) . "\xff",
+        ];
         yield 'throwing (the client sends none)' => [static function (): string {
             throw new \RuntimeException('tracer down');
         }];

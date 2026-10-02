@@ -66,7 +66,7 @@ final class ExecCodec
      */
     public function encode(string $pool, string $sql, array $params, bool $readonly, int $fetch, ?int $txId): string
     {
-        return ExecRequest::encode([
+        $request = [
             'pool' => $pool,
             'sql' => $sql,
             'query_id' => null,
@@ -78,7 +78,15 @@ final class ExecCodec
             // The caller's W3C trace context (M2-C4c-1), read HERE — once per EXEC, in the fiber that
             // issued it — so autocommit, tx-scoped and streamed statements all carry it. Never throws.
             'traceparent' => TraceContext::current(),
-        ], $this->encodePacker);
+        ];
+        $payload = ExecRequest::encode($request, $this->encodePacker);
+        // Tracing never fails a statement — including by being the bytes that push it over the
+        // frame cap (C4c-1 review F5). Re-encoding is paid only on that edge.
+        if ($request['traceparent'] !== null && strlen($payload) > C::MAX_FRAME_PAYLOAD) {
+            $request['traceparent'] = null;
+            $payload = ExecRequest::encode($request, $this->encodePacker);
+        }
+        return $payload;
     }
 
     /**

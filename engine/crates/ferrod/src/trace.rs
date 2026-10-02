@@ -3,14 +3,16 @@
 //! An EXEC may carry the application's `traceparent` header text (`ExecRequest::traceparent`,
 //! `/proto/PROTOCOL.md` §8.1) so the engine's per-statement observability joins the trace the
 //! application is already in. This module is the ONE place that text is interpreted. The codec
-//! moves it as bytes and validates nothing beyond UTF-8.
+//! moves it as bytes and validates nothing — not even UTF-8: it is the one `str` field decoded
+//! lossily, so a non-UTF-8 header arrives here carrying U+FFFD and is refused by the grammar below.
 //!
 //! # Malformed context is IGNORED, never refused
 //!
-//! W3C Trace Context §3.2.2.3 tells a receiver to ignore a `traceparent` it cannot parse, and an
-//! observability field must never be the reason a statement fails. A bad value is therefore
-//! dropped and COUNTED (`ferro_traceparent_invalid_total`), so a broken provider is visible to an
-//! operator without being visible to the statement.
+//! W3C Trace Context says a vendor that cannot parse a `traceparent` does not use it and starts a
+//! new trace (§3.2.2.3 for an invalid trace id, §3.2.4 for a header it cannot parse, §4.3's
+//! processing model) — and an observability field must never be the reason a statement fails. A
+//! bad value is therefore dropped and COUNTED (`ferro_traceparent_invalid_total`), so a broken
+//! provider is visible to an operator without being visible to the statement.
 //!
 //! # What is accepted
 //!
@@ -20,7 +22,9 @@
 //! * Version `ff` is invalid.
 //! * Version `00` must be EXACTLY 55 characters.
 //! * A HIGHER version may be longer, provided the character after the first 55 is `-`. Only the
-//!   first 55 are parsed, per §3.2.4 ("parse the fields it knows").
+//!   first 55 are parsed, and of its flags only `sampled`: §3.2.4 says to parse the trace id, the
+//!   parent id and "the sampled bit of flags", and that vendors "MUST NOT parse or assume anything
+//!   about unknown fields for this version".
 //! * An all-zero trace id or parent id is invalid.
 //!
 //! Uppercase hex is refused rather than normalised. The grammar says lowercase, and a producer
@@ -43,7 +47,8 @@ pub struct TraceParent {
     pub trace_id: [u8; 16],
     /// The 8-byte id of the caller's span, which becomes the PARENT of the engine's span.
     pub parent_id: [u8; 8],
-    /// The trace flags byte. Bit 0 is `sampled`; other bits are kept as received.
+    /// The trace flags byte. Bit 0 is `sampled`. A version-`00` header's other bits are kept as
+    /// received; a higher version's are cleared, since §3.2.4 parses only its sampled bit.
     pub flags: u8,
 }
 
@@ -75,6 +80,7 @@ impl TraceParent {
             *out = hex_byte(&b[36 + 2 * i..38 + 2 * i])?;
         }
         let flags = hex_byte(&b[53..55])?;
+        let flags = if version == 0 { flags } else { flags & 0x01 };
         if trace_id == [0; 16] || parent_id == [0; 8] {
             return None;
         }
@@ -150,7 +156,7 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// The W3C specification's own example (Trace Context Level 1, §3.2.4).
+    /// The W3C specification's own example (Trace Context Level 1, §3.2.3).
     const EXAMPLE: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
     #[test]
@@ -188,6 +194,11 @@ mod tests {
                 format!("00-4bf92f3577b34da6a3ce929d0e0e4736-{}-01", "0".repeat(16)),
             ),
             ("wrong separator", EXAMPLE.replacen('-', "_", 1)),
+            // The second and third separators, each replaced by a HEX digit: anything else is
+            // caught by the hex parse of a neighbouring field, so only a hex digit proves the
+            // separator check itself (the C4c-1 review deleted each check and both survived).
+            ("hex digit for the second separator", sep_to_hex(35)),
+            ("hex digit for the third separator", sep_to_hex(52)),
             (
                 "short trace id, long parent",
                 "00-4bf92f3577b34da6a3ce929d0e0e473-600f067aa0ba902b7-01".to_string(),
@@ -197,6 +208,34 @@ mod tests {
         for (name, s) in cases {
             assert_eq!(TraceParent::parse(s), None, "{name}: {s:?} must not parse");
         }
+    }
+
+    fn sep_to_hex(at: usize) -> String {
+        let mut b = EXAMPLE.as_bytes().to_vec();
+        assert_eq!(b[at], b'-');
+        b[at] = b'a';
+        String::from_utf8(b).unwrap()
+    }
+
+    /// A non-UTF-8 header reaches the parser as U+FFFD (the codec decodes this field lossily) and
+    /// must be refused there. The review's probe sent 55 bytes ending in `0xff`; decoded, that is 57
+    /// bytes — refused by version 00's exact length — and under a LATER version, where length alone
+    /// does not refuse it, the replacement character's first byte fails the flags' hex parse.
+    #[test]
+    fn a_replacement_character_is_refused() {
+        let lossy = format!("{}\u{FFFD}", &EXAMPLE[..54]);
+        assert_eq!(TraceParent::parse(&lossy), None);
+        let later = lossy.replacen("00", "01", 1);
+        assert_eq!(TraceParent::parse(&later), None);
+    }
+
+    /// A higher version's flags are reduced to `sampled` (§3.2.4); version 00 keeps its byte.
+    #[test]
+    fn only_the_sampled_bit_of_a_later_versions_flags_is_kept() {
+        let v01 = EXAMPLE.replacen("00", "01", 1).replace("-01", "-ff");
+        assert_eq!(TraceParent::parse(&v01).unwrap().flags, 0x01);
+        let v00 = EXAMPLE.replace("-01", "-ff");
+        assert_eq!(TraceParent::parse(&v00).unwrap().flags, 0xff);
     }
 
     /// A LATER version may append fields after a `-` (§3.2.4); its known prefix is parsed.

@@ -66,6 +66,55 @@ fn exec_request_traceparent_roundtrips_and_is_not_validated_by_the_codec() {
     }
 }
 
+/// The C4c-1 review's MAJOR finding: a `traceparent` that is not UTF-8 used to fail the whole
+/// request as `Protocol`. Field 9 alone now decodes LOSSILY — the bad byte becomes U+FFFD, which
+/// the engine's ASCII-only W3C parse then drops and counts. Paired with two CONTROLS: the framing
+/// is still strict on that field (a non-`str` marker is refused), and every OTHER `str` field
+/// still refuses invalid UTF-8.
+#[test]
+fn only_the_traceparent_field_tolerates_invalid_utf8() {
+    let r = ExecRequest {
+        pool: "main".into(),
+        sql: Some("SELECT 1".into()),
+        query_id: None,
+        params: vec![],
+        timeout_ms: None,
+        readonly: true,
+        fetch: 0,
+        tx_id: None,
+        traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0Z".into()),
+    };
+    let mut b = r.encode();
+    assert_eq!(b.last(), Some(&b'Z'));
+    *b.last_mut().unwrap() = 0xff;
+    let tp = ExecRequest::decode(&b)
+        .expect("a non-UTF-8 traceparent must not fail the request")
+        .traceparent
+        .expect("present");
+    assert!(tp.ends_with('\u{FFFD}'), "{tp:?}");
+
+    // Control 1: the framing is not loosened — an integer where the str belongs is a wire fault.
+    let mut wrong_type = r.encode();
+    let tp_len = r.traceparent.as_ref().unwrap().len();
+    wrong_type.truncate(wrong_type.len() - tp_len - 2); // drop the str8 header + body
+    wrong_type.push(0x07);
+    assert!(ExecRequest::decode(&wrong_type).is_err());
+
+    // Control 2: every OTHER str field still refuses invalid UTF-8.
+    let s = ExecRequest {
+        sql: Some("SELECT Z".into()),
+        traceparent: None,
+        ..r
+    };
+    let mut bad_sql = s.encode();
+    let z = bad_sql.iter().position(|&c| c == b'Z').unwrap();
+    bad_sql[z] = 0xff;
+    assert!(
+        ExecRequest::decode(&bad_sql).is_err(),
+        "sql must stay strict"
+    );
+}
+
 /// The arity is strict, so a version-3 client's 8-field EXEC is refused rather than misread. That
 /// is why adding the field moved `protocol_version` to 4: the handshake refuses the pair first.
 #[test]

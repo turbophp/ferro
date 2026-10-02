@@ -256,7 +256,7 @@ pub fn render(registry: &PoolRegistry, boot_epoch: u64) -> String {
     out.push_str("# TYPE ferro_indeterminate_total counter\n");
     let _ = writeln!(out, "ferro_indeterminate_total {}", ERRORS.indeterminate());
     out.push_str(
-        "# HELP ferro_traceparent_invalid_total EXEC requests whose W3C traceparent did not parse; the context was dropped, the statement ran (SPEC §13).\n",
+        "# HELP ferro_traceparent_invalid_total EXEC requests whose W3C traceparent did not parse; the context was dropped, and no request is refused for it (SPEC §13).\n",
     );
     out.push_str("# TYPE ferro_traceparent_invalid_total counter\n");
     let _ = writeln!(
