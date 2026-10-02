@@ -131,42 +131,61 @@ final class FerroPdoShim
     }
 
     /**
-     * Quote a string as a PostgreSQL literal — `'` doubled, wrapped in single quotes.
+     * Quote a string as a SQL string literal, by the rule the POOL's backend advertises — the rule
+     * the family's own PDO driver applies.
      *
      * **The caller is real and was MEASURED, which is what changed this from "deliberately absent".**
      * `Connection::escapeString()` is `getReadPdo()->quote($value)`, reached from `DB::escape()` and
      * — more commonly than that — from `Grammar::substituteBindingsIntoRawSql()`, i.e. every
-     * `Builder::toRawSql()`, every `->dd()`/`->dump()` on a query builder, and the query strings
-     * ecosystem debug tooling renders. Upstream's own `Postgres/EscapeTest::testEscapeString` fails
-     * without it, and the control column (stock `pdo_pgsql`, same server) passes it — so it is a
-     * Ferro gap rather than an environment one.
+     * `Builder::toRawSql()`, every `->dd()`/`->dump()` on a query builder, every statement
+     * `DB::pretend()` logs, and Laravel's own `castAsJson()` testing helper. Upstream's
+     * `{Postgres,MySql,MariaDb,Sqlite}/EscapeTest` fail without it, and their controls pass.
      *
      * **Illuminate has already done the dangerous half before this is called**, which is why so
      * little is left here: `Connection::escape()` rejects NUL bytes and invalid UTF-8 itself, and
-     * routes `null`/`int`/`float`/`bool`/binary/array elsewhere entirely. What reaches `quote()` is
-     * a valid UTF-8 string with no NULs.
+     * routes `null`/`int`/`float`/`bool`/binary/array elsewhere entirely. What reaches `quote()`
+     * from Illuminate is a valid UTF-8 string with no NULs.
      *
-     * **The rule is doubling `'` and NOTHING else, and that is only correct while
-     * `standard_conforming_strings` is `on`** — so it is VERIFIED rather than assumed
-     * ({@see assertLiteralsAreStandard}). With it on, a backslash is an ordinary character;
-     * with it off, PostgreSQL would read `\` as an escape and a value ending in a backslash could
-     * consume the closing quote. MEASURED against `pdo_pgsql` on PostgreSQL 16 over eight cases
-     * including `backslash-then-quote \'` and `quote-then-backslash '\`: this rule is
-     * BYTE-IDENTICAL to PDO's output, and every case round-trips through `SELECT <literal>` back to
-     * the original bytes.
+     * **Two rules, chosen by the engine's advertised `literals_are_standard`, never assumed**
+     * ({@see quotingRule}):
+     *
+     *  - **`true` — a backslash is an ordinary character — so the rule is doubling `'` and NOTHING
+     *    else.** PostgreSQL with `standard_conforming_strings = on` (its default since 9.1), SQLite
+     *    (always: it has no backslash escape mode at all), and MySQL/MariaDB with
+     *    `NO_BACKSLASH_ESCAPES` in `sql_mode`. MEASURED against `pdo_pgsql` on PostgreSQL 16 over
+     *    eight cases including `backslash-then-quote \'` and `quote-then-backslash '\`: this rule
+     *    is BYTE-IDENTICAL to PDO's output, and every case round-trips through `SELECT <literal>`.
+     *    It is also exactly what `pdo_mysql` emits under `NO_BACKSLASH_ESCAPES`
+     *    (`mysql_real_escape_string_quote()` doubles the quote and nothing else there).
+     *  - **`false` on a MySQL-family pool — backslashes ARE escapes, MySQL's default — so the rule
+     *    is `mysql_real_escape_string()`'s**: `\` `'` `"` NUL LF CR and Ctrl-Z, each escaped with a
+     *    backslash, which is what `pdo_mysql` emits (M2-C1g). Escaping BYTE-WISE is correct because
+     *    every Ferro MySQL session is `utf8mb4`: `mysql_async` sends `utf8mb4_general_ci` in its
+     *    handshake (not configurable from the DSN), and no UTF-8 multi-byte sequence contains a byte
+     *    below 0x80 — the GBK/Big5/SJIS class, where a trailing `0x5c` makes byte-wise escaping
+     *    unsafe, cannot be negotiated. A tenant that issues `SET NAMES gbk` is tracked as a session
+     *    mutation and reset before the next tenant; inside its own session it has the same exposure
+     *    `pdo_mysql` has after a `SET NAMES` (the client-side charset does not follow it either).
+     *    Measured byte-identical to `pdo_mysql`'s `quote()` on the same server, with each literal
+     *    round-tripped through Ferro (`MySqlEscapeLiveTest`).
+     *
+     * `false` on any OTHER family refuses: on PostgreSQL it means `standard_conforming_strings =
+     * off`, whose escaping (`E''` semantics, encoding-dependent) this driver does not implement.
+     * `null` — the engine has not learned it — refuses on every family.
      *
      * **SPEC §21 D5 is SATISFIED, and it briefly was not.** D5 reads "`quote()` implemented
      * client-side with per-platform tables; **no engine round trip**". The first version of this
      * method verified the rule with a cached `SHOW standard_conforming_strings` — one round trip,
      * which D5 forbids. It is now read from `HELLO_ACK`'s per-pool `literals_are_standard`
-     * (§22.2 (at)), which the engine learns from a `ParameterStatus` and therefore costs nothing at
-     * all. Do NOT "fix" a future concern here by deleting the check: an unverified premise under an
-     * escaping function is the one option that was considered and rejected outright.
+     * (§22.2 (at)), which the engine learns for free on every family (a `ParameterStatus` on
+     * PostgreSQL, the OK packet's `SERVER_STATUS_NO_BACKSLASH_ESCAPES` on MySQL, a constant on
+     * SQLite). Do NOT "fix" a future concern here by deleting the check: an unverified premise
+     * under an escaping function is the one option that was considered and rejected outright.
      *
-     * **`PDO::PARAM_LOB` is refused rather than guessed at.** PostgreSQL's binary literal is
-     * `'\x…'::bytea`, a different shape entirely, and Illuminate never asks this method for one —
-     * `escape($value, binary: true)` goes to `PostgresConnection::escapeBinary()`, which builds that
-     * form in PHP without touching PDO. Accepting the parameter and ignoring it would silently
+     * **`PDO::PARAM_LOB` is refused rather than guessed at.** Each family's binary literal is a
+     * different shape (`'\x…'::bytea`, `x'…'`), and Illuminate never asks this method for one —
+     * `escape($value, binary: true)` goes to the connection's own `escapeBinary()`, which builds
+     * that form in PHP without touching PDO. Accepting the parameter and ignoring it would silently
      * produce a text literal for binary data.
      */
     public function quote(string $string, int $type = \PDO::PARAM_STR): string
@@ -174,48 +193,70 @@ final class FerroPdoShim
         if ($type !== \PDO::PARAM_STR) {
             throw new \LogicException(sprintf(
                 'Ferro: FerroPdoShim::quote() supports only PDO::PARAM_STR (%d), not %d. '
-                . "PostgreSQL's binary literal is a different shape (\\x…::bytea) and Illuminate "
-                . 'builds it in PHP via PostgresConnection::escapeBinary(), never through here.',
+                . "A binary literal is a different shape on every family (PostgreSQL's \\x…::bytea, "
+                . "MySQL's and SQLite's x'…'), and Illuminate builds it in PHP via the connection's "
+                . 'escapeBinary(), never through here.',
                 \PDO::PARAM_STR,
                 $type,
             ));
         }
-        $this->assertLiteralsAreStandard();
 
-        return "'" . str_replace("'", "''", $string) . "'";
+        return match ($this->quotingRule()) {
+            'standard' => "'" . str_replace("'", "''", $string) . "'",
+            'mysql-backslash' => "'" . strtr($string, self::MYSQL_ESCAPES) . "'",
+        };
     }
 
     /**
-     * Confirm the backend treats a backslash as an ordinary character inside a literal.
+     * `mysql_real_escape_string()`'s table, for a `utf8mb4` connection — exactly what `pdo_mysql`'s
+     * `quote()` emits when backslashes are escapes. Single-byte keys, so `strtr()` applies each once
+     * and never re-escapes its own output.
+     */
+    private const MYSQL_ESCAPES = [
+        "\\" => "\\\\",
+        "'" => "\\'",
+        '"' => '\\"',
+        "\0" => '\\0',
+        "\n" => '\\n',
+        "\r" => '\\r',
+        "\x1a" => '\\Z',
+    ];
+
+    /**
+     * Which escaping rule the backend has CONFIRMED for this pool — or a refusal.
      *
      * **Read off the HANDSHAKE, not the connection — SPEC §21 D5 requires exactly that.** D5 says
      * `quote()` is client-side with NO ENGINE ROUND TRIP, and the first version of this method
      * violated it with a cached `SHOW standard_conforming_strings`. `HELLO_ACK` now advertises
-     * `literals_are_standard` per pool (§22.2 (at)), which the engine learns for free — PostgreSQL
-     * reports the GUC as a `ParameterStatus`, so nothing is ever asked. The value is also better
-     * than the `SHOW` was, not merely cheaper: `ParameterStatus` tracks it LIVE, where a cached
-     * `SHOW` was one checkout's snapshot.
+     * `literals_are_standard` per pool (§22.2 (at)), which the engine learns for free.
      *
      * **Fail-closed, and `null` is the case that matters.** `null` means the engine has not learned
-     * it — an unreachable backend, an expired cache, a backend family whose arm is unfilled — and a
-     * client must REFUSE to build a literal on unknown. Never read it as false (that would claim
-     * backslashes ARE escapes) and never as true. Only an unambiguous `true` proceeds.
+     * it — an unreachable backend, an expired cache — and a client must REFUSE to build a literal on
+     * unknown. `false` is a real answer only where this driver implements the rule it implies, which
+     * is the MySQL family (§22.2 (cc)).
+     *
+     * @return 'standard'|'mysql-backslash'
      */
-    private function assertLiteralsAreStandard(): void
+    private function quotingRule(): string
     {
         $info = $this->guardValue(fn (): ?\Ferro\Protocol\PoolInfo => $this->ferro->poolInfo());
 
         if ($info?->literalsAreStandard === true) {
-            return;
+            return 'standard';
+        }
+        if ($info?->literalsAreStandard === false && $info->kind === 'mysql') {
+            return 'mysql-backslash';
         }
         throw new \LogicException(sprintf(
-            'Ferro: this pool (%s) does not advertise literals_are_standard=true (got %s), and '
-            . 'quoting a string literal safely without it needs backslash escaping this driver does '
-            . 'not implement. On PostgreSQL that means standard_conforming_strings is off (set it '
-            . "on — it is PostgreSQL's own default since 9.1), or the engine has not learned it yet "
-            . 'for this pool. Otherwise avoid DB::escape() / toRawSql() on this connection.',
+            'Ferro: this pool (%s) does not advertise a quoting rule this driver implements '
+            . '(literals_are_standard=%s on a %s pool), so it refuses to build a string literal '
+            . 'rather than guess. On PostgreSQL, false means standard_conforming_strings is off — '
+            . "set it on, PostgreSQL's own default since 9.1. NULL means the engine has not learned "
+            . 'it for this pool (an unreachable backend). Otherwise avoid DB::escape() / toRawSql() '
+            . 'on this connection.',
             $info->name ?? '(unknown pool)',
             $info === null ? 'no pool metadata' : var_export($info->literalsAreStandard, true),
+            $info->kind ?? 'unknown',
         ));
     }
 

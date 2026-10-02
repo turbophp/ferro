@@ -26,10 +26,10 @@ use PHPUnit\Framework\TestCase;
 final class PdoShimQuoteTest extends TestCase
 {
     /** A session whose HELLO_ACK advertised this pool's quoting rule. */
-    private static function advertising(?bool $literalsAreStandard): FakeSession
+    private static function advertising(?bool $literalsAreStandard, string $kind = 'postgres'): FakeSession
     {
         $session = new FakeSession();
-        $session->poolInfo = [new PoolInfo('main', 'postgres', 'PostgreSQL 17.10', $literalsAreStandard)];
+        $session->poolInfo = [new PoolInfo('main', $kind, $kind === 'postgres' ? 'PostgreSQL 17.10' : '8.4.11', $literalsAreStandard)];
         return $session;
     }
 
@@ -51,7 +51,7 @@ final class PdoShimQuoteTest extends TestCase
         $shim = new FerroPdoShim(new FerroClient(self::advertising(false), 'main'));
 
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessageMatches('/literals_are_standard=true.*got false/s');
+        $this->expectExceptionMessageMatches('/literals_are_standard=false on a postgres pool/');
         $shim->quote('anything');
     }
 
@@ -66,7 +66,65 @@ final class PdoShimQuoteTest extends TestCase
         $shim = new FerroPdoShim(new FerroClient(self::advertising(null), 'main'));
 
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessageMatches('/got NULL/i');
+        $this->expectExceptionMessageMatches('/literals_are_standard=NULL/');
+        $shim->quote('x');
+    }
+
+    /**
+     * M2-C1g: on a MySQL-family pool `false` is a rule this driver implements —
+     * `mysql_real_escape_string()`'s, which `pdo_mysql` applies when backslashes are escapes (every
+     * default `sql_mode`). Each case is the byte string `pdo_mysql` emits; `MySqlEscapeLiveTest`
+     * proves the equality against the real driver and the round trip through a real server.
+     *
+     * @return iterable<string,array{string,string}>
+     */
+    public static function mysqlBackslashCases(): iterable
+    {
+        yield 'quote' => ["Hello'World", "'Hello\\'World'"];
+        yield 'double quote' => ['say "hi"', "'say \\\"hi\\\"'"];
+        yield 'backslash' => ['a\\b', "'a\\\\b'"];
+        yield 'trailing backslash' => ['a\\', "'a\\\\'"];
+        yield 'backslash then quote' => ["\\'", "'\\\\\\''"];
+        yield 'NUL' => ["a\0b", "'a\\0b'"];
+        yield 'LF and CR' => ["a\nb\rc", "'a\\nb\\rc'"];
+        yield 'Ctrl-Z' => ["a\x1ab", "'a\\Zb'"];
+        yield 'multi-byte untouched' => ['héllo — ✓', "'héllo — ✓'"];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('mysqlBackslashCases')]
+    public function testAMySqlPoolWithBackslashEscapesQuotesAsPdoMysqlDoes(string $in, string $want): void
+    {
+        $shim = new FerroPdoShim(new FerroClient(self::advertising(false, 'mysql'), 'main'));
+
+        self::assertSame($want, $shim->quote($in));
+    }
+
+    /**
+     * Under `NO_BACKSLASH_ESCAPES` a MySQL pool advertises `true`, and the rule is the standard one —
+     * a backslash must NOT be doubled there, or every value containing one would gain a character.
+     */
+    public function testAMySqlPoolWithStandardLiteralsDoublesTheQuoteOnly(): void
+    {
+        $shim = new FerroPdoShim(new FerroClient(self::advertising(true, 'mysql'), 'main'));
+
+        self::assertSame("'it''s a\\b'", $shim->quote("it's a\\b"));
+    }
+
+    /** SQLite always advertises `true` (it has no backslash escape mode): doubling, nothing else. */
+    public function testASqlitePoolDoublesTheQuoteOnly(): void
+    {
+        $shim = new FerroPdoShim(new FerroClient(self::advertising(true, 'sqlite'), 'main'));
+
+        self::assertSame("'Hello''World\\'", $shim->quote("Hello'World\\"));
+    }
+
+    /** UNKNOWN refuses on the MySQL family too — `false` is honoured, `null` never is. */
+    public function testAnUnknownRuleRefusesOnAMySqlPool(): void
+    {
+        $shim = new FerroPdoShim(new FerroClient(self::advertising(null, 'mysql'), 'main'));
+
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessageMatches('/literals_are_standard=NULL on a mysql pool/');
         $shim->quote('x');
     }
 
