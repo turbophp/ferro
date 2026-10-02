@@ -147,7 +147,7 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   upstream) opens a second connection with `path` set to the argument; a Ferro connection ignores
   `path`, because the database is the engine pool's (SPEC §12 / D8, and D14 confines every file the
   engine opens), so it reaches the pool's existing database and returns without error. Measured
-  through upstream's `SqliteSchemaManagerTest::testCreateAndDropDatabase`, which asserts the file
+  through upstream's `Doctrine\DBAL\Tests\Functional\Schema\SqliteSchemaManagerTest::testCreateAndDropDatabase`, which asserts the file
   exists. Provision a database as a pool instead. On DBAL 4 the same call fails loudly rather than
   silently: `SQLitePlatform::getCreateDatabaseSQL()` throws `NotSupported`
   (`docs/dbal-suite/2026-10-02-c5b-dbal3-results.md`).
