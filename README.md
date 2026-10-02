@@ -143,7 +143,7 @@ Scope discipline is a design feature (SPEC §3):
 |---|---|---|
 | **M0** | `/proto` registry + golden vectors, frame codec + fuzzing, `ferrod` core (sessions, epochs), hand-rolled PG pool, EXEC/TX happy paths, sync PHP client, bench harness vs PDO baseline | ✅ complete — provisional D12 boundary measurement recorded in [bench/results/](bench/results/) (WSL2 environment; the §16.1 latency targets await a bare-metal reference re-run — see [bench/README.md](bench/README.md)) |
 | **M1** | Pin engine (protocol signals + assist lexer + conditional hygiene), full error taxonomy incl. `Indeterminate` + write-fate matrix, result streaming (deferred from M0), MySQL backend, canonical type coverage, Doctrine driver | ✅ complete — exit gate re-measured on the upstream DBAL 4 suite (SPEC §22.2) |
-| **M2** | Eloquent tier + PDO shim, observability (OTLP/Prometheus/slow log), SQLite engine-owned mode | 🔨 in progress — Eloquent tier on PG/SQLite/MySQL/MariaDB, SQLite backend, DBAL 3.8 bridge, slow log and Prometheus landed; OTLP, the admin service and the demo app remain |
+| **M2** | Eloquent tier + PDO shim, observability (OTLP/Prometheus/slow log), SQLite engine-owned mode | 🔨 in progress — Eloquent tier on PG/SQLite/MySQL/MariaDB, SQLite backend, DBAL 3.8 bridge, slow log, Prometheus and OTLP traces landed; the admin service, the demo app and the ORM suite remain |
 | M3 | Fibers multiplexing, `ferro check`/`gen` (build-time checked SQL, sqlx-style), manifest handshake, memfd large payloads, COPY API | planned |
 | M4 | MSSQL, manifest-only hardening mode, replica routing + lag gating, `ferro top` TUI | planned |
 | M5 | LISTEN/NOTIFY streams, Octane guidance, packaging (deb/rpm/container sidecar, systemd socket-activated units) | planned |

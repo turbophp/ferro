@@ -58,6 +58,13 @@ jobs:
       # `--wait` blocks on each service's compose healthcheck, so the suite never races a backend
       # that is listening but still running its init script.
       - run: docker compose -f testkit/docker-compose.yml up -d --wait pg mysql mariadb
+      # SPEC §13 OTLP (M2-C4c-2): the trace exporter's CONSUMER is a real OpenTelemetry Collector,
+      # and `ferrod`'s `otlp_it` drives one and reads back what it EXPORTED (a collector drops a
+      # misspelled field silently, with HTTP 200, so the status code proves nothing). Pinned by
+      # version AND checksum in ONE script shared with `ci/local-gate.sh`. Without it the test
+      # prints `skip:` and the no-skip gate below fails the lane.
+      - name: fetch the OpenTelemetry Collector (the OTLP e2e's consumer)
+        run: echo "FERRO_TEST_OTELCOL=$(./ci/fetch-otelcol.sh /tmp/otelcol)" >> "$GITHUB_ENV"
       - name: live suite (all three engines)
         run: |
           set -o pipefail

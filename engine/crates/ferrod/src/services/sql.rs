@@ -211,6 +211,16 @@ async fn handle_exec(
     // A malformed value is dropped and counted, never refused (see `crate::trace`).
     let trace = crate::trace::from_request(req.traceparent.as_deref());
 
+    // (1c) SPEC §13's OTLP span (M2-C4c-2), opened HERE — before any shape check — so a request
+    // refused for its shape is a span too: one EXEC, one END, one span. It rides the `Responder`,
+    // whose `end_*` finishes it whatever path declares the terminal. `begin` returns `None` for an
+    // unsampled statement (or when export is off), and only a sampled one pays for its fingerprint.
+    let responder = responder.with_span(
+        registry
+            .tracer()
+            .and_then(|t| t.begin(trace, || exec_span_attrs(registry, &req))),
+    );
+
     // (2) reject not-yet-supported request shapes (each: one END, session survives).
     if req.query_id.is_some() {
         responder.end_error(unsupported(
@@ -318,10 +328,7 @@ async fn handle_exec(
             match reply_rx.await {
                 Ok(ExecReply::Completed { result, exec_us }) => match result {
                     // queue_us is 0: a pinned conn is never queued for.
-                    Ok(qr) => match build_terminal_body(qr, req.fetch, 0, exec_us) {
-                        Ok(body) => responder.end_ok(Bytes::from(body)),
-                        Err(ep) => responder.end_error(ep),
-                    },
+                    Ok(qr) => declare_buffered_ok(responder, qr, req.fetch, 0, exec_us),
                     // The statement WAS transmitted on the pinned conn (sent=true). This is an
                     // in-transaction user STATEMENT (in_tx=true), NOT a control boundary: a
                     // link-loss here means the WHOLE TRANSACTION is dead (known outcome — it will
@@ -597,10 +604,7 @@ fn declare_autocommit_exec(
     readonly: bool,
 ) {
     match result {
-        Ok(r) => match build_terminal_body(r, fetch, queue_us, exec_us) {
-            Ok(body) => responder.end_ok(Bytes::from(body)),
-            Err(ep) => responder.end_error(ep),
-        },
+        Ok(r) => declare_buffered_ok(responder, r, fetch, queue_us, exec_us),
         Err(e) => responder.end_error(fate::classify_fate(
             e,
             OpContext {
@@ -610,6 +614,76 @@ fn declare_autocommit_exec(
             },
         )),
     }
+}
+
+/// Declare a BUFFERED EXEC's success terminal — or the per-request error when the result does not
+/// fit one frame — recording the statement's measurements on its OTLP span first. Shared by the
+/// autocommit and tx-scoped buffered paths, so the span's counts and the terminal's come from ONE
+/// place; the streamed path records its own at its `END`.
+fn declare_buffered_ok(
+    mut responder: Responder,
+    qr: QueryResult,
+    fetch: u8,
+    queue_us: u64,
+    exec_us: u64,
+) {
+    // Counted BEFORE `build_terminal_body` consumes the result. A `fetch:none` result returns no
+    // rows to the client, so it reports none here either.
+    let rows_returned = if fetch == FETCH_NONE {
+        0
+    } else {
+        qr.rows.len() as u64
+    };
+    let rows_affected = qr.affected;
+    match build_terminal_body(qr, fetch, queue_us, exec_us) {
+        Ok(body) => {
+            responder.record_exec(crate::otlp::ExecResult {
+                rows_returned,
+                rows_affected,
+                queue_us,
+                exec_us,
+                response_bytes: body.len() as u64,
+            });
+            responder.end_ok(Bytes::from(body));
+        }
+        Err(ep) => responder.end_error(ep),
+    }
+}
+
+/// The attributes of an EXEC's OTLP span (M2-C4c-2) — the slow log's redaction contract, applied
+/// to a span: the FINGERPRINT and never raw SQL, measurements, closed labels.
+///
+/// The pool name and family are recorded only for a pool the REGISTRY knows. For an unknown pool
+/// the name is text the client chose — on the tx path it is not even read — and a span is no place
+/// for client-chosen text; the error code says what happened.
+fn exec_span_attrs(registry: &PoolRegistry, req: &ExecRequest) -> Vec<crate::otlp::Attr> {
+    use crate::otlp::AttrValue::{Bool, Str};
+    let mut attrs = Vec::with_capacity(11);
+    if let Some(kind) = registry.kind(&req.pool) {
+        let system = match kind {
+            crate::config::PoolKind::Postgres => "postgresql",
+            crate::config::PoolKind::Mysql => "mysql",
+            crate::config::PoolKind::Sqlite => "sqlite",
+        };
+        attrs.push(("db.system.name", Str(system.to_string())));
+        attrs.push(("ferro.pool", Str(req.pool.clone())));
+    }
+    if let Some(sql) = req.sql.as_deref() {
+        attrs.push((
+            "db.query.text",
+            Str(crate::slow_log::fingerprint_of(sql).to_string()),
+        ));
+    }
+    let fetch = match req.fetch {
+        FETCH_ROWS => "rows",
+        FETCH_NONE => "none",
+        FETCH_STREAM => "stream",
+        _ => "unknown",
+    };
+    attrs.push(("ferro.fetch", Str(fetch.to_string())));
+    attrs.push(("ferro.in_tx", Bool(req.tx_id.is_some())));
+    attrs.push(("ferro.readonly", Bool(req.readonly)));
+    attrs
 }
 
 // ============================ M1-S5 Task 4b: the streaming producer ============================
@@ -940,7 +1014,7 @@ async fn open_streamed_raced<'a, B: PoolBackend>(
 #[allow(clippy::too_many_arguments)]
 async fn run_streamed_exec<B: PoolBackend>(
     mut handle: RowStreamHandle<'_, B>,
-    responder: Responder,
+    mut responder: Responder,
     cancel: &CancellationToken,
     deadline: Option<tokio::time::Instant>,
     cancel_handle: B::CancelHandle,
@@ -1094,6 +1168,13 @@ async fn run_streamed_exec<B: PoolBackend>(
                             exec_us,
                             sent_bytes,
                         );
+                        responder.record_exec(crate::otlp::ExecResult {
+                            rows_returned: streamed_rows,
+                            rows_affected: end.affected,
+                            queue_us: end.stats.queue_us,
+                            exec_us,
+                            response_bytes: sent_bytes + body.len() as u64,
+                        });
                         responder.end_ok(Bytes::from(body));
                         StreamEnded::Intact
                     }

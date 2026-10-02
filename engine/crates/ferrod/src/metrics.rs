@@ -264,6 +264,30 @@ pub fn render(registry: &PoolRegistry, boot_epoch: u64) -> String {
         "ferro_traceparent_invalid_total {}",
         crate::trace::invalid_total()
     );
+    // SPEC §13 OTLP export (M2-C4c-2). Present — as zeroes — when export is off, like every other
+    // series here: "no data" and "nothing happened" must not be the same observation to an alert.
+    let otlp = &crate::otlp::COUNTERS;
+    for (name, help, value) in [
+        (
+            "ferro_otlp_spans_exported_total",
+            "Spans an OTLP collector accepted (SPEC §13).",
+            otlp.exported(),
+        ),
+        (
+            "ferro_otlp_spans_dropped_total",
+            "Spans dropped because the export queue was full; the statement was never delayed (SPEC §13).",
+            otlp.dropped(),
+        ),
+        (
+            "ferro_otlp_spans_failed_total",
+            "Spans in an OTLP export that was refused, unreachable or timed out (SPEC §13).",
+            otlp.failed(),
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        let _ = writeln!(out, "{name} {value}");
+    }
     out
 }
 

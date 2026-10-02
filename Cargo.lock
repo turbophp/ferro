@@ -407,6 +407,7 @@ dependencies = [
  "mysql_async",
  "nix",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

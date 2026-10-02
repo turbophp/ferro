@@ -85,6 +85,11 @@ struct StreamSink {
 pub struct Responder {
     cell: Arc<Mutex<Option<Terminal>>>,
     sink: StreamSink,
+    /// The request's SPEC §13 OTLP span, when it is traced (M2-C4c-2). Finished by whichever
+    /// `end_*` declares the terminal — the one place every request is guaranteed to pass exactly
+    /// once — so one `END` is one span by construction. A `Responder` dropped without an `end_*`
+    /// drops its span too, which exports it as `NoTerminal` (see `otlp::ExecSpan`).
+    span: Option<crate::otlp::ExecSpan>,
 }
 
 impl Responder {
@@ -137,19 +142,41 @@ impl Responder {
             Responder {
                 cell: cell.clone(),
                 sink,
+                span: None,
             },
             cell,
         )
     }
 
+    /// Attach the request's OTLP span (M2-C4c-2). `None` — the statement is not traced — is a
+    /// no-op, so the caller need not branch.
+    pub fn with_span(mut self, span: Option<crate::otlp::ExecSpan>) -> Self {
+        self.span = span;
+        self
+    }
+
+    /// Record a successful EXEC's measurements on its span, if it has one. Called where the success
+    /// terminal is built, immediately before `end_ok`.
+    pub fn record_exec(&mut self, result: crate::otlp::ExecResult) {
+        if let Some(span) = self.span.as_mut() {
+            span.record(result);
+        }
+    }
+
     /// Declare success with `body` — the method-specific opaque result bytes (must already be a
     /// single complete MessagePack value, or empty; see `Outcome::encode`'s contract).
-    pub fn end_ok(self, body: Bytes) {
+    pub fn end_ok(mut self, body: Bytes) {
+        if let Some(span) = self.span.take() {
+            span.finish(crate::otlp::SpanOutcome::Ok);
+        }
         *self.cell.lock().unwrap() = Some(Terminal::Ok(body));
     }
 
     /// Declare failure.
-    pub fn end_error(self, ep: ErrorPayload) {
+    pub fn end_error(mut self, ep: ErrorPayload) {
+        if let Some(span) = self.span.take() {
+            span.finish(crate::otlp::SpanOutcome::Error(&ep));
+        }
         *self.cell.lock().unwrap() = Some(Terminal::Error(ep));
     }
 
@@ -157,7 +184,10 @@ impl Responder {
     /// cancel flag and calls this itself (or races it against its own natural completion); the
     /// supervisor never synthesizes `Cancelled` on its own (its synthetic path is reserved for
     /// the panic/no-terminal bug case and always uses `Terminal::Error`).
-    pub fn end_cancelled(self) {
+    pub fn end_cancelled(mut self) {
+        if let Some(span) = self.span.take() {
+            span.finish(crate::otlp::SpanOutcome::Cancelled);
+        }
         *self.cell.lock().unwrap() = Some(Terminal::Cancelled);
     }
 

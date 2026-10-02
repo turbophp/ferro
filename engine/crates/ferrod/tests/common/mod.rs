@@ -627,10 +627,31 @@ fn exec_server_configured(
     slow_log_ms: Option<u64>,
     log_params: ferrod::config::LogParams,
 ) -> (TestServer, Arc<PoolRegistry>) {
+    exec_server_with_config(url, |c| {
+        c.slow_log_ms = slow_log_ms;
+        c.log_params = log_params;
+    })
+}
+
+/// [`exec_server`] with SPEC §13's OTLP export configured (M2-C4c-2). Returns the registry too,
+/// so a test can drive the exporter's shutdown flush the way `main` does.
+pub fn exec_server_with_otlp(
+    url: String,
+    otlp: ferrod::otlp::OtlpConfig,
+) -> (TestServer, Arc<PoolRegistry>) {
+    exec_server_with_config(url, |c| c.otlp = Some(otlp))
+}
+
+/// One `default` pool at `url`, with `tune` applied to the daemon's `Config` before the registry is
+/// built — the shared body of the configured-server helpers.
+fn exec_server_with_config(
+    url: String,
+    tune: impl FnOnce(&mut Config),
+) -> (TestServer, Arc<PoolRegistry>) {
     // Kind is inferred from the DSN scheme (M1-S6), so `exec_server(mysql_url())` builds a MySQL
     // pool and `exec_server(pg_url())` a Postgres one — the SAME helper drives both dialects.
     let kind = ferrod::config::infer_pool_kind(&url);
-    let config = Config {
+    let mut config = Config {
         pools: vec![PoolSpec {
             name: "default".to_string(),
             dsn: url,
@@ -639,10 +660,9 @@ fn exec_server_configured(
             pin_on_unknown: true,
             allow_dir: None,
         }],
-        slow_log_ms,
-        log_params,
         ..Config::default()
     };
+    tune(&mut config);
     let registry = PoolRegistry::build(&config);
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
     let factory = sql::make_handler(

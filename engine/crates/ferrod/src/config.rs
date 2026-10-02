@@ -283,6 +283,10 @@ pub struct Config {
     /// upgrade. A port appearing on a host because a package was updated is the kind of surprise an
     /// operator should authorise, so the default is off and the documented value is a loopback one.
     pub metrics_addr: Option<String>,
+    /// SPEC §13's OTLP trace export (M2-C4c-2), or `None` — the default — to export nothing.
+    /// Resolved from OpenTelemetry's standard `OTEL_*` variables by `otlp::config_from`; a value it
+    /// cannot honour is logged at `error` and leaves tracing OFF rather than failing startup.
+    pub otlp: Option<crate::otlp::OtlpConfig>,
     /// Configured upstream connection pools (S5). Each `PoolSpec` names a pool and carries its DSN
     /// (§12 server-side secret — never sent to the client, never logged). Default: empty (the EXEC
     /// handler then answers every request with `Unsupported: unknown pool`). From `FERRO_POOLS`
@@ -307,6 +311,7 @@ impl Default for Config {
             slow_log_ms: None,
             log_params: LogParams::Never,
             metrics_addr: None,
+            otlp: None,
             pools: Vec::new(),
         }
     }
@@ -350,6 +355,15 @@ impl Config {
                 Some(t.to_string())
             };
         }
+        // SPEC §13 OTLP traces. An observability misconfiguration must not become an outage, so
+        // an unusable value disables tracing loudly instead of refusing to start.
+        cfg.otlp = match crate::otlp::config_from(&|k| std::env::var(k).ok()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "ferrod: OTLP trace export is DISABLED");
+                None
+            }
+        };
 
         cfg
     }

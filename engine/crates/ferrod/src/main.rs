@@ -97,6 +97,9 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Held past `serve` (which takes the registry) for the OTLP flush below.
+    let tracing_registry = registry.clone();
+
     serve(
         listener,
         config,
@@ -110,6 +113,11 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(tx) = metrics_shutdown {
         let _ = tx.send(true);
+    }
+    // SPEC §13 OTLP: export what is queued, bounded — a collector that is down must not hold the
+    // exit (a systemd stop would otherwise wait it out). Spans not out by then are lost, by design.
+    if let Some(tracer) = tracing_registry.tracer() {
+        tracer.shutdown(std::time::Duration::from_secs(2)).await;
     }
     tracing::info!("ferrod exiting");
     Ok(())
