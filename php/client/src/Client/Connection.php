@@ -15,6 +15,8 @@ use Ferro\Client\Hydration\PlanCache;
 use Ferro\Client\Value\M1ValuePolicy;
 use Ferro\Client\Value\TypePolicyOptions;
 use Ferro\Client\Value\ValuePolicy;
+use Ferro\Protocol\BackupRequest;
+use Ferro\Protocol\BackupResponse;
 use Ferro\Protocol\BeginRequest;
 use Ferro\Protocol\BeginResponse;
 use Ferro\Protocol\CodecException;
@@ -686,6 +688,76 @@ final class Connection
                 $session->abandonStream($rid);
             }
         }
+    }
+
+    // ---- admin service (SPEC §7.6, D15) -----------------------------------------------------------
+
+    /**
+     * Take a consistent online snapshot of this connection's SQLite pool — `ADMIN`/`BACKUP` (SPEC
+     * §7.6; `/proto/PROTOCOL.md` §11).
+     *
+     * `$file` is a plain FILE NAME (`[A-Za-z0-9._-]`, 1..200 bytes, not starting with `.`); the
+     * engine writes it into the pool's allowed directory, which the operator configures and the
+     * application never sees. Without `$replace` an existing name is refused; with it, the new
+     * snapshot is swapped in atomically and a failed backup leaves the previous one intact. The
+     * snapshot is mode 0600, owned by the engine's user.
+     *
+     * **This is an OPERATE verb (SPEC D15):** the engine runs it only for a process whose uid is in
+     * `FERRO_ADMIN_UIDS`, and an empty list — the default — disables it for everyone. A refusal is a
+     * {@see NonRetryableException} with code {@see C::ERR_FORBIDDEN}; so is a name the policy refuses
+     * and, by design, the name of a live database file. A non-SQLite pool is
+     * {@see C::ERR_UNSUPPORTED}: a server database is backed up with its own tooling.
+     *
+     * **Fate.** A backup never writes the source database, and the engine itself resolves the one
+     * file it creates (published or removed), so a lost or cancelled backup is never Indeterminate:
+     * a link lost mid-request is classified as a lost READ ({@see RetryableException}). Retrying is
+     * safe — without `$replace`, a backup that did complete before the link died answers the retry
+     * with "already exists" rather than duplicating anything.
+     *
+     * @param int|null $timeoutMs bound on the snapshot statement (u32); null leaves it unbounded
+     */
+    public function backup(string $file, bool $replace = false, ?int $timeoutMs = null): BackupResult
+    {
+        if ($timeoutMs !== null && ($timeoutMs < 0 || $timeoutMs > 0xFFFFFFFF)) {
+            throw new \InvalidArgumentException('timeoutMs must be null or a u32 (0..4294967295)');
+        }
+        $session = $this->requestSession(OpKind::Read, true);
+        $payload = BackupRequest::encode(
+            ['pool' => $this->pool, 'file' => $file, 'replace' => $replace, 'timeout_ms' => $timeoutMs],
+            $this->encodePacker,
+        );
+        try {
+            $outcome = $session->sendRequest(C::SERVICE_ADMIN, C::METHOD_ADMIN_BACKUP, $payload);
+        } catch (ConnectionLostException | TransportException $e) {
+            throw $this->fate->classifyLoss(
+                OpKind::Read,
+                true,
+                'BACKUP lost: ' . $e->getMessage(),
+                $e instanceof ConnectionLostException ? $e->errorPayload() : null,
+                $this->reconnect?->lastEpochChanged() ?? false,
+                sent: self::wasSent($e),
+            );
+        } catch (CodecException $e) {
+            throw new ProtocolException('failed to decode BACKUP terminal: ' . $e->getMessage(), 0, $e);
+        }
+        if (!$outcome->isOk()) {
+            throw ErrorMapper::fromOutcome($outcome);
+        }
+        try {
+            $off = 0;
+            $body = $outcome->body();
+            $w = $this->decodePacker->unpack($body, $off);
+            if (!is_array($w)) {
+                throw new CodecException('BackupResponse body is not an array');
+            }
+            if ($off !== strlen($body)) {
+                throw new CodecException('BackupResponse body has trailing bytes');
+            }
+            $r = BackupResponse::mapFromWire(array_values($w));
+        } catch (CodecException $e) {
+            throw new ProtocolException('failed to decode BACKUP response: ' . $e->getMessage(), 0, $e);
+        }
+        return new BackupResult($r['bytes'], $r['queue_us'], $r['exec_us']);
     }
 
     // ---- imperative transaction (the DBAL shape) -------------------------------------------------
