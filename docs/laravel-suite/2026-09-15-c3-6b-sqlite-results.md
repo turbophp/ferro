@@ -62,7 +62,7 @@ not a re-record.
 
 | case | cause |
 | --- | --- |
-| `EloquentModelRefreshTest::testItRefreshesModelExcludedByGlobalScope` (failure) | **Reproduces in the CONTROL.** Upstream's own on this framework/SQLite pair. |
+| ~~`EloquentModelRefreshTest::testItRefreshesModelExcludedByGlobalScope`~~ **`ConnectionThreadsCountTest::testGetThreadsCount`** (failure) — *corrected at the M2 exit, see below* | `if ($this->driver === 'sqlite') assertNull(...) else assertGreaterThanOrEqual(1, ...)`. Ferro answers `null`, which is SQLite's correct answer, and the test takes the wrong branch under a different driver NAME. The driver-name artifact. |
 | `SchemaBuilderTest::testCompoundPrimaryWithAutoIncrement` | `if ($this->driver === 'sqlite') markTestSkipped(…)` — the skip never fires under a different driver NAME, so the case runs against a limitation SQLite genuinely has. **It SKIPS in the alias column**, which is the proof rather than the argument. |
 | `SchemaBuilderTest::testAddingAutoIncrementColumn` | Same, same proof. |
 | `SchemaBuilderTest::testAlteringTableWithForeignKeyConstraintsEnabled` | **The one real incompatibility.** See below. |
@@ -170,3 +170,33 @@ The tier was built to the minimum that lets a connection open, and then the fail
   is a weaker gate than CI's and is stated as such — though it still earned its place: PHPStan L9
   caught four `method.notFound` calls and one statically dead guard in the new schema builder before
   the push.
+
+## Correction (2026-10-02, the M2 exit re-measurement)
+
+**This triage named the wrong test for the one failure, and called it "reproduces in the control",
+which the control's own recorded line contradicts** (`Errors: 2` and no failure, both of them the
+control-only cases). The M2 exit audit found it. The column was re-measured on `main` at `7902867`
+in the dev container (SQLite 3.53.2 bundled), twice per column, with `compare-columns.php`:
+
+- `ferro-sqlite`: `Tests: 633, Assertions: 2058, Errors: 3, Failures: 1, Skipped: 54, Risky: 1`
+  → **575 / 579**, the same in both runs (identical fail and skip sets by sha256).
+- `stock-sqlite` (control): `Tests: 633, Errors: 2, Skipped: 45, Risky: 1` → **586 / 588**, the
+  same sets in both runs. The assertion count differs between the two control runs (2103 against
+  2101), with the same outcomes.
+
+The four Ferro-only non-passes are:
+
+- **`ConnectionThreadsCountTest::testGetThreadsCount`**: driver-name branching, as in the corrected
+  row above.
+- **`SchemaBuilderTest::testCompoundPrimaryWithAutoIncrement`** and
+  **`testAddingAutoIncrementColumn`**: driver-name skips, as before.
+- **`SchemaBuilderTest::testAlteringTableWithForeignKeyConstraintsEnabled`**: the one real
+  incompatibility, as before.
+
+`EloquentModelRefreshTest::testItRefreshesModelExcludedByGlobalScope` has no assertions. It is the
+`Risky: 1` that every column reports, the control included, and it was never a non-pass.
+
+**Skip sets:** 11 tests the control runs are skipped under `ferro-sqlite`, and every one carries
+`#[RequiresDatabase('sqlite')]`. Eight are in `SchemaBuilderTest` and three are `testBasicUpdateForJson`
+data sets, so this is the same driver-NAME artifact the alias column exists to expose.
+
