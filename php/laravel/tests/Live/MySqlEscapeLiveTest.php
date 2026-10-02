@@ -96,9 +96,14 @@ final class MySqlEscapeLiveTest extends MySqlLiveTestCase
     }
 
     /**
-     * THE CASE THE PROPERTY EXISTS FOR, in the other direction: inside one transaction (one pinned
-     * connection) the application turns `NO_BACKSLASH_ESCAPES` ON, and the same literal must still read
-     * back as EXACTLY the same bytes — not merely stay one string.
+     * The other mode: inside one transaction (one pinned connection) the application turns
+     * `NO_BACKSLASH_ESCAPES` ON, and the same literal must still read back as EXACTLY the same bytes.
+     *
+     * A CONFIRMATION, not a discriminator (C1g review round 2): under this mode plain `''` doubling is
+     * itself correct, so this test cannot tell the hex form from doubling. The discriminators are the
+     * default-mode test above, the GBK test and the injection test — each fails when the hex arm is
+     * replaced by doubling. What this one does catch is a rule that is only right in the DEFAULT mode
+     * (e.g. `pdo_mysql`'s backslash table, which reads back with doubled backslashes here).
      */
     #[DataProvider('nastyStrings')]
     public function testTheSameLiteralReadsBackExactlyWithNoBackslashEscapesOn(string $raw): void
@@ -113,6 +118,46 @@ final class MySqlEscapeLiveTest extends MySqlLiveTestCase
 
         self::assertCount(1, $rows);
         self::assertSame($raw, $rows[0]->v, 'the literal read differently under NO_BACKSLASH_ESCAPES');
+    }
+
+    /**
+     * The hex form must BEHAVE like a string literal, not only read back like one — which is what the
+     * `_utf8mb4` introducer is for. Without it `X'…'` is a BINARY string (measured: `charset()` says
+     * `binary`): `UPPER()` leaves it unchanged, and it compares to another literal byte-for-byte, so
+     * `'back\slash' = 'BACK\slash'` stops matching. With it, the literal is a utf8mb4 string, exactly
+     * like `pdo_mysql`'s `'back\\slash'` (the control).
+     *
+     * Two of these assertions DISCRIMINATE and one does not, and the distinction was measured rather
+     * than assumed (C1g review round 2 found dropping the introducer survived every read-back test).
+     * Comparing against a COLUMN does not: a bare hex literal is coercible too, so the column's
+     * collation wins either way. `UPPER()` and the literal-to-literal comparison do, because no column
+     * decides there.
+     */
+    public function testTheHexFormBehavesLikeAStringLiteralNotABinaryOne(): void
+    {
+        $conn = $this->mysqlConnection();
+        $quoted = $conn->getPdo()->quote('back\\slash');
+        self::assertStringContainsString("X'", $quoted, 'the case under test is the hex form');
+        $pdo = self::pdoMysql()->quote('back\\slash');
+
+        $sql = static fn (string $lit): string =>
+            "select upper({$lit}) as u, ({$lit} = 'BACK\\\\SLASH') as eq, charset({$lit}) as cs";
+        $control = self::pdoMysql()->query($sql($pdo))->fetch(\PDO::FETCH_ASSOC);
+        $row = $conn->select($sql($quoted))[0];
+
+        self::assertSame(['u' => 'BACK\\SLASH', 'eq' => 1, 'cs' => 'utf8mb4'], [
+            'u' => $control['u'], 'eq' => (int) $control['eq'], 'cs' => $control['cs'],
+        ], 'the control: pdo_mysql\'s literal is a case-insensitive utf8mb4 string');
+        self::assertSame('BACK\\SLASH', $row->u, 'UPPER() of a binary string is a no-op');
+        self::assertSame(1, (int) $row->eq, 'a binary literal compares byte-for-byte');
+        self::assertSame('utf8mb4', $row->cs);
+
+        // Against a COLUMN the collation decides either way — asserted, but it does not discriminate.
+        $conn->statement('drop table if exists c1g_coll');
+        $conn->statement('create table c1g_coll (v varchar(64) collate utf8mb4_unicode_ci)');
+        $conn->table('c1g_coll')->insert(['v' => 'Back\\Slash']);
+        self::assertSame(1, (int) $conn->select("select count(*) as n from c1g_coll where v = {$quoted}")[0]->n);
+        $conn->statement('drop table c1g_coll');
     }
 
     /**

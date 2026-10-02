@@ -78,12 +78,24 @@ final class PdoShimQuoteTest extends TestCase
         }
     }
 
-    /** An unknown FAMILY refuses: there is no form this driver can vouch for. */
-    public function testAnUnknownFamilyRefuses(): void
+    /**
+     * An unknown FAMILY refuses on BOTH paths — with and without a backslash. (C1g review round 2:
+     * the backslash path's refusal had no test, and deleting it survived.)
+     *
+     * @return iterable<string,array{string}>
+     */
+    public static function anyString(): iterable
+    {
+        yield 'no backslash' => ['x'];
+        yield 'with a backslash' => ['a\\b'];
+    }
+
+    #[DataProvider('anyString')]
+    public function testAnUnknownFamilyRefuses(string $in): void
     {
         $this->expectException(\LogicException::class);
         $this->expectExceptionMessageMatches('/family "mssql" is not one this driver knows/');
-        self::shim('mssql')->quote('x');
+        self::shim('mssql')->quote($in);
     }
 
     /** No pool metadata at all is the same refusal — the family cannot be known. */

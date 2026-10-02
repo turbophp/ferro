@@ -535,7 +535,10 @@ upstream's own PDO driver:
   `DB::escape("O'Brien")` is `'O''Brien'` where `pdo_mysql` returns `'O\'Brien'` (the same string
   to the server — upstream's `MySql/EscapeTest::testEscapeString` compares the bytes and records
   it), and a value containing a backslash renders as `E'…'` or hex in `toRawSql()` output. It
-  refuses only when the pool's backend FAMILY is unknown. SPEC §22.2 (as), (at), (cc).
+  refuses only when the pool's backend FAMILY is unknown. One more difference, reachable only by
+  calling `getPdo()->quote()` directly (Illuminate rejects it first): invalid UTF-8 containing a
+  backslash fails LOUDLY on MySQL (`1300`, under any `sql_mode`) where `pdo_mysql` would build a
+  literal. SPEC §22.2 (as), (at), (cc).
 - **`DB::getPdo()->query()` and `prepare()` are refused.** There is no PDO underneath and a
   `PDOStatement` cannot be built without one, so code that reaches past Illuminate to the raw handle
   must use `DB::select()`/`DB::statement()` instead. Measured by upstream's

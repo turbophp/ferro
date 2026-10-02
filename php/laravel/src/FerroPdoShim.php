@@ -187,6 +187,9 @@ final class FerroPdoShim
      * the bytes, records it), and a string with a backslash renders as `E'…'` / hex in `toRawSql()`
      * output. The advertised `literals_are_standard` is not read here at all, so this method no longer
      * refuses on `nil` or `false`; it refuses only when it cannot tell which FAMILY it is quoting for.
+     * (Reachable only by calling this directly, since Illuminate rejects it first: INVALID UTF-8 with a
+     * backslash fails loudly on MySQL — `_utf8mb4 X'…'` is validated by the server, error 1300 under
+     * any `sql_mode` — where `pdo_mysql` would build a literal. Loud, never a misread.)
      *
      * **SPEC §21 D5 holds**: client-side, per-platform tables, no engine round trip (asserted on the
      * session's own sent-frame record).
