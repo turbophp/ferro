@@ -582,7 +582,8 @@ impl ToSql for PgFloat {
     /// binds under `ParameterType::STRING` but hands the driver whatever PHP value the entity holds,
     /// and an entity that assigns a float to a `decimal` field reaches here as a canonical `F64` —
     /// seven doctrine/orm functional tests (`TypeTest::testDecimal`, `DDC1884Test`, `GH9230Test`)
-    /// failed `F64 cannot bind numeric` where `pdo_pgsql` stringifies the float under `PARAM_STR`.
+    /// failed `F64 cannot bind numeric` where `pdo_pgsql` stringifies the float under `PARAM_STR`
+    /// (and what it stringifies TO differs — see [`f64_numeric_text`]).
     /// The driver cannot stringify instead, because `FloatType` binds under `STRING` too and the
     /// TEXT arm deliberately refuses the float widths (§22.2 (ap)).
     fn accepts(ty: &Type) -> bool {
@@ -603,12 +604,17 @@ impl ToSql for PgFloat {
     to_sql_checked!();
 }
 
-/// An `f64` as `numeric` input text: the SHORTEST decimal that round-trips to the same `f64` —
-/// Rust's `Display`, which is also what PHP's `(string)$float` produces under the default
-/// `serialize_precision = -1` and therefore exactly what `pdo_pgsql` sends under `PARAM_STR`
-/// (`0.30000000000000004`, not PostgreSQL's own 15-digit `float8::numeric` cast, which would give
-/// `0.3`). The non-finite values use PostgreSQL's spelling: `NaN`, and `Infinity`/`-Infinity`
-/// (numeric accepts infinities from PG 14; an older server refuses with its own known-fate `22P02`).
+/// An `f64` as `numeric` input text: the SHORTEST decimal that round-trips to the same `f64`
+/// (Rust's `Display`; PHP's `var_export`/`json_encode` form), so `numeric` receives exactly the
+/// value the application's float holds. **This is NOT what `pdo_pgsql` sends**, and the divergence
+/// is deliberate (SPEC §22.2 (ci), known-incompatibilities): PDO's `PARAM_STR` is PHP's `(string)`
+/// cast, which rounds to `precision = 14` significant digits first, so the two disagree for a float
+/// needing more digits (`0.1 + 0.2`: Ferro `0.30000000000000004`, PDO `0.3`) and at a rounding
+/// boundary of the column's scale (`0.00499999999999999` into `numeric(10,2)`: Ferro `0.00`, the
+/// correct rounding of that float; PDO `0.01`, a double rounding through `0.005`). Not PostgreSQL's
+/// own 15-digit `float8::numeric` cast either. The non-finite values use PostgreSQL's spelling:
+/// `NaN`, and `Infinity`/`-Infinity` (numeric accepts infinities from PG 14; an older server refuses
+/// with its own known-fate `22P02`).
 fn f64_numeric_text(f: f64) -> String {
     if f.is_nan() {
         "NaN".to_string()
@@ -1098,9 +1104,10 @@ mod tests {
         );
     }
 
-    /// **M2 (§22.2 (ci)): `F64 → numeric`**, as canonical TEXT in the shortest round-trip form —
-    /// PHP's `(string)$float`, which is what `pdo_pgsql` sends — with PostgreSQL's spellings of the
-    /// non-finite values. The float widths keep their binary form.
+    /// **M2 (§22.2 (ci)): `F64 → numeric`**, as canonical TEXT in the shortest round-trip form
+    /// (Rust's `Display` — NOT PHP's 14-digit `(string)` cast, see [`f64_numeric_text`]) with
+    /// PostgreSQL's spellings of the non-finite values. The float widths keep their binary form, and
+    /// a DOMAIN over `numeric` takes the numeric arm (the format is decided on the resolved type).
     #[test]
     fn orm_f64_binds_numeric_as_shortest_text() {
         assert!(accepts(&Value::F64(1.5), &Type::NUMERIC));
@@ -1115,6 +1122,19 @@ mod tests {
         assert!(matches!(
             PgFloat(1.5).encode_format(&Type::FLOAT4),
             Format::Binary
+        ));
+        // A DOMAIN over numeric must take the numeric arm — the format is decided on the RESOLVED
+        // type, or the text bytes would go out flagged binary (review F6).
+        let dom_numeric = Type::new(
+            "money_d".into(),
+            999_998,
+            tokio_postgres::types::Kind::Domain(Type::NUMERIC),
+            "public".into(),
+        );
+        assert!(accepts(&Value::F64(1.5), &dom_numeric));
+        assert!(matches!(
+            PgFloat(1.5).encode_format(&dom_numeric),
+            Format::Text
         ));
         for (f, text) in [
             (1.5, "1.5"),
@@ -1969,7 +1989,7 @@ mod tests {
             Type::new(
                 "dom_numeric".to_string(),
                 900_002,
-                Kind::Domain(Type::NUMERIC),
+                tokio_postgres::types::Kind::Domain(Type::NUMERIC),
                 "public".to_string(),
             ),
             Type::new(

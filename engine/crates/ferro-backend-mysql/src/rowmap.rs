@@ -126,12 +126,6 @@ pub enum MyKind {
     /// **MySQL 8's** `MYSQL_TYPE_JSON` → `Value::Json` (the raw document text). MariaDB never emits
     /// this type code — its `JSON` is a `LONGTEXT` alias and classifies as [`MyKind::Text`].
     Json,
-    /// `MYSQL_TYPE_NULL` → `Value::Null`: the type of a bare `SELECT NULL` (and of `NULL AS x` in
-    /// any projection), whose every cell is SQL NULL. Refused as `Unsupported` until the
-    /// doctrine/orm functional suite measured it (`NewOperatorTest`, §22.2 (ci)) — `pdo_mysql`
-    /// answers `[[null]]`, so refusing a column that can only hold NULL was refusing nothing
-    /// unsafe. A non-NULL cell under it is a decode mismatch, never coerced.
-    Null,
 }
 
 /// The string/blob family's Text-vs-Bytes decision: the binary collation (63) means a byte string,
@@ -234,7 +228,15 @@ pub fn column_kind(col: &Column) -> Result<MyKind, PoolError> {
         ColumnType::MYSQL_TYPE_SET => Err(unsupported(col, "SET")),
         ColumnType::MYSQL_TYPE_GEOMETRY => Err(unsupported(col, "GEOMETRY")),
         ColumnType::MYSQL_TYPE_VECTOR => Err(unsupported(col, "VECTOR")),
-        ColumnType::MYSQL_TYPE_NULL => Ok(MyKind::Null),
+        // **Refused DELIBERATELY, and the refusal is what keeps the fate honest** (SPEC §22.2 (ci)).
+        // `MYSQL_TYPE_NULL` is what a bare `SELECT NULL` declares — but it is ALSO what MariaDB
+        // declares at PREPARE time for a bare `?` in the select list (`SELECT ? AS p`), whose
+        // executed cells are whatever was bound. Classified from this prepared metadata, admitting
+        // it let such a statement RUN and then fail to decode a non-NULL cell: measured, a
+        // `SELECT bump(), ?` applied its write and reported a known failure. Refused here, the
+        // statement is never sent. Admitting it would need the EXECUTED set's metadata on both the
+        // buffered and the streamed path (the (av)/(aw) shape), which is not built.
+        ColumnType::MYSQL_TYPE_NULL => Err(unsupported(col, "NULL-typed")),
         // The server-internal codes (NEWDATE, DATETIME2, TIMESTAMP2,
         // TIME2, TYPED_ARRAY, UNKNOWN) which no live server sends on the client protocol.
         _ => Err(unsupported(col, "out-of-scope column type")),
@@ -262,7 +264,6 @@ pub fn column_to_tag(col: &Column) -> Result<u8, PoolError> {
         MyKind::Timestamp => tag::TIMESTAMP,
         MyKind::TimestampTz => tag::TIMESTAMPTZ,
         MyKind::Json => tag::JSON,
-        MyKind::Null => tag::NULL,
     })
 }
 
@@ -313,11 +314,6 @@ pub fn extract_value(value: &MyValue, col: &Column) -> Result<Value, PoolError> 
             mytext::timestamptz_to_text,
         )?)),
         MyKind::Json => Ok(Value::Json(render(col, value, mytext::json_to_text)?)),
-        // Every NULL cell returned above; anything else under a NULL-typed column is a mismatch.
-        MyKind::Null => Err(decode_err(
-            col,
-            "a non-NULL cell in a NULL-typed column".to_string(),
-        )),
     }
 }
 
@@ -755,6 +751,7 @@ mod tests {
             ),
             (ColumnType::MYSQL_TYPE_GEOMETRY, NO_FLAGS, 0, BIN),
             (ColumnType::MYSQL_TYPE_VECTOR, NO_FLAGS, 0, BIN),
+            (ColumnType::MYSQL_TYPE_NULL, NO_FLAGS, 0, BIN),
         ];
         for (ct, flags, len, charset) in cases {
             let c = col(ct, flags, len, charset);
@@ -928,17 +925,6 @@ mod tests {
                     MyValue::Bytes(br#"{"a": 1}"#.to_vec()),
                     Value::Json(r#"{"a": 1}"#.into()),
                 )],
-                // §22.2 (ci): the only cell a NULL-typed column can carry, and HEAD promises NULL.
-                MyKind::Null => vec![(
-                    col(
-                        ColumnType::MYSQL_TYPE_NULL,
-                        ColumnFlags::BINARY_FLAG,
-                        0,
-                        BIN,
-                    ),
-                    MyValue::NULL,
-                    Value::Null,
-                )],
             }
         }
 
@@ -958,8 +944,7 @@ mod tests {
                 MyKind::Time => MyKind::Timestamp,
                 MyKind::Timestamp => MyKind::TimestampTz,
                 MyKind::TimestampTz => MyKind::Json,
-                MyKind::Json => MyKind::Null,
-                MyKind::Null => return None,
+                MyKind::Json => return None,
             })
         }
 

@@ -62,8 +62,14 @@ jobs:
               grep -qE '^(OK|Tests: )' "$f" || { echo "::error:: $f has no phpunit result line"; tail -40 "$f"; rc=1; }
               grep -q '\[ferro\] reset: ' "$f" || { echo "::error:: $f has no reset line"; rc=1; }
               case "$col" in
-                control*) grep -q '^\[control\] .*driver=Doctrine' "$f" || { echo "::error:: $f: the control's contact line is missing"; rc=1; } ;;
-                *)        grep -q '^\[ferro\] orm=' "$f" || { echo "::error:: $f: the Ferro contact line is missing"; rc=1; } ;;
+                control*) grep -qE '^\[control\] .* native=(PDO|Pdo.[A-Za-z]+) ' "$f" || { echo "::error:: $f: the control did not reach a PDO connection"; rc=1; } ;;
+                *)        grep -q '^\[ferro\] .* native=Ferro.Client.Connection ' "$f" || { echo "::error:: $f: the Ferro column did not reach a Ferro connection"; rc=1; } ;;
+              esac
+              # The SERVER the column claims: MySQL and MariaDB sit on adjacent ports speaking one
+              # protocol, so a mislabelled column would record a plausible number for the wrong one.
+              case "${{ matrix.family }}" in
+                mysql)   grep -q '^\[[a-z]*\] .* server=[^ ]*' "$f" && ! grep -q '^\[[a-z]*\] .* server=.*MariaDB' "$f" || { echo "::error:: $f: the mysql column did not reach MySQL"; rc=1; } ;;
+                mariadb) grep -q '^\[[a-z]*\] .* server=.*MariaDB' "$f" || { echo "::error:: $f: the mariadb column did not reach MariaDB"; rc=1; } ;;
               esac
             done
             php testkit/dbal/compare-columns.php "$col-run2.xml" "$col-run1.xml" > "repro-$col.txt" || true

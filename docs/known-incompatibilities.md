@@ -175,7 +175,10 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   checkout means it can only see this tenant's `nextval()` (SPEC §22.2 (ci);
   `LastInsertIdLiveTest::testPostgresNeverAnswersWithThePreviousTenantsSequenceValue`). It has
   `pdo_pgsql`'s failure mode too: with no `nextval()` yet in the transaction PostgreSQL raises
-  `55000`, which aborts the transaction. OUTSIDE a transaction it throws, because the autocommit
+  `55000`, which aborts the transaction. **One difference from PDO:** the transaction's session starts
+  with EMPTY sequence state (the same hygiene that makes the answer safe), so an INSERT made BEFORE
+  `beginTransaction()` is invisible inside it — `pdo_pgsql` answers that key, Ferro raises `55000`
+  and the transaction is aborted. Do the INSERT inside the transaction. OUTSIDE a transaction it throws, because the autocommit
   statement's connection has gone back to the pool and a follow-up would run on a **different
   connection** and return a silently wrong key — use `INSERT … RETURNING id` or a transaction. The
   thrown class is the SPI's own `Doctrine\DBAL\Driver\Exception\NoIdentityValue`, wrapped by DBAL into
@@ -201,7 +204,8 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   functional suite under its stock configuration: **1571 of 1597** executed tests pass against a
   `pdo_pgsql` control at 1597/1597, up from 397 (`docs/orm-suite/2026-10-02-local-results.md`). What
   remains is code that calls `lastInsertId()` itself OUTSIDE a transaction (4 of those tests). **ORM
-  adoption on PostgreSQL is config-only.**
+  identity generation on PostgreSQL is config-only** (a database-defaulted sub-second `timestamptz`
+  column is still refused — see *Values*).
 - **ORM multi-table DELETE/UPDATE on class-table inheritance needs an explicit transaction.**
   `MultiTableDeleteExecutor` issues `CREATE TEMPORARY TABLE`, `INSERT`, `DELETE` and `DROP` as four
   separate statements with no transaction; on a transaction-mode pool statements 2-4 land on
@@ -294,6 +298,20 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   `Y-m-d H:i:sO` on PostgreSQL and `Y-m-d H:i:s` on the MySQL family, so no canonical RFC3339 form
   parses anywhere. A whole-second `TIMESTAMPTZ` is re-rendered into the platform's own format; a
   sub-second one is refused.
+- **A PHP float bound into a PostgreSQL `numeric` stores the float's exact shortest form, not PDO's
+  14-digit rendering.** `pdo_pgsql` sends a float under `PARAM_STR` as PHP's `(string)` cast, which
+  rounds to 14 significant digits first; Ferro sends the shortest decimal that round-trips to the same
+  float. They store different values for a float that needs more digits (`0.1 + 0.2`: Ferro
+  `0.30000000000000004`, PDO `0.3`) and at a rounding boundary of the column's scale
+  (`0.00499999999999999` into `numeric(10,2)`: Ferro `0.00` — the correct rounding of that float — PDO
+  `0.01`, a double rounding through `0.005`). Deliberate: Ferro stores what the application holds. Bind
+  a decimal as a STRING to control the digits exactly (SPEC §22.2 (ci)).
+- **On MySQL/MariaDB, a NULL-typed select-list column is refused before execution** — `SELECT NULL`,
+  and, on MariaDB, a bare parameter in the select list (`SELECT ? AS p`), which MariaDB declares the
+  same way when the statement is prepared. Classified from that metadata, admitting the type would let
+  the statement run and then fail to read its value — a write applied and reported as a failure — so
+  it is refused with the statement never sent (SPEC §22.2 (ci)). Cast it (`CAST(NULL AS CHAR)`,
+  `CAST(? AS SIGNED)`) to give the column a type.
 - **An integer parameter above `PHP_INT_MAX` is refused client-side**, not silently saturated
   (a PHP `(int)` cast saturates rather than wrapping). Bind it as a string against a `numeric`
   column, or keep it in `bigint` range.

@@ -895,40 +895,60 @@ async fn deferred_column_types_are_refused_before_execution(url: &str, label: &s
     conn.disconnect().await;
 }
 
-/// **§22.2 (ci): a NULL-typed column reads as NULL.** `SELECT NULL` — and `NULL AS x` beside real
-/// columns, the shape doctrine/orm's `NewOperatorTest` hydrates — arrives as `MYSQL_TYPE_NULL`,
-/// which was refused as `Unsupported` until the ORM suite measured it (`pdo_mysql` answers
-/// `[[null]]`). HEAD promises the NULL tag for it, and the real column beside it is unaffected.
-async fn null_typed_columns_read_as_null(url: &str, label: &str) {
+/// **§22.2 (ci): a NULL-typed select list is refused BEFORE execution, never after.** MariaDB
+/// declares a bare `?` in the select list as `MYSQL_TYPE_NULL` at prepare time, so admitting that
+/// type from prepared metadata let `SELECT ?` run and then fail to decode its non-NULL cell — a
+/// statement that had RUN reported as a known failure (the adversarial review measured a write
+/// applied that way). The property pinned here is the FATE: each shape is either refused with the
+/// statement never executed (`Com_stmt_execute` unchanged on the same session), or — where a
+/// server declares a real type — answered correctly. Never executed-then-refused.
+async fn null_typed_select_lists_are_refused_before_execution(url: &str, label: &str) {
     let backend = MysqlBackend::new(url);
     let mut conn = backend.connect().await.expect("connect");
-    let (head, v) = one(&backend, &mut conn, "NULL").await;
-    assert_eq!(v, Value::Null, "[{label}] SELECT NULL");
-    assert_eq!(
-        head,
-        Value::Null.tag(),
-        "[{label}] HEAD promises NULL for a NULL-typed column"
-    );
-
-    let r = backend
-        .query(
-            &mut conn,
-            "SELECT NULL AS n, 7 AS i, ? AS p",
-            &[Value::Null],
-        )
-        .await
-        .unwrap_or_else(|e| panic!("[{label}] a NULL projection beside real columns: {e:?}"));
-    assert_eq!(
-        r.rows,
-        vec![vec![Value::Null, Value::I64(7), Value::Null]],
-        "[{label}]"
-    );
-    assert_eq!(r.cols[0].tag, Value::Null.tag(), "[{label}]");
-    assert_eq!(
-        r.cols[1].tag,
-        Value::I64(0).tag(),
-        "[{label}] the real column is unaffected"
-    );
+    async fn executes(conn: &mut MysqlConn) -> u64 {
+        let row: (String, String) = conn
+            .driver_mut()
+            .query_first("SHOW SESSION STATUS LIKE 'Com_stmt_execute'")
+            .await
+            .expect("read Com_stmt_execute")
+            .expect("Com_stmt_execute row");
+        row.1.parse().expect("a counter")
+    }
+    for (sql, params, want) in [
+        ("SELECT NULL AS n", vec![], Value::Null),
+        ("SELECT ? AS p", vec![Value::I64(5)], Value::I64(5)),
+        // A STRING into the same shape: any classifier that GUESSES a type for a NULL-typed column
+        // (rather than refusing it) runs the statement and then mis-decodes one of these two.
+        (
+            "SELECT ? AS s",
+            vec![Value::Text("x".into())],
+            Value::Text("x".into()),
+        ),
+    ] {
+        let before = executes(&mut conn).await;
+        match backend.query(&mut conn, sql, &params).await {
+            Err(PoolError::Unsupported(msg)) => {
+                assert!(msg.contains("NULL-typed"), "[{label}] `{sql}`: {msg}");
+                assert_eq!(
+                    executes(&mut conn).await,
+                    before,
+                    "[{label}] `{sql}` was refused AFTER it executed — the refusal must come first"
+                );
+                println!("  [{label}] `{sql}` -> refused before execution");
+            }
+            Ok(r) => {
+                assert_eq!(
+                    r.rows,
+                    vec![vec![want.clone()]],
+                    "[{label}] `{sql}` answered wrongly"
+                );
+                println!("  [{label}] `{sql}` -> answered (the server declared a real type)");
+            }
+            Err(e) => {
+                panic!("[{label}] `{sql}` must be refused before execution or answered: {e:?}")
+            }
+        }
+    }
     conn.disconnect().await;
 }
 
@@ -1640,9 +1660,9 @@ both_engines!(
 );
 
 both_engines!(
-    null_typed_columns_read_as_null,
-    mysql_null_typed_columns_read_as_null,
-    mariadb_null_typed_columns_read_as_null
+    null_typed_select_lists_are_refused_before_execution,
+    mysql_null_typed_select_lists_are_refused_before_execution,
+    mariadb_null_typed_select_lists_are_refused_before_execution
 );
 
 /// MariaDB-only (the types do not exist on MySQL 8).

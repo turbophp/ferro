@@ -327,8 +327,9 @@ final class Result implements ResultInterface
      * The first cell of every remaining row, looped over `fetchNumeric()` — deliberately NOT
      * delegated to `FetchUtils::fetchFirstColumn()`, which is `while (($v = fetchOne()) !== false)`
      * and therefore stops at the first cell that IS `false`: a boolean column whose first value is
-     * false came back as `[]`, with no error (measured through the doctrine/orm functional suite,
-     * `GH9230Test`, on PostgreSQL `boolean` and on a MySQL `TINYINT(1)`, which reads as BOOL). PDO
+     * false came back as `[]`, with no error (measured through the doctrine/orm functional suite's
+     * `GH9230Test` on PostgreSQL `boolean`, and by a separate probe on a MySQL `TINYINT(1)`, which
+     * reads as BOOL — DBAL 4 creates `tinyint(4)`, so the suite itself cannot reach it there). PDO
      * never had the bug because its results answer with `PDO::FETCH_COLUMN`; `fetchNumeric()` is
      * the one call whose end-of-result `false` cannot collide with a value (§22.2 (ci)).
      *

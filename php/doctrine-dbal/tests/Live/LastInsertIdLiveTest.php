@@ -93,6 +93,33 @@ final class LastInsertIdLiveTest extends DbalLiveTestCase
     }
 
     /**
+     * TWO sequences, so `currval(name)` and `lastval()` give DIFFERENT answers — with one, a named
+     * call that silently ran `lastval()` would pass (review F3). Unnamed is the most recent
+     * `nextval()` on either major; DBAL 3's named form answers that sequence's own value.
+     */
+    public function testPostgresNamedSequenceIsCurrvalNotLastval(): void
+    {
+        $c = $this->dbal();
+        $c->executeStatement('DROP TABLE IF EXISTS s8b_lid_a');
+        $c->executeStatement('DROP TABLE IF EXISTS s8b_lid_b');
+        $c->executeStatement('CREATE TABLE s8b_lid_a (id serial primary key, n int)');
+        $c->executeStatement('CREATE TABLE s8b_lid_b (id serial primary key, n int)');
+        $c->executeStatement("SELECT setval('s8b_lid_b_id_seq', 500)");
+
+        $c->beginTransaction();
+        $c->executeStatement('INSERT INTO s8b_lid_a (n) VALUES (1)');
+        $c->executeStatement('INSERT INTO s8b_lid_b (n) VALUES (1)');
+        self::assertSame(501, (int) $c->lastInsertId(), 'unnamed: the most recent nextval()');
+        if (self::isDbal3()) {
+            self::assertSame(1, (int) $c->lastInsertId('s8b_lid_a_id_seq'), 'named: that sequence');
+        }
+        $c->commit();
+
+        $c->executeStatement('DROP TABLE s8b_lid_a');
+        $c->executeStatement('DROP TABLE s8b_lid_b');
+    }
+
+    /**
      * **The safety half.** `lastval()` is SESSION state, and a pooled session outlives its tenant —
      * so a transaction that lands on a RECYCLED connection must not answer with the PREVIOUS tenant's
      * `nextval()`. Hygiene's `DISCARD SEQUENCES` (§7.3) is what clears it. The test proves it got the

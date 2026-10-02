@@ -391,13 +391,16 @@ abstract class AbstractConnection
      *    (`DISCARD SEQUENCES` in the targeted profile, `DISCARD ALL` in the full one — §7.3) so no
      *    earlier tenant's `nextval()` can answer. Doctrine ORM's identity generator always runs
      *    inside the unit of work's transaction, which is what made ORM on PostgreSQL work under its
-     *    stock IDENTITY mapping. `lastval()` has `pdo_pgsql`'s semantics exactly — the session's
-     *    most recent `nextval()` of ANY sequence (a trigger's included) — and its failure mode too:
-     *    with no `nextval()` yet it raises `55000`, which aborts the transaction, as under PDO.
-     *  - **outside one it throws**, because the autocommit statement's connection has gone back to
-     *    the pool and a `lastval()` would run on whichever connection the next checkout gets — a
-     *    silently wrong key. The message names the working answers (`INSERT … RETURNING`, a
-     *    transaction, or the ORM's SEQUENCE strategy — D-S8b-5).
+     *    stock IDENTITY mapping. `lastval()` is the session's most recent `nextval()` of ANY
+     *    sequence (a trigger's included), as under `pdo_pgsql` — with ONE difference that follows
+     *    from the hygiene that makes it safe: the session's sequence state starts EMPTY at the
+     *    transaction's checkout, so an INSERT made before `beginTransaction()` is invisible here.
+     *    `pdo_pgsql` (one long-lived session) answers that earlier key; Ferro raises `55000`, which
+     *    — exactly as under PDO when there is no `nextval()` at all — ABORTS the transaction.
+     *  - **outside one it throws**: the autocommit INSERT's session has gone back to the pool, and a
+     *    follow-up would run on whatever session the next checkout gets — reset, so it could only
+     *    ever answer `55000`, never the key. The message names the working answers
+     *    (`INSERT … RETURNING`, or the INSERT and the read inside one transaction).
      *
      * The thrown class is `Doctrine\DBAL\Driver\Exception\NoIdentityValue` — the SPI's own signal,
      * which all six bundled drivers (PDO, PgSQL, Mysqli, SQLite3, SQLSrv, IBMDB2) throw here. S8b
@@ -445,11 +448,11 @@ abstract class AbstractConnection
         return match ($this->poolKind) {
             PlatformVersion::KIND_POSTGRES =>
                 'Ferro: PostgreSQL reports no generated key on the wire, and outside a transaction '
-                . 'Ferro will not emulate lastInsertId() with a follow-up lastval() — on a '
-                . 'transaction-mode pool that runs on a different connection and returns a wrong '
-                . 'key. Inside a transaction it does (the connection is pinned). Use '
-                . '`INSERT … RETURNING id`, run the INSERT in a transaction, or configure '
-                . 'Doctrine ORM to use the SEQUENCE identity strategy on PostgreSQL.',
+                . 'Ferro cannot recover it: on a transaction-mode pool the INSERT\'s session has '
+                . 'gone back to the pool, and a follow-up lastval() would run on another, reset '
+                . 'session. Inside a transaction the connection is pinned and lastInsertId() '
+                . 'answers. Use `INSERT … RETURNING id`, run the INSERT and lastInsertId() in one '
+                . 'transaction, or configure Doctrine ORM to use the SEQUENCE identity strategy.',
             // SQLite DOES report a key (`last_insert_rowid()`), so this arm is the genuine
             // "nothing was generated" case rather than PostgreSQL's structural absence — but
             // the counter is STICKY, so the engine reports it only when the statement actually

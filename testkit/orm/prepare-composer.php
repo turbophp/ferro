@@ -33,5 +33,9 @@ $json['repositories'] = [
     ['type' => 'path', 'url' => $root . '/php/doctrine-dbal', 'options' => ['symlink' => true]],
 ];
 $json['config']['allow-plugins'] = false;
+// What the measured tree set (they are Composer's defaults, made explicit so a change upstream
+// cannot quietly resolve dev versions of the dependencies).
+$json['minimum-stability'] = 'stable';
+$json['prefer-stable'] = true;
 
 file_put_contents($file, json_encode($json, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");

@@ -5,10 +5,11 @@
 #   FERRO_ORM_SVC       pg | psql (local PostgreSQL) | mysql | mariadb | mysql-local
 #   FERRO_ORM_CONTROL   1 = upstream's own pdo_pgsql/pdo_mysql, no Ferro anywhere (the contact
 #                       assertion INVERTS and refuses a Ferro connection)
-#   FERRO_ORM_SEQUENCE  1 = the D-S8b-5 remedy as a labelled harness change: PostgreSQL identity
-#                       generation prefers SEQUENCE. Without it the ORM maps AUTO to IDENTITY on
-#                       PostgreSQL under DBAL 4, which needs lastInsertId() — which PostgreSQL does not
-#                       report through Ferro. The stock-config column is the honest measure of that.
+#   FERRO_ORM_SEQUENCE  1 = the old D-S8b-5 remedy as a labelled harness change: PostgreSQL identity
+#                       generation prefers SEQUENCE. Under DBAL 4 the ORM maps AUTO to IDENTITY on
+#                       PostgreSQL, which needs lastInsertId() — answered inside a transaction since
+#                       §22.2 (ci). The STOCK-config column is the one that measures config-only
+#                       adoption; this one is kept to show the two configurations agree.
 #   FERRO_ORM_SRC       an existing prepared clone to reuse (skips clone + composer)
 #
 # NO `docker compose down` TRAP OF ANY KIND — the only EXIT trap kills the ferrod THIS script
@@ -42,7 +43,12 @@ if [ -z "${FERRO_ORM_SRC:-}" ]; then
   [ -n "$dbal" ] || { echo "::error:: cannot read doctrine/dbal's version from php/doctrine-dbal/composer.lock"; exit 1; }
   (cd "$src" && git checkout -q -- composer.json)
   php "$root/testkit/orm/prepare-composer.php" "$src" "$root" "$dbal"
-  (cd "$src" && rm -f composer.lock && composer update --no-interaction --no-progress ${FERRO_ORM_COMPOSER_FLAGS:-})
+  # Resolve once per prepared composer.json, not once per run (a lane runs the suite 8 times).
+  stamp="$(sha256sum "$src/composer.json" | cut -d' ' -f1)"
+  if [ ! -f "$src/vendor/.ferro-stamp" ] || [ "$(cat "$src/vendor/.ferro-stamp")" != "$stamp" ]; then
+    (cd "$src" && rm -f composer.lock && composer update --no-interaction --no-progress ${FERRO_ORM_COMPOSER_FLAGS:-})
+    echo "$stamp" > "$src/vendor/.ferro-stamp"
+  fi
 fi
 
 # 1b. The vendor tree must carry THIS checkout's packages — a symlinked path repository resolved

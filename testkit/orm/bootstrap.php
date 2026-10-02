@@ -39,11 +39,13 @@ if ($expect !== '' && $db !== $expect) {
     exit(1);
 }
 fwrite(STDOUT, sprintf(
-    "[%s] orm=%s dbal=%s driver=%s platform=%s server=%s database=%s sequence-preference=%s\n",
+    "[%s] orm=%s dbal=%s native=%s platform=%s server=%s database=%s sequence-preference=%s\n",
     $control ? 'control' : 'ferro',
     Composer\InstalledVersions::getPrettyVersion('doctrine/orm'),
     Composer\InstalledVersions::getPrettyVersion('doctrine/dbal'),
-    get_class($conn->getDriver()),
+    // The NATIVE connection, not getDriver(): the suite wraps every driver in a logging middleware,
+    // so the driver slot names the middleware in both columns and distinguishes nothing.
+    get_debug_type($native),
     get_class($platform),
     $server,
     $db,
