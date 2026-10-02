@@ -21,7 +21,8 @@ async fn mode_says_standard(conn: &mut MysqlConn) -> bool {
         .await
         .expect("read sql_mode")
         .expect("one row");
-    m.split(',').any(|f| f.eq_ignore_ascii_case("NO_BACKSLASH_ESCAPES"))
+    m.split(',')
+        .any(|f| f.eq_ignore_ascii_case("NO_BACKSLASH_ESCAPES"))
 }
 
 /// Oracle 2: the property itself. `'a\b'` is three characters when a backslash is ordinary and
@@ -37,14 +38,23 @@ async fn backslash_is_ordinary(conn: &mut MysqlConn) -> bool {
     n == 3
 }
 
-async fn assert_state(backend: &MysqlBackend, conn: &mut MysqlConn, label: &str, step: &str) -> bool {
+async fn assert_state(
+    backend: &MysqlBackend,
+    conn: &mut MysqlConn,
+    label: &str,
+    step: &str,
+) -> bool {
     // Read the bit FIRST: the oracle queries below produce their own OK packets, and the claim
     // under test is about the packet the connection already had.
     let bit = backend.literals_are_standard(conn);
     let mode = mode_says_standard(conn).await;
     let semantic = backslash_is_ordinary(conn).await;
     assert_eq!(mode, semantic, "[{label}/{step}] the two oracles disagree");
-    assert_eq!(bit, Some(mode), "[{label}/{step}] the advertised bit must be the server's answer");
+    assert_eq!(
+        bit,
+        Some(mode),
+        "[{label}/{step}] the advertised bit must be the server's answer"
+    );
     println!("[{label}/{step}] literals_are_standard = {bit:?}");
     mode
 }
@@ -64,7 +74,10 @@ async fn literals_bit_tracks_the_session(url: &str, label: &str) {
         )
         .await
         .expect("enable NO_BACKSLASH_ESCAPES");
-    assert!(assert_state(&backend, &mut conn, label, "on").await, "[{label}] the SET took effect");
+    assert!(
+        assert_state(&backend, &mut conn, label, "on").await,
+        "[{label}] the SET took effect"
+    );
     backend
         .simple_query(
             &mut conn,
@@ -72,7 +85,10 @@ async fn literals_bit_tracks_the_session(url: &str, label: &str) {
         )
         .await
         .expect("disable NO_BACKSLASH_ESCAPES");
-    assert!(!assert_state(&backend, &mut conn, label, "off").await, "[{label}] the SET took effect");
+    assert!(
+        !assert_state(&backend, &mut conn, label, "off").await,
+        "[{label}] the SET took effect"
+    );
 
     // ---- hygiene restores the server default (the probe reads a reset session) -----------------
     backend

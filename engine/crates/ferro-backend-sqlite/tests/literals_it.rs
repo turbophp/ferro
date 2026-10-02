@@ -24,8 +24,16 @@ async fn literals_are_standard_is_a_constant_of_the_library() {
         )
         .await
         .expect("query");
-    assert_eq!(r.rows[0][0], Value::I64(3), "a backslash is an ordinary character");
-    assert_eq!(r.rows[0][1], Value::Text("it's".into()), "a doubled quote is the escape");
+    assert_eq!(
+        r.rows[0][0],
+        Value::I64(3),
+        "a backslash is an ordinary character"
+    );
+    assert_eq!(
+        r.rows[0][1],
+        Value::Text("it's".into()),
+        "a doubled quote is the escape"
+    );
     // A value ENDING in a backslash, quoted by doubling only: the backslash does not consume the
     // closing quote, which is the property a quoting function depends on.
     assert_eq!(r.rows[0][2], Value::Text(r"a\b".into()));
