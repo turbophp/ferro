@@ -196,7 +196,12 @@ The four Ferro-only non-passes are:
 `EloquentModelRefreshTest::testItRefreshesModelExcludedByGlobalScope` has no assertions. It is the
 `Risky: 1` that every column reports, the control included, and it was never a non-pass.
 
-**Skip sets:** 11 tests the control runs are skipped under `ferro-sqlite`, and every one carries
-`#[RequiresDatabase('sqlite')]`. Eight are in `SchemaBuilderTest` and three are `testBasicUpdateForJson`
-data sets, so this is the same driver-NAME artifact the alias column exists to expose.
+**Skip sets:** 11 tests the control runs are skipped under `ferro-sqlite`, all for the driver-NAME reason.
+- Eight are in `SchemaBuilderTest` and carry `#[RequiresDatabase('sqlite')]`.
+- Three are `testBasicUpdateForJson` data sets, which carry `#[RequiresDatabase(['sqlite', 'mysql', 'mariadb'])]`.
+
+The skips are name-caused, but **these 11 tests are UNMEASURED through Ferro**. The eight `SchemaBuilderTest`
+cases are table-rebuild and ALTER paths, which is where this column's one real incompatibility
+lives. The alias column cannot show them passing, because upstream's own SQLite connections are
+hijacked there.
 

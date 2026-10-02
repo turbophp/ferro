@@ -30,8 +30,8 @@ nothing in this file overrides any of them.
   suite column was re-measured on the exit commit `7902867` and reproduced its record. Not met:
   §14/§15's "green" as written (every non-pass triaged; the DBAL rows meet §14's restated (z) bar;
   the DBAL server-family columns have no recorded stock-driver control), SQLite has no ORM column,
-  Octane sync mode is untested (E6, M5). The loop's routine is disabled when the exit record
-  merges; M3 is not started.
+  Octane sync mode is untested (E6, M5). The loop's routine was disabled at the exit; M3 is not
+  started.
 - Not started: M3 (Fibers, manifest, memfd, COPY), M4 (MSSQL, replica routing, `ferro top`),
   M5 (streams product, packaging).
 

@@ -1285,8 +1285,12 @@ The family-specific directories run as separate columns. Their base classes requ
 
 How the Ferro-named non-passes break down:
 
-- **Every Ferro-named non-pass and every Ferro-only skip is upstream code branching on the driver name** (§22.2 (am), (ar)). The checks take three forms: `$this->driver === …`, `in_array($this->driver, …)` and `#[RequiresDatabase(…)]`.
-- The one exception is a single real incompatibility on SQLite: `compileAlter()`'s foreign-key toggle (§22.2 (bn)). C3-6b's triage named the wrong test for another SQLite non-pass, and its results doc is corrected.
+- **On PostgreSQL, MySQL and MariaDB, every Ferro-named non-pass and every Ferro-only skip is upstream code branching on the driver name** (§22.2 (am), (ar); C1f's triage). The checks take four forms: `$this->driver === …`, `in_array($this->driver, …)`, `match ($this->driver)` and `#[RequiresDatabase(…)]`.
+  - The MySQL-family workflow lists the Ferro-only skips by name (8 on MySQL, 9 on MariaDB).
+  - **The PostgreSQL job has no skip comparison, so its Ferro-only skips (54 skipped against the control's 26) are not listed by name.** They are attributed from upstream source: the class-level `['pgsql','sqlsrv']` gate on `SchemaBuilderSchemaNameTest`, and `RequiresDatabase('pgsql')` cases.
+- **On SQLite, the same is true of the non-passes except one real incompatibility**: `compileAlter()`'s foreign-key toggle (§22.2 (bn)). C3-6b's triage named the wrong test for another non-pass, and its results doc is corrected.
+  - **The 11 Ferro-only skips on SQLite are name-caused but UNMEASURED through Ferro.** They are eight `SchemaBuilderTest` table-rebuild and ALTER cases, all `RequiresDatabase('sqlite')`, and three `testBasicUpdateForJson` data sets (`RequiresDatabase(['sqlite','mysql','mariadb'])`).
+  - These paths are where the one real SQLite incompatibility lives. The alias column cannot show them passing, because upstream's own SQLite connections are hijacked there. Upstream's `Sqlite/` directory is not run either.
 - The alias column is the proof for every case except SQLite. On SQLite the alias is not an escape hatch, because upstream's own throwaway connections carry no `ferro_socket`.
 
 **Demo app: met, as amended by §22.2 (ch).**
@@ -1318,4 +1322,4 @@ How the Ferro-named non-passes break down:
 - The tracker-clean hygiene skip (B7) waits on SPEC §7.2's own condition.
 - Replica lag and `ferro top` are M4.
 
-The development loop's hourly routine is disabled when this record merges. M3 is not started.
+The development loop's hourly routine was disabled at the exit (2026-10-02, after this record's two audit rounds). M3 is not started.
