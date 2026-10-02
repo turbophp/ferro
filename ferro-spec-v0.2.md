@@ -1198,20 +1198,49 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
 
 ### 22.3 M2 exit record (2026-10-02)
 
-**M2's deliverables are built and on `main`. Its acceptance bars, measured against stock-driver controls, are NOT all met as written.** Both halves are stated here, because a milestone record that restates a bar without its measurement, or drops the part not met, is how this project's records have gone wrong before (§22.2 (z), (bq)). Unless a row says otherwise, every number below is RECORDED on CI runners (two runs per column, identical result lines and ordered failure sets), not taken from the dev container. The suites run from on-demand workflows (`dbal-suite`, `laravel-suite`, `orm-suite`), not nightly as §20.3 says; the per-PR `ci` workflow carries the engine, client, tier and demo gates.
+**M2's deliverables are built and on `main`. Its acceptance bars are NOT met as written.** Both halves are stated here, because a milestone record that restates a bar without its measurement, or drops the part not met, is how this project's records have gone wrong before (§22.2 (z), (bq)).
+
+**Every suite number below was measured on the exit commit `7902867`, twice per column, with identical outcome counts and failure sets between the two runs.** Each row names where it ran. CI rows come from on-demand workflow runs:
+
+- `orm-suite` 37067176160
+- `dbal-suite` 37069674974 (4.4.4) and 37069678072 (3.10.6)
+- `laravel-suite` 37069681124
+
+The Laravel SQLite columns ran in the dev container, because the workflow has no SQLite option. All of these reproduced the previously recorded numbers exactly, except the ORM row, which is new. The suites run from on-demand workflows, not nightly (§20.3, amended). The per-push `ci` workflow carries the engine, client, tier and demo-app gates.
 
 **§17's M2 bullet, item by item:**
 
 | §17 item | State | Evidence |
 |---|---|---|
-| Eloquent tier + PDO shim | **built.** `ferro-pgsql`, `ferro-mysql`, `ferro-mariadb` and `ferro-sqlite`; an auto-discovered `FerroServiceProvider`; the `FerroPdoShim` surface Illuminate reaches (`quote`, `lastInsertId`, `inTransaction`, `exec`, `getAttribute(SERVER_VERSION \| DRIVER_NAME)`); reconnection; `cursor()` streaming | §15; §22.2 (al)–(as), (bn), (bw), (bx), (cb), (cc), (ch) |
+| Eloquent tier + PDO shim | **built**, see the details below this table | §15; §22.2 (al)–(as), (bn), (bw), (bx), (cb), (cc), (ch) |
 | Illuminate suite green | **NOT green as written** (below) | `docs/laravel-suite/` |
-| Observability: OTLP, Prometheus, slow log | **built.** One OTLP span per EXEC, read back from a real collector. §13's Prometheus list, with three metrics named as not exportable in M2. The redacted, dialect-aware slow log | §13; §22.2 (br)–(bv), (cd), (ce) |
-| SQLite engine-owned mode | **built.** The third backend under D13's declaration rule, D14 file confinement, and §7.6 online backup through the D15-gated admin service | §7.6, D13–D15; §22.2 (az)–(bp), (cf), (cg) |
-| DBAL `^3.8` bridge | **built.** A second `driverClass` over one shared core, with CI down to the 3.8.0 floor | §14; §22.2 (by), (bz), (ca) |
+| Observability: OTLP, Prometheus, slow log | **built**, see the details below this table | §13; §22.2 (br)–(bv), (cd), (ce) |
+| SQLite engine-owned mode | **built.** The third backend under D13's declaration rule, with D14 file confinement and §7.6 online backup through the D15-gated admin service | §7.6, D13–D15; §22.2 (az)–(bp), (cf), (cg) |
+| DBAL `^3.8` bridge | **built**, see the details below this table | §14; §22.2 (by), (bz), (ca) |
 | Incompatibilities doc page (§14–15) | **built.** Both tiers, every entry cited, and a CI gate that fails on a stale citation or on a resolved follow-up cited as live | `docs/known-incompatibilities.md`; §22.2 (bq) |
 
-**§14's acceptance** ("DBAL functional suite green on PG + MySQL + SQLite; ORM functional suite green on PG + MySQL"). Each cell is passed / executed:
+What "built" covers in the three summarised rows:
+
+- **Eloquent tier + PDO shim.**
+  - Four drivers: `ferro-pgsql`, `ferro-mysql`, `ferro-mariadb` and `ferro-sqlite`, plus an auto-discovered `FerroServiceProvider`.
+  - The `FerroPdoShim` surface Illuminate reaches: `quote`, `lastInsertId`, `inTransaction`, `exec`, and `getAttribute(SERVER_VERSION | DRIVER_NAME)`.
+  - Reconnection, and `cursor()` streaming.
+  - The shim refuses `getPdo()->query()`/`prepare()`, a documented incompatibility.
+- **Observability.**
+  - One OTLP span per EXEC, read back from a real collector.
+  - §13's Prometheus list, with three metrics named as not exportable in M2.
+  - The redacted, dialect-aware slow log.
+- **DBAL `^3.8` bridge.**
+  - A second `driverClass` over one shared core.
+  - The live suites run on 3.10.6.
+  - At the 3.8.0 floor, CI runs PHPStan and the bridge's unit tests (`tests/Dbal3`), not the live suite.
+
+**§14's acceptance.** §14 has two versions of this bar:
+
+- **v0.1 wording:** "DBAL functional suite green on PG + MySQL + SQLite; ORM functional suite green on PG + MySQL". **It is NOT met.**
+- **The bar as restated at M1 under §22.2 (z):** the curated subset, through the real `DriverManager` with driver identity asserted, "green modulo a triaged and recorded list". **The DBAL rows meet it**, because every non-pass is triaged in its results doc and none is a driver defect.
+
+Each cell is passed / executed:
 
 | Suite (Ferro column) | PostgreSQL 17 | MySQL 8.4 | MariaDB 11.8 | SQLite |
 |---|---|---|---|---|
@@ -1219,24 +1248,74 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
 | doctrine/dbal 3.10.6 (curated subset) | 305 / 314 | 296 / 303 | 300 / 307 | 224 / 267 (control 262 / 267) |
 | doctrine/orm 3.7.3 Functional, stock config | 1571 / 1597 (`pdo_pgsql` control 1597 / 1597) | 1583 / 1594 (`pdo_mysql` control 1590 / 1594) | 1579 / 1586 (`pdo_mysql` control 1586 / 1586) | not run |
 
-The ORM row is run 37067176160 (`docs/orm-suite/2026-10-02-ci-results.md`), and no test the control runs is skipped under Ferro on any family. **None of §14's suites is green.** Every DBAL non-pass is triaged in its results doc, and none is a driver defect. The ORM suite's Ferro-only non-passes are all documented incompatibilities: sub-second `TIMESTAMPTZ` at fetch (§22.2 (ab)), §7.4's TEMP tables across statements, `lastInsertId()` outside a transaction on PostgreSQL, and a NULL-typed select-list column on the MySQL family. The DBAL rows are curated subsets (§22.2 (z)), not upstream's whole suites. SQLite has no ORM column. The DBAL 3 lane of the ORM suite is not run.
+**Not every column has a recorded stock-driver control.**
 
-**§15's acceptance** ("the `illuminate/database` integration suite green on MySQL, PG, SQLite via Ferro connections; a Laravel demo app … runs with only the config diff; Octane supported in sync mode"):
+- The ORM columns and the DBAL SQLite columns are measured against a control in the same workflow run. For the ORM, no test the control runs is skipped under Ferro on any family (`docs/orm-suite/2026-10-02-ci-results.md`).
+- **The DBAL server-family columns (PG, MySQL, MariaDB) have no control in the workflow.** C5b compared their SKIP sets against stock drivers locally (`docs/dbal-suite/2026-10-02-c5b-dbal3-results.md`), and MySQL 8.4 has never had a DBAL control.
 
-- **Suite: NOT green.** The curated subset is all 89 driver-agnostic files (633 cases) plus each family's own directory. Recorded: `ferro-pgsql` 570 / 579, `ferro-mysql` 578 / 579, `ferro-mariadb` 578 / 579, `ferro-sqlite` 575 / 579.
-  - Under the stock driver NAME (the opt-in alias), Ferro EQUALS its `pdo_*` control on PostgreSQL (605 / 607 both), MySQL 8.4 (587 / 587) and MariaDB 11.8 (588 / 588).
-  - Every Ferro-named non-pass is upstream code branching on the driver name (§22.2 (am), (ar)), with one exception: on SQLite, one non-pass is a real incompatibility (`compileAlter()`'s foreign-key toggle, §22.2 (bn)).
-  - On SQLite the alias is not an escape hatch (549 / 595 against the control's 586 / 588).
-  - It is a curated subset, not upstream's whole suite.
-- **Demo app: met.** `testkit/laravel-demo/` is a per-PR CI gate on all four families, for Ferro and the control alike. "Only the config diff" holds since `FerroServiceProvider` (§22.2 (ch)). Horizon has no database workload to demonstrate (§15 amended).
-- **Octane in sync mode: NOT tested.** No Octane harness exists, and nothing in M2 measured it. Octane guidance is M5's (§17).
+**The ORM non-passes.**
+
+- The Ferro-only ones are all documented incompatibilities:
+  - sub-second `TIMESTAMPTZ`, refused at fetch (§22.2 (ab));
+  - §7.4's TEMP tables across statements;
+  - `lastInsertId()` outside a transaction on PostgreSQL;
+  - a NULL-typed select-list column on the MySQL family.
+- MySQL 8.4's 4 shared failures fail identically through `pdo_mysql`, so they are not Ferro's. They are not identified by name.
+- The DBAL rows are curated subsets (§22.2 (z)), not upstream's whole suites.
+- SQLite has no ORM column, and the ORM suite's DBAL 3 lane is run nowhere.
+
+**§15's acceptance:** "the `illuminate/database` integration suite green on MySQL, PG, SQLite via Ferro connections; a Laravel demo app … runs with only the config diff; Octane supported in sync mode".
+
+**The suite is NOT green.** The quoted columns are upstream's 89 driver-agnostic files (633 cases), which are a curated subset, not upstream's whole suite.
+
+| Driver-agnostic subset | PostgreSQL 17 | MySQL 8.4 | MariaDB 11.8 | SQLite 3.53 (dev container) |
+|---|---|---|---|---|
+| Ferro driver name (`ferro-*`) | 570 / 579 | 578 / 579 | 578 / 579 | 575 / 579 |
+| Stock name (opt-in alias) | 605 / 607 | 587 / 587 | 588 / 588 | 549 / 595 |
+| `pdo_*` control | 605 / 607 | 587 / 587 | 588 / 588 | 586 / 588 |
+
+The family-specific directories run as separate columns. Their base classes require the stock driver name, so they run under the alias and the control only:
+
+| Family directory | Alias | Control | The difference |
+|---|---|---|---|
+| PostgreSQL | 74 / 74 | 74 / 74 | none |
+| MySQL | 123 / 126 | 126 / 126 | the deliberate `''` in `EscapeTest::testEscapeString`; two `testLastInsertIdIsPreserved` cases refused at `DB::getPdo()->query()`, a recorded incompatibility (§22.2 (cc)) |
+| MariaDB | 122 / 123 | 123 / 123 | `EscapeTest::testEscapeString` only |
+| SQLite | not run | not run | — |
+
+How the Ferro-named non-passes break down:
+
+- **Every Ferro-named non-pass and every Ferro-only skip is upstream code branching on the driver name** (§22.2 (am), (ar)). The checks take three forms: `$this->driver === …`, `in_array($this->driver, …)` and `#[RequiresDatabase(…)]`.
+- The one exception is a single real incompatibility on SQLite: `compileAlter()`'s foreign-key toggle (§22.2 (bn)). C3-6b's triage named the wrong test for another SQLite non-pass, and its results doc is corrected.
+- The alias column is the proof for every case except SQLite. On SQLite the alias is not an escape hatch, because upstream's own throwaway connections carry no `ferro_socket`.
+
+**Demo app: met, as amended by §22.2 (ch).**
+
+- `testkit/laravel-demo/` is one testbench application, and it exercises:
+  - `database` sessions under real `web` requests;
+  - login and registration through hand-written routes, not starter-kit scaffolding;
+  - password-reset tokens;
+  - the `database` queue, with failed jobs, retry and a batch;
+  - the `database` cache with locks.
+- It is a per-PR CI gate on all four families, for Ferro and the control alike.
+- **Horizon has no database workload to demonstrate.** §15 was amended to say so.
+- **"Only the config diff" is proven by a separate test that resolves `FerroServiceProvider` through Laravel's own `PackageManifest`.** The running demo's harness registers the connections explicitly.
+
+**Octane in sync mode: NOT tested.** No Octane harness exists, and nothing in M2 measured it. Octane guidance is M5's (§17).
 
 **Open, carried past M2 (none blocks a deliverable):**
 
-- FB-8: `FERRO_ADDR` is specified and implemented nowhere.
+- FB-8 (MEDIUM): `FERRO_ADDR` is specified and implemented nowhere.
+- FB-6 (MEDIUM): `ci/local-gate.sh` has no `php/laravel` lanes, so the local gate is weaker than CI for M2's own tier.
+- FB-9 (LOW): one batch shape can undercount `ferro_pin_cause_total{cause="tx"}`.
+- FB-10 (LOW): the client poisons a session only on a transport failure.
+- FB-11 (LOW): a connect-time `TransportException` reaches a Doctrine caller unconverted. (The FB items are in `docs/dev-loop/LEDGER.md`.)
 - The Doctrine tier's PG `quote()` breaks out with `standard_conforming_strings` off (`docs/followups/2026-10-02-doctrine-quote-is-mode-dependent-on-pg.md`, OPEN).
 - Through `transactional()`, an indeterminate COMMIT reaches the caller masked under DBAL's own message (`docs/followups/2026-10-02-transactional-masks-a-failed-commit.md`, OPEN, upstream behaviour).
 - A database-defaulted sub-second `timestamptz` is unreadable through the DBAL driver (§22.2 (ab)).
+- `getPdo()->query()`/`prepare()` are refused by the Laravel shim.
 - Chunked `LARGE_OBJECT` (B6b) and multi-result-set `selectResultSets()` (C1a) are deferred `/proto` changes.
 - The tracker-clean hygiene skip (B7) waits on SPEC §7.2's own condition.
 - Replica lag and `ferro top` are M4.
+
+The development loop's hourly routine is disabled when this record merges. M3 is not started.
