@@ -82,9 +82,21 @@ const SQLITE_CONSTRAINT_UNIQUE: i32 = 2067; // 19 | (8<<8)
 fn is_handle_fatal(extended: i32) -> bool {
     matches!(
         extended & 0xff,
-        SQLITE_IOERR | SQLITE_CORRUPT | SQLITE_NOTADB | SQLITE_CANTOPEN | SQLITE_NOMEM
+        SQLITE_IOERR | SQLITE_CORRUPT | SQLITE_NOMEM
     )
 }
+// `SQLITE_CANTOPEN` and `SQLITE_NOTADB` were on this list until M2-C3-7b's review measured what they
+// cost. Measured on the bundled 3.53.2: `VACUUM INTO`/`ATTACH` of a non-database file is NOTADB (26),
+// of a name in a missing directory or past `NAME_MAX` is CANTOPEN (14). On a STATEMENT
+// (as opposed to the dial, which never reaches this map — `open_configured` reports its own failure)
+// they mean a file the statement NAMED could not be opened or is not a database: an `ATTACH` or
+// `VACUUM INTO` target that is not a database, sits in a missing directory, or has a name the
+// filesystem refuses. The handle is fine and the statement did not apply. (A main database that
+// has become unreadable fails every statement the same way — still a known fate each time, and
+// visible to the operator, rather than a stream of fabricated "may have applied" claims.) As "handle-fatal" it became `ConnectionLost`, so a deterministic
+// refusal read as Retryable (a client honouring that loops forever) and an undeclared
+// `VACUUM INTO '<existing file>'` read as §19.3 `Indeterminate` — a fate claim for a statement that
+// provably wrote nothing.
 
 /// Classify an extended code into the `/proto` `(code, branch)` pair. `fate.rs` consumes it
 /// verbatim and re-derives nothing.
@@ -129,6 +141,9 @@ fn classify(extended: i32) -> (u16, u8) {
             // credentials, this connection simply cannot accept a write (the same code also covers
             // a database file on read-only media).
             SQLITE_READONLY => (errc::UNSUPPORTED, errc::UNSUPPORTED_BRANCH),
+            // A file the statement named could not be opened (see the note under
+            // `is_handle_fatal`): NonRetryable, known fate — the same request fails the same way.
+            SQLITE_CANTOPEN | SQLITE_NOTADB => (errc::UNSUPPORTED, errc::UNSUPPORTED_BRANCH),
             // Table-level lock contention (shared cache). Retryable for the same reason as BUSY.
             SQLITE_LOCKED => (
                 errc::SERIALIZATION_FAILURE,

@@ -74,41 +74,73 @@ impl AdminVerb {
 }
 
 /// Decide whether a peer may run `verb`. `peer_uid` is the session's kernel-attested uid, `None`
-/// when the socket could not attest one. The refusal is a ready-to-send `Forbidden` terminal; its
-/// message names the missing condition but never the configured uid list.
+/// when the socket could not attest one. The refusal is a ready-to-send `Forbidden` terminal.
+///
+/// **The two OPERATE refusals read IDENTICALLY on the wire** (M2-C3-7b review): "OPERATE is
+/// disabled" and "this uid is not a member" used to be different messages, which told any admitted
+/// peer whether OPERATE was enabled at all — configuration it is not entitled to. The REASON is
+/// logged server-side, where the operator who has to fix it will look.
 pub fn authorize(
     peer_uid: Option<u32>,
     config: &Config,
     verb: AdminVerb,
 ) -> Result<(), ErrorPayload> {
-    decide(peer_uid, config, verb.class(), verb.name())
+    decide(peer_uid, config, verb.class()).map_err(|refusal| {
+        tracing::warn!(
+            verb = verb.name(),
+            peer_uid,
+            reason = refusal.reason(),
+            "admin verb refused (SPEC D15)"
+        );
+        refusal.payload(verb.name())
+    })
+}
+
+/// Why D15 refused a verb. The reason is for the LOG; [`Refusal::payload`] is what the peer sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// The connection has no kernel-attested uid.
+    Unattested,
+    /// An OPERATE verb while `FERRO_ADMIN_UIDS` is empty.
+    OperateDisabled,
+    /// An OPERATE verb from a uid that is not in `FERRO_ADMIN_UIDS`.
+    NotAdmin,
+}
+
+impl Refusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Unattested => "no kernel-attested peer uid",
+            Self::OperateDisabled => "FERRO_ADMIN_UIDS is empty, which disables every OPERATE verb",
+            Self::NotAdmin => "the peer uid is not in FERRO_ADMIN_UIDS",
+        }
+    }
+
+    fn payload(self, name: &str) -> ErrorPayload {
+        forbidden(match self {
+            Self::Unattested => format!(
+                "admin verb {name} refused: this connection has no kernel-attested peer uid (SPEC \
+                 D15 serves admin verbs only where SO_PEERCRED can attest one)"
+            ),
+            Self::OperateDisabled | Self::NotAdmin => format!(
+                "admin verb {name} is an OPERATE verb and this peer is not authorized for OPERATE \
+                 verbs (SPEC D15: the peer's uid must be in FERRO_ADMIN_UIDS)"
+            ),
+        })
+    }
 }
 
 /// The D15 rule over a verb CLASS — the one implementation, so the READ arm (which no M2 verb
 /// reaches) is the same code a future READ verb will run, and is tested directly.
-fn decide(
-    peer_uid: Option<u32>,
-    config: &Config,
-    class: VerbClass,
-    name: &str,
-) -> Result<(), ErrorPayload> {
+fn decide(peer_uid: Option<u32>, config: &Config, class: VerbClass) -> Result<(), Refusal> {
     let Some(uid) = peer_uid else {
-        return Err(forbidden(format!(
-            "admin verb {name} refused: this connection has no kernel-attested peer uid (SPEC D15 \
-             serves admin verbs only where SO_PEERCRED can attest one)"
-        )));
+        return Err(Refusal::Unattested);
     };
     match class {
         VerbClass::Read => Ok(()),
-        VerbClass::Operate if config.admin_uids.is_empty() => Err(forbidden(format!(
-            "admin verb {name} is an OPERATE verb and FERRO_ADMIN_UIDS is empty, which disables \
-             every OPERATE verb (SPEC D15)"
-        ))),
+        VerbClass::Operate if config.admin_uids.is_empty() => Err(Refusal::OperateDisabled),
         VerbClass::Operate if config.admin_uids.contains(&uid) => Ok(()),
-        VerbClass::Operate => Err(forbidden(format!(
-            "admin verb {name} is an OPERATE verb and peer uid {uid} is not in FERRO_ADMIN_UIDS \
-             (SPEC D15)"
-        ))),
+        VerbClass::Operate => Err(Refusal::NotAdmin),
     }
 }
 
@@ -156,25 +188,50 @@ mod tests {
         // otherwise hold every OPERATE verb.
         let cfg = config_with_admins(&[]);
         let own = Config::own_uid();
+        assert_eq!(
+            decide(Some(own), &cfg, VerbClass::Operate),
+            Err(Refusal::OperateDisabled)
+        );
         let err = authorize(Some(own), &cfg, AdminVerb::Backup).unwrap_err();
         assert_eq!(err.code, errc::FORBIDDEN);
         assert_eq!(err.branch, errc::FORBIDDEN_BRANCH);
-        assert!(
-            err.message.contains("FERRO_ADMIN_UIDS is empty"),
-            "{}",
-            err.message
-        );
     }
 
     #[test]
     fn operate_requires_membership_and_a_member_is_allowed() {
         let cfg = config_with_admins(&[1000, 1001]);
         assert!(authorize(Some(1001), &cfg, AdminVerb::Backup).is_ok());
+        assert_eq!(
+            decide(Some(1002), &cfg, VerbClass::Operate),
+            Err(Refusal::NotAdmin)
+        );
         let err = authorize(Some(1002), &cfg, AdminVerb::Backup).unwrap_err();
         assert_eq!(err.code, errc::FORBIDDEN);
-        assert!(err.message.contains("peer uid 1002"), "{}", err.message);
-        // The refusal names the PEER's uid, never the configured list.
-        assert!(!err.message.contains("1000"), "{}", err.message);
+    }
+
+    /// The two OPERATE refusals are indistinguishable to the peer — neither the configured list nor
+    /// whether OPERATE is enabled at all leaks — while the log reasons differ.
+    #[test]
+    fn the_two_operate_refusals_read_identically_on_the_wire() {
+        let disabled =
+            authorize(Some(1002), &config_with_admins(&[]), AdminVerb::Backup).unwrap_err();
+        let not_member =
+            authorize(Some(1002), &config_with_admins(&[1000]), AdminVerb::Backup).unwrap_err();
+        assert_eq!(disabled, not_member);
+        assert!(
+            !not_member.message.contains("1000"),
+            "{}",
+            not_member.message
+        );
+        assert!(
+            !not_member.message.contains("1002"),
+            "{}",
+            not_member.message
+        );
+        assert_ne!(
+            Refusal::OperateDisabled.reason(),
+            Refusal::NotAdmin.reason()
+        );
     }
 
     #[test]
@@ -189,18 +246,23 @@ mod tests {
             assert!(err.message.contains("kernel-attested"), "{}", err.message);
         }
         // The READ arm, which no M2 verb exercises end to end, is pinned at the rule itself.
-        assert!(read_rule(None, &cfg).is_err());
+        assert_eq!(
+            decide(None, &cfg, VerbClass::Read),
+            Err(Refusal::Unattested)
+        );
     }
 
     #[test]
     fn read_needs_only_an_attested_uid() {
         // READ does not consult FERRO_ADMIN_UIDS: an admitted peer outside it, with the list empty
         // or populated, may read.
-        assert!(read_rule(Some(4242), &config_with_admins(&[])).is_ok());
-        assert!(read_rule(Some(4242), &config_with_admins(&[1000])).is_ok());
-    }
-
-    fn read_rule(peer: Option<u32>, cfg: &Config) -> Result<(), ErrorPayload> {
-        decide(peer, cfg, VerbClass::Read, "TEST_READ")
+        assert_eq!(
+            decide(Some(4242), &config_with_admins(&[]), VerbClass::Read),
+            Ok(())
+        );
+        assert_eq!(
+            decide(Some(4242), &config_with_admins(&[1000]), VerbClass::Read),
+            Ok(())
+        );
     }
 }

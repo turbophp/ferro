@@ -105,10 +105,13 @@
 //! `PING`/`GOODBYE`/`WINDOW_UPDATE` (answered as before); `Request` for SQL/TX/STREAM (goes
 //! through the registry/handler/supervisor mechanism above, regardless of the specific method id
 //! — no method is registered yet, so `default_handler` declares `Unsupported` for all of them);
-//! `Unsupported` for anything else (ADMIN, an unrecognized service, or a CORE method this build
-//! doesn't recognize) — which, like the reused-id/`max_inflight` diagnostics, sends a per-request
-//! `Unsupported` error `END` directly, without ever touching the registry (nothing was spawned
-//! for it, so there is no request lifecycle to guard).
+//! `Admin(verb)` for an ADMIN method this build serves (M2-C3-7b), authorized under SPEC D15 on
+//! the session's kernel-attested peer uid BEFORE it is treated as a `Request` — a refusal is one
+//! per-request `Forbidden` END sent directly; `Unsupported` for anything else (an ADMIN method this
+//! build does not serve, an unrecognized service, or a CORE method this build doesn't recognize) —
+//! which, like the reused-id/`max_inflight` diagnostics, sends a per-request `Unsupported` error
+//! `END` directly, without ever touching the registry (nothing was spawned for it, so there is no
+//! request lifecycle to guard).
 //!
 //! **Handshake hardening + per-session task ownership (S3 fix pass).** Three additions on top of
 //! the above, none of them weakening exactly-one-`END`:
@@ -399,8 +402,9 @@ impl Session {
         // internally). Only a `Classification::Frame` ever reaches CANCEL-checking and
         // `dispatch::route`, the `(service, method) -> Route` table that decides between core
         // control traffic, the request-bearing registry/handler/supervisor mechanism, and a
-        // per-request `Unsupported` for anything else (ADMIN, an unknown service, or a CORE
-        // method this build doesn't recognize).
+        // per-request `Unsupported` for anything else (an ADMIN method this build does not serve,
+        // an unknown service, or a CORE method this build doesn't recognize). A SERVED admin verb
+        // is authorized under SPEC D15 here, before it enters the request lifecycle.
         let registry = Arc::new(Registry::new(config.max_inflight));
 
         // Owns every per-request supervisor task spawned below (S3 fix pass — see this module's
@@ -513,11 +517,7 @@ impl Session {
                             }
                         }
                         Err(err) => {
-                            tracing::warn!(
-                                verb = verb.name(),
-                                peer_uid,
-                                "admin verb refused (SPEC D15)"
-                            );
+                            // `authorize` logged the reason; the peer gets only the payload.
                             let refused = SessionError::PerRequest {
                                 rid: frame.header.request_id,
                                 err,

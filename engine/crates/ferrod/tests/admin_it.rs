@@ -18,6 +18,7 @@
 
 mod common;
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -33,6 +34,15 @@ use ferrod::tx::TxRegistry;
 
 /// A daemon with the given pools and `FERRO_ADMIN_UIDS`.
 fn admin_server(pools: &[(&str, String)], admin_uids: Vec<u32>) -> TestServer {
+    admin_server_allowing(pools, admin_uids, None)
+}
+
+/// [`admin_server`] with every pool's D14 `allow_dir` set to `allow_dir`.
+fn admin_server_allowing(
+    pools: &[(&str, String)],
+    admin_uids: Vec<u32>,
+    allow_dir: Option<&Path>,
+) -> TestServer {
     let config = Config {
         admin_uids,
         pools: pools
@@ -43,7 +53,7 @@ fn admin_server(pools: &[(&str, String)], admin_uids: Vec<u32>) -> TestServer {
                 kind: ferrod::config::infer_pool_kind(dsn),
                 pin_functions: Vec::new(),
                 pin_on_unknown: true,
-                allow_dir: None,
+                allow_dir: allow_dir.map(|d| d.display().to_string()),
             })
             .collect(),
         ..Config::default()
@@ -167,26 +177,26 @@ async fn operate_is_refused_until_the_peers_uid_is_in_ferro_admin_uids() {
     let ep = backup_err(&mut c, 2, &req).await;
     assert_eq!(ep.code, errc::FORBIDDEN, "{ep:?}");
     assert_eq!(ep.branch, branch::NON_RETRYABLE);
-    assert!(
-        ep.message.contains("FERRO_ADMIN_UIDS is empty"),
-        "{}",
-        ep.message
-    );
+    let disabled_message = ep.message.clone();
     assert!(!snap.exists(), "a refused verb wrote a snapshot");
     assert_session_alive(&mut c, 77).await;
 
     // (2) A list that does not contain the peer.
-    let other = own_uid().wrapping_add(1);
+    // A distinctive uid, so "the message does not name it" cannot be satisfied or broken by
+    // accident (as root, `own + 1` is 1, which "D15" contains).
+    let other = own_uid().wrapping_add(424_242);
     let server = admin_server(&[("main", dsn.clone())], vec![other]);
     let mut c = server.connect().await;
     c.hello(1).await;
     let ep = backup_err(&mut c, 2, &req).await;
     assert_eq!(ep.code, errc::FORBIDDEN, "{ep:?}");
-    assert!(
-        ep.message.contains(&format!("peer uid {}", own_uid())),
-        "{}",
-        ep.message
+    // The peer cannot tell "OPERATE is disabled" from "you are not a member": both are the same
+    // refusal on the wire (the reason is logged server-side), and neither names a configured uid.
+    assert_eq!(
+        ep.message, disabled_message,
+        "the two OPERATE refusals leak which one applies"
     );
+    assert!(!ep.message.contains(&other.to_string()), "{}", ep.message);
     assert!(!snap.exists());
 
     // (3) CONTROL: the peer is a member → the snapshot is taken.
@@ -318,6 +328,16 @@ async fn replace_swaps_atomically_and_a_failed_backup_keeps_the_previous_snapsho
     let resp = backup_ok(&mut c, 4, &request("main", "nightly.db", true)).await;
     assert_eq!(rows_in(&snap), 200_000);
     assert_eq!(resp.bytes, std::fs::metadata(&snap).unwrap().len());
+    // The §13 split, by VALUE: a ~40 MB snapshot takes milliseconds of statement time, while the
+    // wait for an idle pool's connection does not — so a swap of the two fields cannot pass.
+    assert!(
+        resp.exec_us >= 1_000,
+        "exec_us is the snapshot's own time: {resp:?}"
+    );
+    assert!(
+        resp.queue_us < resp.exec_us,
+        "queue_us is the pool wait: {resp:?}"
+    );
     assert!(temporaries(dir.path()).is_empty());
 }
 
@@ -399,4 +419,114 @@ async fn a_server_backed_pool_is_unsupported() {
         assert_eq!(ep.code, errc::UNSUPPORTED, "{ep:?}");
         assert!(ep.message.contains("SQLite pools only"), "{}", ep.message);
     }
+}
+
+/// **A snapshot may never be written over a live database or its sidecars** (review finding,
+/// reproduced: `replace` over `main.db` lost an acknowledged write, over `main.db-wal` it corrupted
+/// the database). All four names are refused with or without `replace`, and the database is intact
+/// and writable afterwards — with a control name in the same directory that succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_database_and_its_sidecars_are_never_a_backup_target() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("main.db");
+    seed_db(&db, 20, 10);
+    let server = admin_server(
+        &[("main", format!("sqlite://{}", db.display()))],
+        vec![own_uid()],
+    );
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    // Touch the pool so its WAL and shared-memory files exist, as they do on a live database.
+    backup_ok(&mut c, 2, &request("main", "warmup.db", false)).await;
+
+    let before = std::fs::metadata(&db).unwrap().ino();
+    let mut rid = 10;
+    for name in ["main.db", "main.db-wal", "main.db-shm", "main.db-journal"] {
+        for replace in [true, false] {
+            rid += 1;
+            let ep = backup_err(&mut c, rid, &request("main", name, replace)).await;
+            assert_eq!(ep.code, errc::FORBIDDEN, "{name} replace={replace}: {ep:?}");
+            assert!(ep.message.contains("live database"), "{}", ep.message);
+        }
+    }
+    assert_eq!(
+        std::fs::metadata(&db).unwrap().ino(),
+        before,
+        "the live database file was replaced"
+    );
+    assert!(!dir.path().join("main.db-journal").exists());
+    assert_eq!(rows_in(&db), 20, "the live database is intact");
+    assert!(temporaries(dir.path()).is_empty());
+}
+
+/// **The documented length limit is the real one** (review finding: names of 230–255 bytes passed
+/// the 255-byte policy and then failed at the temporary as a RETRYABLE `ConnectionLost`). The
+/// longest accepted name works end to end, one byte more is a clean `Forbidden`, and the snapshot is
+/// private to `ferrod`'s user.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_longest_accepted_name_works_and_the_snapshot_is_private() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("main.db");
+    seed_db(&db, 5, 10);
+    let server = admin_server(
+        &[("main", format!("sqlite://{}", db.display()))],
+        vec![own_uid()],
+    );
+    let mut c = server.connect().await;
+    c.hello(1).await;
+
+    let longest = "x".repeat(200);
+    backup_ok(&mut c, 2, &request("main", &longest, false)).await;
+    let snap = dir.path().join(&longest);
+    assert_eq!(rows_in(&snap), 5);
+    let mode =
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&snap).unwrap().permissions());
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "a snapshot is a full copy of the data; it is private"
+    );
+
+    let ep = backup_err(&mut c, 3, &request("main", &"x".repeat(201), false)).await;
+    assert_eq!(ep.code, errc::FORBIDDEN, "{ep:?}");
+    assert_ne!(ep.branch, branch::RETRYABLE);
+    assert!(temporaries(dir.path()).is_empty());
+}
+
+/// **A failure BEFORE the snapshot statement is sent is a known fate** — the review found the
+/// not-sent context untested end to end. The pool's database lives in a directory that does not
+/// exist, so the checkout's dial fails, while the operator's allowed directory resolves and the
+/// temporary is created there: the reply is Retryable (nothing was sent), never Indeterminate, and
+/// the temporary is removed. And an allowed directory that does not resolve is refused up front.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_before_the_snapshot_is_sent_is_retryable_and_leaves_nothing() {
+    let allow = tempfile::tempdir().expect("tempdir");
+    let missing = allow.path().join("no-such-dir").join("main.db");
+    let server = admin_server_allowing(
+        &[("main", format!("sqlite://{}", missing.display()))],
+        vec![own_uid()],
+        Some(allow.path()),
+    );
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    let ep = backup_err(&mut c, 2, &request("main", "snap.db", false)).await;
+    assert_eq!(ep.code, errc::CONNECTION_LOST, "{ep:?}");
+    assert_eq!(ep.branch, branch::RETRYABLE, "nothing was sent: {ep:?}");
+    assert!(
+        temporaries(allow.path()).is_empty(),
+        "the temporary was left behind"
+    );
+    assert!(!allow.path().join("snap.db").exists());
+
+    let nowhere = allow.path().join("not-a-dir");
+    let server = admin_server_allowing(
+        &[("main", format!("sqlite://{}", missing.display()))],
+        vec![own_uid()],
+        Some(&nowhere),
+    );
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    let ep = backup_err(&mut c, 2, &request("main", "snap.db", false)).await;
+    assert_eq!(ep.code, errc::UNSUPPORTED, "{ep:?}");
+    assert!(ep.message.contains("does not resolve"), "{}", ep.message);
 }

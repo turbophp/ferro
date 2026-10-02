@@ -185,6 +185,28 @@ impl SqliteBackend {
         resolve_allowed_root(&path, self.allow_dir.clone())
     }
 
+    /// The database file this backend opens, with its directory CANONICALISED (the file itself may
+    /// not exist before the first dial). M2-C3-7b's `BACKUP` needs it to refuse a snapshot NAME that
+    /// is a live database or one of its sidecars: the review measured `replace` over `main.db`
+    /// losing an acknowledged write and over `main.db-wal` corrupting the database outright.
+    pub fn database_path(&self) -> Result<PathBuf, PoolError> {
+        let path = resolve_path(&self.dsn)?;
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(PoolError::Backend(
+                "the database path has no directory or file name".to_string(),
+            ));
+        };
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let parent = parent.canonicalize().map_err(|e| {
+            PoolError::Backend(format!("the database's directory does not resolve: {e}"))
+        })?;
+        Ok(parent.join(name))
+    }
+
     /// The busy timeout this backend opens its connections with. Exists so the C3-3e wiring can be
     /// asserted at the seam it crosses — the registry builds the backend, and without a reader the
     /// only evidence that the pool's `checkout_timeout` arrived would be that a timing test passed,
@@ -800,6 +822,21 @@ fn install_path_guard(
                 Authorization::Deny
             }
         }
+        // An ATTACH whose filename SQLite did NOT pass (M2-C3-7b review, reproduced). SQLite's
+        // `codeAttach` hands the authorizer the filename only when it is a string LITERAL; for a
+        // bound parameter (`ATTACH ?1`) or any expression (`ATTACH 'a' || 'b'`) it passes NULL, which
+        // rusqlite surfaces as `Unknown`. The old `_ => Allow` let both through, and a bound path
+        // outside the allowed directory received a full copy of the database. Without the name
+        // there is nothing to check, so it is refused: the cost is that an application must spell
+        // its ATTACH target as a literal. `VACUUM INTO ?1` is unaffected — SQLite re-issues it
+        // internally as a literal `ATTACH %Q`, so its target IS checked (and the admin `BACKUP` verb
+        // binds its target exactly that way).
+        AuthAction::Unknown { code, .. } if code == rusqlite::ffi::SQLITE_ATTACH => {
+            tracing::warn!(
+                "ferro-backend-sqlite: refused an ATTACH whose target is not a literal (SPEC D14)"
+            );
+            Authorization::Deny
+        }
         _ => Authorization::Allow,
     }))
     .map_err(|e| {
@@ -842,6 +879,24 @@ fn attach_is_allowed(filename: &str, root: &Path) -> bool {
     if filename.is_empty() || filename.eq_ignore_ascii_case(":memory:") {
         return true;
     }
+    // A `file:` URI is REFUSED (M2-C3-7b review, reproduced). The bundled SQLite is compiled with
+    // `SQLITE_USE_URI`, so URI filenames are honoured on every connection whatever its open flags,
+    // and SQLite DECODES a URI's percent-escapes before opening: `file:%2Ftmp%2Fx.db` read here as a
+    // relative name (parent = cwd) passed the guard whenever the daemon's cwd sat inside the root,
+    // and SQLite then opened `/tmp/x.db`. Re-implementing SQLite's URI parser to check the decoded
+    // path would be a second parser to keep in step; refusing the scheme closes it outright. SQLite
+    // matches the scheme case-SENSITIVELY (measured: `FILE:%2F…` was created as a literal file of
+    // that name, not decoded); the guard refuses ANY case anyway, failing closed, since no
+    // legitimate database is named `FILE:…` and a future SQLite need not keep that detail.
+    // Compared as BYTES: slicing the `str` at 5 would panic on a multi-byte character, inside an
+    // FFI callback.
+    if filename
+        .as_bytes()
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"file:"))
+    {
+        return false;
+    }
     let candidate = Path::new(filename);
     let absolute = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -863,11 +918,12 @@ fn attach_is_allowed(filename: &str, root: &Path) -> bool {
         Err(_) => false,
     };
     // The FILE itself must not be a symlink (M2-C3-7b, measured). Canonicalising only the parent
-    // left a hole: a DANGLING symlink inside the root, pointing outside it, passed the parent check
-    // and SQLite then followed it — `VACUUM INTO '<root>/link.db'` created `<outside>/escaped.db`.
-    // A symlink to an EXISTING file is refused by SQLite's own existing-target rule, but a dangling
-    // one is a fresh file at the link's destination. `symlink_metadata` does not follow the link;
-    // "cannot stat" is the normal case (the target does not exist yet) and is not a symlink.
+    // left two holes. A DANGLING symlink inside the root, pointing outside it, passed the parent
+    // check and SQLite followed it — `VACUUM INTO '<root>/link.db'` created `<outside>/escaped.db`.
+    // And a symlink to an EXISTING outside database let `ATTACH '<root>/link.db'` READ it (the
+    // review measured `'outside-secret'` coming back); only `VACUUM INTO` refuses an existing
+    // target, ATTACH happily opens one. `symlink_metadata` does not follow the link; "cannot stat"
+    // is the normal case (the target does not exist yet) and is not a symlink.
     let is_symlink = absolute
         .symlink_metadata()
         .map(|m| m.file_type().is_symlink())

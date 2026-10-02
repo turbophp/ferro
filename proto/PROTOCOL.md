@@ -703,7 +703,7 @@ A positional fixarray of 4 fields:
 | # | field | type | notes |
 |---|---|---|---|
 | 1 | `pool` | `str` | the pool whose database is snapshotted — a SQLite pool; any other is `Unsupported` |
-| 2 | `file` | `str` | the snapshot's FILE NAME — `[A-Za-z0-9._-]`, 1..=255 bytes, not starting with `.` — placed in the pool's D14 allowed directory. **Not a path**: no directory crosses the wire in either direction, and anything else is `Forbidden` |
+| 2 | `file` | `str` | the snapshot's FILE NAME — `[A-Za-z0-9._-]`, 1..=200 bytes, not starting with `.` — placed in the pool's D14 allowed directory. **Not a path**: no directory crosses the wire in either direction (a failed snapshot's error text has the directory redacted), and anything else is `Forbidden`. A name that is any SQLite pool's live database in that directory, or one of its `-wal`/`-shm`/`-journal` sidecars, is `Forbidden` regardless of `replace` |
 | 3 | `replace` | `bool` | `true` swaps a new snapshot over an existing regular file of that name atomically (`rename`); `false` refuses an existing name (`Forbidden`) |
 | 4 | `timeout_ms` | `u32 \| nil` | bounds the snapshot statement; `nil` leaves it unbounded. A per-request `CANCEL` stops it either way |
 
@@ -718,8 +718,10 @@ A positional fixarray of 4 fields:
 | 2 | `queue_us` | `u64` | pool wait (SPEC §13's split) |
 | 3 | `exec_us` | `u64` | the snapshot statement itself |
 
-A failed `BACKUP` never leaves a file: the snapshot is written to a temporary name and only moved into
-place on success, and the previous snapshot survives a failed `replace`. A cancelled or timed-out
+A failed `BACKUP` never leaves a file: the snapshot is written to a temporary the engine creates
+exclusively (mode `0600`, an unpredictable name) and only moved into place on success — and only if
+that temporary is still the engine's own file with a single link — and the previous snapshot
+survives a failed `replace`. The published snapshot is mode `0600`, owned by the engine's user. A cancelled or timed-out
 backup is `Cancelled`/`QueryTimeout` — never `Indeterminate`, since the source database is not
 written.
 

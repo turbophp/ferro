@@ -120,8 +120,9 @@ fn series(body: &str, name_and_labels: &str) -> Option<u64> {
 /// - a recycle of a clean SQLite connection is `targeted`, and the recycle after a `PRAGMA` (which
 ///   taints unconditionally, §22.2 (bm)) is `full`;
 /// - errors through BOTH terminal paths move `ferro_errors_total`: the SESSION path (`session::error`
-///   builds the per-request diagnostics — `ADMIN` has no route, so `Unsupported`; an unknown flag bit,
-///   so `Protocol`), and the HANDLER path (the supervisor's terminal for a real EXEC — a syntax error,
+///   builds the per-request diagnostics — an `ADMIN` method this build does not serve, so
+///   `Unsupported`; `BACKUP` refused by the D15 gate, so `Forbidden`; an unknown flag bit, so
+///   `Protocol`), and the HANDLER path (the supervisor's terminal for a real EXEC — a syntax error,
 ///   and a timed-out autocommit WRITE, which §19.3 sends `Indeterminate`). The adversarial review of
 ///   this slice found the first version exercised the session path TWICE and the handler path never,
 ///   so a second END builder on the handler path — where every SQL error and every `Indeterminate`
@@ -255,9 +256,13 @@ async fn real_traffic_moves_the_hygiene_error_and_pool_series() {
         moved(UNSUPPORTED) >= 1,
         "the dispatch-path error was not counted:\n{after}"
     );
-    assert!(
-        moved(FORBIDDEN) >= 1,
-        "the D15 refusal (a session-built terminal) was not counted:\n{after}"
+    // EXACT, unlike its neighbours: no other test in this binary produces a `Forbidden`, so this
+    // test owns the series outright and a double count (or a refusal that never reached the
+    // builder) cannot hide behind `>=`.
+    assert_eq!(
+        moved(FORBIDDEN),
+        1,
+        "the D15 refusal (a session-built terminal) was not counted exactly once:\n{after}"
     );
     assert!(
         moved(PROTOCOL) >= 1,
