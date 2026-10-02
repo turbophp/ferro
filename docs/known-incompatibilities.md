@@ -169,16 +169,21 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
 
 ## Identity and keys (Doctrine DBAL, and the ORM)
 
-- **`lastInsertId()` throws on PostgreSQL, always.** PG's protocol carries no such field and Ferro
-  refuses to emulate it with `SELECT lastval()`, because on a transaction-mode pool the follow-up
-  runs on a **different connection** and returns a silently wrong key. Use `INSERT … RETURNING id`.
-  The thrown class is the SPI's own `Doctrine\DBAL\Driver\Exception\NoIdentityValue`, wrapped by DBAL
-  into a `DriverException` as usual.
+- **`lastInsertId()` on PostgreSQL answers inside a transaction and throws outside one.** PG's
+  protocol carries no such field. INSIDE a transaction the connection is pinned, so the driver runs
+  `SELECT lastval()` there — exactly what `pdo_pgsql` runs — and hygiene's `DISCARD SEQUENCES` at
+  checkout means it can only see this tenant's `nextval()` (SPEC §22.2 (ci);
+  `LastInsertIdLiveTest::testPostgresNeverAnswersWithThePreviousTenantsSequenceValue`). It has
+  `pdo_pgsql`'s failure mode too: with no `nextval()` yet in the transaction PostgreSQL raises
+  `55000`, which aborts the transaction. OUTSIDE a transaction it throws, because the autocommit
+  statement's connection has gone back to the pool and a follow-up would run on a **different
+  connection** and return a silently wrong key — use `INSERT … RETURNING id` or a transaction. The
+  thrown class is the SPI's own `Doctrine\DBAL\Driver\Exception\NoIdentityValue`, wrapped by DBAL into
+  a `DriverException` as usual.
 - **`lastInsertId()` has no sequence-name argument.** DBAL 4 removed the overload; this is upstream,
-  not Ferro. On **DBAL 3**, which still has it, the name is accepted and **not used** on any family.
-  On PostgreSQL its only use would be a follow-up `currval()`: outside a transaction that is the
-  cross-connection hazard of the entry above; inside one — where Doctrine ORM 2's identity generator
-  runs — it would be correct, and is deferred to the ORM-suite slice for both majors (SPEC §22.2 (by)).
+  not Ferro. On **DBAL 3**, which still has it, the name is used on PostgreSQL inside a transaction
+  only — `currval(name)`, as `pdo_pgsql` runs it — and ignored on MySQL and SQLite, as PDO ignores it
+  (SPEC §22.2 (ci)).
 - **On DBAL 3, `lastInsertId()` throws where DBAL 3's SPI allows `false`.** `false` is a silently
   WRONG key in Doctrine ORM 2: its `IdentityGenerator` casts the answer with `(int)`, so `false`
   becomes the primary key `0`. The throw is a `Doctrine\DBAL\Driver\Exception` (DBAL 3 has no
@@ -188,23 +193,23 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   `Dbal3ConnectionTest::testNoKeyThrowsADriverExceptionNeverFalse`).
 - **`lastInsertId()` is cleared by a failed statement** — a deliberate divergence from PDO. Read it
   immediately after the successful INSERT.
-- **Doctrine ORM + PostgreSQL + the default IDENTITY strategy cannot insert.**
-  `Doctrine\ORM\Id\IdentityGenerator::generateId()` is `(int) $conn->lastInsertId()`, and DBAL 4
-  defaults PostgreSQL to `GENERATOR_TYPE_IDENTITY`. Configure the **SEQUENCE** strategy for the
-  PostgreSQL platform through the ORM's `Configuration::setIdentityGenerationPreferences()`, keyed on
-  `Doctrine\DBAL\Platforms\PostgreSQLPlatform::class`. (The exact constant for the strategy is ORM's
-  own and is not restated here: `doctrine/orm` is not a dependency of this repository, so nothing in
-  this file has been verified against it. The mechanism, and the reason it is needed, are what this
-  entry is asserting.)
-
-  **Drop-in is config-only for DBAL, and is explicitly NOT config-only for ORM on PostgreSQL.** The
-  engine's pooling model is not bent to fit an ORM default; the honest one-line configuration is.
+- **FIXED in M2 — Doctrine ORM + PostgreSQL + the default IDENTITY strategy inserts.** This entry
+  used to say it could not, and that ORM adoption on PostgreSQL needed the SEQUENCE strategy.
+  `IdentityGenerator::generateId()` is `(int) $conn->lastInsertId()`, DBAL 4 makes ORM 3 map `AUTO` to
+  `IDENTITY` on PostgreSQL, and the unit of work always inserts inside a transaction — where
+  `lastInsertId()` now answers (the first entry). Measured through upstream doctrine/orm 3.7.3's own
+  functional suite under its stock configuration: **1571 of 1597** executed tests pass against a
+  `pdo_pgsql` control at 1597/1597, up from 397 (`docs/orm-suite/2026-10-02-local-results.md`). What
+  remains is code that calls `lastInsertId()` itself OUTSIDE a transaction (4 of those tests). **ORM
+  adoption on PostgreSQL is config-only.**
 - **ORM multi-table DELETE/UPDATE on class-table inheritance needs an explicit transaction.**
   `MultiTableDeleteExecutor` issues `CREATE TEMPORARY TABLE`, `INSERT`, `DELETE` and `DROP` as four
   separate statements with no transaction; on a transaction-mode pool statements 2-4 land on
-  different connections. Wrap the query in `$conn->transactional(…)`. (Read from `doctrine/orm 3`
-  during M1-S8b research; like the entry above, it has **not** been re-verified at the acceptance
-  gate, because the ORM suite is not run — see `docs/dbal-suite/2026-08-11-results.md`.)
+  different connections. Wrap the query in `$conn->transactional(…)`. MEASURED by doctrine/orm
+  3.7.3's functional suite on PostgreSQL and MariaDB: 6 tests
+  (`Doctrine\Tests\ORM\Functional\AdvancedDqlQueryTest`,
+  `Doctrine\Tests\ORM\Functional\ClassTableInheritanceTest`, `Doctrine\Tests\ORM\Functional\Ticket\DDC2090Test`) fail with the TEMP table missing, and pass through the
+  stock driver (`docs/orm-suite/2026-10-02-local-results.md`).
 
 ---
 
@@ -280,7 +285,11 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   The full refused set: PG `time '24:00:00'`, PG `date`/`timestamp` `infinity`/`-infinity`, MySQL
   zero and zero-in dates, MySQL negative `TIME` intervals, sub-second `TIME`, and sub-second
   `TIMESTAMPTZ` (refused rather than truncated — silent precision loss is the same defect class).
-  Read those columns through your own `Ferro\Client\Connection`, or cast them in SQL.
+  Read those columns through your own `Ferro\Client\Connection`, or cast them in SQL. **The refusal
+  is at FETCH, before any Doctrine type runs**, so on PostgreSQL it covers a bare `SELECT now()` or
+  DQL `CURRENT_TIMESTAMP()` read through the driver too — measured: 16 of doctrine/orm 3.7.3's
+  functional tests (`Doctrine\Tests\ORM\Functional\QueryDqlFunctionTest`'s `DATE_ADD`/`DATE_SUB` cases) fail this way, where
+  `pdo_pgsql` returns the fractional string.
 - **`datetimetz` is re-rendered per platform.** `DateTimeTzType` has no fallback and accepts only
   `Y-m-d H:i:sO` on PostgreSQL and `Y-m-d H:i:s` on the MySQL family, so no canonical RFC3339 form
   parses anywhere. A whole-second `TIMESTAMPTZ` is re-rendered into the platform's own format; a

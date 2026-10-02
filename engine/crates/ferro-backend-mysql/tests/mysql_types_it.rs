@@ -895,6 +895,43 @@ async fn deferred_column_types_are_refused_before_execution(url: &str, label: &s
     conn.disconnect().await;
 }
 
+/// **§22.2 (ci): a NULL-typed column reads as NULL.** `SELECT NULL` — and `NULL AS x` beside real
+/// columns, the shape doctrine/orm's `NewOperatorTest` hydrates — arrives as `MYSQL_TYPE_NULL`,
+/// which was refused as `Unsupported` until the ORM suite measured it (`pdo_mysql` answers
+/// `[[null]]`). HEAD promises the NULL tag for it, and the real column beside it is unaffected.
+async fn null_typed_columns_read_as_null(url: &str, label: &str) {
+    let backend = MysqlBackend::new(url);
+    let mut conn = backend.connect().await.expect("connect");
+    let (head, v) = one(&backend, &mut conn, "NULL").await;
+    assert_eq!(v, Value::Null, "[{label}] SELECT NULL");
+    assert_eq!(
+        head,
+        Value::Null.tag(),
+        "[{label}] HEAD promises NULL for a NULL-typed column"
+    );
+
+    let r = backend
+        .query(
+            &mut conn,
+            "SELECT NULL AS n, 7 AS i, ? AS p",
+            &[Value::Null],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] a NULL projection beside real columns: {e:?}"));
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Null, Value::I64(7), Value::Null]],
+        "[{label}]"
+    );
+    assert_eq!(r.cols[0].tag, Value::Null.tag(), "[{label}]");
+    assert_eq!(
+        r.cols[1].tag,
+        Value::I64(0).tag(),
+        "[{label}] the real column is unaffected"
+    );
+    conn.disconnect().await;
+}
+
 /// **MariaDB's extended types, MEASURED and recorded (hazard 25).** MariaDB 10.7+ has a native
 /// `UUID` type (and 10.5+ has `INET6`, 10.10+ `INET4`), all of which the plan expected to stay a
 /// loud `Unsupported` in S7. Live measurement says otherwise: without the
@@ -1600,6 +1637,12 @@ both_engines!(
     non_canonical_payloads_are_rejected_pre_send_under_permissive_sql_mode,
     mysql_non_canonical_payloads_are_rejected_pre_send_under_permissive_sql_mode,
     mariadb_non_canonical_payloads_are_rejected_pre_send_under_permissive_sql_mode
+);
+
+both_engines!(
+    null_typed_columns_read_as_null,
+    mysql_null_typed_columns_read_as_null,
+    mariadb_null_typed_columns_read_as_null
 );
 
 /// MariaDB-only (the types do not exist on MySQL 8).

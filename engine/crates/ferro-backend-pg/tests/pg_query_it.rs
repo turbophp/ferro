@@ -420,6 +420,67 @@ async fn a_real_pg_server_error_carries_no_errno() {
     }
 }
 
+/// **M2 (§22.2 (ci)): an `F64` binds a `numeric` slot, against real PostgreSQL** — the shape seven
+/// doctrine/orm functional tests failed on (`DecimalType` binding a PHP float). PostgreSQL is the
+/// oracle: each value is read back through `::text` in the same statement, so a wrong wire FORMAT
+/// (binary float bytes under a numeric OID) cannot pass. The expected texts are what `pdo_pgsql`
+/// stores for the same PHP floats under `PARAM_STR` — the shortest round-trip rendering, NOT
+/// PostgreSQL's own 15-digit `float8::numeric` cast, which the last column shows disagreeing.
+#[tokio::test(flavor = "multi_thread")]
+async fn orm_f64_binds_numeric_live() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let pool = Pool::new(PgBackend::new(url), config(1));
+    let mut co = pool.checkout().await.expect("checkout");
+
+    let rows = co
+        .query(
+            "SELECT ($1::numeric)::text, ($2::numeric)::text, ($3::numeric)::text, \
+             ($4::numeric)::text, ($2::float8::numeric)::text",
+            &[
+                Value::F64(1.5),
+                Value::F64(0.1 + 0.2),
+                Value::F64(f64::NAN),
+                Value::F64(-0.0),
+            ],
+        )
+        .await
+        .expect("an F64 must bind a numeric slot");
+    let r = &rows.rows[0];
+    assert_eq!(r[0], Value::Text("1.5".into()));
+    assert_eq!(
+        r[1],
+        Value::Text("0.30000000000000004".into()),
+        "the shortest round-trip form, as PHP's (string) cast and pdo_pgsql produce"
+    );
+    assert_eq!(r[2], Value::Text("NaN".into()));
+    assert_eq!(r[3], Value::Text("0".into()));
+    assert_eq!(
+        r[4],
+        Value::Text("0.3".into()),
+        "PostgreSQL's own cast rounds to 15 digits — which is why the bind does not use it"
+    );
+
+    // A real column, written and read back: the ORM's insert shape.
+    co.exec("CREATE TEMP TABLE orm_dec (d numeric(10,2))")
+        .await
+        .expect("temp table");
+    co.query("INSERT INTO orm_dec VALUES ($1)", &[Value::F64(12.345)])
+        .await
+        .expect("an F64 must insert into a numeric(10,2) column");
+    let rows = co
+        .query("SELECT d::text FROM orm_dec", &[])
+        .await
+        .expect("read back");
+    assert_eq!(
+        rows.rows[0][0],
+        Value::Text("12.35".into()),
+        "numeric(10,2) rounds, as it does for pdo"
+    );
+    co.exec("DROP TABLE orm_dec").await.expect("drop");
+}
+
 /// **M2-C2: an `I64` binds a `numeric` and a `double precision` slot, against real PostgreSQL.**
 ///
 /// The two shapes are the last three non-passing tests of the `laravel/framework` v11.51.0

@@ -1,0 +1,96 @@
+# M2: upstream doctrine/orm's FUNCTIONAL suite through Ferro's DBAL 4 driver (testkit/orm-suite.sh),
+# against a stock-PDO control, TWICE per column (the two-run reproducibility rule, §22.2 (z)).
+#
+# ON DEMAND ONLY, like dbal-suite.yml: a red phpunit exit is DATA to record, not a build failure.
+# The job fails only when a run died before producing a result line, did not reach what it claims
+# (the contact line), or did not reproduce itself (run 2 ≠ run 1 as sets).
+#
+# PostgreSQL has FOUR columns: Ferro and the control, each under the stock ORM configuration and
+# under the SEQUENCE identity preference (the D-S8b-5 remedy as a labelled harness change). The
+# stock column is the one that measures "config-only adoption".
+name: orm-suite
+on:
+  workflow_dispatch:
+    inputs:
+      family:
+        description: "Backend family to measure"
+        type: choice
+        options: [all, pg, mysql, mariadb]
+        default: all
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        family: ${{ fromJSON(inputs.family == 'all' && '["pg","mysql","mariadb"]' || format('["{0}"]', inputs.family)) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with: { php-version: "8.4", extensions: msgpack, tools: composer }
+      - uses: dtolnay/rust-toolchain@stable
+      # The testkit host ports sit inside Linux's ephemeral range (see dbal-suite.yml).
+      - run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=33060,33061,55432
+      - run: |
+          docker compose -f testkit/docker-compose.yml up -d --wait ${{ matrix.family }} \
+            || { sleep 15; docker compose -f testkit/docker-compose.yml up -d --wait ${{ matrix.family }}; }
+      - run: cargo build -p ferrod
+      - name: measure every column, twice each
+        run: |
+          set +e
+          if [ "${{ matrix.family }}" = pg ]; then cols="ferro-stock control-stock ferro-sequence control-sequence"; else cols="ferro control"; fi
+          for col in $cols; do
+            ctl=0; seq=0
+            case "$col" in control*) ctl=1 ;; esac
+            case "$col" in *-sequence) seq=1 ;; esac
+            for run in 1 2; do
+              FERRO_ORM_SVC=${{ matrix.family }} FERRO_ORM_CONTROL=$ctl FERRO_ORM_SEQUENCE=$seq \
+                FERRO_ORM_FERROD="$PWD/target/debug/ferrod" \
+                timeout 2400 bash testkit/orm-suite.sh --log-junit "$col-run$run.xml" > "$col-run$run.log" 2>&1
+              echo "$col run $run: phpunit exit $? — $(grep -E '^(OK|Tests: )' "$col-run$run.log" | tail -1)"
+            done
+          done
+      - name: assert every run measured what it claims, and reproduced
+        run: |
+          if [ "${{ matrix.family }}" = pg ]; then cols="ferro-stock control-stock ferro-sequence control-sequence"; else cols="ferro control"; fi
+          rc=0
+          for col in $cols; do
+            for run in 1 2; do
+              f="$col-run$run.log"
+              grep -qE '^(OK|Tests: )' "$f" || { echo "::error:: $f has no phpunit result line"; tail -40 "$f"; rc=1; }
+              grep -q '\[ferro\] reset: ' "$f" || { echo "::error:: $f has no reset line"; rc=1; }
+              case "$col" in
+                control*) grep -q '^\[control\] .*driver=Doctrine' "$f" || { echo "::error:: $f: the control's contact line is missing"; rc=1; } ;;
+                *)        grep -q '^\[ferro\] orm=' "$f" || { echo "::error:: $f: the Ferro contact line is missing"; rc=1; } ;;
+              esac
+            done
+            php testkit/dbal/compare-columns.php "$col-run2.xml" "$col-run1.xml" > "repro-$col.txt" || true
+            grep -qE '^fail: ferro ([0-9]+) \(sha256 ([0-9a-f]+)\), control \1 \(sha256 \2\)' "repro-$col.txt" \
+              && grep -qE '^skip: ferro ([0-9]+) \(sha256 ([0-9a-f]+)\), control \1 \(sha256 \2\)' "repro-$col.txt" \
+              || { echo "::error:: $col did not reproduce (run 2 vs run 1)"; cat "repro-$col.txt"; rc=1; }
+          done
+          exit "$rc"
+      - name: compare each Ferro column with its control, as SETS (skips included)
+        if: always()
+        run: |
+          {
+            if [ "${{ matrix.family }}" = pg ]; then
+              php testkit/dbal/compare-columns.php ferro-stock-run1.xml control-stock-run1.xml || true
+              php testkit/dbal/compare-columns.php ferro-sequence-run1.xml control-sequence-run1.xml || true
+            else
+              php testkit/dbal/compare-columns.php ferro-run1.xml control-run1.xml || true
+            fi
+          } | tee compare.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: orm-suite-${{ matrix.family }}-${{ github.run_id }}
+          include-hidden-files: true
+          path: |
+            *-run*.log
+            *-run*.xml
+            repro-*.txt
+            compare.txt
+            .orm-suite/ferrod.log

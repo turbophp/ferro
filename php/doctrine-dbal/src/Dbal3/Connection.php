@@ -74,20 +74,21 @@ final class Connection extends AbstractConnection implements ServerInfoAwareConn
      * and converts, so a caller sees an ordinary `Doctrine\DBAL\Exception\DriverException` naming
      * the reason (DBAL 3 has no `NoIdentityValue`; DBAL 4 added it for exactly this signal).
      *
-     * **The sequence name is not used, on any family.** On MySQL and SQLite the engine reports the
-     * key itself and a name means nothing (PDO ignores it there too). On PostgreSQL its only use
-     * would be a follow-up `currval()`: OUTSIDE a transaction that is the cross-connection hazard
-     * {@see AbstractConnection::noKeyMessage} describes, and INSIDE one — where Doctrine ORM 2's
-     * identity generator runs — it would be correct, and is deferred to the ORM-suite slice for
-     * both majors at once (SPEC §22.2 (by)). Until then DBAL 3 gets exactly DBAL 4's answer. DBAL 3's own upstream test of the `false` return (`WriteTest::
-     * testLastInsertIdNoSequenceGiven`) is skipped on every family Ferro serves, since all three
-     * support identity columns.
+     * **The sequence name is used on PostgreSQL inside a transaction only.** On MySQL and SQLite the
+     * engine reports the key itself and a name means nothing (PDO ignores it there too). On
+     * PostgreSQL INSIDE a transaction — where Doctrine ORM 2's identity generator runs — it is
+     * `currval(name)` on the pinned connection, as `pdo_pgsql` runs it, and without a name
+     * `lastval()` (SPEC §22.2 (ci)); OUTSIDE one it throws, for the cross-connection hazard
+     * {@see AbstractConnection::noKeyMessage} describes. DBAL 3's own upstream test of the `false`
+     * return (`WriteTest::testLastInsertIdNoSequenceGiven`) is skipped on every family Ferro
+     * serves, since all three support identity columns.
      *
      * @param string|null $name
      */
     public function lastInsertId($name = null): int|string
     {
-        return $this->generatedKey() ?? throw DriverException::local($this->noKeyMessage());
+        return $this->generatedKey(is_string($name) && $name !== '' ? $name : null)
+            ?? throw DriverException::local($this->noKeyMessage());
     }
 
     /**
