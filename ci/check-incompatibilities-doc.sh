@@ -75,7 +75,11 @@ done
 #   * matching the LEAF name alone is far too loose. `Connection` is declared a dozen times inside
 #     doctrine/dbal's own tree, so a cited `Ferro\DBAL\Nonexistent\Connection` would have passed.
 # So: only this repository's own sources, and the NAMESPACE has to match as well as the leaf.
-php_own() { find "$root/php" -name vendor -prune -o -name '*.php' -print; }
+# Every vendor tree is pruned, not just the one named `vendor`: `php/doctrine-dbal/vendor-dbal3`
+# (the DBAL 3 lane, M2-C5a) is gitignored too, and installed from source it carries upstream's own
+# test suite — so a bare citation of an UPSTREAM test resolved on a developer's machine and failed
+# in CI, where that tree does not exist (measured at C5b).
+php_own() { find "$root/php" \( -name vendor -o -name 'vendor-*' \) -prune -o -name '*.php' -print; }
 # NOTE: the trailing word boundary is passed as an ARGUMENT, not inside the format string —
 # printf expands `\b` in a FORMAT to a backspace, which silently produced a regex that matched
 # nothing and reported every cited name as missing.

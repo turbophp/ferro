@@ -143,6 +143,14 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   cannot fail and `testInheritCharsetFromPrimary` reports the engine's `utf8mb4` rather than the
   requested `latin1`. Tooling that shells out to `pg_dump`/`mysqldump` with the application's config
   cannot work; ops provisions separate dump credentials.
+- **DBAL 3's `SqliteSchemaManager::createDatabase($path)` creates no file.** That method (deprecated
+  upstream) opens a second connection with `path` set to the argument; a Ferro connection ignores
+  `path`, because the database is the engine pool's (SPEC §12 / D8, and D14 confines every file the
+  engine opens), so it reaches the pool's existing database and returns without error. Measured
+  through upstream's `Doctrine\DBAL\Tests\Functional\Schema\SqliteSchemaManagerTest::testCreateAndDropDatabase`, which asserts the file
+  exists. Provision a database as a pool instead. On DBAL 4 the same call fails loudly rather than
+  silently: `SQLitePlatform::getCreateDatabaseSQL()` throws `NotSupported`
+  (`docs/dbal-suite/2026-10-02-c5b-dbal3-results.md`).
 - **A pool whose BACKEND is unreachable fails at `getDatabasePlatform()`, not at connect.**
   Connecting succeeds because the Ferro handshake never depends on backend availability; the platform
   needs the server version, which does. The failure is a loud
@@ -324,6 +332,18 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
 
 ## Schema, migrations and introspection
 
+- **DBAL 3 on PostgreSQL: set the `user` parameter to the backend role, or a schema named after the
+  role makes DBAL 3 pick the WRONG current schema.** DBAL 3's PostgreSQL schema manager works out
+  the current schema by substituting the connection's `user` PARAMETER for `"$user"` in
+  `SHOW search_path`, and a Ferro connection has no credentials, so no `user`. When the role owns a
+  schema of its own name — PostgreSQL's documented secure-schema-usage pattern — DBAL 3 then takes
+  the next schema in the path as current: the role's tables come back schema-qualified, `public`'s
+  come back bare, and the comparator plans a CREATE of the bare name plus a DROP of the qualified one
+  (measured: a destructive migration). Setting DBAL's `user` parameter to the backend role fixes it
+  and is inert for Ferro's own connection; so does keeping `"$user"` out of the pool's `search_path`.
+  DBAL 4 asks the server (`SELECT current_schema()`) and is not affected. Pinned in all three cells
+  by `SearchPathLiveTest::testTheCurrentSchemaFollowsTheUserParamOnDbal3AndTheServerOnDbal4`
+  (SPEC §22.2 (bz)).
 - **FIXED at M1-S9 — the stock PostgreSQL schema manager works.** This page used to say it did not:
   DBAL's `PostgreSQLSchemaManager::selectIndexColumns()` selects `pg_index.indkey`, an `int2vector`,
   which the PG read path had no mapping for, and it took `introspectTable()`, `listTableIndexes()`,

@@ -13,7 +13,14 @@ declare(strict_types=1);
 // runner dies on `Call to undefined method PHPUnit\TextUI\Configuration\Source::identifyIssueTrigger()`.
 // testkit/dbal-suite.sh asserts the two doctrine/dbal versions match, so "tests from the clone,
 // source from vendor" cannot silently drift.
-require __DIR__ . '/../../php/doctrine-dbal/vendor/autoload.php';
+//
+// WHICH vendor tree is the runner's choice (M2-C5b): the driver package's `vendor/` for DBAL 4, its
+// `vendor-dbal3/` lane for DBAL 3. Defaulting keeps a bare `phpunit -c` against the DBAL 4 tree
+// working as before.
+$vendor = getenv('FERRO_DBAL_VENDOR');
+if ($vendor === false || $vendor === '') {
+    $vendor = __DIR__ . '/../../php/doctrine-dbal/vendor';
+}
 
 $dbal = getenv('FERRO_DBAL_SRC');
 if ($dbal === false || $dbal === '') {
@@ -22,7 +29,7 @@ if ($dbal === false || $dbal === '') {
 }
 
 /** @var Composer\Autoload\ClassLoader $loader */
-$loader = require __DIR__ . '/../../php/doctrine-dbal/vendor/autoload.php';
+$loader = require $vendor . '/autoload.php';
 $loader->addPsr4('Doctrine\\DBAL\\Tests\\', $dbal . '/tests');
 
 // -------------------------------------------------------------------------------------------------
@@ -64,7 +71,15 @@ if ($control) {
     exit(1);
 }
 
-$version  = $conn->getServerVersion();
+// DBAL 4's wrapper exposes `getServerVersion()`; DBAL 3's keeps it PRIVATE, and there the version
+// is the driver connection's — the Ferro one found through the native client, or the control's PDO.
+if (is_callable([$conn, 'getServerVersion'])) {
+    $version = $conn->getServerVersion();
+} elseif ($native instanceof Ferro\Client\Connection) {
+    $version = Ferro\DBAL\AbstractConnection::forNativeConnection($native)?->getServerVersion() ?? '?';
+} else {
+    $version = $native instanceof PDO ? (string) $native->getAttribute(PDO::ATTR_SERVER_VERSION) : '?';
+}
 $platform = get_class($conn->getDatabasePlatform());
 
 // A real round trip, so "connected" cannot mean "constructed an object".

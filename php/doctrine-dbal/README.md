@@ -145,6 +145,15 @@ verbatim, deliberately: MariaDB is detected by the substring `MariaDB` in the ve
 `'11.8.8-MariaDB-ubu2404'` selects `MariaDB110700Platform` while a "helpfully" normalised `'11.8.8'`
 would select `MySQL84Platform` — a different dialect.
 
+`getServerVersion()` answers the same normalised string (since M2-C5b): on PostgreSQL
+`'17.10 (Debian …) on x86_64-…'`, without the leading product name, so it begins with the version
+number as `pdo_pgsql`'s does (which omits the `on …, compiled by …` tail). The raw banner
+`'PostgreSQL 17.10 (…)'` is something `version_compare()` reads as OLDER than every version, so a
+`version_compare($conn->getServerVersion(), '12.0', '<')` gate — upstream doctrine/dbal's own suite
+has one — answered wrong. One consequence: that string is not a valid `serverVersion` parameter,
+because a platform chosen before any connection learns the family only from it — keep writing
+`serverVersion` as the banner (`'PostgreSQL 17.10'`), as above.
+
 ### Read-only connections
 
 Neither DBAL SPI carries a read/write signal: `executeQuery('INSERT … RETURNING id')` is

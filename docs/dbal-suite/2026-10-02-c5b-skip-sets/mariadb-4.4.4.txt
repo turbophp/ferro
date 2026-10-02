@@ -1,0 +1,28 @@
+# C5b skip-set comparison — doctrine/dbal 4.4.4, MariaDB 10.11.14 (dev container, LOCAL — not a recorded column)
+# Produced on 2026-10-02 from commit f080df4 + the C5b review fixes, by:
+#   FERRO_DBAL_TAG=4.4.4 FERRO_DBAL_SVC=mysql FERRO_DBAL_DSN=mysql://ferro:ferro@127.0.0.1:33060/doctrine_tests \
+#     bash testkit/dbal-suite.sh --log-junit ferro.xml          # the Ferro column
+#   (the same with FERRO_DBAL_CONTROL=1 --log-junit control.xml)  # the stock-driver control
+#   php testkit/dbal/compare-columns.php ferro.xml control.xml
+# (the database was reset before each run; JUnit encodes an incomplete test as skipped, so
+#  'skip' counts Skipped + Incomplete from the phpunit result line)
+
+tests: ferro 729, control 729
+in only one column: 0
+skip: ferro 349 (sha256 4ed39f67dd189ae2), control 350 (sha256 eae7c05f7a121f5d)
+  skip under ferro, not under control: 0
+  skip under control, not under ferro: 1
+  Doctrine\DBAL\Tests\Functional\StatementTest::testExecWithRedundantParameters
+fail: ferro 11 (sha256 9680cefd53f9e056), control 2 (sha256 75fe58d8a50f27f8)
+  fail under ferro, not under control: 9
+  Doctrine\DBAL\Tests\Functional\ExceptionTest::testInvalidHost
+  Doctrine\DBAL\Tests\Functional\ExceptionTest::testInvalidPassword
+  Doctrine\DBAL\Tests\Functional\PrimaryReadReplicaConnectionTest::testInheritCharsetFromPrimary
+  Doctrine\DBAL\Tests\Functional\Schema\MySQLSchemaManagerTest::testListTableColumnsThrowsDatabaseRequired
+  Doctrine\DBAL\Tests\Functional\TransactionTest::testBeginTransactionFailure
+  Doctrine\DBAL\Tests\Functional\TransactionTest::testCommitFailure
+  Doctrine\DBAL\Tests\Functional\TransactionTest::testRollbackFailure
+  Doctrine\DBAL\Tests\Functional\TransactionTest::testTransactionalFailureDuringCallback
+  Doctrine\DBAL\Tests\Functional\TransactionTest::testTransactionalFailureDuringCommit
+  fail under control, not under ferro: 0
+RESULT: no test the control runs is skipped under Ferro.

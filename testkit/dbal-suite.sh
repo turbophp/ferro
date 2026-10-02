@@ -8,6 +8,18 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tag="${FERRO_DBAL_TAG:-4.4.4}"
+# THE MAJOR (M2-C5b) is derived from the pinned tag, never configured beside it, so the tests and
+# the code under test cannot name different majors. Everything major-specific hangs off it: the
+# driver package's VENDOR TREE (DBAL 3 lives in vendor-dbal3/, installed from composer.dbal3.json —
+# the package's own DBAL 3 lane), the replacement TestUtil (3.10.6's public surface differs from
+# 4.4.4's), and the driverClass.
+major="${tag%%.*}"
+pkg="$root/php/doctrine-dbal"
+case "$major" in
+  4) vendor="$pkg/vendor";       composer_file=composer.json;       testutil=TestUtil.ferro.php;       driver_class='Ferro\DBAL\Driver' ;;
+  3) vendor="$pkg/vendor-dbal3"; composer_file=composer.dbal3.json; testutil=TestUtil.ferro.dbal3.php; driver_class='Ferro\DBAL\Dbal3\Driver' ;;
+  *) echo "::error:: FERRO_DBAL_TAG=$tag names DBAL major $major; the driver serves 3 and 4"; exit 1 ;;
+esac
 pool="${FERRO_DBAL_POOL:-default}"
 # Which container to reset, and how. `--no-reset` exists for fast iteration; a RECORDED run must not
 # use it (see the results file's environment manifest).
@@ -18,15 +30,19 @@ pool="${FERRO_DBAL_POOL:-default}"
 # is running, and the whole column therefore runs on a box with no database server at all — the
 # first of the three that does.
 svc="${FERRO_DBAL_SVC:-pg}"
-# THE CONTROL COLUMN (`FERRO_DBAL_CONTROL=1`, SQLite only): the identical tests, the identical
-# database file, run through upstream's OWN `pdo_sqlite` with no Ferro anywhere — no daemon is
-# started and no socket is passed. It is what turns "28 non-passes" into an attribution instead of
-# a guess, and `bootstrap.php`'s contact assertion INVERTS for it (it refuses to run if the
-# connection turns out to be a Ferro one). It is the C2e shape (SPEC §22.2 (ar)).
+# THE CONTROL COLUMN (`FERRO_DBAL_CONTROL=1`): the identical tests against the identical database,
+# run through upstream's OWN `pdo_sqlite` / `pdo_pgsql` / `pdo_mysql` with no Ferro anywhere — no
+# daemon is started and no socket is passed. It is what turns "28 non-passes" into an attribution
+# instead of a guess, and `bootstrap.php`'s contact assertion INVERTS for it (it refuses to run if
+# the connection turns out to be a Ferro one). It is the C2e shape (SPEC §22.2 (ar)).
 #
-# SQLite only, and that is a fact about the other two families rather than a limitation here: a
-# pdo_pgsql/pdo_mysql control would need credentials in PHP, which the whole point of §12/D8 is that
-# the suite does not have. SQLite's "credentials" are a file path.
+# The server families' control takes its credentials from `FERRO_DBAL_DSN` and writes them into the
+# GENERATED phpunit config (M2-C5b). That is not the §12/D8 boundary being crossed: D8 keeps
+# credentials out of the PRODUCT's PHP, and the control column is a harness that exists precisely to
+# measure the product against the stock driver, which cannot connect without them — the Laravel
+# runner's `stock-pgsql` column has done the same since C2e. It was added so the rule SPEC §22.2 (bz)
+# records — compare a column's SKIP set against a control, not only its failures — can be followed
+# from the repo for every family rather than with an ad-hoc config.
 control="${FERRO_DBAL_CONTROL:-0}"
 work="${FERRO_DBAL_WORK:-$root/.dbal-suite}"
 # The SQLite column's database file. Inside $work so it is discarded with the rest of the scratch
@@ -41,10 +57,26 @@ if [ "$svc" = sqlite ]; then
 else
   dsn="${FERRO_DBAL_DSN:-postgres://ferro:ferro@127.0.0.1:55432/doctrine_tests}"
 fi
-if [ "$control" = 1 ] && [ "$svc" != sqlite ]; then
-  echo "::error:: FERRO_DBAL_CONTROL=1 is SQLite-only (see the comment above): the other families'"
-  echo "          controls would need database credentials in PHP, which SPEC §12/D8 forbids."
-  exit 1
+# The control's stock driver, and — for a server family — the DSN taken apart into the five
+# parameters `TestUtil` reads. Refused rather than guessed when the DSN does not parse: a control
+# that quietly connected somewhere else would measure the wrong database.
+ctl_driver=""
+if [ "$control" = 1 ]; then
+  case "$svc" in
+    sqlite) ctl_driver=pdo_sqlite ;;
+    pg) ctl_driver=pdo_pgsql ;;
+    mysql|mariadb) ctl_driver=pdo_mysql ;;
+    *) echo "::error:: FERRO_DBAL_CONTROL=1 has no stock driver for FERRO_DBAL_SVC=$svc"; exit 1 ;;
+  esac
+  if [ "$svc" != sqlite ]; then
+    re='^[a-z]+://([^:@/]+):([^@/]*)@([^:/]+):([0-9]+)/([^/?]+)$'
+    if [[ ! "$dsn" =~ $re ]]; then
+      echo "::error:: the control needs FERRO_DBAL_DSN as scheme://user:password@host:port/dbname"
+      exit 1
+    fi
+    ctl_user="${BASH_REMATCH[1]}" ctl_pass="${BASH_REMATCH[2]}" ctl_host="${BASH_REMATCH[3]}"
+    ctl_port="${BASH_REMATCH[4]}" ctl_db="${BASH_REMATCH[5]}"
+  fi
 fi
 src="$work/dbal-$tag"
 reset=1
@@ -73,22 +105,23 @@ if [ ! -d "$src" ]; then
   git clone --depth 1 --branch "$tag" https://github.com/doctrine/dbal.git "$src"
 fi
 
-# 3. The driver package must be installed (its vendor/ is its own, and is the ONLY one this run uses).
-(cd "$root/php/doctrine-dbal" && composer install --no-interaction --no-progress --quiet)
+# 3. The driver package must be installed (its vendor tree for THIS major is the ONLY one this run
+#    uses — vendor/ for DBAL 4, vendor-dbal3/ for DBAL 3).
+(cd "$pkg" && COMPOSER="$composer_file" composer install --no-interaction --no-progress --quiet)
 
 # 1b. …which means the tests come from the clone at $tag and the code under test comes from the
 #     driver package's vendor. If those two versions ever diverge the suite silently tests the wrong
 #     source, so assert they are equal.
-installed="$(cd "$root/php/doctrine-dbal" && composer show doctrine/dbal 2>/dev/null | awk '$1=="versions" {print $NF}')"
+installed="$(cd "$pkg" && COMPOSER="$composer_file" composer show doctrine/dbal 2>/dev/null | awk '$1=="versions" {print $NF}')"
 if [ "$installed" != "$tag" ]; then
-  echo "::error:: doctrine/dbal in php/doctrine-dbal/vendor is '$installed' but the test tree is pinned at '$tag'."
+  echo "::error:: doctrine/dbal in ${vendor#$root/} is '$installed' but the test tree is pinned at '$tag'."
   echo "          The suite would run $tag's tests against $installed's source. Pin one to the other."
   exit 1
 fi
 
 # 2. The patched TestUtil, copied over the upstream one, and VERIFIED — a silently-failed patch is
 #    exactly how this suite goes green against SQLite.
-cp "$root/testkit/dbal/TestUtil.ferro.php" "$src/tests/TestUtil.php"
+cp "$root/testkit/dbal/$testutil" "$src/tests/TestUtil.php"
 grep -q 'neither db_driverClass nor db_driver is set' "$src/tests/TestUtil.php" \
   || { echo "::error:: TestUtil patch did not apply"; exit 1; }
 
@@ -156,7 +189,11 @@ sock=""
 if [ "$control" = 1 ]; then
   # No daemon, no socket, no cargo build. The control must not merely AVOID using Ferro — it must
   # have no Ferro to use, so a mis-set variable cannot quietly route through one.
-  echo "[control] no ferrod started; pdo_sqlite will open $sqlite_db directly"
+  if [ "$svc" = sqlite ]; then
+    echo "[control] no ferrod started; pdo_sqlite will open $sqlite_db directly"
+  else
+    echo "[control] no ferrod started; $ctl_driver will connect to $ctl_host:$ctl_port/$ctl_db directly"
+  fi
 else
   cargo build -p ferrod --manifest-path "$root/Cargo.toml"
   sock="$(mktemp -u /tmp/ferro-dbal-XXXXXX.sock)"
@@ -186,10 +223,18 @@ cfg="$work/phpunit.generated.xml"
   if [ "$control" = 1 ]; then
     # `driver`/`path` and NOTHING else: TestUtil refuses a run that sets both `driver` and
     # `driverClass`, so the two columns cannot be blended by accident.
-    echo '    <var name="db_driver" value="pdo_sqlite"/>'
-    echo '    <var name="db_path" value="'"$sqlite_db"'"/>'
+    echo '    <var name="db_driver" value="'"$ctl_driver"'"/>'
+    if [ "$svc" = sqlite ]; then
+      echo '    <var name="db_path" value="'"$sqlite_db"'"/>'
+    else
+      echo '    <var name="db_host" value="'"$ctl_host"'"/>'
+      echo '    <var name="db_port" value="'"$ctl_port"'"/>'
+      echo '    <var name="db_user" value="'"$ctl_user"'"/>'
+      echo '    <var name="db_password" value="'"$ctl_pass"'"/>'
+      echo '    <var name="db_dbname" value="'"$ctl_db"'"/>'
+    fi
   else
-    echo '    <var name="db_driverClass" value="Ferro\DBAL\Driver"/>'
+    echo '    <var name="db_driverClass" value="'"$driver_class"'"/>'
     echo '    <var name="db_unix_socket" value="'"$sock"'"/>'
     echo '    <var name="db_driver_options" value="{&quot;pool&quot;:&quot;'"$pool"'&quot;}"/>'
   fi
@@ -206,5 +251,5 @@ fi
 # 7. Run it, with the DRIVER package's phpunit (see step 1 — one vendor tree, no version collision).
 #    The bootstrap's contact assertion runs first and exits non-zero if the connection is not a
 #    Ferro one.
-FERRO_DBAL_SRC="$src" FERRO_DBAL_CONTROL="$control" \
-  "$root/php/doctrine-dbal/vendor/bin/phpunit" -c "$cfg" "${args[@]+"${args[@]}"}"
+FERRO_DBAL_SRC="$src" FERRO_DBAL_CONTROL="$control" FERRO_DBAL_VENDOR="$vendor" \
+  "$vendor/bin/phpunit" -c "$cfg" "${args[@]+"${args[@]}"}"

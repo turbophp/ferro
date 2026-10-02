@@ -31,10 +31,11 @@ final class ServerVersionLiveTest extends DbalLiveTestCase
         $c = $this->dbal();
 
         self::assertInstanceOf(PostgreSQL120Platform::class, $c->getDatabasePlatform());
-        self::assertStringContainsString(
-            'PostgreSQL',
-            self::serverVersionOf($c),
-            'the VERBATIM engine string reaches the driver; normalisation happens inside PlatformVersion',
+        $version = self::serverVersionOf($c);
+        self::assertStringStartsNotWith('PostgreSQL', $version, 'the product name is stripped (M2-C5b)');
+        self::assertFalse(
+            version_compare($version, '12.0', '<'),
+            "a modern server must not compare older than 12 — the version_compare contract consumers rely on: $version",
         );
     }
 
@@ -54,7 +55,7 @@ final class ServerVersionLiveTest extends DbalLiveTestCase
     public function testAPoolWhoseBackendIsDownFailsLOUDLYAndNamesItself(): void
     {
         $healthy = $this->dbal();
-        self::assertStringContainsString('PostgreSQL', self::serverVersionOf($healthy));
+        self::assertFalse(version_compare(self::serverVersionOf($healthy), '12.0', '<'));
 
         $c = $this->dbal('dead');
         self::assertInstanceOf(\Ferro\Client\Connection::class, $c->getNativeConnection());
