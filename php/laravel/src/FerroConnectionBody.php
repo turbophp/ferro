@@ -4,6 +4,11 @@ namespace Ferro\Laravel;
 
 use Ferro\Client\Connection as FerroClient;
 use Ferro\Client\Error\FerroException;
+use Ferro\Client\Error\IndeterminateException;
+use Ferro\Client\Error\RetryableException;
+use Ferro\Client\Error\TransportException;
+use Ferro\Laravel\Exception\ConnectFailed;
+use Ferro\Protocol\Generated\Constants;
 use Ferro\Client\RawStream;
 use Ferro\Laravel\Exception\FerroQueryException;
 
@@ -28,10 +33,12 @@ use Ferro\Laravel\Exception\FerroQueryException;
 trait FerroConnectionBody
 {
     /**
+     * @param \Closure(): FerroClient $dial opens ONE new Ferro client per call. It is called each
+     *   time Illuminate resolves this connection's PDO — never at construction (see below).
      * @param array<string,mixed> $config
      */
     public function __construct(
-        private readonly FerroClient $ferro,
+        \Closure $dial,
         string $database = '',
         string $tablePrefix = '',
         array $config = [],
@@ -44,11 +51,34 @@ trait FerroConnectionBody
         // Passed as a CLOSURE, which `getPdo()` resolves on first use, because Illuminate documents
         // the parameter as `\PDO|\Closure`. The closure form satisfies that contract exactly and
         // costs nothing — `getPdo()` memoises the result into `$this->pdo` on the first call.
-        // NOT `static`: the closure reads this connection's remembered insert key (see
-        // {@see rememberInsertId}). Illuminate only invokes it on the first `getPdo()`, long after
-        // construction, so binding `$this` here is safe.
+        //
+        // **The client is NOT kept on this connection — the shim owns it** (M2-C1e-2). See
+        // {@see shim} for why that is a correctness property rather than a matter of taste.
+        //
+        // **And the client is DIALLED when the closure is resolved, never before — once per
+        // resolution, exactly like the closure `ConnectionFactory::createPdoResolver()` hands a
+        // stock connection.** The first cut captured a client dialled at construction, and the
+        // adversarial review measured what that costs, because Illuminate passes this closure
+        // AROUND: `refreshPdoConnections()` transplants it from a throwaway connection that sits
+        // in a reference cycle with its grammar, so the throwaway kept the superseded client — and
+        // its open transaction — alive after `DB::disconnect()` until the cycle collector ran (a
+        // same-key insert blocked the engine's full 10 s idle-in-transaction deadline; 19 of 20
+        // superseded clients survived 20 reconnects). And after `DB::purge()` the closure is
+        // RESOLVED BY TWO CONNECTION OBJECTS, which then shared one session: one connection's
+        // `rollBack()` discarded the other's autocommitted write. A closure that dials owns
+        // nothing until it runs, and each run owns its own session, so neither can happen.
         parent::__construct(
-            fn (): FerroPdoShim => new FerroPdoShim($ferro, fn (): int|string|null => $this->lastInsertId),
+            static function () use ($dial): FerroPdoShim {
+                try {
+                    $client = $dial();
+                } catch (TransportException $e) {
+                    // Nothing was sent: the transport failed before any statement existed. Typed,
+                    // so the lost-connection guard can let Illuminate reconnect and retry, as it
+                    // would after a PDO connect failure ({@see causedByLostConnection}).
+                    throw ConnectFailed::from($e);
+                }
+                return new FerroPdoShim($client);
+            },
             $database,
             $tablePrefix,
             $config,
@@ -56,35 +86,145 @@ trait FerroConnectionBody
     }
 
     /**
-     * The last key any write on THIS connection generated — PDO's `lastInsertId()` semantics, held
-     * here because this is the PDO-emulation tier.
+     * The PDO shim, and through it the ONE Ferro client every path of this connection uses.
      *
-     * The client's own `lastInsertId()` is per-STATEMENT and is cleared on the way in to every
-     * request, which is correct for the engine (a pooled statement can land on another backend
-     * connection, so a carried-over rowid would be a silently wrong key) and wrong for PDO, whose
-     * value belongs to the HANDLE. See {@see FerroPdoShim::lastInsertId} for the measurement that
-     * forced the distinction.
+     * **Why the client lives in the shim rather than on the connection.** Illuminate reconnects by
+     * REPLACING THE PDO, never the connection: `DatabaseManager::refreshPdoConnections()` — behind
+     * `DB::reconnect()`, behind `run()`'s `reconnectIfMissingConnection()` after `DB::disconnect()`,
+     * and behind the lost-connection retry — builds a whole fresh connection and transplants its
+     * `getRawPdo()` into the one the application holds (verified in v11.51.0). With PDO that is
+     * complete, because the PDO object IS the session. The first cut of this tier kept the client
+     * on the connection AND gave the shim its own reference, so after a transplant the shim (and
+     * therefore every BEGIN/COMMIT/ROLLBACK, which `ManagesTransactions` routes through `getPdo()`)
+     * moved to the new client while every statement stayed on the old one.
+     *
+     * **MEASURED, against a live engine, both ways it goes wrong — and both are silent:**
+     * - after `DB::reconnect()`, `transaction(fn () => insert; throw)` rolled back an EMPTY
+     *   transaction on the new client while the insert autocommitted on the old one, so a row the
+     *   application was told was discarded was COMMITTED;
+     * - after `DB::disconnect()` inside a transaction, the old client still held that transaction
+     *   open, so the next ordinary insert ran INSIDE a transaction nothing would ever commit, and
+     *   the write was LOST.
+     *
+     * Routing every path through `getPdo()` makes the shim the single source of truth, so a
+     * transplant moves statements and transactions together — PDO's behaviour, by construction.
+     * The statement paths resolve it INSIDE their `run()` callbacks, never before, because
+     * Illuminate's lost-connection retry reconnects and then re-invokes the SAME callback: one that
+     * captured the client up front would retry on the client that had just failed.
+     *
+     * `getPdo()` is never `null` here on the statement paths: `run()` calls
+     * `reconnectIfMissingConnection()` before it invokes the callback.
      */
-    private int|string|null $lastInsertId = null;
-
-    /**
-     * Called after every successful statement. Overwrites ONLY on a non-null key, which is what
-     * makes the value sticky in exactly PDO's way: a SELECT, an UPDATE, a failed statement or a
-     * rolled-back transaction all leave the previous key readable, because `pdo_sqlite` leaves
-     * `last_insert_rowid()` alone in every one of those cases too.
-     */
-    private function rememberInsertId(): void
+    private function shim(): FerroPdoShim
     {
-        $id = $this->ferro->lastInsertId();
-        if ($id !== null) {
-            $this->lastInsertId = $id;
-        }
+        return self::asShim($this->getPdo());
     }
 
-    /** The underlying Ferro client — the handle a contact assertion checks. */
+    /**
+     * Narrow `getPdo()`'s result to the shim, at a `mixed` boundary on purpose.
+     *
+     * Illuminate DOCUMENTS `Connection::getPdo()` as returning `\PDO`, but the method has no native
+     * return type and returns whatever `$this->pdo` holds — which, on this tier, is a
+     * {@see FerroPdoShim} by construction (see the constructor). Static analysis believes the
+     * docblock and would call this `instanceof` impossible; the runtime check is the honest one,
+     * and it is what turns a foreign PDO set through `setPdo()` into a loud error instead of a
+     * fatal call on the wrong object.
+     */
+    private static function asShim(mixed $pdo): FerroPdoShim
+    {
+        if (!$pdo instanceof FerroPdoShim) {
+            throw new \LogicException(sprintf(
+                'Ferro: this connection\'s PDO is %s, not the Ferro shim — something replaced it with '
+                . 'setPdo(). A Ferro connection executes through its shim\'s client, so it cannot run '
+                . 'on a foreign PDO (SPEC §15).',
+                get_debug_type($pdo),
+            ));
+        }
+        return $pdo;
+    }
+
+    /**
+     * The underlying Ferro client — the handle a contact assertion checks. Reconnects first if
+     * Illuminate has disconnected this connection, exactly as a statement would.
+     */
     public function getFerroConnection(): FerroClient
     {
-        return $this->ferro;
+        $this->reconnectIfMissingConnection();
+        return $this->shim()->ferro();
+    }
+
+    /**
+     * Illuminate's lost-connection detector, answering by TYPE wherever a Ferro failure is involved.
+     *
+     * When a `QueryException` outside a transaction is "caused by lost connection",
+     * `Connection::tryAgainIfCausedByLostConnection()` reconnects and RE-RUNS THE SAME STATEMENT.
+     * The stock detector decides by MESSAGE SUBSTRING (`'Lost connection'`, `'Broken pipe'`,
+     * `'No such file or directory'`, …). For a write whose fate is unknown that re-run is exactly
+     * the transparent retry charter rule 3 and §19.3 forbid — the first attempt may have applied —
+     * and whether a substring happens to match is an accident of wording. Measured at C1e-2: the
+     * engine's link-loss text is a lower-case "connection lost during …", which misses
+     * `'Connection lost'` by one letter; the engine also forwards backend messages verbatim, and the
+     * client's own dial failure DOES match (`'No such file or directory'`).
+     *
+     * So, walking the exception chain, the FIRST Ferro-relevant link decides:
+     * - {@see ConnectFailed} — the client could not be dialled, so nothing was sent: TRUE, the same
+     *   reconnect-and-retry PDO gets after a connect failure;
+     * - {@see RetryableException} carrying `ERR_CONNECTION_LOST` — the engine itself classified the
+     *   loss as known-fate (the statement was never transmitted, or it was inside a transaction,
+     *   where Illuminate does not retry anyway): TRUE, by type, whatever its text;
+     * - any other {@see RetryableException} — the stock detector decides, as it would for PDO;
+     * - ANY OTHER Ferro failure (`IndeterminateException`, a raw `ConnectionLostException` or
+     *   `TransportException` — `cursor()`'s stream-open path can surface those unclassified —,
+     *   `NonRetryableException`, …): FALSE, whatever its text. Its fate is not known-safe, and a
+     *   wrong "yes" re-sends a write.
+     *
+     * A non-Ferro throwable is left entirely to the stock detector.
+     *
+     * The cost, stated: Illuminate's PDO-style retry of a SELECT lost mid-flight no longer happens,
+     * because this tier declares every statement a write (§22.2 (ac)) and the client therefore
+     * reports such a loss `Indeterminate`. The application sees the error instead of a silent retry.
+     *
+     * @param \Throwable $e
+     * @return bool
+     */
+    protected function causedByLostConnection(\Throwable $e)
+    {
+        for ($t = $e; $t !== null; $t = $t->getPrevious()) {
+            if ($t instanceof ConnectFailed) {
+                return true;
+            }
+            if ($t instanceof RetryableException) {
+                return $t->errorPayload()->code === Constants::ERR_CONNECTION_LOST
+                    || parent::causedByLostConnection($e);
+            }
+            if ($t instanceof FerroException) {
+                return false;
+            }
+        }
+        return parent::causedByLostConnection($e);
+    }
+
+    /**
+     * Illuminate's concurrency detector, refusing a write whose fate is unknown.
+     *
+     * A "yes" here makes `DB::transaction($fn, attempts: N)` RE-RUN THE WHOLE TRANSACTION — from
+     * `handleCommitTransactionException()` too, i.e. after a COMMIT. A COMMIT whose reply was lost
+     * is `Indeterminate` (§19.3's one transactional case) and must never be re-run, yet the stock
+     * detector matches message substrings including SQLite's verbatim `'database is locked'`. No
+     * Indeterminate failure carries such a message today; this makes that a property rather than a
+     * fact about wording, the same way {@see causedByLostConnection} does.
+     *
+     * @param \Throwable $e
+     * @return bool
+     */
+    protected function causedByConcurrencyError(\Throwable $e)
+    {
+        for ($t = $e; $t !== null; $t = $t->getPrevious()) {
+            if ($t instanceof IndeterminateException) {
+                return false;
+            }
+        }
+        return parent::causedByConcurrencyError($e);
     }
 
     /**
@@ -122,8 +262,9 @@ trait FerroConnectionBody
                 return [];
             }
             try {
-                $result = $this->ferro->fetchRaw($query, $this->ferroBindings($bindings), readonly: false);
-                $this->rememberInsertId();
+                $shim = $this->shim();
+                $result = $shim->ferro()->fetchRaw($query, $this->ferroBindings($bindings), readonly: false);
+                $shim->rememberInsertId();
             } catch (FerroException $e) {
                 // Mapped here, not at `run()`: Illuminate wraps whatever escapes into a
                 // QueryException and COPIES ITS CODE, so the SQLSTATE has to be on the exception
@@ -174,7 +315,7 @@ trait FerroConnectionBody
                 return null;
             }
             try {
-                return $this->ferro->streamRaw($query, $this->ferroBindings($bindings), readonly: false);
+                return $this->shim()->ferro()->streamRaw($query, $this->ferroBindings($bindings), readonly: false);
             } catch (FerroException $e) {
                 throw FerroQueryException::fromFerro($e);
             }
@@ -335,8 +476,9 @@ trait FerroConnectionBody
     private function execWrite(string $query, array $bindings): int
     {
         try {
-            $affected = $this->ferro->exec($query, $this->ferroBindings($bindings), readonly: false);
-            $this->rememberInsertId();
+            $shim = $this->shim();
+            $affected = $shim->ferro()->exec($query, $this->ferroBindings($bindings), readonly: false);
+            $shim->rememberInsertId();
             return $affected;
         } catch (FerroException $e) {
             throw FerroQueryException::fromFerro($e);

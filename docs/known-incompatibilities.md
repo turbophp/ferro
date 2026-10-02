@@ -377,6 +377,11 @@ upstream's own PDO driver:
   'ferro-pgsql'])` makes name-branching code take its PostgreSQL path — and also captures any
   connection in the application that was meant to dial PostgreSQL directly. An application with a
   mixed setup should rename those connections' driver instead.
+- **A `read`/`write` split is not implemented, although SPEC §15's own config example shows one.**
+  Every statement runs on the connection's one pool. With a `read` key in the config, Illuminate
+  builds the read side with its STOCK connector, so `getReadPdo()` throws `Unsupported driver
+  [ferro-pgsql]` (measured) — while queries keep working, because this tier never routes through it.
+  Explicit replica routing is SPEC §7.5 (M4). SPEC §22.2 (bw).
 - **On SQLite the alias is NOT the same escape hatch, and that asymmetry is structural.** Upstream's
   own tests open throwaway SQLite connections regardless of the family under test, none of them
   carrying a `ferro_socket`, so registering the alias costs **42 extra errors** for the two
@@ -395,15 +400,18 @@ upstream's own PDO driver:
   advertises it. On a SQLite pool the value is `null`, which is **fail-closed**: it is never read as
   false (that would claim backslashes are escapes) and never as true. The refusal names the pool.
   SPEC §22.2 (as), (at).
-- **`lastInsertId()` is sticky on the connection, exactly as PDO's is** — and that is a deliberate
+- **`lastInsertId()` is sticky on the HANDLE, exactly as PDO's is** — and that is a deliberate
   divergence from the client underneath it. The client's value is per-STATEMENT and cleared on the
   way in to every request, which is right for a pooled engine: a statement can land on another
   backend connection and a carried-over key would be silently wrong. PDO's belongs to the handle.
   `Processor::processInsertGetId()` looks like it reads the id immediately, but `Connection::insert()`
   fires `QueryExecuted` first and any listener that runs a query clears the client's value in
   between — measured as **182 of 225 errors on one line** before the shim remembered it. So the
-  connection remembers each non-null key from its own writes and never clears it, which is what
-  `pdo_sqlite` returns in every case, including after a rollback. SPEC §22.2 (bn).
+  handle remembers each non-null key from its own writes and never clears it, which is what
+  `pdo_sqlite` returns in every case, including after a rollback; a reconnect starts a fresh handle
+  with no key, as PDO's does. One divergence: where `pdo_sqlite` answers `"0"` for a handle that has
+  generated nothing, this tier THROWS, since `"0"` is indistinguishable from a key. SPEC §22.2 (bn),
+  (bw).
 
 ### Values
 
@@ -427,6 +435,19 @@ upstream's own PDO driver:
   applies here too. It is not a conservative guess that could be tightened: `PostgresProcessor::processInsertGetId`
   runs `insert … returning id` through `selectFromWriteConnection()`, so treating `select()` as a
   read would mis-declare the commonest Eloquent write on PostgreSQL.
+
+- **Illuminate's lost-connection RETRY is decided by type, not by message.** Stock Illuminate
+  reconnects and re-runs a statement whose error text looks like a lost connection. Through Ferro it
+  does so for a failed DIAL (nothing was sent) and for a connection loss the engine itself classified
+  as known-fate, and **never** for a write whose fate is unknown — whatever the text says. Since
+  `select()` is declared a write (above), a SELECT lost mid-flight is reported rather than silently
+  retried, which PDO would do. The same type rule stops `DB::transaction(attempts:)` re-running a
+  transaction whose COMMIT reply was lost. SPEC §22.2 (bw).
+- **After a `ferrod` restart, a long-lived connection does NOT recover by itself.** Every statement on
+  it fails as an indeterminate write until the application calls `DB::reconnect()` (or the worker
+  restarts) — which matters for Octane and queue workers. Root cause: the client classifies a request
+  that failed while still being WRITTEN as indeterminate, although an incompletely-written frame
+  cannot have executed; being fixed as the next slice. SPEC §22.2 (bw).
 
 ### Schema and migrations
 

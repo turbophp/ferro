@@ -35,14 +35,52 @@ use Ferro\Laravel\Exception\FerroQueryException;
 final class FerroPdoShim
 {
     /**
-     * @param \Closure(): (int|string|null) $lastInsertId the owning connection's remembered key —
-     *   see {@see lastInsertId} for why the shim does not read it from the client directly.
+     * The shim OWNS the connection's Ferro client — the owning connection reaches it only through
+     * `getPdo()` ({@see FerroConnectionBody::shim}), so whatever Illuminate does to the PDO it does
+     * to statements and transactions together. That is what makes `DB::reconnect()`,
+     * `DB::disconnect()` and the lost-connection retry behave as they do on PDO (M2-C1e-2).
      */
     public function __construct(
         private readonly FerroClient $ferro,
-        private readonly \Closure $lastInsertId,
     ) {}
 
+    /**
+     * The last key any write through THIS handle generated — PDO's `lastInsertId()` semantics.
+     *
+     * Held here, on the handle, because that is where PDO keeps it: a fresh handle after a
+     * reconnect starts with none, exactly as a fresh `PDO` does. It used to live on the owning
+     * connection and be read through a closure bound to whichever connection BUILT the shim — which,
+     * after a `DatabaseManager` reconnect, is the throwaway connection the manager discards, so
+     * `insertGetId()` after `DB::reconnect()` read a key nothing would ever write (C1e-2).
+     */
+    private int|string|null $lastInsertId = null;
+
+    /**
+     * The Ferro client behind this handle. Not part of the PDO surface: the owning connection's
+     * execution paths use it, and nothing else should.
+     *
+     * @internal
+     */
+    public function ferro(): FerroClient
+    {
+        return $this->ferro;
+    }
+
+    /**
+     * Called by the owning connection after every successful statement. Overwrites ONLY on a
+     * non-null key, which is what makes the value sticky in exactly PDO's way: a SELECT, an UPDATE,
+     * a failed statement or a rolled-back transaction all leave the previous key readable, because
+     * `pdo_sqlite` leaves `last_insert_rowid()` alone in every one of those cases too.
+     *
+     * @internal
+     */
+    public function rememberInsertId(): void
+    {
+        $id = $this->ferro->lastInsertId();
+        if ($id !== null) {
+            $this->lastInsertId = $id;
+        }
+    }
 
     /**
      * Illuminate calls this only at transaction level 0 — nested levels become savepoints via
@@ -246,12 +284,13 @@ final class FerroPdoShim
      * on the `__call` refusal), which is the whole reason the measurement is built before the tier
      * surface (lesson: do not build what the suite has not demanded).
      *
-     * It THROWS rather than returning PDO's falsy `false`, deliberately and on the sibling Doctrine
-     * tier's reasoning: a caller cannot tell `0`, `''` or `false` from a key, and Illuminate's
-     * `Processor::processInsertGetId` would hand a `false` straight back as the model's primary key.
+     * It THROWS where `pdo_sqlite` answers the string `"0"` (measured on a fresh handle — not
+     * `false`, as an earlier version of this note said), deliberately and on the sibling Doctrine
+     * tier's reasoning: a caller cannot tell `"0"` from a key, and Illuminate's
+     * `Processor::processInsertGetId` would hand it straight back as the model's primary key.
      * Loud beats silently wrong — §22.2 (m) already records a WRONG key as strictly worse than none.
      *
-     * **It reads the CONNECTION's remembered key, not the client's, and that difference is the whole
+     * **It reads the HANDLE's remembered key, not the client's, and that difference is the whole
      * substance of this method.** `Ferro\Client\Connection::lastInsertId()` is deliberately a
      * PER-STATEMENT value: it is cleared on the way in to every request, so a statement that
      * generates no key leaves it `null` rather than carrying a stale one over (M1-S8a, §22.2 (bf)).
@@ -266,7 +305,7 @@ final class FerroPdoShim
      * (which is what `AfterQueryTest`'s whole subject matter is) clears the client's value before
      * Illuminate reads it. Under `pdo_sqlite` the same code is fine.
      *
-     * So the PDO SEMANTICS LIVE IN THE PDO SHIM, which is what this class is for: the connection
+     * So the PDO SEMANTICS LIVE IN THE PDO SHIM, which is what this class is for: the handle
      * remembers each non-null key from its own writes and never clears it, and the remembered value
      * is byte-for-byte the one `pdo_sqlite` would return — including after a rollback, where PDO
      * also still answers the rolled-back rowid. Nothing in the engine or the client changed, so the
@@ -277,11 +316,11 @@ final class FerroPdoShim
      */
     public function lastInsertId(?string $sequence = null): string
     {
-        $id = ($this->lastInsertId)();
+        $id = $this->lastInsertId;
         if ($id === null) {
-            // `null` here means NO write on this connection has ever generated a key — the
-            // connection remembers every one it sees and never clears it, so an intervening
-            // statement, a failed one or a rolled-back transaction cannot produce this.
+            // `null` here means NO write through this handle has ever generated a key — the handle
+            // remembers every one it sees and never clears it, so an intervening statement, a
+            // failed one or a rolled-back transaction cannot produce this.
             throw new \LogicException(
                 'Ferro: no statement on this connection has generated a key, so lastInsertId() has '
                 . 'nothing to return. On SQLite a key comes from last_insert_rowid(), which the '
