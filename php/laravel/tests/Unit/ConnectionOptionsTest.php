@@ -58,6 +58,26 @@ final class ConnectionOptionsTest extends TestCase
         ConnectionOptions::fromConfig(['driver' => 'ferro-pgsql', 'host' => '127.0.0.1']);
     }
 
+    /**
+     * `unix_socket` (Laravel's `DB_SOCKET`) names mysqld's OWN socket in a stock MySQL config.
+     * Reading it as the ferrod socket made a leftover key dial the database server and fail with a
+     * wire-magic error that named neither key (M2-C1f review). It is ignored like `host`, so a
+     * config that sets only it is the same refusal as one that sets nothing.
+     */
+    public function testUnixSocketIsNotReadAsTheFerrodSocket(): void
+    {
+        $o = ConnectionOptions::fromConfig([
+            'driver' => 'ferro-mysql',
+            'unix_socket' => '/var/run/mysqld/mysqld.sock',
+            'ferro_socket' => '/run/ferro/app.sock',
+        ]);
+        self::assertSame('/run/ferro/app.sock', $o->socketPath);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessageMatches('/ferro_socket/');
+        ConnectionOptions::fromConfig(['driver' => 'ferro-mysql', 'unix_socket' => '/var/run/mysqld/mysqld.sock']);
+    }
+
     public function testTheTcpFallbackIsReadWhenNoSocketIsGiven(): void
     {
         $o = ConnectionOptions::fromConfig(['ferro_host' => '10.0.0.5', 'ferro_port' => 9999]);

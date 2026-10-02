@@ -154,15 +154,19 @@ do_reset() {
         psql -v ON_ERROR_STOP=1 -U ferro -d doctrine_tests -q < "$root/testkit/dbal/reset-pg.sql"
       echo "[ferro] reset: pg/doctrine_tests from testkit/dbal/reset-pg.sql"
       ;;
+    # MYSQL_PWD rather than `-p`, so there is no password warning to filter. The previous
+    # `2>&1 | grep -v 'Using a password' || true` swallowed the CLIENT's failure along with grep's
+    # exit status, so a reset that never ran still printed the success line below (found by the
+    # M2-C1f review on the Laravel runner, which had copied it from here).
     mysql)
-      docker compose -f "$root/testkit/docker-compose.yml" exec -T mysql \
-        mysql -uroot -pferro < "$root/testkit/dbal/reset-mysql.sql" 2>&1 | grep -v 'Using a password' || true
+      docker compose -f "$root/testkit/docker-compose.yml" exec -T -e MYSQL_PWD=ferro mysql \
+        mysql -uroot < "$root/testkit/dbal/reset-mysql.sql"
       echo "[ferro] reset: mysql/doctrine_tests from testkit/dbal/reset-mysql.sql"
       ;;
     mariadb)
       # The MariaDB image ships `mariadb`, not `mysql`, as the client binary.
-      docker compose -f "$root/testkit/docker-compose.yml" exec -T mariadb \
-        mariadb -uroot -pferro < "$root/testkit/dbal/reset-mysql.sql" 2>&1 | grep -v 'Using a password' || true
+      docker compose -f "$root/testkit/docker-compose.yml" exec -T -e MYSQL_PWD=ferro mariadb \
+        mariadb -uroot < "$root/testkit/dbal/reset-mysql.sql"
       echo "[ferro] reset: mariadb/doctrine_tests from testkit/dbal/reset-mysql.sql"
       ;;
     sqlite)

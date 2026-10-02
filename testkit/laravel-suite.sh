@@ -37,6 +37,23 @@ if [ "$svc" = sqlite ]; then
   # reached for the obvious URL parser would refuse every valid DSN the engine accepts.
   sqlite_db="${dsn#sqlite://}"
   export FERRO_LARAVEL_SQLITE_DB="$sqlite_db"
+elif [ "$svc" = mysql ] || [ "$svc" = mariadb ] || [ "$svc" = mysql-local ]; then
+  # The MySQL family (M2-C1f): MySQL 8.4 on 33060, MariaDB 11.8 on 33061 (testkit/docker-compose.yml).
+  # `mysql-local` is the dev-container arm — a local server and client, no Docker — exactly as
+  # `psql` is for PostgreSQL.
+  if [ "$svc" = mariadb ]; then port=33061; else port=33060; fi
+  dsn="${FERRO_LARAVEL_DSN:-mysql://ferro:ferro@127.0.0.1:$port/laravel_tests}"
+  # Which SERVER the column claims, checked by bootstrap.php against what actually answers: the two
+  # servers sit on adjacent ports speaking the same protocol, so a mislabelled column would record a
+  # plausible number for the wrong one. `mysql-local` claims nothing.
+  case "$svc" in mysql) export FERRO_LARAVEL_SERVER_FAMILY=mysql ;; mariadb) export FERRO_LARAVEL_SERVER_FAMILY=mariadb ;; esac
+  # THE DSN'S DATABASE MUST BE `laravel_tests`, because that is the database the reset below drops
+  # and recreates — a caller-supplied DSN naming another one would run the suite against a database
+  # the reset never touched, and every number from it would be unreproducible.
+  case "$dsn" in
+    */laravel_tests|*/laravel_tests\?*) ;;
+    *) echo "::error:: FERRO_LARAVEL_DSN must name the laravel_tests database (the one the reset recreates): $dsn"; exit 1 ;;
+  esac
 else
   dsn="${FERRO_LARAVEL_DSN:-postgres://ferro:ferro@127.0.0.1:55432/laravel_tests?options=-csearch_path%3Dpublic,my_schema}"
 fi
@@ -65,6 +82,14 @@ driver="${FERRO_LARAVEL_DRIVER:-ferro-pgsql}"
 case "$svc:$driver" in
   sqlite:ferro-sqlite|sqlite:sqlite|sqlite:stock-sqlite) ;;
   pg:ferro-pgsql|pg:pgsql|pg:stock-pgsql|psql:ferro-pgsql|psql:pgsql|psql:stock-pgsql) ;;
+  mysql:ferro-mysql|mysql:mysql|mysql:stock-mysql) ;;
+  # A MariaDB server accepts BOTH Laravel families: `mariadb` is Laravel 11's own driver for it, and
+  # `mysql` is what an application upgraded from Laravel 10 still runs. The recorded column is the
+  # `mariadb` family.
+  mariadb:ferro-mariadb|mariadb:mariadb|mariadb:stock-mariadb) ;;
+  mariadb:ferro-mysql|mariadb:mysql|mariadb:stock-mysql) ;;
+  mysql-local:ferro-mysql|mysql-local:mysql|mysql-local:stock-mysql) ;;
+  mysql-local:ferro-mariadb|mysql-local:mariadb|mysql-local:stock-mariadb) ;;
   *) echo "::error:: FERRO_LARAVEL_SVC=$svc and FERRO_LARAVEL_DRIVER=$driver name different families"; exit 1 ;;
 esac
 
@@ -184,7 +209,34 @@ if [ "$reset" = 1 ] && [ "$svc" != sqlite ]; then
       psql -v ON_ERROR_STOP=1 -q -d "$dsn" -f "$root/testkit/laravel/reset-pg.sql"
       echo "[ferro] reset: local psql against \$FERRO_LARAVEL_DSN from testkit/laravel/reset-pg.sql"
       ;;
-    *) echo "::error:: unknown FERRO_LARAVEL_SVC=$svc (wired: pg | psql | sqlite)"; exit 1 ;;
+    # The MySQL family, from a container (CI) — root, as the DBAL runner's MySQL reset does.
+    #
+    # The password goes in through MYSQL_PWD rather than `-p`, so the client prints no warning and
+    # there is nothing to filter. That is the point: the first version filtered the warning with
+    # `2>&1 | grep -v … || true`, and the `|| true` that kept grep's exit status from failing the
+    # run swallowed the CLIENT'S failure too — a reset that did not run printed the success line
+    # below and the run recorded a number from an un-reset database.
+    mysql)
+      docker compose -f "$root/testkit/docker-compose.yml" exec -T -e MYSQL_PWD=ferro mysql \
+        mysql -uroot < "$root/testkit/laravel/reset-mysql.sql"
+      echo "[ferro] reset: mysql/laravel_tests from testkit/laravel/reset-mysql.sql"
+      ;;
+    mariadb)
+      # The MariaDB image ships `mariadb`, not `mysql`, as the client binary.
+      docker compose -f "$root/testkit/docker-compose.yml" exec -T -e MYSQL_PWD=ferro mariadb \
+        mariadb -uroot < "$root/testkit/laravel/reset-mysql.sql"
+      echo "[ferro] reset: mariadb/laravel_tests from testkit/laravel/reset-mysql.sql"
+      ;;
+    # A LOCAL client, with the DSN's own credentials — the same SQL works for the suite's user, as
+    # the reset file explains.
+    mysql-local)
+      re='^[a-z]+://([^:@/]+):([^@/]*)@([^:/]+):([0-9]+)/'
+      [[ "$dsn" =~ $re ]] || { echo "::error:: cannot parse FERRO_LARAVEL_DSN for the local reset"; exit 1; }
+      MYSQL_PWD="${BASH_REMATCH[2]}" mysql -u"${BASH_REMATCH[1]}" -h"${BASH_REMATCH[3]}" -P"${BASH_REMATCH[4]}" \
+        < "$root/testkit/laravel/reset-mysql.sql"
+      echo "[ferro] reset: local mysql against \$FERRO_LARAVEL_DSN from testkit/laravel/reset-mysql.sql"
+      ;;
+    *) echo "::error:: unknown FERRO_LARAVEL_SVC=$svc (wired: pg | psql | sqlite | mysql | mariadb | mysql-local)"; exit 1 ;;
   esac
 elif [ "$reset" != 1 ]; then
   echo "[ferro] reset: SKIPPED (--no-reset) — this run's numbers MUST NOT be recorded"

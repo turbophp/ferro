@@ -2,20 +2,24 @@
 
 Ferro connections for Laravel / Illuminate — the §15 Eloquent tier.
 
-> **Status: C1b, the first slice. `select()` only.** Writes, transactions, `cursor()` and the PDO
-> shim are later slices (see `docs/dev-loop/PHASE-C-SCOPE.md`). Every other execution method still
-> falls through to Illuminate's stock PDO path, which has no PDO here and fails loudly rather than
-> appearing to work.
+> **Status (M2):** PostgreSQL (`ferro-pgsql`), SQLite (`ferro-sqlite`), MySQL (`ferro-mysql`) and
+> MariaDB (`ferro-mariadb`, Laravel 11's own MariaDB family) are registered. Reads, writes, transactions (including
+> `DB::transaction(attempts: …)`), streaming `cursor()` / `LazyCollection`, reconnection and the
+> PDO surface Illuminate itself touches all run through the engine. Each family is measured with
+> upstream `laravel/framework`'s own integration suite, against a control column that runs the same
+> tests through the stock PDO driver (`docs/laravel-suite/`). What does not behave like PDO is listed
+> in `docs/known-incompatibilities.md`.
 
 ## Configuration
 
 ```php
 'connections' => [
-    'pgsql' => [
-        'driver'       => 'ferro-pgsql',        // was 'pgsql'
+    'mysql' => [
+        'driver'       => 'ferro-mysql',        // was 'mysql'   (also: ferro-mariadb, ferro-pgsql, ferro-sqlite)
         'ferro_socket' => '/run/ferro/app.sock',
         'pool'         => 'main',
-        // host/username/password may stay; they are IGNORED. Credentials live in ferrod (§12).
+        'database'     => 'app',                // REQUIRED by Illuminate — see below
+        // host/username/password/unix_socket may stay; they are IGNORED. Credentials live in ferrod (§12).
     ],
 ],
 ```
@@ -26,26 +30,66 @@ Register the resolvers once, from a service provider's `register()` or an applic
 Ferro\Laravel\FerroConnections::register();
 ```
 
-`ferro_host` / `ferro_port` select the TCP fallback when there is no socket. Note `host` is
-deliberately **not** read: it describes the upstream database, which the application no longer
-dials.
+`ferro_host` / `ferro_port` select the TCP fallback when there is no socket. `host` and
+`unix_socket` are deliberately **not** read: they describe the upstream database, which the
+application no longer dials.
+
+**`database` is a label on PostgreSQL and SQLite and a SELECTOR on MySQL / MariaDB.** On the first
+two the pool's DSN chooses the database and the key only names it for Laravel. On the MySQL family
+`MySqlBuilder` binds it into every `information_schema` query, so it must be the pool's own
+database; the connection checks that the first time the schema builder is used and refuses a
+mismatch rather than introspecting the wrong schema.
+
+**Laravel's MySQL session keys are ignored** — `strict`, `modes`, `isolation_level`, `timezone`,
+`charset`, `collation`. Stock Laravel issues them on connect; here the pool owns (and resets) the
+session, so the server's own defaults apply, and every session runs at `time_zone = '+00:00'`. Put
+them in the server's configuration. Details and measurements: `docs/known-incompatibilities.md`.
+
+`FerroConnections::register(['mysql' => 'ferro-mysql'])` also registers Ferro under the stock driver
+NAME. That is opt-in, because the alias replaces every connection in the application whose `driver`
+is that name — but some code branches on the name (upstream's own tests do, through
+`#[RequiresDatabase('mysql')]` and `$this->driver`), and only the alias makes such code take the
+same branch it takes on PDO.
 
 ## What this tier changes, and what it does not
 
 Only the **execution layer**. The stock Grammar, Processor and Schema builder are inherited
 untouched — they build SQL strings and post-process arrays, and charter rule 6 says the drop-in
-tiers change execution, never SQL generation.
+tiers change execution, never SQL generation. Each family's connection extends the stock one
+(`PostgresConnection`, `SQLiteConnection`, `MySqlConnection`) and shares one execution trait.
 
-## Two things worth knowing
+## Things worth knowing
 
 **Every statement is fate-declared a write.** `select()` looks like a read and usually is, but it
 genuinely carries writes: `PostgresProcessor::processInsertGetId` runs `insert … returning id`
-through `selectFromWriteConnection()`, which is `select($query, $bindings, false)`. Declaring reads
-would mis-declare the fate of the commonest Eloquent write on PostgreSQL. The cost is the §22.2 (ac)
-trade: a plain `SELECT` killed by a server-side `statement_timeout` surfaces as an indeterminate
-write. Same trade the Doctrine tier makes, for the same reason.
+through `selectFromWriteConnection()`. Declaring reads would mis-declare the fate of the commonest
+Eloquent write on PostgreSQL. The cost is the §22.2 (ac) trade: a plain `SELECT` killed by a
+server-side `statement_timeout` surfaces as an indeterminate write. Same trade the Doctrine tier
+makes, for the same reason.
 
-**`selectResultSets()` is not supported**, and the wire is not why. A MySQL `CALL` returns no usable
-rows today — a prepared `CALL` declares zero result columns even when the procedure emits a result
-set — so multi-result-set support would ship a feature that still returns nothing. See
-`docs/dev-loop/PHASE-C-SCOPE.md` C1a.
+**`lastInsertId()` follows each family's PDO driver.** `pdo_sqlite` keeps the last key on the
+handle, so the SQLite connection does too; `pdo_mysql` answers the statement just executed, `"0"`
+when it generated none, so the MySQL / MariaDB connection does that — `insertGetId()` and
+`DB::getPdo()->lastInsertId()` alike. PostgreSQL uses `insert … returning`.
+
+**On MySQL a `TIMESTAMP` reads back as `pdo_mysql` returns it, to the second**: the naive UTC wall
+clock (`2017-11-12 13:14:15`) — every Ferro MySQL session is pinned to `+00:00` — rather than the
+canonical RFC3339 form the PostgreSQL tier keeps for `timestamptz`. Eloquent writes naive strings,
+so this is what keeps a write → read round trip stable (SPEC §22.2 (cb)). A fractional column
+renders the canonical fraction (none when zero, otherwise six digits), not the column's precision as
+`pdo_mysql` does. A `TIMESTAMP` written through a non-UTC session before adoption reads back in UTC.
+
+**Foreign-key checks on MySQL / MariaDB are pinned to one connection.** `SET FOREIGN_KEY_CHECKS=0` is
+session state and every statement is its own checkout, so the stock sequence would turn checks off
+on a connection the next statement never reaches. `Schema::withoutForeignKeyConstraints()` and
+`dropAllTables()` (`migrate:fresh`, `db:wipe`, `RefreshDatabase`) run inside one transaction instead,
+and a bare `Schema::disableForeignKeyConstraints()` outside a transaction is refused — use
+`withoutForeignKeyConstraints()` or wrap the block in `DB::transaction()`.
+
+**`selectResultSets()` is not supported.** The wire carries one result set per statement, and no
+tier can reach a second one today. (The MySQL `CALL` defect that used to sit underneath it is fixed:
+§22.2 (av), (aw).)
+
+**`DB::escape()`, `toRawSql()`, `castAsJson()` and `DB::pretend()` with string bindings need a pool
+that advertises `literals_are_standard`.** PostgreSQL pools do; SQLite and MySQL / MariaDB pools do
+not yet, and the shim refuses rather than guesses the escaping rule (§21 D5, §22.2 (at)).

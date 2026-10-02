@@ -5,6 +5,7 @@ namespace Ferro\Laravel;
 use Ferro\Client\Connection as FerroClient;
 use Ferro\Client\RetryPolicy;
 use Ferro\Client\Value\RawStringValuePolicy;
+use Ferro\Laravel\Value\MySqlValuePolicy;
 use Ferro\Ferro;
 use Illuminate\Database\Connection;
 
@@ -24,6 +25,8 @@ final class FerroConnections
     private const DRIVERS = [
         'ferro-pgsql' => FerroPostgresConnection::class,
         'ferro-sqlite' => FerroSQLiteConnection::class,
+        'ferro-mysql' => FerroMySqlConnection::class,
+        'ferro-mariadb' => FerroMariaDbConnection::class,
     ];
 
     /**
@@ -107,7 +110,7 @@ final class FerroConnections
         // PDO, and every resolution dials its own session — the semantics of the PDO closure
         // `ConnectionFactory` hands a stock connection (M2-C1e-2, SPEC §22.2 (bw)). The config is
         // still validated HERE, so a misconfigured connection fails at `DB::connection()` as before.
-        return new $class(static fn (): FerroClient => self::client($o), $database, $prefix, $config);
+        return new $class(static fn (): FerroClient => self::client($o, $driver), $database, $prefix, $config);
     }
 
     /**
@@ -141,9 +144,14 @@ final class FerroConnections
      * that `createFromFormat` on its `T` separator and falls through to Illuminate's own
      * `Date::parse($value)`, which reads the `Z` and preserves the instant. SPEC §22.2.
      */
-    private static function client(ConnectionOptions $o): FerroClient
+    private static function client(ConnectionOptions $o, string $driver): FerroClient
     {
-        $values = new RawStringValuePolicy();
+        // The driver NAME is the family here (`make()` is called with the resolved `ferro-*`
+        // name even under a stock-name alias). One family renders one tag differently — see
+        // MySqlValuePolicy for why MySQL's TIMESTAMPTZ must come back naive.
+        $values = in_array($driver, ['ferro-mysql', 'ferro-mariadb'], true)
+            ? new MySqlValuePolicy()
+            : new RawStringValuePolicy();
         return $o->socketPath !== null
             ? Ferro::connect($o->socketPath, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $values)
             : Ferro::connectTcp((string) $o->host, $o->port, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $values);

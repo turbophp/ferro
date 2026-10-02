@@ -40,7 +40,7 @@ final class DriverRegistrationTest extends TestCase
         $p = new \ReflectionProperty(IlluminateConnection::class, 'resolvers');
         /** @var array<string,\Closure> $map */
         $map = $p->getValue();
-        foreach ([...FerroConnections::drivers(), 'pgsql'] as $name) {
+        foreach ([...FerroConnections::drivers(), 'pgsql', 'sqlite', 'mysql', 'mariadb'] as $name) {
             unset($map[$name]);
         }
         $p->setValue(null, $map);
@@ -50,6 +50,31 @@ final class DriverRegistrationTest extends TestCase
     {
         FerroConnections::register();
         self::assertNotNull(IlluminateConnection::getResolver('ferro-pgsql'));
+    }
+
+    /**
+     * One Ferro driver per Laravel family, and MariaDB IS one: Laravel 11 resolves it through its
+     * own `mariadb` driver (`MariaDbConnection`, `MariaDbGrammar`, `MariaDbBuilder`), so a
+     * MariaDB application's `driver` is `mariadb` and its one-word change is `ferro-mariadb`.
+     */
+    public function testEveryFamilyHasAFerroDriverIncludingMariaDb(): void
+    {
+        self::assertSame(
+            ['ferro-mariadb', 'ferro-mysql', 'ferro-pgsql', 'ferro-sqlite'],
+            (function (): array { $d = FerroConnections::drivers(); sort($d); return $d; })(),
+        );
+        FerroConnections::register();
+        foreach (FerroConnections::drivers() as $name) {
+            self::assertNotNull(IlluminateConnection::getResolver($name), $name);
+        }
+    }
+
+    public function testNoStockNameIsClaimedWithoutAnAlias(): void
+    {
+        FerroConnections::register();
+        foreach (['pgsql', 'sqlite', 'mysql', 'mariadb'] as $stock) {
+            self::assertNull(IlluminateConnection::getResolver($stock), $stock);
+        }
     }
 
     public function testTheStockNameIsNotClaimedWithoutAnAlias(): void

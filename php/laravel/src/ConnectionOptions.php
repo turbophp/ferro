@@ -7,8 +7,8 @@ namespace Ferro\Laravel;
  *
  * §15's goal is that adoption is a `driver` change and nothing else, so this reads the keys a
  * Ferro connection needs and deliberately IGNORES the ones that no longer mean anything: `host`,
- * `port`, `username`, `password` and `database` describe an upstream the application no longer
- * dials — credentials live in `ferrod` (§12, D8). They are not rejected, because a real config
+ * `port`, `username`, `password`, `unix_socket` and `database` describe an upstream the
+ * application no longer dials — credentials live in `ferrod` (§12, D8). They are not rejected, because a real config
  * array arrives carrying them and refusing would make adoption a rewrite rather than a one-line
  * change; they are simply not read.
  */
@@ -30,7 +30,10 @@ final class ConnectionOptions
     public static function fromConfig(array $config): self
     {
         $pool = self::str($config, 'pool') ?? 'default';
-        $socket = self::str($config, 'ferro_socket') ?? self::str($config, 'unix_socket');
+        // `ferro_socket` ONLY. A stock MySQL config carries `unix_socket` (Laravel's `DB_SOCKET`)
+        // pointing at mysqld's own socket; reading it as the ferrod socket turned a leftover key into
+        // `bad magic 0x6b` with no hint at the cause (M2-C1f review). Ignored, like `host`.
+        $socket = self::str($config, 'ferro_socket');
         $host = self::str($config, 'ferro_host');
         $port = self::int($config, 'ferro_port') ?? 7777;
 

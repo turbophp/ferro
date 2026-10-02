@@ -78,17 +78,18 @@ That co-design — engine daemon *and* client library from the same protocol reg
 
 ## Drop-in adoption
 
-> The Doctrine driver (M1) is under active development — not yet released; the Eloquent package (M2) does not exist yet. The config below shows what adoption will look like (SPEC §14, §15).
+> Both drop-in packages exist in this repository but are **not yet released**: `ferro/doctrine-dbal-driver` (DBAL 4, and DBAL 3.8+ through a second `driverClass`) and `ferro/laravel` (PostgreSQL, SQLite, MySQL and MariaDB). What does not behave like PDO is listed in [docs/known-incompatibilities.md](docs/known-incompatibilities.md); each package's README has the full configuration.
 
 The drop-in tiers change the **execution layer only**. Doctrine's platforms and Laravel's Grammar/Processor stay completely stock — Ferro never generates or rewrites SQL.
 
 **Doctrine DBAL / Symfony** (SPEC §14):
 
 ```php
-'connections' => ['default' => [
-    'driverClass' => Ferro\DBAL\Driver::class,
-    'ferro' => ['pool' => 'main', 'read_pool' => 'main_ro'],
-]],
+$conn = DriverManager::getConnection([
+    'driverClass'   => Ferro\DBAL\Driver::class,
+    'unix_socket'   => '/run/ferro/app.sock',      // the ferrod socket
+    'driverOptions' => ['pool' => 'main'],
+]);
 ```
 
 **Laravel / Eloquent** (SPEC §15):
@@ -96,15 +97,18 @@ The drop-in tiers change the **execution layer only**. Doctrine's platforms and 
 ```php
 'connections' => [
     'mysql' => [
-        'driver' => 'ferro-mysql',           // was 'mysql'
-        'pool'   => 'main',
-        'read'   => ['pool' => 'main_ro'],   // optional read/write split
-        // host/username/password removed — credentials live in ferrod
+        'driver'       => 'ferro-mysql',          // was 'mysql' (also ferro-pgsql, ferro-sqlite, ferro-mariadb)
+        'ferro_socket' => '/run/ferro/app.sock',  // the ferrod socket
+        'pool'         => 'main',
+        'database'     => 'app',                  // required by Illuminate; on MySQL it must be the pool's database
+        // host/username/password may stay; they are ignored — credentials live in ferrod
     ],
 ],
 ```
 
-Acceptance for both tiers is the **upstream test suites** — DBAL 4's functional suite and `illuminate/database`'s integration suite — running green over Ferro connections.
+Register the drivers once with `Ferro\Laravel\FerroConnections::register()`. A `read`/`write` split is not implemented (explicit replica routing is M4).
+
+Acceptance for both tiers is the **upstream test suites** — DBAL's functional suite and `illuminate/database`'s integration suite — running green over Ferro connections. **Neither is met yet**: each is run as a curated subset on every backend family, against a control column running the same tests through the stock PDO driver, and the recorded numbers and every remaining difference are in [docs/dbal-suite/](docs/dbal-suite/) and [docs/laravel-suite/](docs/laravel-suite/).
 
 The native client is where the new capabilities live. This is the **target API** (SPEC §10) — today's shipped surface is `Ferro::connect()` plus `query`/`queryOne`/`rows`/`scalar`/`exec`, typed DTO hydration into value objects, the lazy `stream()` generator, the transaction closure with a retry policy, and imperative `begin`/`commit`/`rollBack`; `Ferro::pool()` and the async/Fibers surface come later:
 
@@ -138,8 +142,8 @@ Scope discipline is a design feature (SPEC §3):
 | Milestone | Scope | State |
 |---|---|---|
 | **M0** | `/proto` registry + golden vectors, frame codec + fuzzing, `ferrod` core (sessions, epochs), hand-rolled PG pool, EXEC/TX happy paths, sync PHP client, bench harness vs PDO baseline | ✅ complete — provisional D12 boundary measurement recorded in [bench/results/](bench/results/) (WSL2 environment; the §16.1 latency targets await a bare-metal reference re-run — see [bench/README.md](bench/README.md)) |
-| **M1** | Pin engine (protocol signals + assist lexer + conditional hygiene), full error taxonomy incl. `Indeterminate` + write-fate matrix, result streaming (deferred from M0), MySQL backend, canonical type coverage, Doctrine driver | 🔨 in progress — pinning, assist lexer, conditional hygiene, error taxonomy + write-fate matrix (live chaos suites on PG and MySQL/MariaDB), credit-based result streaming (PG; MySQL streaming deferred, SPEC §22.2), MySQL/MariaDB backend, and 14-type canonical coverage landed; Doctrine driver in progress |
-| M2 | Eloquent tier + PDO shim, observability (OTLP/Prometheus/slow log), SQLite engine-owned mode | planned |
+| **M1** | Pin engine (protocol signals + assist lexer + conditional hygiene), full error taxonomy incl. `Indeterminate` + write-fate matrix, result streaming (deferred from M0), MySQL backend, canonical type coverage, Doctrine driver | ✅ complete — exit gate re-measured on the upstream DBAL 4 suite (SPEC §22.2) |
+| **M2** | Eloquent tier + PDO shim, observability (OTLP/Prometheus/slow log), SQLite engine-owned mode | 🔨 in progress — Eloquent tier on PG/SQLite/MySQL/MariaDB, SQLite backend, DBAL 3.8 bridge, slow log and Prometheus landed; OTLP, the admin service and the demo app remain |
 | M3 | Fibers multiplexing, `ferro check`/`gen` (build-time checked SQL, sqlx-style), manifest handshake, memfd large payloads, COPY API | planned |
 | M4 | MSSQL, manifest-only hardening mode, replica routing + lag gating, `ferro top` TUI | planned |
 | M5 | LISTEN/NOTIFY streams, Octane guidance, packaging (deb/rpm/container sidecar, systemd socket-activated units) | planned |
