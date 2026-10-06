@@ -3,9 +3,11 @@ declare(strict_types=1);
 namespace Ferro\Tests\Client;
 
 use Ferro\Client\Connection;
+use Ferro\Client\Error\FerroException;
 use Ferro\Client\Error\InFlightLimitException;
 use Ferro\Client\Error\NonRetryableException;
 use Ferro\Client\Error\ProtocolException;
+use Ferro\Client\Error\ReentrantWriteException;
 use Ferro\Client\Error\TransportException;
 use Ferro\Client\Backoff;
 use Ferro\Client\ReconnectLoop;
@@ -25,12 +27,15 @@ use Ferro\Http\FateClass;
 use Ferro\Http\Upstream;
 use Ferro\Protocol\ExecOk;
 use Ferro\Protocol\Generated\Constants as C;
+use Ferro\Protocol\Header;
 use Ferro\Protocol\HttpRequest;
 use Ferro\Protocol\Msgpack\PackerFactory;
 use Ferro\Protocol\Outcome;
 use Ferro\Protocol\StreamData;
 use Ferro\Protocol\StreamHead;
+use Ferro\Tests\Support\DuplexDouble;
 use Ferro\Tests\Support\FakeTransport;
+use Ferro\Tests\Support\ForkedFakeEngine as Fake;
 use Ferro\Tests\Support\HttpFrames as F;
 use PHPUnit\Framework\TestCase;
 
@@ -44,6 +49,7 @@ final class HttpUpstreamTest extends TestCase
     protected function tearDown(): void
     {
         TraceContext::useProvider(null);
+        gc_enable(); // the collector tests switch automatic collection off
     }
 
     /** A handshaken Connection over `$t`; the first request id is 1. */
@@ -602,12 +608,12 @@ final class HttpUpstreamTest extends TestCase
         $conn = $this->conn($t);
         $http = $conn->upstream('up');
         $other = $http->requestAsync('GET', '/other');               // rid 1, answered later
-        $t->feed(F::head(2, 600) . F::cancelled(2));                  // rid 2: not an HTTP status
+        $t->feed(F::head(2, 1000) . F::cancelled(2));                 // rid 2: not even three digits
         try {
             $http->request('GET', '/bad');
             $this->fail('expected the exchange to fail');
         } catch (ProtocolException $e) {
-            $this->assertStringContainsString('600', $e->getMessage());
+            $this->assertStringContainsString('1000', $e->getMessage());
         }
         $this->assertFalse($conn->session()->isPoisoned(), 'only that exchange failed');
         $this->assertSame([2], F::cancels($t->written), 'it was stopped');
@@ -834,5 +840,311 @@ final class HttpUpstreamTest extends TestCase
         $this->assertSame([1], F::cancels($inner->written), 'the CANCEL followed the read');
         $this->assertTrue($s->isClosed());
         $this->assertFalse($session->isPoisoned());
+    }
+
+    // ---- review round 2 (M6-F8) ------------------------------------------------------------------
+
+    /**
+     * R2-4: a status in 600..=999 is not an HTTP status, but `ferrod` passes one through (it is a
+     * valid `http::StatusCode`), and RFC 9110 §15 says a client SHOULD process it as a 5xx. So it is
+     * DELIVERED, with its head, and {@see \Ferro\Http\StatusFate} reads it as a 5xx: Indeterminate for
+     * a POST the upstream received and answered, Retryable for an idempotent request. No CANCEL.
+     */
+    public function testAStatusAbove599IsDeliveredAsA5xx(): void
+    {
+        $t = new FakeTransport();
+        $conn = $this->conn($t);
+        $http = $conn->upstream('up');
+        $t->feed(F::head(1, 600) . F::body(1, 'odd') . F::done(1));
+        $r = $http->request('POST', '/x', body: 'p');
+        $this->assertSame([600, 'odd'], [$r->status, $r->body]);
+        $this->assertSame(FateClass::Indeterminate, $r->statusFate()->fate);
+        $t->feed(F::head(2, 999, [], true) . F::done(2));
+        $r = $http->request('GET', '/y', idempotent: true);
+        $this->assertSame(999, $r->status);
+        $this->assertSame(FateClass::Retryable, $r->statusFate()->fate);
+        $this->assertSame([], F::cancels($t->written), 'neither exchange was stopped');
+        $this->assertFalse($conn->session()->isPoisoned());
+    }
+
+    /**
+     * R2-5: a deadline CANCEL is a duplex write, which may read frames. Here the read during X's
+     * CANCEL files Y's END — Y completed. The deadline pass must not then CANCEL Y and re-arm a
+     * deadline nothing would ever clear: that closed the session one grace later ("request 2 passed
+     * its deadline and the engine did not answer its CANCEL").
+     */
+    public function testACancelWriteThatReadsAnotherRequestsAnswerDoesNotCancelIt(): void
+    {
+        $inner = new FakeTransport();
+        $dup = new DuplexDouble($inner, 0.2);
+        $inner->feed(F::helloAck());
+        $session = new Session($dup, new RequestIdAllocator(0));
+        $session->hello();
+        $session->setRequestTimeout(0.05);
+        $conn = new Connection($session, 'default');
+        $x = $conn->scalarAsync('SELECT 1'); // rid 1
+        $y = $conn->scalarAsync('SELECT 2'); // rid 2
+        usleep(100_000); // both deadlines pass
+        $inner->feed(self::sqlOk(2, 2) . Fake::cancelled(1));
+        $dup->onWrite = static function (Header $h, \Closure $onReadable) use ($dup): void {
+            if (($h->flags & C::FLAG_CANCEL) !== 0) {
+                $dup->onWrite = null;
+                $onReadable(); // the socket would not take the CANCEL; the engine had Y's answer for us
+            }
+        };
+        try {
+            $x->await();
+            $this->fail('X was cancelled');
+        } catch (FerroException) {
+        }
+        $this->assertSame(2, $y->await(), 'Y completed normally');
+        $this->assertSame([1], F::cancels($inner->written), 'no CANCEL for a request that had completed');
+        usleep(300_000); // past the grace a re-armed deadline would have had
+        $inner->feed(self::sqlOk(3, 3));
+        $this->assertSame(3, $conn->scalar('SELECT 3'));
+        $this->assertFalse($session->isPoisoned());
+    }
+
+    /**
+     * R2-5, the HEAD variant: the read during X's CANCEL files Y's HTTP HEAD, which ends Y's client
+     * deadline. The pass must not CANCEL Y — a live exchange after its HEAD (the F1 class).
+     */
+    public function testACancelWriteThatReadsAnotherExchangesHeadDoesNotCancelIt(): void
+    {
+        $inner = new FakeTransport();
+        $dup = new DuplexDouble($inner, 0.2);
+        $inner->feed(F::helloAck());
+        $session = new Session($dup, new RequestIdAllocator(0));
+        $session->hello();
+        $session->setRequestTimeout(0.05);
+        $conn = new Connection($session, 'default');
+        $x = $conn->scalarAsync('SELECT 1');                      // rid 1
+        $y = $conn->upstream('up')->requestAsync('GET', '/y');    // rid 2
+        $session->setDeadline(2, microtime(true) + 0.05);
+        usleep(100_000); // both deadlines pass
+        $inner->feed(F::head(2) . Fake::cancelled(1));
+        $dup->onWrite = static function (Header $h, \Closure $onReadable) use ($dup): void {
+            if (($h->flags & C::FLAG_CANCEL) !== 0) {
+                $dup->onWrite = null;
+                $onReadable();
+            }
+        };
+        try {
+            $x->await();
+            $this->fail('X was cancelled');
+        } catch (FerroException) {
+        }
+        $this->assertSame([1], F::cancels($inner->written), 'Y had its HEAD: its deadline was over');
+        $inner->feed(F::body(2, 'y') . F::done(2));
+        $this->assertSame('y', $y->await()->body);
+        $this->assertFalse($session->isPoisoned());
+    }
+
+    /**
+     * R2-3: code run in the middle of a write — a destructor the cycle collector runs during a read
+     * inside the write — must not write a frame of its own: it would land in the middle of the
+     * half-written one, which the engine reads as garbage and closes the session over. It is refused
+     * (nothing written); a destructor that catches it leaves the outer write and the session intact.
+     */
+    public function testAWriteFromADestructorRunMidWriteIsRefusedNotSpliced(): void
+    {
+        [$inner, $dup, $session, $conn] = $this->duplexConn();
+        $buffered = $conn->upstream('up')->requestAsync('GET', '/a'); // rid 1
+        $inner->feed(F::head(1));
+        $seen = new \stdClass();
+        $seen->refused = null;
+        gc_disable(); // collected only by the hook (see tearDown)
+        $this->cyclicDestructor($conn, $seen, catch: true);
+        $dup->splitAt = 100;
+        $dup->onWrite = static function (Header $h, \Closure $onReadable) use ($dup): void {
+            $dup->onWrite = null;
+            $dup->onPayloadRead = static function (): void { gc_collect_cycles(); };
+            $onReadable(); // reads HEAD(1); the collector runs the destructor in the middle of it
+        };
+        $before = strlen($inner->written);
+        $post = $conn->upstream('up')->requestAsync('POST', '/b', body: str_repeat('z', 4000)); // rid 2
+        $this->assertInstanceOf(ReentrantWriteException::class, $seen->refused, 'the destructor\'s query was refused');
+        $frames = DuplexDouble::frames(substr($inner->written, $before));
+        $this->assertCount(1, $frames, 'only the REQUEST is on the wire: ' . implode(', ', $frames));
+        $this->assertStringStartsWith(C::SERVICE_HTTP . '/' . C::METHOD_HTTP_REQUEST . '/2/', $frames[0]);
+        $this->assertFalse($session->isPoisoned());
+        $inner->feed(F::done(1) . F::head(2) . F::done(2));
+        $this->assertSame(200, $buffered->await()->status);
+        $this->assertSame(200, $post->await()->status);
+    }
+
+    /**
+     * R2-3, uncaught: the refusal propagates out of the destructor and through the outer write,
+     * leaving part of that frame on the wire, so the session is closed — and nothing is written
+     * after the partial frame. Never a spliced frame.
+     */
+    public function testAnUncaughtRefusalMidWriteClosesTheSessionWithoutSplicing(): void
+    {
+        [$inner, $dup, $session, $conn] = $this->duplexConn();
+        $pending = $conn->upstream('up')->requestAsync('GET', '/a'); // rid 1, never awaited
+        $inner->feed(F::head(1));
+        $seen = new \stdClass();
+        $seen->refused = null;
+        gc_disable(); // collected only by the hook (see tearDown)
+        $this->cyclicDestructor($conn, $seen, catch: false);
+        $dup->splitAt = 100;
+        $dup->onWrite = static function (Header $h, \Closure $onReadable) use ($dup): void {
+            $dup->onWrite = null;
+            $dup->onPayloadRead = static function (): void { gc_collect_cycles(); };
+            $onReadable();
+        };
+        $before = strlen($inner->written);
+        $post = $conn->upstream('up')->requestAsync('POST', '/b', body: str_repeat('z', 4000));
+        $this->assertSame(100, strlen($inner->written) - $before, 'nothing after the partial frame');
+        $this->assertTrue($session->isPoisoned(), 'a partial frame on the wire: nothing may follow it');
+        try {
+            $post->await();
+            $this->fail('the interrupted request failed');
+        } catch (HttpRetryableException $e) {
+            // Its frame never completely left: not sent, so it cannot have reached the upstream.
+            $this->assertStringContainsString('not sent', $e->getMessage());
+            $this->assertStringContainsString('while another frame was being written', $e->getMessage());
+        }
+        unset($pending);
+    }
+
+    /**
+     * R2-3, ordering: the credit a request's own write made owed is written AFTER the write — and
+     * that write may read frames, among them this request's answer. The request must be in flight
+     * by then, or its answer is "a frame for a request not in flight": a desync.
+     */
+    public function testARequestsAnswerReadDuringTheDeferredWritesAfterItIsItsAnswer(): void
+    {
+        [$inner, $dup, $session, $conn] = $this->duplexConn();
+        $buffered = $conn->upstream('up')->requestAsync('GET', '/a'); // rid 1: credit on receipt
+        $inner->feed(F::head(1) . str_repeat(F::body(1, 'x'), 32) . self::sqlOk(2, 7));
+        $dup->onWrite = static function (Header $h, \Closure $onReadable) use ($dup): void {
+            if ($h->service === C::SERVICE_SQL) {
+                for ($i = 0; $i < 33; ++$i) {
+                    $onReadable(); // the EXEC's write is blocked: read rid 1's head and 32 chunks
+                }
+            } elseif ($h->method === C::METHOD_CORE_WINDOW_UPDATE) {
+                $dup->onWrite = null;
+                $onReadable(); // the deferred credit's write is blocked: read rid 2's answer
+            }
+        };
+        $x = $conn->scalarAsync('SELECT 7'); // rid 2
+        $this->assertFalse($session->isPoisoned());
+        $this->assertSame(7, $x->await());
+        $this->assertNotSame([], F::windowUpdates($inner->written, 1), 'the deferred credit was written');
+        $inner->feed(F::done(1));
+        $this->assertSame(32, strlen($buffered->await()->body));
+    }
+
+    /**
+     * R2-3, the reviewer's window: between two of the deferred writes no transport operation is in
+     * progress, but the flush is. A stream's generator collected there (by the cycle collector, on
+     * an allocation) abandons through {@see Session::abandonHttp}, which must still only discard — a
+     * blocking drain from inside the flush would read the wire under it — and its CANCEL joins the
+     * flush. Only the GENERATOR is garbage: the stream object is held, so its destructor (the
+     * non-blocking path) cannot run first and make the test pass without reaching the guard.
+     */
+    public function testAStreamCollectedBetweenTheDeferredWritesOnlyDiscards(): void
+    {
+        $inner = new FakeTransport();
+        $dup = new DuplexDouble($inner);
+        $packer = new \Ferro\Tests\Support\HookedPacker();
+        $inner->feed(F::helloAck());
+        $session = new Session($dup, new RequestIdAllocator(0), encodePacker: $packer);
+        $session->hello();
+        $conn = new Connection($session, 'default');
+        $http = $conn->upstream('up');
+        $inner->feed(F::head(1) . F::body(1, 'one'));
+        $s = $http->stream('GET', '/s');                 // rid 1
+        $it = $s->getIterator();
+        $this->assertSame('one', $it->current());
+        $cycle = new \stdClass();
+        $cycle->self = $cycle;
+        $cycle->it = $it;
+        $collected = new \stdClass();
+        $collected->at = null;
+        $cycle->probe = new class ($collected) {
+            public function __construct(private \stdClass $c) {}
+
+            public function __destruct() { $this->c->at ??= 'elsewhere'; }
+        };
+        // Automatic collection off, so the cycle is collected exactly where the hook asks — not at a
+        // random allocation earlier, which would make this test pass vacuously.
+        gc_disable();
+        unset($it, $cycle);                               // the generator is garbage; $s is held
+        $b2 = $http->requestAsync('GET', '/b2');          // rid 2: credit on receipt
+        $b3 = $http->requestAsync('GET', '/b3');          // rid 3: credit on receipt
+        $inner->feed(F::head(2) . str_repeat(F::body(2, 'x'), 31) . F::head(3) . str_repeat(F::body(3, 'y'), 31)
+            . F::done(1));
+        $readsInHook = null;
+        $dup->onWrite = static function (Header $h, \Closure $onReadable) use ($dup, $packer, &$readsInHook, $collected): void {
+            if ($h->service === C::SERVICE_SQL) {
+                for ($i = 0; $i < 64; ++$i) {
+                    $onReadable(); // both buffered exchanges reach half a window: two deferred credits
+                }
+            } elseif ($h->method === C::METHOD_CORE_WINDOW_UPDATE) {
+                $dup->onWrite = null;
+                // The next pack call encodes the SECOND deferred credit, between the two writes.
+                $packer->onPack = static function () use ($dup, &$readsInHook, $collected): void {
+                    $before = $dup->reads;
+                    $collected->at = 'between the deferred writes';
+                    gc_collect_cycles();
+                    $readsInHook = $dup->reads - $before;
+                };
+            }
+        };
+        $x = $conn->scalarAsync('SELECT 7');              // rid 4
+        $this->assertSame('between the deferred writes', $collected->at, 'the stream was collected inside the flush');
+        $this->assertSame(0, $readsInHook, 'nothing was read from inside the flush');
+        $this->assertSame([1], F::cancels($inner->written), 'the stream was CANCELled, by the flush');
+        $this->assertFalse($session->isPoisoned());
+        $inner->feed(self::sqlOk(4, 7) . F::done(2) . F::done(3));
+        $this->assertSame(7, $x->await());
+        $this->assertSame(31, strlen($b2->await()->body));
+        $this->assertSame(31, strlen($b3->await()->body));
+        $this->assertFalse($session->hasRequestsInFlight(), 'the stream\'s END was read and dropped');
+    }
+
+    /** @return array{0:FakeTransport,1:DuplexDouble,2:Session,3:Connection} */
+    private function duplexConn(): array
+    {
+        $inner = new FakeTransport();
+        $dup = new DuplexDouble($inner);
+        $inner->feed(F::helloAck());
+        $session = new Session($dup, new RequestIdAllocator(0));
+        $session->hello();
+        return [$inner, $dup, $session, new Connection($session, 'default')];
+    }
+
+    /**
+     * Leave an object in a reference cycle whose destructor queries `$conn` (an RAII release).
+     * Caught: an ASYNC query, whose refusal settles its Future — awaited here, as the release would.
+     * Uncaught: a SYNC query, whose refusal is thrown out of the destructor.
+     */
+    private function cyclicDestructor(Connection $conn, \stdClass $seen, bool $catch): void
+    {
+        $o = new class ($conn, $seen, $catch) {
+            public mixed $self;
+
+            public function __construct(private Connection $c, private \stdClass $seen, private bool $catch)
+            {
+                $this->self = $this;
+            }
+
+            public function __destruct()
+            {
+                if (!$this->catch) {
+                    $this->c->scalar('SELECT 9');
+                    return;
+                }
+                $f = $this->c->scalarAsync('SELECT 9');
+                try {
+                    $f->await();
+                } catch (FerroException $e) {
+                    $this->seen->refused = $e;
+                }
+            }
+        };
+        unset($o);
     }
 }

@@ -308,6 +308,10 @@ final class HttpFateTest extends TestCase
         yield '502 non-idem' => [502, false, null, FateClass::Indeterminate, null];
         yield '504 non-idem' => [504, false, null, FateClass::Indeterminate, null];
         yield '599 non-idem' => [599, false, null, FateClass::Indeterminate, null];
+        // RFC 9110 §15: an invalid status (600..=999, which `ferrod` passes through) is processed as a 5xx.
+        yield '600 idem' => [600, true, null, FateClass::Retryable, null];
+        yield '600 non-idem' => [600, false, null, FateClass::Indeterminate, null];
+        yield '999 non-idem' => [999, false, '5', FateClass::Indeterminate, null];
     }
 
     #[DataProvider('statusTable')]
@@ -318,10 +322,16 @@ final class HttpFateTest extends TestCase
         $this->assertSame($delay, $v->retryAfterMs);
     }
 
-    public function testAStatusOutsideTheRangeIsRefused(): void
+    public function testAStatusThatIsNotThreeDigitsIsRefused(): void
     {
-        $this->expectException(\InvalidArgumentException::class);
-        StatusFate::of(600, true, null);
+        foreach ([99, 1000] as $status) {
+            try {
+                StatusFate::of($status, true, null);
+                $this->fail("{$status} accepted");
+            } catch (\InvalidArgumentException) {
+            }
+        }
+        $this->addToAssertionCount(1);
     }
 
     public function testCombineIsTheMostCautious(): void

@@ -370,7 +370,7 @@ Not terminal and not flagged `STREAM`. It debits the request's credit like `STRE
 
 | # | field | type | notes |
 |---|---|---|---|
-| 1 | `status` | `u16` | 200..=599. A 1xx is consumed by the engine; 101 is malformed. |
+| 1 | `status` | `u16` | 200..=999. A 1xx is consumed by the engine; 101 is malformed. *[Amended M6-F8 review round 2 (§22.2 (dd)): this said 200..=599, which was false. `ferrod` passes the upstream's status through as an `http::StatusCode`, which is 100..=999, and nothing narrows it, so an upstream's 600..=999 reaches the client. RFC 9110 §15 calls those invalid and says a client SHOULD process one as a 5xx, which `ferro/client` does (§23.7.4). The engine keeps passing them through: it does not interpret statuses (§23.7.4, rule E), and mapping one would hide what the upstream sent. Carried to F9: `guzzlehttp/psr7`'s `Response` refuses a status of 600 or more, so the Guzzle handler must decide what such a response becomes.]* |
 | 2 | `version` | `u8` | `10`, `11` or `20` |
 | 3 | `reason` | `bin \| nil` | HTTP/1.x reason phrase; `nil` on HTTP/2 |
 | 4 | `headers` | `array<[str, bin]>` | as received, minus hop-by-hop, plus §23.9.2's changes. **Names are lowercase** (P6). |
@@ -611,6 +611,9 @@ PHP gets an advisory helper, `Ferro\Http\StatusFate::of(int $status, bool $idemp
 | 429; 503 with `Retry-After` | Retryable, delay = `Retry-After` | same |
 | other 4xx; 501, 505 | NonRetryable | NonRetryable |
 | 500, 502, 504, 503 without `Retry-After`, other 5xx | Retryable | **Indeterminate**: an intermediary may have forwarded it, and a 500 promises nothing about partial application |
+| 600–999 *(added M6-F8 review round 2)* | as a 5xx: Retryable | as a 5xx: **Indeterminate** |
+
+*[Amended M6-F8 review round 2 (§22.2 (dd)): a status in 600..=999 is not an HTTP status, but the engine passes one through (§23.5.2). RFC 9110 §15: a client "SHOULD process the response as if it had a 5xx (Server Error) status code". So the native API delivers it like any response, with its head and its status, and `StatusFate` reads it as an "other 5xx". A value outside 100..=999, which no engine produces, fails only its own exchange (`ProtocolException`).]*
 
 This refines product-vision §4.2 D and the ledger's F0 row, both amended in the same change (C2; acknowledged, §23.18 Q5).
 
@@ -988,7 +991,8 @@ $s->close();                                 // CANCEL + drain: the RawStream co
 - ***Fiber suspension happens per frame,** not only until the head. A body read under `Ferro\Loop` or the Revolt adapter lets other Fibers run between chunks.*
 - ***Abandonment.** `close()`, an early exit from `foreach`, or a buffered read that fails part-way sends `CANCEL` and drains to the terminal. A stream or Future that is dropped instead sends `CANCEL` and discards, without blocking.*
 - ***Refused before sending:** an engine without the `HTTP` feature bit (`Unsupported`), and a frame over the cap (`RequestTooLargeException`).*
-- ***Review round (§22.2 (dd)):** a buffered request returns its credit as its frames are filed, half a window at a time. It therefore holds its whole body as it arrives, not one window. When every in-flight slot is a stream parked on credit, the next request is refused (`InFlightLimitException`, Retryable, not sent) instead of blocking. The client keeps reading while a write cannot progress (full duplex): `ferrod`'s session reader stops reading while its writer is full, and a client that only wrote deadlocked against it. A HEAD whose status is not an HTTP status fails only its exchange.]*
+- ***Review round (§22.2 (dd)):** a buffered request returns its credit as its frames are filed, half a window at a time. It therefore holds its whole body as it arrives, not one window. When every in-flight slot is a stream parked on credit, the next request is refused (`InFlightLimitException`, Retryable, not sent) instead of blocking. The client keeps reading while a write cannot progress (full duplex): `ferrod`'s session reader stops reading while its writer is full, and a client that only wrote deadlocked against it. A HEAD whose status is not an HTTP status fails only its exchange.*
+- ***Review round 2 (§22.2 (dd)):** a partly read frame is not "readable": an engine that stalls mid-frame meets the backstop and liveness again. A deadline pass re-reads the live deadlines after each `CANCEL`, because that write may read frames. A write is refused while another frame is being written (`ReentrantWriteException`, nothing written), so code a destructor runs mid-write cannot splice a frame. A request is in flight before any deferred write runs. A status of 600..=999 is delivered and read as a 5xx (§23.7.4). The slot refusal reads what is waiting first.]*
 
 #### 23.11.2 The Guzzle handler (`ferro/guzzle`)
 

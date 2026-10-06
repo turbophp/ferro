@@ -5,6 +5,7 @@ namespace Ferro\Client;
 use Ferro\Client\Error\ConnectionLostException;
 use Ferro\Client\Error\HandshakeException;
 use Ferro\Client\Error\InFlightLimitException;
+use Ferro\Client\Error\ReentrantWriteException;
 use Ferro\Client\Error\ProtocolException;
 use Ferro\Client\Error\TransportException;
 use Ferro\Protocol\Codec;
@@ -414,7 +415,9 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     {
         $this->refuseIfDead(true);
         while (count($this->inFlight) >= $this->maxInFlight) {
-            if ($this->allInFlightParkedOnCredit()) {
+            // Only when nothing is waiting to be read (review round 2, R2-2): a frame already here
+            // may be the terminal that frees a slot — an END is never credit-gated — so read it first.
+            if ($this->allInFlightParkedOnCredit() && !$this->readableNow()) {
                 // No slot can ever free: each is an HTTP stream whose window is used up and whose
                 // credit only its holder returns (M6-F8 review F2). Waiting would block until the
                 // engine's own timeouts — 600 s by default — so refuse, unsent. NOT a transport
@@ -453,8 +456,11 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         $rid = $this->nextFreeId();
         // Record BEFORE the write, so it names the request even when the write itself dies.
         $this->lastInFlight = [$service, $method];
-        $this->writeFrame(0, $service, $method, $payload, $rid, true);
+        $this->writeFrame(0, $service, $method, $payload, $rid, true, flush: false);
+        // In flight BEFORE the deferred writes: they may read frames (a duplex write), and this
+        // request's terminal could be one of them (review round 2, R2-3).
         $this->inFlight[$rid] = true;
+        $this->flushDeferred();
         return $rid;
     }
 
@@ -619,9 +625,10 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     {
         $rid = $this->nextFreeId();
         $payload = Message::encode('ping', ['token' => $token], $this->encodePacker);
-        $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_PING, $payload, $rid);
+        $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_PING, $payload, $rid, flush: false);
         // A PONG is routed like any frame, so a ping can run while requests are in flight.
         $this->inFlight[$rid] = true;
+        $this->flushDeferred();
         [$header, $body] = $this->nextFrameFor($rid);
         unset($this->inFlight[$rid]);
         if ($header->service !== C::SERVICE_CORE || $header->method !== C::METHOD_CORE_PONG) {
@@ -1002,8 +1009,8 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         if ($this->poisoned !== null || !$this->isPending($requestId)) {
             return;
         }
-        if ($this->busy > 0) {
-            // Re-entered from inside a transport operation (a destructor run by the cycle
+        if ($this->busy > 0 || $this->flushing) {
+            // Re-entered from inside a transport operation (or between the deferred writes) (a destructor run by the cycle
             // collector): a blocking drain here would read the outer read's bytes. Discard only.
             $this->cancelAndDiscard($requestId);
             return;
@@ -1030,7 +1037,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             return;
         }
         if (isset($this->inFlight[$requestId]) && $this->fatal === null) {
-            if ($this->busy > 0) {
+            if ($this->busy > 0 || $this->flushing) {
                 $this->deferredCancels[$requestId] = true; // written once the operation is over
             } else {
                 try {
@@ -1161,15 +1168,28 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         string $payload,
         int $requestId = 0,
         bool $isRequest = false,
+        bool $flush = true,
     ): void {
         $this->refuseIfDead($isRequest);
+        if ($this->writing) {
+            // A frame is half-written right now, and this call is code run in the middle of it — a
+            // destructor the cycle collector ran during a read inside the write. Writing would splice
+            // a whole frame into the half-written one (review round 2, R2-3). Nothing is written.
+            throw new ReentrantWriteException(sprintf(
+                'not sent: a frame (service=%d method=%d request_id=%d) was to be written while another frame '
+                    . 'was being written on this session — from code run in the middle of that write, such as '
+                    . 'a destructor; issue it after the write, or on another connection',
+                $service,
+                $method,
+                $requestId,
+            ));
+        }
         $header = new Header($flags, $service, $method, $requestId, strlen($payload));
         $frame = $this->codec->encodeFrame($header, $payload);
         // Keep reading while the write cannot progress — unless this write is itself happening
         // inside a read (a liveness PING), where a nested read would take that read's bytes.
-        $duplex = !$this->reading && !$this->writing;
+        $duplex = !$this->reading;
         ++$this->busy;
-        $wasWriting = $this->writing;
         $this->writing = true;
         try {
             if ($duplex && $this->transport instanceof DuplexTransportInterface) {
@@ -1178,14 +1198,34 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
                 $this->transport->writeAll($frame);
             }
         } catch (TransportException $e) {
-            $this->writing = $wasWriting;
+            $this->writing = false;
             --$this->busy;
             $this->poison($e);
             throw $isRequest ? TransportException::requestNotSent($e->getMessage(), $e) : $e;
+        } catch (\Throwable $e) {
+            // Anything else thrown through a write — a destructor's exception surfacing from a read
+            // inside it (review round 2, R2-3) — leaves an unknown part of the frame on the wire:
+            // nothing may follow it. For THIS frame it is a write that did not complete, so it is
+            // reported like one (the destructor's exception is chained); an \Error is a defect and
+            // propagates as itself.
+            $this->writing = false;
+            --$this->busy;
+            $lost = new TransportException(
+                'the frame write was interrupted by an exception thrown in the middle of it: ' . $e->getMessage(),
+                0,
+                $e,
+            );
+            $this->poison($lost);
+            if ($e instanceof \Error) {
+                throw $e;
+            }
+            throw $isRequest ? TransportException::requestNotSent($lost->getMessage(), $e) : $lost;
         }
-        $this->writing = $wasWriting;
+        $this->writing = false;
         --$this->busy;
-        $this->flushDeferred();
+        if ($flush) {
+            $this->flushDeferred();
+        }
     }
 
     /**
@@ -1525,9 +1565,10 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         }
         $rid = $this->nextFreeId();
         $payload = Message::encode('ping', ['token' => $rid], $this->encodePacker);
-        $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_PING, $payload, $rid);
+        $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_PING, $payload, $rid, flush: false);
         $this->probeRid = $rid;
         $this->probeSentAt = microtime(true);
+        $this->flushDeferred();
     }
 
     /**
@@ -1564,12 +1605,18 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     }
 
     /**
-     * Whether a read now would not wait: a frame partly read, bytes in PHP's stream buffer, or the
-     * socket readable. Never throws; a transport it cannot ask says no.
+     * Whether the engine has bytes for us that a read would take without waiting: bytes in PHP's
+     * stream buffer, or the socket readable. Never throws; a transport it cannot ask says no.
+     *
+     * **A frame partly read is NOT readable by itself** (review round 2, R2-1): an engine that
+     * stalls in the middle of a frame leaves the header read and the socket silent, and counting it
+     * made the backstop defer forever — and, since the read it deferred to ended at the past
+     * deadline before any liveness PING, it disabled liveness too: the request hung until EOF. The
+     * rest of a frame still coming makes the socket readable; that is the signal.
      */
     private function readableNow(): bool
     {
-        if ($this->partialHeader !== null || $this->bufferedBytes() > 0) {
+        if ($this->bufferedBytes() > 0) {
             return true;
         }
         $stream = $this->selectableStream();
@@ -1602,11 +1649,19 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         if ($this->poisoned !== null || $this->fatal !== null) {
             return;
         }
-        $now = microtime(true);
         $readable = null;
-        foreach ($this->deadlines as $rid => $at) {
-            if ($now < $at) {
-                continue;
+        // The LIVE state, re-read per id (review round 2, R2-5): a CANCEL is a duplex write that may
+        // read frames, and a frame read there can end another request (its END) or its deadline
+        // (its HTTP HEAD). A copy of the deadlines would then CANCEL a request that had completed —
+        // and re-arm a deadline nothing would ever clear, closing the session one grace later.
+        foreach (array_keys($this->deadlines) as $rid) {
+            if ($this->poisoned !== null) {
+                return;
+            }
+            $at = $this->liveDeadline($rid);
+            $now = microtime(true);
+            if ($at === null || $now < $at) {
+                continue; // null: it ended (or its HEAD arrived) during an earlier CANCEL's write
             }
             // The backstop judges the engine's SILENCE, not the caller's wall time (M6-F8 review
             // F1): bytes already waiting may be this request's answer, so read them first.
@@ -1623,6 +1678,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
                 } catch (TransportException) {
                     return; // `writeFrame` closed the session: see the docblock
                 }
+                $readable = null; // the write may have read; ask again
                 continue;
             }
             $e = new TransportException(sprintf(
@@ -1631,6 +1687,12 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             $this->poison($e);
             return;
         }
+    }
+
+    /** `$requestId`'s deadline as it is NOW — a write since the pass began may have ended it. */
+    private function liveDeadline(int $requestId): ?float
+    {
+        return $this->deadlines[$requestId] ?? null;
     }
 
     /**

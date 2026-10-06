@@ -78,10 +78,12 @@ final class HttpExchange
         $head = ResponseHead::fromWire($frame['head']);
         $this->head = $head;
         $this->replenish($frame['bytes']);
-        if ($head->status < 100 || $head->status > 599) {
-            // Not an HTTP status (RFC 9110 §15: three digits, 100..599). The frames are intact, so
-            // this is THIS exchange's failure, never the session's: stop it, read it to its
-            // terminal, and leave every other request on the socket alone (M6-F8 review).
+        if ($head->status < 100 || $head->status > 999) {
+            // Not even a three-digit status, which no engine produces (`ferrod` passes through an
+            // `http::StatusCode`, 100..=999). The frames are intact, so this is THIS exchange's
+            // failure, never the session's: stop it, read it to its terminal, and leave every other
+            // request on the socket alone (M6-F8 review). A status in 600..=999 IS delivered: RFC 9110
+            // §15 says to process it as a 5xx, which {@see StatusFate} does (review round 2, R2-4).
             $this->abandon();
             throw new ProtocolException(sprintf(
                 'HTTP request %d: the engine sent status %d, which is not an HTTP status; the exchange was abandoned',

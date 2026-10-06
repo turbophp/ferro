@@ -64,8 +64,7 @@ final class HttpChaosLiveTest extends HttpLiveTestCase
 
         // H: stop the engine reading, start writing a REQUEST larger than the socket can buffer, and
         // kill the engine during the write — the frame never completely leaves the client.
-        $pid = $this->ferrodPid();
-        exec('kill -STOP ' . $pid);
+        $pid = $this->stopFerrodAndWait(); // stopped for real: no thread reads the REQUEST
         exec(sprintf('(sleep 1; kill -KILL %d) > /dev/null 2>&1 &', $pid));
         $f['H'] = $up->requestAsync('POST', '/echo?c=H', body: str_repeat('h', 15 * 1024 * 1024));
         $this->killFerrod(); // reap it (already dead, or killed now)

@@ -380,4 +380,86 @@ final class HttpFakeEngineTest extends TestCase
         $this->assertSame(48 * 65536, strlen($s->body()), 'and the flood, read while it was written, is intact');
         $this->assertFalse($conn->session()->isPoisoned());
     }
+
+    // ---- review round 2 (M6-F8) ------------------------------------------------------------------
+
+    /**
+     * R2-1: an engine that stalls in the MIDDLE of a frame — its header and part of its payload
+     * sent, then silence — still meets D1c's backstop: CANCEL at the deadline, the session closed
+     * one read timeout later. Round 1's silence check counted the partly read frame as "readable",
+     * so the backstop deferred forever, and the read it deferred to ended at the past deadline
+     * before any liveness PING: the request hung until the engine's EOF.
+     */
+    public function testAnEngineThatStallsMidFrameStillMeetsTheBackstop(): void
+    {
+        $this->fakes[] = $f = Fake::start(static function ($c): void {
+            while (($fr = Fake::readFrame($c)) !== null) {
+                if (Fake::isExec($fr[0])) {
+                    $frame = Fake::frame(C::FLAG_END, C::SERVICE_SQL, C::METHOD_SQL_EXEC, $fr[0]->requestId, str_repeat("\x00", 100));
+                    fwrite($c, substr($frame, 0, 16 + 10)); // the header and 10 of 100 payload bytes
+                    usleep(12_000_000);                      // then nothing, and no EOF
+                    return;
+                }
+            }
+        });
+        // The read timeout (2 s) is longer than the deadline (0.2 s + the 2 s margin), so the
+        // deadline passes while the frame is half read — the shape that hung.
+        $conn = Ferro::connect($f->path, ioTimeout: 2.0, policy: RetryPolicy::none(), statementTimeout: 0.2);
+        $t0 = microtime(true);
+        try {
+            $conn->scalar('SELECT 1');
+            $this->fail('a stalled engine must not answer');
+        } catch (\Ferro\Client\Error\FerroException $e) {
+            // Either D1c bound may fire first: the unanswered CANCEL's grace or the unanswered PING.
+            $this->assertMatchesRegularExpression('/did not answer (its CANCEL|a liveness PING)/', $e->getMessage());
+        }
+        $elapsed = microtime(true) - $t0;
+        $this->assertLessThan(7.0, $elapsed, 'the deadline and one read timeout (~4.2 s), not the engine\'s EOF at 12 s');
+    }
+
+    /**
+     * R2-2: every slot is a stream that has used up its window, but a terminal that frees one is
+     * already waiting to be read — an END is never credit-gated. The next request is sent, not
+     * refused: the slot wait reads what is there before it judges that nothing can free.
+     */
+    public function testWhenATerminalIsWaitingASlotFreesAndTheRequestIsNotRefused(): void
+    {
+        $f = $this->engine(8.0, static function (Header $h, string $p, \Closure $send): void {
+            if (Fake::isPing($h)) {
+                $send(0, Fake::pong($h->requestId));
+                return;
+            }
+            if (Fake::isCancel($h)) {
+                $send(0, F::cancelled($h->requestId));
+                return;
+            }
+            $rid = $h->requestId;
+            switch (self::target($h, $p)) {
+                case '/a': // rid 1
+                    $send(0, F::head($rid));
+                    break;
+                case '/b': // rid 2: then both windows fill, and /a's upstream response completes
+                    $send(0, F::head($rid) . str_repeat(F::body(1, 'a'), 64) . str_repeat(F::body($rid, 'b'), 64) . F::done(1));
+                    break;
+                case '/c':
+                    $send(0, F::head($rid) . F::body($rid, 'c') . F::done($rid));
+                    break;
+            }
+        });
+        $session = new \Ferro\Client\Session(
+            \Ferro\Client\Transport::connectUnix($f->path, 2.0, 1.0),
+            new \Ferro\Client\RequestIdAllocator(0),
+            maxInFlight: 2,
+        );
+        $session->hello();
+        $conn = new Connection($session, 'default');
+        $http = $conn->upstream('up');
+        $a = $http->stream('GET', '/a');
+        $b = $http->stream('GET', '/b');
+        usleep(200_000); // everything is on the socket
+        $this->assertSame('c', $http->requestAsync('GET', '/c')->await()->body);
+        $this->assertSame(64, strlen($a->body()));
+        $b->close();
+        $this->assertFalse($session->isPoisoned());
+    }
 }

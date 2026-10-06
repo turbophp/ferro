@@ -12,7 +12,7 @@ use Ferro\Protocol\Msgpack\PackerInterface;
  *    decoded: [str, u64|nil]|nil, idempotent: bool].
  *
  * Decoding is STRICT on type and width ({@see HttpWire}); it does NOT apply the producer's semantic
- * contract (status 200..=599, version 10/11/20), which the engine owns and the native API (F8) may
+ * contract (status 200..=999, version 10/11/20), which the engine owns and the native API (F8) may
  * check — the codec moves what the wire carries. `idempotent` is the engine's EFFECTIVE idempotency
  * for the request (§23.7.2), the one authority a client classifies against after `HEAD` (§23.7.3).
  */
