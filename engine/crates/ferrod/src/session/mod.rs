@@ -218,6 +218,11 @@ pub struct SessionInfo {
     /// check, but NOT `idempotent` — the client's retry licence (§9.2) — so the hash is the only
     /// thing that proves the client read the engine's declaration of it.
     pub manifest_agreed: bool,
+    /// The peer's KERNEL-ATTESTED uid (`SO_PEERCRED`), `None` when the transport attests none.
+    /// Read once per session (it cannot change for the socket's life). Ferro HTTP's per-upstream
+    /// `ALLOW_UIDS` and `PARTITION=uid` key on it (§23.3.1, §23.8.1, M6-F4a); an upstream with
+    /// `ALLOW_UIDS` refuses a peer with none.
+    pub peer_uid: Option<u32>,
 }
 
 /// The session task's entry point, one call per accepted connection.
@@ -391,6 +396,7 @@ impl Session {
             session_id,
             SessionInfo {
                 manifest_agreed: hello.manifest_hash.is_some(),
+                peer_uid,
             },
         );
 
@@ -412,6 +418,7 @@ impl Session {
             pool_registry.pool_info().await,
             pool_registry.manifest().is_some(),
             config.memfd_threshold.is_some(),
+            pool_registry.http_served(),
         );
 
         // SPEC §5.1 (M3-D3): a success terminal may move into a sealed memfd only when the client

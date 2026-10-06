@@ -15,6 +15,11 @@ jobs:
       # benches or examples — which is where the live acceptance gates live.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace          # offline: live suites skip (no FERRO_TEST_{PG,MYSQL,MARIADB}_URL)
+      # SPEC §23.13 / D20 (M6-F4a): Ferro HTTP sits behind `ferrod`'s default-on `http` feature, and
+      # `--no-default-features` must stay a buildable, lint-clean database-only daemon. Nothing else in
+      # this lane compiles that configuration, so a `#[cfg(feature = "http")]` gap would go unnoticed.
+      # (`cargo deny` checks the default graph, which is a superset of this one.)
+      - run: cargo clippy -p ferrod --no-default-features --all-targets -- -D warnings
       # Stable-toolchain type-check for the ferrod fuzz target's standalone workspace (see
       # fuzz-smoke's NOTE below for why its actual `cargo fuzz run` is nightly-only/deferred):
       # `cargo check` alone doesn't need coverage instrumentation, so it compiles cleanly on

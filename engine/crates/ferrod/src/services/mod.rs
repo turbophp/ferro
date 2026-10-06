@@ -5,4 +5,6 @@
 
 pub mod admin;
 pub mod fate;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod sql;

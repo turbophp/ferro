@@ -9,14 +9,50 @@ publish = false
 [lints]
 workspace = true
 
-# SPEC §23 (Ferro HTTP). Slice M6-F3 builds ONLY the configuration model and the request validator
-# (§23.3.1, §23.4, the §23.8.5 address classification) — no network, no TLS, no tokio. The D20
-# network set (`hyper`, `rustls`, …) arrives with F4/F5, and so does the default-on `http` cargo
-# feature on `ferrod` that gates this crate (§23.13).
+# SPEC §23 (Ferro HTTP). Slice M6-F3 built the configuration model and the request validator
+# (§23.3.1, §23.4, the §23.8.5 address classification); slice M6-F4a adds the pure fate classifier
+# (`fate`, always built) and the HTTP/1.1 plaintext engine (`engine`, behind the `engine` feature).
 #
 # `unicode-normalization` is D20's one non-network dependency, used ONLY by `PATH_ENCODING=utf8`'s
 # NFKC dot check (§23.4.2 step 8). Its licence (MIT OR Apache-2.0, and `tinyvec`'s
 # Zlib OR Apache-2.0 OR MIT) is on `deny.toml`'s allow-list — premise P16, which spike F1a measured
 # as HOLDS. It was already in the workspace lock (through `stringprep`), so this adds no new crate.
+#
+# `ferro-proto` (always): the fate classifier names codes, branches and `[http.causes]` tokens ONLY
+# through the generated constants (charter rule 2) — F3 deliberately did not spell them.
 [dependencies]
 unicode-normalization = "0.1.25"
+ferro-proto = { path = "../ferro-proto" }
+# --- the `engine` feature: SPEC D20's adopted set, as spike F1a measured it (§23.13) -------------
+# NORMAL dependencies now (F1a had them as dev-dependencies), but OPTIONAL: the network engine is
+# behind this crate's `engine` feature, which `ferrod`'s default-on `http` feature enables. The
+# default build of this crate stays tokio-free ON PURPOSE — its three `cargo-fuzz` targets build
+# under coverage instrumentation, which tokio ICEs on current nightly (ci.yml's fuzz-smoke NOTE), so
+# pulling tokio into the default feature set would silently cost the SSRF rule its fuzz job.
+# `rustls`/`tokio-rustls`/`rustls-native-certs` are NOT here yet: F4a is plaintext only; F5 adds
+# them with the `default-features = false, features = ["ring", "tls12"]` selection P3 proved
+# load-bearing. `http2` likewise waits for F5b. Every crate below was already in the lock (F1a).
+hyper = { version = "1", default-features = false, features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+http = { version = "1", optional = true }
+http-body = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"], optional = true }
+tokio-util = { version = "0.7", optional = true }
+tracing = { version = "0.1", optional = true }
+
+[features]
+default = []
+engine = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http",
+    "dep:http-body",
+    "dep:bytes",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:tracing",
+]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

@@ -105,15 +105,22 @@ fn shown(value: &str) -> String {
 /// list, so the names/kinds a session advertises are always the registry's own (M1-S8a Task 12).
 ///
 /// `manifest_loaded` sets `feature_engine::MANIFEST` (M3-D2d); `memfd_enabled` sets
-/// `feature_engine::MEMFD` (M3-D3).
+/// `feature_engine::MEMFD` (M3-D3); `http_served` sets `feature_engine::HTTP` (M6-F4a) — "this
+/// engine SERVES Ferro HTTP" (§23.5): built with the `http` feature, configured, and not disabled
+/// (`PoolRegistry::http_served`). A client must check it, because a `--no-default-features` engine
+/// carries the same registry hash.
 pub fn hello_ack_frame(
     request_id: u32,
     epoch: BootEpoch,
     pools: Vec<PoolInfo>,
     manifest_loaded: bool,
     memfd_enabled: bool,
+    http_served: bool,
 ) -> OutFrame {
     let mut features = 0u32;
+    if http_served {
+        features |= u32::from(feature_engine::HTTP);
+    }
     if manifest_loaded {
         features |= u32::from(feature_engine::MANIFEST);
     }
@@ -147,41 +154,52 @@ pub fn hello_ack_frame(
 mod tests {
     use super::*;
 
-    /// SPEC §23.5 / §22.2 (cy): `feature_engine::HTTP` means "this engine SERVES Ferro HTTP", and
-    /// nothing in this build does, so no configuration may advertise it. Asserted over every input
-    /// `hello_ack_frame` takes — not only the default one an e2e test happens to run — and as
-    /// "nothing but the bits those inputs control", so a coupling of ANY other bit to the manifest
-    /// or memfd path fails here.
+    /// SPEC §23.5 / §22.2 (cy), (cz): `feature_engine::HTTP` means "this engine SERVES Ferro HTTP",
+    /// and is set by `http_served` alone. Asserted over every input `hello_ack_frame` takes — not
+    /// only the default one an e2e test happens to run — and as "nothing but the bits those inputs
+    /// control", so a coupling of ANY bit to another input fails here.
     #[test]
     fn hello_ack_advertises_only_the_bits_its_inputs_control() {
-        let controlled = u32::from(feature_engine::MANIFEST) | u32::from(feature_engine::MEMFD);
+        let controlled = u32::from(feature_engine::MANIFEST)
+            | u32::from(feature_engine::MEMFD)
+            | u32::from(feature_engine::HTTP);
         for manifest_loaded in [false, true] {
             for memfd_enabled in [false, true] {
-                let frame =
-                    hello_ack_frame(7, BootEpoch(1), Vec::new(), manifest_loaded, memfd_enabled);
-                let ack = HelloAck::decode(&frame.payload).expect("HELLO_ACK decodes");
-                let case =
-                    format!("manifest_loaded={manifest_loaded} memfd_enabled={memfd_enabled}");
-                assert_eq!(
-                    ack.features & u32::from(feature_engine::HTTP),
-                    0,
-                    "{case}: HTTP advertised"
-                );
-                assert_eq!(
-                    ack.features & !controlled,
-                    0,
-                    "{case}: an uncontrolled bit is set"
-                );
-                assert_eq!(
-                    ack.features & u32::from(feature_engine::MANIFEST) != 0,
-                    manifest_loaded,
-                    "{case}"
-                );
-                assert_eq!(
-                    ack.features & u32::from(feature_engine::MEMFD) != 0,
-                    memfd_enabled,
-                    "{case}"
-                );
+                for http_served in [false, true] {
+                    let frame = hello_ack_frame(
+                        7,
+                        BootEpoch(1),
+                        Vec::new(),
+                        manifest_loaded,
+                        memfd_enabled,
+                        http_served,
+                    );
+                    let ack = HelloAck::decode(&frame.payload).expect("HELLO_ACK decodes");
+                    let case = format!(
+                        "manifest_loaded={manifest_loaded} memfd_enabled={memfd_enabled} \
+                     http_served={http_served}"
+                    );
+                    assert_eq!(
+                        ack.features & u32::from(feature_engine::HTTP) != 0,
+                        http_served,
+                        "{case}: HTTP"
+                    );
+                    assert_eq!(
+                        ack.features & !controlled,
+                        0,
+                        "{case}: an uncontrolled bit is set"
+                    );
+                    assert_eq!(
+                        ack.features & u32::from(feature_engine::MANIFEST) != 0,
+                        manifest_loaded,
+                        "{case}"
+                    );
+                    assert_eq!(
+                        ack.features & u32::from(feature_engine::MEMFD) != 0,
+                        memfd_enabled,
+                        "{case}"
+                    );
+                }
             }
         }
     }

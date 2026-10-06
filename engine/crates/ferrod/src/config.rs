@@ -315,6 +315,14 @@ pub struct Config {
     /// From `FERRO_MEMFD_THRESHOLD_BYTES` (see [`parse_memfd_threshold`]); default
     /// [`DEFAULT_MEMFD_THRESHOLD_BYTES`].
     pub memfd_threshold: Option<usize>,
+    /// SPEC §23.3.1 (M6-F4a): the Ferro HTTP configuration (`FERRO_UPSTREAMS` /
+    /// `FERRO_UPSTREAM_<NAME>_*` / `FERRO_HTTP_*`), loaded once at start by `main` when
+    /// `FERRO_UPSTREAMS` is set. `None`: HTTP is not configured, so the route answers `Unsupported`
+    /// and `HELLO_ACK` does not advertise `HTTP`. A refused configuration never takes the daemon down
+    /// (§23.3.1): it disables an upstream, or — for a daemon-wide key — the whole HTTP service.
+    /// Here, beside `manifest`, for the same reason: the registry builds the engine from it.
+    #[cfg(feature = "http")]
+    pub http: Option<std::sync::Arc<ferro_http::HttpConfig>>,
 }
 
 impl Default for Config {
@@ -340,6 +348,8 @@ impl Default for Config {
             manifest_path: None,
             manifest: None,
             memfd_threshold: Some(DEFAULT_MEMFD_THRESHOLD_BYTES),
+            #[cfg(feature = "http")]
+            http: None,
         }
     }
 }

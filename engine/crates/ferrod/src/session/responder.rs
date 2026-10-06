@@ -206,8 +206,15 @@ impl Responder {
             cols: cols.to_vec(),
         }
         .encode();
-        self.send_stream_frame(method_stream::HEAD, 0, payload, cancel, deadline)
-            .await
+        self.send_stream_frame(
+            service::STREAM,
+            method_stream::HEAD,
+            0,
+            payload,
+            cancel,
+            deadline,
+        )
+        .await
     }
 
     /// Stream a batch of result rows as one `STREAM/DATA` frame (flag `STREAM` set). Debits the
@@ -221,6 +228,7 @@ impl Responder {
     ) -> Result<usize, StreamSendError> {
         let payload = StreamData { rows }.encode();
         self.send_stream_frame(
+            service::STREAM,
             method_stream::DATA,
             flags::STREAM,
             payload,
@@ -241,8 +249,14 @@ impl Responder {
     ///
     /// Returns the enqueued payload byte length (`len`) on success — the producer sums these into
     /// `stats.bytes` (Task 4b item 4).
-    async fn send_stream_frame(
+    ///
+    /// **`svc` is the frame's service id (SPEC §23.5, M6-F4a — "the one chassis change").** Credit is
+    /// keyed by `request_id` and the `STREAM` flag, not by service, so the gauntlet above is the same
+    /// for every service that streams: `STREAM`'s HEAD/DATA, and Ferro HTTP's `HEAD`/`BODY`, whose
+    /// payloads the HTTP service encodes itself (nothing HTTP-specific lives here).
+    pub async fn send_stream_frame(
         &self,
+        svc: u16,
         method: u16,
         frame_flags: u16,
         payload: Vec<u8>,
@@ -278,7 +292,7 @@ impl Responder {
         let frame = OutFrame {
             header: Header {
                 flags: frame_flags,
-                service: service::STREAM,
+                service: svc,
                 method,
                 request_id: self.sink.request_id,
                 payload_len: len as u32,

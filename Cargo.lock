@@ -398,6 +398,15 @@ dependencies = [
 name = "ferro-http"
 version = "0.0.0"
 dependencies = [
+ "bytes",
+ "ferro-proto",
+ "http",
+ "http-body",
+ "hyper",
+ "hyper-util",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "unicode-normalization",
 ]
 
@@ -476,6 +485,7 @@ dependencies = [
  "ferro-backend-pg",
  "ferro-backend-sqlite",
  "ferro-classify",
+ "ferro-http",
  "ferro-manifest",
  "ferro-pool",
  "ferro-proto",

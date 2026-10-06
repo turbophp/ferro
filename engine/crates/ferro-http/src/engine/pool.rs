@@ -1,0 +1,171 @@
+//! The hand-rolled HTTP/1.1 keep-alive pool (SPEC §23.8.1, §23.8.2; D9 extended).
+//!
+//! Built directly on `hyper::client::conn::http1` — `hyper-util`'s `legacy::Client` is not used,
+//! because its pool sits where `sent` must be observed and it re-dispatches internally. One sub-pool
+//! per upstream, or per (upstream, peer uid) under `PARTITION=uid` (§23.8.1). An HTTP/1.1
+//! connection carries one exchange at a time, with no pipelining.
+//!
+//! **Reuse (§23.8.2).** Idle connections are taken LIFO. A candidate must be open, younger than
+//! `MAX_LIFETIME_MS`, and idle for less than its idle limit (`IDLE_TIMEOUT_MS`, clamped to the
+//! server's `Keep-Alive: timeout` minus 1 s). **A non-idempotent request additionally refuses a
+//! connection idle longer than `H1_UNSAFE_REUSE_MAX_IDLE_MS` and dials fresh** — the keep-alive race
+//! is the stock cause of a stale-reuse `Indeterminate`, curl hides it with a re-send, and Ferro may
+//! not re-send (charter rule 3), so it narrows the race instead. Such a connection is left in the
+//! pool for an idempotent request; since the stack is LIFO, every connection below it is idler
+//! still, so the check needs only the top.
+//!
+//! **Discard, never drain (§23.8.2).** After a cancel, a timeout, an abandoned body or any failure,
+//! the connection is discarded: [`HttpConn::discard`] aborts `hyper`'s connection task and AWAITS it,
+//! which drops the I/O — the point after which `sent` may be read (§23.7.1).
+//!
+//! **Not here (slice F6, §23.15):** `MAX_CONNECTIONS` / `MAX_REQUESTS` / `MAX_DIALS` as concurrency
+//! limits and the `MAX_QUEUED` queue. F4a bounds only what the pool RETAINS: at most
+//! `MAX_CONNECTIONS` idle connections per sub-pool; a surplus one is discarded on return.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use hyper::client::conn::http1;
+use tokio::task::JoinHandle;
+
+use super::body::OneChunk;
+use super::track::TrackState;
+
+/// One HTTP/1.1 upstream connection.
+pub struct HttpConn {
+    pub sender: http1::SendRequest<OneChunk>,
+    /// `hyper`'s connection task. It writes independently of the response future (§23.7.1), so
+    /// `sent` is final only once it has been aborted and awaited.
+    pub task: JoinHandle<()>,
+    pub track: Arc<TrackState>,
+    /// The checked address this connection is pinned to for life (§23.8.5).
+    pub peer: SocketAddr,
+    pub created: Instant,
+    pub idle_since: Instant,
+    /// `IDLE_TIMEOUT_MS`, clamped by the last response's `Keep-Alive: timeout` (§23.8.2).
+    pub idle_limit: Duration,
+}
+
+impl HttpConn {
+    /// Abort `hyper`'s connection task and wait until it is gone, so the I/O is dropped and no
+    /// later byte can follow. Only after this is the tracker's `sent` final (§23.7.1).
+    pub async fn discard(self) {
+        let HttpConn { sender, task, .. } = self;
+        task.abort();
+        let _ = task.await;
+        drop(sender);
+    }
+}
+
+/// The sub-pool key: the upstream, and the peer uid under `PARTITION=uid`.
+pub type PoolKey = (String, Option<u32>);
+
+/// What a sub-pool may hand out, decided per checkout.
+#[derive(Clone, Copy, Debug)]
+pub struct ReusePolicy {
+    pub max_lifetime: Duration,
+    pub idempotent: bool,
+    pub unsafe_reuse_max_idle: Duration,
+}
+
+/// Every sub-pool's idle stack.
+#[derive(Default)]
+pub struct Pools {
+    idle: Mutex<HashMap<PoolKey, Vec<HttpConn>>>,
+}
+
+impl Pools {
+    /// Take the most recently returned usable connection, discarding every stale one found on the
+    /// way. `None`: dial fresh.
+    pub fn checkout(&self, key: &PoolKey, policy: ReusePolicy) -> Option<HttpConn> {
+        let mut stale = Vec::new();
+        let picked = {
+            let mut map = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+            let stack = map.get_mut(key)?;
+            let now = Instant::now();
+            let mut picked = None;
+            while let Some(c) = stack.pop() {
+                let idle = now.saturating_duration_since(c.idle_since);
+                let unusable = c.sender.is_closed()
+                    || c.task.is_finished()
+                    || now.saturating_duration_since(c.created) >= policy.max_lifetime
+                    || idle >= c.idle_limit;
+                if unusable {
+                    stale.push(c);
+                    continue;
+                }
+                if !policy.idempotent && idle > policy.unsafe_reuse_max_idle {
+                    // §23.8.2: too idle for a non-idempotent request. Left for idempotent ones; the
+                    // ones below it are idler still (LIFO), so dial fresh.
+                    stack.push(c);
+                    break;
+                }
+                picked = Some(c);
+                break;
+            }
+            picked
+        };
+        for c in stale {
+            c.task.abort();
+        }
+        picked
+    }
+
+    /// Return a connection after a completed exchange. `max_idle` bounds what the sub-pool retains
+    /// (`MAX_CONNECTIONS`); a surplus connection is discarded.
+    pub fn checkin(&self, key: PoolKey, mut conn: HttpConn, max_idle: usize) {
+        conn.idle_since = Instant::now();
+        let mut map = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        let stack = map.entry(key).or_default();
+        if stack.len() >= max_idle {
+            conn.task.abort();
+            return;
+        }
+        stack.push(conn);
+    }
+
+    /// Idle connections currently held for `key` (diagnostics and tests).
+    pub fn idle_count(&self, key: &PoolKey) -> usize {
+        let map = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(key).map_or(0, Vec::len)
+    }
+}
+
+/// `Keep-Alive: timeout=N` → the idle limit: `min(IDLE_TIMEOUT_MS, N s − 1 s)` (§23.8.2). A header
+/// with no parseable `timeout` leaves the configured limit.
+pub fn idle_limit(configured: Duration, keep_alive: Option<&[u8]>) -> Duration {
+    let Some(v) = keep_alive.and_then(|v| std::str::from_utf8(v).ok()) else {
+        return configured;
+    };
+    for part in v.split(',') {
+        let mut kv = part.splitn(2, '=');
+        let k = kv.next().unwrap_or("").trim();
+        if k.eq_ignore_ascii_case("timeout")
+            && let Some(secs) = kv.next().and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            let server = Duration::from_secs(secs).saturating_sub(Duration::from_secs(1));
+            return configured.min(server);
+        }
+    }
+    configured
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keep_alive_timeout_clamps_the_idle_limit_minus_a_second() {
+        let cfg = Duration::from_secs(15);
+        assert_eq!(idle_limit(cfg, None), cfg);
+        assert_eq!(
+            idle_limit(cfg, Some(b"timeout=5, max=100")),
+            Duration::from_secs(4)
+        );
+        assert_eq!(idle_limit(cfg, Some(b"max=100, Timeout=60")), cfg);
+        assert_eq!(idle_limit(cfg, Some(b"timeout=1")), Duration::ZERO);
+        assert_eq!(idle_limit(cfg, Some(b"timeout=x")), cfg);
+    }
+}
