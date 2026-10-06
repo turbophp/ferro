@@ -1209,15 +1209,26 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
   **(cj) M3-D1a — the client multiplexes its one socket, and fan-out costs the slowest query, not the sum (2026-10-06).** The engine has run every request on its own task since M0 (`ferrod` `session::mod`), but the client was single-in-flight: write one frame, read one terminal. `Session` now files every frame it reads under its `request_id` (one router, `pump`), so `submit` can write a request and return at once and `awaitTerminal` can read until that one id's terminal arrives, keeping other ids' frames for their own awaiters. `sendRequest` is `submit` + `awaitTerminal`, so every tier's synchronous surface is unchanged.
   - **Measured live:** four `pg_sleep(0.5)` statements cost about 2 s run one after another (the control, so a sleep that never slept cannot pass the test) and about 0.5 s submitted together and awaited with `Ferro\await()`. This needs **no Fiber scheduler**: under plain FPM all k requests are written before any terminal is read.
   - **Failure handling in the router:**
-    - a frame for an id not in flight is a desync: `ProtocolException`, and the session is poisoned;
-    - a session-fatal `request_id=0` terminal fails EVERY pending request, each with its own `ConnectionLostException` carrying the server's payload;
-    - a transport failure fails every pending request as SENT, never `requestNotSent`, because each frame was completely written and its fate is unknown.
+    - a frame for an id not in flight, or a non-terminal frame for a buffered request, is a desync: `ProtocolException`, and the session is poisoned;
+    - **a session-fatal `request_id=0` terminal decides NO pending request's fate.** With several requests in flight it may concern any of them, or a control frame, so its payload is never attributed. The session stops sending and keeps reading until EOF, because the engine drains each in-flight request's own terminal before it closes (`cancel_all` + `drain_supervisors`). A request still unanswered at EOF fails with a `ConnectionLostException` carrying no server payload, so the caller's classifier decides, and a lost write is `Indeterminate`. **This also changes the single-request case**: before M3 the fatal's payload was the request's fate, and that is now never so;
+    - a transport failure fails every pending request as SENT, never `requestNotSent`, because each frame was completely written and its fate is unknown. A request still waiting for an in-flight slot when the session fails was never written, so it IS `requestNotSent`. `close()` poisons the session, so a Future still pending on it fails as sent;
+    - a Future dropped unawaited discards its terminal on arrival, so abandoned Futures cannot grow the session's inbox.
   - **The in-flight limit is the client's (default 256)**, below the engine's `max_inflight` (1024), because the engine answers an excess request with an error instead of running it. At the limit, `submit` reads until a terminal frees a slot and keeps that terminal. A wrapped `u32` id still in flight is skipped, never reused.
   - **The async path reuses the synchronous fate rules rather than copying them.** A lost request is classified by `FateClassifier::classifyLoss` (a lost write is `Indeterminate`), and the one re-issue the policy allows for a read runs through `dispatchAutocommit` counted as its second attempt.
   - **Three deliberate limits, recorded:**
     - **Inside an open transaction an async statement settles at once.** It is part of the transaction's order, and leaving it in flight would let the next statement overtake it in the client's view.
     - **An async statement does not update `lastInsertId()`.** "The most recent statement" has no meaning with several in flight.
     - **An open stream stays exclusive on its session.** A buffered statement on the same `tx_id` would queue in the engine behind a stream stalled on its credit window, which the client would not replenish while awaiting that statement: a deadlock. Lifting this needs per-stream window handling in the router.
+  - **The adversarial review found 9 defects, and the worst was a fate violation measured live.** A malformed frame on ANOTHER request id made the engine send its `request_id=0` fatal. The first version stamped that fatal's NonRetryable payload onto a pending `INSERT`, and the row had been applied in 2 of 3 runs. It also closed the socket, discarding the terminals the engine was still draining. The review also found:
+    - the two rules that stop the async path re-sending a lost write had no test: classifying the loss as "not sent", or retrying regardless of fate, left every test green;
+    - a raw `TypeError` escaping on a read of a closed socket, after a fatal at the in-flight limit and after `close()`;
+    - a request waiting for a slot reported as sent;
+    - `lastInsertId()` touched on three async paths;
+    - an unbounded inbox;
+    - errors thrown at the call instead of at `await`;
+    - consumer lock files missing the new `files` autoload, so `Ferro\await` was undefined in the Doctrine and Laravel tiers.
+
+    All are fixed. The review's mutations and the fixes' own mutations were run against the main tree: 14, all killed.
   - **Not established:** Fiber suspension (D1b: `Ferro\Loop` plus a Revolt adapter, so an `await` inside a Fiber suspends instead of blocking), the `FIBERS` client feature bit (still not advertised), and §16's fan-out target measured on the D17 reference runner.
 
 ### 22.3 M2 exit record (2026-10-02)
