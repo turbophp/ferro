@@ -329,6 +329,210 @@ async fn a_dropped_exchange_closes_its_connection() {
     assert_eq!(engine.in_flight(), 0);
 }
 
+/// The same, mid-WRITE: the exchange is dropped while `hyper` is still trying to write a body the
+/// connection no longer accepts. Here `hyper`'s own connection task would wait on the write for
+/// ever — nothing in `hyper` closes it — so only the engine's abort-on-drop closes the socket. (The
+/// head-phase case above `hyper` closes by itself once its last handle is dropped, which is why
+/// both are pinned.)
+#[tokio::test]
+async fn an_exchange_dropped_mid_write_closes_its_connection() {
+    let up = answering().await;
+    let engine = engine_with(
+        upstreams(&[("u", up.addr)], &[]),
+        StallConnect::new(1024, 1),
+    );
+    let e = engine.clone();
+    let task = tokio::spawn(async move {
+        e.exchange(
+            &post("u", &body_of(3 * MIB, 3)),
+            None,
+            Instant::now(),
+            &CancellationToken::new(),
+            &BlackHole,
+        )
+        .await
+    });
+    wait_for("the head at the upstream", || up.rec.heads() == 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(engine.body_budget_in_use("u"), 3 * MIB as u64);
+    task.abort();
+    let _ = task.await;
+    wait_for("the connection dropped", || engine.live_connections() == 0).await;
+    wait_for("the upstream saw the close", || {
+        up.rec.closed_by_peer() == 1
+    })
+    .await;
+    assert_eq!(engine.body_budget_daemon_in_use(), 0);
+    assert_eq!(engine.in_flight(), 0);
+}
+
+/// An always-ready sink that records when each frame was sent, and cancels `cancel_at.1` once it
+/// has accepted `cancel_at.0` frames — a sink that, unlike `ferrod`'s, checks nothing itself.
+struct Recorder {
+    frames: std::sync::Mutex<Vec<(SinkFrame, Instant, usize)>>,
+    cancel_at: Option<(usize, CancellationToken)>,
+    ticks: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Recorder {
+    fn new(
+        cancel_at: Option<(usize, CancellationToken)>,
+        ticks: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Recorder {
+            frames: std::sync::Mutex::new(Vec::new()),
+            cancel_at,
+            ticks,
+        }
+    }
+}
+
+impl ResponseSink for Recorder {
+    fn send<'a>(
+        &'a self,
+        frame: SinkFrame,
+        _: Vec<u8>,
+        _: tokio::time::Instant,
+        _: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        let mut f = self.frames.lock().unwrap();
+        f.push((frame, Instant::now(), self.ticks.load(Ordering::SeqCst)));
+        if let Some((n, t)) = &self.cancel_at
+            && f.len() == *n
+        {
+            t.cancel();
+        }
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// An endless gzip bomb upstream (~1000× per byte), every write as big as the socket takes.
+async fn bomb_upstream() -> Upstream {
+    let member = Arc::new(zeros_member(64 * MIB));
+    upstream(move |mut s, rec| {
+        let member = Arc::clone(&member);
+        async move {
+            if rec.read_request(&mut s).await.is_none() {
+                return;
+            }
+            let head =
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n";
+            if rec.write(&mut s, head).await.is_err() {
+                return;
+            }
+            loop {
+                let mut out = format!("{:x}\r\n", member.len()).into_bytes();
+                out.extend_from_slice(&member);
+                out.extend_from_slice(b"\r\n");
+                if rec.write(&mut s, &out).await.is_err() {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+}
+
+/// **The decode loop checks the deadline and the stop token between steps itself**, not only
+/// through the sink: with a sink that checks nothing (`ferrod`'s does — this is the engine's own
+/// bound, §23.9.2 "CPU bounded by the deadline"), no frame is sent after the deadline passed or
+/// the request was stopped, though one network read of the bomb inflates to many MiB. Counted, not
+/// timed: a frame recorded after the deadline is a frame decoded after it, however fast or slow
+/// the machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_decode_loop_checks_the_deadline_and_the_stop_between_steps() {
+    let up = bomb_upstream().await;
+    let engine = engine_with(upstreams(&[("u", up.addr)], &[]), Arc::new(TcpConnect));
+    let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // The deadline.
+    let rec = Recorder::new(None, ticks.clone());
+    let started = Instant::now();
+    let t = engine
+        .exchange(
+            &HttpRequest {
+                timeout_ms: Some(400),
+                ..decode_get("/bomb")
+            },
+            None,
+            started,
+            &CancellationToken::new(),
+            &rec,
+        )
+        .await;
+    let deadline = started + Duration::from_millis(400);
+    let frames = rec.frames.lock().unwrap();
+    let late = frames.iter().filter(|(_, at, _)| *at > deadline).count();
+    assert!(
+        frames.len() > 10,
+        "the bomb was decoding: {} frames",
+        frames.len()
+    );
+    assert!(
+        matches!(&t, ferro_http::engine::Terminal::Error(ep) if ep.detail.as_deref() == Some(http_cause::TIMEOUT)),
+        "{t:?}"
+    );
+    assert!(
+        late <= 1,
+        "{late} frames decoded and sent after the deadline"
+    );
+    drop(frames);
+
+    // The stop token (a CANCEL — and the drain cap, which fires the same token).
+    let cancel = CancellationToken::new();
+    let rec = Recorder::new(Some((20, cancel.clone())), ticks.clone());
+    let t = engine
+        .exchange(&decode_get("/bomb"), None, Instant::now(), &cancel, &rec)
+        .await;
+    assert_eq!(t, ferro_http::engine::Terminal::Cancelled);
+    assert_eq!(
+        rec.frames.lock().unwrap().len(),
+        20,
+        "no frame decoded after the stop"
+    );
+}
+
+/// **The decode loop yields between steps.** On a current-thread runtime with an always-ready sink,
+/// a bomb would otherwise hold the thread for a whole network read's worth of inflation (hundreds of
+/// 256 KiB steps); a cooperative task beside it must keep running between frames.
+#[tokio::test(flavor = "current_thread")]
+async fn the_decode_loop_yields_between_steps() {
+    let up = bomb_upstream().await;
+    let engine = engine_with(upstreams(&[("u", up.addr)], &[]), Arc::new(TcpConnect));
+    let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ticker = {
+        let ticks = ticks.clone();
+        tokio::spawn(async move {
+            loop {
+                ticks.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let cancel = CancellationToken::new();
+    let rec = Recorder::new(Some((400, cancel.clone())), ticks.clone());
+    let _ = engine
+        .exchange(&decode_get("/bomb"), None, Instant::now(), &cancel, &rec)
+        .await;
+    ticker.abort();
+    let frames = rec.frames.lock().unwrap();
+    // The longest run of consecutive BODY frames during which the ticker never ran.
+    let mut longest = 0;
+    let mut run = 0;
+    for w in frames.windows(2) {
+        if w[1].2 == w[0].2 {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    assert!(
+        longest <= 2,
+        "{longest} consecutive decode steps with no other task running"
+    );
+}
+
 // =================================================================================================
 // Content decoding (§23.9.2)
 // =================================================================================================

@@ -27,10 +27,16 @@ use ferro_proto::messages::{HttpRequest, Outcome};
 use http_support::*;
 
 const MIB: u64 = 1024 * 1024;
-/// What the engine may add to the resident set while a stalled reader holds a response. The
-/// window is 16 MiB (64 frames of ≤ 256 KiB, or `credit_bytes`), plus `hyper`'s ≤ 512 KiB read
-/// buffer, the decoder's one 256 KiB step, and allocator slack.
-const RSS_BOUND: u64 = 64 * MIB;
+/// What the engine may add to the resident set while a stalled reader holds a PLAIN response: the
+/// window (16 MiB: 64 frames of ≤ 256 KiB, or `credit_bytes`) plus `hyper`'s ≤ 512 KiB read buffer
+/// and allocator slack. Measured: ~5.5 MiB (the frames already went to the client). A read-ahead
+/// producer holds the gigabyte the upstream offers.
+const PLAIN_BOUND: u64 = 32 * MIB;
+/// The same for the decompression bomb: the decoder holds one 256 KiB step and one network read.
+/// Measured: ~0.6 MiB. A decoder that inflates a whole network read before sending (one ~8 KiB read
+/// of this bomb is ~8 MiB of output) measured ~17 MiB — so the bound is tight on purpose: the
+/// bomb's per-read expansion, not the window, is what this case is about.
+const BOMB_BOUND: u64 = 8 * MIB;
 
 fn rss() -> u64 {
     let s = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
@@ -124,9 +130,9 @@ async fn chaos6_rss_is_bounded_by_the_window_for_a_plain_body_and_a_bomb() {
     );
     let mut c = d.client().await;
 
-    for (rid, name, rec, decode) in [
-        (2u32, "plain", &plain.rec, false),
-        (3, "bomb", &bomb.rec, true),
+    for (rid, name, rec, decode, bound) in [
+        (2u32, "plain", &plain.rec, false, PLAIN_BOUND),
+        (3, "bomb", &bomb.rec, true, BOMB_BOUND),
     ] {
         let before = rss();
         send(
@@ -159,7 +165,7 @@ async fn chaos6_rss_is_bounded_by_the_window_for_a_plain_body_and_a_bomb() {
         let grew = after.saturating_sub(before);
         eprintln!(
             "F4b chaos 6 RSS ({name}): {frames} frames / {delivered} B delivered; upstream wrote \
-             {wrote} B and stalled; RSS {before} → {after} (+{grew} B, bound {RSS_BOUND} B)"
+             {wrote} B and stalled; RSS {before} → {after} (+{grew} B, bound {bound} B)"
         );
         assert!(frames <= 64, "{name}: within the window");
         assert!(
@@ -167,8 +173,8 @@ async fn chaos6_rss_is_bounded_by_the_window_for_a_plain_body_and_a_bomb() {
             "{name}: the upstream stalled far short of what it offered"
         );
         assert!(
-            grew < RSS_BOUND,
-            "{name}: resident set grew {grew} B with a stalled reader (bound {RSS_BOUND} B)"
+            grew < bound,
+            "{name}: resident set grew {grew} B with a stalled reader (bound {bound} B)"
         );
         c.cancel(rid).await;
         loop {
