@@ -170,9 +170,10 @@ final class TransportFdTest extends TestCase
      * committed write) would be lost, where the `fread` path would have read it inline.
      *
      * Run in a child PHP process, so lowering `RLIMIT_NOFILE` and filling the fd table cannot
-     * disturb this one. The child fills the table completely, receives a frame with an fd, closes
-     * it (the reserve retakes the slot, so the application still cannot open a file), and receives
-     * a second.
+     * disturb this one. The child fills the table completely, reads an inline frame (which must NOT
+     * free the reserve — a header peek says no fd can ride it), then receives an `OOB_FD` frame with
+     * an fd, closes it (the reserve retakes the slot, so the application still cannot open a file),
+     * and receives a second.
      */
     public function testAProcessAtItsFdLimitStillReceivesTheFd(): void
     {
@@ -190,18 +191,29 @@ final class TransportFdTest extends TestCase
             $sock = socket_import_stream($peer);
             $files = [];
             foreach (['ONE', 'TWO'] as $c) { $f = tmpfile(); fwrite($f, $c); $files[] = $f; }
+            // Loaded now: with the table full the autoloader could not open a class file.
+            class_exists(\Ferro\Protocol\Header::class);
+            class_exists(\Ferro\Protocol\Generated\Constants::class);
+            class_exists(\Ferro\Client\Error\TransportException::class);
             $out = ['reserve_at_connect' => $t->holdsFdReserve()];
             $hold = [];
             while (($h = @fopen('/dev/null', 'r')) !== false) { $hold[] = $h; }
             $out['table_full'] = @fopen('/dev/null', 'r') === false;
+            $C = \Ferro\Protocol\Generated\Constants::class;
+            // An inline frame first: no fd can ride it, so the reserve is not freed for it.
+            fwrite($peer, (new \Ferro\Protocol\Header($C::FLAG_END, 2, 1, 9, 0))->encode());
+            $t->beginFrame();
+            $t->readExact(16);
+            $out['releases_after_inline'] = $t->fdReserveReleases();
             foreach ($files as $i => $f) {
-                socket_sendmsg($sock, ['iov' => [str_pad("frame$i", 16, '.')],
+                $head = (new \Ferro\Protocol\Header($C::FLAG_END | $C::FLAG_OOB_FD, 2, 1, $i + 1, 0))->encode();
+                socket_sendmsg($sock, ['iov' => [$head],
                     'control' => [['level' => SOL_SOCKET, 'type' => SCM_RIGHTS, 'data' => [$f]]]], 0);
                 try {
                     $t->beginFrame();
                     $bytes = $t->readExact(16);
                     $fd = $t->takeFd();
-                    $out["frame$i"] = $bytes . ':' . (is_resource($fd) ? stream_get_contents($fd, -1, 0) : 'NO FD');
+                    $out["frame$i"] = ($bytes === $head ? 'header' : 'WRONG BYTES') . ':' . (is_resource($fd) ? stream_get_contents($fd, -1, 0) : 'NO FD');
                     if (is_resource($fd)) { fclose($fd); $t->fdClosed(); }
                 } catch (\Throwable $e) {
                     $out["frame$i"] = 'ERROR ' . $e->getMessage();
@@ -209,6 +221,7 @@ final class TransportFdTest extends TestCase
                 $out["reserve_after_$i"] = $t->holdsFdReserve();
                 $out["app_can_open_after_$i"] = @fopen('/dev/null', 'r') !== false;
             }
+            $out['releases'] = $t->fdReserveReleases();
             echo json_encode($out);
             PHP;
         $proc = proc_open([PHP_BINARY, '-r', $code, $autoload, $this->path . '.child'], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
@@ -222,12 +235,14 @@ final class TransportFdTest extends TestCase
         $this->assertSame([
             'reserve_at_connect' => true,
             'table_full' => true,
-            'frame0' => 'frame0..........:ONE',
+            'releases_after_inline' => 0,
+            'frame0' => 'header:ONE',
             'reserve_after_0' => true,
             'app_can_open_after_0' => false,
-            'frame1' => 'frame1..........:TWO',
+            'frame1' => 'header:TWO',
             'reserve_after_1' => true,
             'app_can_open_after_1' => false,
+            'releases' => 2,
         ], $out);
     }
 

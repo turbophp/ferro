@@ -3,6 +3,7 @@ declare(strict_types=1);
 namespace Ferro\Client;
 
 use Ferro\Client\Error\TransportException;
+use Ferro\Protocol\Generated\Constants as C;
 
 /**
  * Dependency-free stream transport (charter rule 7): `stream_socket_client` over `unix://`
@@ -64,6 +65,9 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
 
     /** Set by {@see beginFrame}, consumed by the next {@see readExact}. */
     private bool $frameStart = false;
+
+    /** How many reads freed the reserve ({@see fdReserveReleases}). */
+    private int $reserveReleases = 0;
 
     /**
      * Bytes of a frame already read when a read timed out (M3-D1c). The next {@see readExact}
@@ -263,6 +267,48 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
         return $this->reserve !== null;
     }
 
+    /**
+     * How many reads have freed the fd-table reserve. Diagnostic: only a frame that may carry an fd
+     * should, since freeing and retaking it costs about 2 µs.
+     */
+    public function fdReserveReleases(): int
+    {
+        return $this->reserveReleases;
+    }
+
+    /**
+     * Whether the frame at the head of the socket's queue is an `OOB_FD` frame. Its flags (header
+     * bytes 2-3) are read with a blocking `MSG_PEEK` into NO control buffer: the kernel gives a peek
+     * with no room for an fd no fd, so the fd stays queued for the real read (measured). It waits as
+     * a read does, on `SO_RCVTIMEO`, and its timeout is that read's — nothing was consumed. Unsure
+     * (fewer than 4 bytes queued yet, an unexpected error) answers yes: freeing the reserve costs
+     * about 2 µs, a lost fd costs a result. The peek costs about 0.4 µs, so frames that carry no fd —
+     * nearly all — skip the reserve swap.
+     */
+    private function frameMayCarryAnFd(\Socket $socket, int $n): bool
+    {
+        while (true) {
+            $peek = '';
+            socket_clear_error($socket);
+            $got = @socket_recv($socket, $peek, 4, MSG_PEEK);
+            if ($got === false) {
+                $err = socket_last_error($socket);
+                if ($err === SOCKET_EINTR) {
+                    continue;
+                }
+                if ($err === SOCKET_EAGAIN) {
+                    throw TransportException::readTimedOut(sprintf('read timed out after 0 of %d bytes', $n));
+                }
+                return true;
+            }
+            if ($got < 4 || !is_string($peek)) {
+                return true;
+            }
+            $u = unpack('v', $peek, 2);
+            return !is_array($u) || !is_int($u[1] ?? null) || ($u[1] & C::FLAG_OOB_FD) !== 0;
+        }
+    }
+
     public function beginFrame(): void
     {
         $this->frameStart = true;
@@ -304,9 +350,10 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
         if ($fdSocket !== null) {
             // A frame's first byte is the only byte an fd rides; a read resuming a frame already
             // has it (and its fd).
-            if (!$frameStart || $buf !== '') {
+            if (!$frameStart || $buf !== '' || !$this->frameMayCarryAnFd($fdSocket, $n)) {
                 return $this->recvExact($fdSocket, $buf, $n);
             }
+            $this->reserveReleases++;
             $this->releaseReserve();
             try {
                 return $this->recvExact($fdSocket, $buf, $n);
