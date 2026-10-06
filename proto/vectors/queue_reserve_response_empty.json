@@ -1,0 +1,18 @@
+{
+  "frame_hex": "f7040200070002004a0000000c0000009200929092cc96ce000111eb",
+  "header": {
+    "flags": 2,
+    "method": 2,
+    "request_id": 74,
+    "service": 7
+  },
+  "message": {
+    "jobs": [],
+    "stats": [
+      150,
+      70123
+    ],
+    "status": 0
+  },
+  "name": "queue_reserve_response_empty"
+}

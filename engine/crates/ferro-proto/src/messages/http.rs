@@ -351,7 +351,7 @@ impl HttpDone {
 
 // --- shared helpers (one rule each, mirrored byte for byte in the PHP codec) ---
 
-fn expect_arity(rd: &mut &[u8], what: &str, want: u32) -> Result<(), CodecError> {
+pub(crate) fn expect_arity(rd: &mut &[u8], what: &str, want: u32) -> Result<(), CodecError> {
     let n = dec::read_array_len(rd)
         .map_err(|e| CodecError::Malformed(format!("{what} array: {e:?}")))?;
     if n != want {
@@ -360,7 +360,7 @@ fn expect_arity(rd: &mut &[u8], what: &str, want: u32) -> Result<(), CodecError>
     Ok(())
 }
 
-fn expect_end(rd: &[u8]) -> Result<(), CodecError> {
+pub(crate) fn expect_end(rd: &[u8]) -> Result<(), CodecError> {
     if rd.is_empty() {
         Ok(())
     } else {
@@ -391,7 +391,7 @@ fn read_headers(rd: &mut &[u8]) -> Result<Vec<HttpHeaderField>, CodecError> {
     Ok(headers)
 }
 
-fn write_opt_bin(out: &mut Vec<u8>, v: &Option<Vec<u8>>) {
+pub(crate) fn write_opt_bin(out: &mut Vec<u8>, v: &Option<Vec<u8>>) {
     match v {
         None => enc::write_nil(out).unwrap(),
         Some(b) => {
@@ -400,7 +400,7 @@ fn write_opt_bin(out: &mut Vec<u8>, v: &Option<Vec<u8>>) {
     }
 }
 
-fn read_opt_bin(rd: &mut &[u8]) -> Result<Option<Vec<u8>>, CodecError> {
+pub(crate) fn read_opt_bin(rd: &mut &[u8]) -> Result<Option<Vec<u8>>, CodecError> {
     if peek_nil(rd)? {
         return Ok(None);
     }

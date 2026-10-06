@@ -15,6 +15,9 @@ ferro-proto = { path = "../ferro-proto" }
 ferro-pool = { path = "../ferro-pool" }
 ferro-classify = { path = "../ferro-classify" }
 ferro-manifest = { path = "../ferro-manifest" }
+# SPEC §24 (M7-G1a): Ferro Queue's pure core — store configuration, encodings, version gate,
+# shape checks. Not behind a feature: the queue takes no engine feature bit (§24.4).
+ferro-queue = { path = "../ferro-queue" }
 ferro-backend-pg = { path = "../ferro-backend-pg" }
 ferro-backend-mysql = { path = "../ferro-backend-mysql" }
 ferro-backend-sqlite = { path = "../ferro-backend-sqlite" }

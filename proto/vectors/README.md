@@ -7,9 +7,13 @@ bytes — neither language's test suite is the source of truth; these files are.
 ## Layout
 
 - `*.json` — positive vectors: one complete, valid frame per case, covering the CORE messages, the
-  `ERROR`/`Outcome` envelopes, and the SQL / TX / STREAM / ADMIN / HTTP services. The authoritative
+  `ERROR`/`Outcome` envelopes, and the SQL / TX / STREAM / ADMIN / HTTP / QUEUE services. The authoritative
   index (what each vector locks and why) is `/proto/PROTOCOL.md` §7, with the per-service tables at
-  §8.3, §9.6, §10.3, §11.3 and §12.5 — deliberately not duplicated here, and deliberately not a file count, which drifts.
+  §8.3, §9.6, §10.3, §11.3, §12.5, §13.4 and §14.4 — deliberately not duplicated here, and deliberately not a file count, which drifts.
+- `refusal/*.json` — message-level refusal vectors (M7-G1a, QUEUE): a frame whose header is valid and
+  whose payload is well-formed EXCEPT one field out of its shape bound. JSON
+  `{name, header, field, len, frame_hex}`; both codecs must refuse each, naming the field and the
+  length. Index: `/proto/PROTOCOL.md` §14.4.
 - `negative/*.bin` — malformed frame seeds that a conformant decoder MUST reject (4 files:
   `bad_magic`, `bad_version`, `oversize_len`, `reserved_flag`). These are raw bytes only (no
   JSON sidecar) since there is no canonical decoded form to assert — the point is rejection.

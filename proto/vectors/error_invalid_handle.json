@@ -1,0 +1,22 @@
+{
+  "frame_hex": "f7040200070003005600000043000000920197cd301103c0c0d93673746f7265206a6f62732063616e6e6f74206465636f64652074686973206a6f625f69643b206e6f7468696e67207761732073656e74c0c0",
+  "header": {
+    "flags": 2,
+    "method": 3,
+    "request_id": 86,
+    "service": 7
+  },
+  "message": {
+    "error": {
+      "branch": 3,
+      "code": 12305,
+      "detail": null,
+      "errno": null,
+      "message": "store jobs cannot decode this job_id; nothing was sent",
+      "retry_after_ms": null,
+      "sqlstate": null
+    },
+    "status": 1
+  },
+  "name": "error_invalid_handle"
+}

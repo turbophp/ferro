@@ -1,0 +1,19 @@
+{
+  "frame_hex": "f704000007000600520000001200000093a46a6f6273a764656661756c7493c0c0c0",
+  "header": {
+    "flags": 0,
+    "method": 6,
+    "request_id": 82,
+    "service": 7
+  },
+  "message": {
+    "common": [
+      null,
+      null,
+      null
+    ],
+    "queue": "default",
+    "store": "jobs"
+  },
+  "name": "queue_size_request"
+}

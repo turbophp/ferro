@@ -1,0 +1,18 @@
+{
+  "frame_hex": "f7040200070007005300000010000000920092ce0001117092cc96ce000111eb",
+  "header": {
+    "flags": 2,
+    "method": 7,
+    "request_id": 83,
+    "service": 7
+  },
+  "message": {
+    "deleted": 70000,
+    "stats": [
+      150,
+      70123
+    ],
+    "status": 0
+  },
+  "name": "queue_clear_response"
+}

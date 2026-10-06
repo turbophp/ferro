@@ -474,6 +474,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferro-queue"
+version = "0.0.0"
+dependencies = [
+ "ferro-proto",
+ "serde_json",
+]
+
+[[package]]
 name = "ferro-sqlite-spike"
 version = "0.0.0"
 dependencies = [
@@ -496,6 +504,7 @@ dependencies = [
  "ferro-manifest",
  "ferro-pool",
  "ferro-proto",
+ "ferro-queue",
  "flate2",
  "futures",
  "getrandom 0.2.17",

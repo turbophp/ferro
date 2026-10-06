@@ -1,8 +1,8 @@
 //! Emit deterministic golden vectors: for each case, build the full frame (header+payload),
 //! and write {name, header, message(json), frame_hex}. Also emit malformed negative .bin seeds.
 use ferro_proto::consts::{
-    self, flags, method_admin, method_core, method_http, method_sql, method_stream, method_tx,
-    service,
+    self, flags, method_admin, method_core, method_http, method_queue, method_sql, method_stream,
+    method_tx, service,
 };
 use ferro_proto::header::Header;
 use ferro_proto::messages::*;
@@ -1051,6 +1051,7 @@ fn main() {
     );
 
     http_vectors();
+    queue_vectors();
 
     // Negative seeds (decoder must reject; also fuzz corpus).
     let mut bad_magic = frame(
@@ -1401,4 +1402,746 @@ fn http_vectors() {
             None,
         ),
     );
+}
+
+// --- QUEUE service vectors (M7-G1a; SPEC §24.4, /proto/PROTOCOL.md §14). `bin` fields (every
+// `job_id`, `new_job_id` and `token`) ride the vector JSON as lowercase hex under a `_hex` key, so a
+// non-UTF-8 byte survives JSON (the `copy_data` precedent). The `queue_` name prefix is MANDATORY:
+// PHP's byte-lock provider `VectorConformanceTest::queueVectors()` keys on it. Each handle appears at
+// its `sql`-kind size AND at the registry maximum (QUEUE_HANDLE_MAX_BYTES), per SPEC §24.4; the
+// refusal vectors at 0 and max + 1 bytes live in `refusal/` (written by `queue_refusal_vectors`). ---
+
+/// The `sql` kind's 8-byte token for `(created_at, attempts)`: `created_at`'s low 32 bits above
+/// `attempts`' 16, big-endian, top two bytes zero (SPEC §24.3). The layout is `ferro-queue`'s
+/// (`sql::Token`); its own test asserts it mints exactly the bytes these vectors carry.
+fn sql_token(created_at: i64, attempts: u16) -> Vec<u8> {
+    (((created_at as u32 as u64) << 16) | u64::from(attempts))
+        .to_be_bytes()
+        .to_vec()
+}
+
+/// A handle of the registry's maximum length whose bytes are not UTF-8 and include `0xc0` (the nil
+/// marker), so neither a `str` reading nor a `nil` peek could pass it by accident.
+fn max_handle(seed: u8) -> Vec<u8> {
+    (0..consts::QUEUE_HANDLE_MAX_BYTES as usize)
+        .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed) | 0x80)
+        .collect()
+}
+
+fn opt_hex(b: &Option<Vec<u8>>) -> serde_json::Value {
+    b.as_deref()
+        .map_or(serde_json::Value::Null, |b| serde_json::json!(hex(b)))
+}
+fn common_json(c: &QueueCommon) -> serde_json::Value {
+    serde_json::json!([c.tx_id, c.timeout_ms, c.traceparent])
+}
+fn qstats_json(s: &QueueStats) -> serde_json::Value {
+    serde_json::json!([s.queue_us, s.exec_us])
+}
+
+fn write_queue_request(
+    name: &str,
+    method: u16,
+    req_id: u32,
+    payload: Vec<u8>,
+    json: serde_json::Value,
+) {
+    write_case(name, 0, service::QUEUE, method, req_id, payload, json);
+}
+
+/// A success terminal: `Outcome::Ok(body)` on the request's own `QUEUE`/method header with `END`.
+/// The JSON carries the body's fields plus the Outcome `status`.
+fn write_queue_ok(
+    name: &str,
+    method: u16,
+    req_id: u32,
+    body: Vec<u8>,
+    mut json: serde_json::Value,
+) {
+    json["status"] = serde_json::json!(consts::outcome::OK);
+    write_case(
+        name,
+        flags::END,
+        service::QUEUE,
+        method,
+        req_id,
+        Outcome::Ok(body).encode(),
+        json,
+    );
+}
+
+fn write_queue_error(name: &str, method: u16, req_id: u32, code: u16, branch: u8, message: &str) {
+    let ep = ErrorPayload {
+        code,
+        branch,
+        sqlstate: None,
+        errno: None,
+        message: message.into(),
+        detail: None,
+        retry_after_ms: None,
+    };
+    let json = serde_json::json!({ "status": consts::outcome::ERROR, "error": {
+        "code": ep.code, "branch": ep.branch, "sqlstate": ep.sqlstate, "errno": ep.errno,
+        "message": ep.message, "detail": ep.detail, "retry_after_ms": ep.retry_after_ms } });
+    write_case(
+        name,
+        flags::END,
+        service::QUEUE,
+        method,
+        req_id,
+        Outcome::Error(ep).encode(),
+        json,
+    );
+}
+
+fn fenced_json(r: &FencedRequest) -> serde_json::Value {
+    serde_json::json!({
+        "store": r.store, "job_id_hex": hex(&r.job_id), "token_hex": hex(&r.token),
+        "common": common_json(&r.common),
+    })
+}
+fn release_json(r: &ReleaseRequest) -> serde_json::Value {
+    serde_json::json!({
+        "store": r.store, "job_id_hex": hex(&r.job_id), "token_hex": hex(&r.token),
+        "delay_s": r.delay_s, "common": common_json(&r.common),
+    })
+}
+fn reserve_response_json(r: &ReserveResponse) -> serde_json::Value {
+    let jobs: Vec<serde_json::Value> = r
+        .jobs
+        .iter()
+        .map(|j| {
+            serde_json::json!([
+                hex(&j.job_id),
+                hex(&j.token),
+                j.attempts,
+                j.queue,
+                j.payload,
+                j.created_at,
+                j.lease_deadline
+            ])
+        })
+        .collect();
+    serde_json::json!({ "jobs": jobs, "stats": qstats_json(&r.stats) })
+}
+
+fn queue_vectors() {
+    use consts::{ack_outcome, errc};
+    let traced = QueueCommon {
+        tx_id: Some(5_000_000_000),
+        timeout_ms: Some(70_000),
+        traceparent: Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".into()),
+    };
+    let plain = QueueCommon::default();
+    let stats = QueueStats {
+        queue_us: 150,
+        exec_us: 70_123,
+    };
+
+    // ENQUEUE: one job with a dedup key and every `common` field set (a tx_id past u32), so each
+    // non-nil arm of `common` is locked; and a two-job batch with every optional field nil.
+    let enq = EnqueueRequest {
+        store: "jobs".into(),
+        jobs: vec![EnqueueJob {
+            queue: "emails".into(),
+            payload: "{\"uuid\":\"7e1c\",\"job\":\"SendWelcome\"}".into(),
+            delay_s: 0,
+        }],
+        dedup_key: Some("welcome:42".into()),
+        common: traced.clone(),
+    };
+    let enq_json = |r: &EnqueueRequest| {
+        let jobs: Vec<serde_json::Value> = r
+            .jobs
+            .iter()
+            .map(|j| serde_json::json!([j.queue, j.payload, j.delay_s]))
+            .collect();
+        serde_json::json!({ "store": r.store, "jobs": jobs, "dedup_key": r.dedup_key,
+                            "common": common_json(&r.common) })
+    };
+    write_queue_request(
+        "queue_enqueue_request",
+        method_queue::ENQUEUE,
+        70,
+        enq.encode(),
+        enq_json(&enq),
+    );
+    let batch = EnqueueRequest {
+        store: "jobs".into(),
+        jobs: vec![
+            EnqueueJob {
+                queue: "default".into(),
+                payload: "{}".into(),
+                delay_s: 0,
+            },
+            EnqueueJob {
+                queue: "default".into(),
+                payload: "é — a multi-byte payload".into(),
+                delay_s: 70_000,
+            },
+        ],
+        dedup_key: None,
+        common: plain.clone(),
+    };
+    write_queue_request(
+        "queue_enqueue_request_batch",
+        method_queue::ENQUEUE,
+        71,
+        batch.encode(),
+        enq_json(&batch),
+    );
+    // The count bounds INCLUSIVE (review M3: without a positive control at the maximum, a decoder that
+    // made the upper bound exclusive, or used another shape's bound, passed every other vector).
+    let max_batch = EnqueueRequest {
+        store: "jobs".into(),
+        jobs: (0..consts::QUEUE_ENQUEUE_MAX_JOBS)
+            .map(|i| EnqueueJob {
+                queue: "default".into(),
+                payload: format!("{{\"n\":{i}}}"),
+                delay_s: i,
+            })
+            .collect(),
+        dedup_key: None,
+        common: plain.clone(),
+    };
+    write_queue_request(
+        "queue_enqueue_request_max_jobs",
+        method_queue::ENQUEUE,
+        88,
+        max_batch.encode(),
+        enq_json(&max_batch),
+    );
+    let enq_resp_json = |r: &EnqueueResponse| {
+        serde_json::json!({ "job_id_hex": opt_hex(&r.job_id), "inserted": r.inserted,
+                            "deduplicated": r.deduplicated, "stats": qstats_json(&r.stats) })
+    };
+    for (name, req_id, r) in [
+        (
+            "queue_enqueue_response",
+            70,
+            // A dedup REPLAY (SPEC §24.6): the original `job_id`, nothing inserted. (Review L5: the
+            // first version said `inserted: 1` beside `deduplicated: true`, which no engine sends.)
+            EnqueueResponse {
+                job_id: Some(b"9223372036854775807".to_vec()),
+                inserted: 0,
+                deduplicated: true,
+                stats,
+            },
+        ),
+        (
+            "queue_enqueue_response_max",
+            72,
+            EnqueueResponse {
+                job_id: Some(max_handle(1)),
+                inserted: 1,
+                deduplicated: false,
+                stats,
+            },
+        ),
+        (
+            "queue_enqueue_response_batch",
+            71,
+            EnqueueResponse {
+                job_id: None,
+                inserted: 1000,
+                deduplicated: false,
+                stats,
+            },
+        ),
+    ] {
+        write_queue_ok(
+            name,
+            method_queue::ENQUEUE,
+            req_id,
+            r.encode(),
+            enq_resp_json(&r),
+        );
+    }
+
+    // RESERVE: two queues in priority order, a max_jobs past u8 and a wait_ms past u16.
+    let res = ReserveRequest {
+        store: "jobs".into(),
+        queues: vec!["high".into(), "default".into()],
+        max_jobs: 300,
+        wait_ms: 70_000,
+        liveness: false,
+        common: plain.clone(),
+    };
+    write_queue_request(
+        "queue_reserve_request",
+        method_queue::RESERVE,
+        73,
+        res.encode(),
+        serde_json::json!({ "store": res.store, "queues": res.queues, "max_jobs": res.max_jobs,
+                            "wait_ms": res.wait_ms, "liveness": res.liveness,
+                            "common": common_json(&res.common) }),
+    );
+    let max_queues = ReserveRequest {
+        store: "jobs".into(),
+        queues: (0..consts::QUEUE_RESERVE_MAX_QUEUES)
+            .map(|i| format!("q{i}"))
+            .collect(),
+        max_jobs: 1,
+        wait_ms: 0,
+        liveness: false,
+        common: plain.clone(),
+    };
+    write_queue_request(
+        "queue_reserve_request_max_queues",
+        method_queue::RESERVE,
+        89,
+        max_queues.encode(),
+        serde_json::json!({ "store": max_queues.store, "queues": max_queues.queues,
+                            "max_jobs": max_queues.max_jobs, "wait_ms": max_queues.wait_ms,
+                            "liveness": max_queues.liveness,
+                            "common": common_json(&max_queues.common) }),
+    );
+    // Two jobs: one at the `sql` kind's sizes (the largest canonical id, an 8-byte token), one at the
+    // registry maximum for both handles. Times past u32 would not be PG `integer`s, but the WIRE is
+    // `i64`, so the second job carries a negative `created_at` to lock the signed ladder.
+    let rr = ReserveResponse {
+        jobs: vec![
+            ReservedJob {
+                job_id: b"9223372036854775807".to_vec(),
+                token: sql_token(1_790_000_000, 3),
+                attempts: 3,
+                queue: "high".into(),
+                payload: "{\"job\":\"A\"}".into(),
+                created_at: 1_790_000_000,
+                lease_deadline: 1_790_000_091,
+            },
+            ReservedJob {
+                job_id: max_handle(2),
+                token: max_handle(3),
+                attempts: 70_000,
+                queue: "default".into(),
+                payload: "".into(),
+                created_at: -1,
+                lease_deadline: 5_000_000_000,
+            },
+        ],
+        stats,
+    };
+    write_queue_ok(
+        "queue_reserve_response",
+        method_queue::RESERVE,
+        73,
+        rr.encode(),
+        reserve_response_json(&rr),
+    );
+    let empty = ReserveResponse {
+        jobs: vec![],
+        stats,
+    };
+    write_queue_ok(
+        "queue_reserve_response_empty",
+        method_queue::RESERVE,
+        74,
+        empty.encode(),
+        reserve_response_json(&empty),
+    );
+
+    // ACK / EXTEND (one shape) and RELEASE: each at the `sql` sizes and at the maximum.
+    let sql_fenced = FencedRequest {
+        store: "jobs".into(),
+        job_id: b"42".to_vec(),
+        token: sql_token(1_790_000_000, 1),
+        common: plain.clone(),
+    };
+    let max_fenced = FencedRequest {
+        store: "jobs".into(),
+        job_id: max_handle(4),
+        token: max_handle(5),
+        common: traced.clone(),
+    };
+    write_queue_request(
+        "queue_ack_request",
+        method_queue::ACK,
+        75,
+        sql_fenced.encode(),
+        fenced_json(&sql_fenced),
+    );
+    write_queue_request(
+        "queue_ack_request_max",
+        method_queue::ACK,
+        76,
+        max_fenced.encode(),
+        fenced_json(&max_fenced),
+    );
+    write_queue_request(
+        "queue_extend_request",
+        method_queue::EXTEND,
+        77,
+        sql_fenced.encode(),
+        fenced_json(&sql_fenced),
+    );
+    write_queue_request(
+        "queue_extend_request_max",
+        method_queue::EXTEND,
+        78,
+        max_fenced.encode(),
+        fenced_json(&max_fenced),
+    );
+    for (name, req_id, outcome) in [
+        ("queue_ack_response", 75, ack_outcome::ACKED),
+        ("queue_ack_response_gone", 76, ack_outcome::GONE),
+    ] {
+        let a = AckResponse { outcome, stats };
+        write_queue_ok(
+            name,
+            method_queue::ACK,
+            req_id,
+            a.encode(),
+            serde_json::json!({ "outcome": a.outcome, "stats": qstats_json(&a.stats) }),
+        );
+    }
+    let ext = ExtendResponse {
+        lease_deadline: 1_790_000_182,
+        stats,
+    };
+    write_queue_ok(
+        "queue_extend_response",
+        method_queue::EXTEND,
+        77,
+        ext.encode(),
+        serde_json::json!({ "lease_deadline": ext.lease_deadline, "stats": qstats_json(&ext.stats) }),
+    );
+    let sql_release = ReleaseRequest {
+        store: "jobs".into(),
+        job_id: b"42".to_vec(),
+        token: sql_token(1_790_000_000, 1),
+        delay_s: 30,
+        common: plain.clone(),
+    };
+    let max_release = ReleaseRequest {
+        store: "jobs".into(),
+        job_id: max_handle(6),
+        token: max_handle(7),
+        delay_s: 70_000,
+        common: traced.clone(),
+    };
+    write_queue_request(
+        "queue_release_request",
+        method_queue::RELEASE,
+        79,
+        sql_release.encode(),
+        release_json(&sql_release),
+    );
+    write_queue_request(
+        "queue_release_request_max",
+        method_queue::RELEASE,
+        80,
+        max_release.encode(),
+        release_json(&max_release),
+    );
+    for (name, req_id, new_job_id) in [
+        ("queue_release_response", 79, Some(b"43".to_vec())),
+        ("queue_release_response_max", 80, Some(max_handle(8))),
+        ("queue_release_response_gone", 81, None),
+    ] {
+        let r = ReleaseResponse { new_job_id, stats };
+        write_queue_ok(
+            name,
+            method_queue::RELEASE,
+            req_id,
+            r.encode(),
+            serde_json::json!({ "new_job_id_hex": opt_hex(&r.new_job_id), "stats": qstats_json(&r.stats) }),
+        );
+    }
+
+    // SIZE / CLEAR (one request shape).
+    for (name, method, req_id, common) in [
+        ("queue_size_request", method_queue::SIZE, 82, plain.clone()),
+        (
+            "queue_clear_request",
+            method_queue::CLEAR,
+            83,
+            traced.clone(),
+        ),
+    ] {
+        let r = QueueScopeRequest {
+            store: "jobs".into(),
+            queue: "default".into(),
+            common,
+        };
+        write_queue_request(
+            name,
+            method,
+            req_id,
+            r.encode(),
+            serde_json::json!({ "store": r.store, "queue": r.queue, "common": common_json(&r.common) }),
+        );
+    }
+    // `oldest_pending_at` set (a value past u16, so the int ladder is locked) and `nil` (nothing pending).
+    for (name, req_id, size) in [
+        (
+            "queue_size_response",
+            82,
+            SizeResponse {
+                pending: 7,
+                delayed: 300,
+                reserved: 5_000_000_000,
+                oldest_pending_at: Some(1_790_000_000),
+                stats,
+            },
+        ),
+        (
+            "queue_size_response_empty",
+            87,
+            SizeResponse {
+                pending: 0,
+                delayed: 300,
+                reserved: 0,
+                oldest_pending_at: None,
+                stats,
+            },
+        ),
+    ] {
+        write_queue_ok(
+            name,
+            method_queue::SIZE,
+            req_id,
+            size.encode(),
+            serde_json::json!({ "pending": size.pending, "delayed": size.delayed,
+                                "reserved": size.reserved,
+                                "oldest_pending_at": size.oldest_pending_at,
+                                "stats": qstats_json(&size.stats) }),
+        );
+    }
+    let clear = ClearResponse {
+        deleted: 70_000,
+        stats,
+    };
+    write_queue_ok(
+        "queue_clear_response",
+        method_queue::CLEAR,
+        83,
+        clear.encode(),
+        serde_json::json!({ "deleted": clear.deleted, "stats": qstats_json(&clear.stats) }),
+    );
+
+    // The three QUEUE codes, each on the request's own QUEUE/method header (handler-built).
+    write_queue_error(
+        "error_lease_lost",
+        method_queue::ACK,
+        84,
+        errc::LEASE_LOST,
+        errc::LEASE_LOST_BRANCH,
+        "the token names no current reservation of this job; nothing was done",
+    );
+    write_queue_error(
+        "error_pool_mismatch",
+        method_queue::ENQUEUE,
+        85,
+        errc::POOL_MISMATCH,
+        errc::POOL_MISMATCH_BRANCH,
+        "store jobs is not on the transaction's pool; nothing was sent",
+    );
+    write_queue_error(
+        "error_invalid_handle",
+        method_queue::ACK,
+        86,
+        errc::INVALID_HANDLE,
+        errc::INVALID_HANDLE_BRANCH,
+        "store jobs cannot decode this job_id; nothing was sent",
+    );
+
+    queue_refusal_vectors(&sql_fenced, &sql_release, &rr);
+}
+
+/// One refusal vector: a frame whose header is valid and whose payload is a well-formed message
+/// EXCEPT the one field named, which is out of the shape's bounds. Both codecs must refuse it.
+fn write_refusal(name: &str, flags_: u16, method: u16, payload: Vec<u8>, field: &str, len: usize) {
+    let frame = frame(flags_, service::QUEUE, method, 90, payload);
+    let v = serde_json::json!({
+        "name": name,
+        "header": { "flags": flags_, "service": service::QUEUE, "method": method, "request_id": 90 },
+        "field": field,
+        "len": len,
+        "frame_hex": hex(&frame),
+    });
+    let out = dir().join("refusal").join(format!("{name}.json"));
+    std::fs::write(out, serde_json::to_string_pretty(&v).unwrap() + "\n").unwrap();
+}
+
+/// Replace the `bin` written for `marker` in `valid` with a `bin` of `len` bytes.
+fn splice_bin(valid: &[u8], marker: &[u8], len: usize) -> Vec<u8> {
+    let mut needle = Vec::new();
+    rmp::encode::write_bin(&mut needle, marker).unwrap();
+    let at = valid
+        .windows(needle.len())
+        .position(|w| w == needle.as_slice())
+        .expect("marker present exactly where it was written");
+    assert_eq!(
+        valid
+            .windows(needle.len())
+            .filter(|w| *w == needle.as_slice())
+            .count(),
+        1,
+        "marker must be unique"
+    );
+    let mut bad = Vec::new();
+    rmp::encode::write_bin(&mut bad, &vec![0x5a; len]).unwrap();
+    let mut out = valid[..at].to_vec();
+    out.extend_from_slice(&bad);
+    out.extend_from_slice(&valid[at + needle.len()..]);
+    out
+}
+
+/// SPEC §24.3's G1 prerequisite (b): every opaque position gets a refusal vector at 0 bytes and at
+/// QUEUE_HANDLE_MAX_BYTES + 1 — and so do the two count bounds (§24.4's `1..=1000` jobs and
+/// `1..=16` queues), which are receiver-enforced shape bounds too.
+fn queue_refusal_vectors(fenced: &FencedRequest, release: &ReleaseRequest, rr: &ReserveResponse) {
+    std::fs::create_dir_all(dir().join("refusal")).unwrap();
+    let m = b"\x01REFUSE".to_vec();
+    let over = consts::QUEUE_HANDLE_MAX_BYTES as usize + 1;
+    for len in [0, over] {
+        let tag = if len == 0 {
+            "0".to_string()
+        } else {
+            over.to_string()
+        };
+        let ok = |body: Vec<u8>| Outcome::Ok(body).encode();
+
+        let enq = EnqueueResponse {
+            job_id: Some(m.clone()),
+            inserted: 1,
+            deduplicated: false,
+            stats: QueueStats::default(),
+        };
+        write_refusal(
+            &format!("queue_enqueue_response_job_id_{tag}"),
+            flags::END,
+            method_queue::ENQUEUE,
+            splice_bin(&ok(enq.encode()), &m, len),
+            "job_id",
+            len,
+        );
+
+        let mut r = rr.clone();
+        r.jobs.truncate(1);
+        r.jobs[0].job_id = m.clone();
+        write_refusal(
+            &format!("queue_reserve_response_job_id_{tag}"),
+            flags::END,
+            method_queue::RESERVE,
+            splice_bin(&ok(r.encode()), &m, len),
+            "job_id",
+            len,
+        );
+        let mut r = rr.clone();
+        r.jobs.truncate(1);
+        r.jobs[0].token = m.clone();
+        write_refusal(
+            &format!("queue_reserve_response_token_{tag}"),
+            flags::END,
+            method_queue::RESERVE,
+            splice_bin(&ok(r.encode()), &m, len),
+            "token",
+            len,
+        );
+
+        for (verb, method) in [("ack", method_queue::ACK), ("extend", method_queue::EXTEND)] {
+            let mut f = fenced.clone();
+            f.job_id = m.clone();
+            write_refusal(
+                &format!("queue_{verb}_request_job_id_{tag}"),
+                0,
+                method,
+                splice_bin(&f.encode(), &m, len),
+                "job_id",
+                len,
+            );
+            let mut f = fenced.clone();
+            f.token = m.clone();
+            write_refusal(
+                &format!("queue_{verb}_request_token_{tag}"),
+                0,
+                method,
+                splice_bin(&f.encode(), &m, len),
+                "token",
+                len,
+            );
+        }
+        let mut rq = release.clone();
+        rq.job_id = m.clone();
+        write_refusal(
+            &format!("queue_release_request_job_id_{tag}"),
+            0,
+            method_queue::RELEASE,
+            splice_bin(&rq.encode(), &m, len),
+            "job_id",
+            len,
+        );
+        let mut rq = release.clone();
+        rq.token = m.clone();
+        write_refusal(
+            &format!("queue_release_request_token_{tag}"),
+            0,
+            method_queue::RELEASE,
+            splice_bin(&rq.encode(), &m, len),
+            "token",
+            len,
+        );
+
+        let rel = ReleaseResponse {
+            new_job_id: Some(m.clone()),
+            stats: QueueStats::default(),
+        };
+        write_refusal(
+            &format!("queue_release_response_new_job_id_{tag}"),
+            flags::END,
+            method_queue::RELEASE,
+            splice_bin(&ok(rel.encode()), &m, len),
+            "new_job_id",
+            len,
+        );
+    }
+
+    // The count bounds, written field by field (the encoders' debug asserts refuse to build them).
+    let max_jobs = consts::QUEUE_ENQUEUE_MAX_JOBS as usize;
+    for n in [0, max_jobs + 1] {
+        let mut out = Vec::new();
+        rmp::encode::write_array_len(&mut out, EnqueueRequest::ARITY).unwrap();
+        rmp::encode::write_str(&mut out, "jobs").unwrap();
+        rmp::encode::write_array_len(&mut out, n as u32).unwrap();
+        for _ in 0..n {
+            rmp::encode::write_array_len(&mut out, 3).unwrap();
+            rmp::encode::write_str(&mut out, "q").unwrap();
+            rmp::encode::write_str(&mut out, "{}").unwrap();
+            rmp::encode::write_uint(&mut out, 0).unwrap();
+        }
+        rmp::encode::write_nil(&mut out).unwrap();
+        out.extend_from_slice(&[0x93, 0xc0, 0xc0, 0xc0]); // common = [nil, nil, nil]
+        write_refusal(
+            &format!("queue_enqueue_request_jobs_{n}"),
+            0,
+            method_queue::ENQUEUE,
+            out,
+            "jobs",
+            n,
+        );
+    }
+    let max_queues = consts::QUEUE_RESERVE_MAX_QUEUES as usize;
+    for n in [0, max_queues + 1] {
+        let mut out = Vec::new();
+        rmp::encode::write_array_len(&mut out, ReserveRequest::ARITY).unwrap();
+        rmp::encode::write_str(&mut out, "jobs").unwrap();
+        rmp::encode::write_array_len(&mut out, n as u32).unwrap();
+        for i in 0..n {
+            rmp::encode::write_str(&mut out, &format!("q{i}")).unwrap();
+        }
+        rmp::encode::write_uint(&mut out, 1).unwrap();
+        rmp::encode::write_uint(&mut out, 0).unwrap();
+        rmp::encode::write_bool(&mut out, false).unwrap();
+        out.extend_from_slice(&[0x93, 0xc0, 0xc0, 0xc0]);
+        write_refusal(
+            &format!("queue_reserve_request_queues_{n}"),
+            0,
+            method_queue::RESERVE,
+            out,
+            "queues",
+            n,
+        );
+    }
 }

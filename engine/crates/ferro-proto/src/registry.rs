@@ -11,6 +11,16 @@ pub struct Registry {
     pub max_frame_payload: u32,
     pub default_credit_frames: u32,
     pub default_credit_bytes: u32,
+    /// Ferro Queue (SPEC §24.4, M7-G1a): a parked RESERVE's terminal is handed to its writer no
+    /// later than `wait_ms` plus this (§24.8).
+    pub queue_wait_grace_ms: u32,
+    /// Ferro Queue shape bounds both decoders enforce (`/proto/PROTOCOL.md` §14): a `job_id`,
+    /// `new_job_id` or `token` is a `bin` of 1 to this many bytes (SPEC D22 (b), D24).
+    pub queue_handle_max_bytes: u32,
+    /// An ENQUEUE carries 1 to this many jobs.
+    pub queue_enqueue_max_jobs: u32,
+    /// A RESERVE names 1 to this many queues.
+    pub queue_reserve_max_queues: u32,
     pub flags: BTreeMap<String, u16>,
     pub services: BTreeMap<String, u16>,
     pub methods: BTreeMap<String, BTreeMap<String, u16>>,
@@ -18,6 +28,8 @@ pub struct Registry {
     pub outcome: BTreeMap<String, u8>,
     /// What an `OOB_FD` frame's passed memfd holds (M3-D3, `/proto/PROTOCOL.md` §1.1).
     pub oob_encoding: BTreeMap<String, u8>,
+    /// Ferro Queue ACK's `outcome` values (M7-G1a, `/proto/PROTOCOL.md` §14).
+    pub ack_outcome: BTreeMap<String, u8>,
     /// The tags the canonical WIRE CODEC carries, SORTED — a codec/wire scope, NOT a per-engine
     /// availability claim (a listed tag is one both codecs can move, not one every backend can
     /// produce; the per-engine matrix is SPEC §22.2). Part of the hashed lock: changing this set
@@ -59,12 +71,17 @@ struct MethodsToml {
     max_frame_payload: u32,
     default_credit_frames: u32,
     default_credit_bytes: u32,
+    queue_wait_grace_ms: u32,
+    queue_handle_max_bytes: u32,
+    queue_enqueue_max_jobs: u32,
+    queue_reserve_max_queues: u32,
     flags: BTreeMap<String, u16>,
     services: BTreeMap<String, u16>,
     methods: BTreeMap<String, BTreeMap<String, u16>>,
     features: BTreeMap<String, BTreeMap<String, u16>>,
     outcome: BTreeMap<String, u8>,
     oob_encoding: BTreeMap<String, u8>,
+    ack_outcome: BTreeMap<String, u8>,
 }
 #[derive(Deserialize)]
 struct TypesToml {
@@ -101,12 +118,17 @@ impl Registry {
             max_frame_payload: m.max_frame_payload,
             default_credit_frames: m.default_credit_frames,
             default_credit_bytes: m.default_credit_bytes,
+            queue_wait_grace_ms: m.queue_wait_grace_ms,
+            queue_handle_max_bytes: m.queue_handle_max_bytes,
+            queue_enqueue_max_jobs: m.queue_enqueue_max_jobs,
+            queue_reserve_max_queues: m.queue_reserve_max_queues,
             flags: m.flags,
             services: m.services,
             methods: m.methods,
             features: m.features,
             outcome: m.outcome,
             oob_encoding: m.oob_encoding,
+            ack_outcome: m.ack_outcome,
             implemented,
             tags: t.tags,
             branches: e.branches,

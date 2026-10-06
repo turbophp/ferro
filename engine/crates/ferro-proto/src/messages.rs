@@ -139,6 +139,15 @@ pub use http::{
     HttpBody, HttpDecoded, HttpDone, HttpHead, HttpHeaderField, HttpRequest, HttpStats,
 };
 
+/// QUEUE-service messages (M7-G1a, SPEC §24.4): `bin`-bearing (every `job_id` and `token` is opaque
+/// bytes, D22 (b), D24), so — like `http` — a hand-rolled positional codec.
+pub mod queue;
+pub use queue::{
+    AckResponse, ClearResponse, EnqueueJob, EnqueueRequest, EnqueueResponse, ExtendResponse,
+    FencedRequest, QueueCommon, QueueScopeRequest, QueueStats, ReleaseRequest, ReleaseResponse,
+    ReserveRequest, ReserveResponse, ReservedJob, SizeResponse,
+};
+
 /// Terminal outcome envelope `[status, body]` (decision W-4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {

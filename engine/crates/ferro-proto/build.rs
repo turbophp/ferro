@@ -16,12 +16,17 @@ struct Registry {
     max_frame_payload: u32,
     default_credit_frames: u32,
     default_credit_bytes: u32,
+    queue_wait_grace_ms: u32,
+    queue_handle_max_bytes: u32,
+    queue_enqueue_max_jobs: u32,
+    queue_reserve_max_queues: u32,
     flags: BTreeMap<String, u16>,
     services: BTreeMap<String, u16>,
     methods: BTreeMap<String, BTreeMap<String, u16>>,
     features: BTreeMap<String, BTreeMap<String, u16>>,
     outcome: BTreeMap<String, u8>,
     oob_encoding: BTreeMap<String, u8>,
+    ack_outcome: BTreeMap<String, u8>,
     // Not emitted as a constant; declared because `deny_unknown_fields` would otherwise reject the
     // lock and panic the build. It still feeds TYPE_REGISTRY_HASH via the raw lock bytes (M1-S7).
     #[allow(dead_code)]
@@ -84,6 +89,18 @@ fn main() {
     )
     .unwrap();
 
+    // Ferro Queue (SPEC §24.4, M7-G1a): the wait grace and the three shape bounds both codecs
+    // enforce. `u32`, like the other top-level scalars; a receiver compares against them, never
+    // re-derives them.
+    for (name, v) in [
+        ("QUEUE_WAIT_GRACE_MS", reg.queue_wait_grace_ms),
+        ("QUEUE_HANDLE_MAX_BYTES", reg.queue_handle_max_bytes),
+        ("QUEUE_ENQUEUE_MAX_JOBS", reg.queue_enqueue_max_jobs),
+        ("QUEUE_RESERVE_MAX_QUEUES", reg.queue_reserve_max_queues),
+    ] {
+        writeln!(o, "pub const {name}: u32 = {v};").unwrap();
+    }
+
     emit_mod_u16(&mut o, "flags", &reg.flags);
     emit_mod_u16(&mut o, "service", &reg.services);
     for (svc, m) in &reg.methods {
@@ -94,6 +111,7 @@ fn main() {
     }
     emit_mod_u8(&mut o, "outcome", &reg.outcome);
     emit_mod_u8(&mut o, "oob_encoding", &reg.oob_encoding);
+    emit_mod_u8(&mut o, "ack_outcome", &reg.ack_outcome);
     emit_mod_u8(&mut o, "tag", &reg.tags);
     // `branch` additionally carries `ALL` — `(registry name, value)` — for the same reason as
     // `errc::ALL` below: the error-taxonomy metrics label by branch NAME and must not hand-keep it.

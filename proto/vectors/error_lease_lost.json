@@ -1,0 +1,22 @@
+{
+  "frame_hex": "f7040200070003005400000051000000920197cd300f03c0c0d94474686520746f6b656e206e616d6573206e6f2063757272656e74207265736572766174696f6e206f662074686973206a6f623b206e6f7468696e672077617320646f6e65c0c0",
+  "header": {
+    "flags": 2,
+    "method": 3,
+    "request_id": 84,
+    "service": 7
+  },
+  "message": {
+    "error": {
+      "branch": 3,
+      "code": 12303,
+      "detail": null,
+      "errno": null,
+      "message": "the token names no current reservation of this job; nothing was done",
+      "retry_after_ms": null,
+      "sqlstate": null
+    },
+    "status": 1
+  },
+  "name": "error_lease_lost"
+}

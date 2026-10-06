@@ -1,0 +1,31 @@
+{
+  "frame_hex": "f704000007000100470000004300000094a46a6f62739293a764656661756c74a27b7d0093a764656661756c74bbc3a920e280942061206d756c74692d62797465207061796c6f6164ce00011170c093c0c0c0",
+  "header": {
+    "flags": 0,
+    "method": 1,
+    "request_id": 71,
+    "service": 7
+  },
+  "message": {
+    "common": [
+      null,
+      null,
+      null
+    ],
+    "dedup_key": null,
+    "jobs": [
+      [
+        "default",
+        "{}",
+        0
+      ],
+      [
+        "default",
+        "é — a multi-byte payload",
+        70000
+      ]
+    ],
+    "store": "jobs"
+  },
+  "name": "queue_enqueue_request_batch"
+}

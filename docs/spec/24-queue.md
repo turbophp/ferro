@@ -24,6 +24,15 @@ constant and no registry-hash change follows, and no other change may take these
 the constant, golden vectors and both codecs land with slice G1, the engine's first code slice
 (§24.14). Ferro Queue is not behind a cargo feature and
 takes no engine feature bit.
+*[Amended M7-G1a (SPEC §22.2 (df)): **keyed.** `QUEUE = 7`, `[methods.queue]` (`ENQUEUE = 1` … `CLEAR = 7`),
+`LeaseLost = 0x300F`, `PoolMismatch = 0x3010` and `queue_wait_grace_ms = 1000` are real `/proto` keys with
+golden vectors and both codecs, and the reservation comments are gone. G1a also keyed what the shapes
+needed: `InvalidHandle = 0x3011` (NonRetryable; §24.3 prerequisite (c)), the `[ack_outcome]` table
+(`ACKED = 1`, `GONE = 2`, so neither codec hand-writes ACK's byte), and the three shape bounds both
+decoders enforce, `queue_handle_max_bytes = 1024`, `queue_enqueue_max_jobs = 1000` and
+`queue_reserve_max_queues = 16` (a bound a RECEIVER enforces becomes a `/proto` key, M6-F2's rule). The
+messages are `/proto/PROTOCOL.md` **§14**, not §13: M3-D4's COPY took §13 first. The registry hash moved;
+no `protocol_version` bump.]*
 
 **Read first:** §24.16 (how each conflict with existing text was resolved), §24.17 (the decisions
 and the premises not yet measured) and §24.15 (what v1 does not build). Review-finding ids such as
@@ -188,9 +197,33 @@ a DSN:
 When read-only pools exist (§7.6, M4), a store on one is refused too. Today none exist, so the rule
 waits.
 
+*[Amended M7-G1a (SPEC §22.2 (df)): **built, in `ferro-queue`'s `config`, with these decisions.** The
+loading discipline is `ferro-http`'s (§22.2 (cw)): a blank value reads as unset; an unknown key under a
+declared store disables that store (a typo such as `…_LEASE=30` must not leave the lease at 90 s);
+keys are matched exactly, so `jobs` and `jobs_high` both resolve; a `FERRO_QUEUE_*` variable no store
+owns is logged at `warn`; a store name is 1–64 bytes of `[A-Za-z0-9._-]`. Every key that STARTS with
+`LIVENESS_RELEASE` is refused. G1a adds refusals of values with no meaning: a zero `POLL_MS`
+(it would spin), `WAKER_STMT_TIMEOUT_MS`, `MAX_PAYLOAD_BYTES`, `DEDUP_TTL_S` or `DEDUP_PURGE_MS`, and a
+`LABELLED_QUEUES` entry that is not a queue name. **An identifier part is at most 63 bytes**, because
+PostgreSQL silently truncates a longer one to `NAMEDATALEN - 1`, so the store would address another
+table; and **the identifier is used verbatim and quoted** (`"schema"."table"`, `` `t` ``), as Laravel's
+schema builder quotes the tables it creates, so `TABLE=Jobs` means the case-sensitive `"Jobs"`. The
+"reply envelope" for `MAX_PAYLOAD_BYTES` is `sql_reserve_envelope()`, 1 111 bytes, an itemised upper
+bound on a one-job RESERVE terminal minus its payload, pinned against the real encoder.]*
+
 **Version gate.** PostgreSQL ≥ 12 (the `MATERIALIZED` CTE, §24.4), MySQL ≥ 8.0.1 and MariaDB ≥ 10.6
 (`SKIP LOCKED`). SQLite is not supported in v1 (§24.15). The gate is checked at first use against the
-pool's existing version probe (§22.2 (u)). **Cost:** on PostgreSQL this is stricter than Laravel's own
+pool's existing version probe (§22.2 (u)). *[Built M7-G1a: `PoolRegistry::server_version` reads the
+same cache `HELLO_ACK` advertises, starting the probe if none is running. A version that does not parse
+FAILS CLOSED. A pool whose version is unknown (an unreachable backend, a failed probe inside its
+back-off) refuses the verb as `ConnectionLost` (Retryable): nothing was sent. MariaDB is told from MySQL
+by the substring `mariadb`, as the Doctrine tier does. Only PostgreSQL stores pass the gate live in G1a;
+MySQL-family stores are refused before it until G6. *Review round:* the wait for an in-flight probe is
+bounded by the REQUEST's deadline and CANCEL as well as by the probe's own 1.5 s budget (the store's
+verdict lock is held across it); an unknown version is logged once per probe back-off window (5 s) per
+store, not once per request; and a gate REFUSAL is reused only for the probe's TTL (600 s), the lifetime
+of the version it was decided on, so a backend upgraded under a running `ferrod` is noticed without a
+restart.]* **Cost:** on PostgreSQL this is stricter than Laravel's own
 9.5 gate. PG 9.5–11 are out of support; PG 11 reached end of life in 2023. Accepted (§24.17 Q8).
 
 **The layout is Laravel's stock `jobs` table, unchanged, and it is v1's only layout** (decided,
@@ -256,7 +289,11 @@ Reasons for the stock layout, by weight:
     kind (a Redis stream entry id, an SQS receipt handle of about 1 KB), mints differently without a
     wire change.
   - **A token the store cannot decode** (for the `sql` kind, any length other than 8) is refused
-    before any statement. G1 decides and pins its terminal, under prerequisite (c) below. `LeaseLost` would be literally true, since
+    before any statement. G1 decides and pins its terminal, under prerequisite (c) below. *[Decided
+    M7-G1a: `InvalidHandle` (`0x3011`, NonRetryable). The `sql` decoder also refuses an 8-byte token whose
+    top two bytes are not zero: no engine mints one, so it is a client defect, and refusing it makes
+    the token canonical too. A token of 0 or more than 1 024 bytes is refused by both CODECS
+    (`Protocol` on the engine), before the store is consulted.]* `LeaseLost` would be literally true, since
     the token names no current reservation, but only a client defect produces such a token, and the
     Laravel tier treats an autocommit `LeaseLost` as done (§24.11), which would hide the defect. A
     token over 1 024 bytes is an out-of-bounds field, refused like any other, and G1 pins where.
@@ -267,7 +304,11 @@ Reasons for the stock layout, by weight:
 does not fit an `i64`. The client never interprets it.
 
 - **The `sql` kind encodes the row's `bigint` `id` internally**, and decodes it back before any
-  statement. Its byte encoding is fixed at G1 by the builders' tests. A decimal-text encoding would
+  statement. Its byte encoding is fixed at G1 by the builders' tests. *[Decided M7-G1a: **canonical
+  decimal text**, exactly `i64::to_string()`'s ASCII bytes (1 to 20 of them; a `-` only for a negative
+  id). The decoder accepts a byte string iff re-encoding the value it parses gives the same bytes, so
+  `007`, `+7`, `-0` and ` 7` are `InvalidHandle`. It lets G5 hand Laravel stock's digits and keeps a
+  `job_id` safe in JSON and logs. **Cost:** up to 20 bytes where a fixed binary form is 8.]* A decimal-text encoding would
   let the Laravel tier hand Laravel the same digits stock does (§24.11), and G1 weighs that when it
   chooses the encoding.
 - **The fence is unchanged.** It is still `(id, attempts, created_at)` over the row's columns
@@ -279,7 +320,10 @@ does not fit an `i64`. The client never interprets it.
   enqueue order from them.
 - **Cost:** a few bytes per job on the wire, and no numeric ordering for the client.
 
-**G1 prerequisites for the opaque fields (normative; review round of (de)).**
+**G1 prerequisites for the opaque fields (normative; review round of (de)).** *[All three met at
+M7-G1a (SPEC §22.2 (df)): (a) the decimal-text encoding above, with `ferro-queue`'s
+`a_replayed_id_is_byte_identical`; (b) `/proto/vectors/refusal/`, 24 vectors, refused by both codecs
+for their own reason; (c) `InvalidHandle`.]*
 
 - **(a) A canonical `sql` `job_id` encoding with a strict decode.** Each `bigint` id has exactly one
   encoding. The decoder refuses every non-canonical form (for a decimal-text encoding: leading zeros,
@@ -349,6 +393,23 @@ in v1 (§23.6.1, §18), so a migration that changes the table's shape is re-veri
 restart; until then a verb that fails against the changed table is classified like any statement.
 
 - On a mismatch, every verb on that store answers `Unsupported`, naming the column.
+  *[Amended M7-G1a (SPEC §22.2 (df)): built for PostgreSQL (MySQL's statement lands with G6). The
+  accepted types are the stock layout's exactly — `id bigint`, `queue character varying` or `text`,
+  `payload text`, `attempts smallint`, `reserved_at`/`available_at`/`created_at integer` — because the
+  `sql` token carries `created_at` in 32 bits and `attempts` in 16, so a wider column would make tokens
+  collide; `reserved_at` must be nullable; extra columns are allowed. **An absent table is cached only
+  briefly** (`ABSENT_RECHECK`, 2 s): the ordinary deploy order is "start `ferrod`, then migrate", so a
+  table created after boot is served within two seconds, while a missing table costs one catalog read
+  per store per two seconds rather than a checkout per request. A table that exists with the wrong shape
+  IS cached until the next restart, as written above. *Review round (M1):* the table is resolved the way
+  the verbs' statements will resolve it — `to_regclass($1)` on the QUOTED identifier, so an unqualified
+  `TABLE` follows the pool's whole `search_path` (the first version looked in `current_schema()` only and
+  called a table in the path's second schema absent) — and the columns are read from `pg_attribute` by
+  that oid, with `format_type()` names. The relation must be a table: `relkind` `r` or `p` (partitioned)
+  passes; a view, materialized view or foreign table with exactly the right columns is refused, naming
+  its kind, because the verbs are written for a table: a view need not be updatable or lockable, and a
+  foreign table's locking belongs to the remote server. Every returned column is
+  cast to `text`, so the decode does not depend on catalog domain types.]*
 - The engine also resolves the identity default (PG `pg_get_serial_sequence`) for diagnostics only.
 - It never repairs the table.
 
@@ -382,7 +443,7 @@ G3 bench question (charter rule 5). The engine never creates an index.
   (§24.15) then needs no version bump.
 
 Shapes are positional msgpack arrays with strict arity. Field order lands with the golden vectors at
-G1 (PROTOCOL.md §13; §12 is HTTP's, §23). `common` is `[tx_id|nil, timeout_ms|nil, traceparent|nil]`, and `traceparent` is
+G1 (PROTOCOL.md §14 — *[amended M7-G1a: §13 went to M3-D4's COPY]*; §12 is HTTP's, §23). `common` is `[tx_id|nil, timeout_ms|nil, traceparent|nil]`, and `traceparent` is
 parsed as on EXEC (§22.2 (cd)). Every success terminal carries `stats {queue_us, exec_us}`.
 `token` and `job_id` (with `new_job_id`) are opaque bytes, 1 to 1 024 of them, everywhere they
 appear (§24.3; D22 amendment (b) for the token, D24 for the id). The golden vectors carry each at its
@@ -397,8 +458,25 @@ could fail the codec's UTF-8 check.
 | `ACK = 3` | `[store, job_id: bin (1..=1024), token: bin (1..=1024), common]` | `[outcome: u8 (1 acked, 2 gone), stats]`. `gone` is never returned in a transaction | yes |
 | `RELEASE = 4` | `[store, job_id, token, delay_s, common]` | `[new_job_id: bin (1..=1024)\|nil, stats]`. `nil` = `gone` (autocommit only) | yes |
 | `EXTEND = 5` | `[store, job_id, token, common]` | `[lease_deadline, stats]` | yes |
-| `SIZE = 6` | `[store, queue, common]` | `[pending, delayed, reserved, stats]` | yes |
+| `SIZE = 6` | `[store, queue, common]` | `[pending, delayed, reserved, oldest_pending_at: i64\|nil, stats]` | yes |
 | `CLEAR = 7` | `[store, queue, common]` | `[deleted: u64, stats]` | yes |
+
+*[Frozen M7-G1a (SPEC §22.2 (df); layouts in `/proto/PROTOCOL.md` §14). Where the table above names no
+type, G1a fixed one: `attempts` is `u32`; `created_at` and `lease_deadline` are `i64` (Unix seconds, signed
+because PostgreSQL's `integer` is); `pending`, `delayed`, `reserved`, `deleted` and both `stats` fields are
+`u64` bounded below 2^63, so PHP reads native ints; SIZE's `oldest_pending_at` is `i64 | nil` (the
+smallest pending `available_at`, Laravel 12's `creationTimeOfOldestPendingJob()` — added in the G1a review
+round after checking `illuminate/queue` v12.69.3); `common.tx_id` is a `u64` decoded exactly as
+`ExecRequest.tx_id` is (any `u64`; PHP cannot send one ≥ 2^63);
+`common.traceparent` decodes lossily, as on EXEC. ACK and EXTEND share one request shape
+(`[store, job_id, token, common]`), and SIZE and CLEAR another (`[store, queue, common]`). The bounds in
+the table (`bin (1..=1024)`, `(1..=1000)`, `(1..=16)`) are enforced by BOTH decoders, so breaking one is
+`Protocol`; an ACK `outcome` outside `[ack_outcome]` is refused on decode too. **A queue name is 1 to 255
+characters without U+0000** — the stock `string('queue')` width, in characters as both families count
+it; the bound is what makes the RESERVE reply envelope finite — and is refused `Unsupported` before any
+checkout, as the "queue name" refusal below says. Until the slices that build them land, a RESERVE with
+`wait_ms > 0` (G3), a dedup-keyed ENQUEUE (G4), a tx-scoped verb (G2) and any verb on a MySQL-family store
+(G6) are refused `Unsupported` before any checkout, never silently served without the behaviour asked for.]*
 
 **Verb semantics.**
 
@@ -1076,10 +1154,15 @@ every duplicate and every phantom attempt is attributable to a counted or docume
 
 ### 24.14 Slice plan
 
+*[Amended M7-G1a (SPEC §22.2 (df)): G1 is **split** into G1a and G1b — `/proto` plus everything a verb
+needs before its first statement, then the verbs themselves — because the whole of it would not have been
+one reviewable slice (the HTTP precedent: `/proto` alone was F2). `/proto` is complete and frozen in G1a.]*
+
 | slice | delivers | proves |
 |---|---|---|
 | **G0** *(DONE, §22.2 (cn))* | this section; `QUEUE = 7`, `LeaseLost`, `PoolMismatch` and `queue_wait_grace_ms` allocated in the spec (their `/proto` entries land at G1); §21 D21/D22; the §24.16 amendments | review attacked §24.5–§24.8 before any code |
-| **G1** *(D22 ratified 2026-10-06; may start)* | `/proto`: `[services] QUEUE = 7`, the method table, the two codes and `queue_wait_grace_ms` G0 allocated, PROTOCOL.md §1 and a new §13, golden vectors (an 8-byte and a 1 024-byte token, §24.4), both codecs, **all shapes frozen**, with `job_id` as opaque bytes (D24; vectors at the `sql` size and at 1 024 bytes, refusals at 0 and 1 025), after §24.3's G1 prerequisites: a canonical `sql` id encoding with a strict decode, and a terminal for an undecodable token or id that is neither `Protocol` nor `LeaseLost` (a new code if needed); store config (`KIND=sql` and the refusal of any other kind, `TABLE` defaulting to `ferro_jobs`), version gate, shape verification; ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
+| **G1a** *(BUILT M7-G1a, SPEC §22.2 (df); DONE when merged)* | `/proto`: `[services] QUEUE = 7`, `[methods.queue]`, `LeaseLost`/`PoolMismatch` and the new `InvalidHandle` (`0x3011`), `queue_wait_grace_ms`, the `[ack_outcome]` table and three shape bounds; PROTOCOL.md §1 and a new **§14**; golden vectors (every handle position at its `sql` size and at 1 024 bytes) and refusal vectors (0 and 1 025 bytes for every handle position; 0 and max + 1 jobs and queues) in both codecs; **all shapes frozen**; §24.3's G1 prerequisites (the canonical decimal `job_id`, the 8-byte token, both with strict decodes; `InvalidHandle`); store config with every refusal; the version gate and shape verification at first use (PostgreSQL; cached per process, an absent table excepted); `ferrod` routing and a QUEUE handler that makes every pre-checkout refusal and the first-use verification, then answers `Unsupported` for every verb | an undecodable handle is `InvalidHandle` before any statement; a wrong shape names its column; a view is refused and a partitioned table passes; an unqualified table follows `search_path`; the gate and the verdict caching (including the absent-table TTL, counted) are wired; mutation-proven |
+| **G1b** | ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules; the statement builders in `ferro-queue`. *Carried from the G1a review:* shape verification must also require `id` to be UNIQUE (the primary key or a unique index) — a fence `WHERE id = $1 AND …` over duplicate ids would match several rows; and `now + 1 + delay_s` must be pre-checked against PG `integer` before send, since a `delay_s` near `u32::MAX` otherwise overflows `available_at` as a post-send `22003` (refuse it `Unsupported`, nothing sent); SIZE fills `oldest_pending_at` | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
 | **G2** | tx path: `resolve_active` made `pub(crate)`, `PoolMismatch`, `TxCommand::Queue` + `after_commit`, in-tx `LeaseLost` semantics (R1), refused tx-scoped RESERVE | atomicity both ways; mismatch leaves the transaction usable; chaos rows 2 and 7 |
 | **G3** | the waker (per queue, `LIMIT k`, statement deadlines, register-then-sweep), long-poll, the wait bound, **unreserve**, wake hints, coalesced polls, drain; queue metrics and spans | cost bound (row 11); one END under every CANCEL/deadline race and the deliver-xor-unreserve rule (row 12); idle-polling bench vs stock (A's number); R4 reproduced on the real transport |
 | **G4** | native PHP API, `queueWorker()`, wait clamp, client fate and licensed re-sends; dedup table and purge **after** the dedup spike reproduces §24.6's three paths | chaos rows 1, 3–6, 8, 9 and 15 through the client |

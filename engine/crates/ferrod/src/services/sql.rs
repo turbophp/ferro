@@ -256,6 +256,11 @@ async fn handle(
                 }
             }
         }
+        // Ferro Queue (M7-G1a, SPEC §24.4): every `[methods.queue]` method; `dispatch` routes no other
+        // QUEUE id here. The handler declares the ONE terminal.
+        (service::QUEUE, _) => {
+            crate::services::queue::handle(frame, responder, registry, cancel).await
+        }
         // Any other routed frame (an unrecognized SQL/TX method, or STREAM) → one END, session lives.
         _ => responder.end_error(unsupported("service/method not yet implemented")),
     }

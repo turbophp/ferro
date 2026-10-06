@@ -1,0 +1,20 @@
+{
+  "frame_hex": "f7040000070005004d0000001800000094a46a6f6273c4023432c40800006ab13b80000193c0c0c0",
+  "header": {
+    "flags": 0,
+    "method": 5,
+    "request_id": 77,
+    "service": 7
+  },
+  "message": {
+    "common": [
+      null,
+      null,
+      null
+    ],
+    "job_id_hex": "3432",
+    "store": "jobs",
+    "token_hex": "00006ab13b800001"
+  },
+  "name": "queue_extend_request"
+}
