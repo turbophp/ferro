@@ -262,6 +262,22 @@ fn message_payloads_are_canonical_and_byte_stable() {
             (s, m) if s == service::STREAM && m == method_stream::DATA => {
                 StreamData::decode(payload).unwrap().encode()
             }
+            // M3-D4 COPY: the two request bodies (no END flag), a COPY_DATA chunk (a strict `bin`,
+            // either direction) and the empty COPY_DONE. The terminals are ordinary ExecOk
+            // Outcomes and need no vector of their own.
+            (s, m)
+                if s == service::SQL
+                    && (m == method_sql::COPY_IN || m == method_sql::COPY_OUT)
+                    && (h.flags & flags::END) == 0 =>
+            {
+                CopyRequest::decode(payload).unwrap().encode()
+            }
+            (s, m) if s == service::STREAM && m == method_stream::COPY_DATA => {
+                CopyData::decode(payload).unwrap().encode()
+            }
+            (s, m) if s == service::STREAM && m == method_stream::COPY_DONE => {
+                CopyDone::decode(payload).unwrap().encode()
+            }
             // error_protocol vectors: an Outcome terminal payload (END flag).
             _ => Outcome::decode(payload).unwrap().encode(),
         };

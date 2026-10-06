@@ -647,3 +647,26 @@ async fn copy_on_a_non_postgres_pool_is_unsupported() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// EXEC cannot carry the COPY sub-protocol. A `COPY … FROM STDIN` sent as an EXEC is refused with a
+/// pointer to COPY_IN — before anything reaches the server, where it would leave the pooled
+/// connection waiting for data — and the pool goes on serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_refuses_a_copy_statement_and_points_at_the_copy_methods() {
+    let Some(url) = pg_url() else { return };
+    let server = exec_server_with_session_config(url, |_| {});
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    exec_ok(&mut c, 2, "DROP TABLE IF EXISTS d4_e2e_ex; CREATE TABLE d4_e2e_ex (id int)").await;
+    for (rid, sql) in [(3, "COPY d4_e2e_ex FROM STDIN"), (4, "COPY d4_e2e_ex TO STDOUT")] {
+        let started = std::time::Instant::now();
+        let e = err_body(exec(&mut c, rid, &write(sql)).await);
+        assert_eq!(e.code, errc::UNSUPPORTED, "{sql}: {e:?}");
+        assert!(e.message.contains("COPY_IN") || e.message.contains("COPY_OUT"), "{}", e.message);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+    for rid in 5..30 {
+        let ok = exec_ok(&mut c, rid, "SELECT 1").await;
+        assert_eq!(ok.rows[0][0], Value::I64(1));
+    }
+}

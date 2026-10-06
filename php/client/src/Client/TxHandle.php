@@ -290,6 +290,55 @@ final class TxHandle
         return $decoded;
     }
 
+    /**
+     * `COPY … FROM STDIN` inside this transaction (M3-D4) — {@see Connection::copyIn}'s contract,
+     * with the transaction's rules: a ROLLBACK undoes it, a server error leaves the transaction
+     * failed for the caller to roll back, and a COPY stopped or lost mid-way ends the transaction.
+     *
+     * @param iterable<mixed, string> $data
+     */
+    public function copyIn(string $sql, iterable $data): int
+    {
+        $this->lastInsertId = null;
+        return $this->copyRunner()->in(
+            Connection::copySession($this->session),
+            $this->copyPayload($sql, false),
+            $data,
+        );
+    }
+
+    /**
+     * `COPY … TO STDOUT` inside this transaction — {@see Connection::copyOut}'s contract; it sees the
+     * transaction's own uncommitted writes.
+     *
+     * @return \Generator<int, string, mixed, int>
+     */
+    public function copyOut(string $sql, bool $readonly = false): \Generator
+    {
+        $this->lastInsertId = null;
+        return $this->copyRunner()->out(
+            Connection::copySession($this->session),
+            $this->copyPayload($sql, $readonly),
+            $readonly,
+        );
+    }
+
+    private function copyRunner(): CopyRunner
+    {
+        // In a transaction every loss is the transaction's: `TxStatement`, Retryable, whatever the
+        // classifier's read-retry setting — so a default classifier decides exactly as the
+        // Connection's would.
+        return new CopyRunner(new FateClassifier(), $this->codec, true, static fn (): bool => false);
+    }
+
+    private function copyPayload(string $sql, bool $readonly): string
+    {
+        return \Ferro\Protocol\CopyRequest::encode(
+            ['pool' => $this->pool, 'sql' => $sql, 'readonly' => $readonly, 'timeout_ms' => null, 'tx_id' => $this->txId],
+            $this->encodePacker,
+        );
+    }
+
     /** Send a `SERVICE_TX` control frame; a non-`Ok` terminal throws the mapped taxonomy exception. */
     private function control(int $method, string $payload): void
     {

@@ -101,6 +101,16 @@ pub fn copy_direction(sql: &str) -> Option<CopyDirection> {
     Some(dir)
 }
 
+/// Does any top-level statement of `sql` speak the COPY STDIN/STDOUT sub-protocol? For the
+/// statement paths that CANNOT carry it (SQL/`EXEC`): such a statement, sent there, leaves the
+/// pooled connection in copy mode with a driver that expected rows — measured before M3-D4 as a
+/// killed connection and an `Indeterminate` for a statement that could not have applied.
+pub fn speaks_copy_stdio(sql: &str) -> bool {
+    scan::split_top_level_statements(sql)
+        .into_iter()
+        .any(|s| copy_direction(s).is_some())
+}
+
 /// Tokens of the masked code. `None` for an unterminated quoted identifier (fail closed).
 fn tokenize(masked: &str) -> Option<Vec<Tok>> {
     let b = masked.as_bytes();
@@ -210,6 +220,16 @@ mod tests {
             Some(Out)
         );
         assert_eq!(copy_direction("COPY (SELECT 'FROM STDIN') TO '/x'"), None);
+    }
+
+    #[test]
+    fn speaks_copy_stdio_finds_a_copy_in_any_top_level_statement_and_nowhere_else() {
+        assert!(speaks_copy_stdio("COPY t FROM STDIN"));
+        assert!(speaks_copy_stdio("SELECT 1; COPY t TO STDOUT;"));
+        assert!(!speaks_copy_stdio("SELECT 'COPY t FROM STDIN'"));
+        assert!(!speaks_copy_stdio("-- COPY t FROM STDIN\nSELECT 1"));
+        assert!(!speaks_copy_stdio("COPY t FROM '/x.csv'"));
+        assert!(!speaks_copy_stdio("SELECT 1"));
     }
 
     #[test]

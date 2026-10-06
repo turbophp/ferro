@@ -17,7 +17,7 @@ mod redact;
 mod rules;
 mod scan;
 
-pub use copy::{CopyDirection, copy_direction};
+pub use copy::{CopyDirection, copy_direction, speaks_copy_stdio};
 pub use fingerprint::{Fingerprint, INPUT_LIMIT, TRUNCATED_MARKER, fingerprint};
 
 /// The upstream SQL dialect being classified against. [`Dialect::Postgres`] is wired to a live

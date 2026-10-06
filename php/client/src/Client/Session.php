@@ -8,6 +8,7 @@ use Ferro\Client\Error\ProtocolException;
 use Ferro\Client\Error\TransportException;
 use Ferro\Protocol\Codec;
 use Ferro\Protocol\CodecException;
+use Ferro\Protocol\CopyData;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Header;
 use Ferro\Protocol\Hello;
@@ -62,7 +63,7 @@ use Ferro\Protocol\StreamHead;
  * `boot_epoch` is stored OPAQUE (`int|string`) exactly as the packer yields it — never coerced, so
  * the Task-4 reconnect loop can detect an epoch change even for `u64 > PHP_INT_MAX` values.
  */
-final class Session implements MultiplexingSessionInterface, StreamingSessionInterface
+final class Session implements MultiplexingSessionInterface, StreamingSessionInterface, CopySessionInterface
 {
     private readonly Codec $codec;
     private readonly PackerInterface $encodePacker;
@@ -627,6 +628,133 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         $this->sendCancel($requestId);
         while ($this->streamOpen) {
             $this->readStreamFrame($requestId); // discards DATA batches; clears the guard on 'end'.
+        }
+    }
+
+    // ---- COPY (M3-D4, {@see CopySessionInterface}) ------------------------------------------------
+
+    /**
+     * Send a SQL/`COPY_IN` and wait for the engine's answer: its first `WINDOW_UPDATE` grant — "the
+     * COPY has started; you may send this much" — or the terminal of a COPY that never started. A
+     * started COPY holds this session's stream guard until its terminal arrives or it is abandoned.
+     *
+     * @return array{type:'grant', requestId:int, frames:int, bytes:int}|array{type:'end', requestId:int, outcome:Outcome}
+     */
+    public function openCopyIn(string $payload): array
+    {
+        $rid = $this->submit(C::SERVICE_SQL, C::METHOD_SQL_COPY_IN, $payload);
+        $event = $this->copyEvent($rid, false);
+        if ($event['type'] === 'end') {
+            return ['type' => 'end', 'requestId' => $rid, 'outcome' => $event['outcome']];
+        }
+        if ($event['type'] !== 'grant') {
+            throw new ProtocolException(sprintf('expected a COPY_IN grant for request %d', $rid));
+        }
+        $this->streamOpen = true;
+        $this->streamRequestId = $rid;
+        $this->streamFiber = \Fiber::getCurrent();
+        return ['type' => 'grant', 'requestId' => $rid, 'frames' => $event['frames'], 'bytes' => $event['bytes']];
+    }
+
+    /** Send a SQL/`COPY_OUT`; its frames are read with {@see readCopyEvent}. */
+    public function openCopyOut(string $payload): int
+    {
+        $rid = $this->submit(C::SERVICE_SQL, C::METHOD_SQL_COPY_OUT, $payload);
+        $this->streamOpen = true;
+        $this->streamRequestId = $rid;
+        $this->streamFiber = \Fiber::getCurrent();
+        return $rid;
+    }
+
+    /**
+     * The next frame of an open COPY: a COPY_IN's `grant`, a COPY_OUT's `data`, or the ONE terminal
+     * (`end`), which releases the stream guard.
+     *
+     * @return array{type:'grant', frames:int, bytes:int}|array{type:'data', data:string, bytes:int}|array{type:'end', outcome:Outcome}
+     */
+    public function readCopyEvent(int $requestId): array
+    {
+        return $this->copyEvent($requestId, true);
+    }
+
+    /**
+     * @return array{type:'grant', frames:int, bytes:int}|array{type:'data', data:string, bytes:int}|array{type:'end', outcome:Outcome}
+     */
+    private function copyEvent(int $requestId, bool $guarded): array
+    {
+        try {
+            [$header, $body] = $this->nextFrameFor($requestId);
+        } catch (ConnectionLostException | ProtocolException $e) {
+            if ($guarded && $this->streamRequestId === $requestId) {
+                $this->streamOpen = false;
+                $this->streamRequestId = null;
+            }
+            throw $e;
+        }
+        if (($header->flags & C::FLAG_END) !== 0) {
+            if ($guarded && $this->streamRequestId === $requestId) {
+                $this->streamOpen = false;
+                $this->streamRequestId = null;
+            }
+            return ['type' => 'end', 'outcome' => Outcome::decode($body, $this->decodePacker)];
+        }
+        if ($header->service === C::SERVICE_CORE && $header->method === C::METHOD_CORE_WINDOW_UPDATE) {
+            $off = 0;
+            $w = $this->decodePacker->unpack($body, $off);
+            if (!is_array($w) || count($w) !== 2 || $off !== strlen($body)
+                || !is_int($w[0] ?? null) || !is_int($w[1] ?? null)) {
+                throw new ProtocolException(sprintf('malformed COPY grant for request %d', $requestId));
+            }
+            return ['type' => 'grant', 'frames' => $w[0], 'bytes' => $w[1]];
+        }
+        if ($header->service === C::SERVICE_STREAM && $header->method === C::METHOD_STREAM_COPY_DATA) {
+            try {
+                $data = CopyData::decode($body);
+            } catch (CodecException $e) {
+                throw new ProtocolException('malformed COPY_DATA: ' . $e->getMessage(), 0, $e);
+            }
+            return ['type' => 'data', 'data' => $data, 'bytes' => strlen($body)];
+        }
+        throw new ProtocolException(sprintf(
+            'unexpected frame for COPY request %d: service=%d method=%d flags=%d',
+            $requestId,
+            $header->service,
+            $header->method,
+            $header->flags,
+        ));
+    }
+
+    /**
+     * One chunk of COPY_IN data. The caller keeps within its granted credit; the engine closes the
+     * session on data beyond it. A failure is a plain {@see TransportException} (a control-class frame:
+     * the request itself was already sent) and poisons the session.
+     */
+    public function sendCopyData(int $requestId, string $data): void
+    {
+        $this->writeFrame(C::FLAG_STREAM, C::SERVICE_STREAM, C::METHOD_STREAM_COPY_DATA,
+            CopyData::encode($data, $this->encodePacker), $requestId);
+    }
+
+    /** The COPY_IN's end-of-data — the one frame that lets the server complete the COPY. */
+    public function sendCopyDone(int $requestId): void
+    {
+        $this->writeFrame(0, C::SERVICE_STREAM, C::METHOD_STREAM_COPY_DONE, CopyData::DONE, $requestId);
+    }
+
+    /**
+     * Abandon an open COPY: `CANCEL`, then read (and discard) its frames to its ONE terminal, so the
+     * next request on this session does not read them. A no-op for a COPY already ended or a
+     * poisoned session — like {@see abandonStream}, this usually runs from a `finally` carrying the
+     * real error.
+     */
+    public function abandonCopy(int $requestId): void
+    {
+        if (!$this->streamOpen || $this->streamRequestId !== $requestId) {
+            return;
+        }
+        $this->sendCancel($requestId);
+        while ($this->streamOpen && $this->streamRequestId === $requestId) {
+            $this->readCopyEvent($requestId);
         }
     }
 
