@@ -47,6 +47,24 @@ final class RevoltWatch
     private int $frames = 0;
     private bool $stopped = false;
 
+    /**
+     * Set when the socket is readable but there is nothing to read FOR — no request in flight: an
+     * EOF, a late PONG, a frame nobody awaits yet. The readable watcher is then disabled, because a
+     * level-triggered one would fire on every tick (M3-D1d review F3, measured: 1.3 s of CPU in
+     * 1.5 s). It is enabled again when a Fiber parks or a frame is filed — the only two things that
+     * can give a read something to do.
+     */
+    private bool $readParked = false;
+
+    /** The most frames one readable event reads before it lets the rest of the loop run. */
+    private const FRAMES_PER_EVENT = 64;
+
+    /** Inside {@see readable}: it drains PHP's buffer itself, so a frame it reads schedules nothing. */
+    private bool $reading = false;
+
+    /** A deferred {@see readable} is queued and has not run yet. */
+    private bool $drainQueued = false;
+
     private function __construct(private readonly Session $session, private readonly float $readTimeout)
     {
         $this->lastProgress = microtime(true);
@@ -90,13 +108,9 @@ final class RevoltWatch
         $token = new \stdClass();
         $key = ++$this->nextKey;
         $this->waiting[$key] = [$waiter, $suspension, $token];
-        if ($this->readId !== null) {
-            EventLoop::enable($this->readId); // may have been parked by a read that found nothing
-        }
-        if ($this->session->bufferedBytes() > 0) {
-            // Bytes PHP has buffered do not make the descriptor readable: read them on the next tick.
-            EventLoop::defer(fn () => $this->readable());
-        }
+        $this->unparkRead(); // this Fiber's request may be what a read was missing
+        // Bytes PHP has already buffered do not make the descriptor readable: read them next tick.
+        $this->drainSoon();
         try {
             $value = $suspension->suspend();
         } finally {
@@ -124,6 +138,7 @@ final class RevoltWatch
             }
             $this->lastProgress = microtime(true);
             ++$this->frames;
+            $this->unparkRead();
             foreach ($this->waiting as $key => [$waiter]) {
                 if ($waiter->requestId === $requestId && $waiter->ready()) {
                     $this->resume($key);
@@ -131,35 +146,83 @@ final class RevoltWatch
             }
             if ($this->waiting === []) {
                 $this->stop();
+                return;
+            }
+            if (!$this->reading) {
+                // Read by someone else — another Fiber's or a callback's synchronous call — which may
+                // have pulled the NEXT frames into PHP's stream buffer. An fd-based driver never
+                // reports those bytes, so drain them now rather than at the next timer (review F1).
+                $this->drainSoon();
             }
         } catch (\Throwable $e) {
             $this->fail($e);
         }
     }
 
-    /** The socket is readable: read frames until neither the descriptor nor PHP's buffer has any. */
+    /**
+     * The socket is readable — or was when this event was queued. Read frames while bytes are
+     * actually waiting, in the kernel or in PHP's stream buffer.
+     *
+     * **Never read on a stale event** (M3-D1c's blocking read, M3-D1d review F1, HIGH). An event is
+     * queued when the select saw bytes, and something else may have consumed them before it runs: a
+     * second event for the same bytes in the same tick (the deferred read {@see park} queues for
+     * PHP-buffered bytes, and the driver's own report of them), or another Fiber's synchronous call
+     * on this session. {@see Session::pollOnce} then BLOCKS — the whole event loop — until the
+     * session's next frame, up to a full read timeout (measured: a 50 ms timer fired twice in 2 s).
+     * So every read is preceded by a zero-wait check that bytes are there.
+     */
     private function readable(): void
     {
+        $this->reading = true;
         try {
-            $progressed = false;
-            do {
-                if ($this->stopped || $this->session->isPoisoned()) {
+            $read = 0;
+            while (!$this->stopped && !$this->session->isPoisoned() && $this->unreadWaiting()) {
+                if (!$this->session->hasRequestsInFlight()) {
+                    // Readable, but there is nothing to read FOR: pollOnce would return at once, and
+                    // a level-triggered watcher would fire again on every tick.
+                    $this->parkRead();
                     break;
                 }
-                $seen = $this->frames;
                 $this->session->pollOnce();
-                $more = $this->frames !== $seen;
-                $progressed = $progressed || $more;
-            } while ($more && $this->session->bufferedBytes() > 0);
-            if (!$progressed && !$this->stopped && $this->readId !== null) {
-                // Readable, yet nothing was read: no request is in flight to read for (an EOF, or a
-                // frame nobody awaits yet). A level-triggered watcher would spin on it; park it until
-                // a waiter arrives or the session changes.
-                EventLoop::disable($this->readId);
+                if (++$read >= self::FRAMES_PER_EVENT) {
+                    $this->reading = false;
+                    $this->drainSoon(); // let the rest of the loop run; bytes PHP holds wake no fd watcher
+                    break;
+                }
             }
+            $this->reading = false;
             $this->recheck();
         } catch (\Throwable $e) {
+            $this->reading = false;
             $this->fail($e);
+        }
+    }
+
+    /** Queue one {@see readable} for the next tick if PHP's stream buffer holds bytes. */
+    private function drainSoon(): void
+    {
+        if (!$this->drainQueued && !$this->stopped && $this->session->bufferedBytes() > 0) {
+            $this->drainQueued = true;
+            EventLoop::defer(function (): void {
+                $this->drainQueued = false;
+                $this->readable();
+            });
+        }
+    }
+
+    private function parkRead(): void
+    {
+        if ($this->readId !== null && !$this->readParked) {
+            $this->readParked = true;
+            EventLoop::disable($this->readId);
+        }
+    }
+
+    private function unparkRead(): void
+    {
+        if ($this->readId !== null && $this->readParked) {
+            $this->readParked = false;
+            EventLoop::enable($this->readId);
         }
     }
 
@@ -205,9 +268,6 @@ final class RevoltWatch
         if ($this->waiting === []) { // always so after a failure: the closed socket is never selected
             $this->stop();
             return;
-        }
-        if ($this->readId !== null) {
-            EventLoop::enable($this->readId);
         }
         $this->arm();
     }

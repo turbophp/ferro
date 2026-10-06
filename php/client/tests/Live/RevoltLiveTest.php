@@ -4,11 +4,16 @@ namespace Ferro\Tests\Live;
 
 use Ferro\Client\Connection;
 use Ferro\Client\Error\NonRetryableException;
+use Ferro\Client\Session;
+use Ferro\Client\Transport;
 use Ferro\Client\Error\FerroException;
 use Ferro\Ferro;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Revolt;
 use Ferro\Tests\Support\RevoltTasks;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Group;
+use PHPUnit\Framework\Attributes\Large;
 use Revolt\EventLoop;
 
 /**
@@ -16,6 +21,7 @@ use Revolt\EventLoop;
  * inside a Revolt-driven Fiber (what `Amp\async()` gives you) suspends, the event loop keeps
  * running, and k Fibers' statements are in flight at once on one socket.
  */
+#[Large] // a 60 s limit per test, enforced (phpunit.xml.dist): a hang fails loudly
 final class RevoltLiveTest extends LiveTestCase
 {
     private const SLEEP_S = 0.5;
@@ -29,17 +35,36 @@ final class RevoltLiveTest extends LiveTestCase
     protected function tearDown(): void
     {
         $left = EventLoop::getIdentifiers();
-        foreach ($left as $id) {
-            EventLoop::cancel($id);
+        try {
+            foreach ($left as $id) {
+                EventLoop::cancel($id);
+            }
+            Revolt::uninstall();
+        } finally {
+            parent::tearDown(); // ferrod is stopped whatever the adapter's state (review F6)
         }
-        Revolt::uninstall();
-        parent::tearDown();
         $this->assertSame([], $left, 'a Revolt callback outlived the test');
     }
 
-    private function connection(?float $statementTimeout = null, string $pool = 'default'): Connection
+    private function connection(?float $statementTimeout = null, string $pool = 'default', ?bool $receiveFds = null): Connection
     {
-        return Ferro::connect($this->socketPath, $pool, 2.0, 5.0, statementTimeout: $statementTimeout);
+        return Ferro::connect($this->socketPath, $pool, 2.0, 5.0, statementTimeout: $statementTimeout, receiveFds: $receiveFds);
+    }
+
+    /**
+     * Both read paths (M3-D3): `fread` on the stream, and `recvmsg` on the imported socket when
+     * ext-sockets can receive fds. The adapter watches the same descriptor either way; only the
+     * second has no PHP-side buffer.
+     *
+     * @return array<string, array{bool}>
+     */
+    public static function readPaths(): array
+    {
+        $paths = ['fread' => [false]];
+        if (Transport::canReceiveFds()) {
+            $paths['recvmsg'] = [true];
+        }
+        return $paths;
     }
 
     /**
@@ -47,9 +72,11 @@ final class RevoltLiveTest extends LiveTestCase
      * take about one sleep, and they ran on four DIFFERENT backends — four statements genuinely in
      * flight at once — against a sequential control in one Fiber that takes about four sleeps.
      */
-    public function testFibersOverlapTheirStatementsOnDistinctBackends(): void
+    #[DataProvider('readPaths')]
+    public function testFibersOverlapTheirStatementsOnDistinctBackends(bool $receiveFds): void
     {
-        $conn = $this->connection();
+        $conn = $this->connection(receiveFds: $receiveFds);
+        $this->assertSame($receiveFds, $conn->session()->receivesFds());
         $sql = sprintf('SELECT pg_backend_pid() FROM pg_sleep(%F)', self::SLEEP_S);
         try {
             $tasks = [];
@@ -113,9 +140,11 @@ final class RevoltLiveTest extends LiveTestCase
      * order unrelated to the submissions; every Fiber gets its own value, then a second round on the
      * same session proves nothing was left unread.
      */
-    public function testEveryFiberGetsItsOwnTerminal(): void
+    #[DataProvider('readPaths')]
+    public function testEveryFiberGetsItsOwnTerminal(bool $receiveFds): void
     {
-        $conn = $this->connection();
+        $conn = $this->connection(receiveFds: $receiveFds);
+        $this->assertSame($receiveFds, $conn->session()->receivesFds());
         try {
             for ($round = 0; $round < 2; ++$round) {
                 $tasks = [];
@@ -226,6 +255,39 @@ final class RevoltLiveTest extends LiveTestCase
             // liveness tick (the read timeout, 5 s).
             $elapsed = microtime(true) - $start;
             $this->assertLessThan(1.5, $elapsed, sprintf('the waiting Fiber finished at %.2f s', $elapsed));
+        } finally {
+            $conn->session()->close();
+        }
+    }
+
+    /**
+     * M3-D3 under Revolt: a result large enough to arrive through a sealed memfd, awaited in one
+     * Fiber while small statements are awaited in others on the same socket. Each Fiber gets its
+     * own result, and the memfd path was really taken.
+     */
+    #[Group('oob')]
+    public function testAMemfdResultUnderRevoltReachesItsOwnFiber(): void
+    {
+        if (!Transport::canReceiveFds()) {
+            $this->markTestSkipped('the memfd path needs Linux and ext-sockets');
+        }
+        $conn = $this->connection(receiveFds: true);
+        $big = 2 * 1024 * 1024;
+        try {
+            $tasks = ['big' => static fn (): mixed => $conn->scalarAsync("SELECT ?::text || repeat('x', {$big})", ['tag-'])->await()];
+            for ($i = 0; $i < 6; ++$i) {
+                $tasks["small{$i}"] = static fn (): mixed => $conn->scalarAsync('SELECT ?::int8 FROM pg_sleep(0.05)', [$i])->await();
+            }
+            $r = RevoltTasks::run($tasks);
+            $this->assertIsString($r['big']);
+            $this->assertStringStartsWith('tag-xxx', $r['big']);
+            $this->assertSame(strlen('tag-') + $big, strlen($r['big']));
+            for ($i = 0; $i < 6; ++$i) {
+                $this->assertSame($i, $r["small{$i}"]);
+            }
+            $session = $conn->session();
+            $this->assertInstanceOf(Session::class, $session);
+            $this->assertSame(1, $session->oobPayloadsReceived(), 'the result came through a memfd');
         } finally {
             $conn->session()->close();
         }

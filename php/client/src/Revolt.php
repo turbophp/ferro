@@ -5,6 +5,8 @@ namespace Ferro;
 use Ferro\Client\RevoltWatch;
 use Ferro\Client\Waiter;
 use Revolt\EventLoop;
+use Revolt\EventLoop\Driver;
+use Revolt\EventLoop\Driver\TracingDriver;
 use Revolt\EventLoop\Internal\AbstractDriver;
 
 /**
@@ -31,7 +33,8 @@ use Revolt\EventLoop\Internal\AbstractDriver;
  *    for an `await` outside any Fiber);
  *  - any other Fiber suspends only while it runs UNDER the Revolt loop (the loop's Fiber is mid-
  *    dispatch: an `Amp\async()` task, a Revolt callback, a Fiber either of them resumed). A Fiber
- *    that `{main}` starts and drives by hand blocks instead, because the loop would never resume it;
+ *    that `{main}` starts and drives by hand blocks instead, because the loop would never resume it,
+ *    and so does every Fiber under a driver the adapter cannot see into;
  *  - a Fiber that is resumed by something other than the Revolt loop while it waits (it was being
  *    driven by another scheduler after all) gets a `LogicException` from the `await`, and the
  *    adapter never resumes it again; it does not crash the event loop.
@@ -90,6 +93,8 @@ final class Revolt
 
     private static ?\ReflectionProperty $loopFiber = null;
 
+    private static ?\ReflectionProperty $tracedDriver = null;
+
     /**
      * Whether the code running now runs UNDER the Revolt loop: the loop's own Fiber is mid-`resume`
      * of a callback — or of a Fiber that callback resumed — so the current Fiber was started or
@@ -99,24 +104,33 @@ final class Revolt
      * which is its state for the rest of the program once `{main}` has awaited anything (measured:
      * a Fiber `{main}` started afterwards was suspended into a loop that was not running). PHP
      * exposes no Fiber's parent, so this reads Revolt's loop Fiber off its `AbstractDriver`, which
-     * every bundled driver extends. Any other driver (a custom one, `TracingDriver`) falls back to
-     * `isRunning()`, the weaker test.
+     * every bundled driver extends, looking through the `TracingDriver` that
+     * `REVOLT_DRIVER_DEBUG_TRACE=1` wraps around it (review F4).
+     *
+     * **A driver it cannot see into answers NO**, so the Fiber blocks: correct and serial, where a
+     * wrong yes strands it. `isRunning()` was the fallback once, and it is the signal measured wrong.
      */
     private static function loopIsDispatching(): bool
     {
         $driver = EventLoop::getDriver();
-        if ($driver instanceof AbstractDriver) {
-            try {
-                self::$loopFiber ??= new \ReflectionProperty(AbstractDriver::class, 'fiber');
-                $fiber = self::$loopFiber->getValue($driver);
-                if ($fiber instanceof \Fiber) {
-                    return $fiber->isRunning();
+        try {
+            for ($depth = 0; $driver instanceof TracingDriver && $depth < 8; ++$depth) {
+                self::$tracedDriver ??= new \ReflectionProperty(TracingDriver::class, 'driver');
+                $inner = self::$tracedDriver->getValue($driver);
+                if (!$inner instanceof Driver) {
+                    return false;
                 }
-            } catch (\ReflectionException) {
-                // a Revolt that renamed it: fall back
+                $driver = $inner;
             }
+            if (!$driver instanceof AbstractDriver) {
+                return false;
+            }
+            self::$loopFiber ??= new \ReflectionProperty(AbstractDriver::class, 'fiber');
+            $fiber = self::$loopFiber->getValue($driver);
+            return $fiber instanceof \Fiber && $fiber->isRunning();
+        } catch (\ReflectionException | \Error) {
+            return false; // a Revolt that renamed or retyped them: block
         }
-        return $driver->isRunning();
     }
 
     /**

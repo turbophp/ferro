@@ -1482,11 +1482,13 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
   - **Which awaits suspend once installed.**
     - A Fiber `Ferro\Loop` owns is still that loop's. This holds even when `Ferro\Loop::run` is itself called from a Revolt callback, which is pinned by a test.
     - `{main}` suspends, and Revolt runs its loop until the terminal arrives. This is AMPHP's own rule for an await outside any Fiber.
-    - Any other Fiber suspends only when it runs UNDER the loop: the loop's own Fiber is mid-dispatch, so the current Fiber was started or resumed, directly or not, by a callback. That covers an `Amp\async()` task, a Revolt callback, and a Fiber either of them resumed. It is read off Revolt's `AbstractDriver::$fiber` by reflection, because Revolt exposes nothing better. A driver that is not an `AbstractDriver` (a custom one, `TracingDriver`) falls back to `isRunning()`, the weaker test.
+    - Any other Fiber suspends only when it runs UNDER the loop: the loop's own Fiber is mid-dispatch, so the current Fiber was started or resumed, directly or not, by a callback. That covers an `Amp\async()` task, a Revolt callback, and a Fiber either of them resumed. It is read off Revolt's `AbstractDriver::$fiber` by reflection, because Revolt exposes nothing better, looking through the `TracingDriver` that `REVOLT_DRIVER_DEBUG_TRACE=1` wraps around it. **A driver it cannot see into answers no, and the Fiber blocks** — the review round's F4: the first version fell back to `isRunning()`, the very signal measured wrong above, and stranded a Fiber under Revolt's own debug driver.
     - A Fiber `{main}` starts and drives by hand blocks.
     - A Fiber resumed by anything but the adapter while it waits is caught by a per-wait token. It gets a `LogicException` at its await and is never resumed again. Without the check, measured by its mutation, the Fiber parks again on a still-pending suspension and Revolt's `Must call resume() or throw() before calling suspend() again` `Error` escapes `EventLoop::run()`.
   - **How the loop is told.** Each waited-on session gets ONE readable watcher and ONE timer, and neither outlives the last waiter, so an idle connection never keeps `EventLoop::run()` alive. Every test asserts that no Revolt callback is left registered.
-    - **The watcher** reads one frame at a time through the session's router. It then drains PHP's own stream buffer, because an fd-based driver (ev/uv/event) does not see bytes PHP has already read.
+    - **The watcher** reads one frame at a time through the session's router, and **only when bytes are actually waiting** — a zero-wait check before every read (review F1). It reads at most 64 frames per event, then lets the loop run.
+    - **PHP's own stream buffer is drained by the adapter**, because an fd-based driver (ev/uv/event) never reports bytes PHP has already read. That happens when a Fiber parks, after a burst capped at 64 frames, and when the session's router reports a frame read by someone else's synchronous call, which may have pulled the next frames in with it. On the `recvmsg` read path (M3-D3) there is no such buffer, and this is a no-op.
+    - **A socket that is readable with nothing to read FOR** (no request in flight: an EOF, a late PONG) parks the watcher. It is unparked when a Fiber parks or a frame is filed, the only two things that can give a read something to do (review F3).
     - **The timer** fires at the nearest request deadline, or at one read timeout of silence. It runs `enforceDeadlines()` (M3-D1c's backstop CANCEL), checks for unread bytes, then `probeLiveness()` (a PING, then a close after a second silent timeout). These are `Ferro\Loop`'s rules, unchanged.
   - **`Session::observe()`, the one addition to the session.** A single `@internal` observer slot, called after every frame is filed — whoever read it — and when the session fails, a stream closes, or a deadline is set. Each case is needed, and each was proven by a mutation:
     - **a frame read by another Fiber's blocking call:** a suspended Fiber's terminal can be read by someone else's synchronous `query()` on the same session, leaving nothing on the socket to wake the watcher;
@@ -1503,7 +1505,8 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
     - a 0.3 s `statementTimeout` is answered by the ENGINE's `Cancelled` in under 1 s, while another Fiber on the same socket succeeds;
     - `SELECT 1/0` in one Fiber fails only that Fiber;
     - a Fiber waits for another Fiber's open stream and is woken when it closes;
-    - the same fan-out on the MySQL-family pool.
+    - the same fan-out on the MySQL-family pool;
+    - after M3-D3: the fan-out and the routing test on BOTH read paths (`receiveFds: false`, and `recvmsg` with ext-sockets), and a 2 MiB result arriving through a sealed memfd in one Fiber while six small statements are awaited in others on the same socket.
 
     Offline (`RevoltFakeEngineTest`, a forked scripted engine) pins the rest:
     - reverse-order terminals, so an await must suspend;
@@ -1511,21 +1514,52 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
     - the not-under-the-loop guard and the foreign-resume refusal;
     - the backstop CANCEL at statement timeout + 2 s, and a failed CANCEL write;
     - a silent session failing at two read timeouts without stalling a busy one, and M3-D1c review F6's late PONG;
-    - a terminal read by another caller, a session closed under a waiter, a deadline set on a watched session, and an internal failure delivered to the waiter.
-  - **Mutation round: 24 mutations of the adapter, the session hook and `Ferro\Loop`'s delegation; 20 killed, and the 4 survivors are named.**
-    - **Killed:** the delegation itself; both directions of the under-the-loop guard (always-true, and `isRunning()` alone); `{main}` not suspending; a watcher or a timer left registered; each of the four observer notifications; the foreign-resume check; a double resume; the timer skipping deadlines, liveness, or the deadline in its wake time; the adapter's own catch, and its delivery to waiters; and `Ferro\Loop` delegating before its owned check.
-    - **Three survivors are unobservable on the only driver installable here.** The PHP-buffer drain, and its deferred re-read when a Fiber parks, are needed only by fd-based drivers (ev, uv, event). It was verified that `stream_select` — and so Revolt's `StreamSelectDriver` — reports PHP-buffered bytes as readable. The unread-bytes check before a liveness PING is defensive in the same way, because `StreamSelectDriver` enqueues read callbacks before timers.
-    - **The fourth survivor costs only CPU.** The guard that parks a readable-but-unreadable watcher stops a level-triggered spin and changes no result.
+    - a terminal read by another caller, a session closed under a waiter, a deadline set on a watched session, and an internal failure delivered to the waiter;
+    - the review round's regressions (below), each on both read paths where the path matters.
+  - **Mutation round, re-run after the review: 38 mutations covering the adapter, the session hooks and `Ferro\Loop`'s delegation; 36 killed, 2 named survivors.** These are the first round's 24 rewritten for the fixed code, the review's MA–MQ, and new ones for every review fix.
+    - **Killed:**
+      - the delegation itself, and `Ferro\Loop` delegating before its owned check;
+      - every arm of the under-the-loop guard: always-true, `isRunning()` alone, `TracingDriver` not looked through, an unknown driver falling back to `isRunning()`;
+      - `{main}` not suspending, and the `uninstall()` guard;
+      - a watcher or a timer left registered, including after a refused foreign resume;
+      - the foreign-resume check, a wrong resume token, and a double resume;
+      - not resuming every waiter on failure, the adapter's own catch, and its delivery to waiters;
+      - each of the session's four notifications, waking by request id, and counting a frame as liveness progress;
+      - reading on a stale event; not parking, re-enabling, or never unparking a read with nothing to read for;
+      - `readable()` without its re-check;
+      - each of the three PHP-buffer drains (on park, after a capped burst, and on a frame someone else read). These are killed under `FdOnlyDriver`, a test driver that sees kernel readiness only, as ev, uv and event do. The first round had called them unobservable, which was true only of `StreamSelectDriver`: it reports PHP-buffered bytes as readable;
+      - the timer skipping deadlines, liveness, the unread check (review F2), or the deadline in its wake time;
+      - `recheck()` not re-arming.
+    - **Two survivors, with reasons:**
+      - **The 64-frame cap per event.** It is fairness, not correctness: removing it changes no result, only how long one burst holds the loop.
+      - **The timer's unread branch returning without reading (MQ).** It is now equivalent. Bytes in the kernel fire the watcher, whose re-check re-arms the timer. Bytes in PHP's buffer were already queued for a drain at whichever of the three points put them there. Nothing in flight means nothing for the timer to do.
+  - **The adversarial review (HEAD `f3b68df`) confirmed six findings; all fixed, each with a test that failed first.**
+    - **F1 (HIGH): a stale readable event froze the whole loop.** The watcher read on every readable event. An event can go stale before it runs: the same bytes reported twice in one tick (the deferred read a parking Fiber queues for PHP-buffered bytes, plus the driver's own report), or another Fiber's synchronous call consuming them first. `Session::pollOnce()` then BLOCKS — the event loop with it — until the session's next frame, up to a full read timeout.
+      - Measured: a 50 ms timer fired twice in 2.1 s, and the longest gap was 5.01 s. It reproduces on one session (`fread` path) and across two sessions (both read paths).
+      - The watcher now checks that bytes are waiting before every read (zero-wait select, or PHP's `unread_bytes`).
+    - **F2: the unread check before a liveness PING is load-bearing on `StreamSelectDriver`.** The first round called it driver-specific and untested; that was wrong. Two overdue timers make the adapter's timer run in the SAME dispatch, after the answer and the PONG arrived but before any read. Without the check, a HEALTHY session was closed for "not answering a liveness PING", and a write on it would have been `Indeterminate`. That case is now a test.
+    - **F3: the guard against a readable-but-unreadable socket was dead code.** The read was disabled, then `recheck()` re-enabled it on the same call. A Fiber waiting for another Fiber's stream to close, with the engine's EOF on the socket, spun at 1.3 s of CPU in 1.5 s. The watcher is now parked when no request is in flight and unparked only by a parking Fiber or a filed frame; CPU over the same wait is bounded in a test.
+    - **F4: the unknown-driver fallback was `isRunning()`**, the signal this entry measured wrong. It stranded a Fiber under `REVOLT_DRIVER_DEBUG_TRACE=1`. `TracingDriver` is now looked through, and any other driver answers no, so the Fiber blocks. Tests cover both: under `TracingDriver` loop-driven Fibers still suspend, and under an opaque driver a Fiber `{main}` started blocks.
+    - **F5: five mutations survived the first round's tests**:
+      - `park()` leaving the watch alive after a refused foreign resume;
+      - the `uninstall()` guard;
+      - the liveness clock ignoring frames, which caused spurious PINGs on a busy session;
+      - `readable()` without its re-check;
+      - the timer's unread branch returning without reading.
 
-    No `ext-ev`/`ext-uv`/`ext-event` is available, so the fd-driver paths are not exercised.
+      Each now has a test, except the last, whose effect the drain added for F1 now covers (see the mutation round).
+    - **F6: test hygiene.** `RevoltLiveTest::tearDown` stops `ferrod` even if `uninstall()` throws. Both Revolt suites carry PHPUnit size attributes (`#[Medium]` 10 s, `#[Large]` 60 s), enforced through `enforceTimeLimit` with `defaultTimeLimit="0"` (unsized tests are unchanged) and `failOnRisky`, so a hang fails loudly instead of orphaning a process. Two orphaned `phpunit` processes from the first mutation round were blocked in `stream_select` with no timer — a mutated tree's signature. The mutation driver now runs each suite in its own process group and kills the group on a timeout.
+    - **Found by the flake hunt, fixed separately:** `ManifestLiveTest` used fixed table names in the shared `ferro` database, so concurrent live runs from different checkouts collided — 16/16 rounds of two concurrent runs failed. Its fixture names now carry the process id, and the manifest it writes per run carries them too.
+  - **M3-D3 interplay, checked after the merge.** On the `recvmsg` read path there is no PHP-side buffer, so `bufferedBytes()` is 0 and `stream_select` on the stream is truthful. The watcher reads through `pollOnce()`, so D3's reserve and peek (`beginFrame()`) and the memfd substitution happen inside the session as for any reader. The observer still sees the substituted frame. Both read paths are covered live; CI's `fread`-path lane (`socket_recvmsg` disabled) runs the same Revolt suites, and the memfd case is in group `oob`.
   - **The `FIBERS` client feature bit is unchanged.** It is advertised on every HELLO since M3-D1b, informational, and the engine does not read it. Revolt changes nothing about what the session can do.
   - **Dependencies.** `revolt/event-loop` ^1.0 (v1.0.9) is a `require-dev` and a `suggest` of `ferro/client`, never a `require` (charter rule 7). The adapter's classes load only when `install()` is called, and `Ferro\Loop` delegates through a closure, so a process that never installs it never loads them. `amphp/amp` was deliberately NOT added: `Amp\async()` is `EventLoop::queue` into a Revolt callback Fiber and `Amp\Future::await` is `EventLoop::getSuspension()`, the exact mechanisms the tests drive directly. A second dependency would add no coverage of Ferro's code.
   - **Cost stated:**
     - one call at boot, and an AMPHP application that forgets it gets serial awaits with no error;
-    - the under-the-loop test reads a private Revolt property, so a Revolt release that renames it degrades the guard to `isRunning()` rather than breaking;
+    - the under-the-loop test reads two private Revolt properties, so a Revolt release that renames them makes every non-`{main}` await block (serial, never stranded);
+    - one zero-wait `stream_select` per frame the watcher reads, the price of never reading on a stale event;
     - inherited from `Ferro\Loop`: a synchronous call, a stream, or an await inside a transaction still blocks the whole loop. A frame whose bytes arrive only partly blocks the watcher's read until the rest arrives, bounded by the read timeout.
   - **Not established:**
-    - the fd-based drivers;
+    - the real fd-based drivers (`ext-ev`/`ext-uv`/`ext-event` are not installable here). Their one relevant difference — readiness from the kernel only, never PHP's buffer — is emulated by a test driver (`FdOnlyDriver`) that selects through a twin stream on the same descriptor;
     - an `amphp/amp`-level test;
     - a Revolt Fiber another scheduler drives that never resumes it — it is suspended and stays so, which is the cost of the AMPHP rule;
     - fan-out numbers under Revolt on the D17 runner (§16's are `Ferro\Loop` and plain `await`, §22.2 (cs)).

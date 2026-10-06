@@ -501,6 +501,15 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         return $meta['unread_bytes'];
     }
 
+    /**
+     * Whether any request's final frame is still to be read off the wire. When none is,
+     * {@see pollOnce} reads nothing, so a scheduler must not keep asking it to (M3-D1d review F3).
+     */
+    public function hasRequestsInFlight(): bool
+    {
+        return $this->inFlight !== [];
+    }
+
     /** Whether `$requestId` was submitted and its terminal has not been consumed yet. */
     public function isPending(int $requestId): bool
     {
