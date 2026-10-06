@@ -21,6 +21,9 @@ jobs:
       # stable and catches API drift between session_classify.rs and ferrod without waiting on
       # the nightly ICE fix.
       - run: cd engine/crates/ferrod/fuzz && cargo check
+      # The same stable type-check for ferro-http's fuzz workspace (SPEC §23.4, M6-F3). It is not a
+      # workspace member, so nothing else notices if `ferro_http::fuzzing` drifts from its targets.
+      - run: cd engine/crates/ferro-http/fuzz && cargo check
       # The M0 EXIT GATE (SPEC §16.1 / D12): a bench run must stay committed under bench/results/.
       # The script existed since M0 but was wired into no workflow, so deleting the recorded
       # measurement would have been green. It needs no toolchain or backend — it is a file check.
@@ -235,6 +238,12 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - run: cd engine/crates/ferro-proto && cargo +nightly fuzz run decode_frame -- -runs=20000 -max_total_time=60
       - run: cd engine/crates/ferro-proto && cargo +nightly fuzz run roundtrip_frame -- -runs=20000 -max_total_time=60
+      # SPEC §23.4's SSRF rule (chaos case 13; M6-F3). Unlike ferrod's target, ferro-http has no
+      # tokio dependency, so these build under coverage instrumentation. Their bodies also run
+      # deterministically on stable in `cargo test -p ferro-http` (tests/property_it.rs).
+      - run: cd engine/crates/ferro-http && cargo +nightly fuzz run validate_request -- -max_total_time=60
+      - run: cd engine/crates/ferro-http && cargo +nightly fuzz run parse_origin -- -max_total_time=30
+      - run: cd engine/crates/ferro-http && cargo +nightly fuzz run classify_address -- -max_total_time=30
       # NOTE: engine/crates/ferrod/fuzz/session_classify exists but is NOT run here yet: cargo-fuzz
       # compiles tokio (a ferrod dep) under coverage instrumentation, which ICEs on current nightly
       # rustc. Fix = extract the tokio-free `classify`/codec types into their own crate the fuzz

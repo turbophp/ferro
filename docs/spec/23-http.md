@@ -136,6 +136,8 @@ Configuration uses the environment convention the tree already has (`config.rs`)
 
 - **A blank value reads as unset.** That is D14's `ALLOW_DIR` rule.
 - **An unparseable value disables that upstream, never the daemon.** It is logged at `error`, and requests to that upstream are refused.
+
+  *[Amended M6-F3 (SPEC §22.2 (cw)): an **unknown key** also disables its upstream, because a typo widens rather than narrows (`…_ALLOW_PATH=/api` would leave `ALLOW_PATHS` at `/`). Keys are matched exactly against the table below, so `api` and `api_http` both resolve; a variable two declared upstreams could both own disables both, and a `FERRO_UPSTREAM_*` variable no declared name owns is reported for the startup log. An unparseable or unknown **daemon-wide** `FERRO_HTTP_*` key disables the whole HTTP service, never the daemon (a `NAT64_PREFIXES` the engine half-applied would silently classify the wrong addresses). Upstream names are 1–64 bytes of `[A-Za-z0-9._-]` and never `_unknown`, the metrics label every `forbidden_upstream` counts under (§23.10.2); names that map to one `<NAME>` all disable. A refused configuration's error names the upstream and the key and never quotes the value. Booleans are exactly `0` or `1`. `ORIGIN` is parsed strictly: lowercase is required, not applied; no trailing `/` or `.`; no IDNA mapping (a non-ASCII host is refused); and a host whose last label is numeric must be a canonical dotted-quad, so no `inet_aton` spelling (`2130706433`, `0x7f.1`, `0177.0.0.1`, `127.1`) reaches the resolver unclassified. An IP-literal `ORIGIN` in the always-refused table (§23.8.5) disables the upstream at start. TLS keys on an `http://` origin are refused; `CLIENT_CERT_FILE` and `CLIENT_KEY_FILE` come as a pair; `RATE_BURST`/`RATE_MAX_WAIT_MS` without `RATE_PER_SEC` are refused, and `RATE_PER_SEC` takes up to three fractional digits.]*
 - **Configuration is read once, at start.** There is no reload in v1 (C18).
 
 **Daemon-wide keys:**
@@ -251,6 +253,8 @@ The `target` is checked by the following algorithm over its raw bytes. Every ste
 8. **UTF-8 opt-in** (`PATH_ENCODING=utf8`). The decoded copy must be valid UTF-8, which refuses overlong forms such as `%c0%ae` by construction. Step 7's check then also runs on each segment's NFKC normalisation, which catches fullwidth `．` (U+FF0E), one-dot and two-dot leaders, and similar characters. The default refuses non-ASCII escapes outright. Wikipedia-style APIs need the opt-in.
 9. **Prefix confinement.** Some prefix `P` in `ALLOW_PATHS` must match the raw path `T`, case-sensitively. `P` matches when `T == P`, or when `T` starts with `P` and either `P` ends with `/` or the byte after `P` in `T` is `/`. An encoded form of the prefix (`/%61pi`) does not match, which is conservative.
 
+*[Amended M6-F3 (SPEC §22.2 (cw)), all stricter than the text above, never looser:* **step 7 cuts each decoded segment at its first `;`, `?` or `#`, whatever `PATH_PARAMS` says.** With `refuse`, a raw `;` is already refused, so a `;` in the decoded copy came from `%3B`, and a server that decodes *before* stripping `;params` reads `/api/..%3B/admin` as `/admin`. A decoded `?` or `#` (`%3F`, `%23`, or through step 8 their compatibility forms U+FF1F, U+FE56, U+FF03) is cut for the same reason: code that percent-decodes the path and then parses it as a URL reads `/api/..%3F` as `/api/..` plus a query (mainstream servers do not — nginx does not re-feed a decoded `?`, `#` or `%` — so the reach is application code, one level up). Cutting can only refuse more. **`+` is not a path decoding:** it means space only in `application/x-www-form-urlencoded`, which the query may be and the path is not, so the dot check does not model it (a server that read `..+` as `.. ` would see a segment step 7 refuses in its `%20` form; no change). **Step 8 normalises the whole decoded path, then splits** (which contains the per-segment check and also catches a compatibility solidus, backslash or semicolon, `／` U+FF0F, `＼` U+FF3C, `；` U+FF1B, making a segment boundary), and **refuses a path whose NFKC form contains `%`** (the decoded copy holds none after step 6a, so it came from a character such as U+FF05, which a server that normalises and then percent-decodes would decode twice). **Every `ALLOW_PATHS` entry must itself pass steps 1–8** as a target with no query, under the upstream's own `PATH_PARAMS`/`PATH_ENCODING`; `PATH_PARAMS=allow` does not relax step 9, so `/x;v=1` does not match the prefix `/x`.]*
+
 **What the guarantee does not cover, stated:**
 
 - **The query string is not confined.** An upstream that routes on it (`index.php?r=admin`, `?action=delete`) is reachable at any route the query can name. Operators who must confine such an upstream cannot do it with `ALLOW_PATHS`.
@@ -259,6 +263,8 @@ The `target` is checked by the following algorithm over its raw bytes. Every ste
 **The `origin` field.** PHP may state the origin it believes it addresses. When present, it must be byte-equal to the upstream's normalised `ORIGIN`: lowercase, default port removed, IPv6 in brackets. A mismatch is `forbidden_origin`. The engine never *uses* the field. The check turns a drifted PHP-side map into a loud refusal.
 
 **Property gate (slice F3).** A `cargo-fuzz` target and a property test assert, for every accepted input, that the request line a test upstream *received* carries exactly that target and that `Host` is exactly the upstream authority.
+
+*[Amended M6-F3 (SPEC §22.2 (cw)): F3 has no network, so it owns the **offline half**: for every accepted generated request the HTTP/1.1 head the plan describes is rendered and parsed back as an upstream reads it (the request-target is byte-identical, there is exactly one `Host` and it is the authority, the line count is the plan's — no injection); every accepted request passes an oracle written independently of the validator; and it **re-validates identically after a round trip** (the request the engine would send is itself accepted, with the same target, kept headers and effective idempotency). Three `cargo-fuzz` targets (`validate_request`, `parse_origin`, `classify_address`) share those bodies with `cargo test`. The **wire half** — the bytes a test upstream received through `hyper` — needs the engine, and is owed by slice F4.]*
 
 **The refusal corpus (chaos case 13)** includes:
 
@@ -271,6 +277,8 @@ The `target` is checked by the following algorithm over its raw bytes. Every ste
 - CR/LF/NUL in header values.
 
 #### 23.4.3 Headers
+
+*[Amended M6-F3 (SPEC §22.2 (cw)): **every rule in the table below looks the name up FOLDED** — ASCII-lowercased, with every non-alphanumeric byte mapped to `-` — so `X_Forwarded_For`, `X.Forwarded.For` and `x-forwarded_for` all hit the forwarding row, and `X_Api_Key` is an attached name. CGI-style servers never see header names, only `HTTP_*` variables: `php -S`, WSGI (`wsgiref`), gunicorn before 22 and Puma before its CVE-2024-45614 fix merge those spellings into one variable, so an exact-name table let PHP smuggle a refused header — or a second value for an attached credential, which under `php -S` REPLACED the daemon's — past the engine (reproduced by the review). The name sent is still PHP's own bytes. The one exception is `IDEMPOTENCY_KEY_HEADER`, matched exactly (case-insensitively): folding there would widen a licence, declaring a request idempotent on a spelling a non-folding upstream never deduplicates.]*
 
 - **Names** are RFC 9110 tokens, 1–256 bytes.
 - **Values** are field-values (`0x21–0x7E`, `0x80–0xFF`, interior `SP`/`HTAB`). Every other control byte is refused, so header injection is refused, never stripped.
@@ -285,8 +293,8 @@ The `target` is checked by the following algorithm over its raw bytes. Every ste
 | `connection`, `keep-alive`, `proxy-connection`, `te` (except `te: trailers`), `http2-settings` | Dropped (hop-by-hop on a hop that is not HTTP). |
 | `expect` | Dropped. The body is already complete. |
 | `upgrade`, `proxy-authorization` | Refused. |
-| **Method and URL overrides:** `x-http-method-override`, `x-http-method`, `x-method-override`, `x-original-url`, `x-rewrite-url` | **Refused** unless named in `PASS_HEADERS`. They re-target the method or path server-side after the engine's checks (review F19). |
-| **Forwarding:** `forwarded`, any `x-forwarded-*`, `x-real-ip` | **Refused** unless named in `PASS_HEADERS`. Fronts that trust them re-route or re-authorise on them. |
+| **Method and URL overrides:** `x-http-method-override`, `x-http-method`, `x-method-override`, `x-original-url`, `x-rewrite-url`, `destination` | **Refused** unless named in `PASS_HEADERS`. They re-target the method or path server-side after the engine's checks (review F19). *[Amended M6-F3: `destination` added — WebDAV `MOVE`/`COPY` name a second target the server writes to. Cost: WebDAV clients cannot `MOVE`/`COPY` through Ferro in v1 unless the operator lists `Destination` in `PASS_HEADERS`.]* |
+| **Forwarding:** `forwarded`, any `x-forwarded-*`, `x-real-ip`, `true-client-ip`, `cf-connecting-ip`, `x-client-ip`, `client-ip`, `x-host`, `x-original-host` | **Refused** unless named in `PASS_HEADERS`. Fronts that trust them re-route or re-authorise on them. *[Amended M6-F3: the last six added, the client-identity and host headers CDNs and frameworks trust.]* |
 | A name in the upstream's attached set | Refused (the default), or overridden and counted, per `ATTACH_POLICY`. |
 | `accept-encoding` | Passed as given. When the request asks for decoding and PHP set none, the engine sets `gzip, deflate`. |
 | Everything else | Sent verbatim. **The engine adds no header except `Host`, `Content-Length`, the attached headers and the decode-only `Accept-Encoding`.** |
@@ -298,6 +306,8 @@ The `target` is checked by the following algorithm over its raw bytes. Every ste
 #### 23.4.4 Body
 
 The body is a `bin` of at most `MAX_FRAME_PAYLOAD` minus the encoded size of the rest of the frame. The client computes that size exactly and refuses a larger body before sending (§23.9.3). A `GET` or `HEAD` with a body is passed through, as curl does.
+
+*[Amended M6-F3 (SPEC §22.2 (cw)): a body larger than the smaller of the upstream's `MAX_BODY_BYTES` and `FERRO_HTTP_MAX_BODY_BYTES` can never be admitted, so it is `forbidden_body` (NonRetryable) at validation rather than a Retryable `body_budget` that no retry could satisfy; `body_budget` keeps its meaning of *current* occupancy (§23.8.6). Headers, as built: `transfer-encoding: chunked` and `te: trailers` compare their value ASCII-case-insensitively; `content-length` compares numerically (leading zeros allowed, nothing else); an `Accept-Encoding` in the attached set suppresses the decode-only one. `PASS_HEADERS` may name only the override and forwarding headers (anything else is a configuration error, not a no-op). `IDEMPOTENCY_KEY_HEADER` may not name, in any folded spelling, a header the engine sets, drops, refuses or attaches — `accept-encoding` included, which the engine may set and Guzzle sends on most requests — since an attached key would declare every request idempotent with one constant key. The attached-header file is `Name: value` lines (LF or CRLF, blank lines skipped, no comment syntax, surrounding `SP`/`HTAB` trimmed), at most 100 lines and 68 KiB, and may not name `host`, `content-length`, `transfer-encoding`, a hop-by-hop header, `expect`, `upgrade` or `proxy-authorization`. An upstream with `ALLOW_UIDS` refuses a peer whose uid the transport did not attest. A refusal is reported as a `Rule` grouped into the seven `forbidden_*` causes; the wire tokens themselves are not spelled in `ferro-http` (charter rule 2) — F4 maps the group to F2's generated `[http.causes]` constants.]*
 
 ---
 
@@ -627,6 +637,7 @@ The client's own per-request deadline is `timeout_ms` plus a margin (§23.11.0).
 **Classification.** Every resolved address, and an IP-literal `ORIGIN`, is classified after unwrapping these embeddings to the IPv4 address they carry:
 
 - IPv4-mapped `::ffff:0:0/96`;
+- SIIT IPv4-translated `::ffff:0:0:0/96` (RFC 2765, deprecated) — *[Amended M6-F3: added; it carries an IPv4 address the same way and was otherwise `public`, so a translator that still honours it would reach a metadata address under the default class]*;
 - NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`;
 - every `FERRO_HTTP_NAT64_PREFIXES` entry.
 
@@ -638,6 +649,7 @@ The client's own per-request deadline is `timeout_ms` plus a margin (§23.11.0).
 | `224.0.0.0/4`, `ff00::/8`, `255.255.255.255`, `240.0.0.0/4` | multicast, broadcast, reserved |
 | `169.254.0.0/16`, `fe80::/10` *M* | link-local: AWS/GCP/Azure/OCI/DigitalOcean IMDS `169.254.169.254`, ECS `169.254.170.2`, Tencent `169.254.0.23` |
 | `fd00:ec2::/32` *M* | AWS IPv6 IMDS `fd00:ec2::254`, EKS Pod Identity `fd00:ec2::23` (inside ULA, which would otherwise be `private`) |
+| `fd20:ce::254/128` *M* | GCP's IPv6 metadata server (inside ULA). *[Amended M6-F3: added; documented by GCP, not verified here.]* |
 | `100.100.100.200/32` *M* | Alibaba Cloud metadata (inside CGNAT) |
 | `168.63.129.16/32` *M* | Azure WireServer (a *public* address) |
 | `192.0.0.0/24` *M* | IETF special-purpose block, which includes metadata uses such as `192.0.0.192` |
@@ -648,6 +660,8 @@ The client's own per-request deadline is `timeout_ms` plus a margin (§23.11.0).
 - **`loopback`:** `127.0.0.0/8`, `::1`.
 - **`private`:** `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `fc00::/7`, and `198.18/15`, minus the always-refused rows.
 - **`public`:** everything else.
+
+*[Amended M6-F3 (SPEC §22.2 (cw)): the IPv6 rows of the always-refused table are checked **before** any embedding is unwrapped, so a `FERRO_HTTP_NAT64_PREFIXES` entry declared inside one (`fe80::/96`) cannot widen it. `64:ff9b:1::/48` may carry its IPv4 address in any RFC 6052 layout of length 48 or more, which the engine cannot see, so every candidate (/48, /56, /64, /96) is classified and **all** must be admitted. The cost: an undeclared local-use deployment is refused wherever another layout reads as refused — which is every `64:ff9b:1::/96` address, whose /48 reading is `0.0.0.0` — and the remedy is to declare the exact prefix in `FERRO_HTTP_NAT64_PREFIXES`, which then decides alone. `ALLOW_METADATA=1` admits the *M* rows whatever `ADDRESS_CLASSES` says (they sit across classes: Azure's WireServer is public, Alibaba's metadata address is inside CGNAT) and never admits another row. The classification lives in `ferro-http` (`address.rs`) from F3; F4 owns resolution and pinning.]*
 
 An IP-literal `ORIGIN` implicitly admits its own literal, unless that literal is in the always-refused table. An internal upstream on a DNS name (`http://es.internal:9200` → `10.x`) needs `ADDRESS_CLASSES=private`. That is the cost, and it is what stops a **DNS rebinding** of any upstream's name to `127.0.0.1` or to an internal service. On `https`, certificate verification also defeats rebinding; on `http`, this guard is the only defence.
 
@@ -1305,7 +1319,7 @@ Every premise below is owed by the slice that names it, and none may be relied o
 | *P19* | *HOLDS in one direction only:* message returned ⇒ not sent *(a request serialised into `hyper`'s buffer whose first I/O write fails returns no message)* | *§23.7.1* |
 | *P14* | *HOLDS WITH CAVEAT: `eof_empty`/`eof_partial_head` need the tracker's read count, counted from dispatch; `oversize_head`/`malformed_head` need `hyper`'s `Display` text; `write` vs `reset` is not reliably separable (same class, same fate); a 101 arrives as a head* | *§23.5.4, §23.5.6* |
 | *P15* | *HOLDS WITH CAVEAT: `max_buf_size` is not exact (heads up to 507 904 B delivered at 256 KiB; hard ceiling < 2×); the exact limit is the engine's own check; `hyper`'s HTTP/2 default is 16 KiB* | *§23.9.1* |
-| *P7 (h1)* | *HOLDS: ~0.6 MB past the credit with pinned 128 KiB socket buffers, against 511 MiB for the read-ahead control. After the stall, the upstream must not move for a 3 s hold, so a read-ahead slower than the 300 ms stall window is caught too, up to one frame per ~3.3 s (measured: caught at 3.2 s, missed at 4 s)* | *—* |
+| *P7 (h1)* | *HOLDS: ~0.6 MB past the credit with pinned 128 KiB socket buffers, against 511 MiB for the read-ahead control. After the stall, the upstream must not move for a 3 s hold, so a read-ahead slower than the 300 ms stall window is caught too when its reads reach the socket inside the hold — guaranteed at one frame per 350 ms; slower readers only sometimes (caught at 2–3.2 s locally, missed at 2 s on a GitHub runner)* | *—* |
 | *P3* | *HOLDS WITH CAVEAT: `tokio-rustls` defaults to `aws_lc_rs`; no CMake (measured with a failing shim); every licence allowed; the full `cargo deny check` passes, once `deny.toml` stops its licence check skipping dev-only crates (`include-dev = true`, allow-list unchanged)* | *§23.13* |
 | *P16* | *HOLDS: `MIT OR Apache-2.0` (`tinyvec`: `Zlib OR Apache-2.0 OR MIT`); NFKC folds U+FF0E/U+2024/U+2025, NFC does not* | *—* |
 | *P17* | *HOLDS, bounded by `drain_deadline`: busy and idle sessions answer new frames after the drain starts; after the hard close a request is lost, which is why §23.6.1's chassis change 2 is needed* | *—* |
