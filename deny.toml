@@ -23,3 +23,9 @@ ignore = []
 [licenses]
 version = 2
 allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Unicode-3.0", "Zlib"]
+# M6-F1a (SPEC §22.2 (ct)): cargo-deny's licence check SKIPS crates reachable only through
+# dev-dependencies unless this is set (measured with cargo-deny 0.20.2: with `ISC` removed from
+# `allow`, the check still passed, because `ring`/`rustls-webpki`/`untrusted` are dev-only in the
+# `ferro-http-spike` crate). Dev-dependencies are code this repository builds and runs, and the
+# spike's are SPEC D20's adopted set, so the licence gate covers them too. The allow-list is unchanged.
+include-dev = true
