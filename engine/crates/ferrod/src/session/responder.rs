@@ -118,9 +118,45 @@ pub struct InboundRx {
     rx: mpsc::Receiver<super::registry::Inbound>,
     cell: Arc<super::registry::InboundCell>,
     window: super::flow::Credit,
-    consumed_frames: u32,
-    consumed_bytes: u32,
+    regrant: Regrant,
     _reserve: super::flow::CapReserve,
+}
+
+/// The re-grant accounting of one `COPY_IN` (M3-D4): what has left the channel since the last grant.
+/// A pure value so the one property the memory bound rests on — every grant returns EXACTLY what was
+/// consumed, never more, in frames and in bytes — is unit-tested on its own.
+#[derive(Debug, Clone, Copy)]
+struct Regrant {
+    window: super::flow::Credit,
+    frames: u32,
+    bytes: u32,
+}
+
+impl Regrant {
+    fn new(window: super::flow::Credit) -> Self {
+        Regrant {
+            window,
+            frames: 0,
+            bytes: 0,
+        }
+    }
+
+    fn consumed(&mut self, len: usize) -> Option<(u32, u32)> {
+        self.frames += 1;
+        self.bytes = self
+            .bytes
+            .saturating_add(u32::try_from(len).unwrap_or(u32::MAX));
+        if self.frames >= self.window.frames().div_ceil(2)
+            || self.bytes >= self.window.bytes().div_ceil(2)
+        {
+            let g = (self.frames, self.bytes);
+            self.frames = 0;
+            self.bytes = 0;
+            Some(g)
+        } else {
+            None
+        }
+    }
 }
 
 impl InboundRx {
@@ -139,20 +175,7 @@ impl InboundRx {
     /// client with any credit left can always send (COPY data is divisible: it splits a chunk to fit),
     /// and one with none has sent at least half the window, so the grant always comes: no deadlock.
     pub fn consumed(&mut self, len: usize) -> Option<(u32, u32)> {
-        self.consumed_frames += 1;
-        self.consumed_bytes = self
-            .consumed_bytes
-            .saturating_add(u32::try_from(len).unwrap_or(u32::MAX));
-        if self.consumed_frames >= self.window.frames().div_ceil(2)
-            || self.consumed_bytes >= self.window.bytes().div_ceil(2)
-        {
-            let g = (self.consumed_frames, self.consumed_bytes);
-            self.consumed_frames = 0;
-            self.consumed_bytes = 0;
-            Some(g)
-        } else {
-            None
-        }
+        self.regrant.consumed(len)
     }
 }
 
@@ -260,8 +283,7 @@ impl Responder {
             rx,
             cell,
             window: ctx.window,
-            consumed_frames: 0,
-            consumed_bytes: 0,
+            regrant: Regrant::new(ctx.window),
             _reserve: reserve,
         })
     }
@@ -485,6 +507,42 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every re-grant returns EXACTLY the frames and bytes consumed since the previous one — an
+    /// over-grant (review M2: `frames + 1`) lets a conforming client overrun the channel (session-
+    /// fatal under load) or, in bytes, the session's memory bound — and one always comes by half the
+    /// window, so a client with no credit is never left waiting.
+    #[test]
+    fn a_regrant_returns_exactly_what_was_consumed_and_comes_by_half_the_window() {
+        for (wf, wb) in [(8u32, 64 * 1024u32), (32, 2 * 1024 * 1024), (1, 1), (3, 10)] {
+            let mut r = Regrant::new(Credit::new(wf, wb));
+            let (mut since_f, mut since_b) = (0u32, 0u32);
+            let (mut total_f, mut total_b, mut granted_f, mut granted_b) = (0u64, 0u64, 0u64, 0u64);
+            for i in 0..5000usize {
+                let len = (i * 7919) % (wb as usize).max(1) + 1;
+                let len = len.min(wb as usize);
+                since_f += 1;
+                since_b += len as u32;
+                total_f += 1;
+                total_b += len as u64;
+                match r.consumed(len) {
+                    Some((f, b)) => {
+                        assert_eq!((f, b), (since_f, since_b), "window ({wf}, {wb}) step {i}");
+                        granted_f += u64::from(f);
+                        granted_b += u64::from(b);
+                        since_f = 0;
+                        since_b = 0;
+                    }
+                    None => assert!(
+                        since_f < wf.div_ceil(2) && since_b < wb.div_ceil(2),
+                        "a grant was owed by half the window"
+                    ),
+                }
+            }
+            assert_eq!(granted_f + u64::from(since_f), total_f);
+            assert_eq!(granted_b + u64::from(since_b), total_b);
+        }
+    }
 
     use std::sync::Arc;
     use std::time::Duration;

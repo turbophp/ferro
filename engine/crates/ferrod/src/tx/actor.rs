@@ -515,7 +515,6 @@ pub async fn run<B: PoolBackend>(
                 readonly,
                 cancel,
                 responder,
-                inbound,
                 done,
             } => {
                 // The SAME four stop sources, combined the same way, as `ExecStreamed` above.
@@ -536,9 +535,8 @@ pub async fn run<B: PoolBackend>(
                     ),
                     None => max_instant,
                 });
-                let ended = crate::services::copy::run_copy(
-                    &mut co, direction, &sql, responder, inbound, &child, deadline, readonly, true,
-                    0,
+                let ended = crate::services::copy::run_tx_copy(
+                    &mut co, direction, &sql, responder, &child, deadline, readonly,
                 )
                 .await;
                 linker.abort();

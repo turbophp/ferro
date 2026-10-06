@@ -13,6 +13,7 @@ use Ferro\Client\FateClassifier;
 use Ferro\Client\Hydration\PlanCache;
 use Ferro\Client\Value\M1ValuePolicy;
 use Ferro\Client\Value\TypePolicyOptions;
+use Ferro\Bytes;
 use Ferro\Pg\Copy;
 use Ferro\Protocol\ErrorPayload;
 use Ferro\Protocol\ExecOk;
@@ -120,6 +121,28 @@ final class CopyRunnerTest extends TestCase
         $this->assertFalse($s->abandoned, 'no second wire operation on a failed session');
     }
 
+    /**
+     * The COPY_DONE frame's OWN write fails: the end-of-data never completely reached the engine, so
+     * the COPY cannot have applied — Retryable, not the Indeterminate of a COPY lost after it. (Review
+     * M3: marking the end-of-data sent BEFORE writing it turned this into Indeterminate unnoticed.)
+     */
+    public function testACopyDoneWriteThatFailsIsAKnownRetryableNotIndeterminate(): void
+    {
+        foreach ([false, true] as $inTx) {
+            $s = new ScriptedCopySession(grant: [8, 64]);
+            $s->failDone = true;
+            try {
+                self::runner($inTx)->in($s, 'payload', ["1\n"]);
+                $this->fail('must throw');
+            } catch (RetryableException $e) {
+                $this->assertSame(C::ERR_CONNECTION_LOST, $e->errorPayload()->code);
+                $this->assertStringContainsString('lost before its end-of-data', $e->getMessage());
+            }
+            $this->assertSame(["1\n"], $s->sent);
+            $this->assertFalse($s->abandoned, 'no second wire operation on a failed session');
+        }
+    }
+
     public function testALossAfterTheEndOfDataIsIndeterminateInAutocommitAndRetryableInATransaction(): void
     {
         foreach ([false => IndeterminateException::class, true => RetryableException::class] as $inTx => $class) {
@@ -200,6 +223,8 @@ final class CopyRunnerTest extends TestCase
         } catch (\InvalidArgumentException) {
             $this->addToAssertionCount(1);
         }
+        // bytea: its own hex input form, the backslash escaped for the COPY reader.
+        $this->assertSame("\\\\x00ff5c78\t\\\\x\n", Copy::textRow([new Bytes("\x00\xff\\x"), new Bytes('')]));
         $rows = Copy::textRows([[1], [2]]);
         $this->assertSame(["1\n", "2\n"], iterator_to_array($rows, false));
     }
@@ -218,6 +243,7 @@ final class ScriptedCopySession implements CopySessionInterface
     public array $events = [];
     public ?int $failSendAt = null;
     public bool $failReadAfterDone = false;
+    public bool $failDone = false;
 
     /** @param array{0:int,1:int} $grant */
     public function __construct(private readonly array $grant) {}
@@ -255,6 +281,9 @@ final class ScriptedCopySession implements CopySessionInterface
 
     public function sendCopyDone(int $requestId): void
     {
+        if ($this->failDone) {
+            throw new TransportException('write failed after 3 of 8 bytes');
+        }
         $this->doneSent = true;
     }
 

@@ -1043,3 +1043,240 @@ async fn exec_refuses_a_copy_statement_and_points_at_the_copy_methods() {
         assert_eq!(ok.rows[0][0], Value::I64(1));
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Review round (M3-D4): the in-tx stop-before-the-copy-starts fate, the in-tx shape refusal, and
+// backend link loss on both sides of COPY_DONE.
+// ---------------------------------------------------------------------------------------------
+
+async fn begin_tx(c: &mut TestClient, rid: u32) -> u64 {
+    c.send_request(
+        rid,
+        service::TX,
+        method_tx::BEGIN,
+        BeginRequest {
+            pool: "default".into(),
+            isolation: None,
+            readonly: false,
+        }
+        .encode(),
+    )
+    .await;
+    match Outcome::decode(&recv_for(c, rid).await.payload).unwrap() {
+        Outcome::Ok(b) => BeginResponse::decode(&b).unwrap().tx_id,
+        o => panic!("BEGIN: {o:?}"),
+    }
+}
+
+async fn tx_ctl(c: &mut TestClient, rid: u32, method: u16, tx_id: u64) -> Outcome {
+    c.send_request(rid, service::TX, method, TxControl { tx_id }.encode())
+        .await;
+    Outcome::decode(&recv_for(c, rid).await.payload).unwrap()
+}
+
+async fn tx_exec(c: &mut TestClient, rid: u32, sql: &str, tx_id: u64) -> Outcome {
+    let mut r = write(sql);
+    r.tx_id = Some(tx_id);
+    exec(c, rid, &r).await
+}
+
+/// A tx-scoped COPY_IN stopped while it waits for the session's COPY capacity — before the COPY
+/// started — must make its `TxDeadline` claim TRUE: the transaction is rolled back and tombstoned, so
+/// a later COMMIT cannot commit the transaction's earlier writes. Both stop sources: a CANCEL, and
+/// the request's own `timeout_ms`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_tx_copy_stopped_while_waiting_for_capacity_really_ends_the_transaction() {
+    let Some(url) = pg_url() else { return };
+    // One COPY_IN window is the whole inbound cap, so a second COPY_IN on the session must wait.
+    let server = exec_server_with_session_config(url, |c| {
+        c.copy_in_window_frames = 8;
+        c.copy_in_window_bytes = c.session_cap_bytes as u32;
+    });
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    exec_ok(
+        &mut c,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_capw; CREATE TABLE d4_e2e_capw (id int)",
+    )
+    .await;
+    // COPY A (autocommit) holds the cap.
+    let _ = open_in(
+        &mut c,
+        3,
+        &copy_req("COPY d4_e2e_capw FROM STDIN", false, None),
+    )
+    .await
+    .unwrap();
+
+    for (round, use_timeout) in [(0u32, false), (1, true)] {
+        let base = 10 + round * 10;
+        let tx = begin_tx(&mut c, base).await;
+        let ins = format!("INSERT INTO d4_e2e_capw VALUES ({})", 100 + round);
+        assert!(matches!(
+            tx_exec(&mut c, base + 1, &ins, tx).await,
+            Outcome::Ok(_)
+        ));
+        let mut req = copy_req("COPY d4_e2e_capw FROM STDIN", false, Some(tx));
+        if use_timeout {
+            req.timeout_ms = Some(400);
+        }
+        c.send_request(base + 2, service::SQL, method_sql::COPY_IN, req.encode())
+            .await;
+        assert!(
+            c.recv_or_none(Duration::from_millis(200)).await.is_none(),
+            "the COPY waits for capacity: no grant, no terminal"
+        );
+        if !use_timeout {
+            c.cancel(base + 2).await;
+        }
+        let e = err_body(terminal(&mut c, base + 2).await);
+        assert_eq!(e.code, errc::TX_DEADLINE, "round {round}: {e:?}");
+        let e = err_body(tx_ctl(&mut c, base + 3, method_tx::COMMIT, tx).await);
+        assert_eq!(
+            e.code,
+            errc::TX_DEADLINE,
+            "round {round}: the transaction the terminal said was rolled back must not commit: {e:?}"
+        );
+    }
+    send_done(&mut c, 3).await;
+    assert_eq!(ok_body(terminal(&mut c, 3).await).affected, 0);
+    assert_eq!(
+        count(&mut c, 40, "d4_e2e_capw").await,
+        0,
+        "neither transaction's INSERT committed"
+    );
+}
+
+/// A shape refusal inside a transaction (nothing reached the server) leaves the transaction exactly
+/// as EXEC's refusal does: open, and committable. Both methods.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shape_refusal_inside_a_transaction_leaves_it_usable() {
+    let Some(url) = pg_url() else { return };
+    let server = small_windows(url);
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    exec_ok(
+        &mut c,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_shtx; CREATE TABLE d4_e2e_shtx (id int)",
+    )
+    .await;
+    let cases = [
+        (method_sql::COPY_IN, "SELECT 1"),
+        (
+            method_sql::COPY_IN,
+            "COPY d4_e2e_shtx FROM STDIN; COPY d4_e2e_shtx FROM STDIN",
+        ),
+        (method_sql::COPY_OUT, "COPY d4_e2e_shtx FROM STDIN"),
+    ];
+    for (i, (method, sql)) in cases.iter().enumerate() {
+        let base = 10 + 10 * i as u32;
+        let tx = begin_tx(&mut c, base).await;
+        assert!(matches!(
+            tx_exec(&mut c, base + 1, "INSERT INTO d4_e2e_shtx VALUES (1)", tx).await,
+            Outcome::Ok(_)
+        ));
+        c.send_request(
+            base + 2,
+            service::SQL,
+            *method,
+            copy_req(sql, *method == method_sql::COPY_OUT, Some(tx)).encode(),
+        )
+        .await;
+        let e = err_body(Outcome::decode(&recv_for(&mut c, base + 2).await.payload).unwrap());
+        assert_eq!(e.code, errc::UNSUPPORTED, "{sql}: {e:?}");
+        assert!(
+            e.message.contains("before it reached a connection"),
+            "refused by the handler, ahead of the transaction's actor: {}",
+            e.message
+        );
+        assert!(
+            matches!(
+                tx_ctl(&mut c, base + 3, method_tx::COMMIT, tx).await,
+                Outcome::Ok(_)
+            ),
+            "{sql}: the transaction survives a refusal that sent nothing"
+        );
+        assert_eq!(count(&mut c, base + 4, "d4_e2e_shtx").await, i as i64 + 1);
+    }
+}
+
+/// Terminate the backend running `COPY <table> …`, from another session. Returns how many died.
+async fn kill_copy_backend(server: &common::TestServer, table: &str) -> i64 {
+    let mut k = server.connect().await;
+    k.hello(1).await;
+    let sql = format!(
+        "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+         WHERE query LIKE 'COPY {table} %' AND pid <> pg_backend_pid()"
+    );
+    match exec_ok(&mut k, 2, &sql).await.rows[0][0] {
+        Value::I64(n) => n,
+        ref v => panic!("{v:?}"),
+    }
+}
+
+/// The backend link dies BEFORE COPY_DONE: nothing can have applied — `ConnectionLost{Retryable}`,
+/// 0 rows. It dies during the implicit COMMIT, after COPY_DONE: the engine cannot know —
+/// `Indeterminate`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backend_killed_before_copy_done_is_retryable_and_during_commit_indeterminate() {
+    let Some(url) = pg_url() else { return };
+    let server = small_windows(url);
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    exec_ok(
+        &mut c,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_kill; CREATE TABLE d4_e2e_kill (id int);
+         DROP TABLE IF EXISTS d4_e2e_killc; CREATE TABLE d4_e2e_killc (id int);
+         CREATE OR REPLACE FUNCTION d4_e2e_sleep2() RETURNS trigger LANGUAGE plpgsql AS
+           $$ BEGIN PERFORM pg_sleep(1.5); RETURN NULL; END $$;
+         CREATE CONSTRAINT TRIGGER d4_e2e_killc_t AFTER INSERT ON d4_e2e_killc
+           DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION d4_e2e_sleep2()",
+    )
+    .await;
+
+    // Before COPY_DONE.
+    let _ = open_in(
+        &mut c,
+        3,
+        &copy_req("COPY d4_e2e_kill FROM STDIN", false, None),
+    )
+    .await
+    .unwrap();
+    send_data(&mut c, 3, b"1\n2\n").await;
+    assert_eq!(kill_copy_backend(&server, "d4_e2e_kill").await, 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    send_data(&mut c, 3, b"3\n").await;
+    let e = err_body(terminal(&mut c, 3).await);
+    assert_eq!(e.code, errc::CONNECTION_LOST, "{e:?}");
+    assert_eq!(e.branch, errc::CONNECTION_LOST_BRANCH);
+    assert_eq!(count(&mut c, 4, "d4_e2e_kill").await, 0);
+
+    // During the implicit COMMIT (a deferred trigger sleeping at commit time).
+    let _ = open_in(
+        &mut c,
+        5,
+        &copy_req("COPY d4_e2e_killc FROM STDIN", false, None),
+    )
+    .await
+    .unwrap();
+    send_data(&mut c, 5, b"1\n").await;
+    send_done(&mut c, 5).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(kill_copy_backend(&server, "d4_e2e_killc").await, 1);
+    let t = loop {
+        match c.recv_or_none(Duration::from_secs(10)).await {
+            Some(f) if f.header.flags & flags::END != 0 => {
+                break Outcome::decode(&f.payload).unwrap();
+            }
+            Some(_) => {}
+            None => panic!("no terminal"),
+        }
+    };
+    let e = err_body(t);
+    assert_eq!(e.code, errc::WRITE_UNCONFIRMED, "{e:?}");
+    assert_eq!(e.branch, errc::WRITE_UNCONFIRMED_BRANCH);
+    assert_session_alive(&mut c, 77).await;
+}

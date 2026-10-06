@@ -125,10 +125,10 @@ pub enum TxCommand {
     /// A tx-scoped SQL/`COPY_IN` or SQL/`COPY_OUT` (M3-D4). Shaped like [`TxCommand::ExecStreamed`]
     /// and for the same reason: the COPY borrows the actor's pinned `co`, so the producer runs IN the
     /// actor and declares the ONE terminal through the moved `Responder`; `done` lets the forwarding
-    /// handler return after it. `inbound` is the COPY_IN's client data channel, opened (and its
-    /// window reserved) by the forwarding handler; `None` for COPY_OUT. A COPY stopped by the client
-    /// or a deadline ends the transaction (rollback + tombstone, `TxDeadline{Retryable}`), exactly
-    /// as a streamed statement does.
+    /// handler return after it. A COPY_IN's client data channel is opened by the ACTOR
+    /// (`services::copy::run_tx_copy`), so a stop while it waits for the session's COPY capacity is
+    /// a stop of an in-tx statement like any other: it ends the transaction (rollback + tombstone,
+    /// `TxDeadline{Retryable}`), exactly as a streamed statement does.
     Copy {
         direction: ferro_classify::CopyDirection,
         sql: String,
@@ -136,7 +136,6 @@ pub enum TxCommand {
         readonly: bool,
         cancel: CancellationToken,
         responder: Responder,
-        inbound: Option<crate::session::responder::InboundRx>,
         done: oneshot::Sender<()>,
     },
     /// Establish a savepoint. `name` is an optional client alias; the engine composes the ACTUAL

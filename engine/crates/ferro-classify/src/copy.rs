@@ -51,7 +51,17 @@ enum Tok {
 /// The direction of `sql` if it is exactly one PostgreSQL `COPY … FROM STDIN` or
 /// `COPY … TO STDOUT` statement (a trailing `;` allowed), else `None`.
 pub fn copy_direction(sql: &str) -> Option<CopyDirection> {
-    let toks = tokenize(&scan::masked_code(sql))?;
+    // The region pass is total: an UNTERMINATED literal, block comment or dollar-quoted body simply
+    // runs to the end of the input, so a statement like `COPY t FROM STDIN 'x` would mask to a
+    // well-formed COPY. Probe for that: append a newline (which legitimately ends a `--` comment)
+    // and a marker; the marker survives in the masked copy only if every region was closed.
+    let probe = format!("{sql}\n;");
+    let masked = scan::masked_code(&probe);
+    if !masked.ends_with(';') {
+        return None;
+    }
+    // The two probe bytes are ASCII and the mask is byte-for-byte, so this is a char boundary.
+    let toks = tokenize(&masked[..masked.len() - 2])?;
     let mut it = toks.iter().enumerate();
     match it.next() {
         Some((_, Tok::Word(w))) if w == "COPY" => {}
@@ -241,6 +251,86 @@ mod tests {
         assert!(!speaks_copy_stdio("-- COPY t FROM STDIN\nSELECT 1"));
         assert!(!speaks_copy_stdio("COPY t FROM '/x.csv'"));
         assert!(!speaks_copy_stdio("SELECT 1"));
+    }
+
+    /// Tokenization edge cases, each with the verdict the server's own grammar implies. The
+    /// refusal direction wins on anything not positively recognised.
+    #[test]
+    fn tokenization_edge_cases_and_the_refusal_direction() {
+        let cases: &[(&str, Option<CopyDirection>)] = &[
+            // Comments before, inside and after the statement.
+            ("/* lead */ COPY t FROM STDIN", Some(In)),
+            ("/* a /* nested */ b */ COPY t FROM STDIN", Some(In)),
+            ("COPY /* x */ t /* y */ FROM /* z */ STDIN", Some(In)),
+            ("COPY t FROM -- c\n STDIN", Some(In)),
+            ("COPY t FROM STDIN -- trailing; DROP TABLE t", Some(In)),
+            ("COPY t FROM STDIN /* ; DROP TABLE t */", Some(In)),
+            ("COPY t TO STDOUT --", Some(Out)),
+            // Unterminated regions: the server rejects them; so does the shape check.
+            ("COPY t FROM STDIN /* open", None),
+            ("COPY t FROM STDIN 'open", None),
+            ("COPY t FROM STDIN $$ open", None),
+            ("COPY t FROM STDIN E'open\\'", None),
+            ("COPY (SELECT 'a) TO STDOUT", None),
+            // Quoted identifiers spelling the keywords are identifiers, never the target.
+            ("COPY t FROM \"stdin\"", None),
+            ("COPY t TO \"stdout\"", None),
+            ("COPY \"stdin\" FROM STDIN", Some(In)),
+            ("COPY \"t\" (\"from\", \"to\") FROM STDIN", Some(In)),
+            // The keywords inside a literal or a dollar-quoted body are values.
+            ("COPY t FROM 'STDIN'", None),
+            ("COPY t FROM $$STDIN$$", None),
+            ("COPY (SELECT $$ FROM STDIN $$) TO STDOUT", Some(Out)),
+            ("COPY (SELECT $q$ ) TO STDOUT; $q$) TO STDOUT", Some(Out)),
+            ("COPY (SELECT E'\\' TO STDOUT') TO STDOUT", Some(Out)),
+            ("SELECT 'COPY t FROM STDIN'", None),
+            // Case.
+            ("CoPy T fRoM sTdIn", Some(In)),
+            ("copy t to stdout", Some(Out)),
+            // Unicode whitespace is not whitespace to PostgreSQL's lexer: it is identifier text.
+            ("COPY\u{00A0}t FROM STDIN", None),
+            ("COPY t FROM\u{00A0}STDIN", None),
+            ("COPY t FROM\u{2003}STDIN", None),
+            ("COPY t\u{3000}FROM STDIN", None),
+            // ASCII whitespace of every kind is.
+            ("COPY\tt\r\nFROM\x0cSTDIN", Some(In)),
+            // Option lists.
+            (
+                "COPY t FROM STDIN WITH (FORMAT csv, HEADER true, QUOTE '\"', NULL '')",
+                Some(In),
+            ),
+            ("COPY t TO STDOUT (FORMAT binary)", Some(Out)),
+            ("COPY t FROM STDIN WITH CSV HEADER", Some(In)),
+            // One statement only, whatever follows.
+            ("COPY t FROM STDIN; DROP TABLE t", None),
+            ("COPY t FROM STDIN;DROP TABLE t;", None),
+            ("COPY t FROM STDIN; ;", Some(In)),
+            ("COPY t TO STDOUT; SELECT 1", None),
+            ("SELECT 1; COPY t FROM STDIN", None),
+            // psql meta-commands and lookalikes.
+            ("\\copy t from stdin", None),
+            ("\\copy t to stdout", None),
+            ("COPY t FROM STDIN_X", None),
+            ("COPY t FROM pstdin", None),
+            ("COPYt FROM STDIN", None),
+            // Nested parentheses and quotes inside a query.
+            (
+                "COPY (SELECT '(' || a, \"x)\" FROM (SELECT 1 AS a, 2 AS \"x)\") s) TO STDOUT",
+                Some(Out),
+            ),
+            (
+                "COPY (SELECT ((1)) FROM (SELECT (2)) s WHERE (3) = (3)) TO STDOUT",
+                Some(Out),
+            ),
+            ("COPY ((SELECT 1) TO STDOUT", None),
+            ("COPY (SELECT 1)) TO STDOUT", None),
+            // The server's grammar refuses a query as a FROM source (42601, before copy mode, known
+            // fate); the shape is still a COPY FROM STDIN, and the server decides the rest.
+            ("COPY (SELECT 1 FROM t) FROM STDIN", Some(In)),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(copy_direction(sql), *want, "{sql:?}");
+        }
     }
 
     #[test]

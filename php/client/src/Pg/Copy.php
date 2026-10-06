@@ -2,6 +2,7 @@
 declare(strict_types=1);
 namespace Ferro\Pg;
 
+use Ferro\Bytes;
 use Ferro\Client\Connection;
 use Ferro\Client\TxHandle;
 
@@ -52,13 +53,17 @@ final class Copy
     /**
      * One row in PostgreSQL's default COPY TEXT format (tab-delimited, `\N` for NULL), newline
      * included. A string is escaped exactly as the format requires — backslash, newline, carriage
-     * return and tab become `\\`, `\n`, `\r`, `\t` — so any byte sequence round-trips; an int is its
-     * decimal form; a bool is `t`/`f`; null is `\N`. A float is REFUSED: PHP's own string form of a
-     * float depends on `precision` and can drop digits, so format it yourself into a string. Only for
-     * the default text format: a statement with `DELIMITER`, `NULL` or `FORMAT csv` options needs rows
-     * in that format instead.
+     * return and tab become `\\`, `\n`, `\r`, `\t` — so the server's COPY reader hands the column
+     * type's TEXT INPUT exactly the bytes given. What the column makes of them is that type's input
+     * function: into `text`/`varchar` they round-trip (a NUL byte or invalid encoding is refused by
+     * the server, loudly); into `bytea` they do NOT — bytea's input re-parses `\x…` and `\nnn` — so
+     * pass a {@see Bytes} for a bytea column, which is rendered in bytea's own hex form and
+     * round-trips any bytes. An int is its decimal form; a bool is `t`/`f`; null is `\N`. A float is
+     * REFUSED: PHP's own string form of a float depends on `precision` and can drop digits, so format
+     * it yourself into a string. Only for the default text format: a statement with `DELIMITER`,
+     * `NULL` or `FORMAT csv` options needs rows in that format instead.
      *
-     * @param array<array-key, mixed> $values string|int|bool|null, checked at runtime
+     * @param array<array-key, mixed> $values string|int|bool|null|Bytes, checked at runtime
      */
     public static function textRow(array $values): string
     {
@@ -68,9 +73,11 @@ final class Copy
                 $v === null => '\N',
                 is_bool($v) => $v ? 't' : 'f',
                 is_int($v) => (string) $v,
+                // bytea's hex input form (`\x` + hex), its backslash escaped for the COPY reader.
+                $v instanceof Bytes => '\\\\x' . bin2hex($v->value),
                 is_string($v) => strtr($v, ['\\' => '\\\\', "\n" => '\n', "\r" => '\r', "\t" => '\t']),
                 default => throw new \InvalidArgumentException(sprintf(
-                    'Copy::textRow() takes string|int|bool|null, got %s (format a float into a string yourself)',
+                    'Copy::textRow() takes string|int|bool|null|Ferro\\Bytes, got %s (format a float into a string yourself)',
                     get_debug_type($v),
                 )),
             };

@@ -2,6 +2,7 @@
 declare(strict_types=1);
 namespace Ferro\Tests\Live;
 
+use Ferro\Bytes;
 use Ferro\Client\Connection;
 use Ferro\Client\Error\NonRetryableException;
 use Ferro\Pg\Copy;
@@ -203,6 +204,55 @@ final class CopyLiveTest extends LiveTestCase
         } catch (NonRetryableException $e) {
             $this->assertSame(C::ERR_UNSUPPORTED, $e->errorPayload()->code);
             $this->assertStringContainsString('COPY_IN', $e->getMessage());
+        }
+    }
+
+    /**
+     * A shape refusal inside an imperative transaction sent nothing, so it leaves the transaction
+     * exactly as an EXEC refusal does: open, and committable with its earlier write (review F2).
+     */
+    public function testAShapeRefusalInsideATransactionLeavesItCommittable(): void
+    {
+        $conn = $this->conn();
+        $conn->exec('DROP TABLE IF EXISTS d4_php_shtx');
+        $conn->exec('CREATE TABLE d4_php_shtx (id int)');
+        $refusals = [
+            static fn (Connection $c) => $c->copyIn('COPY d4_php_shtx FROM STDIN; COPY d4_php_shtx FROM STDIN', ["1\n"]),
+            static fn (Connection $c) => $c->copyIn('SELECT 1', ["1\n"]),
+            static fn (Connection $c) => iterator_to_array($c->copyOut('COPY d4_php_shtx FROM STDIN')),
+        ];
+        foreach ($refusals as $i => $refuse) {
+            $conn->begin();
+            $conn->exec('INSERT INTO d4_php_shtx VALUES (1)');
+            try {
+                $refuse($conn);
+                $this->fail("case {$i}: must be refused");
+            } catch (NonRetryableException $e) {
+                $this->assertSame(C::ERR_UNSUPPORTED, $e->errorPayload()->code, "case {$i}");
+            }
+            $conn->commit();
+            $this->assertSame($i + 1, $conn->scalar('SELECT count(*)::int FROM d4_php_shtx'), "case {$i}: committed");
+        }
+    }
+
+    /** bytea through `textRow`: a {@see Bytes} round-trips every byte value (review F3). */
+    public function testBytesRoundTripIntoAByteaColumn(): void
+    {
+        $conn = $this->conn();
+        $conn->exec('DROP TABLE IF EXISTS d4_php_bytea');
+        $conn->exec('CREATE TABLE d4_php_bytea (id int, b bytea)');
+        $all = '';
+        for ($i = 0; $i < 256; $i++) {
+            $all .= chr($i);
+        }
+        $values = [$all, '\x41', '\\', "\t\n\r", ''];
+        $rows = [];
+        foreach ($values as $i => $v) {
+            $rows[] = [$i, new Bytes($v)];
+        }
+        $this->assertSame(count($values), (new Copy($conn))->in('COPY d4_php_bytea (id, b) FROM STDIN', Copy::textRows($rows)));
+        foreach ($values as $i => $v) {
+            $this->assertSame(bin2hex($v), $conn->scalar("SELECT encode(b, 'hex') FROM d4_php_bytea WHERE id = {$i}"), "row {$i}");
         }
     }
 

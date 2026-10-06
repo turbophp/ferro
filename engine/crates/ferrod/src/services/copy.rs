@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use ferro_classify::CopyDirection;
+use ferro_classify::{CopyDirection, copy_direction};
 use ferro_pool::backend::{Cancel, PoolBackend};
 use ferro_pool::error::PoolError;
 use ferro_pool::pool::{Checkout, Pool};
@@ -134,6 +134,23 @@ pub(crate) async fn handle_copy(
         ));
         return;
     }
+    // The statement's SHAPE, checked before anything else is involved — no connection, no
+    // transaction actor. A refusal here sent nothing, so it must leave a transaction exactly as
+    // EXEC's refusal does: open (review F2 — run in the actor, it had torn the transaction down).
+    // `Checkout::copy_in`/`copy_out` keep the same check as defence in depth for any other caller.
+    if copy_direction(&req.sql) != Some(direction) {
+        responder.end_error(unsupported(match direction {
+            CopyDirection::In => {
+                "COPY_IN requires exactly one `COPY … FROM STDIN` statement (refused before it \
+                 reached a connection; nothing was sent)"
+            }
+            CopyDirection::Out => {
+                "COPY_OUT requires exactly one `COPY … TO STDOUT` statement (refused before it \
+                 reached a connection; nothing was sent)"
+            }
+        }));
+        return;
+    }
     let deadline = req
         .timeout_ms
         .map(|ms| tokio::time::Instant::now() + Duration::from_millis(u64::from(ms)));
@@ -151,14 +168,11 @@ pub(crate) async fn handle_copy(
                 responder.end_error(copy_unsupported());
                 return;
             }
-            let inbound =
-                match open_inbound_for(direction, &responder, &cancel, deadline, true).await {
-                    Ok(i) => i,
-                    Err(ep) => {
-                        responder.end_error(ep);
-                        return;
-                    }
-                };
+            // The data channel (and the wait for the session's COPY capacity) is opened INSIDE the
+            // actor ([`run_tx_copy`]), never here: a stop during that wait must end the transaction
+            // for the `TxDeadline` it reports to be true, and only the actor can end it (review F1 —
+            // opened here, a CANCEL reported "rolled back" while the transaction lived on and
+            // committed). The connection is pinned already, so waiting there holds nothing new.
             let (done_tx, done_rx) = oneshot::channel::<()>();
             let cmd = TxCommand::Copy {
                 direction,
@@ -167,7 +181,6 @@ pub(crate) async fn handle_copy(
                 readonly: req.readonly,
                 cancel,
                 responder,
-                inbound,
                 done: done_tx,
             };
             match handle.cmd_tx.send(cmd).await {
@@ -219,33 +232,68 @@ fn copy_unsupported() -> ferro_proto::messages::ErrorPayload {
     )
 }
 
-/// For a COPY_IN, reserve its window and open its data channel — BEFORE any checkout, so a session
-/// at its inbound cap never holds a pooled connection while it waits. A wait the client cancels or
-/// a deadline ends is a known did-not-apply. `None` for a COPY_OUT.
+/// For a COPY_IN, reserve its window and open its data channel — in autocommit BEFORE any checkout,
+/// so a session at its inbound cap never holds a pooled connection while it waits; in a transaction
+/// inside the actor. A wait the client cancels or a deadline ends is a known did-not-apply. `None`
+/// for a COPY_OUT. The error's `bool` says whether the request was STOPPED (which ends a
+/// transaction, like any other stop of an in-tx statement) rather than refused.
 async fn open_inbound_for(
     direction: CopyDirection,
     responder: &Responder,
     cancel: &CancellationToken,
     deadline: Option<tokio::time::Instant>,
     in_tx: bool,
-) -> Result<Option<InboundRx>, ferro_proto::messages::ErrorPayload> {
+) -> Result<Option<InboundRx>, (ferro_proto::messages::ErrorPayload, bool)> {
     if direction == CopyDirection::Out {
         return Ok(None);
     }
     match responder.open_inbound(cancel, deadline).await {
         Ok(rx) => Ok(Some(rx)),
-        Err(OpenInboundError::Aborted(_)) => Err(fate::classify_fate(
-            copy_stopped_before_done("waiting for the session's COPY capacity"),
-            OpContext {
-                readonly: false,
-                sent: false,
-                in_tx,
-            },
+        Err(OpenInboundError::Aborted(_)) => Err((
+            fate::classify_fate(
+                copy_stopped_before_done("waiting for the session's COPY capacity"),
+                OpContext {
+                    readonly: false,
+                    sent: false,
+                    in_tx,
+                },
+            ),
+            true,
         )),
         Err(OpenInboundError::Unavailable) => {
-            Err(protocol("COPY_IN could not open its data channel"))
+            Err((protocol("COPY_IN could not open its data channel"), false))
         }
     }
+}
+
+/// A tx-scoped COPY, run by the transaction's actor on its pinned `co`: open the COPY_IN's data
+/// channel here (see `handle_copy`), then [`run_copy`]. A stop while waiting for capacity returns
+/// `Broken`, so the actor rolls back and tombstones — which is what the `TxDeadline` it reports says.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tx_copy<B: PoolBackend>(
+    co: &mut Checkout<B>,
+    direction: CopyDirection,
+    sql: &str,
+    responder: Responder,
+    cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+    readonly: bool,
+) -> StreamEnded {
+    let inbound = match open_inbound_for(direction, &responder, cancel, deadline, true).await {
+        Ok(i) => i,
+        Err((ep, stopped)) => {
+            responder.end_error(ep);
+            return if stopped {
+                StreamEnded::Broken
+            } else {
+                StreamEnded::Intact
+            };
+        }
+    };
+    run_copy(
+        co, direction, sql, responder, inbound, cancel, deadline, readonly, true, 0,
+    )
+    .await
 }
 
 async fn run_autocommit_copy<B: PoolBackend>(
@@ -258,7 +306,7 @@ async fn run_autocommit_copy<B: PoolBackend>(
 ) {
     let inbound = match open_inbound_for(direction, &responder, &cancel, deadline, false).await {
         Ok(i) => i,
-        Err(ep) => {
+        Err((ep, _)) => {
             responder.end_error(ep);
             return;
         }
@@ -341,9 +389,10 @@ pub(crate) async fn run_copy<B: PoolBackend>(
 
 /// Did this error end the transaction it ran in? A server's own rejection (a malformed row, a
 /// constraint) leaves the transaction open — failed, for the client to roll back, exactly as a
-/// failed EXEC does. A cancel/timeout (57014) or anything that is not a server answer ends it.
+/// failed EXEC does — and so does a refusal that sent nothing (`Unsupported`). A cancel/timeout
+/// (57014) or anything else — a lost link, a timeout — ends it.
 fn ends_tx(e: &PoolError) -> bool {
-    fate::is_57014(e) || !matches!(e, PoolError::Sql { .. })
+    fate::is_57014(e) || !matches!(e, PoolError::Sql { .. } | PoolError::Unsupported(_))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -694,5 +743,25 @@ async fn run_copy_out<B: PoolBackend>(
                 StreamEnded::Intact
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_or_a_server_error_keeps_the_transaction_and_a_stop_ends_it() {
+        assert!(!ends_tx(&PoolError::Unsupported("shape".into())));
+        assert!(!ends_tx(&PoolError::Sql {
+            code: errc::PROTOCOL,
+            branch: errc::PROTOCOL_BRANCH,
+            sqlstate: Some("22P02".into()),
+            errno: None,
+            message: "bad row".into(),
+        }));
+        assert!(ends_tx(&copy_stopped_before_done("cancelled")));
+        assert!(ends_tx(&PoolError::ConnectionLost));
+        assert!(ends_tx(&PoolError::Timeout));
     }
 }
