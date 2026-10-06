@@ -25,6 +25,11 @@ const DEFAULT_SOCKET_PATH: &str = "/run/ferro/dev.sock";
 /// doc above for why that floor exists).
 const DEFAULT_SESSION_CAP_BYTES: usize = 16 * 1024 * 1024;
 
+/// Default out-of-band threshold (SPEC §5.1, M3-D3): a buffered success terminal whose inline
+/// payload is at least this many bytes moves into a sealed memfd for a client that advertised
+/// `MEMFD_RX`. §5.1's own default.
+pub const DEFAULT_MEMFD_THRESHOLD_BYTES: usize = 1024 * 1024;
+
 /// Default cap on concurrently in-flight requests per session.
 const DEFAULT_MAX_INFLIGHT: usize = 1024;
 
@@ -305,6 +310,11 @@ pub struct Config {
     /// test harness) after [`crate::manifest::LoadedManifest::load`] succeeds; never by `from_env`,
     /// because loading can fail and `from_env` falls back to defaults instead of failing.
     pub manifest: Option<std::sync::Arc<crate::manifest::LoadedManifest>>,
+    /// SPEC §5.1 (M3-D3): the inline-payload size at or above which a success terminal is sent
+    /// through a sealed memfd to a client that advertised `MEMFD_RX`, or `None` to never do so.
+    /// From `FERRO_MEMFD_THRESHOLD_BYTES` (see [`parse_memfd_threshold`]); default
+    /// [`DEFAULT_MEMFD_THRESHOLD_BYTES`].
+    pub memfd_threshold: Option<usize>,
 }
 
 impl Default for Config {
@@ -329,6 +339,7 @@ impl Default for Config {
             pools: Vec::new(),
             manifest_path: None,
             manifest: None,
+            memfd_threshold: Some(DEFAULT_MEMFD_THRESHOLD_BYTES),
         }
     }
 }
@@ -381,6 +392,9 @@ impl Config {
                 Some(t.to_string())
             };
         }
+        if let Ok(raw) = std::env::var("FERRO_MEMFD_THRESHOLD_BYTES") {
+            cfg.memfd_threshold = parse_memfd_threshold(&raw);
+        }
         // SPEC §13 OTLP traces. An observability misconfiguration must not become an outage, so
         // an unusable value disables tracing loudly instead of refusing to start.
         cfg.otlp = match crate::otlp::config_from(&|k| std::env::var(k).ok()) {
@@ -430,6 +444,35 @@ impl Config {
             });
         }
         Ok(())
+    }
+}
+
+/// Parse `FERRO_MEMFD_THRESHOLD_BYTES` (M3-D3). A byte count is the threshold (`0` sends EVERY
+/// success terminal out of band, which is what a test of the path wants); `off` disables the path;
+/// a BLANK value reads as unset (the D14 `allow_dir` rule), so it keeps the default.
+///
+/// A value that does not parse keeps the DEFAULT and is warned about, rather than disabling the
+/// path or refusing to start: the two paths are observably identical apart from throughput (§5.1),
+/// so a typo cannot change what any client receives, and a startup failure over a tuning knob would
+/// turn a typo into an outage.
+pub fn parse_memfd_threshold(raw: &str) -> Option<usize> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Some(DEFAULT_MEMFD_THRESHOLD_BYTES);
+    }
+    if t.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    match t.parse::<usize>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            tracing::warn!(
+                value = t,
+                default = DEFAULT_MEMFD_THRESHOLD_BYTES,
+                "FERRO_MEMFD_THRESHOLD_BYTES is neither a byte count nor `off`; keeping the default"
+            );
+            Some(DEFAULT_MEMFD_THRESHOLD_BYTES)
+        }
     }
 }
 
@@ -752,6 +795,30 @@ mod tests {
         let my = pools.iter().find(|p| p.name == "mypool").unwrap();
         assert_eq!(pg.kind, PoolKind::Postgres);
         assert_eq!(my.kind, PoolKind::Mysql);
+    }
+
+    #[test]
+    fn the_memfd_threshold_knob() {
+        assert_eq!(
+            Config::default().memfd_threshold,
+            Some(DEFAULT_MEMFD_THRESHOLD_BYTES),
+            "ON by default, at SPEC §5.1's 1 MiB"
+        );
+        assert_eq!(DEFAULT_MEMFD_THRESHOLD_BYTES, 1 << 20);
+        assert_eq!(parse_memfd_threshold("4096"), Some(4096));
+        assert_eq!(parse_memfd_threshold(" 0 "), Some(0));
+        assert_eq!(parse_memfd_threshold("off"), None);
+        assert_eq!(parse_memfd_threshold("OFF"), None);
+        assert_eq!(
+            parse_memfd_threshold("   "),
+            Some(DEFAULT_MEMFD_THRESHOLD_BYTES),
+            "blank reads as unset"
+        );
+        assert_eq!(
+            parse_memfd_threshold("1MiB"),
+            Some(DEFAULT_MEMFD_THRESHOLD_BYTES),
+            "a typo keeps the default"
+        );
     }
 
     #[test]

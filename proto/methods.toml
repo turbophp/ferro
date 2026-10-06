@@ -84,6 +84,16 @@ OK        = 0
 ERROR     = 1
 CANCELLED = 2
 
+# Out-of-band payload encodings (M3-D3, SPEC §5.1, PROTOCOL.md §1.1). A frame carrying the `OOB_FD`
+# flag has an `OobRef {fd_index, len, encoding}` as its payload, and `encoding` says what the
+# passed memfd's `len` bytes ARE. In /proto for the same reason `[outcome]` is: both codecs
+# generate it instead of hand-writing the byte (charter rule 2).
+# FRAME_PAYLOAD: the memfd holds exactly the bytes the frame would have carried INLINE as its
+# payload (for an `END` frame, the whole `Outcome` envelope), so a receiver decodes them exactly as
+# it would an inline payload. `COMPRESSED` (D11) would be a second value; none exists.
+[oob_encoding]
+FRAME_PAYLOAD = 0
+
 [features.engine]
 MEMFD          = 0x01
 LISTEN_STREAMS = 0x02

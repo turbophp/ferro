@@ -51,6 +51,36 @@ final class DriverOptionsTest extends TestCase
         DriverOptions::fromParams([]);
     }
 
+    /**
+     * `receive_fds` (SPEC §5.1): unset is AUTO (null), and an application can opt this connection
+     * out of the memfd path (`false`) or insist on it (`true`). Anything else is refused.
+     */
+    public function testReceiveFdsIsAutoUnlessSetAndOnlyABoolOrNull(): void
+    {
+        self::assertNull(DriverOptions::fromParams(['unix_socket' => '/s'])->receiveFds);
+        foreach ([false, true, null] as $v) {
+            $o = DriverOptions::fromParams(['unix_socket' => '/s', 'driverOptions' => ['receive_fds' => $v]]);
+            self::assertSame($v, $o->receiveFds);
+        }
+        $this->expectException(\InvalidArgumentException::class);
+        DriverOptions::fromParams(['unix_socket' => '/s', 'driverOptions' => ['receive_fds' => 'no']]);
+    }
+
+    /**
+     * `receive_fds = true` insists, and the TCP fallback can never receive an fd: refused, never
+     * silently ignored. `false` or unset is fine there (TCP reads inline anyway).
+     */
+    public function testReceiveFdsTrueOnTheTcpFallbackIsRefused(): void
+    {
+        foreach ([false, null] as $v) {
+            $o = DriverOptions::fromParams(['host' => '127.0.0.1', 'port' => 7777, 'driverOptions' => ['receive_fds' => $v]]);
+            self::assertSame($v, $o->receiveFds);
+        }
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessageMatches('/receive_fds.*TCP/');
+        DriverOptions::fromParams(['host' => '127.0.0.1', 'port' => 7777, 'driverOptions' => ['receive_fds' => true]]);
+    }
+
     /** A wrongly-typed option is refused, not silently coerced (level 9 narrows, but so do we). */
     public function testAWronglyTypedOptionIsRefused(): void
     {

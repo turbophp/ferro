@@ -25,7 +25,7 @@ alignment — the payload starts at byte 16.
 |---|---|---|---|
 | 0 | `magic` | `u8` | always `0xF7` (`consts::MAGIC`) |
 | 1 | `version` | `u8` | protocol major version, currently `4` (`consts::PROTOCOL_VERSION`) |
-| 2 | `flags` | `u16` | bitfield: `STREAM 0x01`, `END 0x02`, `CANCEL 0x04`, `OOB_FD 0x08`, `COMPRESSED 0x10` (reserved, unimplemented before post-M3) |
+| 2 | `flags` | `u16` | bitfield: `STREAM 0x01`, `END 0x02`, `CANCEL 0x04`, `OOB_FD 0x08` (engine → client only, §1.1), `COMPRESSED 0x10` (reserved, unimplemented before post-M3) |
 | 4 | `service` | `u16` | `CORE 1`, `SQL 2`, `TX 3`, `STREAM 4`, `ADMIN 5` |
 | 6 | `method` | `u16` | per-service method id, registry `/proto/methods.toml` |
 | 8 | `request_id` | `u32` | client-assigned multiplexing key |
@@ -89,6 +89,46 @@ not a single frame's size. The two are numerically equal by deliberate design (a
 frame at the ceiling must always fit the initial credit window, or a maximally-sized row could
 never be sent — see SPEC §22.2's M1-S5 deviation note) but remain distinct knobs: one is a codec
 invariant, the other an operator-tunable default.
+
+## 1.1 Out-of-band payloads (`OOB_FD`, M3-D3)
+
+Engine → client only, and only to a client whose `HELLO` set `MEMFD_RX` (§4). A frame carrying the
+`OOB_FD` flag has had its payload moved into a **sealed** memfd (`F_SEAL_SHRINK | F_SEAL_GROW |
+F_SEAL_WRITE | F_SEAL_SEAL`, positioned at offset 0), passed beside the frame with `SCM_RIGHTS` on the
+Unix socket. The frame's `payload_len`/payload are then an `OobRef`, a positional fixarray of 3:
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `fd_index` | `u32` | which of the fds that arrived with this frame holds the payload. The engine attaches exactly ONE fd per `OOB_FD` frame, so it is always `0`; a receiver refuses any other value |
+| 2 | `len` | `u64` | the payload's exact length; the memfd's size equals it. Bounded by `MAX_FRAME_PAYLOAD`, like an inline payload — a receiver refuses more |
+| 3 | `encoding` | `u8` | registry `oob_encoding::*`. `FRAME_PAYLOAD` (`0`, the only value) means the memfd holds EXACTLY the bytes the frame would have carried inline, so the receiver decodes them as that payload |
+
+In this build only a **success terminal** moves (`END | OOB_FD`; the memfd holds the whole
+`Outcome::Ok` envelope, §6), and only when its inline payload is at least the engine's threshold
+(`FERRO_MEMFD_THRESHOLD_BYTES`, default 1 MiB). It is still the request's ONE `END`. A stream's
+`HEAD`/`DATA` frames never move. A CLIENT frame carrying `OOB_FD` remains session-fatal (§7's
+`reserved_flag.bin`).
+
+**Pairing an fd with its frame — the rule both sides follow.** On a `SOCK_STREAM` Unix socket an fd
+is attached to the bytes of the `sendmsg` that carried it, but one `recvmsg` can return those bytes
+together with EARLIER, fd-less bytes, so an fd cannot be paired by its position in a read. The engine
+writes every earlier frame completely, then sends the `OOB_FD` frame with a `sendmsg` that begins at
+the frame's first byte and carries its one fd, and attaches fds to nothing else. Fds therefore arrive
+in the same order as `OOB_FD` frames, each no later than its own frame's first byte. A receiver reads
+**every** byte with `recvmsg` (plain `read(2)` makes the kernel discard an attached fd), queues the
+fds it receives in arrival order, and gives the n-th `OOB_FD` frame the n-th fd. An `OOB_FD` frame
+with no fd queued, a memfd whose size is not `len`, or an `OOB_FD` frame on a session that never set
+`MEMFD_RX` means the two ends disagree about the byte stream: a desync.
+
+**What a receiver must not lose.** A receiver whose process has no free fd-table slot gets no fd: the
+kernel closes it and reports a truncated control message (`MSG_CTRUNC`), and the result is gone. A
+receiver therefore keeps a slot free for the read of an `OOB_FD` frame's FIRST byte (the only read an
+fd can arrive with when every read is exact-length) — the PHP client holds one slot in reserve and
+frees it for that read. A `MSG_PEEK` of the header into no control buffer reads the flags without
+taking the fd. Engine side, the memfd is made immediately before its frame is sent and the engine's
+copy closed right after, so a terminal waiting behind a slow reader holds no fd in the engine.
+
+Vector: `oob_ref` (§7).
 
 ## 2. Canonical MessagePack profile
 
@@ -244,7 +284,7 @@ service's terminal frame carries.
 | 2 | `type_registry_hash` | `str` | |
 | 3 | `manifest_hash` | `str \| nil` | the checked-SQL manifest the client was built against (§11 of the SPEC, M3-D2d), or `nil` for none. When set it must equal the engine's loaded manifest hash, or the handshake is refused session-fatal `Unsupported` (also when the engine has no manifest). `nil` makes no claim and is always admitted. `HELLO_ACK` sets the `MANIFEST` engine feature when a manifest is loaded |
 | 4 | `pid` | `u32` | client OS pid, diagnostic |
-| 5 | `features` | `u32` | client feature bitfield: `MEMFD_RX 0x01`, `FIBERS 0x02` |
+| 5 | `features` | `u32` | client feature bitfield: `MEMFD_RX 0x01`, `FIBERS 0x02`. `MEMFD_RX` licenses the engine to send `OOB_FD` frames (§1.1), so a client sets it only when it reads every byte with `recvmsg`; `FIBERS` is informational |
 
 ### `HELLO_ACK` (service `CORE`, method `HELLO_ACK` = 2) — server → client
 
@@ -252,7 +292,7 @@ service's terminal frame carries.
 |---|---|---|---|
 | 1 | `engine_version` | `u32` | |
 | 2 | `boot_epoch` | `u64` | unique per daemon start (§19.1); see §2 uint64-overflow note |
-| 3 | `features` | `u32` | engine feature bitfield: `MEMFD 0x01`, `LISTEN_STREAMS 0x02`, `MANIFEST 0x04` |
+| 3 | `features` | `u32` | engine feature bitfield: `MEMFD 0x01` (the §1.1 path is enabled; informational — a client reacts to the `OOB_FD` flag, not to this), `LISTEN_STREAMS 0x02`, `MANIFEST 0x04` |
 | 4 | `pools` | `array<[str, str, str \| nil, bool \| nil]>` | one nested positional entry per pool available on this engine — `[name, kind, server_version, literals_are_standard]`; see below (M1-S8a; fourth element M2-C2g) |
 | 5 | `type_registry_hash` | `str` | echoed back; mismatch vs. the client's hash is a hard error |
 
@@ -406,6 +446,10 @@ NOT NULL violation (`1048`), so a consumer keyed on the SQLSTATE alone cannot te
 `cd 04 26`, a `uint16`), NOT a fixed width.
 
 **Per-service indexes:** SQL `EXEC` → §8.3 · TX → §9.6 · STREAM `HEAD`/`DATA` → §10.3 · ADMIN → §11.3.
+
+**M3-D3:** `oob_ref` — an `END | OOB_FD` SQL/`EXEC` terminal whose payload is the §1.1 `OobRef`
+(`len = 1048578`, past u16, so the width is locked), NOT an `Outcome`: the `Outcome` is what the memfd
+holds, which a vector cannot. Byte-locked by name in the PHP conformance suite.
 
 **Negative seeds:** `bad_magic.bin`, `bad_version.bin`, `oversize_len.bin`, `reserved_flag.bin`
 (the last has a structurally valid header and is rejected at the flags layer, not by

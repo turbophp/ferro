@@ -16,6 +16,8 @@ pub struct Registry {
     pub methods: BTreeMap<String, BTreeMap<String, u16>>,
     pub features: BTreeMap<String, BTreeMap<String, u16>>,
     pub outcome: BTreeMap<String, u8>,
+    /// What an `OOB_FD` frame's passed memfd holds (M3-D3, `/proto/PROTOCOL.md` §1.1).
+    pub oob_encoding: BTreeMap<String, u8>,
     /// The tags the canonical WIRE CODEC carries, SORTED — a codec/wire scope, NOT a per-engine
     /// availability claim (a listed tag is one both codecs can move, not one every backend can
     /// produce; the per-engine matrix is SPEC §22.2). Part of the hashed lock: changing this set
@@ -48,6 +50,7 @@ struct MethodsToml {
     methods: BTreeMap<String, BTreeMap<String, u16>>,
     features: BTreeMap<String, BTreeMap<String, u16>>,
     outcome: BTreeMap<String, u8>,
+    oob_encoding: BTreeMap<String, u8>,
 }
 #[derive(Deserialize)]
 struct TypesToml {
@@ -83,6 +86,7 @@ impl Registry {
             methods: m.methods,
             features: m.features,
             outcome: m.outcome,
+            oob_encoding: m.oob_encoding,
             implemented,
             tags: t.tags,
             branches: e.branches,

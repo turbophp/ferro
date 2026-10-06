@@ -144,6 +144,7 @@ pub mod codec;
 pub mod error;
 pub mod flow;
 pub mod handshake;
+pub mod oob;
 pub mod registry;
 pub mod responder;
 pub mod supervisor;
@@ -158,10 +159,10 @@ use futures::future::BoxFuture;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio_util::codec::Framed;
+use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
-use ferro_proto::consts::{errc, flags, method_core, service};
+use ferro_proto::consts::{errc, feature_client, flags, method_core, service};
 use ferro_proto::flags::has as flag_has;
 use ferro_proto::header::Header;
 use ferro_proto::messages::{ErrorPayload, Outcome, Ping, WindowUpdate};
@@ -289,8 +290,12 @@ impl Session {
             }
         };
 
-        let framed = Framed::new(stream, FrameCodec);
-        let (sink, mut reader) = framed.split();
+        // Split into OWNED halves rather than `Framed::split`, so the writer can reach the socket
+        // itself: an `OOB_FD` terminal (M3-D3) is sent with `sendmsg` + `SCM_RIGHTS`, which a
+        // `Sink` cannot express. The codec on each half is the same `FrameCodec`.
+        let (read_half, write_half) = stream.into_split();
+        let mut reader = FramedRead::new(read_half, FrameCodec);
+        let sink = FramedWrite::new(write_half, FrameCodec);
 
         let (control_tx, control_rx) =
             mpsc::channel::<ControlMsg>(config.max_inflight + CONTROL_CHANNEL_SLACK);
@@ -406,7 +411,17 @@ impl Session {
             epoch,
             pool_registry.pool_info().await,
             pool_registry.manifest().is_some(),
+            config.memfd_threshold.is_some(),
         );
+
+        // SPEC §5.1 (M3-D3): a success terminal may move into a sealed memfd only when the client
+        // said it can receive one (`MEMFD_RX`) AND the operator has not disabled the path. Decided
+        // once per session, here, because both inputs are fixed for the session's life.
+        let oob_threshold = if hello.features & u32::from(feature_client::MEMFD_RX) != 0 {
+            config.memfd_threshold
+        } else {
+            None
+        };
         if control_tx.send(ControlMsg::bare(ack)).await.is_err() {
             // Writer already gone; nothing left to do.
             drop(control_tx);
@@ -509,6 +524,7 @@ impl Session {
                         &handler,
                         &config,
                         &mut supervisors,
+                        oob_threshold,
                     )
                     .await
                     {
@@ -531,6 +547,7 @@ impl Session {
                                 &handler,
                                 &config,
                                 &mut supervisors,
+                                oob_threshold,
                             )
                             .await
                             {
@@ -633,6 +650,7 @@ async fn drain_supervisors(supervisors: &mut JoinSet<()>, deadline: Duration) {
 /// permit, then spawn the handler task and a supervisor task (owned by the caller's per-session
 /// `supervisors` `JoinSet`) to await it. Returns `false` if the control channel is gone (writer
 /// task exited) and the reader loop should stop.
+#[allow(clippy::too_many_arguments)]
 async fn handle_request_frame(
     frame: InFrame,
     registry: &Arc<Registry>,
@@ -641,6 +659,7 @@ async fn handle_request_frame(
     handler: &HandlerFn,
     config: &Config,
     supervisors: &mut JoinSet<()>,
+    oob_threshold: Option<usize>,
 ) -> bool {
     let id = frame.header.request_id;
 
@@ -697,7 +716,7 @@ async fn handle_request_frame(
     // `tokio::spawn` — see `drain_supervisors` and this module's top doc comment for why: without
     // this, a writer that exits early (a `sink.send()` error, e.g. a mid-request client
     // disconnect with other requests still in flight) left this task orphaned, tracked by nothing.
-    supervisors.spawn(supervisor::supervise(
+    supervisors.spawn(supervisor::supervise_with(
         id,
         service,
         method,
@@ -705,6 +724,7 @@ async fn handle_request_frame(
         cell,
         handle,
         registry.clone(),
+        oob_threshold,
     ));
 
     true
