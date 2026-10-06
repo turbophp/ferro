@@ -17,6 +17,14 @@ final class FakeTransport implements TransportInterface
     public string $written = '';
     public bool $closed = false;
 
+    /**
+     * Every read and write in order — `'r'` per `readExact`, `'w'` per `writeAll` — so a test can
+     * assert that a read happened BEFORE a write (M3-D1a review F9).
+     *
+     * @var list<string>
+     */
+    public array $events = [];
+
     public function feed(string $bytes): void
     {
         $this->inbound .= $bytes;
@@ -25,6 +33,7 @@ final class FakeTransport implements TransportInterface
     public function readExact(int $n): string
     {
         if ($n === 0) { return ''; }
+        $this->events[] = 'r';
         if ($this->pos + $n > strlen($this->inbound)) {
             throw new TransportException(sprintf(
                 'fake transport: need %d bytes at %d, only %d queued',
@@ -51,6 +60,7 @@ final class FakeTransport implements TransportInterface
     public function writeAll(string $bytes): void
     {
         ++$this->writeCalls;
+        $this->events[] = 'w';
         if ($this->failNextWrite !== null) {
             $e = $this->failNextWrite;
             $this->failNextWrite = null;

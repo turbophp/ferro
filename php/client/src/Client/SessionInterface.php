@@ -34,9 +34,10 @@ interface SessionInterface
 
     /**
      * The `(service, method)` of the frame most recently put on the wire by {@see sendRequest}, or
-     * null if none has been sent. In the synchronous single-in-flight model this is exactly the op
-     * that was in flight when a {@see \Ferro\Client\Error\ConnectionLostException} fired — the signal
-     * the §19.3 lost-COMMIT carve-out reads to force `Indeterminate`.
+     * null if none has been sent. DIAGNOSTIC ONLY: the fate rules do not read it — each call site
+     * passes its own `OpKind` to {@see FateClassifier::classifyLoss}, which is what decides a lost
+     * COMMIT. With several requests in flight (M3-D1a) it names the LAST one written, not
+     * necessarily the one a failure concerns.
      *
      * @return array{0:int,1:int}|null
      */

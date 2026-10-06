@@ -20,9 +20,34 @@ use Ferro\Protocol\StreamData;
 use Ferro\Protocol\StreamHead;
 
 /**
- * The synchronous, single-in-flight session over a {@see TransportInterface}: HELLO/HELLO_ACK, one
- * request -> one terminal `END`, PING/PONG liveness, GOODBYE on close. The Fibers/multiplexing
- * feature is post-M0 — this client advertises `features=0`.
+ * The session over a {@see TransportInterface}: HELLO/HELLO_ACK, request -> exactly one terminal
+ * `END`, PING/PONG liveness, GOODBYE on close.
+ *
+ * **Multiplexed (M3-D1, SPEC §10.1).** Several requests may be in flight on the one socket at once:
+ * {@see submit} writes a request frame and returns its `request_id` without reading, and
+ * {@see awaitTerminal} reads until THAT id's terminal arrives. Every frame read off the wire goes
+ * through ONE router ({@see pump}), which files it under its `request_id`, so a terminal for one
+ * request can arrive while another is being awaited and is kept, not misread. The engine has always
+ * run each request on its own task (`ferrod` `session::mod`), so k requests submitted before any is
+ * awaited cost about max(query) rather than the sum. {@see sendRequest} is `submit` +
+ * `awaitTerminal`, so the synchronous surface every tier uses is unchanged.
+ *
+ * Three rules keep the routing safe:
+ *  - a frame for an id this session has not got in flight is a desync, so it poisons the session;
+ *  - a session-fatal terminal on `request_id=0` does NOT decide any pending request's fate. With
+ *    several requests in flight it may concern any one of them, or a control frame, so its payload
+ *    is never attributed. The session stops sending and keeps READING until EOF, because the engine
+ *    drains every in-flight request's own terminal before it closes (`ferrod` `session::mod`:
+ *    `cancel_all` + `drain_supervisors`). A request still unanswered at EOF fails with a
+ *    {@see ConnectionLostException} carrying NO server payload, so the caller's classifier decides
+ *    (a lost write is `Indeterminate`);
+ *  - a transport failure fails every pending request as SENT (each frame was completely written),
+ *    so its fate stays the caller's to classify. A request that never got written is
+ *    {@see TransportException::requestNotSent}, including one refused because the session had
+ *    already failed while it waited for an in-flight slot.
+ *
+ * Open streams are still exclusive: no request may be submitted while a stream is open on this
+ * session (see {@see $streamOpen}).
  *
  * Handshake branching (SPEC §5): after sending HELLO the session reads ONE reply frame and routes
  * it by shape, NEVER by comparing hashes client-side (the registry check is SERVER-side and can
@@ -35,7 +60,7 @@ use Ferro\Protocol\StreamHead;
  * `boot_epoch` is stored OPAQUE (`int|string`) exactly as the packer yields it — never coerced, so
  * the Task-4 reconnect loop can detect an epoch change even for `u64 > PHP_INT_MAX` values.
  */
-final class Session implements SessionInterface, StreamingSessionInterface
+final class Session implements MultiplexingSessionInterface, StreamingSessionInterface
 {
     private readonly Codec $codec;
     private readonly PackerInterface $encodePacker;
@@ -59,9 +84,10 @@ final class Session implements SessionInterface, StreamingSessionInterface
 
     /**
      * Set between a successful {@see openStream} and the streamed read reaching its terminal (or
-     * being {@see abandonStream}-ed). While set, {@see sendRequest} / {@see openStream} refuse —
-     * the single-in-flight session cannot interleave a buffered request with an open stream's
-     * un-read DATA/END frames without desyncing the wire (M1-S5 Task 6).
+     * being {@see abandonStream}-ed). While set, {@see submit} refuses. The router would keep a
+     * stream's frames apart from a buffered request's, so this is no longer about desync (M3-D1a):
+     * a buffered statement on the same `tx_id` would queue in the engine behind a stream stalled on
+     * its credit window, which nobody replenishes while that statement is awaited — a deadlock.
      */
     private bool $streamOpen = false;
     private ?int $streamRequestId = null;
@@ -79,13 +105,56 @@ final class Session implements SessionInterface, StreamingSessionInterface
      */
     private ?string $poisoned = null;
 
+    /**
+     * Ids whose request frame was written and whose final frame (a terminal, or a PONG) has not yet
+     * been read off the wire. Its size is what {@see $maxInFlight} bounds.
+     *
+     * @var array<int, true>
+     */
+    private array $inFlight = [];
+
+    /**
+     * Frames read off the wire, filed under their `request_id`, not yet consumed by whoever awaits
+     * that id. A stream's DATA frames wait here while another request is awaited; the credit window
+     * bounds how many there can be.
+     *
+     * @var array<int, list<array{0:Header,1:string}>>
+     */
+    private array $inbox = [];
+
+    /**
+     * The message of a session-fatal `request_id=0` terminal, once one has arrived. From then on the
+     * session sends nothing and only reads, to collect the terminals the engine drains. Its payload
+     * is deliberately not kept for the pending requests (see the class docblock).
+     */
+    private ?string $fatal = null;
+
+    /**
+     * Ids whose {@see \Ferro\Future} was dropped unawaited ({@see discard}). Their frames are thrown
+     * away on arrival, so an abandoned Future cannot grow {@see $inbox} for the session's life.
+     *
+     * @var array<int, true>
+     */
+    private array $discarded = [];
+
+    /**
+     * @param int $maxInFlight the most requests this session keeps in flight at once. At the limit,
+     *                         {@see submit} reads frames until a terminal frees a slot before it
+     *                         writes. It must stay below the engine's own per-session limit
+     *                         (`max_inflight`, default 1024), which answers an excess request with
+     *                         an error instead of running it.
+     */
     public function __construct(
         private readonly TransportInterface $transport,
         ?RequestIdAllocator $ids = null,
         ?Codec $codec = null,
         ?PackerInterface $encodePacker = null,
         ?PackerInterface $decodePacker = null,
+        private readonly int $maxInFlight = 256,
     ) {
+        if ($maxInFlight < 1) {
+            throw new \InvalidArgumentException("maxInFlight must be >= 1, got {$maxInFlight}");
+        }
         $this->ids = $ids ?? new RequestIdAllocator();
         $this->codec = $codec ?? new Codec();
         $this->encodePacker = $encodePacker ?? PackerFactory::forEncode();
@@ -154,32 +223,90 @@ final class Session implements SessionInterface, StreamingSessionInterface
      */
     public function sendRequest(int $service, int $method, string $payload): Outcome
     {
+        return $this->awaitTerminal($this->submit($service, $method, $payload));
+    }
+
+    /**
+     * Write one request-bearing frame and return its `request_id` WITHOUT reading its terminal
+     * (M3-D1). The terminal is read by {@see awaitTerminal}, in any order relative to other
+     * submitted requests.
+     *
+     * At {@see $maxInFlight} this reads frames first, until one request's terminal frees a slot.
+     * A failure to write is {@see TransportException::requestNotSent}, exactly as for
+     * {@see sendRequest}.
+     */
+    public function submit(int $service, int $method, string $payload): int
+    {
         $this->assertNoOpenStream();
-        $rid = $this->ids->next();
+        $this->refuseIfDead(true);
+        while (count($this->inFlight) >= $this->maxInFlight) {
+            // This request has not been written: whatever goes wrong while waiting for a slot, it
+            // cannot have executed, so every failure here is `requestNotSent` (the C1e-3 rule).
+            try {
+                $this->pump();
+            } catch (TransportException $e) {
+                throw $e->requestUnsent() ? $e : TransportException::requestNotSent(
+                    'not sent: the session failed while this request waited for an in-flight slot ('
+                        . $e->getMessage() . ')',
+                    $e,
+                );
+            } catch (ProtocolException $e) {
+                throw TransportException::requestNotSent(
+                    'not sent: the session desynchronised while this request waited for an in-flight slot ('
+                        . $e->getMessage() . ')',
+                    $e,
+                );
+            }
+            $this->refuseIfDead(true);
+        }
+        $rid = $this->nextFreeId();
         // Record BEFORE the write, so it names the request even when the write itself dies.
         $this->lastInFlight = [$service, $method];
         $this->writeFrame(0, $service, $method, $payload, $rid, true);
+        $this->inFlight[$rid] = true;
+        return $rid;
+    }
 
-        [$header, $body] = $this->readFrame();
-        $isEnd = ($header->flags & C::FLAG_END) !== 0;
-
-        if ($header->requestId === 0) {
-            // Session-context terminal. Decode its Outcome::Error (if any) so the fate is preserved.
-            throw $this->sessionFatal($body, $isEnd);
+    /**
+     * Read until the terminal for `$requestId` (a previously {@see submit}-ted id) arrives, and
+     * return it. Frames for other ids that arrive meanwhile are kept for their own awaiters.
+     *
+     * A non-terminal frame for this id is a {@see ProtocolException}: only a stream's frames are
+     * non-terminal, and a stream is read through {@see readStreamFrame}.
+     */
+    public function awaitTerminal(int $requestId): Outcome
+    {
+        [$header, $body] = $this->nextFrameFor($requestId);
+        if (($header->flags & C::FLAG_END) === 0) {
+            // Only a stream's frames are non-terminal, and this id was not opened as a stream: the
+            // two ends disagree about what this request is, so its remaining frames cannot be read
+            // safely, and neither can anyone else's.
+            $error = new ProtocolException(sprintf('terminal for request %d did not carry the END flag', $requestId));
+            $this->poison(new TransportException($error->getMessage()));
+            throw $error;
         }
-
-        if (!$isEnd) {
-            throw new ProtocolException(sprintf('terminal for request %d did not carry the END flag', $rid));
-        }
-        if ($header->requestId !== $rid) {
-            throw new ProtocolException(sprintf(
-                'terminal request_id %d does not echo the sent id %d',
-                $header->requestId,
-                $rid,
-            ));
-        }
-
         return Outcome::decode($body, $this->decodePacker);
+    }
+
+    /**
+     * Give up on a submitted request's terminal: it will be read and thrown away when it arrives
+     * (M3-D1a review F6). Called when a {@see \Ferro\Future} is dropped without being awaited, so
+     * its terminal does not sit in {@see $inbox} for the session's life. The request's fate is then
+     * never observed, which is the caller's choice.
+     */
+    public function discard(int $requestId): void
+    {
+        unset($this->inbox[$requestId]);
+        if (isset($this->inFlight[$requestId])) {
+            $this->discarded[$requestId] = true;
+        }
+    }
+
+    /** Whether `$requestId` was submitted and its terminal has not been consumed yet. */
+    public function isPending(int $requestId): bool
+    {
+        return (isset($this->inFlight[$requestId]) || isset($this->inbox[$requestId]))
+            && !isset($this->discarded[$requestId]);
     }
 
     /**
@@ -188,11 +315,13 @@ final class Session implements SessionInterface, StreamingSessionInterface
      */
     public function ping(int $token): void
     {
-        $rid = $this->ids->next();
+        $rid = $this->nextFreeId();
         $payload = Message::encode('ping', ['token' => $token], $this->encodePacker);
         $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_PING, $payload, $rid);
-
-        [$header, $body] = $this->readFrame();
+        // A PONG is routed like any frame, so a ping can run while requests are in flight.
+        $this->inFlight[$rid] = true;
+        [$header, $body] = $this->nextFrameFor($rid);
+        unset($this->inFlight[$rid]);
         if ($header->service !== C::SERVICE_CORE || $header->method !== C::METHOD_CORE_PONG) {
             throw new ProtocolException(sprintf(
                 'expected PONG, got service=%d method=%d',
@@ -224,7 +353,10 @@ final class Session implements SessionInterface, StreamingSessionInterface
         } catch (\Throwable) {
             // The connection may already be gone; closing the transport is what matters.
         }
-        $this->transport->close();
+        // Mark the session closed BEFORE anything can read it again: a Future still pending on it
+        // then fails as a sent-and-lost request (`TransportException`, so a write is
+        // `Indeterminate`) instead of reading a closed stream (M3-D1a review F3).
+        $this->poison(new TransportException('the session was closed'));
     }
 
     /** The opaque `boot_epoch` cached at handshake (`int|string`). Throws if HELLO has not run. */
@@ -258,33 +390,18 @@ final class Session implements SessionInterface, StreamingSessionInterface
     /** @return array{type:'head', requestId:int, cols:list<array{name:string,tag:int}>}|array{type:'end', requestId:int, outcome:Outcome} */
     public function openStream(int $service, int $method, string $payload): array
     {
-        $this->assertNoOpenStream();
-        $rid = $this->ids->next();
-        $this->lastInFlight = [$service, $method];
-        $this->writeFrame(0, $service, $method, $payload, $rid, true);
+        $rid = $this->submit($service, $method, $payload);
 
-        [$header, $body] = $this->readFrame();
+        [$header, $body] = $this->nextFrameFor($rid);
         $isEnd = ($header->flags & C::FLAG_END) !== 0;
-
-        if ($header->requestId === 0) {
-            throw $this->sessionFatal($body, $isEnd);
-        }
 
         if ($isEnd) {
             // A known fate decided before any HEAD/DATA went out (e.g. a checkout failure) — no
             // stream was ever really opened, so there is nothing to guard or drain.
-            if ($header->requestId !== $rid) {
-                throw new ProtocolException(sprintf(
-                    'stream-open terminal request_id %d does not echo the sent id %d',
-                    $header->requestId,
-                    $rid,
-                ));
-            }
             return ['type' => 'end', 'requestId' => $rid, 'outcome' => Outcome::decode($body, $this->decodePacker)];
         }
 
-        if ($header->service !== C::SERVICE_STREAM || $header->method !== C::METHOD_STREAM_HEAD
-            || $header->requestId !== $rid) {
+        if ($header->service !== C::SERVICE_STREAM || $header->method !== C::METHOD_STREAM_HEAD) {
             throw new ProtocolException(sprintf(
                 'expected STREAM/HEAD for request %d, got service=%d method=%d flags=%d request_id=%d',
                 $rid,
@@ -307,30 +424,24 @@ final class Session implements SessionInterface, StreamingSessionInterface
      */
     public function readStreamFrame(int $requestId): array
     {
-        [$header, $body] = $this->readFrame();
+        try {
+            [$header, $body] = $this->nextFrameFor($requestId);
+        } catch (ConnectionLostException | ProtocolException $e) {
+            if ($this->streamRequestId === $requestId) {
+                $this->streamOpen = false;
+                $this->streamRequestId = null;
+            }
+            throw $e;
+        }
         $isEnd = ($header->flags & C::FLAG_END) !== 0;
 
-        if ($header->requestId === 0) {
-            $this->streamOpen = false;
-            $this->streamRequestId = null;
-            throw $this->sessionFatal($body, $isEnd);
-        }
-
         if ($isEnd) {
-            if ($header->requestId !== $requestId) {
-                throw new ProtocolException(sprintf(
-                    'stream terminal request_id %d does not echo the open stream id %d',
-                    $header->requestId,
-                    $requestId,
-                ));
-            }
             $this->streamOpen = false;
             $this->streamRequestId = null;
             return ['type' => 'end', 'outcome' => Outcome::decode($body, $this->decodePacker)];
         }
 
-        if ($header->service !== C::SERVICE_STREAM || $header->method !== C::METHOD_STREAM_DATA
-            || $header->requestId !== $requestId) {
+        if ($header->service !== C::SERVICE_STREAM || $header->method !== C::METHOD_STREAM_DATA) {
             throw new ProtocolException(sprintf(
                 'expected STREAM/DATA for request %d, got service=%d method=%d flags=%d request_id=%d',
                 $requestId,
@@ -392,12 +503,7 @@ final class Session implements SessionInterface, StreamingSessionInterface
         int $requestId = 0,
         bool $isRequest = false,
     ): void {
-        if ($this->poisoned !== null) {
-            $why = 'this session was closed after an earlier transport failure (' . $this->poisoned . ')';
-            throw $isRequest
-                ? TransportException::requestNotSent('not sent: ' . $why)
-                : new TransportException($why);
-        }
+        $this->refuseIfDead($isRequest);
         $header = new Header($flags, $service, $method, $requestId, strlen($payload));
         try {
             $this->transport->writeAll($this->codec->encodeFrame($header, $payload));
@@ -405,6 +511,127 @@ final class Session implements SessionInterface, StreamingSessionInterface
             $this->poison($e);
             throw $isRequest ? TransportException::requestNotSent($e->getMessage(), $e) : $e;
         }
+    }
+
+    /**
+     * The next frame filed under `$requestId`, reading off the wire (through {@see pump}) until one
+     * is there.
+     *
+     * @return array{0:Header,1:string}
+     */
+    private function nextFrameFor(int $requestId): array
+    {
+        while (true) {
+            $queue = $this->inbox[$requestId] ?? [];
+            if ($queue !== []) {
+                $frame = array_shift($queue);
+                if ($queue === []) {
+                    unset($this->inbox[$requestId]);
+                } else {
+                    $this->inbox[$requestId] = $queue;
+                }
+                return $frame;
+            }
+            if (!isset($this->inFlight[$requestId])) {
+                throw new ProtocolException(sprintf('request %d is not in flight on this session', $requestId));
+            }
+            if ($this->poisoned !== null && $this->fatal !== null) {
+                // The engine drained what it could after its fatal and then closed: this request got
+                // no terminal. The fatal may have been about any frame, so it decides nothing here.
+                unset($this->inFlight[$requestId]);
+                throw new ConnectionLostException(
+                    'the engine ended the session (' . $this->fatal . ') before this request\'s '
+                        . 'terminal arrived; its fate is unknown',
+                );
+            }
+            if ($this->poisoned !== null) {
+                // Every frame this request needs was lost with the socket. The request WAS written
+                // (it is in flight), so this is the sent-and-lost case, never `requestNotSent`.
+                unset($this->inFlight[$requestId]);
+                throw new TransportException('the session closed while this request was in flight ('
+                    . $this->poisoned . ')');
+            }
+            try {
+                $this->pump();
+            } catch (TransportException $e) {
+                if ($this->fatal === null) {
+                    throw $e;
+                }
+                // The EOF that follows a fatal is expected: loop once more, and the branch above
+                // fails this request without attributing the fatal to it.
+            }
+        }
+    }
+
+    /**
+     * Read ONE frame off the wire and file it under its `request_id` — the only place a frame is
+     * read after the handshake.
+     *
+     * A frame for an id not in flight means the two ends disagree about what is outstanding, so
+     * nothing later can be trusted: the session is poisoned. A session-fatal `request_id=0`
+     * terminal is recorded so that every pending request fails with it.
+     */
+    private function pump(): void
+    {
+        [$header, $body] = $this->readFrame();
+        $rid = $header->requestId;
+        $isEnd = ($header->flags & C::FLAG_END) !== 0;
+
+        if ($rid === 0) {
+            // Record it and keep reading: the engine drains every in-flight request's own terminal
+            // after a fatal, then closes, and that EOF is what ends the session here.
+            $this->fatal = $this->sessionFatal($body, $isEnd)->getMessage();
+            return;
+        }
+        if (isset($this->discarded[$rid])) {
+            if ($isEnd) {
+                unset($this->discarded[$rid], $this->inFlight[$rid]);
+            }
+            return;
+        }
+        if (!isset($this->inFlight[$rid])) {
+            $error = new ProtocolException(sprintf(
+                'a frame arrived for request_id %d, which is not in flight on this session '
+                    . '(service=%d method=%d flags=%d)',
+                $rid,
+                $header->service,
+                $header->method,
+                $header->flags,
+            ));
+            $this->poison(new TransportException($error->getMessage()));
+            throw $error;
+        }
+        if ($isEnd) {
+            unset($this->inFlight[$rid]);
+        }
+        $this->inbox[$rid][] = [$header, $body];
+    }
+
+    /**
+     * Refuse to write on a session that has failed or been told it is over. A request refused here
+     * was never sent, so it is {@see TransportException::requestNotSent}; a control frame's refusal
+     * is a plain {@see TransportException} (see {@see writeFrame}).
+     */
+    private function refuseIfDead(bool $isRequest): void
+    {
+        $why = match (true) {
+            $this->poisoned !== null => 'this session was closed after an earlier failure (' . $this->poisoned . ')',
+            $this->fatal !== null => 'the engine ended this session (' . $this->fatal . ')',
+            default => null,
+        };
+        if ($why === null) {
+            return;
+        }
+        throw $isRequest ? TransportException::requestNotSent('not sent: ' . $why) : new TransportException($why);
+    }
+
+    /** The next `request_id` that is neither 0 nor still pending (the u32 space wraps). */
+    private function nextFreeId(): int
+    {
+        do {
+            $rid = $this->ids->next();
+        } while ($this->isPending($rid));
+        return $rid;
     }
 
     /**

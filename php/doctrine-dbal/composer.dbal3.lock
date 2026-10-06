@@ -282,7 +282,10 @@
             "autoload": {
                 "psr-4": {
                     "Ferro\\": "src/"
-                }
+                },
+                "files": [
+                    "src/functions.php"
+                ]
             },
             "autoload-dev": {
                 "psr-4": {

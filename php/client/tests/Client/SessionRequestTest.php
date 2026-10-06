@@ -102,9 +102,11 @@ final class SessionRequestTest extends TestCase
             $session->sendRequest(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'body');
             $this->fail('expected ConnectionLostException');
         } catch (ConnectionLostException $e) {
-            $this->assertNotNull($e->errorPayload(), 'the decoded Outcome::Error is carried');
-            $this->assertSame(C::ERR_CONNECTION_LOST, $e->errorPayload()?->code);
-            $this->assertSame(C::BRANCH_RETRYABLE, $e->errorPayload()?->branch);
+            // M3-D1a review F1: with several requests in flight a request_id=0 fatal may concern
+            // any of them, so its payload is never attributed to the request being awaited — the
+            // caller's classifier decides (a lost write is Indeterminate). Its message is kept.
+            $this->assertNull($e->errorPayload(), 'the fatal payload is not attributed to this request');
+            $this->assertStringContainsString('connection reset by peer', $e->getMessage());
         }
     }
 }

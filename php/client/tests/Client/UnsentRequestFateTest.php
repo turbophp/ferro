@@ -92,7 +92,7 @@ final class UnsentRequestFateTest extends TestCase
             $c->exec('INSERT INTO t VALUES (2)');
             self::fail('a poisoned session must refuse');
         } catch (RetryableException $e) {
-            self::assertStringContainsString('closed after an earlier transport failure', $e->getMessage());
+            self::assertStringContainsString('closed after an earlier failure', $e->getMessage());
         }
         self::assertSame($writes, $t->writeCalls, 'the refused request must not have touched the socket');
     }

@@ -7,8 +7,8 @@ use Ferro\Client\Error\TransportException;
 /**
  * Dependency-free stream transport (charter rule 7): `stream_socket_client` over `unix://`
  * (primary, `/run/ferro/{schema_hash}.sock`) or `tcp://` (the `FERRO_ADDR` fallback) — NOT
- * `ext-sockets`. Blocking, single-in-flight: the S7 M0 client writes one framed request and
- * block-reads exactly its one terminal.
+ * `ext-sockets`. Blocking reads and writes; {@see Session} routes several in-flight requests over it
+ * (M3-D1a).
  *
  * The stream is held as `/** @var resource *​/ private $sock` (a stream resource has no native
  * property type, so this class is deliberately NOT `readonly`); both
@@ -82,6 +82,7 @@ final class Transport implements TransportInterface
     {
         if ($n < 0) { throw new TransportException("readExact: negative length {$n}"); }
         if ($n === 0) { return ''; }
+        $this->assertOpen('read');
 
         $buf = '';
         $remaining = $n;
@@ -107,6 +108,7 @@ final class Transport implements TransportInterface
 
     public function writeAll(string $bytes): void
     {
+        $this->assertOpen('write');
         $len = strlen($bytes);
         $written = 0;
         while ($written < $len) {
@@ -122,6 +124,18 @@ final class Transport implements TransportInterface
                 throw new TransportException(sprintf('write failed after %d of %d bytes', $written, $len));
             }
             $written += $n;
+        }
+    }
+
+    /**
+     * A read or write on a closed stream is a {@see TransportException}, never PHP's `TypeError`,
+     * which `@` cannot suppress and which would escape every caller's typed handling (M3-D1a
+     * review F2/F3).
+     */
+    private function assertOpen(string $op): void
+    {
+        if (!is_resource($this->sock)) {
+            throw new TransportException("{$op} on a closed transport");
         }
     }
 
