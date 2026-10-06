@@ -222,6 +222,83 @@ enum Script {
 
 /// A TLS upstream on `127.0.0.1`.
 async fn tls_upstream(cfg: Arc<ServerConfig>, script: Script) -> (SocketAddr, TlsRec) {
+    tls_upstream_held(cfg, script, None).await
+}
+
+/// The server side of a socket whose first read AFTER the client's first bytes (the ClientHello)
+/// waits `hold` first: the server sends its own flight at once but reads the client's last
+/// flight — and so decides on the client's certificate — `hold` late (M6-F5c).
+struct HeldRead {
+    inner: TcpStream,
+    hold: Option<Duration>,
+    seen_first: bool,
+    held: Option<Pin<Box<tokio::time::Sleep>>>,
+    done: bool,
+}
+
+impl AsyncRead for HeldRead {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Some(d) = self.hold
+            && self.seen_first
+            && !self.done
+        {
+            let held = self
+                .held
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(d)));
+            if held.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.done = true;
+        }
+        let before = buf.filled().len();
+        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.seen_first = true;
+        }
+        r
+    }
+}
+
+// Transparent, VECTORED writes included: `rustls` writes a record as several buffers, and on its
+// error path writes an alert once without looping, so the default `poll_write_vectored` (first
+// buffer only) would truncate the alert — measured: `version_and_alpn_refusals_are_tls_refused`
+// then saw `tls_handshake` instead of `tls_alpn`.
+impl AsyncWrite for HeldRead {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// [`tls_upstream`], with the server's read of the client's last handshake flight held `hold`.
+async fn tls_upstream_held(
+    cfg: Arc<ServerConfig>,
+    script: Script,
+    hold: Option<Duration>,
+) -> (SocketAddr, TlsRec) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let rec = TlsRec::default();
@@ -233,6 +310,13 @@ async fn tls_upstream(cfg: Arc<ServerConfig>, script: Script) -> (SocketAddr, Tl
             let r = r.clone();
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
+                let s = HeldRead {
+                    inner: s,
+                    hold,
+                    seen_first: false,
+                    held: None,
+                    done: false,
+                };
                 let Ok(mut t) = acceptor.accept(s).await else {
                     return;
                 };
@@ -1434,10 +1518,14 @@ async fn assert_mtls_refusal(presented: Presented) {
     assert!(rec.requests().is_empty(), "{presented:?}");
     assert_eq!(rec.tcp(), 2, "{presented:?}: each dialled once");
 
-    // TLS 1.3: after dispatch — "sent, no head", cause `reset`.
-    let (addr, rec) = tls_upstream(
+    // TLS 1.3: after dispatch — "sent, no head", cause `reset`. The server's read of the client's
+    // last flight is held 100 ms so the request is on the socket before the alert exists: the
+    // ordinary order, made deterministic (unheld, it is a race the engine wins by microseconds;
+    // `an_mtls_refusal_read_before_the_request_is_written_is_unsent` forces the other branch).
+    let (addr, rec) = tls_upstream_held(
         mtls_server_cfg(&pki.leaf(), &client_ca, false),
         Script::Respond(OK_HELLO),
+        Some(Duration::from_millis(100)),
     )
     .await;
     let d = daemon_over(engine(env(addr.port(), &extra)));
@@ -1491,6 +1579,162 @@ async fn mtls_refusal_of_an_absent_certificate_is_tls_verify_under_tls12_and_sen
 async fn mtls_refusal_of_a_rejected_certificate_is_tls_verify_under_tls12_and_sent_no_head_under_tls13()
  {
     assert_mtls_refusal(Presented::Rejected).await;
+}
+
+/// A client socket whose first FLUSH after the server's first bytes — the end of the client's last
+/// handshake flight, which `tokio-rustls` flushes before `connect` resolves — completes only after
+/// `.0`. Every byte is already on the wire; only the handshake's completion is late, so a server
+/// that refuses the client certificate has its alert in the socket before the engine can dispatch.
+struct LateFinishConnect(Duration);
+
+struct LateFinishIo {
+    inner: TcpStream,
+    delay: Duration,
+    read_any: bool,
+    held: Option<Pin<Box<tokio::time::Sleep>>>,
+    done: bool,
+}
+
+impl AsyncRead for LateFinishIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.read_any = true;
+        }
+        r
+    }
+}
+
+impl AsyncWrite for LateFinishIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.read_any && !self.done {
+            let d = self.delay;
+            let held = self
+                .held
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(d)));
+            if held.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.done = true;
+        }
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Connect for LateFinishConnect {
+    fn connect<'a>(
+        &'a self,
+        peer: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<BoxIo>> + Send + 'a>> {
+        let delay = self.0;
+        Box::pin(async move {
+            let inner = TcpStream::connect(peer).await?;
+            inner.set_nodelay(true)?;
+            Ok(Box::new(LateFinishIo {
+                inner,
+                delay,
+                read_any: false,
+                held: None,
+                done: false,
+            }) as BoxIo)
+        })
+    }
+}
+
+/// **D23's race, its other branch, forced.** The refusal tests above hold the SERVER's read of the
+/// client's last flight, so the request reaches the socket before the alert is sent: the ordinary
+/// order, "sent, no head", `reset`. Here the CLIENT is held instead — its handshake completes
+/// 200 ms after its last flight left — so the server's alert is already in the socket when the
+/// engine dispatches. `hyper`'s idle connection task reads before it writes (`require_empty_read`),
+/// finds the alert, and the request is returned UNWRITTEN. No record of it reached the socket, so it
+/// is "dispatched, not sent" — `unsent_closed`, Retryable for a POST and a declared GET alike, never
+/// `Indeterminate` — nothing reached the server, and the refusal is still NAMED (the `hyper` error
+/// carries the alert). The control keeps the same 200 ms client hold and holds the server 600 ms:
+/// the alert comes after dispatch again, and the POST is `Indeterminate` with `reset` — so the
+/// ordering, not the connector, decides the branch. Measured while building: a client hold of
+/// ~1 ms (a zero `tokio::time::sleep`) already flips it, so in production the branch an
+/// operator sees depends on scheduling; both are refusals the operator must fix, and neither
+/// re-sends.
+#[tokio::test]
+async fn an_mtls_refusal_read_before_the_request_is_written_is_unsent() {
+    let pki = Pki::new();
+    let client_ca = testcert::ca("Client CA");
+    let run = |server_hold: Option<Duration>| {
+        let pki = &pki;
+        let client_ca = &client_ca;
+        async move {
+            let (addr, rec) = tls_upstream_held(
+                mtls_server_cfg(&pki.leaf(), client_ca, false),
+                Script::Respond(OK_HELLO),
+                server_hold,
+            )
+            .await;
+            let d = daemon_over(engine_full(
+                env(
+                    addr.port(),
+                    &[("CA_FILE", pki.ca_file().display().to_string())],
+                ),
+                resolver_to_loopback(),
+                Arc::new(LateFinishConnect(Duration::from_millis(200))),
+                OsRoots::Fixed(Vec::new()),
+            ));
+            let (p, g) = both(&d).await;
+            for r in [&p, &g] {
+                assert!(
+                    r.error()
+                        .message
+                        .contains("refused the TLS client certificate after the handshake"),
+                    "named: {:?}",
+                    r.error()
+                );
+            }
+            assert!(rec.requests().is_empty());
+            assert_eq!(rec.handshakes(), 0);
+            assert_eq!(rec.tcp(), 2, "each dialled once, never re-sent");
+            (p, g)
+        }
+    };
+    let (p, g) = run(None).await;
+    assert_both(
+        &p,
+        &g,
+        errc::CONNECTION_LOST,
+        branch::RETRYABLE,
+        http_cause::UNSENT_CLOSED,
+    );
+    // The control: the alert after dispatch.
+    let (p, g) = run(Some(Duration::from_millis(600))).await;
+    p.assert_error(
+        errc::WRITE_UNCONFIRMED,
+        branch::INDETERMINATE,
+        http_cause::RESET,
+    );
+    g.assert_error(errc::CONNECTION_LOST, branch::RETRYABLE, http_cause::RESET);
 }
 
 /// M6-F5c: client certificate or key material that cannot be loaded at start DISABLES the upstream
