@@ -58,6 +58,17 @@ final class ExecCodec
 
     public function plans(): PlanCache { return $this->plans; }
 
+    /** The per-statement timeout every EXEC carries (M3-D1c), enforced by the engine; null for none. */
+    private ?int $timeoutMs = null;
+
+    public function setTimeoutMs(?int $timeoutMs): void
+    {
+        if ($timeoutMs !== null && $timeoutMs < 1) {
+            throw new \InvalidArgumentException("a statement timeout must be at least 1 ms, got {$timeoutMs}");
+        }
+        $this->timeoutMs = $timeoutMs;
+    }
+
     /**
      * Build one EXEC payload. `$txId = null` is the autocommit path; a non-null `$txId` scopes the
      * statement to that transaction's actor on the engine.
@@ -71,7 +82,7 @@ final class ExecCodec
             'sql' => $sql,
             'query_id' => null,
             'params' => $this->bindParams($params),
-            'timeout_ms' => null,
+            'timeout_ms' => $this->timeoutMs,
             'readonly' => $readonly,
             'fetch' => $fetch,
             'tx_id' => $txId,

@@ -24,11 +24,32 @@ final class Transport implements SelectableTransportInterface
     private $sock;
 
     /**
+     * Bytes of a frame already read when a read timed out (M3-D1c). The next {@see readExact}
+     * starts from them, so a timeout never drops bytes and never puts the stream out of step.
+     */
+    private string $pending = '';
+
+    /** The wait currently applied with `stream_set_timeout`, to skip redundant calls. */
+    private float $appliedWait;
+
+    /**
      * @param resource $sock an already-connected, blocking stream
      */
     private function __construct($sock, private readonly float $readTimeout = self::DEFAULT_READ_TIMEOUT)
     {
         $this->sock = $sock;
+        $this->appliedWait = $readTimeout;
+    }
+
+    public function setReadWait(float $seconds): void
+    {
+        $seconds = max($seconds, 0.001);
+        if ($seconds === $this->appliedWait || !is_resource($this->sock)) {
+            return;
+        }
+        $sec = (int) $seconds;
+        stream_set_timeout($this->sock, $sec, (int) round(($seconds - $sec) * 1_000_000));
+        $this->appliedWait = $seconds;
     }
 
     public function readTimeout(): float
@@ -89,8 +110,10 @@ final class Transport implements SelectableTransportInterface
         if ($n === 0) { return ''; }
         $this->assertOpen('read');
 
-        $buf = '';
-        $remaining = $n;
+        // Resume from what an earlier timed-out read had already received.
+        $buf = (string) substr($this->pending, 0, $n);
+        $this->pending = (string) substr($this->pending, $n);
+        $remaining = $n - strlen($buf);
         while ($remaining > 0) {
             // Suppress the PHP-level warning (a dead peer raises one): the return value + stream meta
             // below are the authoritative error signal, surfaced as a typed TransportException.
@@ -98,7 +121,9 @@ final class Transport implements SelectableTransportInterface
             if ($chunk === false || $chunk === '') {
                 $meta = stream_get_meta_data($this->sock);
                 if ($meta['timed_out'] === true) {
-                    throw new TransportException(sprintf('read timed out after %d of %d bytes', $n - $remaining, $n));
+                    // Keep what was read: the frame is still in step, and the caller may wait on.
+                    $this->pending = $buf . $this->pending;
+                    throw TransportException::readTimedOut(sprintf('read timed out after %d of %d bytes', $n - $remaining, $n));
                 }
                 if (feof($this->sock)) {
                     throw new TransportException(sprintf('unexpected EOF after %d of %d bytes', $n - $remaining, $n));

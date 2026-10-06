@@ -20,8 +20,11 @@ use Ferro\Client\Waiter;
  *
  * Every Fiber shares the one socket per {@see Session}: the loop selects on the sessions its
  * waiting Fibers need and reads one frame at a time, filing each under its `request_id`, then
- * resumes every Fiber whose terminal is there. Each session keeps its own deadline, its transport's
- * read timeout, so a silent peer fails as soon as it would synchronously, whatever the others do. A task that throws does not stop the others; the
+ * resumes every Fiber whose terminal is there. Each session keeps its own liveness clock, its
+ * transport's read timeout: a session silent that long is PINGed without blocking the others, and
+ * one that answers neither its requests nor the PING within another timeout fails, as it would
+ * synchronously (M3-D1c), whatever the others do. Request deadlines ({@see Session::setDeadline})
+ * wake the loop too, so a due request is CANCELled on time. A task that throws does not stop the others; the
  * first failure, in task order, is thrown once every task has finished (the {@see await} rule).
  *
  * **Waiting on another Fiber's open stream suspends too**: a Fiber that wants the session while
@@ -41,9 +44,10 @@ final class Loop
 
     /**
      * When each waited-on session last delivered a frame (or was first waited on), keyed by
-     * `spl_object_id`. A session silent for its own transport read timeout is read with a BLOCKING
-     * read, which then fails exactly as a synchronous call would (M3-D1b review F2: one global
-     * counter let a busy session keep a silent one waiting forever).
+     * `spl_object_id`. A session silent for its own transport read timeout is probed with a PING
+     * ({@see Session::probeLiveness}), never read with a blocking read that would stall the other
+     * sessions (M3-D1c); one global counter once let a busy session keep a silent one waiting
+     * forever (M3-D1b review F2), which is why the clock is per session.
      *
      * @var array<int, float>
      */
@@ -164,9 +168,10 @@ final class Loop
      *
      * One session: a blocking read, exactly the synchronous behaviour, read timeout included.
      * Several: `stream_select` across the ones that can be selected, waiting no longer than the
-     * nearest session deadline. A session that has delivered nothing for its own read timeout gets a
-     * blocking read, which either returns a frame or fails that session's requests on time. A
-     * session that cannot be selected (a test double) is read directly.
+     * nearest liveness clock or request deadline. A session that has delivered nothing for its own
+     * read timeout is PINGed, and closed if a PING is already out unanswered; due requests are
+     * CANCELled after every select. A session that cannot be selected (a test double) is read
+     * directly.
      *
      * @param array<array-key, Waiter> $waiting
      */
@@ -196,12 +201,22 @@ final class Loop
             $since = self::$lastProgress[$id] ??= $now;
             $remaining = $timeout - ($now - $since);
             if ($remaining <= 0.0) {
-                // Silent for its whole read timeout: a blocking read decides it now.
-                $session->pollOnce();
-                self::$lastProgress[$id] = microtime(true);
-                return;
+                // Silent for its whole read timeout. Silence is not failure (M3-D1c): probe it with a
+                // PING — without blocking the other sessions — and give it another timeout; a second
+                // silent timeout with the PING unanswered closes it.
+                $session->probeLiveness();
+                self::$lastProgress[$id] = $now;
+                $remaining = $timeout;
+                $stream = $session->selectableStream();
+                if ($stream === null) {
+                    return; // the probe closed it: its waiters are ready, and fail at their await
+                }
             }
             $nearest = min($nearest, $remaining);
+            $deadline = $session->nearestDeadline();
+            if ($deadline !== null) {
+                $nearest = min($nearest, max($deadline - $now, 0.001));
+            }
             $streams[$id] = $stream;
         }
 
@@ -211,6 +226,9 @@ final class Loop
         $sec = (int) $nearest;
         $usec = (int) (($nearest - $sec) * 1_000_000);
         $n = @stream_select($read, $write, $except, $sec, max($usec, 1000));
+        foreach ($sessions as $session) {
+            $session->enforceDeadlines(); // CANCEL whatever is due; close a session past its grace
+        }
         if ($n === false || $n === 0) {
             return;
         }

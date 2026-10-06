@@ -117,6 +117,7 @@ final class Connection
         ?PackerInterface $encodePacker = null,
         ?PackerInterface $decodePacker = null,
         ?TypePolicyOptions $types = null,
+        private readonly ?float $statementTimeout = null,
     ) {
         // A supplied ExecCodec already carries its own ValuePolicy and PlanCache, so `values:`,
         // `plans:` and `types:` have nowhere to go — they used to be accepted and DROPPED, which
@@ -156,6 +157,11 @@ final class Connection
         );
         $this->policy = $policy ?? RetryPolicy::default();
         $this->fate = $fate ?? new FateClassifier($this->policy->retryReads);
+        if ($statementTimeout !== null) {
+            // The ENGINE enforces it (`timeout_ms`, M1-S4) and answers with the statement's fate;
+            // the session's request deadline (set by `Ferro::connect`) is the client's backstop.
+            $this->codec->setTimeoutMs(max(1, (int) round($statementTimeout * 1000)));
+        }
     }
 
     /** The SPEC §9.1 type policy this connection decodes with (client-side in M1). */
@@ -1361,6 +1367,9 @@ final class Connection
             $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, null);
             try {
                 $rid = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
+                if ($session instanceof Session) {
+                    $session->armRequestTimeout($rid);
+                }
             } catch (ConnectionLostException | TransportException $e) {
                 if (!self::wasSent($e)) {
                     // Nothing was sent: the synchronous path reconnects, re-sends and classifies

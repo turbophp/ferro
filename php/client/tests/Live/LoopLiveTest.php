@@ -124,9 +124,10 @@ final class LoopLiveTest extends LiveTestCase
     }
 
     /**
-     * Review F2: a peer that accepts and never answers fails at ITS OWN read timeout even while
+     * Review F2: a peer that accepts and never answers fails on ITS OWN read timeout even while
      * another session stays busy. One global idle counter used to let the busy session keep it
-     * waiting.
+     * waiting. Since M3-D1c silence is probed first: one read timeout of silence sends a liveness
+     * PING, and a second with the PING unanswered closes the session (~2 x 0.5 s here).
      */
     public function testASilentPeerFailsAtItsOwnDeadlineWhileAnotherSessionIsBusy(): void
     {
