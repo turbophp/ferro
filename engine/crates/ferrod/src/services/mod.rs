@@ -4,6 +4,7 @@
 //! dispatched from the same per-connection handler, after the session's D15 gate.
 
 pub mod admin;
+pub mod copy;
 pub mod fate;
 #[cfg(feature = "http")]
 pub mod http;

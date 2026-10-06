@@ -508,6 +508,49 @@ pub async fn run<B: PoolBackend>(
                     }
                 }
             }
+            TxCommand::Copy {
+                direction,
+                sql,
+                timeout_ms,
+                readonly,
+                cancel,
+                responder,
+                done,
+            } => {
+                // The SAME four stop sources, combined the same way, as `ExecStreamed` above.
+                let child = abort.child_token();
+                let linker = {
+                    let child = child.clone();
+                    let req_cancel = cancel.clone();
+                    tokio::spawn(async move {
+                        req_cancel.cancelled().await;
+                        child.cancel();
+                    })
+                };
+                let max_instant = max_deadline.deadline();
+                let deadline = Some(match timeout_ms {
+                    Some(ms) => std::cmp::min(
+                        tokio::time::Instant::now() + Duration::from_millis(u64::from(ms)),
+                        max_instant,
+                    ),
+                    None => max_instant,
+                });
+                let ended = crate::services::copy::run_tx_copy(
+                    &mut co, direction, &sql, responder, &child, deadline, readonly,
+                )
+                .await;
+                linker.abort();
+                let _ = done.send(());
+                match ended {
+                    StreamEnded::Intact => {}
+                    StreamEnded::Broken => {
+                        if abort.is_cancelled() {
+                            break 'actor TxEnd::Abort;
+                        }
+                        break 'actor TxEnd::Deadline;
+                    }
+                }
+            }
         }
 
         // A non-terminal command was processed: reset the idle deadline (it measures the idle gap
@@ -550,10 +593,17 @@ pub async fn run<B: PoolBackend>(
 fn drain_buffered_on_teardown(cmd_rx: &mut mpsc::Receiver<TxCommand>, end: TxEnd) {
     cmd_rx.close();
     while let Ok(cmd) = cmd_rx.try_recv() {
-        if let TxCommand::ExecStreamed {
-            responder, done, ..
-        } = cmd
-        {
+        // M3-D4: a buffered tx-scoped COPY moved its `Responder` in too — same treatment.
+        let moved = match cmd {
+            TxCommand::ExecStreamed {
+                responder, done, ..
+            }
+            | TxCommand::Copy {
+                responder, done, ..
+            } => Some((responder, done)),
+            _ => None,
+        };
+        if let Some((responder, done)) = moved {
             let ep = match end {
                 TxEnd::Deadline | TxEnd::Abort => crate::services::sql::tx_deadline(
                     "transaction torn down before this queued streamed statement ran \
@@ -922,6 +972,7 @@ mod tests {
                 // Derived from the ONE authority, exactly as `begin_on_pool` does (FakeBackend
                 // inherits the `true` default) — never a literal restated here.
                 streaming: pool.backend().supports_row_streaming(),
+                copy: pool.backend().supports_copy(),
                 pool: "default".into(),
                 dialect: pool.backend().dialect(),
             },
@@ -1498,6 +1549,7 @@ mod tests {
                 done: done_rx,
                 // Derived from the ONE authority, exactly as `begin_on_pool` does.
                 streaming: pool.backend().supports_row_streaming(),
+                copy: pool.backend().supports_copy(),
                 pool: "default".into(),
                 dialect: pool.backend().dialect(),
             },

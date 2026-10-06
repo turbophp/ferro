@@ -1,0 +1,11 @@
+{
+  "frame_hex": "f7040000040004003c0000000100000090",
+  "header": {
+    "flags": 0,
+    "method": 4,
+    "request_id": 60,
+    "service": 4
+  },
+  "message": {},
+  "name": "copy_done"
+}

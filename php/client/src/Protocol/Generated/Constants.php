@@ -37,7 +37,11 @@ final class Constants
     public const METHOD_HTTP_BODY = 3;
     public const METHOD_HTTP_HEAD = 2;
     public const METHOD_HTTP_REQUEST = 1;
+    public const METHOD_SQL_COPY_IN = 2;
+    public const METHOD_SQL_COPY_OUT = 3;
     public const METHOD_SQL_EXEC = 1;
+    public const METHOD_STREAM_COPY_DATA = 3;
+    public const METHOD_STREAM_COPY_DONE = 4;
     public const METHOD_STREAM_DATA = 2;
     public const METHOD_STREAM_HEAD = 1;
     public const METHOD_TX_BEGIN = 1;
@@ -223,5 +227,5 @@ final class Constants
         'write',
     ];
 
-    public const TYPE_REGISTRY_HASH = '8a862520dcdf7e38';
+    public const TYPE_REGISTRY_HASH = '2c826954795ad915';
 }

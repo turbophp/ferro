@@ -1,0 +1,17 @@
+{
+  "frame_hex": "f7040000020003003d0000004a00000095a46d61696ed93d434f5059202853454c4543542069642c206e616d652046524f4d206974656d732920544f205354444f555420574954482028464f524d41542063737629c3cd75302a",
+  "header": {
+    "flags": 0,
+    "method": 3,
+    "request_id": 61,
+    "service": 2
+  },
+  "message": {
+    "pool": "main",
+    "readonly": true,
+    "sql": "COPY (SELECT id, name FROM items) TO STDOUT WITH (FORMAT csv)",
+    "timeout_ms": 30000,
+    "tx_id": 42
+  },
+  "name": "copy_out_request"
+}

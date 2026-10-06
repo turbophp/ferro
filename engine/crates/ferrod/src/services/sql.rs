@@ -161,6 +161,31 @@ async fn handle(
             )
             .await
         }
+        // M3-D4: the COPY sub-protocol (`services::copy`).
+        (service::SQL, method_sql::COPY_IN) => {
+            crate::services::copy::handle_copy(
+                frame,
+                responder,
+                registry,
+                tx_registry,
+                session_id,
+                cancel,
+                ferro_classify::CopyDirection::In,
+            )
+            .await
+        }
+        (service::SQL, method_sql::COPY_OUT) => {
+            crate::services::copy::handle_copy(
+                frame,
+                responder,
+                registry,
+                tx_registry,
+                session_id,
+                cancel,
+                ferro_classify::CopyDirection::Out,
+            )
+            .await
+        }
         (service::TX, method_tx::BEGIN) => {
             handle_begin(
                 frame,
@@ -715,7 +740,7 @@ async fn sleep_opt(ms: Option<u32>) {
 /// arm that override documents for exactly this pre-dispatch race: a write is a known did-not-apply
 /// (`ConnectionLost{Retryable}`), a read `Cancelled`. No SQLSTATE is invented: the cancel came from
 /// the client, not from a backend, and the override keys on the code.
-fn cancelled_before_dispatch() -> PoolError {
+pub(crate) fn cancelled_before_dispatch() -> PoolError {
     PoolError::Sql {
         code: errc::CANCELLED,
         branch: errc::CANCELLED_BRANCH,
@@ -1413,7 +1438,7 @@ async fn abort_stream<B: PoolBackend>(
 /// one is PG, which has no such protocol field, and MySQL row streaming is deferred (§22.2 (n)) —
 /// but it is a parameter rather than a hardcoded `None` so wiring a future streaming backend that
 /// DOES report one is an edit at its call site, not a silent drop here.
-fn build_stream_terminal_body(
+pub(crate) fn build_stream_terminal_body(
     affected: u64,
     last_insert_id: Option<u64>,
     streamed_rows: u64,
@@ -1469,7 +1494,7 @@ fn estimate_row_bytes(row: &[Value]) -> usize {
 /// exactly as it routes the buffered path's drained cancel: a streamed autocommit READ →
 /// `Cancelled{NonRetryable}`, a dispatched streamed autocommit WRITE → `WriteUnconfirmed{Indeterminate}`,
 /// a tx-scoped stream (Task 5) → `TxDeadline{Retryable}`.
-fn stream_cancel_error() -> PoolError {
+pub(crate) fn stream_cancel_error() -> PoolError {
     PoolError::Sql {
         code: errc::CANCELLED,
         branch: errc::CANCELLED_BRANCH,
@@ -1483,7 +1508,7 @@ fn stream_cancel_error() -> PoolError {
 /// Map a `StreamSendError` (a failed `send_head`/`send_data`) to the `PoolError` the abort path
 /// classifies from: a flow-control OR final-channel-send abort is a cancel/timeout (57014); an
 /// oversized single row is the §5.2 large-row ceiling; a closed control channel is a lost link.
-fn send_err_to_pool_error(e: StreamSendError) -> PoolError {
+pub(crate) fn send_err_to_pool_error(e: StreamSendError) -> PoolError {
     match e {
         StreamSendError::Aborted(_) => stream_cancel_error(),
         StreamSendError::Oversized => PoolError::Unsupported(
@@ -1497,7 +1522,7 @@ fn send_err_to_pool_error(e: StreamSendError) -> PoolError {
 /// Await `deadline` if there is one, else never resolve — the `Instant`-based sibling of
 /// [`sleep_opt`], for [`run_streamed_exec`]'s outer select (a single fixed `Instant` deadline is
 /// shared with every `send_head`/`send_data` wait, so the whole stream honors one `timeout_ms`).
-async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+pub(crate) async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(t) => tokio::time::sleep_until(t).await,
         None => std::future::pending::<()>().await,
@@ -1663,6 +1688,7 @@ async fn begin_on_pool<B: PoolBackend>(
             // Captured at BEGIN from the ONE authority, so the (backend-agnostic) forwarding
             // handler can refuse a tx-scoped `fetch:stream` WITHOUT touching the pinned conn.
             streaming: pool.backend().supports_row_streaming(),
+            copy: pool.backend().supports_copy(),
             pool: req.pool.as_str().into(),
             dialect: pool.backend().dialect(),
         },
@@ -1787,7 +1813,7 @@ async fn handle_savepoint(
 /// Resolve a tx-scoped request to its live `TxHandle`, or the terminal `ErrorPayload` to declare:
 /// `NotFoundOrForbidden` (unknown OR cross-session) → `Protocol`; the owner's own `Tombstoned` tx →
 /// `TxDeadline{Retryable}`. A client can never tell a cross-session id from an unknown one.
-fn resolve_active(
+pub(crate) fn resolve_active(
     tx_registry: &TxRegistry,
     tx_id: u64,
     session_id: SessionId,
@@ -1835,7 +1861,7 @@ fn declare_ctl(responder: Responder, reply: CtlReply, readonly: bool) {
 /// The prompt terminal to declare when the actor is gone mid-teardown (an mpsc send-Err or a
 /// oneshot recv-Err): a fresh lookup decides — a now-tombstoned id → `TxDeadline`, otherwise
 /// `Protocol`. Never a hang; the supervisor stays the sole terminal-sender so exactly-one-END holds.
-fn actor_gone_terminal(
+pub(crate) fn actor_gone_terminal(
     tx_registry: &TxRegistry,
     tx_id: u64,
     session_id: SessionId,
@@ -2264,6 +2290,7 @@ mod tests {
             // These fixtures only exercise `resolve_active`'s lookup states, never a streamed
             // fetch; `true` is the trait default (PG's real value).
             streaming: true,
+            copy: true,
             pool: "default".into(),
             dialect: ferro_classify::Dialect::Postgres,
         }

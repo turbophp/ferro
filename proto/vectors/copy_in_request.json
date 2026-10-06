@@ -1,0 +1,17 @@
+{
+  "frame_hex": "f7040000020002003c0000002b00000095a46d61696ed920434f5059206974656d73202869642c206e616d65292046524f4d20535444494ec2c0c0",
+  "header": {
+    "flags": 0,
+    "method": 2,
+    "request_id": 60,
+    "service": 2
+  },
+  "message": {
+    "pool": "main",
+    "readonly": false,
+    "sql": "COPY items (id, name) FROM STDIN",
+    "timeout_ms": null,
+    "tx_id": null
+  },
+  "name": "copy_in_request"
+}

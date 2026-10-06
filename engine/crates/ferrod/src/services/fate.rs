@@ -101,13 +101,17 @@ pub fn classify_fate(err: PoolError, ctx: OpContext) -> ErrorPayload {
             )
         } else {
             // An autocommit WRITE cancel that fired BEFORE dispatch (sent=false): the statement
-            // never reached the backend, so its fate is a KNOWN did-not-apply -> Retryable. (See
+            // never reached the backend, so its fate is a KNOWN did-not-apply -> Retryable. M3-D4
+            // also routes a COPY FROM STDIN stopped before its end-of-data here: its bytes reached
+            // the backend, but PostgreSQL completes a COPY only on CopyDone, so it cannot apply —
+            // the same KNOWN did-not-apply (`services::copy`). (See
             // the module doc: reaching 57014 at all normally implies sent=true; this arm exists
             // for totality and for the future biased-select pre-dispatch race.)
             payload(
                 errc::CONNECTION_LOST,
                 errc::CONNECTION_LOST_BRANCH,
-                "cancelled before the write was dispatched; it never reached the backend \
+                "cancelled before the write could take effect — it was never dispatched, or it is \
+                 a COPY FROM STDIN stopped before its end-of-data — so it cannot have applied \
                  (retryable — the engine never retries)",
             )
         };
