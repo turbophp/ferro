@@ -142,7 +142,8 @@ pub enum BreakerCounts {
     ConnectTimeout5xx,
 }
 
-/// TLS file locations. They are only *named* here; slice F5 reads them.
+/// TLS file locations. They are only *named* here; `engine::tls` reads them once, at start (`CA_FILE`
+/// since M6-F5a; `CLIENT_CERT_FILE`/`CLIENT_KEY_FILE`, mTLS, since M6-F5c).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TlsFiles {
     pub ca_file: Option<PathBuf>,
@@ -650,14 +651,17 @@ impl HttpConfig {
         &self.orphan_keys
     }
 
-    /// §23.3.3: the upstreams carrying attached headers whose credential isolation is void,
-    /// given `FERRO_ALLOW_UIDS` and `ferrod`'s own uid. Names only — never values.
+    /// §23.3.3: the upstreams carrying credential material — attached headers, or (since M6-F5c)
+    /// a `CLIENT_KEY_FILE`, which is credential material too (§23.3.1) — whose credential isolation
+    /// is void, given `FERRO_ALLOW_UIDS` and `ferrod`'s own uid. Names only — never values.
     pub fn isolation_void(&self, ferro_allow_uids: &[u32], own_uid: u32) -> Vec<&str> {
         let daemon_void = ferro_allow_uids.is_empty() || ferro_allow_uids.contains(&own_uid);
         self.upstreams
             .iter()
             .filter_map(|(n, e)| match e {
-                UpstreamEntry::Enabled(up) if !up.attached.is_empty() => {
+                UpstreamEntry::Enabled(up)
+                    if !up.attached.is_empty() || up.tls.client_key_file.is_some() =>
+                {
                     let up_void = up.allow_uids.as_ref().is_some_and(|u| u.contains(&own_uid));
                     (daemon_void || up_void).then_some(n.as_str())
                 }

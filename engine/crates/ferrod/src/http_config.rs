@@ -7,8 +7,8 @@
 //!   `ConfigError`'s `Display` is log-safe by construction);
 //! - every `FERRO_UPSTREAM_*` variable no declared upstream owns, at `warn` (a typo in the NAME part
 //!   leaves the intended upstream at its defaults — wider, §22.2 (cw)'s stated cost);
-//! - §23.3.3's isolation warning, naming each upstream that carries attached headers (never their
-//!   values) when PHP and `ferrod` can share a uid;
+//! - §23.3.3's isolation warning, naming each upstream that carries attached headers or a client key
+//!   (M6-F5c; never their values) when PHP and `ferrod` can share a uid;
 //! - one summary line naming the enabled and disabled upstreams.
 //!
 //! **HTTP is configured iff `FERRO_UPSTREAMS` is set and non-blank** (D14's blank-reads-as-unset
@@ -53,7 +53,7 @@ pub fn log(cfg: &HttpConfig, ferro_allow_uids: &[u32], own_uid: u32) {
         tracing::warn!(
             upstreams = ?void,
             "ferrod: credential isolation is VOID for these upstreams: PHP can run as ferrod's uid \
-             and read the attached-header files (SPEC §23.3.3)"
+             and read the attached-header and client-key files (SPEC §23.3.3)"
         );
     }
     let mut enabled = Vec::new();

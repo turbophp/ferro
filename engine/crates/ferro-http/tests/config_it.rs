@@ -335,9 +335,15 @@ fn non_utf8_values_disable() {
 }
 
 #[test]
-fn isolation_void_names_upstreams_with_attached_headers_only() {
+fn isolation_void_names_upstreams_with_credential_material_only() {
+    // Credential material: attached headers, or (M6-F5c) a client key. A CA_FILE is not.
     let cfg = load(&[
-        ("FERRO_UPSTREAMS", "pay,plain,narrow"),
+        ("FERRO_UPSTREAMS", "pay,plain,narrow,mtls,ca"),
+        ("FERRO_UPSTREAM_MTLS_ORIGIN", "https://m.example"),
+        ("FERRO_UPSTREAM_MTLS_CLIENT_CERT_FILE", "/fixture/cert"),
+        ("FERRO_UPSTREAM_MTLS_CLIENT_KEY_FILE", "/fixture/key"),
+        ("FERRO_UPSTREAM_CA_ORIGIN", "https://ca.example"),
+        ("FERRO_UPSTREAM_CA_CA_FILE", "/fixture/ca"),
         ("FERRO_UPSTREAM_PAY_ORIGIN", "https://pay.example"),
         ("FERRO_UPSTREAM_PAY_ATTACH_HEADERS_FILE", "/fixture/attach"),
         ("FERRO_UPSTREAM_PLAIN_ORIGIN", "https://plain.example"),
@@ -350,9 +356,12 @@ fn isolation_void_names_upstreams_with_attached_headers_only() {
     ]);
     let own = 999;
     // FERRO_ALLOW_UIDS empty → only the daemon's own uid connects: void for every attached set.
-    assert_eq!(cfg.isolation_void(&[], own), ["narrow", "pay"]);
+    assert_eq!(cfg.isolation_void(&[], own), ["mtls", "narrow", "pay"]);
     // ferrod's own uid listed daemon-wide.
-    assert_eq!(cfg.isolation_void(&[33, own], own), ["narrow", "pay"]);
+    assert_eq!(
+        cfg.isolation_void(&[33, own], own),
+        ["mtls", "narrow", "pay"]
+    );
     // A proper split, but one upstream lists ferrod's uid.
     assert_eq!(cfg.isolation_void(&[33], own), ["narrow"]);
 }

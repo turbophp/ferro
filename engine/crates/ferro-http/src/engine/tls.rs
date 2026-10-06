@@ -29,13 +29,30 @@
 //! "up to N× connections and handshakes". Full and resumed handshakes are counted per upstream
 //! ([`HandshakeCounts`]; the `ferro_http_tls_handshakes_total{resumed}` metric is F7's).
 //!
-//! **mTLS is slice M6-F5c, not here.** Under TLS 1.3 a server's rejection of the client's
-//! certificate (or of its absence) is an alert the client receives AFTER its own handshake has
-//! completed — measured by `a_tls13_client_auth_refusal_arrives_after_connect_resolves` below — so
-//! it would surface after dispatch, with request bytes already on the socket. Classifying that
-//! without making a handshake refusal `Indeterminate` is a fate-rule decision (SPEC §21 open item
-//! O-F5c), so an upstream configured with `CLIENT_CERT_FILE` is not served by this build
-//! (`Unsupported`), as `https` was not before F5a.
+//! **mTLS (slice M6-F5c, SPEC D23).** `CLIENT_CERT_FILE` (a PEM chain, end-entity first) and
+//! `CLIENT_KEY_FILE` (one PEM private key) are read HERE, at start, with the roots — never per
+//! dial — and become the base configuration's client-certificate resolver, so every pool's
+//! configuration (each a clone of the base) presents the same certificate on every full handshake,
+//! fresh dial or new partition alike. Material that cannot be loaded — unreadable, not PEM, no
+//! certificate or no key, a certificate that does not parse, a key `ring` cannot use, or a key that
+//! does not match the end-entity certificate — DISABLES the upstream under the `CA_FILE` rule above
+//! (`forbidden_upstream`, before validation), naming the key and never the value. **Key custody**
+//! (§23.3.2): the key's bytes exist only inside this load and inside `rustls`'s signing key; the
+//! file buffer is overwritten before it is freed (best effort — the DER copy `rustls` consumes and
+//! the live signing key are not ours to wipe), nothing here derives `Debug` over them, and no error
+//! quotes a path or the file's contents.
+//!
+//! **A refusal of the client certificate** (or of its absence) differs by version, measured by
+//! `a_tls13_client_auth_refusal_arrives_after_connect_resolves` below. Under TLS 1.2 the server's
+//! verdict precedes its Finished, so the refusal fails `connect`: before dispatch, `tls_verify`.
+//! Under TLS 1.3 the client's handshake is complete once it has sent its Finished, so the
+//! refusal is an alert read AFTER dispatch, with the request's records already on the socket — and
+//! by SPEC D23 it is "sent, no head": a POST `Indeterminate`, a declared-idempotent request
+//! `Retryable`, never re-sent, and its cause token is the one §23.5.6's "sent, no head" group
+//! derives for that read failure (`reset`), NEVER a `tls_*` token (§23.11.3 maps `tls_*` to
+//! `ConnectException`, which naive deciders retry). [`client_auth_alert`] recognises the alert so
+//! the engine can SAY what happened (the terminal's message and a `warn` naming the upstream); it
+//! never changes the fate or the token.
 
 use std::collections::HashMap;
 use std::io;
@@ -44,7 +61,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rustls::client::Resumption;
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{AlertDescription, ClientConfig, RootCertStore};
 
 use crate::config::{HttpConfig, MinTls, Upstream, UpstreamEntry, env_name};
@@ -61,7 +78,8 @@ pub const ALPN_HTTP11: &[u8] = b"http/1.1";
 /// leaves the one name this pool uses resident.
 const SESSIONS_PER_POOL: usize = 32;
 
-/// A `CA_FILE` larger than this is refused (an OS bundle is ~200 KiB).
+/// A TLS file (`CA_FILE`, `CLIENT_CERT_FILE`, `CLIENT_KEY_FILE`) larger than this is refused (an OS
+/// bundle is ~200 KiB).
 pub const MAX_CA_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Where the OS root store comes from.
@@ -105,14 +123,7 @@ fn classify_rustls(err: &rustls::Error) -> TlsCause {
             TlsCause::Verify
         }
         E::AlertReceived(a) => match a {
-            AlertDescription::BadCertificate
-            | AlertDescription::UnsupportedCertificate
-            | AlertDescription::CertificateRevoked
-            | AlertDescription::CertificateExpired
-            | AlertDescription::CertificateUnknown
-            | AlertDescription::UnknownCA
-            | AlertDescription::AccessDenied
-            | AlertDescription::CertificateRequired => TlsCause::Verify,
+            a if is_client_auth_alert(*a) => TlsCause::Verify,
             AlertDescription::ProtocolVersion => TlsCause::Version,
             AlertDescription::NoApplicationProtocol => TlsCause::Alpn,
             _ => TlsCause::Handshake,
@@ -130,6 +141,45 @@ fn classify_rustls(err: &rustls::Error) -> TlsCause {
         }
         _ => TlsCause::Handshake,
     }
+}
+
+/// Whether a peer's alert refuses OUR certificate, or its absence (`bad_certificate`,
+/// `unknown_ca`, `certificate_required`, …). Inside a handshake that is `tls_verify`
+/// ([`classify_handshake_error`]); read after dispatch (TLS 1.3 client authentication, SPEC D23) it
+/// is only NAMED ([`client_auth_alert`]) — the fate and the cause token stay "sent, no head"'s.
+pub fn is_client_auth_alert(a: AlertDescription) -> bool {
+    matches!(
+        a,
+        AlertDescription::BadCertificate
+            | AlertDescription::UnsupportedCertificate
+            | AlertDescription::CertificateRevoked
+            | AlertDescription::CertificateExpired
+            | AlertDescription::CertificateUnknown
+            | AlertDescription::UnknownCA
+            | AlertDescription::AccessDenied
+            | AlertDescription::CertificateRequired
+    )
+}
+
+/// The client-certificate refusal somewhere in an exchange's error chain (a `hyper` error whose
+/// I/O cause is `tokio-rustls`'s `io::Error` wrapping `rustls::Error::AlertReceived`), if any.
+/// `io::Error::source` skips a custom error's own payload, so each `io::Error` is opened with
+/// `get_ref` rather than only followed through `source`.
+pub fn client_auth_alert(err: &(dyn std::error::Error + 'static)) -> Option<AlertDescription> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        let tls = match e.downcast_ref::<io::Error>() {
+            Some(io) => io.get_ref().and_then(|r| r.downcast_ref::<rustls::Error>()),
+            None => e.downcast_ref::<rustls::Error>(),
+        };
+        if let Some(rustls::Error::AlertReceived(a)) = tls
+            && is_client_auth_alert(*a)
+        {
+            return Some(*a);
+        }
+        cur = e.source();
+    }
+    None
 }
 
 /// Why an upstream's TLS material could not be loaded. Its `Display` names the upstream and the
@@ -239,7 +289,12 @@ impl TlsContexts {
                     .get_or_init(|| Arc::new(load_os_roots(os_roots)))
                     .clone()),
             };
-            let built = roots.and_then(|roots| build_upstream(up, roots));
+            // The client certificate and key are TLS material too: loaded here, at start, beside
+            // the roots, and a failure disables the upstream under the same rule (M6-F5c).
+            let built = roots.and_then(|roots| {
+                let client = load_client_auth(up, read_file)?;
+                build_upstream(up, roots, client)
+            });
             by_upstream.insert(name.to_string(), built.map(Arc::new));
         }
         TlsContexts { by_upstream }
@@ -320,7 +375,84 @@ fn load_ca_file(
     Ok(Arc::new(store))
 }
 
-fn build_upstream(up: &Upstream, roots: Arc<RootCertStore>) -> Result<UpstreamTls, TlsSetupError> {
+/// An upstream's client certificate and key (mTLS, slice M6-F5c), loaded at start. Deliberately not
+/// `Debug`: the key is credential material (§23.3.2).
+struct ClientAuth {
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+}
+
+/// Overwrite a buffer that held key material before it is freed. Best effort: `black_box` keeps the
+/// writes from being elided as dead stores, but earlier reallocations of the buffer, and the copies
+/// the PEM decoder and `rustls` make, are out of reach (this crate forbids `unsafe` and adds no
+/// crate for this).
+fn wipe(buf: &mut [u8]) {
+    buf.fill(0);
+    std::hint::black_box(&*buf);
+}
+
+/// Load `CLIENT_CERT_FILE` and `CLIENT_KEY_FILE` (both set or neither: `config` refuses a half
+/// pair). `None` when the upstream has no client certificate. Every failure names the key, never
+/// the path or the file's contents.
+fn load_client_auth(
+    up: &Upstream,
+    read_file: &dyn Fn(&Path) -> io::Result<Vec<u8>>,
+) -> Result<Option<ClientAuth>, TlsSetupError> {
+    use rustls::pki_types::pem::PemObject;
+    let (Some(cert_path), Some(key_path)) = (&up.tls.client_cert_file, &up.tls.client_key_file)
+    else {
+        return Ok(None);
+    };
+    let err = |key: &'static str, reason: String| TlsSetupError {
+        upstream: up.name.clone(),
+        key,
+        reason,
+    };
+    let bytes = read_file(cert_path)
+        .map_err(|e| err("CLIENT_CERT_FILE", format!("cannot be read ({})", e.kind())))?;
+    let mut chain = Vec::new();
+    for (i, c) in CertificateDer::pem_slice_iter(&bytes).enumerate() {
+        let c = c.map_err(|_| {
+            err(
+                "CLIENT_CERT_FILE",
+                format!("PEM block {} is malformed", i + 1),
+            )
+        })?;
+        // Every certificate must parse: one that does not would be SENT as-is and refused by the
+        // server on every handshake — under TLS 1.3 after dispatch (D23), so every POST
+        // Indeterminate. Refusing it here turns the misconfiguration into a startup error (the
+        // `CA_FILE` rule: never a chain built from whatever happened to parse).
+        rustls::server::ParsedCertificate::try_from(&c).map_err(|_| {
+            err(
+                "CLIENT_CERT_FILE",
+                format!("certificate {} does not parse as X.509", i + 1),
+            )
+        })?;
+        chain.push(c);
+    }
+    if chain.is_empty() {
+        return Err(err("CLIENT_CERT_FILE", "holds no PEM certificate".into()));
+    }
+    let mut bytes = read_file(key_path)
+        .map_err(|e| err("CLIENT_KEY_FILE", format!("cannot be read ({})", e.kind())))?;
+    let mut keys = PrivateKeyDer::pem_slice_iter(&bytes);
+    let key = match (keys.next(), keys.next()) {
+        (Some(Ok(k)), None) => Ok(k),
+        (None, _) => Err("holds no PEM private key"),
+        (Some(Err(_)), _) | (Some(Ok(_)), Some(Err(_))) => Err("holds a malformed PEM block"),
+        (Some(Ok(_)), Some(Ok(_))) => Err("holds more than one private key"),
+    };
+    drop(keys);
+    wipe(&mut bytes);
+    let key = key.map_err(|r| err("CLIENT_KEY_FILE", r.into()))?;
+    Ok(Some(ClientAuth { chain, key }))
+}
+
+fn build_upstream(
+    up: &Upstream,
+    roots: Arc<RootCertStore>,
+    client: Option<ClientAuth>,
+) -> Result<UpstreamTls, TlsSetupError> {
     let err = |key, reason: &str| TlsSetupError {
         upstream: up.name.clone(),
         key,
@@ -331,11 +463,29 @@ fn build_upstream(up: &Upstream, roots: Arc<RootCertStore>) -> Result<UpstreamTl
         MinTls::V1_3 => &[&rustls::version::TLS13],
     };
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut base = ClientConfig::builder_with_provider(provider)
+    let builder = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(versions)
         .map_err(|_| err("MIN_TLS", "selects no protocol version this build supports"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        .with_root_certificates(roots);
+    // mTLS: the certificate goes into the BASE configuration, which every pool's configuration
+    // clones (`config_for`), so no pool, partition or fresh dial can present less than the operator
+    // configured.
+    let mut base =
+        match client {
+            None => builder.with_no_client_auth(),
+            Some(ClientAuth { chain, key }) => builder.with_client_auth_cert(chain, key).map_err(
+                |e| match e {
+                    rustls::Error::InconsistentKeys(_) => err(
+                        "CLIENT_KEY_FILE",
+                        "does not match CLIENT_CERT_FILE's first (end-entity) certificate",
+                    ),
+                    _ => err(
+                        "CLIENT_KEY_FILE",
+                        "is not a private key this build can use (RSA, ECDSA P-256/P-384, Ed25519)",
+                    ),
+                },
+            )?,
+        };
     base.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
     base.resumption = Resumption::disabled(); // replaced per pool (`config_for`)
     let server_name = match up.origin.host() {
@@ -352,7 +502,8 @@ fn build_upstream(up: &Upstream, roots: Arc<RootCertStore>) -> Result<UpstreamTl
     })
 }
 
-/// The production file reader: `CA_FILE` with a size cap.
+/// The production file reader for TLS material (`CA_FILE`, `CLIENT_CERT_FILE`, `CLIENT_KEY_FILE`),
+/// with a size cap.
 pub fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::Read;
     let mut buf = Vec::new();
@@ -384,6 +535,21 @@ mod tests {
     /// A client context for `https://api.test` trusting `ca`, built through the production path
     /// (`HttpConfig::load` → `TlsContexts::build`, `CA_FILE` read through the seam).
     fn client_for(ca: &Issued, extra: &[(&str, &str)]) -> Arc<UpstreamTls> {
+        contexts_with(ca, extra, Vec::new())
+            .get("api")
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone()
+    }
+
+    /// The contexts for `https://api.test` trusting `ca`, with `extra` keys and `files` (path →
+    /// contents) served through the read seam beside `/ca.pem`.
+    fn contexts_with(
+        ca: &Issued,
+        extra: &[(&str, &str)],
+        files: Vec<(&'static str, Vec<u8>)>,
+    ) -> TlsContexts {
         let pem = ca.cert_pem().into_bytes();
         let mut vars: Vec<(OsString, OsString)> = vec![
             ("FERRO_UPSTREAMS".into(), "api".into()),
@@ -398,15 +564,37 @@ mod tests {
         }
         let read = move |p: &Path| {
             if p == Path::new("/ca.pem") {
-                Ok(pem.clone())
-            } else {
-                Err(io::ErrorKind::NotFound.into())
+                return Ok(pem.clone());
             }
+            files
+                .iter()
+                .find(|(f, _)| p == Path::new(f))
+                .map(|(_, b)| b.clone())
+                .ok_or_else(|| io::ErrorKind::NotFound.into())
         };
         let cfg = HttpConfig::load(vars, &read);
         assert!(cfg.errors().is_empty(), "{:?}", cfg.errors());
-        let ctxs = TlsContexts::build(&cfg, &OsRoots::Fixed(Vec::new()), &read);
-        ctxs.get("api").unwrap().as_ref().unwrap().clone()
+        TlsContexts::build(&cfg, &OsRoots::Fixed(Vec::new()), &read)
+    }
+
+    /// A client context presenting `client` (cert at `/client.pem`, key at `/client.key`).
+    fn mtls_client_for(ca: &Issued, client: &Issued) -> Arc<UpstreamTls> {
+        contexts_with(
+            ca,
+            &[
+                ("CLIENT_CERT_FILE", "/client.pem"),
+                ("CLIENT_KEY_FILE", "/client.key"),
+            ],
+            vec![
+                ("/client.pem", client.cert_pem().into_bytes()),
+                ("/client.key", client.key_pem().into_bytes()),
+            ],
+        )
+        .get("api")
+        .unwrap()
+        .as_ref()
+        .unwrap_or_else(|e| panic!("{e}"))
+        .clone()
     }
 
     fn server(leaf: &Issued, tls12_only: bool, alpn: &[&[u8]]) -> Arc<ServerConfig> {
@@ -583,12 +771,12 @@ mod tests {
         srv.await.unwrap();
     }
 
-    /// **Premise P-M (the mTLS split, SPEC §21 O-F5c).** Under TLS 1.3 the client's handshake is
-    /// complete once it has SENT its Finished, so a server's refusal of the client certificate — or
-    /// of its absence — is an alert the client reads only afterwards: `connect` RESOLVES, and the
-    /// refusal surfaces on the first read, after request bytes are already on the socket. Under
-    /// TLS 1.2 the server's Finished follows its verdict, so the same refusal fails `connect` (the
-    /// control). This is why mTLS is not in M6-F5a.
+    /// **Premise P-M (the mTLS split; raised as O-F5c, decided as SPEC D23).** Under TLS 1.3 the
+    /// client's handshake is complete once it has SENT its Finished, so a server's refusal of the
+    /// client certificate — or of its absence — is an alert the client reads only afterwards:
+    /// `connect` RESOLVES, and the refusal surfaces on the first read, after request bytes are
+    /// already on the socket. Under TLS 1.2 the server's Finished follows its verdict, so the same
+    /// refusal fails `connect` (the control). This is why mTLS waited for D23 and is M6-F5c.
     #[tokio::test]
     async fn a_tls13_client_auth_refusal_arrives_after_connect_resolves() {
         let ca = testcert::ca("Ferro Test CA");
@@ -615,12 +803,246 @@ mod tests {
             }
             other => panic!("expected certificate_required, got {other:?}"),
         }
+        assert_eq!(
+            client_auth_alert(&e),
+            Some(AlertDescription::CertificateRequired),
+            "the engine can name it"
+        );
 
         // Control: TLS 1.2 — the refusal fails `connect` itself.
         let (c, s) = tokio::io::duplex(64 * 1024);
         let _srv = spawn_server(mtls_server(&leaf, &client_ca, true), s);
         let e = connect(&ctx, c).await.unwrap_err();
         assert_eq!(classify_handshake_error(&e), TlsCause::Verify, "{e}");
+    }
+
+    /// One mTLS handshake from `ctx`'s pool `partition` against `server`, then a request: the
+    /// server's answer, or the error that refused it.
+    async fn mtls_exchange(
+        ctx: &UpstreamTls,
+        partition: Option<u32>,
+        server: Arc<ServerConfig>,
+    ) -> io::Result<Vec<u8>> {
+        let (c, s) = tokio::io::duplex(64 * 1024);
+        let _srv = spawn_server(server, s);
+        let (tap, _state) = CipherTap::new(c);
+        let mut t = tokio_rustls::TlsConnector::from(ctx.config_for(partition))
+            .connect(ctx.server_name(), tap)
+            .await?;
+        t.write_all(b"GET / HTTP/1.1\r\nhost: api.test\r\n\r\n")
+            .await?;
+        t.flush().await?;
+        let mut b = [0u8; 64];
+        let n = t.read(&mut b).await?;
+        Ok(b[..n].to_vec())
+    }
+
+    /// M6-F5c: a configured client certificate is presented and ACCEPTED by a server that requires
+    /// one, under TLS 1.3 and TLS 1.2, from EVERY pool's configuration (each a clone of the base:
+    /// the unpartitioned pool and two `PARTITION=uid` pools) — the positive control for every
+    /// refusal below. Under TLS 1.3 `connect` resolving proves nothing (P-M), so acceptance is the
+    /// server's ANSWER to a request.
+    #[tokio::test]
+    async fn a_configured_client_certificate_is_presented_from_every_pool() {
+        let ca = testcert::ca("Ferro Test CA");
+        let client_ca = testcert::ca("Client CA");
+        let leaf = ca.sign(&Spec::new("api.test", Usage::Server).dns("api.test"));
+        let client = client_ca.sign(&Spec::new("ferro-client", Usage::Client));
+        let ctx = mtls_client_for(&ca, &client);
+        for tls12_only in [false, true] {
+            for partition in [None, Some(1000), Some(1001)] {
+                let answer =
+                    mtls_exchange(&ctx, partition, mtls_server(&leaf, &client_ca, tls12_only))
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!("tls12_only={tls12_only} partition={partition:?}: refused: {e}")
+                        });
+                assert!(answer.starts_with(b"HTTP/1.1 200"), "{answer:?}");
+            }
+        }
+    }
+
+    /// D23's second refusal shape: a configured certificate the server REJECTS (issued by a CA it
+    /// does not trust). Under TLS 1.3 it, too, arrives after `connect` resolves, and
+    /// [`client_auth_alert`] names it; under TLS 1.2 it fails `connect` as `tls_verify`.
+    #[tokio::test]
+    async fn a_rejected_client_certificate_is_read_after_a_tls13_connect_and_is_tls_verify_under_tls12()
+     {
+        let ca = testcert::ca("Ferro Test CA");
+        let client_ca = testcert::ca("Client CA");
+        let leaf = ca.sign(&Spec::new("api.test", Usage::Server).dns("api.test"));
+        let stranger = testcert::ca("Stranger CA");
+        let rejected = stranger.sign(&Spec::new("ferro-client", Usage::Client));
+        let ctx = mtls_client_for(&ca, &rejected);
+
+        let e = mtls_exchange(&ctx, None, mtls_server(&leaf, &client_ca, false))
+            .await
+            .unwrap_err();
+        let alert = client_auth_alert(&e).unwrap_or_else(|| panic!("a named refusal, got {e}"));
+        assert!(is_client_auth_alert(alert), "{alert:?}");
+
+        let (c, s) = tokio::io::duplex(64 * 1024);
+        let _srv = spawn_server(mtls_server(&leaf, &client_ca, true), s);
+        let (tap, _state) = CipherTap::new(c);
+        let e = tokio_rustls::TlsConnector::from(ctx.config_for(None))
+            .connect(ctx.server_name(), tap)
+            .await
+            .unwrap_err();
+        assert_eq!(classify_handshake_error(&e), TlsCause::Verify, "{e}");
+    }
+
+    /// [`client_auth_alert`] reads through an error chain (as `hyper` wraps the I/O error) and names
+    /// only an alert about OUR certificate — never another alert, never a plain I/O failure.
+    #[test]
+    fn client_auth_alert_reads_through_a_chain_and_names_only_certificate_alerts() {
+        #[derive(Debug)]
+        struct Wrap(io::Error);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "wrapped")
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let alert = |a| io::Error::new(io::ErrorKind::InvalidData, rustls::Error::AlertReceived(a));
+        use AlertDescription as A;
+        assert_eq!(
+            client_auth_alert(&Wrap(alert(A::CertificateRequired))),
+            Some(A::CertificateRequired)
+        );
+        assert_eq!(client_auth_alert(&alert(A::UnknownCA)), Some(A::UnknownCA));
+        assert_eq!(client_auth_alert(&Wrap(alert(A::HandshakeFailure))), None);
+        assert_eq!(client_auth_alert(&Wrap(alert(A::DecodeError))), None);
+        assert_eq!(
+            client_auth_alert(&Wrap(io::ErrorKind::ConnectionReset.into())),
+            None
+        );
+    }
+
+    /// M6-F5c: client certificate or key material that cannot be loaded DISABLES the upstream at
+    /// start — the `CA_FILE` rule — naming the upstream and the key, never the path or the contents.
+    /// Every case is paired with the good pair as its control.
+    #[test]
+    fn unloadable_client_material_disables_the_upstream_naming_the_key_never_the_value() {
+        const CERT: &str = "CLIENT_CERT_FILE";
+        const KEY: &str = "CLIENT_KEY_FILE";
+        let ca = testcert::ca("Ferro Test CA");
+        let client = ca.sign(&Spec::new("ferro-client", Usage::Client));
+        let other = ca.sign(&Spec::new("someone-else", Usage::Client));
+        let cert = client.cert_pem().into_bytes();
+        let key = client.key_pem().into_bytes();
+        let garbage_cert =
+            b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".to_vec();
+        let garbage_key =
+            b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n".to_vec();
+        let cat = |a: &[u8], b: &[u8]| [a, b].concat();
+        type Case = (
+            &'static str,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            &'static str,
+            &'static str,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "cert missing",
+                None,
+                Some(key.clone()),
+                CERT,
+                "cannot be read",
+            ),
+            (
+                "key missing",
+                Some(cert.clone()),
+                None,
+                KEY,
+                "cannot be read",
+            ),
+            (
+                "cert not PEM",
+                Some(b"not pem at all".to_vec()),
+                Some(key.clone()),
+                CERT,
+                "holds no PEM certificate",
+            ),
+            (
+                "cert block not X.509",
+                Some(garbage_cert.clone()),
+                Some(key.clone()),
+                CERT,
+                "certificate 1 does not parse",
+            ),
+            (
+                "good cert, then a block not X.509",
+                Some(cat(&cert, &garbage_cert)),
+                Some(key.clone()),
+                CERT,
+                "certificate 2 does not parse",
+            ),
+            (
+                "key file holds only a certificate",
+                Some(cert.clone()),
+                Some(cert.clone()),
+                KEY,
+                "holds no PEM private key",
+            ),
+            (
+                "two keys",
+                Some(cert.clone()),
+                Some(cat(&key, other.key_pem().as_bytes())),
+                KEY,
+                "more than one private key",
+            ),
+            (
+                "key unusable",
+                Some(cert.clone()),
+                Some(garbage_key),
+                KEY,
+                "this build can use",
+            ),
+            (
+                "key does not match the certificate",
+                Some(cert.clone()),
+                Some(other.key_pem().into_bytes()),
+                KEY,
+                "does not match",
+            ),
+        ];
+        let paths = [(CERT, "/secret/client.pem"), (KEY, "/secret/client.key")];
+        for (what, c, k, bad_key, reason) in cases {
+            let mut files = Vec::new();
+            if let Some(c) = c {
+                files.push(("/secret/client.pem", c));
+            }
+            if let Some(k) = k {
+                files.push(("/secret/client.key", k));
+            }
+            let ctxs = contexts_with(&ca, &paths, files);
+            let errs = ctxs.errors();
+            assert_eq!(errs.len(), 1, "{what}");
+            assert_eq!(errs[0].key, bad_key, "{what}: {}", errs[0]);
+            let s = errs[0].to_string();
+            assert!(
+                s.contains(&format!("FERRO_UPSTREAM_API_{bad_key}")),
+                "{what}: {s}"
+            );
+            assert!(s.contains(reason), "{what}: {s}");
+            assert!(!s.contains("/secret"), "{what}: never the path: {s}");
+            assert!(!s.contains("BEGIN"), "{what}: never the contents: {s}");
+            assert!(s.ends_with("the upstream is disabled"), "{what}: {s}");
+            assert!(matches!(ctxs.get("api"), Some(Err(_))), "{what}");
+        }
+        // The control: the good pair loads.
+        let ctxs = contexts_with(
+            &ca,
+            &paths,
+            vec![("/secret/client.pem", cert), ("/secret/client.key", key)],
+        );
+        assert!(ctxs.errors().is_empty());
+        assert!(matches!(ctxs.get("api"), Some(Ok(_))));
     }
 
     /// Writes PASS until `hold` is set; then every write and flush is `Pending` (a socket that

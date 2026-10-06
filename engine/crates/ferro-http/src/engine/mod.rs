@@ -44,8 +44,16 @@
 //! **TLS (§23.8.8, slice M6-F5a, [`tls`]).** An `https` dial is TCP to the checked address, then a
 //! [`track::CipherTap`] (the ciphertext half of the write tracker), then the `rustls` handshake —
 //! inside the same connect bound — then the plaintext [`track::Tracker`] and `hyper`. A handshake
-//! failure is a dial failure: "before dispatch", never `Indeterminate`. An upstream with
-//! `CLIENT_CERT_FILE` is `Unsupported` until slice F5c (mTLS).
+//! failure is a dial failure: "before dispatch", never `Indeterminate`.
+//!
+//! **mTLS (slice M6-F5c, SPEC D23, [`tls`]).** An upstream with `CLIENT_CERT_FILE` presents it on
+//! every full handshake. A server's refusal of it inside a TLS 1.2 handshake is a dial failure
+//! (`tls_verify`). Under TLS 1.3 the refusal is an alert read AFTER dispatch, so it takes the path
+//! every post-dispatch failure takes: `sent` read after the teardown, then "sent, no head" (a POST
+//! `Indeterminate`, a declared-idempotent request `Retryable`) with the cause [`head::sent_no_head`]
+//! derives — never a `tls_*` token, which only a dial failure can produce. The engine only NAMES
+//! the refusal ([`tls::client_auth_alert`]: the terminal's message and a `warn`), so an operator
+//! can tell a rejected certificate from a dropped link; it never changes the fate or the token.
 //!
 //! **Slice F6:** concurrency limits, the queue, breaker and rate limits. **F7:** metrics, spans and
 //! the slow log.
@@ -485,24 +493,6 @@ impl HttpEngine {
         };
         let up = v.upstream;
         let idem = v.idempotent;
-        if up.origin.scheme() == Scheme::Https && up.tls.client_cert_file.is_some() {
-            // mTLS is slice F5c (`tls`'s module docs: under TLS 1.3 a refusal of the client
-            // certificate arrives after the handshake, so its fate is an open decision). Until it
-            // lands such an upstream is NOT SERVED: `Unsupported`, which on service HTTP carries no
-            // cause token (§22.2 (cy)) — and never a connection that silently omits the certificate
-            // the operator configured.
-            return Terminal::Error(ferro_proto::messages::ErrorPayload {
-                code: ferro_proto::consts::errc::UNSUPPORTED,
-                branch: ferro_proto::consts::errc::UNSUPPORTED_BRANCH,
-                sqlstate: None,
-                errno: None,
-                message: "upstreams with a client certificate (mTLS) are not served by this build \
-                          yet (slice M6-F5c)"
-                    .into(),
-                detail: None,
-                retry_after_ms: None,
-            });
-        }
         let bounds = Bounds {
             deadline: tokio::time::Instant::from_std(started)
                 + ms(req
@@ -619,10 +609,17 @@ impl HttpEngine {
             Ok(Err(mut e)) => {
                 let returned = e.take_message().is_some();
                 let err = e.into_error();
+                // TLS 1.3 client authentication (SPEC D23): the server's refusal of our certificate
+                // is read here, after dispatch. It is NAMED, never re-classified (see the helper).
+                let refusal = tls::client_auth_alert(&err);
                 let track = conn.track.clone();
                 conn.discard().await; // only now is `sent` final (§23.7.1)
                 if !track.sent() {
-                    return classify(Situation::DispatchedNotSent(head::not_sent(&track)), idem);
+                    return name_client_auth_refusal(
+                        classify(Situation::DispatchedNotSent(head::not_sent(&track)), idem),
+                        refusal,
+                        &up.name,
+                    );
                 }
                 if returned {
                     // P19: `message returned ⇒ not sent`. The tracker is the authority; a
@@ -632,9 +629,13 @@ impl HttpEngine {
                         "http: hyper returned an unserialised request the tracker counts as sent"
                     );
                 }
-                return classify(
-                    Situation::SentNoHead(head::sent_no_head(&err, &track)),
-                    idem,
+                return name_client_auth_refusal(
+                    classify(
+                        Situation::SentNoHead(head::sent_no_head(&err, &track)),
+                        idem,
+                    ),
+                    refusal,
+                    &up.name,
                 );
             }
             Err(stopped) => {
@@ -1009,6 +1010,41 @@ fn micros(d: Duration) -> u64 {
 
 fn classify(s: Situation, idempotent: bool) -> Terminal {
     fate::classify(s, idempotent).into()
+}
+
+/// SPEC D23: a TLS 1.3 server's refusal of our client certificate (or of its absence) is read after
+/// dispatch, and is classified exactly as the link failure it is on the wire — "sent, no head" (or
+/// "dispatched, not sent" if no record reached the socket), with that row's cause token. This only
+/// SAYS what happened: a `warn` naming the upstream and the alert (never a path or key material),
+/// and a prefix on the terminal's message, which is not for programmatic matching (PROTOCOL.md
+/// §5). The code, the branch and the `detail` token are untouched — a `tls_*` token here would map
+/// an `Indeterminate` POST to Guzzle's `ConnectException`, which naive deciders retry (§23.11.3).
+fn name_client_auth_refusal(
+    t: Terminal,
+    alert: Option<rustls::AlertDescription>,
+    upstream: &str,
+) -> Terminal {
+    let Some(alert) = alert else {
+        return t;
+    };
+    tracing::warn!(
+        upstream = %upstream,
+        alert = ?alert,
+        "http: the upstream refused this engine's TLS client certificate (or its absence) after \
+         the TLS 1.3 handshake, with the request already dispatched (SPEC D23) — check \
+         CLIENT_CERT_FILE, the CA the upstream trusts, and the certificate's expiry"
+    );
+    match t {
+        Terminal::Error(mut ep) => {
+            ep.message = format!(
+                "the upstream refused the TLS client certificate after the handshake (alert \
+                 {alert:?}, SPEC D23): {}",
+                ep.message
+            );
+            Terminal::Error(ep)
+        }
+        other => other,
+    }
 }
 
 /// The stop token fired before dispatch: the drain cap, or a `CANCEL`.

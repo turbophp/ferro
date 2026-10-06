@@ -1,4 +1,5 @@
-//! **M6-F5a — Ferro HTTP originates TLS (SPEC §23.8.8, §23.7.1's TLS rows, §23.14 chaos 3).**
+//! **M6-F5a — Ferro HTTP originates TLS (SPEC §23.8.8, §23.7.1's TLS rows, §23.14 chaos 3);
+//! M6-F5c — mTLS, with a client-certificate refusal classified by SPEC D23.**
 //!
 //! Every test runs against a LOCAL TLS upstream whose certificates are generated in-test
 //! (`ferro_http::testcert`), and that records what it received at the HTTP layer — so "received 0"
@@ -75,6 +76,17 @@ impl Pki {
         self.ca
             .sign(&Spec::new("api.test", Usage::Server).dns("api.test"))
     }
+
+    /// `client`'s certificate and key written as `<stem>.pem` / `<stem>.key`, as the
+    /// `CLIENT_CERT_FILE` / `CLIENT_KEY_FILE` pair (M6-F5c).
+    fn client_files(&self, stem: &str, client: &Issued) -> [(&'static str, String); 2] {
+        let cert = self.write(&format!("{stem}.pem"), &client.cert_pem());
+        let key = self.write(&format!("{stem}.key"), &client.key_pem());
+        [
+            ("CLIENT_CERT_FILE", cert.display().to_string()),
+            ("CLIENT_KEY_FILE", key.display().to_string()),
+        ]
+    }
 }
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -148,6 +160,8 @@ struct TlsRec {
     handshakes: Arc<AtomicU64>,
     resumed: Arc<AtomicU64>,
     sni: Arc<Mutex<Vec<Option<String>>>>,
+    /// Per completed handshake: how many client certificates the peer presented (M6-F5c).
+    client_certs: Arc<Mutex<Vec<usize>>>,
     requests: Arc<Mutex<Vec<Seen>>>,
 }
 
@@ -163,6 +177,9 @@ impl TlsRec {
     }
     fn requests(&self) -> Vec<Seen> {
         self.requests.lock().unwrap().clone()
+    }
+    fn client_certs(&self) -> Vec<usize> {
+        self.client_certs.lock().unwrap().clone()
     }
 }
 
@@ -229,6 +246,10 @@ async fn tls_upstream(cfg: Arc<ServerConfig>, script: Script) -> (SocketAddr, Tl
                         .lock()
                         .unwrap()
                         .push(conn.server_name().map(str::to_string));
+                    r.client_certs
+                        .lock()
+                        .unwrap()
+                        .push(conn.peer_certificates().map_or(0, <[_]>::len));
                 }
                 while let Some(seen) = read_request(&mut t).await {
                     r.requests.lock().unwrap().push(seen);
@@ -1193,7 +1214,7 @@ async fn chaos3_refused_nxdomain_wrong_host_expired_and_reset_during_the_handsha
 }
 
 // =================================================================================================
-// TLS material, mTLS (not served until F5c), and the open item
+// TLS material, and mTLS (M6-F5c, SPEC D23)
 // =================================================================================================
 
 /// An upstream whose `CA_FILE` cannot be loaded is DISABLED at start (§23.3.1's rule for an
@@ -1267,56 +1288,133 @@ async fn one_unusable_certificate_beside_a_good_one_disables_the_upstream() {
     assert_eq!(r.head.expect("a head").status, 200);
 }
 
-/// mTLS is slice F5c: an upstream configured with a client certificate is `Unsupported` (no cause
-/// token) and never dialled — never a connection that silently omits the configured certificate.
+/// **M6-F5c — mTLS served.** An upstream configured with `CLIENT_CERT_FILE`/`CLIENT_KEY_FILE`
+/// presents its certificate to a server that REQUIRES one, under TLS 1.3 and TLS 1.2, on every
+/// fresh dial — resumed ones included (the server reads the identity back from the session) — and
+/// is served: three POSTs, each a fresh dial, and a declared GET, each answered 200 and received
+/// exactly once. The positive control for every refusal below, built from the same PKI.
 #[tokio::test]
-async fn an_mtls_upstream_is_not_served_until_f5c() {
+async fn an_mtls_upstream_presents_its_certificate_on_every_dial() {
+    for tls12_only in [false, true] {
+        let pki = Pki::new();
+        let client_ca = testcert::ca("Client CA");
+        let files = pki.client_files(
+            "client",
+            &client_ca.sign(&Spec::new("ferro-client", Usage::Client)),
+        );
+        let (addr, rec) = tls_upstream(
+            mtls_server_cfg(&pki.leaf(), &client_ca, tls12_only),
+            Script::Respond(OK_HELLO),
+        )
+        .await;
+        let mut extra = vec![
+            ("CA_FILE", pki.ca_file().display().to_string()),
+            ("H1_UNSAFE_REUSE_MAX_IDLE_MS", "0".into()),
+        ];
+        extra.extend(files);
+        let d = daemon_over(engine(env(addr.port(), &extra)));
+        let mut c = d.client().await;
+        for i in 0..3u32 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let r = exchange(&mut c, 1 + 2 * i, &fresh_post()).await;
+            assert_eq!(r.head.as_ref().expect("a head").status, 200, "{r:?}");
+            assert!(!r.done().stats.reused, "a fresh dial");
+        }
+        let g = exchange(&mut c, 7, &idempotent_get("api")).await;
+        assert_eq!(g.head.as_ref().expect("a head").status, 200, "{g:?}");
+        assert_eq!(rec.requests().len(), 4, "tls12_only={tls12_only}");
+        assert_eq!(
+            d.engine.tls_handshakes("api"),
+            Some((1, 2)),
+            "tls12_only={tls12_only}: resumption works under mTLS"
+        );
+        assert_eq!(rec.handshakes(), 3);
+        assert_eq!(
+            rec.client_certs(),
+            vec![1, 1, 1],
+            "tls12_only={tls12_only}: every handshake carried the client certificate"
+        );
+    }
+}
+
+/// M6-F5c: `PARTITION=uid` gives each uid its own pool configuration — each a clone of the base,
+/// so each presents the certificate: three uids, each with its own FULL handshake (separate session
+/// caches, §23.8.8), all served.
+#[tokio::test]
+async fn every_partition_presents_the_client_certificate() {
     let pki = Pki::new();
-    let client = pki.ca.sign(&Spec::new("ferro-client", Usage::Client));
-    let cert = pki.write("client.pem", &client.cert_pem());
-    let key = pki.write("client.key", &client.key_pem());
+    let client_ca = testcert::ca("Client CA");
+    let files = pki.client_files(
+        "client",
+        &client_ca.sign(&Spec::new("ferro-client", Usage::Client)),
+    );
     let (addr, rec) = tls_upstream(
-        server_cfg(&pki.leaf(), false, &[]),
+        mtls_server_cfg(&pki.leaf(), &client_ca, false),
         Script::Respond(OK_HELLO),
     )
     .await;
-    let d = daemon_over(engine(env(
-        addr.port(),
-        &[
-            ("CA_FILE", pki.ca_file().display().to_string()),
-            ("CLIENT_CERT_FILE", cert.display().to_string()),
-            ("CLIENT_KEY_FILE", key.display().to_string()),
-        ],
-    )));
-    let r = one(&d, &post("api", b"x")).await;
-    let ep = r.error();
+    let mut extra = vec![
+        ("CA_FILE", pki.ca_file().display().to_string()),
+        ("H1_UNSAFE_REUSE_MAX_IDLE_MS", "0".into()),
+        ("PARTITION", "uid".into()),
+    ];
+    extra.extend(files);
+    let e = engine(env(addr.port(), &extra));
+    for uid in [1000, 2000, 3000] {
+        let t = on_engine(&e, &fresh_post(), Some(uid)).await;
+        assert!(!done(&t).stats.reused, "uid {uid}");
+    }
     assert_eq!(
-        (ep.code, ep.detail.as_deref()),
-        (errc::UNSUPPORTED, None),
-        "{ep:?}"
+        e.tls_handshakes("api"),
+        Some((3, 0)),
+        "one full handshake per partition"
     );
-    assert_eq!(rec.tcp(), 0);
+    assert_eq!(rec.client_certs(), vec![1, 1, 1]);
+    assert_eq!(rec.requests().len(), 3);
 }
 
-/// **SPEC D23 (formerly §21 open item O-F5c).** An upstream that REQUIRES a client
-/// certificate, configured without one: under TLS 1.2 the refusal fails the handshake (before
-/// dispatch, `tls_verify`, never Indeterminate); under TLS 1.3 the client's handshake completes
-/// first (premise P-M), the request's records reach the socket, and the server's
-/// `certificate_required` alert arrives after dispatch — so by the measured `sent` rule the POST is
-/// "sent, no head" (`Indeterminate`), although the server's HTTP layer received nothing. Never
-/// re-sent. Decided by D23 (option a); F5c renames this test; its assertions stay.
-#[tokio::test]
-async fn mtls_required_but_absent_tls12_is_tls_verify_and_tls13_is_the_open_item() {
+/// Which client certificate an mTLS refusal test configures.
+#[derive(Clone, Copy, Debug)]
+enum Presented {
+    /// None: the upstream requires one, the operator configured none.
+    Absent,
+    /// One issued by a CA the server does not trust.
+    Rejected,
+}
+
+/// **SPEC D23 (was §21 open item O-F5c), measured end to end for one refusal shape.** An upstream
+/// that REQUIRES a client certificate refuses ours (or its absence):
+///
+/// - **TLS 1.2:** the refusal fails the handshake, before dispatch: `TlsRefused` / `tls_verify`
+///   for a POST and a declared GET, never `Indeterminate`.
+/// - **TLS 1.3:** the client's handshake completes first (premise P-M), the request's records
+///   reach the socket, and the server's alert is read after dispatch, so by the measured `sent`
+///   rule it is "sent, no head": the POST is `Indeterminate` (`WriteUnconfirmed`) and the declared
+///   GET `Retryable` (`ConnectionLost`), although the server's HTTP layer received nothing. **The
+///   cause token is `reset`** — §23.5.6's "sent, no head" group, which §23.11.3 maps to a
+///   `RequestException`, NEVER a `tls_*` token (`ConnectException`, which naive deciders retry).
+///   The message names the refusal, so an operator can tell it from a dropped link.
+///
+/// In every cell each request is dialled exactly once: never re-sent (charter rule 3).
+async fn assert_mtls_refusal(presented: Presented) {
     let pki = Pki::new();
     let client_ca = testcert::ca("Client CA");
-    let ca_file = pki.ca_file().display().to_string();
+    let stranger = testcert::ca("Stranger CA");
+    let mut extra = vec![("CA_FILE", pki.ca_file().display().to_string())];
+    if let Presented::Rejected = presented {
+        extra.extend(pki.client_files(
+            "rejected",
+            &stranger.sign(&Spec::new("ferro-client", Usage::Client)),
+        ));
+    }
 
+    // TLS 1.2: before dispatch.
     let (addr, rec) = tls_upstream(
         mtls_server_cfg(&pki.leaf(), &client_ca, true),
         Script::Respond(OK_HELLO),
     )
     .await;
-    let d = daemon_over(engine(env(addr.port(), &[("CA_FILE", ca_file.clone())])));
+    let d = daemon_over(engine(env(addr.port(), &extra)));
     let (p, g) = both(&d).await;
     assert_both(
         &p,
@@ -1325,36 +1423,160 @@ async fn mtls_required_but_absent_tls12_is_tls_verify_and_tls13_is_the_open_item
         branch::NON_RETRYABLE,
         http_cause::TLS_VERIFY,
     );
-    assert!(rec.requests().is_empty());
+    assert!(rec.requests().is_empty(), "{presented:?}");
+    assert_eq!(rec.tcp(), 2, "{presented:?}: each dialled once");
 
+    // TLS 1.3: after dispatch — "sent, no head", cause `reset`.
     let (addr, rec) = tls_upstream(
         mtls_server_cfg(&pki.leaf(), &client_ca, false),
         Script::Respond(OK_HELLO),
     )
     .await;
-    let d = daemon_over(engine(env(addr.port(), &[("CA_FILE", ca_file)])));
+    let d = daemon_over(engine(env(addr.port(), &extra)));
     let (p, g) = both(&d).await;
-    let ep = p.error();
-    assert_eq!(
-        (ep.code, ep.branch),
-        (errc::WRITE_UNCONFIRMED, branch::INDETERMINATE),
-        "{ep:?}"
+    assert!(p.head.is_none() && g.head.is_none());
+    let ep = p.assert_error(
+        errc::WRITE_UNCONFIRMED,
+        branch::INDETERMINATE,
+        http_cause::RESET,
     );
-    let eg = g.error();
-    assert_eq!(
-        (eg.code, eg.branch),
-        (errc::CONNECTION_LOST, branch::RETRYABLE),
-        "{eg:?}"
-    );
+    let eg = g.assert_error(errc::CONNECTION_LOST, branch::RETRYABLE, http_cause::RESET);
+    for e in [ep, eg] {
+        let cause = e.detail.as_deref().unwrap_or_default();
+        assert!(
+            !cause.starts_with("tls_"),
+            "{presented:?}: D23 forbids a tls_* cause after dispatch: {e:?}"
+        );
+        assert!(
+            e.message
+                .contains("refused the TLS client certificate after the handshake"),
+            "{presented:?}: the refusal is named: {e:?}"
+        );
+    }
     assert!(
         rec.requests().is_empty(),
-        "the server's HTTP layer received nothing"
+        "{presented:?}: the server's HTTP layer received nothing"
     );
     assert_eq!(
         rec.handshakes(),
         0,
-        "the server never completed a handshake"
+        "{presented:?}: the server never completed a handshake"
     );
+    assert_eq!(
+        rec.tcp(),
+        2,
+        "{presented:?}: each dialled once, never re-sent"
+    );
+}
+
+/// D23, shape 1 (the F5a test `mtls_required_but_absent_tls12_is_tls_verify_and_tls13_is_the_open_item`,
+/// renamed, its assertions kept and the cause token pinned): the upstream requires a client
+/// certificate and none is configured.
+#[tokio::test]
+async fn mtls_refusal_of_an_absent_certificate_is_tls_verify_under_tls12_and_sent_no_head_under_tls13()
+ {
+    assert_mtls_refusal(Presented::Absent).await;
+}
+
+/// D23, shape 2: a configured certificate the upstream REJECTS (the wrong CA).
+#[tokio::test]
+async fn mtls_refusal_of_a_rejected_certificate_is_tls_verify_under_tls12_and_sent_no_head_under_tls13()
+ {
+    assert_mtls_refusal(Presented::Rejected).await;
+}
+
+/// M6-F5c: client certificate or key material that cannot be loaded at start DISABLES the upstream
+/// under F5a's rule for TLS material — refused exactly as an unknown upstream (`forbidden_upstream`,
+/// same sentence, before validation), never dialled, and logged naming the key, never the path.
+/// The cases: an unreadable certificate, an unreadable key, a key file with no key, and a key that
+/// does not match the certificate; the control serves the good pair.
+#[tokio::test]
+async fn unloadable_client_material_disables_the_upstream_indistinguishably() {
+    let pki = Pki::new();
+    let client_ca = testcert::ca("Client CA");
+    let client = client_ca.sign(&Spec::new("ferro-client", Usage::Client));
+    let other = client_ca.sign(&Spec::new("someone-else", Usage::Client));
+    let (addr, rec) = tls_upstream(
+        mtls_server_cfg(&pki.leaf(), &client_ca, false),
+        Script::Respond(OK_HELLO),
+    )
+    .await;
+    let path = |p: PathBuf| p.display().to_string();
+    let cert = path(pki.write("client.pem", &client.cert_pem()));
+    let key = path(pki.write("client.key", &client.key_pem()));
+    let other_key = path(pki.write("other.key", &other.key_pem()));
+    let missing = path(pki.dir.path().join("missing"));
+    let ca_file = path(pki.ca_file());
+    let cases = [
+        (
+            "certificate unreadable",
+            missing.clone(),
+            key.clone(),
+            "CLIENT_CERT_FILE",
+        ),
+        ("key unreadable", cert.clone(), missing, "CLIENT_KEY_FILE"),
+        (
+            "key file holds no key",
+            cert.clone(),
+            cert.clone(),
+            "CLIENT_KEY_FILE",
+        ),
+        ("key mismatch", cert.clone(), other_key, "CLIENT_KEY_FILE"),
+    ];
+    for (what, c, k, bad) in cases {
+        let e = engine(env(
+            addr.port(),
+            &[
+                ("CA_FILE", ca_file.clone()),
+                ("CLIENT_CERT_FILE", c.clone()),
+                ("CLIENT_KEY_FILE", k.clone()),
+            ],
+        ));
+        let errs: Vec<String> = e.tls_errors().iter().map(|e| e.to_string()).collect();
+        assert_eq!(errs.len(), 1, "{what}: {errs:?}");
+        assert!(
+            errs[0].contains(&format!("FERRO_UPSTREAM_API_{bad}")),
+            "{what}: {errs:?}"
+        );
+        for p in [&c, &k] {
+            assert!(
+                !errs[0].contains(p.as_str()),
+                "{what}: never the path: {errs:?}"
+            );
+        }
+        let d = daemon_over(e);
+        let mut cl = d.client().await;
+        let a = exchange(&mut cl, 1, &post("api", b"x")).await;
+        let unknown = exchange(&mut cl, 3, &request("nope", "GET", "/")).await;
+        let bad_target = exchange(&mut cl, 5, &request("api", "GET", "/../x")).await;
+        for r in [&a, &unknown, &bad_target] {
+            r.assert_error(
+                errc::FORBIDDEN,
+                errc::FORBIDDEN_BRANCH,
+                http_cause::FORBIDDEN_UPSTREAM,
+            );
+        }
+        assert_eq!(a.error().message, unknown.error().message, "{what}");
+        assert_eq!(
+            bad_target.error().message,
+            unknown.error().message,
+            "{what}"
+        );
+        assert_eq!(rec.tcp(), 0, "{what}: never dialled");
+    }
+    // The control: the good pair is served.
+    let good = engine(env(
+        addr.port(),
+        &[
+            ("CA_FILE", ca_file),
+            ("CLIENT_CERT_FILE", cert),
+            ("CLIENT_KEY_FILE", key),
+        ],
+    ));
+    assert!(good.tls_errors().is_empty());
+    let r = one(&daemon_over(good), &post("api", b"x")).await;
+    assert_eq!(r.head.expect("a head").status, 200);
+    assert_eq!(rec.client_certs(), vec![1]);
 }
 
 // =================================================================================================
