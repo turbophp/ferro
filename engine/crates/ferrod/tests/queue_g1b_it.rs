@@ -507,6 +507,35 @@ async fn an_overflowing_delay_is_refused_before_anything_is_sent() {
         "{}",
         ep.message
     );
+    // The bound is judged on the engine's REAL clock (mutation R7 fed it 0 and survived the
+    // `u32::MAX` case above, which no clock admits): one second past today's largest admissible
+    // delay is refused, while ten seconds under it reaches the pool.
+    let today_max = i64::from(i32::MAX)
+        - i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+        - 1
+        - ferro_queue::checks::DELAY_CLOCK_MARGIN_S;
+    let just_over = u32::try_from(today_max + 1).unwrap();
+    let ep = c
+        .err(
+            method_queue::ENQUEUE,
+            enqueue_req(&[("default", "{}", just_over)], None),
+        )
+        .await;
+    assert!(ep.message.contains("delay_s is too large"), "{ep:?}");
+    let under = u32::try_from(today_max - 10).unwrap();
+    let ep = c
+        .err(
+            method_queue::ENQUEUE,
+            enqueue_req(&[("default", "{}", under)], None),
+        )
+        .await;
+    assert_eq!(ep.code, errc::CONNECTION_LOST, "{ep:?}");
     // The control: an ordinary delay reaches the pool (and its connection failure).
     let ep = c
         .err(
@@ -1196,7 +1225,10 @@ async fn concurrent_reservers_never_exceed_the_limit_or_deliver_a_job_twice() {
             let mut empties = 0;
             // Keep going past the first empty reply: rows locked by a concurrent statement are
             // SKIPPED, so one empty answer does not mean the queue is drained.
-            while empties < 3 {
+            // Bounded: 800 jobs need 200 full replies in all, so a session that has made 400
+            // RESERVEs is looking at a queue that never drains (a reservation that does not
+            // reserve) — stop, and let the assertions below say so instead of hanging.
+            while empties < 3 && spans.len() < 400 {
                 let started = epoch.elapsed();
                 let jobs = c.reserve(&["default"], K).await;
                 spans.push((started, epoch.elapsed()));
