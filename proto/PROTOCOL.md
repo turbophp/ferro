@@ -26,7 +26,7 @@ alignment — the payload starts at byte 16.
 | 0 | `magic` | `u8` | always `0xF7` (`consts::MAGIC`) |
 | 1 | `version` | `u8` | protocol major version, currently `4` (`consts::PROTOCOL_VERSION`) |
 | 2 | `flags` | `u16` | bitfield: `STREAM 0x01`, `END 0x02`, `CANCEL 0x04`, `OOB_FD 0x08` (engine → client only, §1.1), `COMPRESSED 0x10` (reserved, unimplemented before post-M3) |
-| 4 | `service` | `u16` | `CORE 1`, `SQL 2`, `TX 3`, `STREAM 4`, `ADMIN 5`, `HTTP 6` (§12, M6-F2). `7` is reserved for Ferro Queue (SPEC §24; its messages take §13) |
+| 4 | `service` | `u16` | `CORE 1`, `SQL 2`, `TX 3`, `STREAM 4`, `ADMIN 5`, `HTTP 6` (§12, M6-F2), `QUEUE 7` (§14, M7-G1a) |
 | 6 | `method` | `u16` | per-service method id, registry `/proto/methods.toml` |
 | 8 | `request_id` | `u32` | client-assigned multiplexing key |
 | 12 | `payload_len` | `u32` | MessagePack payload length in bytes |
@@ -400,7 +400,7 @@ normalized shape for every backend/engine error (SPEC §9.2), positional array:
 | 3 | `sqlstate` | `str \| nil` | raw backend SQLSTATE, when the backend provides one |
 | 4 | `errno` | `i32 \| nil` | raw backend errno, when the backend provides one |
 | 5 | `message` | `str` | human-readable, not for programmatic matching |
-| 6 | `detail` | `str \| nil` | backend detail/hint text, if any. **On service `HTTP` it is never free text:** it is either `nil` or EXACTLY one token of the registry's `[http.causes]` vocabulary (`consts::http_cause::*` / `Constants::HTTP_CAUSE_*`, SPEC §23.5.6), and `sqlstate` and `errno` are `nil`. It is `nil` only on an HTTP terminal that is not an exchange fate — `Protocol` (a malformed frame) and `Unsupported` (not served) — and a cause token on every other HTTP error (§12.6) |
+| 6 | `detail` | `str \| nil` | backend detail/hint text, if any. **On service `HTTP` it is never free text:** it is either `nil` or EXACTLY one token of the registry's `[http.causes]` vocabulary (`consts::http_cause::*` / `Constants::HTTP_CAUSE_*`, SPEC §23.5.6), and `sqlstate` and `errno` are `nil`. It is `nil` only on an HTTP terminal that is not an exchange fate — `Protocol` (a malformed frame) and `Unsupported` (not served) — and a cause token on every other HTTP error (§12.6). On service `QUEUE` the engine's own refusals carry `detail` `nil` (§14.3) |
 | 7 | `retry_after_ms` | `u32 \| nil` | advisory backoff hint (e.g. for `PoolTimeout`) |
 
 ## 6. Terminal outcome envelope
@@ -450,7 +450,8 @@ NOT NULL violation (`1048`), so a consumer keyed on the SQLSTATE alone cannot te
 `errno` rides the §2 signed/unsigned narrowing ladder like any other integer field (`1062` ⇒
 `cd 04 26`, a `uint16`), NOT a fixed width.
 
-**Per-service indexes:** SQL `EXEC` → §8.3 · TX → §9.6 · STREAM `HEAD`/`DATA` → §10.3 · ADMIN → §11.3 · HTTP → §12.5 · COPY (`COPY_IN`/`COPY_OUT`, `COPY_DATA`/`COPY_DONE`) → §13.4.
+**Per-service indexes:** SQL `EXEC` → §8.3 · TX → §9.6 · STREAM `HEAD`/`DATA` → §10.3 · ADMIN → §11.3 · HTTP → §12.5 · COPY (`COPY_IN`/`COPY_OUT`, `COPY_DATA`/`COPY_DONE`) → §13.4 · QUEUE → §14.4 (with the
+`refusal/` vectors).
 
 **M3-D3:** `oob_ref` — an `END | OOB_FD` SQL/`EXEC` terminal whose payload is the §1.1 `OobRef`
 (`len = 1048578`, past u16, so the width is locked), NOT an `Outcome`: the `Outcome` is what the memfd
@@ -469,8 +470,8 @@ required set from the registry rather than a parallel hardcoded list, and which 
 vector whose `message` and `frame_hex` disagree.
 
 **Byte-lock coverage is keyed on the vector NAME.** The PHP conformance suite selects its
-cross-language byte-lock cases by prefix (`sql_exec_`, `stream_head_`, `stream_data_`, `http_` — the
-last since M6-F2); a vector
+cross-language byte-lock cases by prefix (`sql_exec_`, `stream_head_`, `stream_data_`, `http_` — since
+M6-F2 — and `queue_`, since M7-G1a); a vector
 named outside those prefixes silently receives only the generic header/unpack tests. New SQL and
 STREAM vectors MUST use those prefixes (asserted by
 `VectorConformanceTest::testEveryCommittedVectorIsByteLocked`). A vector outside those prefixes
@@ -942,7 +943,7 @@ are new messages on a new service, the registry hash moved with them and is chec
 so a skewed engine/client pair fails at the first frame, and an older decoder classifies a new code
 correctly by its explicit `branch` (§5).
 
-*(§13 is reserved for Ferro Queue's messages, SPEC §24.)*
+*(Ferro Queue's messages, once reserved §13 here, are §14: M3-D4's COPY took §13 first.)*
 
 ## 13. COPY (`SQL`/`COPY_IN`, `SQL`/`COPY_OUT`, `STREAM`/`COPY_DATA`, `STREAM`/`COPY_DONE`)
 
@@ -1016,3 +1017,122 @@ fixarray `[]`. Neither is an `Outcome`, and neither carries `END`.
 `timeout_ms = 30000`, `tx_id = 42` — the populated arms), `copy_data` (300 bytes, so `bin16` is
 locked rather than a `bin8` every codec agrees on, carrying COPY text-format specials and a `0xc0`
 byte), and `copy_done`. The grant is a `window_update` (§4); the terminals are `ExecOk`s (§8.3).
+
+## 14. QUEUE service messages (`ENQUEUE`/`RESERVE`/`ACK`/`RELEASE`/`EXTEND`/`SIZE`/`CLEAR`)
+
+The QUEUE service (`SERVICE_QUEUE = 7`, M7-G1a; SPEC §24, `docs/spec/24-queue.md`) carries Ferro Queue:
+PHP producers and workers move **jobs** through an operator-declared STORE (a table in a pool `ferrod`
+owns). Its methods are registry `methods.queue`: `ENQUEUE = 1`, `RESERVE = 2`, `ACK = 3`, `RELEASE = 4`,
+`EXTEND = 5`, `SIZE = 6`, `CLEAR = 7`. **Every method is client → engine and request-bearing**: one
+request frame (flags `0`), and the request's ONE terminal on the same `QUEUE`/method header with `END`,
+whose `Outcome::Ok` body is the method's response shape below. There is no streamed delivery (SPEC
+§24.4). The engine routes a QUEUE method id the registry does not allocate to `Unsupported`.
+
+**Every shape here is frozen from M7-G1a** (SPEC §24.4): a later change to any of them bumps
+`protocol_version` (§8). That is why `RESERVE` already carries `liveness`, which a v1 engine refuses
+when `true`.
+
+**Opaque handles.** Every `job_id`, `new_job_id` and `token` is a msgpack **`bin`** of
+`1..=QUEUE_HANDLE_MAX_BYTES` (1 024) bytes (SPEC D22 (b), D24). A client never interprets one: it
+receives it and sends it back unchanged, as `bin` — a `str` would change the wire type and could fail
+the engine's UTF-8 check. Each store KIND mints its own: the v1 `sql` kind writes a `job_id` as the
+canonical decimal text of the row's `bigint` id (1–20 ASCII bytes) and an 8-byte token, and an engine
+that cannot decode a well-formed handle answers `InvalidHandle` (below), never `Protocol`.
+
+**The codec enforces the wire's types, widths and the shapes' bounds**: strict arity; every array
+and `str`/`bin` length bounded by the bytes remaining before anything is allocated; trailing bytes
+refused; a `str` must be UTF-8, except `common.traceparent`, decoded lossily as `ExecRequest` field 9
+is; a handle outside `1..=QUEUE_HANDLE_MAX_BYTES`, an `ENQUEUE` with `0` or more than
+`QUEUE_ENQUEUE_MAX_JOBS` (1 000) jobs, a `RESERVE` naming `0` or more than `QUEUE_RESERVE_MAX_QUEUES`
+(16) queues, an `ACK` `outcome` outside `[ack_outcome]`, and a count at or above 2^63 are malformed.
+Those bounds are registry keys because both RECEIVERS enforce them (the M6-F2 rule). What a value
+MEANS — a payload containing U+0000, a queue name over 255 characters, an unknown store — is the
+engine's to refuse (SPEC §24.4), never a decoder's. The Rust codec is hand-rolled (`ferro-proto`
+`messages::queue`); the PHP one is `Ferro\Protocol\QueueCodec`, which also refuses, BEFORE writing a
+byte, everything the engine's decoder would refuse.
+
+Two shapes are shared: `common = [tx_id: u64 | nil, timeout_ms: u32 | nil, traceparent: str | nil]` (a
+fixarray(3), the last element of every request; `tx_id` bounded below 2^63 like every TX id, §2) and
+`stats = [queue_us: u64, exec_us: u64]` (a fixarray(2), the last element of every response; both bounded
+below 2^63).
+
+### 14.1 Requests — client → server
+
+| method | fixarray | fields |
+|---|---|---|
+| `ENQUEUE` | 4 | `store: str`, `jobs: array<[queue: str, payload: str, delay_s: u32]>` (1..=1000), `dedup_key: str \| nil`, `common` |
+| `RESERVE` | 6 | `store: str`, `queues: array<str>` (1..=16, priority order), `max_jobs: u16`, `wait_ms: u32`, `liveness: bool`, `common` |
+| `ACK`, `EXTEND` | 4 | `store: str`, `job_id: bin`, `token: bin`, `common` |
+| `RELEASE` | 5 | `store: str`, `job_id: bin`, `token: bin`, `delay_s: u32`, `common` |
+| `SIZE`, `CLEAR` | 3 | `store: str`, `queue: str`, `common` |
+
+A job is a fixarray(3). `payload` is opaque to the engine (SPEC §24.2 I2) but is a `str`, so it is
+UTF-8 by construction.
+
+### 14.2 Responses — the terminal `Outcome::Ok` body — server → client
+
+| method | fixarray | fields |
+|---|---|---|
+| `ENQUEUE` | 4 | `job_id: bin \| nil` (non-nil iff exactly one job), `inserted: u32`, `deduplicated: bool`, `stats` |
+| `RESERVE` | 2 | `jobs: array<ReservedJob>` (possibly empty), `stats` |
+| `ACK` | 2 | `outcome: u8` — `ACK_OUTCOME_ACKED` (1) or `ACK_OUTCOME_GONE` (2), registry `[ack_outcome]` — `stats` |
+| `RELEASE` | 2 | `new_job_id: bin \| nil` (`nil` = gone, autocommit only), `stats` |
+| `EXTEND` | 2 | `lease_deadline: i64`, `stats` |
+| `SIZE` | 4 | `pending: u64`, `delayed: u64`, `reserved: u64`, `stats` |
+| `CLEAR` | 2 | `deleted: u64`, `stats` |
+
+`ReservedJob` is a fixarray(7): `[job_id: bin, token: bin, attempts: u32, queue: str, payload: str,
+created_at: i64, lease_deadline: i64]`. Times are Unix seconds on the database's clock (SPEC §24.3);
+they are `i64` on the wire because PostgreSQL's `integer` columns are signed, and they ride §2's signed
+ladder. Every `u64` here is bounded below 2^63, so PHP decodes it to a native int and REFUSES a
+decimal-string one.
+
+### 14.3 The codes
+
+QUEUE terminals use §5's `ErrorPayload` with `sqlstate`, `errno` and `detail` `nil` on the engine's own
+refusals (a classified statement error carries the backend's, as on EXEC). The three QUEUE codes, all
+NonRetryable known fates:
+
+- **`LeaseLost` (`0x300F`)** — a fenced verb's token names no current reservation; the verb did
+  nothing (SPEC §24.4, §24.6).
+- **`PoolMismatch` (`0x3010`)** — a tx-scoped verb named a store whose pool is not the transaction's;
+  refused before any statement (SPEC §24.5).
+- **`InvalidHandle` (`0x3011`, allocated at M7-G1a)** — a `job_id` or `token` that is well-formed on the
+  wire but that the store's kind cannot decode; refused before any statement (SPEC §24.3 prerequisite
+  (c)). Not `Protocol` (the frame is well-formed) and not `LeaseLost` (a tier treats that as "did
+  nothing, done", which would hide what is always a client defect).
+
+An unknown store reuses `Unsupported`, as an unknown pool does. **No `protocol_version` bump** (the §11
+and §12 precedent): these are new messages on a new service, and the registry hash, which moved with
+them, refuses a skewed pair at the handshake.
+
+### 14.4 QUEUE vector index
+
+Every `queue_*` vector, each locking a handle position at its `sql`-kind size and at the registry
+maximum (asserted, from the decoded vectors, by
+`golden_vectors.rs::every_queue_handle_position_is_locked_at_the_sql_size_and_at_the_maximum`):
+`queue_enqueue_request` (one job, a dedup key, every `common` field set — a `tx_id` past u32),
+`queue_enqueue_request_batch` (two jobs, a `delay_s` past u16, a multi-byte payload, every nullable
+`nil`), `queue_enqueue_response` (the largest canonical id), `queue_enqueue_response_max`,
+`queue_enqueue_response_batch` (`job_id` `nil`), `queue_reserve_request` (two queues, `max_jobs` past
+u8, `wait_ms` past u16), `queue_reserve_response` (one job at the `sql` sizes and one at 1 024 bytes for
+both handles, a negative `created_at`), `queue_reserve_response_empty`, `queue_ack_request`,
+`queue_ack_request_max`, `queue_ack_response`, `queue_ack_response_gone`, `queue_release_request`,
+`queue_release_request_max`, `queue_release_response`, `queue_release_response_max`,
+`queue_release_response_gone`, `queue_extend_request`, `queue_extend_request_max`,
+`queue_extend_response`, `queue_size_request`, `queue_size_response` (a count past u32),
+`queue_clear_request`, `queue_clear_response`; and the three error terminals `error_lease_lost`,
+`error_pool_mismatch`, `error_invalid_handle`, each on its request's own `QUEUE`/method header. A
+`1 024`-byte handle is not UTF-8 and holds bytes in the `0xc0` range, so neither a `str` read nor a
+`nil` peek could pass it by accident.
+
+**Refusal vectors** (`/proto/vectors/refusal/queue_*.json`, new at M7-G1a: `{name, header, field, len,
+frame_hex}`): a frame with a valid header whose payload is well-formed EXCEPT the one `field`, which
+is out of its bound — every handle position at `0` and `QUEUE_HANDLE_MAX_BYTES + 1` bytes, and the job
+and queue counts at `0` and their maximum + 1. Both codecs must refuse each FOR ITS OWN REASON (the
+error names the field and the length): `golden_vectors.rs::queue_refusal_vectors_are_refused_for_their_own_reason`
+and PHP's `QueueRefusalVectorTest`, each also asserting the set is complete.
+
+The `queue_` vectors are byte-locked in PHP by the `queueVectors()` prefix provider, which picks the
+codec from the HEADER (method and `END`), never the name; the three error vectors by a name-keyed test.
+In Rust each is decoded and compared against its vector's NAMED fields.

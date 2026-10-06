@@ -143,8 +143,8 @@ fn message_payloads_are_canonical_and_byte_stable() {
     // level), and that decode->encode is a fixpoint. This is the Rust half of the cross-language
     // byte lock; the PHP half asserts PurePacker re-encodes to these same bytes (Task 9).
     use ferro_proto::consts::{
-        flags, method_admin, method_core as mc, method_http, method_sql, method_stream, method_tx,
-        service,
+        flags, method_admin, method_core as mc, method_http, method_queue, method_sql,
+        method_stream, method_tx, service,
     };
     use ferro_proto::messages::*;
     for entry in fs::read_dir(vectors_dir()).unwrap() {
@@ -306,6 +306,61 @@ fn message_payloads_are_canonical_and_byte_stable() {
             }
             (s, m) if s == service::HTTP && m == method_http::BODY => {
                 HttpBody::decode(payload).unwrap().encode()
+            }
+            // QUEUE (M7-G1a, /proto/PROTOCOL.md §14). Every method is client → engine, so a frame
+            // without END is the request and one with END is the terminal; CRACK an Ok body with the
+            // method's own response decoder (the three error vectors re-encode whole, below).
+            (s, m) if s == service::QUEUE && (h.flags & flags::END) == 0 => match m {
+                x if x == method_queue::ENQUEUE => {
+                    EnqueueRequest::decode(payload).unwrap().encode()
+                }
+                x if x == method_queue::RESERVE => {
+                    ReserveRequest::decode(payload).unwrap().encode()
+                }
+                x if x == method_queue::ACK || x == method_queue::EXTEND => {
+                    FencedRequest::decode(payload).unwrap().encode()
+                }
+                x if x == method_queue::RELEASE => {
+                    ReleaseRequest::decode(payload).unwrap().encode()
+                }
+                x if x == method_queue::SIZE || x == method_queue::CLEAR => {
+                    QueueScopeRequest::decode(payload).unwrap().encode()
+                }
+                other => panic!("{p:?}: no QUEUE request decoder for method {other}"),
+            },
+            (s, m) if s == service::QUEUE => {
+                let outcome = Outcome::decode(payload).unwrap();
+                if let Outcome::Ok(body) = &outcome {
+                    let again = match m {
+                        x if x == method_queue::ENQUEUE => {
+                            EnqueueResponse::decode(body).unwrap().encode()
+                        }
+                        x if x == method_queue::RESERVE => {
+                            ReserveResponse::decode(body).unwrap().encode()
+                        }
+                        x if x == method_queue::ACK => AckResponse::decode(body).unwrap().encode(),
+                        x if x == method_queue::RELEASE => {
+                            ReleaseResponse::decode(body).unwrap().encode()
+                        }
+                        x if x == method_queue::EXTEND => {
+                            ExtendResponse::decode(body).unwrap().encode()
+                        }
+                        x if x == method_queue::SIZE => {
+                            SizeResponse::decode(body).unwrap().encode()
+                        }
+                        x if x == method_queue::CLEAR => {
+                            ClearResponse::decode(body).unwrap().encode()
+                        }
+                        other => panic!("{p:?}: no QUEUE response decoder for method {other}"),
+                    };
+                    assert_eq!(
+                        &again,
+                        body,
+                        "QUEUE body for {:?} is not canonical",
+                        p.file_name()
+                    );
+                }
+                outcome.encode()
             }
             // error_protocol vectors: an Outcome terminal payload (END flag).
             _ => Outcome::decode(payload).unwrap().encode(),
@@ -682,4 +737,451 @@ fn every_http_error_vector_carries_exactly_one_cause_token() {
         }
     }
     assert_eq!(seen, 5, "five HTTP error vectors (§23.5.5)");
+}
+
+// ---------------------------------------------------------------------------------------------
+// QUEUE (M7-G1a; SPEC §24.4, /proto/PROTOCOL.md §14)
+// ---------------------------------------------------------------------------------------------
+
+fn hex_bytes(v: &serde_json::Value) -> Vec<u8> {
+    unhex(
+        v.as_str()
+            .unwrap_or_else(|| panic!("expected a hex string, got {v}")),
+    )
+}
+fn opt_hex_bytes(v: &serde_json::Value) -> Option<Vec<u8>> {
+    (!v.is_null()).then(|| hex_bytes(v))
+}
+fn json_common(v: &serde_json::Value) -> ferro_proto::messages::QueueCommon {
+    ferro_proto::messages::QueueCommon {
+        tx_id: v[0].as_u64(),
+        timeout_ms: json_opt_u32(&v[1]),
+        traceparent: json_opt_str(&v[2]),
+    }
+}
+fn json_qstats(v: &serde_json::Value) -> ferro_proto::messages::QueueStats {
+    ferro_proto::messages::QueueStats {
+        queue_us: v[0].as_u64().unwrap(),
+        exec_us: v[1].as_u64().unwrap(),
+    }
+}
+
+/// The QUEUE vectors, `(name, header, message, payload)`, read from disk: every vector on service
+/// `QUEUE` (positive ones only — refusals live in `refusal/`).
+fn queue_vectors_on_disk() -> Vec<(String, Header, serde_json::Value, Vec<u8>)> {
+    use ferro_proto::consts::service;
+    let mut out = Vec::new();
+    for entry in fs::read_dir(vectors_dir()).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let frame = unhex(v["frame_hex"].as_str().unwrap());
+        let h = Header::decode(&frame).unwrap();
+        if h.service == service::QUEUE {
+            out.push((
+                v["name"].as_str().unwrap().to_string(),
+                h,
+                v["message"].clone(),
+                frame[16..].to_vec(),
+            ));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The Rust half of the QUEUE byte lock, by NAMED field (a decode→encode fixpoint alone passes a
+/// symmetric field swap). Which decoder applies is read from the HEADER (method and `END`), never
+/// from the vector's name.
+#[test]
+fn queue_vectors_decode_to_their_named_message_fields() {
+    use ferro_proto::consts::{flags, method_queue as mq};
+    use ferro_proto::messages::*;
+
+    let vectors = queue_vectors_on_disk();
+    let mut seen_ok = 0;
+    for (name, h, m, payload) in &vectors {
+        let end = h.flags & flags::END != 0;
+        if !end {
+            match h.method {
+                x if x == mq::ENQUEUE => {
+                    let want = EnqueueRequest {
+                        store: m["store"].as_str().unwrap().into(),
+                        jobs: m["jobs"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|j| EnqueueJob {
+                                queue: j[0].as_str().unwrap().into(),
+                                payload: j[1].as_str().unwrap().into(),
+                                delay_s: json_opt_u32(&j[2]).unwrap(),
+                            })
+                            .collect(),
+                        dedup_key: json_opt_str(&m["dedup_key"]),
+                        common: json_common(&m["common"]),
+                    };
+                    assert_eq!(EnqueueRequest::decode(payload).unwrap(), want, "{name}");
+                }
+                x if x == mq::RESERVE => {
+                    let want = ReserveRequest {
+                        store: m["store"].as_str().unwrap().into(),
+                        queues: m["queues"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|q| q.as_str().unwrap().to_string())
+                            .collect(),
+                        max_jobs: u16::try_from(m["max_jobs"].as_u64().unwrap()).unwrap(),
+                        wait_ms: json_opt_u32(&m["wait_ms"]).unwrap(),
+                        liveness: m["liveness"].as_bool().unwrap(),
+                        common: json_common(&m["common"]),
+                    };
+                    assert_eq!(ReserveRequest::decode(payload).unwrap(), want, "{name}");
+                }
+                x if x == mq::ACK || x == mq::EXTEND => {
+                    let want = FencedRequest {
+                        store: m["store"].as_str().unwrap().into(),
+                        job_id: hex_bytes(&m["job_id_hex"]),
+                        token: hex_bytes(&m["token_hex"]),
+                        common: json_common(&m["common"]),
+                    };
+                    assert_eq!(FencedRequest::decode(payload).unwrap(), want, "{name}");
+                }
+                x if x == mq::RELEASE => {
+                    let want = ReleaseRequest {
+                        store: m["store"].as_str().unwrap().into(),
+                        job_id: hex_bytes(&m["job_id_hex"]),
+                        token: hex_bytes(&m["token_hex"]),
+                        delay_s: json_opt_u32(&m["delay_s"]).unwrap(),
+                        common: json_common(&m["common"]),
+                    };
+                    assert_eq!(ReleaseRequest::decode(payload).unwrap(), want, "{name}");
+                }
+                x if x == mq::SIZE || x == mq::CLEAR => {
+                    let want = QueueScopeRequest {
+                        store: m["store"].as_str().unwrap().into(),
+                        queue: m["queue"].as_str().unwrap().into(),
+                        common: json_common(&m["common"]),
+                    };
+                    assert_eq!(QueueScopeRequest::decode(payload).unwrap(), want, "{name}");
+                }
+                other => panic!("{name}: no QUEUE request decoder for method {other}"),
+            }
+            continue;
+        }
+        let Outcome::Ok(body) = Outcome::decode(payload).unwrap() else {
+            continue; // the three error vectors: `every_queue_error_vector_...` below
+        };
+        seen_ok += 1;
+        let stats = json_qstats(&m["stats"]);
+        match h.method {
+            x if x == mq::ENQUEUE => assert_eq!(
+                EnqueueResponse::decode(&body).unwrap(),
+                EnqueueResponse {
+                    job_id: opt_hex_bytes(&m["job_id_hex"]),
+                    inserted: json_opt_u32(&m["inserted"]).unwrap(),
+                    deduplicated: m["deduplicated"].as_bool().unwrap(),
+                    stats,
+                },
+                "{name}"
+            ),
+            x if x == mq::RESERVE => assert_eq!(
+                ReserveResponse::decode(&body).unwrap(),
+                ReserveResponse {
+                    jobs: m["jobs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|j| ReservedJob {
+                            job_id: hex_bytes(&j[0]),
+                            token: hex_bytes(&j[1]),
+                            attempts: json_opt_u32(&j[2]).unwrap(),
+                            queue: j[3].as_str().unwrap().into(),
+                            payload: j[4].as_str().unwrap().into(),
+                            created_at: j[5].as_i64().unwrap(),
+                            lease_deadline: j[6].as_i64().unwrap(),
+                        })
+                        .collect(),
+                    stats,
+                },
+                "{name}"
+            ),
+            x if x == mq::ACK => assert_eq!(
+                AckResponse::decode(&body).unwrap(),
+                AckResponse {
+                    outcome: u8::try_from(m["outcome"].as_u64().unwrap()).unwrap(),
+                    stats,
+                },
+                "{name}"
+            ),
+            x if x == mq::RELEASE => assert_eq!(
+                ReleaseResponse::decode(&body).unwrap(),
+                ReleaseResponse {
+                    new_job_id: opt_hex_bytes(&m["new_job_id_hex"]),
+                    stats,
+                },
+                "{name}"
+            ),
+            x if x == mq::EXTEND => assert_eq!(
+                ExtendResponse::decode(&body).unwrap(),
+                ExtendResponse {
+                    lease_deadline: m["lease_deadline"].as_i64().unwrap(),
+                    stats,
+                },
+                "{name}"
+            ),
+            x if x == mq::SIZE => assert_eq!(
+                SizeResponse::decode(&body).unwrap(),
+                SizeResponse {
+                    pending: m["pending"].as_u64().unwrap(),
+                    delayed: m["delayed"].as_u64().unwrap(),
+                    reserved: m["reserved"].as_u64().unwrap(),
+                    stats,
+                },
+                "{name}"
+            ),
+            x if x == mq::CLEAR => assert_eq!(
+                ClearResponse::decode(&body).unwrap(),
+                ClearResponse {
+                    deleted: m["deleted"].as_u64().unwrap(),
+                    stats,
+                },
+                "{name}"
+            ),
+            other => panic!("{name}: no QUEUE response decoder for method {other}"),
+        }
+    }
+    assert_eq!(seen_ok, 13, "thirteen QUEUE success-terminal vectors");
+    // Every registered QUEUE method has at least one request vector AND one success vector, so a
+    // method added to `[methods.queue]` without vectors fails here.
+    for &(mname, id) in ferro_proto::consts::method_queue::ALL {
+        for want_end in [false, true] {
+            assert!(
+                vectors.iter().any(|(_, h, _, p)| h.method == id
+                    && (h.flags & flags::END != 0) == want_end
+                    && (!want_end || matches!(Outcome::decode(p), Ok(Outcome::Ok(_))))),
+                "QUEUE {mname} has no {} vector",
+                if want_end {
+                    "success-terminal"
+                } else {
+                    "request"
+                }
+            );
+        }
+    }
+}
+
+/// SPEC §24.4: every handle position is locked at its `sql`-kind size AND at the registry maximum.
+/// Derived from the decoded vectors, not from their names.
+#[test]
+fn every_queue_handle_position_is_locked_at_the_sql_size_and_at_the_maximum() {
+    use ferro_proto::consts::{QUEUE_HANDLE_MAX_BYTES, flags, method_queue as mq};
+    use ferro_proto::messages::*;
+    use std::collections::BTreeMap;
+
+    let max = QUEUE_HANDLE_MAX_BYTES as usize;
+    let mut lens: BTreeMap<&str, BTreeSet<usize>> = BTreeMap::new();
+    for (_, h, _, payload) in queue_vectors_on_disk() {
+        let end = h.flags & flags::END != 0;
+        let mut add = |pos: &'static str, n: usize| {
+            lens.entry(pos).or_default().insert(n);
+        };
+        if !end {
+            match h.method {
+                x if x == mq::ACK || x == mq::EXTEND => {
+                    let r = FencedRequest::decode(&payload).unwrap();
+                    let verb = if x == mq::ACK { "ack" } else { "extend" };
+                    add(
+                        if verb == "ack" {
+                            "ack.job_id"
+                        } else {
+                            "extend.job_id"
+                        },
+                        r.job_id.len(),
+                    );
+                    add(
+                        if verb == "ack" {
+                            "ack.token"
+                        } else {
+                            "extend.token"
+                        },
+                        r.token.len(),
+                    );
+                }
+                x if x == mq::RELEASE => {
+                    let r = ReleaseRequest::decode(&payload).unwrap();
+                    add("release.job_id", r.job_id.len());
+                    add("release.token", r.token.len());
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let Ok(Outcome::Ok(body)) = Outcome::decode(&payload) else {
+            continue;
+        };
+        match h.method {
+            x if x == mq::ENQUEUE => {
+                if let Some(id) = EnqueueResponse::decode(&body).unwrap().job_id {
+                    add("enqueue_response.job_id", id.len());
+                }
+            }
+            x if x == mq::RESERVE => {
+                for j in ReserveResponse::decode(&body).unwrap().jobs {
+                    add("reserve_response.job_id", j.job_id.len());
+                    add("reserve_response.token", j.token.len());
+                }
+            }
+            x if x == mq::RELEASE => {
+                if let Some(id) = ReleaseResponse::decode(&body).unwrap().new_job_id {
+                    add("release_response.new_job_id", id.len());
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(lens.len(), 10, "ten handle positions: {lens:?}");
+    for (pos, got) in &lens {
+        assert!(
+            got.contains(&max),
+            "{pos} has no {max}-byte vector: {got:?}"
+        );
+        let sql = if pos.ends_with("token") { 8 } else { 0 };
+        if sql == 8 {
+            assert!(
+                got.contains(&8),
+                "{pos} has no 8-byte sql token vector: {got:?}"
+            );
+        } else {
+            assert!(
+                got.iter().any(|&n| (1..=20).contains(&n)),
+                "{pos} has no sql-kind (1..=20 byte) job_id vector: {got:?}"
+            );
+        }
+    }
+}
+
+/// SPEC §24.3 prerequisite (b): every refusal vector is refused by its message's decoder, FOR ITS
+/// OWN REASON (the error names the field and the length), and every opaque position and count bound
+/// has one at both ends — so a deleted file cannot make this pass vacuously.
+#[test]
+fn queue_refusal_vectors_are_refused_for_their_own_reason() {
+    use ferro_proto::CodecError;
+    use ferro_proto::consts::{
+        QUEUE_ENQUEUE_MAX_JOBS, QUEUE_HANDLE_MAX_BYTES, QUEUE_RESERVE_MAX_QUEUES, flags,
+        method_queue as mq, service,
+    };
+    use ferro_proto::messages::*;
+
+    let dir = vectors_dir().join("refusal");
+    let mut seen = BTreeSet::new();
+    for entry in fs::read_dir(&dir).unwrap() {
+        let p = entry.unwrap().path();
+        let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let name = v["name"].as_str().unwrap().to_string();
+        let field = v["field"].as_str().unwrap();
+        let len = v["len"].as_u64().unwrap();
+        let frame = unhex(v["frame_hex"].as_str().unwrap());
+        let h = Header::decode(&frame).expect("a refusal vector's HEADER is valid");
+        assert_eq!(h.service, service::QUEUE, "{name}");
+        let payload = &frame[16..];
+        let body;
+        let msg_bytes: &[u8] = if h.flags & flags::END != 0 {
+            let Outcome::Ok(b) = Outcome::decode(payload).expect("the envelope is valid") else {
+                panic!("{name}: a refusal terminal is an Outcome::Ok");
+            };
+            body = b;
+            &body
+        } else {
+            payload
+        };
+        let end = h.flags & flags::END != 0;
+        let err = match (h.method, end) {
+            (x, false) if x == mq::ENQUEUE => EnqueueRequest::decode(msg_bytes).err(),
+            (x, false) if x == mq::RESERVE => ReserveRequest::decode(msg_bytes).err(),
+            (x, false) if x == mq::ACK || x == mq::EXTEND => FencedRequest::decode(msg_bytes).err(),
+            (x, false) if x == mq::RELEASE => ReleaseRequest::decode(msg_bytes).err(),
+            (x, true) if x == mq::ENQUEUE => EnqueueResponse::decode(msg_bytes).err(),
+            (x, true) if x == mq::RESERVE => ReserveResponse::decode(msg_bytes).err(),
+            (x, true) if x == mq::RELEASE => ReleaseResponse::decode(msg_bytes).err(),
+            other => panic!("{name}: no decoder arm for {other:?}"),
+        };
+        match err {
+            Some(CodecError::Malformed(m)) => assert!(
+                m.contains(field) && m.contains(&len.to_string()),
+                "{name}: refused, but not for its own reason: {m}"
+            ),
+            other => panic!("{name} must be refused as Malformed naming {field}: {other:?}"),
+        }
+        seen.insert(name);
+    }
+    let over = QUEUE_HANDLE_MAX_BYTES + 1;
+    let mut required = Vec::new();
+    for n in [0, over] {
+        for pos in [
+            "enqueue_response_job_id",
+            "reserve_response_job_id",
+            "reserve_response_token",
+            "ack_request_job_id",
+            "ack_request_token",
+            "extend_request_job_id",
+            "extend_request_token",
+            "release_request_job_id",
+            "release_request_token",
+            "release_response_new_job_id",
+        ] {
+            required.push(format!("queue_{pos}_{n}"));
+        }
+    }
+    for n in [0, QUEUE_ENQUEUE_MAX_JOBS + 1] {
+        required.push(format!("queue_enqueue_request_jobs_{n}"));
+    }
+    for n in [0, QUEUE_RESERVE_MAX_QUEUES + 1] {
+        required.push(format!("queue_reserve_request_queues_{n}"));
+    }
+    let required: BTreeSet<String> = required.into_iter().collect();
+    assert_eq!(
+        seen, required,
+        "the refusal set is exactly the required set"
+    );
+}
+
+/// The three QUEUE codes' vectors: handler-built terminals on the request's own QUEUE/method header,
+/// carrying the registered code and branch, with `sqlstate`, `errno` and `detail` nil.
+#[test]
+fn every_queue_error_vector_carries_its_registered_code() {
+    use ferro_proto::consts::{errc, flags};
+    use ferro_proto::messages::Outcome;
+
+    let mut codes = BTreeSet::new();
+    for (name, h, _, payload) in queue_vectors_on_disk() {
+        if h.flags & flags::END == 0 {
+            continue; // a request, not a terminal
+        }
+        let Outcome::Error(ep) = Outcome::decode(&payload).unwrap() else {
+            continue;
+        };
+        assert_eq!(h.flags, flags::END, "{name}");
+        let registered = errc::ALL
+            .iter()
+            .find(|&&(_, c, _)| c == ep.code)
+            .unwrap_or_else(|| panic!("{name}: code {:#06x} is not registered", ep.code));
+        assert_eq!(ep.branch, registered.2, "{name}: branch is the registry's");
+        assert_eq!(
+            (ep.sqlstate.as_deref(), ep.errno, ep.detail.as_deref()),
+            (None, None, None),
+            "{name}"
+        );
+        codes.insert(ep.code);
+    }
+    assert_eq!(
+        codes,
+        BTreeSet::from([errc::LEASE_LOST, errc::POOL_MISMATCH, errc::INVALID_HANDLE])
+    );
+    for code in [errc::LEASE_LOST, errc::POOL_MISMATCH, errc::INVALID_HANDLE] {
+        let (_, _, branch) = errc::ALL.iter().find(|&&(_, c, _)| c == code).unwrap();
+        assert_eq!(*branch, ferro_proto::consts::branch::NON_RETRYABLE);
+    }
 }

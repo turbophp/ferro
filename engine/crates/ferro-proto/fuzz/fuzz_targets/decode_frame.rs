@@ -24,6 +24,16 @@ fuzz_target!(|data: &[u8]| {
         let _ = ferro_proto::messages::HttpHead::decode(&body[..take]);
         let _ = ferro_proto::messages::HttpBody::decode(&body[..take]);
         let _ = ferro_proto::messages::HttpDone::decode(&body[..take]);
+        // QUEUE (M7-G1a): the five request shapes the ENGINE decodes from an untrusted client (with
+        // their nested job/queue arrays and bounded `bin` handles), plus the response shapes the
+        // shared codec also decodes.
+        let _ = ferro_proto::messages::EnqueueRequest::decode(&body[..take]);
+        let _ = ferro_proto::messages::ReserveRequest::decode(&body[..take]);
+        let _ = ferro_proto::messages::FencedRequest::decode(&body[..take]);
+        let _ = ferro_proto::messages::ReleaseRequest::decode(&body[..take]);
+        let _ = ferro_proto::messages::QueueScopeRequest::decode(&body[..take]);
+        let _ = ferro_proto::messages::ReserveResponse::decode(&body[..take]);
+        let _ = ferro_proto::messages::EnqueueResponse::decode(&body[..take]);
         let mut rd = &body[..take];
         let _ = ferro_proto::value::Value::decode(&mut rd);
     }

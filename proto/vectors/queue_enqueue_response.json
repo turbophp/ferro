@@ -1,0 +1,20 @@
+{
+  "frame_hex": "f7040200070001004600000022000000920094c4133932323333373230333638353437373538303701c392cc96ce000111eb",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 70,
+    "service": 7
+  },
+  "message": {
+    "deduplicated": true,
+    "inserted": 1,
+    "job_id_hex": "39323233333732303336383534373735383037",
+    "stats": [
+      150,
+      70123
+    ],
+    "status": 0
+  },
+  "name": "queue_enqueue_response"
+}

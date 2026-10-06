@@ -406,7 +406,7 @@ pub(crate) fn write_opt_u32(out: &mut Vec<u8>, v: &Option<u32>) {
 
 /// Opt-u64 sibling of `write_opt_u32`. `tx_id` is a full 64-bit counter (bounded < 2^63 but wider
 /// than u32), so it MUST use this — the u32 helper would truncate any value above `u32::MAX`.
-fn write_opt_u64(out: &mut Vec<u8>, v: &Option<u64>) {
+pub(crate) fn write_opt_u64(out: &mut Vec<u8>, v: &Option<u64>) {
     match v {
         None => enc::write_nil(out).unwrap(),
         Some(n) => {
@@ -439,7 +439,7 @@ pub(crate) fn read_opt_u32(rd: &mut &[u8]) -> Result<Option<u32>, CodecError> {
 
 /// Opt-u64 sibling of `read_opt_u32` (same bare-nil peek rule); reads `tx_id` at full width so a
 /// value above `u32::MAX` survives the round trip instead of being truncated.
-fn read_opt_u64(rd: &mut &[u8]) -> Result<Option<u64>, CodecError> {
+pub(crate) fn read_opt_u64(rd: &mut &[u8]) -> Result<Option<u64>, CodecError> {
     if peek_nil(rd)? {
         return Ok(None);
     }

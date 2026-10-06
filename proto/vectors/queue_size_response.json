@@ -1,0 +1,20 @@
+{
+  "frame_hex": "f704020007000600520000001800000092009407cd012ccf000000012a05f20092cc96ce000111eb",
+  "header": {
+    "flags": 2,
+    "method": 6,
+    "request_id": 82,
+    "service": 7
+  },
+  "message": {
+    "delayed": 300,
+    "pending": 7,
+    "reserved": 5000000000,
+    "stats": [
+      150,
+      70123
+    ],
+    "status": 0
+  },
+  "name": "queue_size_response"
+}

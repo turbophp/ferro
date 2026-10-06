@@ -1,0 +1,25 @@
+{
+  "frame_hex": "f704000007000200490000002100000096a46a6f627392a468696768a764656661756c74cd012cce00011170c293c0c0c0",
+  "header": {
+    "flags": 0,
+    "method": 2,
+    "request_id": 73,
+    "service": 7
+  },
+  "message": {
+    "common": [
+      null,
+      null,
+      null
+    ],
+    "liveness": false,
+    "max_jobs": 300,
+    "queues": [
+      "high",
+      "default"
+    ],
+    "store": "jobs",
+    "wait_ms": 70000
+  },
+  "name": "queue_reserve_request"
+}

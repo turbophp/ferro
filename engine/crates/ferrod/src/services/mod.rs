@@ -8,4 +8,5 @@ pub mod copy;
 pub mod fate;
 #[cfg(feature = "http")]
 pub mod http;
+pub mod queue;
 pub mod sql;

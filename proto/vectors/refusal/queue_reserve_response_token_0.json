@@ -1,0 +1,12 @@
+{
+  "field": "token",
+  "frame_hex": "f7040200070002005a000000400000009200929197c41339323233333732303336383534373735383037c40003a468696768ab7b226a6f62223a2241227dce6ab13b80ce6ab13bdb92cc96ce000111eb",
+  "header": {
+    "flags": 2,
+    "method": 2,
+    "request_id": 90,
+    "service": 7
+  },
+  "len": 0,
+  "name": "queue_reserve_response_token_0"
+}

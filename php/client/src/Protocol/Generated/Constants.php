@@ -13,6 +13,10 @@ final class Constants
     public const MAX_FRAME_PAYLOAD = 16777216;
     public const DEFAULT_CREDIT_FRAMES = 64;
     public const DEFAULT_CREDIT_BYTES = 16777216;
+    public const QUEUE_WAIT_GRACE_MS = 1000;
+    public const QUEUE_HANDLE_MAX_BYTES = 1024;
+    public const QUEUE_ENQUEUE_MAX_JOBS = 1000;
+    public const QUEUE_RESERVE_MAX_QUEUES = 16;
 
     public const FLAG_CANCEL = 4;
     public const FLAG_COMPRESSED = 16;
@@ -23,6 +27,7 @@ final class Constants
     public const SERVICE_ADMIN = 5;
     public const SERVICE_CORE = 1;
     public const SERVICE_HTTP = 6;
+    public const SERVICE_QUEUE = 7;
     public const SERVICE_SQL = 2;
     public const SERVICE_STREAM = 4;
     public const SERVICE_TX = 3;
@@ -37,6 +42,13 @@ final class Constants
     public const METHOD_HTTP_BODY = 3;
     public const METHOD_HTTP_HEAD = 2;
     public const METHOD_HTTP_REQUEST = 1;
+    public const METHOD_QUEUE_ACK = 3;
+    public const METHOD_QUEUE_CLEAR = 7;
+    public const METHOD_QUEUE_ENQUEUE = 1;
+    public const METHOD_QUEUE_EXTEND = 5;
+    public const METHOD_QUEUE_RELEASE = 4;
+    public const METHOD_QUEUE_RESERVE = 2;
+    public const METHOD_QUEUE_SIZE = 6;
     public const METHOD_SQL_COPY_IN = 2;
     public const METHOD_SQL_COPY_OUT = 3;
     public const METHOD_SQL_EXEC = 1;
@@ -56,6 +68,9 @@ final class Constants
     public const OUTCOME_OK = 0;
 
     public const OOB_ENCODING_FRAME_PAYLOAD = 0;
+
+    public const ACK_OUTCOME_ACKED = 1;
+    public const ACK_OUTCOME_GONE = 2;
 
     public const TAG_ARRAY = 14;
     public const TAG_BOOL = 1;
@@ -101,8 +116,14 @@ final class Constants
     public const ERR_FORBIDDEN_BRANCH = 3;
     public const ERR_FOREIGN_KEY = 12291;
     public const ERR_FOREIGN_KEY_BRANCH = 3;
+    public const ERR_INVALID_HANDLE = 12305;
+    public const ERR_INVALID_HANDLE_BRANCH = 3;
+    public const ERR_LEASE_LOST = 12303;
+    public const ERR_LEASE_LOST_BRANCH = 3;
     public const ERR_NOT_NULL = 12292;
     public const ERR_NOT_NULL_BRANCH = 3;
+    public const ERR_POOL_MISMATCH = 12304;
+    public const ERR_POOL_MISMATCH_BRANCH = 3;
     public const ERR_POOL_TIMEOUT = 4098;
     public const ERR_POOL_TIMEOUT_BRANCH = 1;
     public const ERR_PROTOCOL = 12297;
@@ -227,5 +248,5 @@ final class Constants
         'write',
     ];
 
-    public const TYPE_REGISTRY_HASH = '2c826954795ad915';
+    public const TYPE_REGISTRY_HASH = 'cc12fc0a92d82617';
 }

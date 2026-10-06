@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod otlp;
 pub mod peercred;
 pub mod pools;
+pub mod queue_config;
 pub mod serve;
 pub mod services;
 pub mod session;

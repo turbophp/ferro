@@ -342,6 +342,10 @@ pub struct PoolRegistry {
     /// request handler already holds it. Upstream names share no namespace with pool names (§23.3).
     #[cfg(feature = "http")]
     http: Option<Arc<ferro_http::engine::HttpEngine>>,
+    /// SPEC §24's Ferro Queue stores (M7-G1a), when `FERRO_QUEUE_STORES` configured any. Here for the
+    /// reason `http` is: every request handler already holds the registry, and a store resolves its
+    /// pool through it.
+    queue: Option<Arc<crate::services::queue::QueueStores>>,
 }
 
 impl PoolRegistry {
@@ -464,7 +468,58 @@ impl PoolRegistry {
             manifest: config.manifest.clone(),
             #[cfg(feature = "http")]
             http,
+            queue: config
+                .queue
+                .clone()
+                .map(|c| Arc::new(crate::services::queue::QueueStores::new(c))),
         })
+    }
+
+    /// Test seam: record `version` as `name`'s freshly probed server version, so a test can drive
+    /// a consumer of the cache (Ferro Queue's version gate) against a server it does not have — a
+    /// PostgreSQL 11, say — without a probe.
+    #[cfg(test)]
+    pub(crate) fn seed_version_for_test(&self, name: &str, version: &str) {
+        let entry = self.by_name.get(name).expect("a configured pool");
+        entry.lock().state = VersionState::Known {
+            version: version.to_string(),
+            literals_are_standard: None,
+            at: Instant::now(),
+        };
+    }
+
+    /// Ferro Queue's stores, when the queue is configured (SPEC §24.3, M7-G1a).
+    pub fn queue(&self) -> Option<&Arc<crate::services::queue::QueueStores>> {
+        self.queue.as_ref()
+    }
+
+    /// One pool's server version for Ferro Queue's version gate (SPEC §24.3: "checked at first use
+    /// against the pool's existing version probe"). The SAME cache `HELLO_ACK` advertises from
+    /// ([`PoolRegistry::pool_info`]) and the same probe — never a second `version()` statement.
+    ///
+    /// A fresh cached value answers at once. Otherwise this starts the probe if nobody is running
+    /// one (detached, for `pool_info`'s drain-don't-drop reason) and waits for an outcome, bounded by
+    /// the probe's whole-call budget; a probe another caller started is waited for the same way.
+    /// `None` means the version is not known — an unreachable backend, a failed probe still inside
+    /// its backoff, or one that outran the budget — and the caller refuses with a known
+    /// non-execution rather than gating against nothing.
+    pub async fn server_version(&self, name: &str) -> Option<String> {
+        let entry = self.by_name.get(name)?;
+        if let Some(v) = entry.cached_version() {
+            return Some(v);
+        }
+        if entry.begin_probe() {
+            self.probes_issued.fetch_add(1, Ordering::Relaxed);
+            let e = Arc::clone(entry);
+            let probe = tokio::spawn(async move { e.probe_and_record().await });
+            let _ = tokio::time::timeout(self.tuning.call_budget, probe).await;
+        } else {
+            let deadline = Instant::now() + self.tuning.call_budget;
+            while entry.lock().in_flight && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        entry.cached_version()
     }
 
     /// The Ferro HTTP engine, when HTTP is configured (SPEC §23, M6-F4a).

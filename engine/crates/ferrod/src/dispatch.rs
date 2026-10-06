@@ -16,7 +16,7 @@
 //! per-request `Unsupported` error `END` directly on that frame's `request_id` and moves on; the
 //! session survives (SPEC's per-request set, not the session-fatal one).
 
-use ferro_proto::consts::{method_core, method_http, method_stream, service};
+use ferro_proto::consts::{method_core, method_http, method_queue, method_stream, service};
 
 use crate::admin::AdminVerb;
 
@@ -84,6 +84,16 @@ pub fn route(service: u16, method: u16) -> Route {
     // here a method id's direction is part of the contract.
     if service == service::HTTP {
         return if method == method_http::REQUEST {
+            Route::Request
+        } else {
+            Route::Unsupported
+        };
+    }
+    // Ferro Queue (M7-G1a, SPEC §24.4): every `[methods.queue]` method is client → engine and
+    // request-bearing, so each enters the request lifecycle; any other QUEUE method id has no route.
+    // Per METHOD, like HTTP, so a client probing an unallocated id never reaches a handler.
+    if service == service::QUEUE {
+        return if method_queue::ALL.iter().any(|&(_, id)| id == method) {
             Route::Request
         } else {
             Route::Unsupported
@@ -187,6 +197,23 @@ mod tests {
             3,
             "a new HTTP method needs a routing decision"
         );
+    }
+
+    #[test]
+    fn every_registered_queue_method_is_a_request_and_nothing_else_on_queue_is() {
+        // Derived from the registry, so a method added to `[methods.queue]` is routed (and the
+        // handler's own decode test then demands a decoder for it).
+        for &(name, id) in method_queue::ALL {
+            assert_eq!(
+                route(service::QUEUE, id),
+                Route::Request,
+                "QUEUE method {name}"
+            );
+        }
+        assert_eq!(method_queue::ALL.len(), 7, "SPEC §24.4's seven verbs");
+        for m in [0, 8, 0x7FFF, 0xFFFF] {
+            assert_eq!(route(service::QUEUE, m), Route::Unsupported, "method {m}");
+        }
     }
 
     #[test]

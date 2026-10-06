@@ -1,0 +1,16 @@
+[package]
+name = "ferro-queue"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Ferro Queue (SPEC §24): store model, configuration, the sql kind's encodings, the version gate, shape checks and request checks. No I/O."
+
+[dependencies]
+ferro-proto = { path = "../ferro-proto" }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true
