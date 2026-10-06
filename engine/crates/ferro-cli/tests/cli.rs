@@ -242,3 +242,245 @@ fn a_failed_write_leaves_the_previous_manifest_intact() {
         .collect();
     assert!(leftovers.is_empty(), "the temporary is removed");
 }
+
+// ---- M3-D2b: schema-sync and check (SQLite: no server needed) --------------------------------
+
+fn ferro_env(args: &[&str], dsn: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ferro"))
+        .args(args)
+        .env("FERRO_POOLS", "default")
+        .env("FERRO_POOL_DEFAULT_DSN", dsn)
+        .output()
+        .expect("runs")
+}
+
+fn shadow(dir: &Path, stem: &str) -> String {
+    format!("sqlite://{}", dir.join(format!("{stem}.db")).display())
+}
+
+#[test]
+fn schema_sync_refuses_a_database_not_named_shadow_and_leaves_it_alone() {
+    let dir = scratch("sync-refuse");
+    write(&dir, "mig/001.sql", "CREATE TABLE t (id INTEGER);");
+    let db = dir.join("app.db");
+    std::fs::write(&db, "precious").unwrap();
+    let o = ferro_env(
+        &[
+            "schema-sync",
+            "--migrations",
+            dir.join("mig").to_str().unwrap(),
+        ],
+        &shadow(&dir, "app"),
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("does not end in `_shadow`"));
+    assert_eq!(
+        std::fs::read_to_string(&db).unwrap(),
+        "precious",
+        "nothing was touched"
+    );
+}
+
+#[test]
+fn schema_sync_applies_migrations_in_order_and_is_repeatable_then_check_records_shapes() {
+    let dir = scratch("sync-ok");
+    write(
+        &dir,
+        "mig/002_posts.sql",
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id));",
+    );
+    write(
+        &dir,
+        "mig/001_users.sql",
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL);\nCREATE INDEX ue ON users(email);",
+    );
+    let dsn = shadow(&dir, "app_shadow");
+    for _ in 0..2 {
+        let o = ferro_env(
+            &[
+                "schema-sync",
+                "--migrations",
+                dir.join("mig").to_str().unwrap(),
+            ],
+            &dsn,
+        );
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    write(
+        &dir,
+        "q/find.sql",
+        "-- ferro:\n--   id: users.find\n--   readonly: true\nSELECT id, email FROM users WHERE email = ?\n",
+    );
+    let m = dir.join("m.json");
+    assert!(
+        ferro(&[
+            "manifest",
+            "--sql",
+            dir.join("q").to_str().unwrap(),
+            "--out",
+            m.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+    let out = dir.join("checked.json");
+    let o = ferro_env(
+        &[
+            "check",
+            "--manifest",
+            m.to_str().unwrap(),
+            "--write",
+            out.to_str().unwrap(),
+        ],
+        &dsn,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let checked: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    let q = &checked["queries"]["users.find"];
+    assert_eq!(q["params"], serde_json::json!([null]));
+    assert_eq!(q["columns"][1]["name"], "email");
+    assert_eq!(q["columns"][1]["type"], "TEXT");
+    // The recorded shapes are not part of the hash.
+    let h = |p: &Path| {
+        String::from_utf8(ferro(&["manifest-hash", p.to_str().unwrap()]).stdout).unwrap()
+    };
+    assert_eq!(h(&m), h(&out));
+}
+
+#[test]
+fn a_failing_migration_names_its_file() {
+    let dir = scratch("sync-fail");
+    write(&dir, "mig/001.sql", "CREATE TABLE t (id INTEGER);");
+    write(&dir, "mig/002.sql", "CREATE TABLE broken (;");
+    let o = ferro_env(
+        &[
+            "schema-sync",
+            "--migrations",
+            dir.join("mig").to_str().unwrap(),
+        ],
+        &shadow(&dir, "x_shadow"),
+    );
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("002.sql") && err.contains("migration failed"),
+        "{err}"
+    );
+}
+
+#[test]
+fn check_fails_on_a_query_that_does_not_prepare_and_writes_nothing() {
+    let dir = scratch("check-fail");
+    write(&dir, "mig/001.sql", "CREATE TABLE t (id INTEGER);");
+    let dsn = shadow(&dir, "c_shadow");
+    assert!(
+        ferro_env(
+            &[
+                "schema-sync",
+                "--migrations",
+                dir.join("mig").to_str().unwrap()
+            ],
+            &dsn
+        )
+        .status
+        .success()
+    );
+    write(
+        &dir,
+        "q/a.sql",
+        "-- ferro:\n--   id: a\nSELECT nope FROM t\n",
+    );
+    write(
+        &dir,
+        "q/b.sql",
+        "-- ferro:\n--   id: b\nSELECT id FROM missing_table\n",
+    );
+    let m = dir.join("m.json");
+    assert!(
+        ferro(&[
+            "manifest",
+            "--sql",
+            dir.join("q").to_str().unwrap(),
+            "--out",
+            m.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+    let out = dir.join("checked.json");
+    let o = ferro_env(
+        &[
+            "check",
+            "--manifest",
+            m.to_str().unwrap(),
+            "--write",
+            out.to_str().unwrap(),
+        ],
+        &dsn,
+    );
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("query `a`") && err.contains("query `b`"),
+        "every problem is listed: {err}"
+    );
+    assert!(!out.exists());
+}
+
+#[test]
+fn an_unconfigured_pool_is_named_and_a_dsn_is_never_printed() {
+    let dir = scratch("check-secret");
+    write(
+        &dir,
+        "q/a.sql",
+        "-- ferro:\n--   id: a\n--   pool: reports\nSELECT 1\n",
+    );
+    let m = dir.join("m.json");
+    assert!(
+        ferro(&[
+            "manifest",
+            "--sql",
+            dir.join("q").to_str().unwrap(),
+            "--out",
+            m.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+    let o = ferro_env(
+        &["check", "--manifest", m.to_str().unwrap()],
+        "postgres://u:SECRETPW@127.0.0.1:1/x_shadow",
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("pool `reports`"));
+
+    // A configured but unreachable pool: the error names the pool and never the credential.
+    write(&dir, "q/a.sql", "-- ferro:\n--   id: a\nSELECT 1\n");
+    assert!(
+        ferro(&[
+            "manifest",
+            "--sql",
+            dir.join("q").to_str().unwrap(),
+            "--out",
+            m.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+    let o = ferro_env(
+        &["check", "--manifest", m.to_str().unwrap()],
+        "postgres://u:SECRETPW@127.0.0.1:1/x_shadow",
+    );
+    assert_eq!(o.status.code(), Some(1));
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(all.contains("pool `default`"), "{all}");
+    assert!(
+        !all.contains("SECRETPW"),
+        "the DSN's password was printed: {all}"
+    );
+}

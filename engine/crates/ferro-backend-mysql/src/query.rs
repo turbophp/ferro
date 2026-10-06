@@ -54,6 +54,35 @@ use crate::Value;
 use crate::conn::MysqlConn;
 use crate::{bind, rowmap};
 
+/// Prepares `sql` without running it and reports the server's description (`ferro check`,
+/// M3-D2b): the parameter COUNT (MySQL infers no usable parameter types at prepare) and each
+/// column's name, type and §9 tag. A column type outside §9, or a `NULL`-typed prepared column,
+/// is the same loud refusal a query would raise. A `CALL` declares its columns only when executed,
+/// so it describes as columnless — stated, not guessed.
+pub async fn describe(
+    conn: &mut MysqlConn,
+    sql: &str,
+) -> Result<ferro_pool::backend::Describe, PoolError> {
+    let stmt = match conn.driver_mut().prep(sql).await {
+        Ok(s) => s,
+        Err(e) => return Err(conn.map_stmt_error(&e)),
+    };
+    let prepared = stmt.columns();
+    rowmap::refuse_prepared_null(&prepared)?;
+    let mut cols = Vec::with_capacity(prepared.len());
+    for col in prepared.iter() {
+        cols.push(ferro_pool::backend::DescribedColumn {
+            name: col.name_str().into_owned(),
+            tag: Some(rowmap::column_to_tag(col)?),
+            type_name: format!("{:?}", col.column_type()),
+        });
+    }
+    Ok(ferro_pool::backend::Describe {
+        params: vec![None; stmt.num_params() as usize],
+        cols,
+    })
+}
+
 /// Runs `sql` (with native `?` placeholders) + `params` against `conn`, buffering the full result.
 /// See the module docs for the flow and the §19.3 safety invariants.
 pub async fn run(

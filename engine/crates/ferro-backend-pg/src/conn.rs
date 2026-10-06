@@ -307,6 +307,14 @@ impl PoolBackend for PgBackend {
         crate::query::run(&conn.client, sql, params).await
     }
 
+    async fn describe(
+        &self,
+        conn: &mut Self::Conn,
+        sql: &str,
+    ) -> Result<ferro_pool::backend::Describe, PoolError> {
+        crate::query::describe(&conn.client, sql).await
+    }
+
     /// The incremental, constant-memory row-returning path (S5 Task 3): prepare + `query_raw`, then
     /// return the prepared `cols` and a box-pinned [`crate::query::PgRowStream`] the caller drains
     /// one row at a time. See `crate::query::stream` for the prepare/bind-pre-validation flow (§19.3

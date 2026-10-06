@@ -9,6 +9,27 @@ use ferro_proto::value::Value;
 /// without taking their own direct dependency on the `ferro-classify` leaf crate.
 pub use ferro_classify::Dialect;
 
+/// What a statement IS, learned by preparing it without running it (`ferro check`, M3-D2b, SPEC
+/// §11): its parameters and its result columns, as the server describes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Describe {
+    /// One entry per bind parameter: the server's name for its type, or `None` where the backend
+    /// does not infer parameter types (MySQL, SQLite).
+    pub params: Vec<Option<String>>,
+    pub cols: Vec<DescribedColumn>,
+}
+
+/// One result column of a [`Describe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribedColumn {
+    pub name: String,
+    /// The §9 tag the engine will put on the wire for it, or `None` where the backend has no
+    /// declared column types (SQLite types each VALUE, not the column).
+    pub tag: Option<u8>,
+    /// The server's own name for the column type (`int4`, `VARCHAR`, …), for messages and codegen.
+    pub type_name: String,
+}
+
 /// The buffered result of a row-returning statement (S5, BLOCKER-2). `cols` is populated even for
 /// a zero-row result (built from the prepared statement's columns), `rows` is the fully-buffered
 /// result set (D-S5-1: M0 buffers rather than streams), and `affected` comes from the command tag
@@ -300,6 +321,17 @@ pub trait PoolBackend: Send + Sync + 'static {
     /// backend (e.g. an S6 MySQL session-state tracker) that can prove a recycled conn needs
     /// nothing at all. `PgBackend` always returns `Some(ResetProfile::Targeted)`.
     fn clean_reset_profile(&self) -> Option<ResetProfile>;
+
+    /// Prepare `sql` WITHOUT running it and report its parameters and result columns (M3-D2b,
+    /// SPEC §11's `ferro check`). An error is the statement's own fault as the server reports it —
+    /// a syntax error, an unknown relation — or `Unsupported` for a column type outside §9. Used by
+    /// the CLI against a disposable shadow database, never on the request path. The default refuses,
+    /// so a backend that cannot describe says so instead of reporting nothing.
+    async fn describe(&self, _conn: &mut Self::Conn, _sql: &str) -> Result<Describe, PoolError> {
+        Err(PoolError::Unsupported(
+            "this backend cannot describe a statement".into(),
+        ))
+    }
 
     /// Raw simple query — UNGUARDED. Used only by the pin hook (BEGIN/COMMIT/ROLLBACK, Task 4)
     /// and internal reset. The user-facing guarded entry point (`Checkout::exec`) lands in Task

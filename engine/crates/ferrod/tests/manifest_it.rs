@@ -35,6 +35,8 @@ fn query(sql: &str, pool: &str, readonly: bool) -> Query {
         idempotent: false,
         dto: None,
         source: None,
+        params: None,
+        columns: None,
     }
 }
 

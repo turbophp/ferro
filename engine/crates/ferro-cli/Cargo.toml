@@ -12,6 +12,18 @@ path = "src/main.rs"
 
 [dependencies]
 ferro-manifest = { path = "../ferro-manifest" }
+# `check` and `schema-sync` (M3-D2b) connect through the SAME backend crates and the same pool
+# configuration as the daemon, so a statement is described with the engine's own type mapping.
+ferro-pool = { path = "../ferro-pool" }
+ferro-proto = { path = "../ferro-proto" }
+ferro-backend-pg = { path = "../ferro-backend-pg" }
+ferro-backend-mysql = { path = "../ferro-backend-mysql" }
+ferro-backend-sqlite = { path = "../ferro-backend-sqlite" }
+ferrod = { path = "../ferrod" }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+serde_json = "1"
