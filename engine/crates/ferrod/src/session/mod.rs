@@ -206,7 +206,18 @@ pub type SessionId = u64;
 /// tx service keys tx ownership off it) without threading a `SessionId` through `HandlerFn`'s own
 /// signature — which would churn the ~8 scripted-handler test closures and the mod.rs call site.
 /// `Session::run` and the pure-session tests use a trivial factory that ignores the id.
-pub type HandlerFactory = Arc<dyn Fn(SessionId) -> HandlerFn + Send + Sync>;
+pub type HandlerFactory = Arc<dyn Fn(SessionId, SessionInfo) -> HandlerFn + Send + Sync>;
+
+/// What the handshake established about a session, handed to the [`HandlerFactory`] once HELLO has
+/// been validated (the handler is built AFTER the handshake, so it can depend on it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionInfo {
+    /// The client sent a `manifest_hash` and it equals the engine's (M3-D2d). Only such a session
+    /// may run EXEC by `query_id`: the request carries `readonly` and runs on a pool the engine can
+    /// check, but NOT `idempotent` — the client's retry licence (§9.2) — so the hash is the only
+    /// thing that proves the client read the engine's declaration of it.
+    pub manifest_agreed: bool,
+}
 
 /// The session task's entry point, one call per accepted connection.
 pub struct Session;
@@ -226,7 +237,7 @@ impl Session {
         // registry and dials nothing — and if one ever does carry pools, `Pool::new` is lazy, so it
         // still dials nothing until a checkout asks.
         let pool_registry = PoolRegistry::build(&config);
-        let factory: HandlerFactory = Arc::new(|_session_id| default_handler_fn());
+        let factory: HandlerFactory = Arc::new(|_session_id, _info| default_handler_fn());
         Self::run_with_handler(stream, config, epoch, pool_registry, tx_registry, factory).await;
     }
 
@@ -263,7 +274,6 @@ impl Session {
         // handler only runs for request-bearing frames, and none are dispatched during the
         // handshake), so the handshake-phase early returns need not — and do not — abort.
         let session_id = tx_registry.next_session_id();
-        let handler = factory(session_id);
 
         // SPEC D15: the peer's KERNEL-ATTESTED uid, read from this session's own socket — never from
         // anything the client sends — once, before the stream is split. `SO_PEERCRED` reports the
@@ -357,7 +367,7 @@ impl Session {
             return;
         }
 
-        let _hello =
+        let hello =
             match handshake::validate_hello(&first, pool_registry.manifest().map(|m| m.hash())) {
                 Ok(hello) => hello,
                 Err(err) => {
@@ -369,6 +379,15 @@ impl Session {
                     return;
                 }
             };
+
+        // Built only now, so it can depend on what the handshake established. No request-bearing
+        // frame is dispatched before this point, so nothing could have needed it earlier.
+        let handler = factory(
+            session_id,
+            SessionInfo {
+                manifest_agreed: hello.manifest_hash.is_some(),
+            },
+        );
 
         // The per-pool metadata, with `server_version` learned lazily per pool, CONCURRENTLY, and
         // bounded AS A WHOLE by `PoolRegistry::VERSION_PROBE_BUDGET` — never fatal: a pool whose

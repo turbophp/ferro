@@ -38,11 +38,25 @@ pub fn validate_hello(
         .map_err(|e| SessionError::protocol_fatal(format!("malformed HELLO payload: {e}")))?;
     if hello.type_registry_hash != TYPE_REGISTRY_HASH {
         return Err(SessionError::type_registry_mismatch(format!(
-            "type_registry_hash mismatch: client sent {:?}, engine is {:?}",
-            hello.type_registry_hash, TYPE_REGISTRY_HASH
+            "type_registry_hash mismatch: client sent {}, engine is {:?}",
+            shown(&hello.type_registry_hash),
+            TYPE_REGISTRY_HASH
         )));
     }
     if let Some(client) = hello.manifest_hash.as_deref() {
+        // A manifest hash is 64 lowercase hex characters (`Manifest::hash`); anything else cannot
+        // match and is refused without being echoed (M3-D2d review F6: a multi-megabyte value was
+        // echoed into a terminal frame larger than the frame cap, so the refusal never arrived).
+        if client.len() != 64
+            || !client
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(SessionError::type_registry_mismatch(format!(
+                "manifest_hash is not a manifest hash (64 lowercase hex characters; got {})",
+                shown(client)
+            )));
+        }
         match engine_manifest {
             Some(engine) if engine == client => {}
             Some(engine) => {
@@ -61,6 +75,21 @@ pub fn validate_hello(
         }
     }
     Ok(hello)
+}
+
+/// A client-supplied hash for an error message: itself when it is short lowercase hex (it can then
+/// carry nothing but hex), else only its length — never arbitrary client bytes, and never a value
+/// large enough to push the refusal past the frame cap.
+fn shown(value: &str) -> String {
+    if value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        format!("{value:?}")
+    } else {
+        format!("a malformed value of {} bytes", value.len())
+    }
 }
 
 /// Build the `HELLO_ACK` `OutFrame` replying to `request_id` (the `HELLO` frame's own id, per

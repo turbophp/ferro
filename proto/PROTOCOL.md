@@ -468,7 +468,7 @@ A positional fixarray of 9 fields in declaration order (payload of a non-`END` `
 | # | field | type | notes |
 |---|---|---|---|
 | 1 | `pool` | `str` | target pool name |
-| 2 | `sql` | `str \| nil` | literal SQL; `nil` iff a `query_id` is used (manifest mode, M3) |
+| 2 | `sql` | `str \| nil` | literal SQL; `nil` iff a `query_id` is used. Exactly one of the two must be set: both is `Protocol`, neither is `Unsupported` |
 | 3 | `query_id` | `str \| nil` | manifest query id (M3-D2d): the engine runs the manifest's SQL for it. The request's `readonly`, and the pool it runs on (`pool` for autocommit, the transaction's pinned pool when `tx_id` is set), must equal the manifest's declaration, else `Unsupported`; so are an unknown id and an engine with no manifest. Setting both `sql` and `query_id` is `Protocol` |
 | 4 | `params` | `array<Value>` | positional bind params, each a `[tag, payload]` `Value` (§3) |
 | 5 | `timeout_ms` | `u32 \| nil` | per-statement deadline hint |

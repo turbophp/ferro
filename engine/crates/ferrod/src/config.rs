@@ -354,14 +354,16 @@ impl Config {
             cfg.pools = parse_pools(&names, &|k| std::env::var(k).ok());
         }
 
-        // SPEC §13 slow log. A value that does not parse leaves it OFF rather than guessing a
-        // threshold: a mistyped `FERRO_SLOW_LOG_MS` should not quietly start logging every
-        // statement, and `0` is a legitimate "log everything" the operator may actually want.
+        // SPEC §11 (M3-D2d). A blank value reads as unset. Only the PATH is read here: loading can
+        // fail, and `main` must refuse to start when it does rather than fall back to a default.
         if let Ok(raw) = std::env::var("FERRO_MANIFEST")
             && !raw.trim().is_empty()
         {
             cfg.manifest_path = Some(PathBuf::from(raw));
         }
+        // SPEC §13 slow log. A value that does not parse leaves it OFF rather than guessing a
+        // threshold: a mistyped `FERRO_SLOW_LOG_MS` should not quietly start logging every
+        // statement, and `0` is a legitimate "log everything" the operator may actually want.
         if let Ok(raw) = std::env::var("FERRO_SLOW_LOG_MS") {
             cfg.slow_log_ms = raw.trim().parse::<u64>().ok();
         }

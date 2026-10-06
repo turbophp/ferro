@@ -9,13 +9,13 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{TestClient, TestServer, assert_session_alive, exec, exec_err, exec_ok, req};
+use common::{TestClient, TestServer, assert_session_alive, exec_err, exec_ok, req};
 use ferro_manifest::{Manifest, Query};
 use ferro_proto::consts::{
     TYPE_REGISTRY_HASH, errc, feature_engine, flags, method_core, method_sql, method_tx, service,
 };
 use ferro_proto::header::Header;
-use ferro_proto::messages::sql::ExecRequest;
+use ferro_proto::messages::sql::{ExecRequest, StreamData};
 use ferro_proto::messages::tx::{BeginRequest, BeginResponse};
 use ferro_proto::messages::{Hello, HelloAck, Outcome};
 use ferro_proto::value::Value;
@@ -233,7 +233,7 @@ async fn a_request_that_disagrees_with_the_manifest_is_refused_and_nothing_runs(
     let dir = tempfile::tempdir().unwrap();
     let srv = server(&dir, Some(manifest()));
     let mut c = srv.connect().await;
-    hello(&mut c, None).await.unwrap();
+    hello(&mut c, Some(manifest().hash())).await.unwrap();
     setup(&mut c).await;
 
     let refused = |ep: ferro_proto::messages::ErrorPayload, want: &str| {
@@ -303,7 +303,7 @@ async fn inside_a_transaction_the_pinned_pool_is_what_must_match() {
     let dir = tempfile::tempdir().unwrap();
     let srv = server(&dir, Some(manifest()));
     let mut c = srv.connect().await;
-    hello(&mut c, None).await.unwrap();
+    hello(&mut c, Some(manifest().hash())).await.unwrap();
     setup(&mut c).await;
 
     let tx = begin(&mut c, 4, "reports").await;
@@ -337,52 +337,169 @@ async fn inside_a_transaction_the_pinned_pool_is_what_must_match() {
     assert_session_alive(&mut c, 72).await;
 }
 
-/// A streamed fetch takes the same resolution (the stream producer is a separate code path).
+/// Run a `fetch:stream` EXEC and collect its rows (an error terminal is returned as `Err`).
+async fn stream_rows(
+    c: &mut TestClient,
+    rid: u32,
+    r: &ExecRequest,
+) -> Result<Vec<Vec<Value>>, ferro_proto::messages::ErrorPayload> {
+    let r = ExecRequest {
+        fetch: 2,
+        ..r.clone()
+    };
+    c.send_request(rid, service::SQL, method_sql::EXEC, r.encode())
+        .await;
+    let mut rows = Vec::new();
+    loop {
+        let f = c.recv().await;
+        assert_eq!(f.header.request_id, rid);
+        if f.header.flags & flags::END != 0 {
+            return match Outcome::decode(&f.payload).unwrap() {
+                Outcome::Ok(_) => Ok(rows),
+                Outcome::Error(ep) => Err(ep),
+                other => panic!("{other:?}"),
+            };
+        }
+        if f.header.flags & flags::STREAM != 0 {
+            rows.extend(StreamData::decode(&f.payload).unwrap().rows);
+        }
+    }
+}
+
+/// A streamed fetch takes the same resolution (the stream producer is a separate code path), on
+/// both the autocommit and the tx-scoped paths — and the ROWS prove which SQL ran (review F4: the
+/// first version asserted only that something streamed, so running other SQL passed it).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_streamed_query_id_runs_the_manifest_sql() {
     let dir = tempfile::tempdir().unwrap();
     let srv = server(&dir, Some(manifest()));
     let mut c = srv.connect().await;
-    hello(&mut c, None).await.unwrap();
+    hello(&mut c, Some(manifest().hash())).await.unwrap();
     setup(&mut c).await;
     exec_ok(
         &mut c,
         4,
-        &inline("INSERT INTO r(v) VALUES ('s1'), ('s2')", "reports"),
+        &inline("INSERT INTO r(v) VALUES ('s2'), ('s1')", "reports"),
     )
     .await;
+    let want = vec![
+        vec![Value::Text("s1".into())],
+        vec![Value::Text("s2".into())],
+    ];
 
-    let streamed = ExecRequest {
-        fetch: 2,
+    let rows = stream_rows(&mut c, 5, &by_id("r.all", "reports", true, vec![]))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, want,
+        "autocommit stream ran the manifest's ordered SELECT"
+    );
+
+    // Refused before any stream frame.
+    let err = stream_rows(&mut c, 6, &by_id("r.all", "default", true, vec![]))
+        .await
+        .unwrap_err();
+    assert!(
+        err.message.contains("declared for pool `reports`"),
+        "{}",
+        err.message
+    );
+
+    // Tx-scoped stream.
+    let tx = begin(&mut c, 7, "reports").await;
+    let in_tx = ExecRequest {
+        tx_id: Some(tx),
         ..by_id("r.all", "reports", true, vec![])
     };
-    c.send_request(5, service::SQL, method_sql::EXEC, streamed.encode())
-        .await;
-    let mut data_frames = 0;
-    loop {
-        let f = c.recv().await;
-        assert_eq!(f.header.request_id, 5);
-        if f.header.flags & flags::END != 0 {
-            assert!(
-                matches!(Outcome::decode(&f.payload).unwrap(), Outcome::Ok(_)),
-                "the stream ends Ok"
-            );
-            break;
-        }
-        if f.header.flags & flags::STREAM != 0 {
-            data_frames += 1;
-        }
-    }
-    assert!(data_frames >= 1, "rows were streamed");
-
-    // And a refused one is refused BEFORE any stream frame.
-    let wrong = ExecRequest {
-        fetch: 2,
-        ..by_id("r.all", "default", true, vec![])
-    };
-    match exec(&mut c, 6, &wrong).await {
-        Outcome::Error(ep) => assert!(ep.message.contains("declared for pool `reports`")),
-        other => panic!("{other:?}"),
-    }
+    let rows = stream_rows(&mut c, 8, &in_tx).await.unwrap();
+    assert_eq!(
+        rows, want,
+        "tx-scoped stream ran the manifest's ordered SELECT"
+    );
     assert_session_alive(&mut c, 73).await;
+}
+
+/// The tx-scoped path checks `readonly` too (review F5: only the autocommit check had a test).
+#[tokio::test(flavor = "multi_thread")]
+async fn inside_a_transaction_readonly_must_match_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = server(&dir, Some(manifest()));
+    let mut c = srv.connect().await;
+    hello(&mut c, Some(manifest().hash())).await.unwrap();
+    setup(&mut c).await;
+    let tx = begin(&mut c, 4, "reports").await;
+    let lying = ExecRequest {
+        tx_id: Some(tx),
+        ..by_id("r.add", "reports", true, vec![Value::Text("x".into())])
+    };
+    let ep = exec_err(&mut c, 5, &lying).await;
+    assert_eq!(ep.code, errc::UNSUPPORTED);
+    assert!(
+        ep.message.contains("declared readonly=false"),
+        "{}",
+        ep.message
+    );
+    assert_session_alive(&mut c, 74).await;
+}
+
+/// **A session that did not agree on the manifest at HELLO cannot run a query id** (review F8).
+/// `readonly` and the pool travel with every request; `idempotent` — the client's licence to
+/// re-send a lost write — does not, so only the hash proves the client read the engine's value.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_without_the_manifest_hash_cannot_run_a_query_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = server(&dir, Some(manifest()));
+    let mut c = srv.connect().await;
+    hello(&mut c, None).await.unwrap();
+    setup(&mut c).await; // inline SQL is unaffected
+
+    let ep = exec_err(
+        &mut c,
+        4,
+        &by_id("t.add", "default", false, vec![Value::Text("x".into())]),
+    )
+    .await;
+    assert_eq!(ep.code, errc::UNSUPPORTED);
+    assert!(ep.message.contains("manifest_hash"), "{}", ep.message);
+    let ok = exec_ok(&mut c, 5, &inline("SELECT count(*) FROM t", "default")).await;
+    assert_eq!(
+        ok.rows,
+        vec![vec![Value::I64(0)]],
+        "the refused write did not run"
+    );
+    assert_session_alive(&mut c, 75).await;
+}
+
+/// A malformed `manifest_hash` is refused with a bounded message that never echoes it (review F6:
+/// a multi-megabyte value was echoed into a terminal larger than the frame cap, so the refusal
+/// never arrived — the client saw a bare EOF).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_manifest_hash_is_refused_without_being_echoed() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = server(&dir, Some(manifest()));
+    let hash = manifest().hash();
+    for bad in [
+        "\u{1}".repeat(3_400_000),
+        hash.to_uppercase(),
+        "zz".into(),
+        // Lowercase hex of the wrong LENGTH: the shape check is two halves, and a version that
+        // dropped the length half survived the three cases above (all non-hex).
+        hash[..63].to_string(),
+        format!("{hash}0"),
+        "a".repeat(100_000),
+    ] {
+        let err = hello(&mut srv.connect().await, Some(bad.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not a manifest hash"),
+            "{}",
+            &err[..err.len().min(200)]
+        );
+        assert!(
+            err.len() < 200,
+            "the refusal is bounded: {} bytes",
+            err.len()
+        );
+    }
 }

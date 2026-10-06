@@ -123,14 +123,21 @@ pub enum ResolveError {
 ///   `Indeterminate`, a SQLite checkout enforces it); a request claiming `readonly` for a query the
 ///   manifest declares a write would turn an unknown write fate into a "safe to retry".
 ///
-/// A mismatch means the client is reading a different manifest (or none) — exactly what the HELLO
-/// hash check exists to catch for a client that sent one — so it is refused, loudly.
+/// A mismatch means the client is reading a different manifest (or none), so it is refused, loudly.
+///
+/// **And the session must have AGREED on the manifest at HELLO** (`manifest_agreed`: it sent a
+/// `manifest_hash` equal to the engine's). `readonly` and the pool travel with every request and are
+/// checked above, but the third declaration — `idempotent`, the client's licence to re-send a lost
+/// write (§9.2) — never does: only the hash proves the client read the engine's value of it. A
+/// session that sent no hash could otherwise run an id under its own, different, `idempotent` and
+/// re-send a write the engine's manifest says must not be (M3-D2d review F8).
 pub fn resolve<'a>(
     sql: Option<&'a str>,
     query_id: Option<&str>,
     readonly: bool,
     run_pool: &str,
     manifest: Option<&'a LoadedManifest>,
+    manifest_agreed: bool,
 ) -> Result<&'a str, ResolveError> {
     match (sql, query_id) {
         (Some(_), Some(_)) => Err(ResolveError::BothSqlAndQueryId),
@@ -143,6 +150,13 @@ pub fn resolve<'a>(
                         .into(),
                 ));
             };
+            if !manifest_agreed {
+                return Err(ResolveError::Refused(
+                    "query_id needs a session whose HELLO carried this engine's manifest_hash \
+                     (connect with the manifest loaded)"
+                        .into(),
+                ));
+            }
             // The id is client-supplied: it is echoed only once it is known to be a well-formed
             // id, so an arbitrary string never lands in an error message (or a log line).
             if ferro_manifest::check_id(id).is_err() {
@@ -248,15 +262,22 @@ mod tests {
     #[test]
     fn inline_sql_resolves_to_itself_and_both_or_neither_are_refused() {
         assert_eq!(
-            resolve(Some("SELECT 2"), None, false, "default", None),
+            resolve(Some("SELECT 2"), None, false, "default", None, true),
             Ok("SELECT 2")
         );
         assert_eq!(
-            resolve(Some("SELECT 2"), Some("users.find"), false, "default", None),
+            resolve(
+                Some("SELECT 2"),
+                Some("users.find"),
+                false,
+                "default",
+                None,
+                true
+            ),
             Err(ResolveError::BothSqlAndQueryId)
         );
         assert_eq!(
-            resolve(None, None, false, "default", None),
+            resolve(None, None, false, "default", None, true),
             Err(ResolveError::NoStatement)
         );
     }
@@ -266,11 +287,11 @@ mod tests {
         let m = LoadedManifest::from_manifest(manifest(), &pools(&["default", "reports"])).unwrap();
         let m = Some(&*m);
         assert_eq!(
-            resolve(None, Some("users.find"), true, "default", m),
+            resolve(None, Some("users.find"), true, "default", m, true),
             Ok("SELECT 1")
         );
         assert_eq!(
-            resolve(None, Some("users.touch"), false, "reports", m),
+            resolve(None, Some("users.touch"), false, "reports", m, true),
             Ok("UPDATE u SET t = now()")
         );
 
@@ -279,25 +300,39 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         };
         assert!(
-            refused(resolve(None, Some("users.touch"), false, "default", m))
-                .contains("declared for pool `reports`, but this request runs on pool `default`")
+            refused(resolve(
+                None,
+                Some("users.touch"),
+                false,
+                "default",
+                m,
+                true
+            ))
+            .contains("declared for pool `reports`, but this request runs on pool `default`")
         );
         // A write claimed readonly would make an unknown fate look retryable.
         assert!(
-            refused(resolve(None, Some("users.touch"), true, "reports", m))
+            refused(resolve(None, Some("users.touch"), true, "reports", m, true))
                 .contains("declared readonly=false")
         );
         assert!(
-            refused(resolve(None, Some("users.find"), false, "default", m))
+            refused(resolve(None, Some("users.find"), false, "default", m, true))
                 .contains("declared readonly=true")
         );
         assert!(
-            refused(resolve(None, Some("nope"), false, "default", m))
+            refused(resolve(None, Some("nope"), false, "default", m, true))
                 .contains("unknown query_id `nope`")
         );
         assert!(
-            refused(resolve(None, Some("users.find"), true, "default", None))
-                .contains("has none loaded")
+            refused(resolve(
+                None,
+                Some("users.find"),
+                true,
+                "default",
+                None,
+                true
+            ))
+            .contains("has none loaded")
         );
     }
 
@@ -305,9 +340,25 @@ mod tests {
     fn a_malformed_query_id_is_not_echoed() {
         let m = LoadedManifest::from_manifest(manifest(), &pools(&["default", "reports"])).unwrap();
         let junk = "x'; DROP TABLE users; --\u{7}";
-        match resolve(None, Some(junk), false, "default", Some(&m)) {
+        match resolve(None, Some(junk), false, "default", Some(&m), true) {
             Err(ResolveError::Refused(msg)) => assert!(!msg.contains("DROP"), "{msg}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_session_that_did_not_agree_on_the_manifest_cannot_run_a_query_id() {
+        // F8: `idempotent` never travels per request, so only the HELLO hash proves the client read
+        // the engine's declaration of it.
+        let m = LoadedManifest::from_manifest(manifest(), &pools(&["default", "reports"])).unwrap();
+        match resolve(None, Some("users.find"), true, "default", Some(&m), false) {
+            Err(ResolveError::Refused(msg)) => assert!(msg.contains("manifest_hash"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        // Inline SQL is unaffected.
+        assert_eq!(
+            resolve(Some("SELECT 2"), None, false, "default", Some(&m), false),
+            Ok("SELECT 2")
+        );
     }
 }
