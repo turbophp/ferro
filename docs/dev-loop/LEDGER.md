@@ -189,7 +189,8 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 | # | Item | State | Notes |
 |---|------|-------|-------|
 | D1a | Multiplexed session + `Future`/`Ferro\await()` + async `Connection` methods (§10.1) | DONE — SPEC §22.2 (cj) | Fan-out ≈ max(query) under plain FPM (measured live with a sequential control). Limits recorded: in-tx statements settle at once, async does not update `lastInsertId()`, an open stream stays exclusive. |
-| D1b | Fiber suspension: `Ferro\Loop` + Revolt adapter, `FIBERS` feature bit, §16 fan-out bench | OPEN | An `await` inside a Fiber suspends instead of blocking. |
+| D1b | Fiber suspension: `Ferro\Loop` + the `FIBERS` feature bit | DONE — SPEC §22.2 (ck) | An `await` inside a Loop-run Fiber suspends; measured live on one session and across two. |
+| D1c | Revolt/AMPHP adapter + §16 fan-out bench on the D17 runner + per-request client deadlines | OPEN | Revolt is not installed in the container; fetch it with `--prefer-source` as a dev dependency. **Deadlines:** the socket read timeout (5 s default in `Ferro::connect`) is also every request's deadline and poisons the whole session when a single query runs long. Replace it with a per-request deadline that CANCELs only that request, and keep the socket timeout as a liveness bound. Ferro HTTP needs this first (F0 review F2). |
 | D2 | `ferro check`/`gen` + `idempotent` manifest + manifest handshake (§11) | OPEN | The only licensed auto-retry lives here. |
 | D3 | memfd large-payload path behind `MEMFD_RX` (§5.1) | OPEN | |
 | D4 | COPY API | OPEN | |

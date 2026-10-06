@@ -7,6 +7,7 @@ use Ferro\Client\Error\HandshakeException;
 use Ferro\Client\Error\ProtocolException;
 use Ferro\Client\Error\TransportException;
 use Ferro\Protocol\Codec;
+use Ferro\Protocol\CodecException;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Header;
 use Ferro\Protocol\Hello;
@@ -91,6 +92,12 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
      */
     private bool $streamOpen = false;
     private ?int $streamRequestId = null;
+    /**
+     * The Fiber that opened the stream; null is the main program.
+     *
+     * @var \Fiber<mixed, mixed, mixed, mixed>|null
+     */
+    private ?\Fiber $streamFiber = null;
 
     /**
      * Set by the first transport failure; the session is unusable from then on (M2-C1e-3).
@@ -173,7 +180,9 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             typeRegistryHash: C::TYPE_REGISTRY_HASH,
             manifestHash: null,
             pid: getmypid() ?: 0,
-            features: 0,
+            // Informational: this client can multiplex requests over the session (M3-D1). The engine
+            // has always served requests concurrently and does not read this bit.
+            features: C::FEATURE_CLIENT_FIBERS,
         );
         $payload = $hello->encode($this->encodePacker);
         $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_HELLO, $payload, 0, true);
@@ -302,6 +311,56 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         }
     }
 
+    /**
+     * Whether awaiting `$requestId` now would NOT need to read the wire (M3-D1b): its next frame has
+     * arrived, or the session has failed so awaiting it fails at once. A scheduler resumes a Fiber
+     * waiting on this id only once it is ready.
+     */
+    public function isReady(int $requestId): bool
+    {
+        return ($this->inbox[$requestId] ?? []) !== []
+            || !isset($this->inFlight[$requestId])
+            || $this->poisoned !== null;
+    }
+
+    /**
+     * The stream a scheduler can select on, or null when the transport cannot be selected (a test
+     * double) or the session is closed — the scheduler then reads with {@see pollOnce} directly.
+     *
+     * @return resource|null
+     */
+    public function selectableStream(): mixed
+    {
+        if ($this->poisoned !== null || !$this->transport instanceof SelectableTransportInterface) {
+            return null;
+        }
+        return $this->transport->stream();
+    }
+
+    /** The transport's read timeout in seconds, or null when it is not selectable. */
+    public function readTimeout(): ?float
+    {
+        return $this->transport instanceof SelectableTransportInterface ? $this->transport->readTimeout() : null;
+    }
+
+    /**
+     * Read ONE frame and file it (M3-D1b), for a scheduler that has seen this session's stream
+     * become readable or that cannot select on it. A failure is recorded on the session, never
+     * thrown: each awaiter then meets it through its own {@see awaitTerminal}, with its own fate.
+     */
+    public function pollOnce(): void
+    {
+        if ($this->poisoned !== null || $this->inFlight === []) {
+            return;
+        }
+        try {
+            $this->pump();
+        } catch (TransportException | ProtocolException) {
+            // `pump` has already poisoned the session (or recorded a fatal before EOF): every
+            // pending request is now ready, and fails at its own await.
+        }
+    }
+
     /** Whether `$requestId` was submitted and its terminal has not been consumed yet. */
     public function isPending(int $requestId): bool
     {
@@ -414,6 +473,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
 
         $this->streamOpen = true;
         $this->streamRequestId = $rid;
+        $this->streamFiber = \Fiber::getCurrent();
 
         return ['type' => 'head', 'requestId' => $rid, 'cols' => $this->decodeStreamHead($body)];
     }
@@ -651,6 +711,13 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             $head = $this->transport->readExact(16);
             $header = Header::decode($head);
             $payload = $header->payloadLen > 0 ? $this->transport->readExact($header->payloadLen) : '';
+        } catch (CodecException $e) {
+            // An undecodable header (bad magic, version, oversized length) leaves the stream at an
+            // unknown offset: every later read would be out of step. It is a desync, so the session
+            // is poisoned and the fault is a ProtocolException, which the router's callers handle
+            // (M3-D1b review F4: a raw CodecException escaped Ferro\Loop past every task's catch).
+            $this->poison(new TransportException('undecodable frame: ' . $e->getMessage()));
+            throw new ProtocolException('undecodable frame: ' . $e->getMessage(), 0, $e);
         } catch (TransportException $e) {
             // The request (if any) WAS fully written, so its fate is the caller's to classify; the
             // session is unusable either way, because what is left unread is unknown.
@@ -681,9 +748,30 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         }
     }
 
-    /** @throws ProtocolException if a stream is currently open on this session. */
+    /** Whether the open stream has ended, or the session has failed (either ends a wait for it). */
+    private function streamClosedOrDead(): bool
+    {
+        return !$this->streamOpen || $this->poisoned !== null;
+    }
+
+    /**
+     * @throws ProtocolException if a stream is currently open on this session.
+     *
+     * Under {@see \Ferro\Loop}, a Fiber that is NOT the stream's own waits for it to close
+     * instead (M3-D1b review F5): the stream's Fiber keeps reading it whenever it runs, so the wait
+     * ends. The stream's own Fiber, the main program and Fibers the loop did not start still get
+     * the refusal, because for them waiting would never end.
+     */
     private function assertNoOpenStream(): void
     {
+        if ($this->streamOpen && \Fiber::getCurrent() !== $this->streamFiber) {
+            \Ferro\Loop::waitFor(new Waiter(
+                $this,
+                $this->streamRequestId ?? 0,
+                $this->streamClosedOrDead(...),
+            ));
+            $this->refuseIfDead(true);
+        }
         if ($this->streamOpen) {
             throw new ProtocolException(sprintf(
                 'a stream (request_id=%d) is open on this session; drive it to its terminal or call '
@@ -698,7 +786,11 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     {
         $ep = null;
         if ($isEnd) {
-            $outcome = Outcome::decode($body, $this->decodePacker);
+            try {
+                $outcome = Outcome::decode($body, $this->decodePacker);
+            } catch (CodecException $e) {
+                return new ConnectionLostException('session-fatal terminal with an undecodable body: ' . $e->getMessage());
+            }
             if ($outcome->isError()) { $ep = $outcome->errorPayload(); }
         }
         return new ConnectionLostException(

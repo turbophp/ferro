@@ -542,7 +542,7 @@ final class Connection
         // `session()` (the reconnect loop's CURRENT one). They are the same object today because
         // nothing reconnects while a transaction is open — but "today" is not an invariant, and the
         // failure if they ever diverge is the engine refusing a tx_id it does not own.
-        $session = $this->tx?->session() ?? $this->requestSession(OpKind::Read, true);
+        $session = $this->ownTx()?->session() ?? $this->requestSession(OpKind::Read, true);
         if (!$session instanceof StreamingSessionInterface) {
             throw new ProtocolException(
                 'stream() requires a session implementing StreamingSessionInterface (the concrete Session)',
@@ -554,7 +554,7 @@ final class Connection
             $params,
             true,
             ExecCodec::FETCH_STREAM,
-            $this->tx?->txId(),
+            $this->ownTx()?->txId(),
         );
         // A streamed read reports no generated key, and — like every other statement — it CLEARS the
         // previous one rather than letting it linger (the `lastInsertId()` contract is "the last
@@ -647,7 +647,7 @@ final class Connection
      */
     public function streamRaw(string $sql, array $params = [], bool $readonly = false): RawStream
     {
-        $session = $this->tx?->session() ?? $this->requestSession($readonly ? OpKind::Read : OpKind::Write, $readonly);
+        $session = $this->ownTx()?->session() ?? $this->requestSession($readonly ? OpKind::Read : OpKind::Write, $readonly);
         if (!$session instanceof StreamingSessionInterface) {
             throw new ProtocolException(
                 'streamRaw() requires a session implementing StreamingSessionInterface (the concrete Session)',
@@ -659,7 +659,7 @@ final class Connection
             $params,
             $readonly,
             ExecCodec::FETCH_STREAM,
-            $this->tx?->txId(),
+            $this->ownTx()?->txId(),
         );
         // CLEAR on the way in — the "never a stale key" half of the `lastInsertId()` contract, and
         // the honest answer while the statement is in flight. It is REPOPULATED when the terminal
@@ -873,6 +873,13 @@ final class Connection
     }
 
     /**
+     * The Fiber that called {@see begin} for the open transaction; null is the main program.
+     *
+     * @var \Fiber<mixed, mixed, mixed, mixed>|null
+     */
+    private ?\Fiber $txFiber = null;
+
+    /**
      * Open a transaction IMPERATIVELY and leave it open until {@see commit} or {@see rollBack}.
      *
      * This is the shape a Doctrine DBAL driver needs: DBAL's `Connection::beginTransaction()`,
@@ -907,7 +914,7 @@ final class Connection
      */
     public function begin(bool $readonly = false, ?Isolation $isolation = null): void
     {
-        if ($this->tx !== null) {
+        if ($this->ownTx() !== null) {
             throw new InvalidTransactionStateException(
                 'a transaction is already open on this connection; Ferro does not nest transactions '
                     . '(use SAVEPOINT SQL, which passes through inside an open transaction)',
@@ -958,6 +965,7 @@ final class Connection
             $this->decodeTxId($outcome),
             $this->encodePacker,
         );
+        $this->txFiber = \Fiber::getCurrent();
     }
 
     /**
@@ -974,6 +982,7 @@ final class Connection
     {
         $tx = $this->requireTx('commit');
         $this->tx = null;
+        $this->txFiber = null;
         try {
             $tx->commit();
         } catch (ConnectionLostException | TransportException $e) {
@@ -1037,8 +1046,9 @@ final class Connection
      */
     public function rollBack(): void
     {
-        $tx = $this->requireTx('rollBack');
+        $tx = $this->requireTx('rollBack', allowAbandoned: true);
         $this->tx = null;
+        $this->txFiber = null;
         try {
             $tx->rollback();
         } catch (ConnectionLostException | TransportException) {
@@ -1063,11 +1073,43 @@ final class Connection
      * error the caller was already carrying — the exact failure {@see rollBack}'s swallowing arm
      * exists to prevent.
      */
-    private function requireTx(string $method): TxHandle
+    private function requireTx(string $method, bool $allowAbandoned = false): TxHandle
     {
-        return $this->tx ?? throw new InvalidTransactionStateException(
-            $method . '() with no open transaction (call begin() first)',
-        );
+        if ($this->tx === null) {
+            throw new InvalidTransactionStateException($method . '() with no open transaction (call begin() first)');
+        }
+        // An owner Fiber that has already ended can never finish its own transaction, so a rollback
+        // from anywhere is the only way to release it. Nothing else may continue it.
+        if ($allowAbandoned && $this->txFiber !== null && $this->txFiber->isTerminated()) {
+            return $this->tx;
+        }
+        return $this->ownTx() ?? throw new InvalidTransactionStateException($method . '() with no open transaction');
+    }
+
+    /**
+     * The open imperative transaction, if this Fiber owns it (M3-D1b review F1).
+     *
+     * The imperative transaction lives on the Connection, but under {@see \Ferro\Loop} several
+     * Fibers share a Connection. Without this check, a second Fiber's statement ran INSIDE the first
+     * Fiber's transaction and reported success, and the first Fiber's rollback then undid it
+     * (measured live). So the transaction belongs to the Fiber that called {@see begin} (the main
+     * program counts as one), and any other Fiber's statement, `begin`, `commit` or `rollBack` is
+     * refused rather than routed. The closure form {@see transaction} is unaffected: its statements
+     * go through its own {@see TxHandle}.
+     */
+    private function ownTx(): ?TxHandle
+    {
+        if ($this->tx === null) {
+            return null;
+        }
+        if (\Fiber::getCurrent() !== $this->txFiber) {
+            throw new InvalidTransactionStateException(
+                'this Connection\'s open transaction belongs to another Fiber; a transaction belongs to '
+                    . 'the Fiber that began it (use a Connection per concurrent transaction, or the '
+                    . 'closure form transaction())',
+            );
+        }
+        return $this->tx;
     }
 
     // ---- transaction ----------------------------------------------------------------------------
@@ -1096,7 +1138,7 @@ final class Connection
         // still points at the first — and, worse, its §19.1 re-run loop could reconnect underneath
         // the open imperative tx and silently void its `tx_id`. Everything below this guard is
         // unchanged.
-        if ($this->tx !== null) {
+        if ($this->ownTx() !== null) {
             throw new InvalidTransactionStateException(
                 'transaction() cannot be called while an imperative transaction is open '
                     . '(commit() or rollBack() first); Ferro does not nest transactions',
@@ -1253,10 +1295,11 @@ final class Connection
         // a statement that errored, was cancelled, or whose fate is Indeterminate.
         $this->lastInsertId = null;
 
-        if ($this->tx === null) {
+        $tx = $this->ownTx();
+        if ($tx === null) {
             return $this->dispatchAutocommit($sql, $params, $readonly, $fetch);
         }
-        $res = $this->tx->runForConnection($sql, $params, $readonly, $fetch);
+        $res = $tx->runForConnection($sql, $params, $readonly, $fetch);
         // Propagate the generated key to the connection level (M1-S8a Task 9): a driver's
         // `lastInsertId()` is read off the Connection, and nearly every real INSERT happens inside a
         // transaction. The closure form deliberately does NOT propagate — see {@see lastInsertId}.
@@ -1296,7 +1339,12 @@ final class Connection
      */
     private function dispatchAsync(string $sql, array $params, bool $readonly, int $fetch, \Closure $shape): \Ferro\Future
     {
-        if ($this->tx !== null) {
+        try {
+            $inTx = $this->ownTx() !== null;
+        } catch (InvalidTransactionStateException $e) {
+            return \Ferro\Future::settleNow(static fn () => throw $e);
+        }
+        if ($inTx) {
             return \Ferro\Future::settleNow(fn () => $shape($this->preservingLastInsertId(
                 fn () => $this->dispatch($sql, $params, $readonly, $fetch),
             )));
@@ -1360,7 +1408,10 @@ final class Connection
                 return $shape($this->dispatchAutocommit($sql, $params, $readonly, $fetch, 1));
             }
             throw $ex;
-        }), static fn () => $session instanceof Session ? $session->discard($rid) : null);
+        }),
+            static fn () => $session instanceof Session ? $session->discard($rid) : null,
+            $session instanceof Session ? new Waiter($session, $rid) : null,
+        );
     }
 
     /**
@@ -1471,7 +1522,7 @@ final class Connection
             return $session->openStream(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
         } catch (ConnectionLostException | TransportException $e) {
             throw $this->fate->classifyLoss(
-                $this->tx !== null ? OpKind::TxStatement : ($readonly ? OpKind::Read : OpKind::Write),
+                $this->ownTx() !== null ? OpKind::TxStatement : ($readonly ? OpKind::Read : OpKind::Write),
                 $readonly,
                 'stream open lost: ' . $e->getMessage(),
                 $e instanceof ConnectionLostException ? $e->errorPayload() : null,
