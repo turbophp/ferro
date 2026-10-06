@@ -24,6 +24,8 @@ final class MySqlConnectionLiveTest extends MySqlLiveTestCase
                 $this->conn->statement("drop table if exists {$t}");
             }
         }
+        // Released before the parent stops ferrod, so its idle session does not hold the drain.
+        $this->conn = null;
         parent::tearDown();
     }
 

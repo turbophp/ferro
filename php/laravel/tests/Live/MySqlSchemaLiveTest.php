@@ -24,6 +24,8 @@ final class MySqlSchemaLiveTest extends MySqlLiveTestCase
         if ($this->c !== null) {
             $this->c->getSchemaBuilder()->dropAllTables();
         }
+        // Released before the parent stops ferrod, so its idle session does not hold the drain.
+        $this->c = null;
         parent::tearDown();
     }
 
