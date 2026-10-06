@@ -168,7 +168,8 @@ OVERSIZE_HEAD       = "oversize_head"
 INFORMATIONAL_101   = "informational_101"
 TIMEOUT             = "timeout"
 CANCELLED           = "cancelled"
-# HTTP/2 (an effectively-idempotent request only, in v1)
+# HTTP/2: RESERVED. These are post-v1 with slice F5b (SPEC §22.2 (de)), and no v1 path produces them.
+# Post-v1 they apply to an effectively-idempotent request only.
 H2_REFUSED_STREAM   = "h2_refused_stream"
 H2_GOAWAY_ABOVE_LAST = "h2_goaway_above_last"
 H2_STREAM_ERROR     = "h2_stream_error"

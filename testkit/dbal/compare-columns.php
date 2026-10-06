@@ -17,8 +17,8 @@ declare(strict_types=1);
  *
  *   php compare-columns.php <ferro.xml> <control.xml> --triage <file> --column <key> [--upstream <dir>]
  *     THE D18 GATE (E9). SPEC D18 calls a suite column green when it has PARITY with a stock-driver
- *     control (read with §21's open item on D18's clauses, which this gate's interim reading
- *     follows): every DIFFERENCE between the columns must be explained by a checked-in triage entry
+ *     control (clause 3 of D18's first text, the reading the owner settled on 2026-10-06 and D18
+ *     now states alone, §22.2 (de)): every DIFFERENCE between the columns must be explained by a checked-in triage entry
  *     whose expectation matches what Ferro actually did. A difference is any of:
  *       - Ferro FAILS a test the control passes, skips or did not collect;
  *       - both FAIL, with a different exception type, or — for PHPUnit's own assertion types, which

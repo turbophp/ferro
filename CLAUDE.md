@@ -24,6 +24,8 @@ Now **M2 / Phase C (Eloquent, SQLite backend, observability, DBAL ^3.8 bridge)**
 
 **M3 is complete (2026-10-06)** — every Phase D row is merged; see `docs/dev-loop/LEDGER.md` (Phase D) for the record.
 
+**Owner decisions of 2026-10-06 (SPEC §21, §22.2 (de)):** D22 ratified with two amendments (default store table `ferro_jobs`; store kinds with opaque-bytes tokens), job ids opaque bytes by D24, so G1 may start; O-F5c settled as D23 (F5c unblocked); D18 clarified to its clause 3; HTTP/2 (F5b, F1b's HTTP/2 premises) and the MSSQL backend (E1) deferred past v1, with `HTTP=auto` refused in v1.
+
 ## What Ferro is
 
 A **per-host database access engine for PHP**. One Rust daemon (`ferrod`, tokio) owns all upstream DB connections, pools them in transaction mode, and multiplexes many PHP-FPM workers over a local Unix socket — while remaining a **drop-in** replacement for Doctrine DBAL and Laravel Eloquent (config-only adoption).
@@ -101,7 +103,7 @@ Load-bearing ideas that shape almost every change (all enshrined in the charter'
 3. **The engine never transparently retries user statements** (SPEC §3, §19.3). It classifies and reports; retry is client policy. This is load-bearing for the `Indeterminate` guarantee — do not "helpfully" add engine retries.
 4. **Every in-flight request terminates in exactly one END frame.** All session-layer code is written against that invariant.
 5. **Correctness over throughput until the M0 gate.** Optimize only against recorded bench numbers (SPEC §16.1), never speculatively.
-6. **Scope discipline:** no ORM semantics in Rust, no SQL rewriting, no result caching, no read/write inference (SPEC §3). The drop-in tiers change execution, never SQL generation — Grammar/Processor and DBAL platforms stay stock.
+6. **Scope discipline:** no ORM semantics in Rust, no SQL rewriting, no result caching, no read/write inference (SPEC §3). The drop-in tiers change execution, never SQL generation — Grammar/Processor and DBAL platforms stay stock. Engine-authored statements of the §24 queue verbs are not SQL rewriting, and the `ferro` queue driver is not a drop-in database tier under the rule's 'change execution, never SQL generation': it is a new driver name whose transport replaces `DatabaseQueue`'s builder-generated SQL by design, while the drop-in database tiers keep stock SQL generation.
 7. **PHP client stays dependency-free at runtime.** Optional extensions (`ext-msgpack`, `ext-sockets`) are runtime-detected, never required.
 
 ## Build order
