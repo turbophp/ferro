@@ -133,3 +133,23 @@ reference re-run scope.
 release ferrod, required manifest fields, and the provisional/reference tags — a bad shape is
 never written). The `fanout` field is an explicit `{placeholder:true, blocked_on:"M3-fibers"}`
 until Fibers multiplexing lands.
+
+## The §16 fan-out result (M3-D1e) — `results/*-gh-ubuntu-latest-fanout.json`
+
+`cargo run --release -p ferro-bench -- --scenario fanout` (or the `bench` workflow, which runs it on
+a GitHub-hosted `ubuntu-latest` runner — SPEC §21 D17's reference environment — twice, on two
+runners). Each iteration times one `SELECT pg_backend_pid() FROM pg_sleep(0.010)`, the same
+statement fanned out 10 ways under `Ferro\Loop::run`, and 10 awaited with `Ferro\await()`; the
+target is `fanout − single ≤ 2 ms`, judged at p50 and p99 on the UPPER bound of a 95% bootstrap
+interval, against one single call (the conservative reading of "max(single query)"). Every fan-out
+must be answered by 10 distinct backend sessions or the record is refused. SPEC §22.2 (cs).
+
+| run (runner CPU) | mode | p50 over single [95% CI] | p99 over single [95% CI] | verdict |
+|---|---|---|---|---|
+| 1 (AMD EPYC 9V45) | fibers | +0.82 ms [+0.81, +0.83] | +1.30 ms [+0.89, +1.65] | MET |
+| 1 | await | +0.57 ms [+0.57, +0.58] | +0.77 ms [+0.37, +1.16] | MET |
+| 2 (Intel Xeon Platinum 8573C) | fibers | +0.67 ms [+0.65, +0.68] | +0.76 ms [+0.62, +0.93] | MET |
+| 2 | await | +0.47 ms [+0.45, +0.48] | +0.53 ms [+0.41, +0.65] | MET |
+
+D17's caveat applies: a shared runner's p99 is an upper bound on the target's p99. Each record
+keeps its raw samples.
