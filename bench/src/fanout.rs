@@ -642,6 +642,34 @@ mod tests {
         assert_eq!(r.note, D17_NOTE);
     }
 
+    /// Every committed fan-out record must still deserialize under the current shape and pass
+    /// `validate()`; a reference record must also come from the D17 runner.
+    #[test]
+    fn every_committed_fanout_record_validates() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("results");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.ends_with("-fanout.json") {
+                continue;
+            }
+            let r: FanoutResult =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            r.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                r.reference,
+                name.contains(&format!("-{REFERENCE_ENV}-")),
+                "{name}"
+            );
+            seen += 1;
+        }
+        assert!(
+            seen >= 2,
+            "D17 needs at least two recorded runs, found {seen}"
+        );
+    }
+
     #[test]
     fn the_reference_runner_is_read_from_the_runners_own_variables() {
         assert!(is_reference_runner(Some("true"), Some("github-hosted")));
