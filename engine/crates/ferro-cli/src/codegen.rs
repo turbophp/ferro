@@ -464,7 +464,14 @@ fn is_php_identifier(s: &str) -> bool {
 
 /// Words PHP refuses as a CLASS name (PHP 8.4, each verified with `php -l`; `enum`, `from`,
 /// `resource`, `numeric` and `__COMPILER_HALT_OFFSET__` are accepted and are not listed). Compared
-/// lowercase: keywords are case-insensitive.
+/// lowercase: keywords are case-insensitive. The list is the UNION over the PHP versions the client
+/// supports, because generated code must load on all of them: a word reserved only by a newer PHP
+/// (see [`RESERVED_SINCE`]) is refused even though an older PHP would accept it.
+/// The entries of [`RESERVED_CLASS`] that an older supported PHP still accepts, with the
+/// `(major, minor)` that reserved them. Only the lint comparison test reads it.
+#[cfg(test)]
+const RESERVED_SINCE: &[(&str, (u32, u32))] = &[("__property__", (8, 4))];
+
 const RESERVED_CLASS: &[&str] = &[
     "__class__",
     "__dir__",
@@ -1105,9 +1112,19 @@ mod tests {
         if php().is_none() {
             return;
         }
+        let v = std::process::Command::new("php")
+            .args(["-r", "echo PHP_MAJOR_VERSION, ' ', PHP_MINOR_VERSION;"])
+            .output()
+            .unwrap();
+        let v = String::from_utf8(v.stdout).unwrap();
+        let mut it = v.split(' ').map(|n| n.trim().parse::<u32>().unwrap());
+        let running = (it.next().unwrap(), it.next().unwrap());
         let dir = std::env::temp_dir().join(format!("ferro-gen-lint-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut cases: Vec<String> = RESERVED_CLASS.iter().map(|w| format!("App\\{w}")).collect();
+        // Named independently of RESERVED_CLASS, so dropping one from that list cannot also drop
+        // its case here.
+        cases.extend(RESERVED_SINCE.iter().map(|(w, _)| format!("App\\{w}")));
         cases.extend(
             [
                 "App\\Enum",
@@ -1134,11 +1151,25 @@ mod tests {
                 .arg(&f)
                 .output()
                 .unwrap();
-            assert_eq!(
-                lint.status.success(),
-                check_fqcn(fq).is_ok(),
-                "`{fq}`: php -l and check_fqcn disagree"
-            );
+            // A word reserved only by a NEWER PHP than the one running is accepted by `php -l`
+            // here and still refused by the check (the union rule); everything else must agree.
+            let newer = RESERVED_SINCE.iter().any(|(w, since)| {
+                fq.to_ascii_lowercase().ends_with(&format!("\\{w}")) && *since > running
+            });
+            let php_accepts = lint.status.success();
+            if newer {
+                assert!(php_accepts, "`{fq}`: expected PHP {running:?} to accept it");
+                assert!(
+                    check_fqcn(fq).is_err(),
+                    "`{fq}`: must stay refused (union rule)"
+                );
+            } else {
+                assert_eq!(
+                    php_accepts,
+                    check_fqcn(fq).is_ok(),
+                    "`{fq}`: php -l and check_fqcn disagree (PHP {running:?})"
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
