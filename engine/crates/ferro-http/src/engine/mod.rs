@@ -41,8 +41,14 @@
 //! idempotent request is Retryable. [`HttpEngine::in_flight_watch`] lets `serve` outlast the cap
 //! (chassis change 2).
 //!
-//! **Slice F6:** concurrency limits, the queue, breaker and rate limits. **F5:** TLS (`https`
-//! upstreams are `Unsupported` until then). **F7:** metrics, spans and the slow log.
+//! **TLS (§23.8.8, slice M6-F5a, [`tls`]).** An `https` dial is TCP to the checked address, then a
+//! [`track::CipherTap`] (the ciphertext half of the write tracker), then the `rustls` handshake —
+//! inside the same connect bound — then the plaintext [`track::Tracker`] and `hyper`. A handshake
+//! failure is a dial failure: "before dispatch", never `Indeterminate`. An upstream with
+//! `CLIENT_CERT_FILE` is `Unsupported` until slice F5c (mTLS).
+//!
+//! **Slice F6:** concurrency limits, the queue, breaker and rate limits. **F7:** metrics, spans and
+//! the slow log.
 
 pub mod body;
 pub mod budget;
@@ -50,6 +56,7 @@ pub mod decode;
 pub mod dial;
 pub mod head;
 pub mod pool;
+pub mod tls;
 pub mod track;
 
 use std::future::Future;
@@ -76,11 +83,14 @@ use crate::validate::{self, PolicyCause, Validated};
 pub use dial::{BoxIo, Connect, Io, Resolve, StaticResolver, SystemResolver, TcpConnect};
 pub use head::MAX_HEAD_BYTES;
 
+pub use tls::{OsRoots, TlsCause, TlsSetupError};
+
 use body::OneChunk;
 use budget::Budgets;
 use dial::{DialFailure, DnsCache};
 use pool::{HttpConn, LiveConn, PoolKey, Pools, ReusePolicy};
-use track::Tracker;
+use tls::TlsContexts;
+use track::{CipherTap, Tracker};
 
 /// The largest `BODY` chunk (§23.5.3). Not a registry constant: no receiver enforces it (§22.2 (cy)).
 pub const MAX_BODY_CHUNK: usize = 256 * 1024;
@@ -229,6 +239,7 @@ pub struct HttpEngine {
     budgets: Budgets,
     in_flight: InFlight,
     live: Arc<AtomicUsize>,
+    tls: TlsContexts,
 }
 
 impl std::fmt::Debug for HttpEngine {
@@ -259,13 +270,37 @@ impl HttpEngine {
         Self::with_seams(config, resolver, Arc::new(TcpConnect))
     }
 
-    /// The engine over an injected resolver AND connector (fault injection below `hyper`).
+    /// The engine over an injected resolver AND connector (fault injection below `hyper`). TLS
+    /// material comes from the real files and the OS store (production's).
     pub fn with_seams(
         config: Arc<HttpConfig>,
         resolver: Arc<dyn Resolve>,
         connector: Arc<dyn Connect>,
     ) -> Self {
+        Self::with_tls_seams(
+            config,
+            resolver,
+            connector,
+            &OsRoots::Native,
+            &tls::read_capped,
+        )
+    }
+
+    /// The engine over every seam, the OS root store and the TLS file reader included. TLS
+    /// contexts are built HERE, once, at start (§23.8.8: no reload); an upstream whose TLS material
+    /// cannot be loaded is disabled and logged at `error` (names and keys only, never a value).
+    pub fn with_tls_seams(
+        config: Arc<HttpConfig>,
+        resolver: Arc<dyn Resolve>,
+        connector: Arc<dyn Connect>,
+        os_roots: &OsRoots,
+        read_file: &dyn Fn(&std::path::Path) -> std::io::Result<Vec<u8>>,
+    ) -> Self {
         let budgets = Budgets::new(&config);
+        let tls = TlsContexts::build(&config, os_roots, read_file);
+        for e in tls.errors() {
+            tracing::error!(error = %e, "http: TLS configuration refused");
+        }
         HttpEngine {
             config,
             resolver,
@@ -275,7 +310,28 @@ impl HttpEngine {
             budgets,
             in_flight: InFlight(watch::Sender::new(0)),
             live: Arc::new(AtomicUsize::new(0)),
+            tls,
         }
+    }
+
+    /// The upstreams disabled by their TLS material (§23.8.8), as logged at start.
+    pub fn tls_errors(&self) -> Vec<TlsSetupError> {
+        self.tls.errors().into_iter().cloned().collect()
+    }
+
+    /// `(full, resumed)` TLS handshakes `upstream` has completed (§23.8.8, P5) — diagnostics and
+    /// tests; the `ferro_http_tls_handshakes_total{resumed}` metric is F7's. `None`: not an `https`
+    /// upstream this engine serves.
+    pub fn tls_handshakes(&self, upstream: &str) -> Option<(u64, u64)> {
+        match self.tls.get(upstream) {
+            Some(Ok(t)) => Some((t.counts.full(), t.counts.resumed())),
+            _ => None,
+        }
+    }
+
+    /// Idle connections in `upstream`'s pool for peer uid `uid` (`PARTITION=uid`).
+    pub fn idle_connections_for(&self, upstream: &str, uid: u32) -> usize {
+        self.pools.idle_count(&(upstream.to_string(), Some(uid)))
     }
 
     pub fn config(&self) -> &HttpConfig {
@@ -398,6 +454,18 @@ impl HttpEngine {
             .iter()
             .map(|h| (h.name.clone(), h.value.clone()))
             .collect();
+        // §23.8.8: an upstream whose TLS material could not be loaded at start is DISABLED, and a
+        // disabled upstream is refused exactly as an unknown one (§23.3.1, D15): the same cause and
+        // sentence, before any other check — validation would otherwise answer a later rule
+        // (`forbidden_target` …) and tell the peer the upstream exists.
+        if matches!(self.tls.get(&req.upstream), Some(Err(_))) {
+            let refusal = validate::Refusal {
+                rule: validate::Rule::UpstreamUnavailable,
+                offset: None,
+                header: None,
+            };
+            return policy(refusal.cause(), Some(refusal.to_string()));
+        }
         let vreq = validate::Request {
             upstream: &req.upstream,
             method: &req.method,
@@ -417,17 +485,19 @@ impl HttpEngine {
         };
         let up = v.upstream;
         let idem = v.idempotent;
-        if up.origin.scheme() == Scheme::Https {
-            // TLS origination is slice F5. Until it lands an `https` upstream is NOT SERVED by this
-            // build: `Unsupported`, which on service HTTP carries no cause token (§22.2 (cy)) — not a
-            // Retryable `tls_handshake` a client policy would loop on.
+        if up.origin.scheme() == Scheme::Https && up.tls.client_cert_file.is_some() {
+            // mTLS is slice F5c (`tls`'s module docs: under TLS 1.3 a refusal of the client
+            // certificate arrives after the handshake, so its fate is an open decision). Until it
+            // lands such an upstream is NOT SERVED: `Unsupported`, which on service HTTP carries no
+            // cause token (§22.2 (cy)) — and never a connection that silently omits the certificate
+            // the operator configured.
             return Terminal::Error(ferro_proto::messages::ErrorPayload {
                 code: ferro_proto::consts::errc::UNSUPPORTED,
                 branch: ferro_proto::consts::errc::UNSUPPORTED_BRANCH,
                 sqlstate: None,
                 errno: None,
-                message: "https upstreams are not served by this build yet (TLS origination is \
-                          slice M6-F5)"
+                message: "upstreams with a client certificate (mTLS) are not served by this build \
+                          yet (slice M6-F5c)"
                     .into(),
                 detail: None,
                 retry_after_ms: None,
@@ -499,7 +569,7 @@ impl HttpEngine {
 
         // ---- before dispatch: acquire a connection ------------------------------------------------
         let acquire = self.acquire(&key, up, idem, bounds.connect);
-        let (mut conn, reused, connect_us) = tokio::select! {
+        let (mut conn, reused, connect_us, tls_us) = tokio::select! {
             biased;
             () = stop.token.cancelled() => {
                 return classify(Situation::BeforeDispatch(before_dispatch_stop(stop)), idem)
@@ -533,8 +603,8 @@ impl HttpEngine {
             return classify(Situation::BeforeDispatch(event), idem);
         }
         let dispatched = Instant::now();
-        let queue_us =
-            micros(dispatched.saturating_duration_since(admitted)).saturating_sub(connect_us);
+        let queue_us = micros(dispatched.saturating_duration_since(admitted))
+            .saturating_sub(connect_us + tls_us);
         conn.track.arm();
         let send = conn.sender.try_send_request(hreq);
         let outcome = tokio::select! {
@@ -752,7 +822,7 @@ impl HttpEngine {
         let stats = HttpStats {
             queue_us,
             connect_us,
-            tls_us: 0,
+            tls_us,
             ttfb_us,
             total_us: micros(started.elapsed()),
             bytes_sent: conn.track.written_armed(),
@@ -778,23 +848,25 @@ impl HttpEngine {
         Terminal::Done(HttpDone { trailers, stats })
     }
 
-    /// Reuse (§23.8.2) or dial (§23.8.5). Returns the connection, whether it was reused, and its
-    /// `connect_us`.
+    /// Reuse (§23.8.2) or dial (§23.8.5), then — on `https` — the TLS handshake (§23.8.8), all
+    /// within the one connect bound (§23.8.4: DNS + TCP + TLS). Returns the connection, whether it
+    /// was reused, its `connect_us` (DNS + TCP) and its `tls_us` (the handshake).
     async fn acquire(
         &self,
         key: &PoolKey,
         up: &Upstream,
         idempotent: bool,
         connect: Duration,
-    ) -> Result<(HttpConn, bool, u64), DialFailure> {
+    ) -> Result<(HttpConn, bool, u64, u64), DialFailure> {
         let policy = ReusePolicy {
             max_lifetime: ms(up.limits.max_lifetime_ms),
             idempotent,
             unsafe_reuse_max_idle: ms(up.limits.h1_unsafe_reuse_max_idle_ms),
         };
         if let Some(c) = self.pools.checkout(key, policy) {
-            return Ok((c, true, 0));
+            return Ok((c, true, 0, 0));
         }
+        let started = tokio::time::Instant::now();
         let d = dial::dial(
             up,
             self.resolver.as_ref(),
@@ -804,26 +876,34 @@ impl HttpEngine {
             connect,
         )
         .await?;
-        let (tracked, track) = Tracker::new(d.stream);
-        let mut builder = http1::Builder::new();
-        builder
-            .max_buf_size(head::H1_MAX_BUF_SIZE)
-            .max_headers(head::H1_MAX_HEADERS)
-            .title_case_headers(true)
-            // M6-F4b: the `Queue` write strategy, PINNED rather than inherited from the transport's
-            // `is_write_vectored`. Under it `hyper` keeps the request body's own `Bytes` until its
-            // last byte is written, which is what the body budget's release-when-written rule
-            // observes (`budget`'s module docs); `Flatten` would copy the body and drop ours at once.
-            .writev(true);
-        let (sender, conn) = match builder.handshake(TokioIo::new(tracked)).await {
-            Ok(x) => x,
-            // No I/O happens in an h1 handshake (P1); a failure here is not a dial outcome the
-            // table names, so it is the closest one: the connection is unusable.
-            Err(_) => return Err(DialFailure::ConnectUnreachable),
+        let (sender, task, track, tls_us) = if up.origin.scheme() == Scheme::Https {
+            let ctx = match self.tls.get(&up.name) {
+                Some(Ok(ctx)) => ctx.clone(),
+                // `run` refuses an upstream whose TLS material failed before it gets here, and every
+                // enabled `https` upstream has a context; an absent one is an engine invariant
+                // violation, made the safe dial failure (nothing has been sent).
+                _ => return Err(DialFailure::Tls(TlsCause::Handshake)),
+            };
+            // The ciphertext half sits on the socket, BELOW TLS; it is unarmed during the handshake,
+            // whose bytes therefore never count as `sent` (§23.7.1).
+            let (tap, track) = CipherTap::new(d.stream);
+            let connector = tokio_rustls::TlsConnector::from(ctx.config_for(key.1));
+            let tls_start = Instant::now();
+            let handshake = connector.connect(ctx.server_name(), tap);
+            let tls = match tokio::time::timeout_at(started + connect, handshake).await {
+                Err(_) => return Err(DialFailure::ConnectTimeout),
+                Ok(Err(e)) => return Err(DialFailure::Tls(tls::classify_handshake_error(&e))),
+                Ok(Ok(s)) => s,
+            };
+            ctx.counts.record(tls.get_ref().1.handshake_kind());
+            let tls_us = micros(tls_start.elapsed());
+            let (sender, task) = h1_handshake(Tracker::over_tls(tls, track.clone())).await?;
+            (sender, task, track, tls_us)
+        } else {
+            let (tracked, track) = Tracker::new(d.stream);
+            let (sender, task) = h1_handshake(tracked).await?;
+            (sender, task, track, 0)
         };
-        let task = tokio::spawn(async move {
-            let _ = conn.await;
-        });
         let now = Instant::now();
         Ok((
             HttpConn {
@@ -838,8 +918,35 @@ impl HttpEngine {
             },
             false,
             micros(d.elapsed),
+            tls_us,
         ))
     }
+}
+
+/// `hyper`'s HTTP/1.1 client over a tracked I/O, with its connection task spawned.
+async fn h1_handshake<T: Io>(
+    io: Tracker<T>,
+) -> Result<(http1::SendRequest<OneChunk>, tokio::task::JoinHandle<()>), DialFailure> {
+    let mut builder = http1::Builder::new();
+    builder
+        .max_buf_size(head::H1_MAX_BUF_SIZE)
+        .max_headers(head::H1_MAX_HEADERS)
+        .title_case_headers(true)
+        // M6-F4b: the `Queue` write strategy, PINNED rather than inherited from the transport's
+        // `is_write_vectored`. Under it `hyper` keeps the request body's own `Bytes` until its
+        // last byte is written, which is what the body budget's release-when-written rule
+        // observes (`budget`'s module docs); `Flatten` would copy the body and drop ours at once.
+        .writev(true);
+    let (sender, conn) = match builder.handshake(TokioIo::new(io)).await {
+        Ok(x) => x,
+        // No I/O happens in an h1 handshake (P1); a failure here is not a dial outcome the
+        // table names, so it is the closest one: the connection is unusable.
+        Err(_) => return Err(DialFailure::ConnectUnreachable),
+    };
+    let task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok((sender, task))
 }
 
 /// Send a raw body chunk as `BODY` frames of at most [`MAX_BODY_CHUNK`].
@@ -945,6 +1052,10 @@ fn dial_situation(f: DialFailure) -> BeforeDispatch {
         DialFailure::ConnectRefused => BeforeDispatch::ConnectRefused,
         DialFailure::ConnectUnreachable => BeforeDispatch::ConnectUnreachable,
         DialFailure::ConnectTimeout => BeforeDispatch::ConnectTimeout,
+        DialFailure::Tls(TlsCause::Handshake) => BeforeDispatch::TlsHandshake,
+        DialFailure::Tls(TlsCause::Verify) => BeforeDispatch::TlsVerify,
+        DialFailure::Tls(TlsCause::Version) => BeforeDispatch::TlsVersion,
+        DialFailure::Tls(TlsCause::Alpn) => BeforeDispatch::TlsAlpn,
     }
 }
 
