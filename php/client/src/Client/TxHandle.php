@@ -197,9 +197,9 @@ final class TxHandle
      * @param list<mixed> $params
      * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
      */
-    public function runForConnection(string $sql, array $params, bool $readonly, int $fetch): array
+    public function runForConnection(string $sql, array $params, bool $readonly, int $fetch, ?string $queryId = null): array
     {
-        return $this->run($sql, $params, $readonly, $fetch);
+        return $this->run($sql, $params, $readonly, $fetch, $queryId);
     }
 
     /**
@@ -209,14 +209,14 @@ final class TxHandle
      * @param list<mixed> $params
      * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
      */
-    private function run(string $sql, array $params, bool $readonly, int $fetch): array
+    private function run(string $sql, array $params, bool $readonly, int $fetch, ?string $queryId = null): array
     {
         // CLEAR FIRST, exactly as `Connection::dispatch` does: {@see lastInsertId} promises the
         // SAME contract as the Connection's, so a statement that fails here must not leave the
         // previous statement's key readable either.
         $this->lastInsertId = null;
 
-        $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, $this->txId);
+        $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, $this->txId, $queryId);
         try {
             $outcome = $this->session->sendRequest(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
         } catch (CodecException $e) {
