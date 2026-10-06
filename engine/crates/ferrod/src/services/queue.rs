@@ -26,8 +26,22 @@
 //!    matrix as a read (never `Indeterminate`). A definitive verdict is cached for the process — one
 //!    process is one `boot_epoch` — except a gate refusal (reused for the version probe's TTL) and an
 //!    absent table (reused for [`ABSENT_RECHECK`]) (SPEC §24.3 amendment);
-//! 8. every verb then answers `Unsupported` ("not served before slice G1b"): the seven PostgreSQL
-//!    verbs, the fence and the clock rules are G1b's (SPEC §24.14).
+//! 8. **the verb itself (M7-G1b), autocommit on PostgreSQL:** ONE checkout — declared read-only for
+//!    SIZE alone — and the verb's statement(s), each built by `ferro_queue::pg` (the closed,
+//!    mutation-tested builder set D22's mitigation names) and run through the guarded, interruptible
+//!    [`run_autocommit_exec`] with what is left of the request's ONE deadline, then decoded by the same
+//!    module into the verb's success terminal or its known-fate refusal (`LeaseLost`). A failure is
+//!    classified by the shared fate matrix with SPEC §24.6's `OpContext`: `readonly` for SIZE only
+//!    (RESERVE writes `attempts` and a lease), `sent` honest per statement, `in_tx: false`. The engine
+//!    never re-sends anything (charter rule 3, §24.2 I4).
+//!
+//! RESERVE serves its queues in the given order and answers from the FIRST queue that yields any job
+//! (one statement per queue tried, on the one checkout), so every job in a reply comes from one queue
+//! and a failure on queue *i* means queues before it reserved nothing — the failure's fate is that one
+//! statement's. Its `LIMIT` is `max_jobs` clamped so the reply fits one frame
+//! ([`checks::reserve_limit`]). **Not in G1b:** the unreserve of §24.8 — a RESERVE whose terminal is
+//! raced by session teardown leaves its lease to expire (a stock-equivalent phantom) until slice G3
+//! builds unreserve.
 //!
 //! Never logged or put in a terminal: a payload, a dedup key, a token or a DSN.
 
@@ -36,16 +50,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ferro_pool::backend::PoolBackend;
+use bytes::Bytes;
+use ferro_pool::backend::{PoolBackend, QueryResult};
 use ferro_pool::error::PoolError;
-use ferro_pool::pool::Pool;
-use ferro_proto::consts::{errc, method_queue};
+use ferro_pool::pool::{Checkout, Pool};
+use ferro_proto::consts::{ack_outcome, errc, method_queue};
 use ferro_proto::messages::{
-    EnqueueRequest, ErrorPayload, FencedRequest, QueueCommon, QueueScopeRequest, ReleaseRequest,
-    ReserveRequest,
+    AckResponse, ClearResponse, EnqueueRequest, EnqueueResponse, ErrorPayload, ExtendResponse,
+    FencedRequest, QueueCommon, QueueScopeRequest, QueueStats, ReleaseRequest, ReleaseResponse,
+    ReserveRequest, ReserveResponse, ReservedJob, SizeResponse,
 };
 use ferro_queue::config::{QueueConfig, StoreConfig, StoreKind};
-use ferro_queue::shape::{self, PgRelation, ShapeError};
+use ferro_queue::pg::{self as pgq, NoMatch};
+use ferro_queue::shape::{self, PgRelation, ShapeError, Statement};
 use ferro_queue::sql::{JobId, Token, Undecodable};
 use ferro_queue::{PoolFamily, checks, version};
 use tokio_util::sync::CancellationToken;
@@ -234,8 +251,8 @@ fn invalid_handle(store: &str, e: Undecodable) -> ErrorPayload {
     }
 }
 
-/// The `sql` kind's decode of a fenced verb's handles (SPEC §24.3), before any statement. G1b's
-/// statement builders consume the decoded values; G1a only proves they decode.
+/// The `sql` kind's decode of a fenced verb's handles (SPEC §24.3), before any statement: once among
+/// the pre-checkout refusals, and again where the verb's statement consumes the decoded values.
 fn decode_handles(
     store: &StoreConfig,
     job_id: &[u8],
@@ -250,8 +267,21 @@ fn decode_handles(
     }
 }
 
-/// Steps 4–6 of the module doc: every refusal made before a checkout.
-fn refuse_before_checkout(req: &QueueRequest, store: &StoreConfig) -> Result<(), ErrorPayload> {
+/// The engine's wall clock, Unix seconds — ONLY for the pre-send `delay_s` overflow check
+/// ([`checks::delay`]). Every rule a verb applies to rows reads the DATABASE's clock (SPEC §24.3).
+fn engine_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Steps 4–6 of the module doc: every refusal made before a checkout. `now` is the engine's wall
+/// clock ([`engine_now`]).
+fn refuse_before_checkout(
+    req: &QueueRequest,
+    store: &StoreConfig,
+    now: i64,
+) -> Result<(), ErrorPayload> {
     let refusal = |r: checks::Refusal| unsupported(format!("queue store {}: {r}", store.name));
     // Permanent, so FIRST for RESERVE (review L7): a tx-scoped RESERVE that also has `wait_ms > 0`
     // must be told the call can never work, not to send `wait_ms = 0`.
@@ -264,13 +294,14 @@ fn refuse_before_checkout(req: &QueueRequest, store: &StoreConfig) -> Result<(),
         ));
     }
     match req {
-        QueueRequest::Enqueue(r) => checks::enqueue(r, store).map_err(refusal)?,
+        QueueRequest::Enqueue(r) => checks::enqueue(r, store, now).map_err(refusal)?,
         QueueRequest::Reserve(r) => checks::reserve(r).map_err(refusal)?,
         QueueRequest::Ack(r) | QueueRequest::Extend(r) => {
             decode_handles(store, &r.job_id, &r.token)?;
         }
         QueueRequest::Release(r) => {
             decode_handles(store, &r.job_id, &r.token)?;
+            checks::release(r, store, now).map_err(refusal)?;
         }
         QueueRequest::Size(r) | QueueRequest::Clear(r) => {
             checks::queue_name(&r.queue).map_err(refusal)?
@@ -329,21 +360,301 @@ pub async fn handle(
         ));
         return;
     };
-    if let Err(ep) = refuse_before_checkout(&req, store) {
+    if let Err(ep) = refuse_before_checkout(&req, store, engine_now()) {
         responder.end_error(ep);
         return;
     }
-    if let Err(ep) =
-        ensure_verified(stores, store, registry, req.common().timeout_ms, &cancel).await
-    {
+    // ONE deadline for the whole request — the first-use verification, the checkout and every
+    // statement — as on EXEC (M3-D1c review F1).
+    let deadline = deadline_of(req.common().timeout_ms);
+    if let Err(ep) = ensure_verified(stores, store, registry, deadline, &cancel).await {
         responder.end_error(ep);
         return;
     }
-    responder.end_error(unsupported(format!(
-        "QUEUE {} is not served before slice G1b (SPEC §24.14); store {} is verified",
-        req.verb(),
-        store.name
-    )));
+    match registry.get(&store.pool) {
+        Some(AnyPool::Pg(pool)) => serve_pg(pool, req, store, deadline, &cancel, responder).await,
+        // Unreachable: verification passed, so the pool is PostgreSQL (`ensure_verified` answers
+        // every other family). Answered rather than asserted.
+        Some(_) | None => responder.end_error(unsupported(format!(
+            "queue store {}: its pool cannot serve QUEUE verbs in this build",
+            store.name
+        ))),
+    }
+}
+
+/// The request's absolute deadline from its `timeout_ms`.
+fn deadline_of(timeout_ms: Option<u32>) -> Option<tokio::time::Instant> {
+    timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(u64::from(ms)))
+}
+
+/// SPEC §24.6's `OpContext` for an autocommit verb: `readonly` for SIZE ONLY — every other verb
+/// writes, RESERVE included (`attempts` and a lease) — and never `in_tx` (tx-scoped verbs are G2's).
+fn verb_context(req: &QueueRequest, sent: bool) -> OpContext {
+    OpContext {
+        readonly: matches!(req, QueueRequest::Size(_)),
+        sent,
+        in_tx: false,
+    }
+}
+
+/// A statement that RAN but whose rows do not have the shape its builder produces (only a table
+/// altered after verification, or a defect, does that). For a write the effect is real but cannot be
+/// reported, so the answer is `Indeterminate` — never a known-fate error that would tell the client
+/// the verb did nothing. For SIZE (a read) it is a plain refusal.
+fn malformed(req: &QueueRequest, store: &StoreConfig) -> ErrorPayload {
+    let message = format!(
+        "queue store {}: the QUEUE {} statement ran but its result did not have the expected shape \
+         (was the table altered after it was verified? ferrod re-verifies at restart)",
+        store.name,
+        req.verb()
+    );
+    if verb_context(req, true).readonly {
+        unsupported(message)
+    } else {
+        ErrorPayload {
+            code: errc::WRITE_UNCONFIRMED,
+            branch: errc::WRITE_UNCONFIRMED_BRANCH,
+            sqlstate: None,
+            errno: None,
+            message: format!("{message}; its effect is unconfirmed"),
+            detail: None,
+            retry_after_ms: None,
+        }
+    }
+}
+
+fn lease_lost(store: &StoreConfig, verb: &str) -> ErrorPayload {
+    ErrorPayload {
+        code: errc::LEASE_LOST,
+        branch: errc::LEASE_LOST_BRANCH,
+        sqlstate: None,
+        errno: None,
+        message: format!(
+            "queue store {}: QUEUE {verb} did nothing: the token names no current reservation \
+             (another holder has the job, or it was reserved again after this lease expired)",
+            store.name
+        ),
+        detail: None,
+        retry_after_ms: None,
+    }
+}
+
+/// One verb statement on `co`: what is left of the deadline (none left → answered UNSENT, never
+/// dispatched with no time), then the guarded, interruptible [`run_autocommit_exec`]. A CANCEL that
+/// arrived before this statement is answered UNSENT too, so a RESERVE serving its second queue does
+/// not send it after the client cancelled. `exec_us` accumulates.
+async fn run_verb_statement<B: PoolBackend>(
+    co: &mut Checkout<B>,
+    stmt: &Statement,
+    deadline: Option<tokio::time::Instant>,
+    cancel: &CancellationToken,
+    ctx: impl Fn(bool) -> OpContext,
+    exec_us: &mut u64,
+) -> Result<QueryResult, ErrorPayload> {
+    if cancel.is_cancelled() {
+        return Err(fate::classify_fate(cancelled_before_dispatch(), ctx(false)));
+    }
+    let timeout_ms = match deadline {
+        None => None,
+        Some(d) => {
+            let left = d
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis();
+            if left == 0 {
+                return Err(fate::classify_fate(PoolError::Timeout, ctx(false)));
+            }
+            Some(u32::try_from(left).unwrap_or(u32::MAX))
+        }
+    };
+    let (result, us) = run_autocommit_exec(co, &stmt.sql, &stmt.params, timeout_ms, cancel).await;
+    *exec_us += us;
+    result.map_err(|e| fate::classify_fate(e, ctx(true)))
+}
+
+/// The verb, autocommit, on a verified PostgreSQL store (step 8 of the module doc).
+async fn serve_pg<B: PoolBackend>(
+    pool: &Pool<B>,
+    req: QueueRequest,
+    store: &StoreConfig,
+    deadline: Option<tokio::time::Instant>,
+    cancel: &CancellationToken,
+    responder: Responder,
+) {
+    let readonly = verb_context(&req, false).readonly;
+    let checkout = pool.checkout_declared(readonly);
+    tokio::pin!(checkout);
+    let checked_out = tokio::select! {
+        biased;
+        r = &mut checkout => r,
+        () = sleep_until_opt(deadline) => Err(PoolError::Timeout),
+        () = cancel.cancelled() => Err(cancelled_before_dispatch()),
+    };
+    let mut co = match checked_out {
+        Ok(co) => co,
+        Err(e) => {
+            // No connection: nothing was sent.
+            responder.end_error(fate::classify_fate(e, verb_context(&req, false)));
+            return;
+        }
+    };
+    let queue_us = co.stats().queue_us;
+    let mut exec_us = 0u64;
+    let outcome = run_pg_verb(&mut co, &req, store, deadline, cancel, &mut exec_us).await;
+    // Release the connection before framing the terminal (as EXEC does): held only for the verb.
+    drop(co);
+    let stats = QueueStats { queue_us, exec_us };
+    match outcome {
+        Ok(body) => responder.end_ok(Bytes::from(body.encode(stats))),
+        Err(ep) => responder.end_error(ep),
+    }
+}
+
+/// A verb's success, before its `stats` are known.
+enum VerbOk {
+    Enqueue(pgq::Enqueued),
+    Reserve(Vec<pgq::Reserved>),
+    Ack { gone: bool },
+    Release(Option<JobId>),
+    Extend(i64),
+    Size(pgq::Sizes),
+    Clear(u64),
+}
+
+impl VerbOk {
+    fn encode(self, stats: QueueStats) -> Vec<u8> {
+        match self {
+            VerbOk::Enqueue(e) => EnqueueResponse {
+                job_id: e.job_id.map(JobId::encode),
+                inserted: e.inserted,
+                deduplicated: false,
+                stats,
+            }
+            .encode(),
+            VerbOk::Reserve(jobs) => ReserveResponse {
+                jobs: jobs
+                    .into_iter()
+                    .map(|j| ReservedJob {
+                        job_id: j.id.encode(),
+                        token: j.token.encode().to_vec(),
+                        attempts: j.attempts,
+                        queue: j.queue,
+                        payload: j.payload,
+                        created_at: j.created_at,
+                        lease_deadline: j.lease_deadline,
+                    })
+                    .collect(),
+                stats,
+            }
+            .encode(),
+            VerbOk::Ack { gone } => AckResponse {
+                outcome: if gone {
+                    ack_outcome::GONE
+                } else {
+                    ack_outcome::ACKED
+                },
+                stats,
+            }
+            .encode(),
+            VerbOk::Release(new_id) => ReleaseResponse {
+                new_job_id: new_id.map(JobId::encode),
+                stats,
+            }
+            .encode(),
+            VerbOk::Extend(lease_deadline) => ExtendResponse {
+                lease_deadline,
+                stats,
+            }
+            .encode(),
+            VerbOk::Size(s) => SizeResponse {
+                pending: s.pending,
+                delayed: s.delayed,
+                reserved: s.reserved,
+                oldest_pending_at: s.oldest_pending_at,
+                stats,
+            }
+            .encode(),
+            VerbOk::Clear(deleted) => ClearResponse { deleted, stats }.encode(),
+        }
+    }
+}
+
+/// Build, run and decode the verb's statement(s) on `co`.
+async fn run_pg_verb<B: PoolBackend>(
+    co: &mut Checkout<B>,
+    req: &QueueRequest,
+    store: &StoreConfig,
+    deadline: Option<tokio::time::Instant>,
+    cancel: &CancellationToken,
+    exec_us: &mut u64,
+) -> Result<VerbOk, ErrorPayload> {
+    let ctx = |sent| verb_context(req, sent);
+    let bad = |_: pgq::Malformed| malformed(req, store);
+    let t = &store.table;
+    match req {
+        QueueRequest::Enqueue(r) => {
+            let n = r.jobs.len();
+            let stmt = pgq::enqueue(t, r.jobs.clone());
+            let qr = run_verb_statement(co, &stmt, deadline, cancel, ctx, exec_us).await?;
+            pgq::decode_enqueue(&qr.rows, qr.affected, n)
+                .map(VerbOk::Enqueue)
+                .map_err(bad)
+        }
+        QueueRequest::Reserve(r) => {
+            let limit = checks::reserve_limit(r.max_jobs, store.max_payload_bytes);
+            for queue in &r.queues {
+                let stmt = pgq::reserve(t, queue, store.lease_s, store.max_payload_bytes, limit);
+                // A failure here is THIS statement's fate: every earlier queue reserved nothing.
+                let qr = run_verb_statement(co, &stmt, deadline, cancel, ctx, exec_us).await?;
+                let jobs = pgq::decode_reserve(&qr.rows, limit).map_err(bad)?;
+                if !jobs.is_empty() {
+                    return Ok(VerbOk::Reserve(jobs));
+                }
+            }
+            Ok(VerbOk::Reserve(Vec::new()))
+        }
+        QueueRequest::Ack(r) => {
+            let (id, token) = decode_handles(store, &r.job_id, &r.token)?;
+            let qr =
+                run_verb_statement(co, &pgq::ack(t, id, token), deadline, cancel, ctx, exec_us)
+                    .await?;
+            match pgq::decode_ack(&qr.rows, token).map_err(bad)? {
+                Ok(()) => Ok(VerbOk::Ack { gone: false }),
+                Err(NoMatch::Gone) => Ok(VerbOk::Ack { gone: true }),
+                Err(NoMatch::LeaseLost) => Err(lease_lost(store, req.verb())),
+            }
+        }
+        QueueRequest::Release(r) => {
+            let (id, token) = decode_handles(store, &r.job_id, &r.token)?;
+            let stmt = pgq::release(t, id, token, r.delay_s);
+            let qr = run_verb_statement(co, &stmt, deadline, cancel, ctx, exec_us).await?;
+            match pgq::decode_release(&qr.rows, token).map_err(bad)? {
+                Ok(new_id) => Ok(VerbOk::Release(Some(new_id))),
+                Err(NoMatch::Gone) => Ok(VerbOk::Release(None)),
+                Err(NoMatch::LeaseLost) => Err(lease_lost(store, req.verb())),
+            }
+        }
+        QueueRequest::Extend(r) => {
+            let (id, token) = decode_handles(store, &r.job_id, &r.token)?;
+            let stmt = pgq::extend(t, id, token, store.lease_s);
+            let qr = run_verb_statement(co, &stmt, deadline, cancel, ctx, exec_us).await?;
+            match pgq::decode_extend(&qr.rows).map_err(bad)? {
+                Some(lease_deadline) => Ok(VerbOk::Extend(lease_deadline)),
+                None => Err(lease_lost(store, req.verb())),
+            }
+        }
+        QueueRequest::Size(r) => {
+            let qr =
+                run_verb_statement(co, &pgq::size(t, &r.queue), deadline, cancel, ctx, exec_us)
+                    .await?;
+            pgq::decode_size(&qr.rows).map(VerbOk::Size).map_err(bad)
+        }
+        QueueRequest::Clear(r) => {
+            let qr =
+                run_verb_statement(co, &pgq::clear(t, &r.queue), deadline, cancel, ctx, exec_us)
+                    .await?;
+            Ok(VerbOk::Clear(qr.affected))
+        }
+    }
 }
 
 /// The version gate and shape verification, once per store per process (SPEC §24.3).
@@ -351,16 +662,14 @@ async fn ensure_verified(
     stores: &QueueStores,
     store: &StoreConfig,
     registry: &PoolRegistry,
-    timeout_ms: Option<u32>,
+    deadline: Option<tokio::time::Instant>,
     cancel: &CancellationToken,
 ) -> Result<(), ErrorPayload> {
     let Some(cell) = stores.verdicts.get(&store.name) else {
         return Err(unsupported("unknown queue store"));
     };
-    // ONE deadline for the whole first use — the wait for another request's verification, the
-    // checkout and the statement — as on EXEC (M3-D1c review F1).
-    let deadline =
-        timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(u64::from(ms)));
+    // The REQUEST's one deadline bounds the whole first use — the wait for another request's
+    // verification, the checkout and the statement — as on EXEC (M3-D1c review F1).
     let not_sent = |e: PoolError| fate::classify_fate(e, verification_context(false));
     let mut verdict = tokio::select! {
         biased;
@@ -522,7 +831,7 @@ async fn verify_pg<B: PoolBackend>(
     stores.verifications.fetch_add(1, Ordering::Relaxed);
     let (result, _exec_us) = run_autocommit_exec(
         &mut co,
-        stmt.sql,
+        &stmt.sql,
         &stmt.params,
         remaining(deadline)?,
         cancel,
@@ -542,7 +851,7 @@ async fn verify_pg<B: PoolBackend>(
     // refused — ENQUEUE would then fail with `NotNull`, classified like any statement.
     let serial = shape::pg_serial_statement(&store.table);
     if let Ok(left) = remaining(deadline) {
-        let (r, _) = run_autocommit_exec(&mut co, serial.sql, &serial.params, left, cancel).await;
+        let (r, _) = run_autocommit_exec(&mut co, &serial.sql, &serial.params, left, cancel).await;
         match r
             .as_ref()
             .map(|qr| qr.rows.first().and_then(|row| row.first()))
@@ -563,6 +872,9 @@ mod tests {
     use super::*;
     use ferro_proto::messages::EnqueueJob;
     use std::ffi::OsString;
+
+    /// A fixed engine clock for the pre-send checks.
+    const NOW: i64 = 1_790_000_000;
 
     fn store() -> StoreConfig {
         let cfg = QueueConfig::load(
@@ -588,7 +900,7 @@ mod tests {
     #[test]
     fn an_undecodable_handle_is_invalid_handle_never_protocol_or_lease_lost() {
         let good_token = Token::from_pg(1, 1).encode();
-        assert!(refuse_before_checkout(&fenced(b"42", &good_token), &store()).is_ok());
+        assert!(refuse_before_checkout(&fenced(b"42", &good_token), &store(), NOW).is_ok());
         for (job_id, token) in [
             (&b"042"[..], &good_token[..]),
             (b"+42", &good_token),
@@ -596,7 +908,7 @@ mod tests {
             (b"42", &[0u8; 7][..]),
             (b"42", &[1u8; 8][..]),
         ] {
-            let ep = refuse_before_checkout(&fenced(job_id, token), &store()).unwrap_err();
+            let ep = refuse_before_checkout(&fenced(job_id, token), &store(), NOW).unwrap_err();
             assert_eq!(ep.code, errc::INVALID_HANDLE);
             assert_eq!(ep.branch, errc::INVALID_HANDLE_BRANCH);
             assert_ne!(ep.code, errc::PROTOCOL);
@@ -611,7 +923,9 @@ mod tests {
             common: QueueCommon::default(),
         });
         assert_eq!(
-            refuse_before_checkout(&rel, &store()).unwrap_err().code,
+            refuse_before_checkout(&rel, &store(), NOW)
+                .unwrap_err()
+                .code,
             errc::INVALID_HANDLE
         );
     }
@@ -630,7 +944,7 @@ mod tests {
             liveness: false,
             common: tx.clone(),
         });
-        let ep = refuse_before_checkout(&reserve, &store()).unwrap_err();
+        let ep = refuse_before_checkout(&reserve, &store(), NOW).unwrap_err();
         assert_eq!(ep.code, errc::UNSUPPORTED);
         assert!(ep.message.contains("§24.5"), "{}", ep.message);
         let enq = QueueRequest::Enqueue(EnqueueRequest {
@@ -643,7 +957,7 @@ mod tests {
             dedup_key: None,
             common: tx,
         });
-        let ep = refuse_before_checkout(&enq, &store()).unwrap_err();
+        let ep = refuse_before_checkout(&enq, &store(), NOW).unwrap_err();
         assert!(ep.message.contains("G2"), "{}", ep.message);
         let mut my = store();
         my.family = PoolFamily::Mysql;
@@ -652,8 +966,8 @@ mod tests {
             queue: "default".into(),
             common: QueueCommon::default(),
         });
-        assert!(refuse_before_checkout(&size, &store()).is_ok());
-        let ep = refuse_before_checkout(&size, &my).unwrap_err();
+        assert!(refuse_before_checkout(&size, &store(), NOW).is_ok());
+        let ep = refuse_before_checkout(&size, &my, NOW).unwrap_err();
         assert!(ep.message.contains("G6"), "{}", ep.message);
     }
 
@@ -726,7 +1040,7 @@ mod tests {
                 ..QueueCommon::default()
             },
         });
-        let ep = refuse_before_checkout(&reserve, &store()).unwrap_err();
+        let ep = refuse_before_checkout(&reserve, &store(), NOW).unwrap_err();
         assert!(ep.message.contains("§24.5"), "{}", ep.message);
     }
 
@@ -837,7 +1151,7 @@ mod tests {
             &stores,
             &store,
             &registry,
-            Some(150),
+            deadline_of(Some(150)),
             &CancellationToken::new(),
         )
         .await
@@ -979,6 +1293,167 @@ mod tests {
             fate::classify_fate(cancelled(), write).branch,
             ferro_proto::consts::branch::INDETERMINATE
         );
+    }
+
+    /// A two-queue RESERVE on a one-connection `FakeBackend` pool whose every statement answers no
+    /// rows — so, unguarded, the verb would run BOTH queues' statements and answer `Ok(empty)`.
+    async fn two_queue_reserve(
+        deadline: Option<tokio::time::Instant>,
+        cancel: &CancellationToken,
+    ) -> Result<VerbOk, ErrorPayload> {
+        use ferro_pool::config::PoolConfig;
+        use ferro_pool::fake::FakeBackend;
+        let backend = FakeBackend::new();
+        backend.set_query_result(QueryResult::default());
+        let pool = Pool::new(
+            backend,
+            PoolConfig {
+                max_size: 1,
+                reap_interval: None,
+                ..PoolConfig::default()
+            },
+        );
+        let mut co = pool.checkout().await.expect("checkout");
+        let req = QueueRequest::Reserve(ReserveRequest {
+            store: "jobs".into(),
+            queues: vec!["high".into(), "default".into()],
+            max_jobs: 1,
+            wait_ms: 0,
+            liveness: false,
+            common: QueueCommon::default(),
+        });
+        let mut exec_us = 0;
+        run_pg_verb(&mut co, &req, &store(), deadline, cancel, &mut exec_us).await
+    }
+
+    /// Review F2 (mutation T7): a CANCEL that arrived before a statement is SENT answers the verb
+    /// unsent — a known non-execution (`Retryable{ConnectionLost}`), never `Indeterminate` and never
+    /// a statement sent after the client gave up.
+    #[tokio::test]
+    async fn a_cancel_before_the_statement_is_sent_answers_unsent() {
+        let cancel = CancellationToken::new();
+        let control = two_queue_reserve(None, &cancel).await;
+        assert!(
+            matches!(control, Ok(VerbOk::Reserve(ref j)) if j.is_empty()),
+            "control: an uncancelled RESERVE runs both queues and answers empty"
+        );
+        cancel.cancel();
+        let ep = two_queue_reserve(None, &cancel)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a cancelled RESERVE must not answer Ok"));
+        assert_ne!(ep.branch, ferro_proto::consts::branch::INDETERMINATE);
+        assert_eq!(
+            (ep.code, ep.branch),
+            (errc::CONNECTION_LOST, errc::CONNECTION_LOST_BRANCH),
+            "{ep:?}"
+        );
+    }
+
+    /// Review F2 (mutation T8): a request whose deadline has already passed sends no statement and
+    /// answers `PoolTimeout` — a write is never dispatched with no time left (which could only end
+    /// `Indeterminate`).
+    #[tokio::test]
+    async fn no_time_left_answers_pool_timeout_unsent() {
+        let past = tokio::time::Instant::now() - Duration::from_millis(5);
+        let ep = two_queue_reserve(Some(past), &CancellationToken::new())
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("an expired deadline must not answer Ok"));
+        assert_eq!(ep.code, errc::POOL_TIMEOUT, "{ep:?}");
+        assert_ne!(ep.branch, ferro_proto::consts::branch::INDETERMINATE);
+    }
+
+    /// One request of every verb, autocommit.
+    fn every_verb() -> Vec<QueueRequest> {
+        let token = Token::from_pg(1, 1).encode().to_vec();
+        let fenced = FencedRequest {
+            store: "jobs".into(),
+            job_id: b"1".to_vec(),
+            token: token.clone(),
+            common: QueueCommon::default(),
+        };
+        let scope = QueueScopeRequest {
+            store: "jobs".into(),
+            queue: "default".into(),
+            common: QueueCommon::default(),
+        };
+        vec![
+            QueueRequest::Enqueue(EnqueueRequest {
+                store: "jobs".into(),
+                jobs: vec![EnqueueJob {
+                    queue: "default".into(),
+                    payload: "{}".into(),
+                    delay_s: 0,
+                }],
+                dedup_key: None,
+                common: QueueCommon::default(),
+            }),
+            QueueRequest::Reserve(ReserveRequest {
+                store: "jobs".into(),
+                queues: vec!["default".into()],
+                max_jobs: 1,
+                wait_ms: 0,
+                liveness: false,
+                common: QueueCommon::default(),
+            }),
+            QueueRequest::Ack(fenced.clone()),
+            QueueRequest::Release(ReleaseRequest {
+                store: "jobs".into(),
+                job_id: b"1".to_vec(),
+                token,
+                delay_s: 0,
+                common: QueueCommon::default(),
+            }),
+            QueueRequest::Extend(fenced),
+            QueueRequest::Size(scope.clone()),
+            QueueRequest::Clear(scope),
+        ]
+    }
+
+    /// SPEC §24.6: `readonly` is true for SIZE ONLY — RESERVE writes `attempts` and a lease — and
+    /// never `in_tx` on the autocommit path. A statement that ran but whose rows cannot be decoded is
+    /// `Indeterminate` for every write (its effect is real but unreportable), and a plain refusal for
+    /// SIZE.
+    #[test]
+    fn only_size_is_a_read_and_an_unreadable_write_result_is_indeterminate() {
+        let s = store();
+        for req in every_verb() {
+            let is_size = matches!(req, QueueRequest::Size(_));
+            for sent in [false, true] {
+                let ctx = verb_context(&req, sent);
+                assert_eq!(ctx.readonly, is_size, "{}", req.verb());
+                assert_eq!(ctx.sent, sent);
+                assert!(!ctx.in_tx);
+            }
+            let ep = malformed(&req, &s);
+            if is_size {
+                assert_eq!(ep.code, errc::UNSUPPORTED);
+            } else {
+                assert_eq!(
+                    (ep.code, ep.branch),
+                    (
+                        errc::WRITE_UNCONFIRMED,
+                        ferro_proto::consts::branch::INDETERMINATE
+                    ),
+                    "{}",
+                    req.verb()
+                );
+            }
+            assert!(ep.message.contains(req.verb()), "{}", ep.message);
+        }
+    }
+
+    /// `LeaseLost` is the registry's known-fate code, and its message names the verb, never a token.
+    #[test]
+    fn lease_lost_is_the_known_fate_code() {
+        let ep = lease_lost(&store(), "ACK");
+        assert_eq!(
+            (ep.code, ep.branch),
+            (errc::LEASE_LOST, errc::LEASE_LOST_BRANCH)
+        );
+        assert_eq!(ep.branch, ferro_proto::consts::branch::NON_RETRYABLE);
+        assert!(ep.message.contains("ACK did nothing"), "{}", ep.message);
     }
 
     #[test]

@@ -29,8 +29,12 @@ use Ferro\Protocol\ErrorPayload;
  *     `WriteUnconfirmed`, so the label stays this honest generic, NEVER narrowed to `"timeout"`.
  *
  * Do not add a `"timeout"` cause, or any other label, that the wire cannot actually carry.
+ *
+ * Not `final` since M6-F8: Ferro HTTP's Indeterminate ({@see \Ferro\Http\Error\HttpIndeterminateException})
+ * extends it, and on HTTP `cause()` is the engine's `[http.causes]` token, which the wire DOES carry
+ * (SPEC §23.5.6, §23.11.1).
  */
-final class IndeterminateException extends FerroException
+class IndeterminateException extends FerroException
 {
     use CarriesErrorPayload {
         __construct as private fromErrorPayload;

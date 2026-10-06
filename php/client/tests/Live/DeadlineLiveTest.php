@@ -136,8 +136,7 @@ final class DeadlineLiveTest extends LiveTestCase
     {
         $c = Ferro::connect($this->socketPath, ioTimeout: 0.4, policy: RetryPolicy::none());
         $this->assertSame(1, $c->scalar('SELECT 1'));
-        $pid = $this->ferrodPid();
-        exec('kill -STOP ' . $pid);
+        $pid = $this->stopFerrodAndWait(); // every thread stopped: a STOP still in flight answered SELECT 2
         try {
             $start = microtime(true);
             try {
@@ -149,7 +148,37 @@ final class DeadlineLiveTest extends LiveTestCase
             $this->assertGreaterThan(0.7, $elapsed, 'silence was probed, not treated as failure at once');
             $this->assertLessThan(2.5, $elapsed, 'two read timeouts, not a hang');
         } finally {
-            exec('kill -CONT ' . $pid);
+            $this->continueFerrod($pid);
+        }
+    }
+
+    /**
+     * M6-F8 review round 2 (R2-1), against a real `ferrod` on the `fread` path: an engine stopped
+     * in the MIDDLE of writing a frame — its header and a socket buffer's worth of a 24 MB payload
+     * sent — still meets the backstop (CANCEL at the deadline, the session closed one read timeout
+     * later). Round 1 counted the partly read frame as "readable", which disabled the backstop AND
+     * liveness: measured, the await hung 25 s until the probe's SIGCONT, then returned the value.
+     */
+    public function testAnEngineStoppedMidFrameStillMeetsTheBackstop(): void
+    {
+        $conn = Ferro::connect($this->socketPath, ioTimeout: 5.0, policy: RetryPolicy::none(), statementTimeout: 0.5, receiveFds: false);
+        $this->assertSame(1, $conn->scalar('SELECT 1'));
+        $f = $conn->scalarAsync("SELECT length(repeat('x', 12000000)) || repeat('y', 12000000)");
+        usleep(1_000_000); // ferrod writes the frame's header and what the socket takes, then blocks
+        $pid = $this->stopFerrodAndWait();
+        // A regression must fail, not hang the suite: resume the engine after 20 s regardless.
+        exec(sprintf('(sleep 20; kill -CONT %d) > /dev/null 2>&1 &', $pid));
+        try {
+            $t0 = microtime(true);
+            try {
+                $f->await();
+                $this->fail('a stopped engine must not answer');
+            } catch (FerroException) {
+            }
+            // The deadline (0.5 s + the 2 s margin, from the submit) + one read timeout (5 s).
+            $this->assertLessThan(12.0, microtime(true) - $t0, 'the backstop, not the 20 s SIGCONT');
+        } finally {
+            $this->continueFerrod($pid);
         }
     }
 }

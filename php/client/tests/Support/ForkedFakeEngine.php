@@ -27,7 +27,7 @@ final class ForkedFakeEngine
     private function __construct(public readonly string $path, private readonly int $pid) {}
 
     /** @param \Closure(resource): void $serve */
-    public static function start(\Closure $serve): self
+    public static function start(\Closure $serve, int $features = 0): self
     {
         static $n = 0;
         $path = sys_get_temp_dir() . '/ferro-fake-' . getmypid() . '-' . (++$n) . '.sock';
@@ -46,7 +46,7 @@ final class ForkedFakeEngine
                 if ($c !== false) {
                     stream_set_timeout($c, 30);
                     self::readFrame($c); // HELLO
-                    fwrite($c, self::helloAck());
+                    fwrite($c, self::helloAck($features));
                     $serve($c);
                 }
             } catch (\Throwable $e) {
@@ -100,10 +100,10 @@ final class ForkedFakeEngine
         return (new Codec())->encodeFrame(new Header($flags, $service, $method, $rid, strlen($payload)), $payload);
     }
 
-    public static function helloAck(): string
+    public static function helloAck(int $features = 0): string
     {
         $payload = Message::encode('hello_ack', [
-            'engine_version' => 1, 'boot_epoch' => 1, 'features' => 0,
+            'engine_version' => 1, 'boot_epoch' => 1, 'features' => $features,
             'pools' => [['name' => 'default', 'kind' => 'postgres', 'server_version' => '17.0', 'literals_are_standard' => true]],
             'type_registry_hash' => C::TYPE_REGISTRY_HASH,
         ], PackerFactory::forEncode());
