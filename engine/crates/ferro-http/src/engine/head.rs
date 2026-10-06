@@ -3,7 +3,7 @@
 
 use std::io;
 
-use ferro_proto::messages::{HttpHead, HttpHeaderField};
+use ferro_proto::messages::{HttpDecoded, HttpHead, HttpHeaderField};
 use http::{HeaderMap, StatusCode, Version};
 
 use super::track::{Dir, TrackState};
@@ -94,22 +94,37 @@ pub fn fields(headers: &HeaderMap, drop: &[String]) -> Vec<HttpHeaderField> {
         .collect()
 }
 
-/// The `HEAD` frame for a response. `decoded` is always `nil` in F4a: content decoding (§23.9.2)
-/// is slice F4b's, and until it lands the engine neither asks for an encoding nor removes one.
+/// The `HEAD` frame for a response. `decoded_as` is the `Content-Encoding` value the engine decodes
+/// (§23.9.2, M6-F4b), or `None` when the body passes through: when set, `content-encoding` and
+/// `content-length` are removed from the fields and reported in `decoded` — the length as
+/// received, `nil` when absent or not a number the wire can carry (§22.2 (cy) item 3).
 pub fn http_head(
     status: StatusCode,
     version: Version,
     reason: Vec<u8>,
     headers: &HeaderMap,
     idempotent: bool,
+    decoded_as: Option<String>,
 ) -> HttpHead {
-    let drop = hop_by_hop(headers);
+    let mut drop = hop_by_hop(headers);
+    let decoded = decoded_as.map(|content_encoding| {
+        drop.push("content-encoding".to_string());
+        drop.push("content-length".to_string());
+        HttpDecoded {
+            content_encoding,
+            content_length: headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|&n| n < (1 << 63)),
+        }
+    });
     HttpHead {
         status: status.as_u16(),
         version: if version == Version::HTTP_10 { 10 } else { 11 },
         reason: Some(reason),
         headers: fields(headers, &drop),
-        decoded: None,
+        decoded,
         idempotent,
     }
 }
@@ -201,9 +216,54 @@ mod tests {
         h.insert("x-private", "1".parse().unwrap());
         h.append("set-cookie", "a=1".parse().unwrap());
         h.append("set-cookie", "b=2".parse().unwrap());
-        let head = http_head(StatusCode::OK, Version::HTTP_11, b"OK".to_vec(), &h, false);
+        let head = http_head(
+            StatusCode::OK,
+            Version::HTTP_11,
+            b"OK".to_vec(),
+            &h,
+            false,
+            None,
+        );
         let names: Vec<&str> = head.headers.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["set-cookie", "set-cookie"]);
         assert_eq!(head.version, 11);
+        assert_eq!(head.decoded, None);
+    }
+
+    /// §23.9.2: a decoded body's head loses `content-encoding` and `content-length`, which are
+    /// reported in `decoded` instead; every other field is kept.
+    #[test]
+    fn a_decoded_head_moves_the_encoding_and_length_into_decoded() {
+        let mut h = HeaderMap::new();
+        h.insert("content-encoding", "gzip".parse().unwrap());
+        h.insert("content-length", "1234".parse().unwrap());
+        h.insert("etag", "\"x\"".parse().unwrap());
+        let head = http_head(
+            StatusCode::OK,
+            Version::HTTP_11,
+            b"OK".to_vec(),
+            &h,
+            true,
+            Some("gzip".into()),
+        );
+        let names: Vec<&str> = head.headers.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["etag"]);
+        assert_eq!(
+            head.decoded,
+            Some(HttpDecoded {
+                content_encoding: "gzip".into(),
+                content_length: Some(1234),
+            })
+        );
+        h.remove("content-length");
+        let head = http_head(
+            StatusCode::OK,
+            Version::HTTP_11,
+            b"OK".to_vec(),
+            &h,
+            true,
+            Some("gzip".into()),
+        );
+        assert_eq!(head.decoded.unwrap().content_length, None);
     }
 }

@@ -40,6 +40,12 @@ bytes = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"], optional = true }
 tokio-util = { version = "0.7", optional = true }
 tracing = { version = "0.1", optional = true }
+# §23.9.2 content decoding (M6-F4b): gzip / zlib / raw deflate through the LOW-LEVEL `Decompress`,
+# so each step's output is bounded (`engine::decode`). `flate2` 1.1.9 and its pure-Rust
+# `miniz_oxide` backend were already in the lock (through `mysql_async`), and §23.13 records
+# "`flate2` is already locked" — so this adds no crate. `default-features = false` plus
+# `rust_backend` keeps the C zlib backends out.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
 
 [features]
 default = []
@@ -52,6 +58,7 @@ engine = [
     "dep:tokio",
     "dep:tokio-util",
     "dep:tracing",
+    "dep:flate2",
 ]
 
 [dev-dependencies]

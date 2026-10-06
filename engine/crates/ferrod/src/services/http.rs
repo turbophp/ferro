@@ -12,6 +12,10 @@
 //!   follows every `REQUEST` (charter rule 4) — including a sink failure, a cancel or a deadline,
 //!   which the engine classifies (§23.7.1) and returns like any other terminal.
 //!
+//! - the daemon's drain (SPEC §23.6.1, M6-F4b) reaches the engine as a `DrainView` built from the
+//!   session's [`SessionInfo::drain`] (chassis change 1); the engine refuses a request that arrives
+//!   during it and stops in-flight exchanges at `FERRO_HTTP_DRAIN_MS`.
+//!
 //! Nothing here interprets HTTP. The session and dispatch layers carry only the route.
 
 use std::future::Future;
@@ -20,18 +24,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use ferro_http::engine::{HttpEngine, ResponseSink, SinkError, SinkFrame, Terminal};
+use ferro_http::engine::{DrainView, HttpEngine, ResponseSink, SinkError, SinkFrame, Terminal};
 use ferro_proto::consts::{flags, method_http, service};
 use ferro_proto::messages::HttpRequest;
 use tokio_util::sync::CancellationToken;
 
+use crate::session::SessionInfo;
 use crate::session::flow::WaitAborted;
 use crate::session::responder::{Responder, StreamSendError};
 
 /// The engine's frames, sent through the request's `Responder`.
 pub struct ResponderSink<'r> {
     responder: &'r Responder,
-    cancel: CancellationToken,
 }
 
 impl ResponseSink for ResponderSink<'_> {
@@ -40,6 +44,7 @@ impl ResponseSink for ResponderSink<'_> {
         frame: SinkFrame,
         payload: Vec<u8>,
         deadline: tokio::time::Instant,
+        cancel: &'a CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         let (method, frame_flags) = match frame {
             SinkFrame::Head => (method_http::HEAD, 0),
@@ -52,7 +57,7 @@ impl ResponseSink for ResponderSink<'_> {
                     method,
                     frame_flags,
                     payload,
-                    &self.cancel,
+                    cancel,
                     Some(deadline),
                 )
                 .await
@@ -72,7 +77,7 @@ impl ResponseSink for ResponderSink<'_> {
 pub async fn handle_request(
     engine: &Arc<HttpEngine>,
     req: HttpRequest,
-    peer_uid: Option<u32>,
+    info: &SessionInfo,
     started: Instant,
     responder: Responder,
     cancel: CancellationToken,
@@ -81,13 +86,14 @@ pub async fn handle_request(
     // and counted (`ferro_traceparent_invalid_total`), never refused. It is not forwarded upstream,
     // and nothing else consumes it until slice F7's span.
     let _trace = crate::trace::from_request(req.traceparent.as_deref());
+    let (started_token, started_at) = info.drain.parts();
+    let drain = DrainView::new(started_token, started_at);
     let terminal = {
         let sink = ResponderSink {
             responder: &responder,
-            cancel: cancel.clone(),
         };
         engine
-            .exchange(&req, peer_uid, started, &cancel, &sink)
+            .serve_request(req, info.peer_uid, started, &cancel, &drain, &sink)
             .await
     };
     match terminal {
