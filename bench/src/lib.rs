@@ -8,10 +8,12 @@
 //!
 //! The library half is deliberately small and pure so it is unit-testable without a live stack:
 //! - [`stats`] — nearest-rank percentiles over a sorted ns sample.
+//! - [`fanout`] — the §16 fan-out record (M3-D1e) + its `validate()`.
 //! - [`result`] — the serde result types + `validate()` (the structural honesty self-check).
 //! - [`manifest`] — the host-side environment manifest collector.
 //! - [`ferrod_proc`] — a `Child` + socket wrapper whose `Drop` guarantees teardown even on a panic.
 
+pub mod fanout;
 pub mod ferrod_proc;
 pub mod manifest;
 pub mod result;
