@@ -50,6 +50,9 @@ pub enum RefusedRange {
     LinkLocal,
     /// `fd00:ec2::/32` (*M*).
     AwsImdsV6,
+    /// `fd20:ce::254/128` (*M*): GCP's IPv6 metadata server — documented by GCP, not verified
+    /// here. It is inside ULA, which `ADDRESS_CLASSES=private` would otherwise admit (review F-9).
+    GcpImdsV6,
     /// `100.100.100.200/32` (*M*).
     AlibabaMetadata,
     /// `168.63.129.16/32` (*M*).
@@ -61,11 +64,12 @@ pub enum RefusedRange {
 }
 
 impl RefusedRange {
-    pub const ALL: [RefusedRange; 8] = [
+    pub const ALL: [RefusedRange; 9] = [
         RefusedRange::Unspecified,
         RefusedRange::MulticastReserved,
         RefusedRange::LinkLocal,
         RefusedRange::AwsImdsV6,
+        RefusedRange::GcpImdsV6,
         RefusedRange::AlibabaMetadata,
         RefusedRange::AzureWireServer,
         RefusedRange::IetfSpecial,
@@ -78,6 +82,7 @@ impl RefusedRange {
             self,
             RefusedRange::LinkLocal
                 | RefusedRange::AwsImdsV6
+                | RefusedRange::GcpImdsV6
                 | RefusedRange::AlibabaMetadata
                 | RefusedRange::AzureWireServer
                 | RefusedRange::IetfSpecial
@@ -91,6 +96,7 @@ impl RefusedRange {
             RefusedRange::MulticastReserved => "multicast_reserved",
             RefusedRange::LinkLocal => "link_local",
             RefusedRange::AwsImdsV6 => "aws_imds_v6",
+            RefusedRange::GcpImdsV6 => "gcp_imds_v6",
             RefusedRange::AlibabaMetadata => "alibaba_metadata",
             RefusedRange::AzureWireServer => "azure_wireserver",
             RefusedRange::IetfSpecial => "ietf_special",
@@ -206,6 +212,11 @@ pub fn embedded_v4(a: &Ipv6Addr, nat64: &Nat64Prefixes) -> Option<Vec<Ipv4Addr>>
     if o[..10] == [0; 10] && o[10] == 0xff && o[11] == 0xff {
         return Some(vec![v4_from(last)]);
     }
+    // SIIT IPv4-translated ::ffff:0:0:0/96 (RFC 2765, deprecated): it carries an IPv4 address the
+    // same way, and a translator that still honours it reaches that address (review F-7).
+    if o[..8] == [0; 8] && o[8] == 0xff && o[9] == 0xff && o[10] == 0 && o[11] == 0 {
+        return Some(vec![v4_from(last)]);
+    }
     // NAT64 well-known prefix 64:ff9b::/96.
     if v6_in(a, Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0), 96) {
         return Some(vec![v4_from(last)]);
@@ -243,7 +254,7 @@ pub fn classify(addr: IpAddr, nat64: &Nat64Prefixes) -> Vec<Classification> {
         return vec![Classification::Class(Loopback)];
     }
     // The IPv6 rows of the always-refused table come FIRST (see the module docs).
-    let refused: [(Ipv6Addr, u32, RefusedRange); 7] = [
+    let refused: [(Ipv6Addr, u32, RefusedRange); 8] = [
         (Ipv6Addr::UNSPECIFIED, 96, DeprecatedV6), // IPv4-compatible
         (
             Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0),
@@ -255,6 +266,11 @@ pub fn classify(addr: IpAddr, nat64: &Nat64Prefixes) -> Vec<Classification> {
             Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0),
             32,
             AwsImdsV6,
+        ),
+        (
+            Ipv6Addr::new(0xfd20, 0xce, 0, 0, 0, 0, 0, 0x254),
+            128,
+            GcpImdsV6,
         ),
         (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16, DeprecatedV6), // 6to4
         (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32, DeprecatedV6), // Teredo

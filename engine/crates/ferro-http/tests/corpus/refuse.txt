@@ -411,3 +411,61 @@ config https ATTACH_HEADERS_FILE=/missing ATTACH_HEADERS_FILE
 config https ATTACH_HEADERS_FILE=/fixture/bad-attach ATTACH_HEADERS_FILE
 config http CA_FILE=/ca.pem CA_FILE
 config http MIN_TLS=1.3 MIN_TLS
+# --- review F-1: header NAMES are folded (lowercase, every non-alphanumeric byte -> '-') before
+# every table lookup, because CGI-style servers (php -S, WSGI/wsgiref, Puma CVE-2024-45614,
+# gunicorn < 22) map `X_Forwarded_For` and `X.Forwarded.For` onto the same variable as
+# `X-Forwarded-For`.
+header root X_Forwarded_For=1.2.3.4 header.forwarding
+header root X.Forwarded.For=1.2.3.4 header.forwarding
+header root X-Forwarded_Host=evil.example header.forwarding
+header root X_Real_IP=127.0.0.1 header.forwarding
+header root x.real_ip=127.0.0.1 header.forwarding
+header api X_Forwarded_Host=evil.example header.forwarding
+header root X_HTTP_Method_Override=DELETE header.method_override
+header root X.HTTP.Method.Override=DELETE header.method_override
+header root X-Original_URL=/admin header.method_override
+header root X_Rewrite_Url=/admin header.method_override
+header root X_Method.Override=PUT header.method_override
+header attach X_Api_Key=x header.attached
+header attach X-Api.Key=x header.attached
+header attach x.api_key=x header.attached
+header root Content_Length=5 header.content_length
+header root Content.Length=5 header.content_length
+header root Transfer_Encoding=gzip header.transfer_encoding
+header root Proxy_Authorization=Basic\sx header.upgrade_or_proxy_auth
+header root Proxy.Authorization=Basic\sx header.upgrade_or_proxy_auth
+# --- review F-9: WebDAV re-targeting and more forwarding names ---------------------------------
+header root Destination=https://api.example.com/admin header.method_override
+header root destination=/admin header.method_override
+header root True-Client-IP=127.0.0.1 header.forwarding
+header root CF-Connecting-IP=127.0.0.1 header.forwarding
+header root CF_Connecting_IP=127.0.0.1 header.forwarding
+header root X-Client-IP=127.0.0.1 header.forwarding
+header root Client-IP=127.0.0.1 header.forwarding
+header root X-Host=evil.example header.forwarding
+header root X-Original-Host=evil.example header.forwarding
+header root X-Forwarded-A=x header.forwarding
+address public fd20:ce::254 gcp_imds_v6
+address public,private fd20:ce::254 gcp_imds_v6
+# --- review F-5: a decoded '?' or '#' (or its NFKC form) cuts a segment, like ';' ------------
+target api /api/..%3F path.dot_segment
+target api /api/..%3f path.dot_segment
+target api /api/..%23 path.dot_segment
+target api /api/..%3Fx=1 path.dot_segment
+target api /v1/..%23 path.dot_segment
+target root /api/.%3f/admin path.dot_segment
+target utf8 /w/x/..%EF%BC%9F path.nfkc_dot_segment
+target utf8 /w/x/..%EF%BC%83 path.nfkc_dot_segment
+target utf8 /w/x/..%EF%B9%96 path.nfkc_dot_segment
+# --- review F-7: SIIT ::ffff:0:0:0/96 is classified by the IPv4 it carries ----------------------
+address public ::ffff:0:a9fe:a9fe link_local
+address public ::ffff:0:7f00:1 loopback
+address public ::ffff:0:a00:1 private
+# --- review F-2 D: the /56 local-use NAT64 candidate (reads 127.8.8.8) --------------------------
+address public 64:ff9b:1:87f:8:808:808:808 loopback
+# --- review F-4: the key header may not be one the engine sets ---------------------------------
+config https IDEMPOTENCY_KEY_HEADER=Accept-Encoding IDEMPOTENCY_KEY_HEADER
+config https IDEMPOTENCY_KEY_HEADER=accept_encoding IDEMPOTENCY_KEY_HEADER
+config https IDEMPOTENCY_KEY_HEADER=X_Forwarded_For IDEMPOTENCY_KEY_HEADER
+config https IDEMPOTENCY_KEY_HEADER=Content_Length IDEMPOTENCY_KEY_HEADER
+config https PASS_HEADERS=Host_ PASS_HEADERS

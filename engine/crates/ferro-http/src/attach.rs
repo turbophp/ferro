@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use crate::syntax::{is_field_value, is_token};
+use crate::syntax::{fold_name, is_field_value, is_token};
 
 /// One attached value. Deliberately not `Debug`/`Display`/`Clone`.
 pub struct SecretValue(Box<[u8]>);
@@ -21,7 +21,7 @@ impl SecretValue {
 }
 
 /// One `Name: value` line. The name is kept as written (it is sent); comparisons use
-/// [`lower`](AttachedHeader::lower).
+/// [`lower`](AttachedHeader::lower), the FOLDED name (`crate::fold_name`).
 pub struct AttachedHeader {
     name: String,
     lower: String,
@@ -67,7 +67,7 @@ impl AttachedHeaders {
         self.0.len()
     }
 
-    /// Whether `lower_name` (already ASCII-lowercased) is attached.
+    /// Whether `lower_name` (already folded with `crate::fold_name`) is attached.
     pub fn names(&self, lower_name: &str) -> bool {
         self.0.iter().any(|h| h.lower == lower_name)
     }
@@ -164,7 +164,7 @@ pub fn parse(bytes: &[u8]) -> Result<AttachedHeaders, AttachError> {
         }
         // `is_token` admitted only ASCII, so this is valid UTF-8.
         let name = String::from_utf8_lossy(name).into_owned();
-        let lower = name.to_ascii_lowercase();
+        let lower = fold_name(&name);
         if is_reserved_attach_name(&lower) {
             return Err(AttachError::ReservedName(n));
         }
@@ -203,6 +203,15 @@ mod tests {
             (b"a: x\rInjected: y", AttachError::BadValue(1)),
             (b"Host: evil", AttachError::ReservedName(1)),
             (b"Transfer-Encoding: chunked", AttachError::ReservedName(1)),
+            (b"TE: trailers", AttachError::ReservedName(1)),
+            (b"Connection: close", AttachError::ReservedName(1)),
+            (
+                b"Proxy-Authorization: Basic x",
+                AttachError::ReservedName(1),
+            ),
+            // Folded names (review F-1): CGI-style servers read these as the reserved ones.
+            (b"Transfer_Encoding: chunked", AttachError::ReservedName(1)),
+            (b"Content.Length: 1", AttachError::ReservedName(1)),
         ];
         for (input, want) in cases {
             let e = parse(input).err();

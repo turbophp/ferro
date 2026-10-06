@@ -187,3 +187,30 @@ config https ORIGIN=http://127.0.0.1:9200 enabled
 config https ORIGIN=http://[::1] enabled
 config https ORIGIN=http://10.0.0.5 enabled
 config http HTTP=auto enabled
+# --- review F-1: folded names, controls ---------------------------------------------------------
+header api X_Forwarded_For=1.2.3.4 kept
+header api x.forwarded.for=1.2.3.4 kept
+header root Keep_Alive=timeout=5 dropped
+header root Proxy_Connection=keep-alive dropped
+header root HTTP2_Settings=AAMAAABkAAQAAP__ dropped
+header root Content_Length=0 dropped
+header root Transfer_Encoding=chunked dropped
+header override X_Api_Key=x overridden
+header override x.api.key=x overridden
+header root Accept_Encoding=br kept
+header root X_Custom_Name=x kept
+header root X-Forwarded=x kept
+header root Destinations=x kept
+# --- review F-7/F-9/F-2 C controls ---------------------------------------------------------------
+address loopback ::ffff:0:7f00:1 accept
+address public ::ffff:0:808:808 accept
+address meta fd20:ce::254 accept
+address private fd20:ce::253 accept
+# Just outside ::ffff:0:0/96 (byte 11 is 0xfe): an ordinary IPv6 address, not 127.0.0.1.
+address public ::fffe:7f00:1 accept
+address public 64:ff9b:1:808:8:808:808:808 accept
+# --- review F-5 controls -------------------------------------------------------------------------
+target api /api/..x%3F accept
+target api /api/x%3F.. accept
+target api /api/x%23 accept
+config https PASS_HEADERS=Destination,X_Forwarded_For,True-Client-IP enabled

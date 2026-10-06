@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::address::{AddressPolicy, AddressRefusal, ClassSet, Nat64Prefixes};
 use crate::attach::{self, AttachError, AttachedHeaders, is_reserved_attach_name};
 use crate::origin::{Origin, OriginError, Scheme};
-use crate::syntax::{is_token, parse_decimal_u64};
+use crate::syntax::{fold_name, is_token, parse_decimal_u64};
 use crate::validate::{
     Refusal, check_prefix, is_always_refused_method, is_forwarding_header, is_override_header,
 };
@@ -667,7 +667,9 @@ impl HttpConfig {
     }
 }
 
-fn read_capped(p: &Path) -> std::io::Result<Vec<u8>> {
+/// The reader [`HttpConfig::from_env`] uses: at most one byte past the attached-header file cap,
+/// so an oversize file is REFUSED by the parser instead of being silently truncated to fit.
+pub fn read_capped(p: &Path) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     std::fs::File::open(p)?
         .take(attach::MAX_FILE_BYTES as u64 + 1)
@@ -908,7 +910,7 @@ fn parse_upstream(
             if !is_token(h.as_bytes(), 256) {
                 return Err(Reason::BadHeaderName(i + 1));
             }
-            let lower = h.to_ascii_lowercase();
+            let lower = fold_name(h);
             if !is_exemptible(&lower) {
                 return Err(Reason::NotExemptible(i + 1));
             }
@@ -923,13 +925,20 @@ fn parse_upstream(
         if !is_token(r.as_bytes(), 256) {
             return Err(Reason::BadHeaderName(1));
         }
-        let lower = r.to_ascii_lowercase();
-        // A key the engine sets/drops/refuses could never arrive; an ATTACHED key would make
-        // every request "idempotent" on the operator's say-so and with one constant key.
-        if is_reserved_attach_name(&lower) || is_exemptible(&lower) || attached.names(&lower) {
+        // Checked FOLDED (any spelling a CGI-style server would merge), matched EXACTLY at
+        // request time: folding the match would license a key a non-folding upstream never sees.
+        let folded = fold_name(r);
+        // A key the engine sets/drops/refuses could never arrive as PHP sent it; an ATTACHED key
+        // would make every request "idempotent" with one constant key; and `accept-encoding`,
+        // which the engine itself may set (review F-4), would make every Guzzle request so.
+        if is_reserved_attach_name(&folded)
+            || is_exemptible(&folded)
+            || attached.names(&folded)
+            || folded == "accept-encoding"
+        {
             return Err(Reason::KeyHeaderReserved);
         }
-        Ok(Some(lower))
+        Ok(Some(r.to_ascii_lowercase()))
     });
     let http = parse!("HTTP", HttpVersions::H1Only, |r| one_of(
         r,

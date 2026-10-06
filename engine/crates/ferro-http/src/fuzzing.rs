@@ -312,7 +312,10 @@ fn oracle(v: &Validated<'_>, req: &Request<'_>) {
         }
     }
     for seg in decoded.split(|&b| b == b'/' || b == b'\\') {
-        let seg = seg.split(|&b| b == b';').next().unwrap_or_default();
+        let seg = seg
+            .split(|&b| b == b';' || b == b'?' || b == b'#')
+            .next()
+            .unwrap_or_default();
         let dot_only =
             !seg.is_empty() && seg.contains(&b'.') && seg.iter().all(|&b| b == b'.' || b == b' ');
         assert!(!dot_only, "dot segment accepted");
@@ -328,8 +331,33 @@ fn oracle(v: &Validated<'_>, req: &Request<'_>) {
     // Headers.
     for &i in &v.send_headers {
         let (n, val) = &req.headers[i];
-        let lower = n.to_ascii_lowercase();
-        assert!(!lower.starts_with(':'));
+        // Folded independently of `syntax::fold_name`: lowercase, every non-alphanumeric byte '-'.
+        let lower: String = n
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        assert!(!n.starts_with(':'));
+        for refused in [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-real-ip",
+            "x-http-method-override",
+            "destination",
+            "true-client-ip",
+        ] {
+            if lower == refused {
+                assert!(
+                    up.pass_headers.iter().any(|p| p == refused),
+                    "{n} kept without PASS_HEADERS"
+                );
+            }
+        }
         assert!(!ENGINE_OWNED.contains(&lower.as_str()), "{lower} kept");
         if lower == "te" {
             assert!(val.eq_ignore_ascii_case(b"trailers"));

@@ -27,4 +27,5 @@ pub mod fuzzing;
 mod syntax;
 
 pub use config::{HttpConfig, Upstream};
+pub use syntax::fold_name;
 pub use validate::{PolicyCause, Refusal, Request, Rule, Validated, validate};

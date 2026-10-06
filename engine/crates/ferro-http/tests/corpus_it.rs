@@ -274,90 +274,110 @@ fn every_refusal_line_is_refused_by_its_rule() {
     let mut rules: BTreeSet<&'static str> = BTreeSet::new();
     let mut origin_errors: BTreeSet<String> = BTreeSet::new();
     let mut labels: BTreeSet<&'static str> = BTreeSet::new();
+    let mut failures: Vec<String> = Vec::new();
     for l in &lines {
-        match run(l) {
-            Outcome::Validated(r, header) => {
-                let refusal = match r {
-                    Err(e) => e,
-                    Ok(v) => panic!("refuse.txt:{}: ACCEPTED {} {}: {v:?}", l.no, l.ctx, l.input),
-                };
-                assert_eq!(
-                    refusal.rule.name(),
-                    l.expect,
-                    "refuse.txt:{}: {} {} refused by the wrong rule ({refusal})",
-                    l.no,
-                    l.ctx,
-                    l.input
-                );
-                if refusal.rule == Rule::UpstreamUnavailable {
-                    assert_eq!(refusal.to_string(), "upstream not available to this peer");
-                }
-                match &header {
-                    Some((_, v)) => assert_no_echo(&refusal, v, l),
-                    None => assert_no_echo(&refusal, &unescape(&l.input), l),
-                }
-                rules.insert(refusal.rule.name());
-            }
-            Outcome::Origin(r) => {
-                let e = r.expect_err(&format!("refuse.txt:{}: ORIGIN {} accepted", l.no, l.input));
-                assert_eq!(
-                    format!("{e:?}"),
-                    l.expect,
-                    "refuse.txt:{}: {}",
-                    l.no,
-                    l.input
-                );
-                let input = text(&l.input);
-                if input.len() >= 6 {
-                    assert!(!e.to_string().contains(&input));
-                }
-                origin_errors.insert(format!("{e:?}"));
-            }
-            Outcome::Address(r) => {
-                let e = r.expect_err(&format!("refuse.txt:{}: {} admitted", l.no, l.input));
-                assert_eq!(e.label(), l.expect, "refuse.txt:{}: {}", l.no, l.input);
-                labels.insert(e.label());
-            }
-            Outcome::Config(cfg, key, value) => {
-                let errs: Vec<&ConfigError> = cfg.errors();
-                let disabled =
-                    matches!(cfg.entries().next(), Some((_, UpstreamEntry::Disabled(_))));
-                assert!(
-                    disabled,
-                    "refuse.txt:{}: {key}={value} left the upstream enabled",
-                    l.no
-                );
-                assert!(
-                    errs.iter().any(
-                        |e| matches!(e, ConfigError::Upstream { key: k, .. } if *k == l.expect)
-                    ),
-                    "refuse.txt:{}: no error names {}: {:?}",
-                    l.no,
-                    l.expect,
-                    errs.iter().map(ToString::to_string).collect::<Vec<_>>()
-                );
-                assert!(
-                    cfg.upstream_for("cfg", Some(FIXTURE_UID)).is_none(),
-                    "a disabled upstream must be refused"
-                );
-                for e in &errs {
-                    let shown = e.to_string();
-                    // A value that is a word of the fixed sentence ("upgrade") is not an echo.
-                    let fixed = match e {
-                        ConfigError::Upstream { reason, .. } => reason.to_string(),
-                        _ => String::new(),
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match run(l) {
+                Outcome::Validated(r, header) => {
+                    let refusal = match r {
+                        Err(e) => e,
+                        Ok(v) => {
+                            panic!("refuse.txt:{}: ACCEPTED {} {}: {v:?}", l.no, l.ctx, l.input)
+                        }
                     };
-                    if value.len() >= 5 && !fixed.contains(&value) {
-                        assert!(
-                            !shown.contains(&value),
-                            "refuse.txt:{}: the error quotes the value: {shown}",
-                            l.no
-                        );
+                    assert_eq!(
+                        refusal.rule.name(),
+                        l.expect,
+                        "refuse.txt:{}: {} {} refused by the wrong rule ({refusal})",
+                        l.no,
+                        l.ctx,
+                        l.input
+                    );
+                    if refusal.rule == Rule::UpstreamUnavailable {
+                        assert_eq!(refusal.to_string(), "upstream not available to this peer");
+                    }
+                    match &header {
+                        Some((_, v)) => assert_no_echo(&refusal, v, l),
+                        None => assert_no_echo(&refusal, &unescape(&l.input), l),
+                    }
+                    rules.insert(refusal.rule.name());
+                }
+                Outcome::Origin(r) => {
+                    let e =
+                        r.expect_err(&format!("refuse.txt:{}: ORIGIN {} accepted", l.no, l.input));
+                    assert_eq!(
+                        format!("{e:?}"),
+                        l.expect,
+                        "refuse.txt:{}: {}",
+                        l.no,
+                        l.input
+                    );
+                    let input = text(&l.input);
+                    if input.len() >= 6 {
+                        assert!(!e.to_string().contains(&input));
+                    }
+                    origin_errors.insert(format!("{e:?}"));
+                }
+                Outcome::Address(r) => {
+                    let e = r.expect_err(&format!("refuse.txt:{}: {} admitted", l.no, l.input));
+                    assert_eq!(e.label(), l.expect, "refuse.txt:{}: {}", l.no, l.input);
+                    labels.insert(e.label());
+                }
+                Outcome::Config(cfg, key, value) => {
+                    let errs: Vec<&ConfigError> = cfg.errors();
+                    let disabled =
+                        matches!(cfg.entries().next(), Some((_, UpstreamEntry::Disabled(_))));
+                    assert!(
+                        disabled,
+                        "refuse.txt:{}: {key}={value} left the upstream enabled",
+                        l.no
+                    );
+                    assert!(
+                        errs.iter().any(
+                            |e| matches!(e, ConfigError::Upstream { key: k, .. } if *k == l.expect)
+                        ),
+                        "refuse.txt:{}: no error names {}: {:?}",
+                        l.no,
+                        l.expect,
+                        errs.iter().map(ToString::to_string).collect::<Vec<_>>()
+                    );
+                    assert!(
+                        cfg.upstream_for("cfg", Some(FIXTURE_UID)).is_none(),
+                        "a disabled upstream must be refused"
+                    );
+                    for e in &errs {
+                        let shown = e.to_string();
+                        // A value that is a word of the fixed sentence ("upgrade") is not an echo.
+                        let fixed = match e {
+                            ConfigError::Upstream { reason, .. } => reason.to_string(),
+                            _ => String::new(),
+                        };
+                        if value.len() >= 5 && !fixed.contains(&value) {
+                            assert!(
+                                !shown.contains(&value),
+                                "refuse.txt:{}: the error quotes the value: {shown}",
+                                l.no
+                            );
+                        }
                     }
                 }
             }
+        }));
+        if let Err(e) = outcome {
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            failures.push(format!("line {}: {msg}", l.no));
         }
     }
+    assert!(
+        failures.is_empty(),
+        "{} refuse.txt line(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
     // Rules no single short corpus line can reach.
     rules.extend(synthesized_refusals());
     let missing: Vec<&str> = Rule::ALL
@@ -440,8 +460,9 @@ fn synthesized_refusals() -> Vec<&'static str> {
 fn every_accept_line_is_accepted() {
     let lines = load("accept.txt");
     assert!(lines.len() > 150, "the corpus lost lines: {}", lines.len());
+    let mut failures: Vec<String> = Vec::new();
     for l in &lines {
-        match run(l) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match run(l) {
             Outcome::Validated(r, header) => {
                 let v = r.unwrap_or_else(|e| {
                     panic!(
@@ -487,8 +508,22 @@ fn every_accept_line_is_accepted() {
                 assert!(cfg.upstream_for("cfg", Some(FIXTURE_UID)).is_some());
                 assert_eq!(l.expect, "enabled");
             }
+        }));
+        if let Err(e) = outcome {
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            failures.push(format!("line {}: {msg}", l.no));
         }
     }
+    assert!(
+        failures.is_empty(),
+        "{} accept.txt line(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 #[test]

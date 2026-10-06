@@ -493,3 +493,213 @@ fn accept_encoding_is_added_only_when_absent() {
     assert!(!go(&[], false));
     assert!(!go(&ae, true));
 }
+
+fn one_upstream(
+    extra: &[(&str, &str)],
+    read: &dyn Fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> HttpConfig {
+    let mut env = vec![
+        ("FERRO_UPSTREAMS", "u"),
+        ("FERRO_UPSTREAM_U_ORIGIN", "https://u.example"),
+    ];
+    env.extend_from_slice(extra);
+    HttpConfig::load(
+        env.iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v))),
+        read,
+    )
+}
+
+fn validate_u<'c>(
+    cfg: &'c HttpConfig,
+    headers: &[(String, Vec<u8>)],
+    body: Option<&[u8]>,
+    decode: bool,
+) -> Result<ferro_http::Validated<'c>, ferro_http::Refusal> {
+    ferro_http::validate(
+        cfg,
+        None,
+        &ferro_http::Request {
+            upstream: "u",
+            method: "POST",
+            target: "/",
+            origin: None,
+            headers,
+            body,
+            idempotent: None,
+            decode,
+        },
+    )
+}
+
+/// Review mutation B: an attached `Accept-Encoding` suppresses the decode-only one (§23.4.4
+/// amendment), otherwise the request would carry two.
+#[test]
+fn an_attached_accept_encoding_suppresses_the_decode_only_one() {
+    let read = |_: &Path| Ok(b"Accept-Encoding: identity\n".to_vec());
+    let cfg = one_upstream(&[("FERRO_UPSTREAM_U_ATTACH_HEADERS_FILE", "/f")], &read);
+    assert!(cfg.errors().is_empty(), "{:?}", shown(&cfg));
+    assert!(
+        !validate_u(&cfg, &[], None, true)
+            .unwrap()
+            .add_accept_encoding
+    );
+    // Control: the same upstream without the attached header asks for decoding.
+    let cfg = one_upstream(&[], &fixture_read);
+    assert!(
+        validate_u(&cfg, &[], None, true)
+            .unwrap()
+            .add_accept_encoding
+    );
+}
+
+/// Review mutation V: the daemon-wide FERRO_HTTP_MAX_BODY_BYTES half of "the smaller of the two".
+#[test]
+fn the_daemon_body_budget_bounds_a_body_too() {
+    let cfg = one_upstream(&[("FERRO_HTTP_MAX_BODY_BYTES", "10")], &fixture_read);
+    assert!(cfg.errors().is_empty());
+    assert!(validate_u(&cfg, &[], Some(&[0u8; 10]), false).is_ok());
+    assert_eq!(
+        validate_u(&cfg, &[], Some(&[0u8; 11]), false)
+            .map(|_| ())
+            .unwrap_err()
+            .rule,
+        ferro_http::Rule::BodyTooLarge
+    );
+}
+
+/// Review mutation U: a BLANK unknown daemon key is still an unknown key (a typo is a typo).
+#[test]
+fn a_blank_unknown_daemon_key_still_disables() {
+    let cfg = one_upstream(&[("FERRO_HTTP_BOGUS", "")], &fixture_read);
+    assert!(cfg.service_disabled());
+    let cfg = one_upstream(&[("FERRO_HTTP_DRAIN_MS", "")], &fixture_read);
+    assert!(
+        !cfg.service_disabled(),
+        "control: a blank KNOWN key reads as unset"
+    );
+}
+
+/// Review mutation A: the real reader caps one byte PAST the limit, so an oversize file is refused
+/// rather than truncated to a file that parses.
+#[test]
+fn read_capped_refuses_an_oversize_file_instead_of_truncating_it() {
+    let dir = std::env::temp_dir().join(format!("ferro-http-f3-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let max = ferro_http::attach::MAX_FILE_BYTES;
+    let line = |len: usize| {
+        let mut v = b"X-A: ".to_vec();
+        v.resize(len, b'v');
+        v
+    };
+    let over = dir.join("over");
+    std::fs::write(&over, line(max + 1)).unwrap();
+    let exact = dir.join("exact");
+    std::fs::write(&exact, line(max)).unwrap();
+    let path = |p: &Path| p.to_str().unwrap().to_string();
+    let cfg = one_upstream(
+        &[("FERRO_UPSTREAM_U_ATTACH_HEADERS_FILE", &path(&over))],
+        &ferro_http::config::read_capped,
+    );
+    assert!(
+        !enabled(&cfg, "u"),
+        "an oversize file must not be truncated into acceptance"
+    );
+    let cfg = one_upstream(
+        &[("FERRO_UPSTREAM_U_ATTACH_HEADERS_FILE", &path(&exact))],
+        &ferro_http::config::read_capped,
+    );
+    assert!(
+        enabled(&cfg, "u"),
+        "control: a file of exactly the cap: {:?}",
+        shown(&cfg)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    // from_env reads the real environment, which declares no upstream under `cargo test`.
+    let env_cfg = HttpConfig::from_env();
+    assert!(env_cfg.errors().is_empty() || std::env::var_os("FERRO_UPSTREAMS").is_some());
+}
+
+/// Review F-6: a request's Debug never shows a header value, the target or the body.
+#[test]
+fn a_request_debug_shows_names_never_values() {
+    let headers = vec![(
+        "Authorization".to_string(),
+        b"Bearer END-USER-SECRET".to_vec(),
+    )];
+    let req = ferro_http::Request {
+        upstream: "u",
+        method: "POST",
+        target: "/users/TARGET-SECRET?token=QUERY-SECRET",
+        origin: Some("https://u.example"),
+        headers: &headers,
+        body: Some(b"BODY-SECRET"),
+        idempotent: None,
+        decode: false,
+    };
+    let shown = format!("{req:?} {req:#?}");
+    for secret in [
+        "END-USER-SECRET",
+        "TARGET-SECRET",
+        "QUERY-SECRET",
+        "BODY-SECRET",
+    ] {
+        assert!(!shown.contains(secret), "{secret} in {shown}");
+    }
+    assert!(shown.contains("Authorization"), "names are shown: {shown}");
+}
+
+/// Review F-1, at the plan level: under ATTACH_POLICY=override a folded spelling of an attached
+/// name is REPLACED (counted), never sent beside the daemon's value.
+#[test]
+fn a_folded_spelling_of_an_attached_name_is_overridden() {
+    let cfg = ferro_http::fuzzing::fixture_config();
+    for name in ["X_Api_Key", "x.api.key", "X-API_KEY"] {
+        let headers = vec![(name.to_string(), b"PHP".to_vec())];
+        let v = ferro_http::validate(
+            cfg,
+            Some(ferro_http::fuzzing::FIXTURE_UID),
+            &ferro_http::Request {
+                upstream: "override",
+                method: "GET",
+                target: "/",
+                origin: None,
+                headers: &headers,
+                body: None,
+                idempotent: None,
+                decode: false,
+            },
+        )
+        .unwrap();
+        assert_eq!((v.send_headers.len(), v.overridden), (0, 1), "{name}");
+    }
+}
+
+/// The idempotency key is matched EXACTLY (case-insensitively), never folded: folding it would
+/// license a request whose `Idempotency_Key` a non-folding upstream never sees.
+#[test]
+fn the_idempotency_key_is_not_folded() {
+    let cfg = ferro_http::fuzzing::fixture_config();
+    let go = |name: &str| {
+        let headers = vec![(name.to_string(), b"k-1".to_vec())];
+        ferro_http::validate(
+            cfg,
+            Some(ferro_http::fuzzing::FIXTURE_UID),
+            &ferro_http::Request {
+                upstream: "api",
+                method: "POST",
+                target: "/api/x",
+                origin: None,
+                headers: &headers,
+                body: None,
+                idempotent: None,
+                decode: false,
+            },
+        )
+        .unwrap()
+        .idempotent
+    };
+    assert!(go("Idempotency-Key"));
+    assert!(!go("Idempotency_Key"));
+    assert!(!go("idempotency.key"));
+}

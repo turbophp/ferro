@@ -15,7 +15,7 @@ use std::fmt;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::config::{AttachPolicy, HttpConfig, PathEncoding, PathParams, Upstream};
-use crate::syntax::{hex_val, is_field_value, is_token, parse_decimal_u64};
+use crate::syntax::{fold_name, hex_val, is_field_value, is_token, parse_decimal_u64};
 
 /// The `forbidden_*` cause group of §23.5.6 a refusal belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -271,7 +271,10 @@ impl fmt::Display for Refusal {
 }
 
 /// One request as `HttpRequest` (§23.5.1) carries it, minus the fields validation does not read.
-#[derive(Clone, Debug)]
+///
+/// Its `Debug` is written by hand and shows header NAMES only — never a header value, the target,
+/// the `origin` field's value or the body, which may carry an end user's credentials (§23.10.3).
+#[derive(Clone)]
 pub struct Request<'a> {
     pub upstream: &'a str,
     pub method: &'a str,
@@ -281,6 +284,28 @@ pub struct Request<'a> {
     pub body: Option<&'a [u8]>,
     pub idempotent: Option<bool>,
     pub decode: bool,
+}
+
+impl fmt::Debug for Request<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request")
+            .field("upstream", &self.upstream)
+            .field("method", &self.method)
+            .field("target_len", &self.target.len())
+            .field("origin", &self.origin.map(|_| "<elided>"))
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(n, v)| format!("{n}: <{} bytes>", v.len()))
+                    .collect::<Vec<_>>(),
+            )
+            .field("body_len", &self.body.map(<[u8]>::len))
+            .field("idempotent", &self.idempotent)
+            .field("decode", &self.decode)
+            .finish()
+    }
 }
 
 /// An accepted request: what the engine sends, by reference to what PHP sent.
@@ -454,20 +479,25 @@ fn is_dot_only(seg: &[u8]) -> bool {
     !seg.is_empty() && seg.iter().all(|&b| b == b'.' || b == b' ') && seg.contains(&b'.')
 }
 
-/// Split on `/` and `\`, cut each segment at its first `;`, and report whether any segment is a
-/// dot segment (§23.4.2 step 7).
+/// Split on `/` and `\`, cut each segment at its first `;`, `?` or `#`, and report whether any
+/// segment is a dot segment (§23.4.2 step 7).
 ///
-/// The cut is applied whatever `PATH_PARAMS` says. With `PATH_PARAMS=refuse` a raw `;` is already
+/// A decoded `?` or `#` (`%3F`, `%23`, or their NFKC forms U+FF1F, U+FE56, U+FF03 through step 8)
+/// is cut for the same reason as `;`: code that percent-decodes the path and then parses it as a
+/// URL reads `/api/..%3F` as `/api/..` plus a query (review F-5). The cut is applied whatever
+/// `PATH_PARAMS` says. With `PATH_PARAMS=refuse` a raw `;` is already
 /// refused, so a `;` in the decoded copy came from `%3B`; a server that decodes BEFORE stripping
 /// `;params` reads `/api/..%3B/admin` as `/admin`, and cutting can only refuse more
 /// (SPEC §22.2 (cw)).
 fn has_dot_segment(decoded: &[u8]) -> bool {
     decoded
         .split(|&b| b == b'/' || b == b'\\')
-        .map(|seg| match seg.iter().position(|&b| b == b';') {
-            Some(c) => &seg[..c],
-            None => seg,
-        })
+        .map(
+            |seg| match seg.iter().position(|&b| matches!(b, b';' | b'?' | b'#')) {
+                Some(c) => &seg[..c],
+                None => seg,
+            },
+        )
         .any(is_dot_only)
 }
 
@@ -547,15 +577,26 @@ pub(crate) fn is_override_header(lower: &str) -> bool {
             | "x-method-override"
             | "x-original-url"
             | "x-rewrite-url"
+            // WebDAV MOVE/COPY: names a second target the server writes to (review F-9).
+            | "destination"
     )
 }
 
 pub(crate) fn is_forwarding_header(lower: &str) -> bool {
-    lower == "forwarded"
-        || lower == "x-real-ip"
-        || lower
-            .strip_prefix("x-forwarded-")
-            .is_some_and(|rest| !rest.is_empty())
+    matches!(
+        lower,
+        "forwarded"
+            | "x-real-ip"
+            // Client-identity and host headers fronts trust (review F-9).
+            | "true-client-ip"
+            | "cf-connecting-ip"
+            | "x-client-ip"
+            | "client-ip"
+            | "x-host"
+            | "x-original-host"
+    ) || lower
+        .strip_prefix("x-forwarded-")
+        .is_some_and(|rest| !rest.is_empty())
 }
 
 struct HeaderPlan {
@@ -594,7 +635,8 @@ fn check_headers(
         if !is_field_value(value) {
             return Err(Refusal::header(Rule::HeaderValue, i, named));
         }
-        let lower = name.to_ascii_lowercase();
+        // Every table is keyed on the FOLDED name (see `fold_name`): `X_Api_Key` is `x-api-key`.
+        let lower = fold_name(name);
         let keep = match lower.as_str() {
             "host" => {
                 if value.as_slice() != up.origin.authority().as_bytes() {

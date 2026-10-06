@@ -144,6 +144,15 @@ const METHODS: &[&str] = &[
 ];
 
 const HEADER_NAMES: &[&str] = &[
+    "X_Forwarded_For",
+    "x.api.key",
+    "X_Api_Key",
+    "Keep_Alive",
+    "Content_Length",
+    "Destination",
+    "True-Client-IP",
+    "Accept_Encoding",
+    "X-Custom_Name",
     "Accept",
     "X-A",
     "Host",
@@ -216,9 +225,64 @@ fn gen_benign(r: &mut Rng, upstream: &str) -> (String, String) {
     (t, r.pick(&["GET", "POST"]).to_string())
 }
 
-fn gen_request(r: &mut Rng) -> OwnedRequest {
+/// Adversarial-looking fragments that the rules nevertheless ACCEPT on at least one upstream —
+/// the edge of the accepted class, which a gate over only benign requests never reaches.
+const EDGE_FRAGMENTS: &[&str] = &[
+    "..x",
+    "x..",
+    ".hidden",
+    "%2e%2ex",
+    "x%2e%2e",
+    "%2fadmin",
+    "%5cx",
+    "%3b",
+    "a;b=1",
+    "%7e",
+    "%20",
+    "x%3F",
+    "x%23",
+    "@",
+    ":",
+    "!$&'()*+,=",
+    "%c3%a9",
+    "%ef%bc%8ex",
+    "~",
+    "x?..",
+    "x?%2e%2e/..",
+    "x?a;b",
+    "%2e%2e%2ex",
+];
+
+fn gen_adversarial_target(r: &mut Rng, upstream: &str) -> String {
+    if r.below(4) == 0 {
+        return gen_target(r);
+    }
+    let mut t = match upstream {
+        "api" => r.pick(&["/api/", "/v1/", "/v1"]).to_string(),
+        "utf8" => "/w/".to_string(),
+        "params" => r.pick(&["/x/", "/a;b/"]).to_string(),
+        _ => "/".to_string(),
+    };
+    for i in 0..1 + r.below(3) {
+        if i > 0 {
+            t.push('/');
+        }
+        let f: &&str = if r.below(4) == 0 {
+            r.pick(FRAGMENTS)
+        } else {
+            r.pick(EDGE_FRAGMENTS)
+        };
+        t.push_str(f);
+    }
+    t
+}
+
+/// A generated request, and whether it came from the benign generator.
+fn gen_request_tagged(r: &mut Rng) -> (OwnedRequest, bool) {
     let upstream = r.pick(&FIXTURE_UPSTREAMS).to_string();
-    let benign = r.below(2) == 0;
+    // A quarter benign; the rest adversarial (review F-3: the first mix left the accepted class
+    // ~98% benign, so a regression refusing every adversarial request would have passed).
+    let benign = r.below(4) == 0;
     let authority = match fixture_config().upstream_for(&upstream, None) {
         Some(u) => u.origin.authority().to_string(),
         None => "internal.example.com".to_string(),
@@ -233,15 +297,24 @@ fn gen_request(r: &mut Rng) -> OwnedRequest {
             (name, v)
         })
         .collect();
-    let origin = match r.below(4) {
+    let normalised = fixture_config()
+        .upstream_for(&upstream, None)
+        .map(|u| u.origin.normalised().to_string());
+    let origin = match r.below(6) {
         0 => Some(format!("https://{authority}")),
         1 => Some(format!("http://{authority}")),
+        2 | 3 => normalised,
         _ => None,
     };
     let (target, method) = if benign {
         gen_benign(r, &upstream)
     } else {
-        (gen_target(r), r.pick(METHODS).to_string())
+        let m = if r.below(4) == 0 {
+            r.pick(METHODS).to_string()
+        } else {
+            r.pick(&["GET", "POST", "patch"]).to_string()
+        };
+        (gen_adversarial_target(r, &upstream), m)
     };
     let headers = if benign {
         vec![("Accept".to_string(), b"*/*".to_vec())]
@@ -249,7 +322,7 @@ fn gen_request(r: &mut Rng) -> OwnedRequest {
         headers
     };
     let origin = if benign { None } else { origin };
-    OwnedRequest {
+    let req = OwnedRequest {
         upstream,
         method,
         target,
@@ -258,7 +331,8 @@ fn gen_request(r: &mut Rng) -> OwnedRequest {
         body,
         idempotent: [None, Some(true), Some(false)][r.below(3)],
         decode: r.below(2) == 0,
-    }
+    };
+    (req, benign)
 }
 
 /// Render the HTTP/1.1 head the engine sends for an accepted request (attached values replaced
@@ -349,8 +423,12 @@ fn the_request_gate_over_generated_requests() {
     let cfg = fixture_config();
     let mut r = Rng(0x5eed_f3f3_0001);
     let (mut accepted, mut refused) = (0usize, 0usize);
+    // Accepted ADVERSARIAL requests, per upstream, and how many of them kept a non-benign header,
+    // carried an `origin` field, or had a target outside the benign alphabet.
+    let mut adv: std::collections::BTreeMap<String, usize> = Default::default();
+    let (mut adv_headers, mut adv_origin, mut adv_edge_target) = (0usize, 0usize, 0usize);
     for i in 0..60_000 {
-        let owned = gen_request(&mut r);
+        let (owned, benign) = gen_request_tagged(&mut r);
         let req = owned.as_request();
         // The oracle and the round trip (the fuzz target's body).
         check_request(&req);
@@ -358,12 +436,30 @@ fn the_request_gate_over_generated_requests() {
             Ok(v) => {
                 accepted += 1;
                 render_and_reparse(&v, &req);
+                if !benign {
+                    *adv.entry(req.upstream.to_string()).or_default() += 1;
+                    adv_headers += v.send_headers.len();
+                    adv_origin += usize::from(req.origin.is_some());
+                    adv_edge_target +=
+                        usize::from(req.target.contains(['%', ';', '?', ':', '@', '.']));
+                }
             }
             Err(e) => {
                 refused += 1;
                 let shown = e.to_string();
+                // The rule's fixed sentence may itself contain a value ("chunked").
+                let bare = ferro_http::Refusal {
+                    rule: e.rule,
+                    offset: None,
+                    header: None,
+                }
+                .to_string();
                 for (_, val) in req.headers.iter() {
-                    if val.len() >= 6 {
+                    let in_sentence = bare
+                        .as_bytes()
+                        .windows(val.len().max(1))
+                        .any(|w| w == val.as_slice());
+                    if val.len() >= 6 && !in_sentence {
                         assert!(
                             !shown
                                 .as_bytes()
@@ -381,6 +477,28 @@ fn the_request_gate_over_generated_requests() {
         "too few accepted cases to mean anything: {accepted}"
     );
     assert!(refused > 3_000, "too few refused cases: {refused}");
+    // Every upstream a uid-1000 peer can reach must have a substantial ADVERSARIAL accepted class
+    // of its own; `uidonly` is refused by construction.
+    for up in FIXTURE_UPSTREAMS.iter().filter(|u| **u != "uidonly") {
+        let n = adv.get(*up).copied().unwrap_or(0);
+        assert!(
+            n >= 400,
+            "too few accepted adversarial requests on {up}: {n} ({adv:?})"
+        );
+    }
+    assert!(
+        adv_headers >= 1_500,
+        "kept non-benign headers: {adv_headers}"
+    );
+    assert!(adv_origin >= 2_000, "accepted origin fields: {adv_origin}");
+    assert!(
+        adv_edge_target >= 4_000,
+        "accepted edge targets: {adv_edge_target}"
+    );
+    eprintln!(
+        "request gate: accepted {accepted}, refused {refused}; adversarial accepted {adv:?}, \
+         kept headers {adv_headers}, origin fields {adv_origin}, edge targets {adv_edge_target}"
+    );
 }
 
 #[test]

@@ -41,6 +41,27 @@ pub(crate) fn is_field_value(v: &[u8]) -> bool {
     visible(first) && visible(last) && v.iter().all(|&b| visible(b) || b == b' ' || b == b'\t')
 }
 
+/// A header NAME as every rule table looks it up: ASCII-lowercased, with every non-alphanumeric
+/// byte folded to `-` (SPEC §23.4.3, amended M6-F3).
+///
+/// CGI-style servers do not see header names, they see `HTTP_*` variables: `php -S`, WSGI
+/// (`wsgiref`), gunicorn before 22 and Puma before CVE-2024-45614's fix map `X_Forwarded_For`,
+/// `X.Forwarded.For` and `X-Forwarded-For` onto the same `HTTP_X_FORWARDED_FOR`. A table keyed on
+/// the exact name would let PHP smuggle a refused forwarding/override header, or a second value for
+/// an attached credential, past the engine under one of those spellings. Folding makes every
+/// spelling such a server could merge hit the same rule. The name SENT is still PHP's own bytes.
+pub fn fold_name(name: &str) -> String {
+    name.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                char::from(b.to_ascii_lowercase())
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
