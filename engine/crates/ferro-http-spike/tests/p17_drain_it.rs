@@ -189,22 +189,22 @@ async fn p17_existing_sessions_keep_reading_frames_during_the_drain() {
     assert_eq!(i.header.request_id, 10);
     assert_eq!(ok_body(&i), b"draining");
 
-    // A frame on the future HTTP service id is read and answered (Unsupported today) — one END.
+    // A frame on the HTTP service id (6/REQUEST, routed to the handler since M6-F2) is read during
+    // the drain, reaches the handler, and is refused with `draining` — exactly one END. (Before F2
+    // the session answered service 6 with `Unsupported`; either way the frame is read, which is
+    // P17's claim.)
     idle.send(HTTP_SERVICE_ID, SOME_METHOD, 11, vec![]).await;
     let u = idle.recv().await.expect("service 6 answered");
     assert_eq!(u.header.request_id, 11);
-    assert_eq!(u.header.flags, flags::END);
-    assert!(matches!(
-        Outcome::decode(&u.payload).unwrap(),
-        Outcome::Error(_)
-    ));
+    assert_eq!(ok_body(&u), b"draining");
 
     // The in-flight request still completes.
     park.notify_one();
     let r1 = busy.recv().await.expect("rid 1 completes");
     assert_eq!(r1.header.request_id, 1);
     assert_eq!(ok_body(&r1), b"served");
-    assert_eq!(invoked.load(Ordering::SeqCst), 3);
+    // Three SQL requests plus the service-6 REQUEST, which reaches the handler since M6-F2.
+    assert_eq!(invoked.load(Ordering::SeqCst), 4);
 
     drop(busy);
     drop(idle);
