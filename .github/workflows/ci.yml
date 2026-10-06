@@ -57,6 +57,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # `--wait` blocks on each service's compose healthcheck, so the suite never races a backend
       # that is listening but still running its init script.
+      # M3-D2c: `ferro gen`'s tests run the REAL PHP client's hydrator and `php -l` against the
+      # generated code. They print `skip:` without a `php`, which the no-skip gate below refuses.
+      - uses: shivammathur/setup-php@v2
+        with: { php-version: "8.4" }
       - run: docker compose -f testkit/docker-compose.yml up -d --wait pg mysql mariadb
       # SPEC §13 OTLP (M2-C4c-2): the trace exporter's CONSUMER is a real OpenTelemetry Collector,
       # and `ferrod`'s `otlp_it` drives one and reads back what it EXPORTED (a collector drops a
