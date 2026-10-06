@@ -85,13 +85,27 @@ pub struct RunParams {
 /// interpretation contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct D12Meta {
-    /// A provisional (WSL2) measurement, not the bare-metal reference re-run [honesty].
+    /// Any run NOT on the D17 reference runner (a developer machine, WSL2, a container) [honesty].
+    /// Always `!reference`.
     pub provisional: bool,
-    /// `false` until a human signs off on a bare-metal/host-network re-run.
+    /// `true` only on the SPEC §21 D17 reference environment, a GitHub-hosted `ubuntu-latest`
+    /// runner, read from the runner's own variables (`fanout::is_reference_runner`). D17 replaced
+    /// the earlier bare-metal sign-off; D17's caveat is that a shared-runner p99 is an upper bound.
     pub reference: bool,
     /// SPEC §16.1 boundary-latency targets on loopback UDS, for at-a-glance comparison.
     pub target_p50_ns: u64,
     pub target_p99_ns: u64,
+}
+
+impl D12Meta {
+    /// The tags for a run: provisional everywhere but the D17 reference runner.
+    pub fn for_run(reference: bool) -> Self {
+        D12Meta {
+            reference,
+            provisional: !reference,
+            ..D12Meta::default()
+        }
+    }
 }
 
 impl Default for D12Meta {
@@ -127,7 +141,7 @@ impl BenchResult {
     /// - each `ferro` run's EFFECTIVE JIT equals its INTENDED JIT [V6] (a silently-disabled JIT on
     ///   WSL2 would otherwise mislabel the number);
     /// - the manifest pins a `release` ferrod [V1] and carries the required identifying fields;
-    /// - the record is tagged `provisional && !reference` (this path only ever writes provisional).
+    /// - the tags are consistent: `provisional == !reference` (`reference` only on the D17 runner).
     pub fn validate(&self) -> Result<(), String> {
         // ---- ferro runs: presence + JIT off/on coverage ----
         let ferro: Vec<&Run> = self.runs.iter().filter(|r| r.target == "ferro").collect();
@@ -192,11 +206,13 @@ impl BenchResult {
             }
         }
 
-        // ---- tags: this writer only ever emits a provisional record ----
-        if !self.d12.provisional || self.d12.reference {
-            return Err("a bench run written by this orchestrator must be tagged \
-                        provisional=true, reference=false [honesty]"
-                .to_string());
+        // ---- tags: a run is either the D17 reference or provisional, never both or neither ----
+        if self.d12.provisional == self.d12.reference {
+            return Err(format!(
+                "inconsistent tags provisional={} reference={}: a run is provisional exactly when \
+                 it is not the D17 reference [honesty]",
+                self.d12.provisional, self.d12.reference
+            ));
         }
 
         Ok(())
@@ -364,10 +380,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_provisional_tag() {
+    fn rejects_inconsistent_tags() {
         let mut r = good_result();
-        r.d12.reference = true;
+        r.d12.reference = true; // and still provisional
         let err = r.validate().unwrap_err();
-        assert!(err.contains("provisional"), "got: {err}");
+        assert!(err.contains("inconsistent tags"), "got: {err}");
+        r.d12 = D12Meta::for_run(true);
+        r.validate()
+            .expect("the D17 reference run is a valid record");
+        r.d12 = D12Meta::for_run(false);
+        r.validate().expect("a provisional run is a valid record");
+        r.d12.provisional = false; // neither
+        assert!(r.validate().unwrap_err().contains("inconsistent tags"));
     }
 }

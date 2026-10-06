@@ -6,18 +6,22 @@ declare(strict_types=1);
  * 2 ms under Fibers" (M3-D1e).
  *
  * Every iteration times, back to back on ONE connection:
- *   - single: one synchronous `SELECT pg_sleep(s)` — the slowest query, since all k are equal;
+ *   - single: one synchronous `SELECT pg_backend_pid() FROM pg_sleep(s)` — the slowest query,
+ *             since all k are equal;
  *   - fibers: k tasks under `Ferro\Loop::run`, each awaiting its own `scalarAsync` of the same
  *             statement — the §16 shape ("under Fibers");
  *   - await:  the same k statements submitted together and awaited with `Ferro\await()` — plain
  *             FPM, no scheduler (M3-D1a);
  * and the orchestrator reports each distribution and `fanout − single` per iteration. The sleep
- * keeps the measurement about OVERLAP: k sequential sleeps would cost k × s.
+ * keeps the measurement about OVERLAP: k sequential sleeps would cost k × s. Each statement returns
+ * its backend's pid, and every fan-out records how many DISTINCT pids answered it, so the record
+ * proves the k statements ran on k server sessions at once rather than inferring it from timing.
  *
  * GC stays on and the samples are emitted once after the loop, as in bench_client.php.
  *
  * Usage: php bench_fanout.php <autoload.php> <socket> <warmup> <measured> <k> <sleep_ms>
- * Output: {"header": {...}, "single": [ns…], "fibers": [ns…], "await": [ns…]}
+ * Output: {"header": {...}, "single": [ns…], "fibers": [ns…], "await": [ns…],
+ *          "fibers_pids": [distinct…], "await_pids": [distinct…]}
  */
 
 if ($argc < 7) {
@@ -57,14 +61,15 @@ if ($conn === null) {
     exit(66);
 }
 
-$sql = sprintf('SELECT 1 FROM pg_sleep(%.6F)', $sleep);
+$sql = sprintf('SELECT pg_backend_pid() FROM pg_sleep(%.6F)', $sleep);
 
 $single = static function () use ($conn, $sql): int {
     $t = hrtime(true);
     $conn->scalar($sql);
     return hrtime(true) - $t;
 };
-$fibers = static function () use ($conn, $sql, $k): int {
+/** @return array{int, int} [ns, distinct backend pids] */
+$fibers = static function () use ($conn, $sql, $k): array {
     $tasks = [];
     for ($i = 0; $i < $k; ++$i) {
         $tasks[] = static fn (): mixed => $conn->scalarAsync($sql)->await();
@@ -75,9 +80,10 @@ $fibers = static function () use ($conn, $sql, $k): int {
     if (count($out) !== $k) {
         throw new \RuntimeException('fan-out lost a result');
     }
-    return $ns;
+    return [$ns, count(array_unique($out))];
 };
-$await = static function () use ($conn, $sql, $k): int {
+/** @return array{int, int} [ns, distinct backend pids] */
+$await = static function () use ($conn, $sql, $k): array {
     $t = hrtime(true);
     $futures = [];
     for ($i = 0; $i < $k; ++$i) {
@@ -88,7 +94,7 @@ $await = static function () use ($conn, $sql, $k): int {
     if (count($out) !== $k) {
         throw new \RuntimeException('fan-out lost a result');
     }
-    return $ns;
+    return [$ns, count(array_unique($out))];
 };
 
 for ($i = 0; $i < $warmup; ++$i) {
@@ -99,10 +105,12 @@ for ($i = 0; $i < $warmup; ++$i) {
 $s = array_fill(0, $measured, 0);
 $f = array_fill(0, $measured, 0);
 $a = array_fill(0, $measured, 0);
+$fp = array_fill(0, $measured, 0);
+$ap = array_fill(0, $measured, 0);
 for ($i = 0; $i < $measured; ++$i) {
     $s[$i] = $single();
-    $f[$i] = $fibers();
-    $a[$i] = $await();
+    [$f[$i], $fp[$i]] = $fibers();
+    [$a[$i], $ap[$i]] = $await();
 }
 
 $jitRaw = null;
@@ -129,4 +137,6 @@ echo json_encode([
     'single' => $s,
     'fibers' => $f,
     'await' => $a,
+    'fibers_pids' => $fp,
+    'await_pids' => $ap,
 ], JSON_THROW_ON_ERROR), "\n";

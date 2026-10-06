@@ -3,8 +3,9 @@
 # separate jobs on two separate runners, because a shared runner is noisy and one run is an anecdote.
 #
 # A result is DATA to record, not a build verdict: a missed budget does not fail the job. The job
-# fails only when a run could not produce a valid record (`validate()` refused it, or ferrod or PHP
-# died).
+# fails when a run could not produce a valid record (`validate()` refused it, or ferrod or PHP
+# died), and when it would have SKIPPED (no Postgres): on a runner a skip is a failure, and the
+# upload step refuses an empty result set.
 #
 # Runs on demand, and on a pull request that changes the bench itself — a new workflow can only be
 # dispatched once it is on the default branch, and a bench change should be measured before it lands.
@@ -37,9 +38,15 @@ jobs:
       FERRO_TEST_PG_URL: postgres://ferro:ferro@127.0.0.1:55432/ferro
       FERRO_BENCH_ENV: gh-ubuntu-latest
     steps:
+      # On a pull request the default checkout is GitHub's synthetic merge commit, which is on no
+      # branch; the manifest's git_sha must name the commit that was measured.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      # `coverage: none`: setup-php enables Xdebug on GitHub's Ubuntu images by default, and Xdebug
+      # disables the JIT the bench requires (the harness refuses a JIT that did not engage).
       - uses: shivammathur/setup-php@v2
-        with: { php-version: "8.4", extensions: "opcache, pdo_pgsql", tools: composer }
+        with: { php-version: "8.4", extensions: "opcache, pdo_pgsql", tools: composer, coverage: none }
       - uses: dtolnay/rust-toolchain@stable
       - run: docker compose -f testkit/docker-compose.yml up -d --wait pg
       - run: cargo build -p ferrod --release
@@ -58,4 +65,4 @@ jobs:
         with:
           name: bench-results-run${{ matrix.run }}
           path: bench/results/*-gh-ubuntu-latest*.json
-          if-no-files-found: ignore
+          if-no-files-found: error

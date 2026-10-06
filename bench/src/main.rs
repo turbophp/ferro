@@ -45,6 +45,11 @@ fn main() {
         Ok(path) => {
             eprintln!("ferro-bench: wrote {}", path.display());
         }
+        // On a CI runner a skip means the job measured nothing; it must not pass green.
+        Err(RunExit::Skip(msg)) if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") => {
+            eprintln!("ferro-bench: FAILED — would have skipped on a CI runner: {msg}");
+            std::process::exit(1);
+        }
         Err(RunExit::Skip(msg)) => {
             eprintln!("ferro-bench: SKIP — {msg}");
             // exit 0: a missing live stack must not fail the offline gate (matches ferro-e2e).
@@ -154,23 +159,8 @@ fn run() -> Result<PathBuf, RunExit> {
     }
     let _ = std::fs::remove_file(&socket_path); // clear any stale file before bind
 
-    // The fan-out scenario reads the daemon's pool size off its own metrics endpoint.
-    let metrics_addr = if args.scenario == "fanout" {
-        let l = std::net::TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| RunExit::Fail(format!("no free loopback port for metrics: {e}")))?;
-        let a = l.local_addr().map_err(|e| RunExit::Fail(e.to_string()))?;
-        drop(l);
-        Some(a.to_string())
-    } else {
-        None
-    };
-    let extra_env: Vec<(&str, &str)> = metrics_addr
-        .as_deref()
-        .map(|a| vec![("FERRO_METRICS_ADDR", a)])
-        .unwrap_or_default();
-    let mut ferrod =
-        FerrodProc::spawn_with_env(&ferrod_bin, &socket_path, &pg_url, &log_path, &extra_env)
-            .map_err(|e| RunExit::Fail(format!("failed to launch ferrod: {e}")))?;
+    let mut ferrod = FerrodProc::spawn(&ferrod_bin, &socket_path, &pg_url, &log_path)
+        .map_err(|e| RunExit::Fail(format!("failed to launch ferrod: {e}")))?;
     eprintln!(
         "ferro-bench: launched ferrod pid={} on {}",
         ferrod.pid(),
@@ -187,15 +177,7 @@ fn run() -> Result<PathBuf, RunExit> {
         )));
     }
     if args.scenario == "fanout" {
-        let metrics_addr = metrics_addr.expect("set for the fanout scenario above");
-        return run_fanout(
-            &php_bin,
-            &repo_root,
-            &autoload,
-            &socket_path,
-            &metrics_addr,
-            &mut ferrod,
-        );
+        return run_fanout(&php_bin, &repo_root, &autoload, &socket_path, &mut ferrod);
     }
     if args.scenario != "trivial" {
         return Err(RunExit::Fail(format!(
@@ -350,9 +332,11 @@ fn run() -> Result<PathBuf, RunExit> {
 
     runs.push(pdo_run);
 
+    let env = run_env_label(&mf.virtualization);
+    let reference = run_is_reference();
     let result = BenchResult {
         schema_version: SCHEMA_VERSION,
-        d12: D12Meta::default(),
+        d12: D12Meta::for_run(reference),
         params: RunParams {
             scenario: args.scenario,
             warmup: WARMUP,
@@ -374,17 +358,15 @@ fn run() -> Result<PathBuf, RunExit> {
     let results_dir = repo_root.join("bench/results");
     std::fs::create_dir_all(&results_dir)
         .map_err(|e| RunExit::Fail(format!("failed to create {}: {e}", results_dir.display())))?;
-    let out_path = results_dir.join(format!(
-        "{}-{}.json",
-        manifest::utc_filename_stamp(),
-        env_label(&result.manifest.virtualization)
-    ));
+    let out_path = results_dir.join(format!("{}-{env}.json", manifest::utc_filename_stamp()));
     let json = serde_json::to_string_pretty(&result)
         .map_err(|e| RunExit::Fail(format!("failed to serialize result: {e}")))?;
     std::fs::write(&out_path, json.as_bytes())
         .map_err(|e| RunExit::Fail(format!("failed to write {}: {e}", out_path.display())))?;
 
-    print_summary(&result);
+    // The workflow reads the record back out of the job log, so print it whole.
+    println!("{json}");
+    print_summary(&result, &env);
     // Returning drops `ferrod` -> SIGTERM/SIGKILL + unlink socket [V8].
     Ok(out_path)
 }
@@ -397,6 +379,8 @@ struct FanoutOutput {
     fibers: Vec<u64>,
     #[serde(rename = "await")]
     await_: Vec<u64>,
+    fibers_pids: Vec<usize>,
+    await_pids: Vec<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -408,40 +392,20 @@ struct FanoutHeader {
     packer_class: String,
 }
 
-/// Where this run happened. `FERRO_BENCH_ENV` names it explicitly (the workflow sets
-/// `gh-ubuntu-latest`); otherwise `wsl2` or `local`.
-fn env_label(virtualization: &str) -> String {
-    match std::env::var("FERRO_BENCH_ENV") {
-        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ if virtualization == "WSL2" => "wsl2".to_string(),
-        _ => "local".to_string(),
-    }
+/// [`ferro_bench::fanout::env_label`] over this process's `FERRO_BENCH_ENV`.
+fn run_env_label(virtualization: &str) -> String {
+    ferro_bench::fanout::env_label(
+        std::env::var("FERRO_BENCH_ENV").ok().as_deref(),
+        virtualization,
+    )
 }
 
-/// SPEC §21 D17: the reference environment is a GitHub-HOSTED runner. Read from the variables the
-/// runner itself sets, never from the operator-chosen label.
-fn on_reference_runner() -> bool {
-    std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
-        && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
-}
-
-/// One `GET /metrics` against the daemon's own endpoint, returning the value of
-/// `ferro_pool_max_connections` for the `default` pool.
-fn read_pool_max(addr: &str) -> Result<usize, String> {
-    use std::io::{Read, Write};
-    let mut s = std::net::TcpStream::connect(addr).map_err(|e| format!("metrics connect: {e}"))?;
-    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-        .map_err(|e| format!("metrics write: {e}"))?;
-    let mut body = String::new();
-    s.read_to_string(&mut body)
-        .map_err(|e| format!("metrics read: {e}"))?;
-    body.lines()
-        .find_map(|l| {
-            l.strip_prefix("ferro_pool_max_connections{pool=\"default\"} ")
-                .and_then(|v| v.trim().parse().ok())
-        })
-        .ok_or_else(|| "ferro_pool_max_connections{pool=\"default\"} not exported".to_string())
+/// [`ferro_bench::fanout::is_reference_runner`] over this process's runner variables.
+fn run_is_reference() -> bool {
+    ferro_bench::fanout::is_reference_runner(
+        std::env::var("GITHUB_ACTIONS").ok().as_deref(),
+        std::env::var("RUNNER_ENVIRONMENT").ok().as_deref(),
+    )
 }
 
 /// `--scenario fanout` (M3-D1e): SPEC §16's "10-query fan-out latency ≤ max(single query) + 2 ms
@@ -451,10 +415,9 @@ fn run_fanout(
     repo_root: &Path,
     autoload: &Path,
     socket_path: &Path,
-    metrics_addr: &str,
     ferrod: &mut FerrodProc,
 ) -> Result<PathBuf, RunExit> {
-    use ferro_bench::fanout::{self, FanoutParams, FanoutResult};
+    use ferro_bench::fanout::{self, FanoutParams, FanoutResult, RawSamples};
 
     let directives = vec![
         "opcache.enable_cli=1".to_string(),
@@ -500,7 +463,6 @@ fn run_fanout(
             doc.header.jit_effective
         )));
     }
-    let pool_max_size = read_pool_max(metrics_addr).map_err(RunExit::Fail)?;
 
     let mut mf = manifest::collect_host();
     mf.ferrod_build_profile = "release".to_string();
@@ -509,25 +471,33 @@ fn run_fanout(
     mf.pdo_pgsql = false; // no PDO run in this scenario
     mf.gc_enabled = doc.header.gc_enabled;
     mf.packer_class = doc.header.packer_class;
-    let env = env_label(&mf.virtualization);
+    let env = run_env_label(&mf.virtualization);
 
+    eprintln!(
+        "ferro-bench: bootstrapping {} resamples ...",
+        fanout::BOOTSTRAP
+    );
     let result = FanoutResult::build(
         env.clone(),
-        on_reference_runner(),
+        run_is_reference(),
         FanoutParams {
             k: fanout::K,
             sleep_ms: fanout::SLEEP_MS,
             warmup: fanout::WARMUP,
             measured: fanout::MEASURED,
+            bootstrap_rounds: fanout::BOOTSTRAP,
             transport: "UDS".to_string(),
-            pool_max_size,
             php_directives: directives,
             jit_effective: doc.header.jit_effective,
         },
         mf,
-        &doc.single,
-        &doc.fibers,
-        &doc.await_,
+        RawSamples {
+            single_ns: doc.single,
+            fibers_ns: doc.fibers,
+            await_ns: doc.await_,
+            fibers_distinct_backends: doc.fibers_pids,
+            await_distinct_backends: doc.await_pids,
+        },
     );
     result
         .validate()
@@ -544,8 +514,13 @@ fn run_fanout(
         .map_err(|e| RunExit::Fail(format!("failed to serialize result: {e}")))?;
     std::fs::write(&out_path, json.as_bytes())
         .map_err(|e| RunExit::Fail(format!("failed to write {}: {e}", out_path.display())))?;
-    // The workflow reads the record back out of the job log, so print it whole.
-    println!("{json}");
+    // The workflow reads the record back out of the job log, so print it whole (one line: the raw
+    // samples would otherwise be thousands of log lines).
+    println!(
+        "{}",
+        serde_json::to_string(&result)
+            .map_err(|e| RunExit::Fail(format!("failed to serialize result: {e}")))?
+    );
 
     eprintln!(
         "\n=== ferro-bench fan-out ({env}, reference={}) ===",
@@ -557,16 +532,29 @@ fn run_fanout(
     );
     for m in &result.modes {
         eprintln!(
-            "  {:<7} p50={:>9}ns p99={:>9}ns  over single: p50 {:+}ns p99 {:+}ns  budget {}ns  {}",
+            "  {:<7} p50={:>9}ns p99={:>9}ns  over single: p50 {:+}ns [{:+}, {:+}] {}, p99 \
+             {:+}ns [{:+}, {:+}] {}  (budget {}ns, judged on the 95% upper bound; k={} distinct \
+             backends min {})",
             m.mode,
             m.summary.p50,
             m.summary.p99,
-            m.p50_over_single_ns,
-            m.p99_over_single_ns,
+            m.p50_over_single.point,
+            m.p50_over_single.ci95_low,
+            m.p50_over_single.ci95_high,
+            if m.met_p50 { "MET" } else { "MISSED" },
+            m.p99_over_single.point,
+            m.p99_over_single.ci95_low,
+            m.p99_over_single.ci95_high,
+            if m.met_p99 { "MET" } else { "MISSED" },
             result.budget_ns,
-            if m.met { "MET" } else { "MISSED" }
+            result.params.k,
+            m.min_distinct_backends
         );
     }
+    eprintln!(
+        "  max of {} single calls (the literal comparator, context only): p50={}ns p99={}ns",
+        result.params.k, result.max_of_k_single_p50_ns, result.max_of_k_single_p99_ns
+    );
     Ok(out_path)
 }
 
@@ -721,9 +709,14 @@ fn pg_reachable(host: &str, port: u16) -> bool {
 }
 
 /// Print a compact human summary of the measured result to stderr (the numbers Task 3 records).
-fn print_summary(r: &BenchResult) {
+fn print_summary(r: &BenchResult, env: &str) {
     eprintln!(
-        "\n=== ferro-bench D12 (provisional, {}) ===",
+        "\n=== ferro-bench D12 ({}, {env}, {}) ===",
+        if r.d12.reference {
+            "D17 reference"
+        } else {
+            "provisional"
+        },
         r.manifest.virtualization
     );
     eprintln!(
