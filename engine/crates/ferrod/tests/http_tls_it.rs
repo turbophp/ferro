@@ -1293,20 +1293,28 @@ async fn one_unusable_certificate_beside_a_good_one_disables_the_upstream() {
 /// fresh dial — resumed ones included (the server reads the identity back from the session) — and
 /// is served: three POSTs, each a fresh dial, and a declared GET, each answered 200 and received
 /// exactly once. The positive control for every refusal below, built from the same PKI.
+///
+/// A resumed handshake carries no certificate (the session does), so a build that presented the
+/// certificate only on a pool's FIRST dial would pass against a server that resumes. The third run
+/// is against a server that never resumes — every dial a full handshake that must present it.
 #[tokio::test]
 async fn an_mtls_upstream_presents_its_certificate_on_every_dial() {
-    for tls12_only in [false, true] {
+    for (tls12_only, resumes) in [(false, true), (true, true), (false, false)] {
         let pki = Pki::new();
         let client_ca = testcert::ca("Client CA");
         let files = pki.client_files(
             "client",
             &client_ca.sign(&Spec::new("ferro-client", Usage::Client)),
         );
-        let (addr, rec) = tls_upstream(
-            mtls_server_cfg(&pki.leaf(), &client_ca, tls12_only),
-            Script::Respond(OK_HELLO),
-        )
-        .await;
+        let server = if resumes {
+            mtls_server_cfg(&pki.leaf(), &client_ca, tls12_only)
+        } else {
+            let mut s = Arc::unwrap_or_clone(mtls_server_cfg(&pki.leaf(), &client_ca, tls12_only));
+            s.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+            s.send_tls13_tickets = 0;
+            Arc::new(s)
+        };
+        let (addr, rec) = tls_upstream(server, Script::Respond(OK_HELLO)).await;
         let mut extra = vec![
             ("CA_FILE", pki.ca_file().display().to_string()),
             ("H1_UNSAFE_REUSE_MAX_IDLE_MS", "0".into()),
@@ -1325,8 +1333,8 @@ async fn an_mtls_upstream_presents_its_certificate_on_every_dial() {
         assert_eq!(rec.requests().len(), 4, "tls12_only={tls12_only}");
         assert_eq!(
             d.engine.tls_handshakes("api"),
-            Some((1, 2)),
-            "tls12_only={tls12_only}: resumption works under mTLS"
+            Some(if resumes { (1, 2) } else { (3, 0) }),
+            "tls12_only={tls12_only} resumes={resumes}: resumption works under mTLS"
         );
         assert_eq!(rec.handshakes(), 3);
         assert_eq!(
