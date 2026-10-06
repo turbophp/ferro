@@ -44,6 +44,27 @@ pub struct Query {
     /// Where the query was declared, for error messages (not part of the hash).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// What `ferro check` learned by preparing the SQL against a shadow schema (M3-D2b): one entry
+    /// per bind parameter, the server's type name where it infers one. Not part of the hash: it
+    /// describes the schema the query was checked against, not what the engine runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Vec<Option<String>>>,
+    /// The result columns `ferro check` saw (M3-D2b); `ferro gen` builds DTOs from them. Not hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<Column>>,
+}
+
+/// One result column as `ferro check` described it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Column {
+    pub name: String,
+    /// The §9 type tag the engine sends for it, or `None` where the backend has no column types
+    /// (SQLite types each value).
+    pub tag: Option<u8>,
+    /// The server's own name for the type.
+    #[serde(rename = "type")]
+    pub type_name: String,
 }
 
 /// A whole manifest: every declared query, keyed by id.
@@ -468,6 +489,8 @@ pub fn parse_sql_file(source: &str, text: &str) -> Result<(String, Query), Vec<P
         idempotent,
         dto,
         source: Some(source.into()),
+        params: None,
+        columns: None,
     };
     if let Err(m) = check_pool(&query.pool) {
         problems.push(Problem {
@@ -543,6 +566,8 @@ impl ExtractedQuery {
                 idempotent: self.idempotent,
                 dto: self.dto,
                 source: Some(self.source),
+                params: None,
+                columns: None,
             },
         )
     }
@@ -769,6 +794,8 @@ mod tests {
             idempotent: false,
             dto: None,
             source: None,
+            params: None,
+            columns: None,
         };
         a.insert("x".into(), q("SELECT 1")).unwrap();
         a.insert("y".into(), q("SELECT 2")).unwrap();
@@ -791,6 +818,8 @@ mod tests {
                 idempotent: false,
                 dto: None,
                 source: None,
+                params: None,
+                columns: None,
             },
         )
         .unwrap();
@@ -835,6 +864,8 @@ mod tests {
                 idempotent: false,
                 dto: None,
                 source: None,
+                params: None,
+                columns: None,
             },
         )
         .unwrap();
@@ -855,6 +886,8 @@ mod tests {
                 idempotent: true,
                 dto: None,
                 source: None,
+                params: None,
+                columns: None,
             },
         )
         .unwrap();
@@ -980,6 +1013,8 @@ mod tests {
                 idempotent: false,
                 dto: None,
                 source: None,
+                params: None,
+                columns: None,
             },
         )
         .unwrap();
@@ -1019,5 +1054,37 @@ mod tests {
             "the upper-case `.SQL` file is found, once"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checked_shapes_round_trip_and_are_not_hashed() {
+        // M3-D2b: `ferro check --write` records params/columns; they describe the schema the query
+        // was checked against, not what the engine runs, so the hash must not move.
+        let (id, q) = parse_sql_file("a.sql", FILE).unwrap();
+        let mut plain = Manifest::new();
+        plain.insert(id.clone(), q.clone()).unwrap();
+        let mut checked = Manifest::new();
+        checked
+            .insert(
+                id.clone(),
+                Query {
+                    params: Some(vec![Some("int8".into()), None]),
+                    columns: Some(vec![Column {
+                        name: "id".into(),
+                        tag: Some(2),
+                        type_name: "int8".into(),
+                    }]),
+                    ..q
+                },
+            )
+            .unwrap();
+        assert_eq!(plain.hash(), checked.hash());
+        let loaded = Manifest::from_json(checked.to_json_with_hash().as_bytes()).expect("loads");
+        assert_eq!(loaded, checked);
+        // A misspelt column field is refused, like every other field.
+        let bad = checked
+            .to_json_with_hash()
+            .replace("\"type\": \"int8\"", "\"typ\": \"int8\"");
+        assert!(Manifest::from_json(bad.as_bytes()).is_err());
     }
 }

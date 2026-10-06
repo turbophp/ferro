@@ -501,5 +501,20 @@ final class ManifestTest extends TestCase
         $doc['hash'] = null;
         $this->assertSame(Manifest::fromJson(self::json(self::queries()))->hash(), Manifest::fromJson(json_encode($doc, JSON_THROW_ON_ERROR))->hash());
     }
+
+    /** M3-D2b: a manifest `ferro check --write` produced loads, with the same hash; a malformed shape does not. */
+    public function testACheckedManifestLoadsAndItsShapesAreNotHashed(): void
+    {
+        $q = self::queries();
+        $checked = $q;
+        $checked['users.find']['params'] = [null, 'int8'];
+        $checked['users.find']['columns'] = [['name' => 'id', 'tag' => 2, 'type' => 'int8']];
+        $this->assertSame(Manifest::fromJson(self::json($q))->hash(), Manifest::fromJson(self::json($checked))->hash());
+
+        $bad = $q;
+        $bad['users.find']['columns'] = [['name' => 'id', 'tag' => 2, 'typ' => 'int8']];
+        $this->expectException(ManifestException::class);
+        Manifest::fromJson(self::json($bad));
+    }
 }
 

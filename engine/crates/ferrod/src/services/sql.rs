@@ -2016,6 +2016,8 @@ mod tests {
             idempotent: false,
             dto: None,
             source: None,
+            params: None,
+            columns: None,
         };
         m.insert(
             "x.q".into(),

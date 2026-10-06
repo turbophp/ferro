@@ -54,4 +54,9 @@ GRANT ALL PRIVILEGES ON doctrine_tests.* TO 'ferro'@'%';
 -- must never be the shared `ferro` one. testkit/laravel/reset-mysql.sql recreates it.
 CREATE DATABASE IF NOT EXISTS laravel_tests CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 GRANT ALL PRIVILEGES ON laravel_tests.* TO 'ferro'@'%';
+-- `ferro schema-sync`'s live test (M3-D2b): a database it may EMPTY. Its reset is `DROP DATABASE` +
+-- `CREATE DATABASE` (the only reset that also removes routines, events and sequences), which the
+-- database-scoped grant permits for this name and no other.
+CREATE DATABASE IF NOT EXISTS ferro_cli_shadow;
+GRANT ALL PRIVILEGES ON ferro_cli_shadow.* TO 'ferro'@'%';
 FLUSH PRIVILEGES;

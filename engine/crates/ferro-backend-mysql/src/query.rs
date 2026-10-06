@@ -54,6 +54,46 @@ use crate::Value;
 use crate::conn::MysqlConn;
 use crate::{bind, rowmap};
 
+/// Prepares `sql` without running it and reports the server's description (`ferro check`,
+/// M3-D2b): the parameter COUNT (MySQL infers no usable parameter types at prepare) and each
+/// column's name, type and §9 tag — for a TABLE column only (an expression's prepared type is not
+/// its executed type, so it is reported untagged). A column type outside §9, or a `NULL`-typed prepared column,
+/// is the same loud refusal a query would raise. A `CALL` declares its columns only when executed,
+/// so it describes as columnless — stated, not guessed.
+pub async fn describe(
+    conn: &mut MysqlConn,
+    sql: &str,
+) -> Result<ferro_pool::backend::Describe, PoolError> {
+    let stmt = match conn.driver_mut().prep(sql).await {
+        Ok(s) => s,
+        Err(e) => return Err(conn.map_stmt_error(&e)),
+    };
+    let prepared = stmt.columns();
+    rowmap::refuse_prepared_null(&prepared)?;
+    let mut cols = Vec::with_capacity(prepared.len());
+    for col in prepared.iter() {
+        // A TABLE column's prepared type is its executed type. An EXPRESSION's is not: the engine
+        // describes and decodes from the EXECUTED metadata (§22.2 (av)/(aw)), and MySQL types an
+        // expression at prepare from its operands' guessed types (`SELECT ? + 1` prepares as a
+        // DOUBLE and executes as a LONGLONG for an integer bind) — so an expression gets no tag
+        // rather than a wrong one (M3-D2b review F10). A table column has an `org_table`.
+        let tag = if col.org_table_ref().is_empty() {
+            None
+        } else {
+            Some(rowmap::column_to_tag(col)?)
+        };
+        cols.push(ferro_pool::backend::DescribedColumn {
+            name: col.name_str().into_owned(),
+            tag,
+            type_name: format!("{:?}", col.column_type()),
+        });
+    }
+    Ok(ferro_pool::backend::Describe {
+        params: vec![None; stmt.num_params() as usize],
+        cols,
+    })
+}
+
 /// Runs `sql` (with native `?` placeholders) + `params` against `conn`, buffering the full result.
 /// See the module docs for the flow and the §19.3 safety invariants.
 pub async fn run(

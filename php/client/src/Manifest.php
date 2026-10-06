@@ -33,7 +33,11 @@ final class Manifest
     private const JSON_FLAGS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
         | JSON_UNESCAPED_LINE_TERMINATORS | JSON_THROW_ON_ERROR;
 
-    private const QUERY_FIELDS = ['sql', 'pool', 'readonly', 'idempotent', 'dto', 'source'];
+    /**
+     * `params`/`columns` are what `ferro check --write` recorded (M3-D2b): descriptions of the schema
+     * the query was checked against, outside the hash. Accepted and shape-checked, not acted on.
+     */
+    private const QUERY_FIELDS = ['sql', 'pool', 'readonly', 'idempotent', 'dto', 'source', 'params', 'columns'];
 
     /** @param array<string, ManifestQuery> $queries */
     private function __construct(
@@ -107,6 +111,7 @@ final class Manifest
         $idempotent = $q['idempotent'] ?? null;
         $dto = $q['dto'] ?? null;
         $source = $q['source'] ?? null;
+        self::checkShapes($id, $q['params'] ?? null, $q['columns'] ?? null);
         if (!is_string($sql) || $sql === '' || !is_string($pool) || $pool === ''
             || !is_bool($readonly) || !is_bool($idempotent) || !($dto === null || is_string($dto))
             || !($source === null || is_string($source))
@@ -124,6 +129,37 @@ final class Manifest
             throw new ManifestException("query `{$id}`'s SQL has surrounding whitespace (it must be stored trimmed)");
         }
         return new ManifestQuery($id, $sql, $pool, $readonly, $idempotent, $dto);
+    }
+
+    /**
+     * The engine's loader refuses a malformed `params`/`columns` (`ferro_manifest::Column` denies
+     * unknown fields), so the client does too: never accept a file the engine would not.
+     */
+    private static function checkShapes(string $id, mixed $params, mixed $columns): void
+    {
+        if ($params !== null) {
+            if (!is_array($params) || !array_is_list($params)) {
+                throw new ManifestException("query `{$id}`: `params` must be a list");
+            }
+            foreach ($params as $p) {
+                if ($p !== null && !is_string($p)) {
+                    throw new ManifestException("query `{$id}`: each of `params` must be a type name or null");
+                }
+            }
+        }
+        if ($columns !== null) {
+            if (!is_array($columns) || !array_is_list($columns)) {
+                throw new ManifestException("query `{$id}`: `columns` must be a list");
+            }
+            foreach ($columns as $c) {
+                if (!is_array($c) || array_diff(array_keys($c), ['name', 'tag', 'type']) !== []
+                    || !is_string($c['name'] ?? null) || !is_string($c['type'] ?? null)
+                    || !(($c['tag'] ?? null) === null || is_int($c['tag']) && $c['tag'] >= 0 && $c['tag'] <= 255)
+                ) {
+                    throw new ManifestException("query `{$id}`: each column needs a string `name` and `type` and an integer-or-null `tag`");
+                }
+            }
+        }
     }
 
     /**
