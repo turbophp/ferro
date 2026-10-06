@@ -10,4 +10,10 @@ interface SelectableTransportInterface extends TransportInterface
 {
     /** @return resource|null the stream to select on, or null once closed. */
     public function stream(): mixed;
+
+    /**
+     * Seconds a blocking read waits before failing. A scheduler that selects instead of reading
+     * uses it as the session's deadline, so a silent peer fails as soon as it would synchronously.
+     */
+    public function readTimeout(): float;
 }

@@ -26,9 +26,14 @@ final class Transport implements SelectableTransportInterface
     /**
      * @param resource $sock an already-connected, blocking stream
      */
-    private function __construct($sock)
+    private function __construct($sock, private readonly float $readTimeout = self::DEFAULT_READ_TIMEOUT)
     {
         $this->sock = $sock;
+    }
+
+    public function readTimeout(): float
+    {
+        return $this->readTimeout;
     }
 
     /** Connect over a Unix domain socket at `$socketPath` (the primary transport). */
@@ -75,7 +80,7 @@ final class Transport implements SelectableTransportInterface
         $sec = (int) $readTimeout;
         $usec = (int) round(($readTimeout - $sec) * 1_000_000);
         stream_set_timeout($sock, $sec, $usec);
-        return new self($sock);
+        return new self($sock, $readTimeout);
     }
 
     public function readExact(int $n): string

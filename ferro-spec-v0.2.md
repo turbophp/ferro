@@ -319,7 +319,7 @@ The closure is the *idiom*, not the only form: `Connection` also exposes an **im
 ]);
 ```
 
-Fan-out of k queries costs ≈ max(query) + boundary overhead, not the sum. Transactions are Fiber-safe because pins follow `tx_id`, not the socket.
+Fan-out of k queries costs ≈ max(query) + boundary overhead, not the sum. Transactions are Fiber-safe because pins follow `tx_id`, not the socket. *[Amended M3-D1b (§22.2 (ck)): that holds for the closure form. An IMPERATIVE transaction (`begin()`) lives on the `Connection`, so it belongs to the Fiber that began it, and another Fiber's statement on that Connection is refused while it is open.]*
 
 *[Amended M3-D1a (§22.2 (cj)): the multiplexed session and the blocking half of this section exist. `Connection` has `queryAsync`, `queryOneAsync`, `scalarAsync`, `rowsAsync` and `execAsync`, each returning a `Ferro\Future`, and `Ferro\await()` awaits a keyed list of them. Several requests are in flight on the one socket and every frame is routed by `request_id`, so fan-out costs about max(query) **even under plain FPM, with no Fiber scheduler at all**: all k requests are written before any terminal is read. Fiber suspension landed in D1b: `Ferro\Loop::run([...])` runs tasks as Fibers, and an `await` inside one suspends it until its terminal arrives (§22.2 (ck)); the Revolt adapter is D1c. Three deliberate limits: a statement inside an open transaction settles at once, because it belongs to the transaction's order; an asynchronous statement does not update `lastInsertId()`, because "the most recent statement" means nothing with several in flight; and an open stream is still exclusive on its session.]* **Octane/Swoole caveat:** Swoole coroutines and Fibers don't compose; under Octane the client runs in sync-per-worker mode (documented).
 
@@ -1235,13 +1235,26 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
   - **How a Fiber waits.** When a task awaits a `Future` returned by an `…Async` method and its terminal has not arrived, the Fiber suspends with a `Waiter` (session + request id), and the loop runs the others.
   - **How the loop reads.** It reads ONE frame at a time and files each under its `request_id`, then resumes every Fiber whose terminal is there. With one session the read blocks, exactly the synchronous behaviour, so the transport's read timeout still bounds a silent peer. With several sessions it `stream_select`s across their sockets, and after 30 empty one-second selects it falls back to a blocking read so that timeout still applies.
   - **Measured live:** four tasks each submitting and awaiting a 0.5 s sleep finish in about one sleep, on one session and across two. That is only possible if an await suspends, because each task submits only when its Fiber runs. A unit test pins the same property without timing: two tasks whose replies arrive in reverse order finish in reverse order, and both requests are written before anything is read.
+  - **Each session keeps its own deadline**, its transport's read timeout, so a silent peer fails as soon as it would synchronously, whatever other sessions do.
   - **What does NOT suspend, by design:**
     - a synchronous call inside a task, and an await on a Future that settled at once (inside a transaction), block the whole loop until they finish. That stays correct, because other Fibers' frames are kept for them;
     - a Fiber the loop did not start never suspends into it, so another scheduler's Fibers are left alone;
     - a task that suspends its Fiber with anything else is refused with a `LogicException`, never resumed blindly;
     - the loop does not nest.
+  - **The adversarial review found 6 defects; the worst was measured live.** Fiber A `begin()`s on a Connection and suspends; Fiber B's `execAsync` on the same Connection settled INSIDE A's transaction and reported success, and A's `rollBack()` then deleted B's acknowledged row. Fixed and pinned:
+    - **an imperative transaction belongs to the Fiber that began it.** Another Fiber's statement, `begin`, `commit` or `rollBack` on that Connection is refused with `InvalidTransactionStateException`, never routed into it. The one exception is `rollBack()` once the owner Fiber has terminated, the only way to release a transaction its owner abandoned;
+    - one global idle counter let a busy session keep a silent one waiting forever: each session now has its own deadline;
+    - an undecodable frame escaped `Loop::run` as a raw `CodecException`: it is now a desync, so the session is poisoned and the fault is a `ProtocolException` at each await;
+    - a Fiber using a Connection while another Fiber's stream is open failed with `ProtocolException`: it now waits for the stream to close. The stream's own Fiber, the main program and Fibers the loop did not start still get the refusal, because for them the wait would never end;
+    - the docblock example threw;
+    - three mechanisms had no test.
   - The HELLO now advertises the `FIBERS` client feature. It is informational: the engine has always served requests concurrently and does not read it.
-  - **Not established:** the Revolt/AMPHP adapter (D1c: an `await` inside a Revolt-managed Fiber still blocks, which is correct but serial), and §16's fan-out target on the D17 runner (D1c).
+  - **Not established:**
+    - the Revolt/AMPHP adapter. An `await` inside a Revolt-managed Fiber still blocks: correct, but serial;
+    - §16's fan-out target on the D17 runner;
+    - **a known limit both D1 slices inherit: the client's socket read timeout doubles as every request's deadline.** `Ferro::connect`'s default is 5 s, so a query slower than that poisons the session and fails every request in flight on it, not just the slow one.
+
+    All three are D1c. The remedy for the third is a per-request deadline that CANCELs only its own request, with the socket timeout reduced to a liveness bound.
 
 ### 22.3 M2 exit record (2026-10-02)
 

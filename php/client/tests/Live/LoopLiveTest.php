@@ -93,4 +93,79 @@ final class LoopLiveTest extends LiveTestCase
             $conn->session()->close();
         }
     }
+
+    /**
+     * Review F3(d): two sessions with ASYMMETRIC work. The fast session's five short queries must
+     * not wait behind the slow session's long one. A loop that always blocked on one session would
+     * finish them only after the long query.
+     */
+    public function testAFastSessionIsNotHeldBehindASlowOne(): void
+    {
+        $slow = $this->connection();
+        $fast = $this->connection();
+        try {
+            $fastDone = 0.0;
+            $start = microtime(true);
+            Loop::run([
+                'slow' => static fn (): mixed => $slow->scalarAsync('SELECT 1 FROM pg_sleep(2)')->await(),
+                'fast' => static function () use ($fast, $start, &$fastDone): int {
+                    for ($i = 0; $i < 5; ++$i) {
+                        $fast->scalarAsync('SELECT 1 FROM pg_sleep(0.05)')->await();
+                    }
+                    $fastDone = microtime(true) - $start;
+                    return 5;
+                },
+            ]);
+            $this->assertLessThan(1.0, $fastDone, sprintf('the fast session finished at %.3fs, behind the slow one', $fastDone));
+        } finally {
+            $slow->session()->close();
+            $fast->session()->close();
+        }
+    }
+
+    /**
+     * Review F2: a peer that accepts and never answers fails at ITS OWN read timeout even while
+     * another session stays busy. One global idle counter used to let the busy session keep it
+     * waiting.
+     */
+    public function testASilentPeerFailsAtItsOwnDeadlineWhileAnotherSessionIsBusy(): void
+    {
+        $path = sys_get_temp_dir() . '/ferro-silent-' . getmypid() . '.sock';
+        @unlink($path);
+        $server = stream_socket_server('unix://' . $path, $errno, $errstr);
+        $this->assertNotFalse($server, $errstr);
+        $busy = $this->connection();
+        try {
+            $silentTransport = \Ferro\Client\Transport::connectUnix($path, 1.0, 0.5);
+            $accepted = stream_socket_accept($server, 1.0);
+            $this->assertNotFalse($accepted);
+            $silent = new Connection(new \Ferro\Client\Session($silentTransport), 'default');
+
+            $failedAt = null;
+            $start = microtime(true);
+            Loop::run([
+                'busy' => static function () use ($busy): int {
+                    for ($i = 0; $i < 12; ++$i) {
+                        $busy->scalarAsync('SELECT 1 FROM pg_sleep(0.25)')->await();
+                    }
+                    return 12;
+                },
+                'silent' => static function () use ($silent, $start, &$failedAt): string {
+                    try {
+                        $silent->scalarAsync('SELECT 1')->await();
+                        return 'answered';
+                    } catch (\Ferro\Client\Error\FerroException) {
+                        $failedAt = microtime(true) - $start;
+                        return 'failed';
+                    }
+                },
+            ]);
+            $this->assertNotNull($failedAt);
+            $this->assertLessThan(2.0, $failedAt, sprintf('the silent peer failed at %.3fs (read timeout 0.5s, busy work ~3s)', $failedAt));
+        } finally {
+            $busy->session()->close();
+            fclose($server);
+            @unlink($path);
+        }
+    }
 }

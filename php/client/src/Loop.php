@@ -9,15 +9,23 @@ use Ferro\Client\Waiter;
  * The built-in Fiber scheduler (SPEC §10.1, M3-D1b): run several tasks as Fibers, and when one of
  * them awaits a {@see Future} whose terminal has not arrived, suspend it and run the others.
  *
- *     [$profile, $orders] = Ferro\Loop::run(
+ *     [$profile, $orders] = Ferro\Loop::run([
  *         fn () => $db->queryOneAsync('select … where id = ?', [$id])->await(),
  *         fn () => $db->queryAsync('select … where user_id = ?', [$id])->await(),
- *     );
+ *     ]);
+ *
+ * **An imperative transaction belongs to the Fiber that began it** ({@see \Ferro\Client\Connection::begin}):
+ * another Fiber's statement on the same Connection is refused while it is open, never routed into
+ * it. Use a Connection per concurrent transaction, or the closure form `transaction()`.
  *
  * Every Fiber shares the one socket per {@see Session}: the loop selects on the sessions its
  * waiting Fibers need and reads one frame at a time, filing each under its `request_id`, then
- * resumes every Fiber whose terminal is there. A task that throws does not stop the others; the
+ * resumes every Fiber whose terminal is there. Each session keeps its own deadline, its transport's
+ * read timeout, so a silent peer fails as soon as it would synchronously, whatever the others do. A task that throws does not stop the others; the
  * first failure, in task order, is thrown once every task has finished (the {@see await} rule).
+ *
+ * **Waiting on another Fiber's open stream suspends too**: a Fiber that wants the session while
+ * a different Fiber has a stream open on it waits for that stream to close.
  *
  * **Only `await` on a Future returned by an `…Async` method suspends.** A synchronous call inside a
  * task, and an `await` on a Future that settled at once (inside a transaction, for example), block
@@ -32,14 +40,14 @@ final class Loop
     private static ?\WeakMap $owned = null;
 
     /**
-     * How many consecutive one-second selects may find nothing before the loop falls back to a
-     * blocking read, which the session's own transport read timeout bounds. Without it, a peer
-     * that stops answering without closing would keep the loop waiting forever, where a
-     * synchronous call would have failed at its read timeout.
+     * When each waited-on session last delivered a frame (or was first waited on), keyed by
+     * `spl_object_id`. A session silent for its own transport read timeout is read with a BLOCKING
+     * read, which then fails exactly as a synchronous call would (M3-D1b review F2: one global
+     * counter let a busy session keep a silent one waiting forever).
+     *
+     * @var array<int, float>
      */
-    private const IDLE_SELECTS_BEFORE_BLOCKING_READ = 30;
-
-    private static int $idleSelects = 0;
+    private static array $lastProgress = [];
 
     /**
      * Run every task to completion and return their results, keyed as given.
@@ -54,11 +62,12 @@ final class Loop
             throw new \LogicException('Ferro\\Loop::run() is already running; await inside it instead of nesting it');
         }
         self::$owned = new \WeakMap();
-        self::$idleSelects = 0;
+        self::$lastProgress = [];
         try {
             return self::drive($tasks);
         } finally {
             self::$owned = null;
+            self::$lastProgress = [];
         }
     }
 
@@ -151,8 +160,13 @@ final class Loop
     }
 
     /**
-     * Read at least one frame for the waiting Fibers' sessions: select on the ones that can be
-     * selected and read from whichever is ready; a session that cannot be selected is read directly.
+     * Read at least one frame for the waiting Fibers' sessions.
+     *
+     * One session: a blocking read, exactly the synchronous behaviour, read timeout included.
+     * Several: `stream_select` across the ones that can be selected, waiting no longer than the
+     * nearest session deadline. A session that has delivered nothing for its own read timeout gets a
+     * blocking read, which either returns a frame or fails that session's requests on time. A
+     * session that cannot be selected (a test double) is read directly.
      *
      * @param array<array-key, Waiter> $waiting
      */
@@ -163,39 +177,47 @@ final class Loop
         foreach ($waiting as $waiter) {
             $sessions[spl_object_id($waiter->session)] = $waiter->session;
         }
-        $first = array_values($sessions)[0];
         if (count($sessions) === 1) {
-            // One session: a blocking read is exactly the synchronous behaviour, read timeout included.
-            $first->pollOnce();
+            array_values($sessions)[0]->pollOnce();
             return;
         }
+
+        $now = microtime(true);
         $streams = [];
+        $nearest = 1.0;
         foreach ($sessions as $id => $session) {
             $stream = $session->selectableStream();
-            if ($stream === null) {
-                // Not selectable (a test double, or a session that just failed): read directly.
+            $timeout = $session->readTimeout();
+            if ($stream === null || $timeout === null) {
                 $session->pollOnce();
+                self::$lastProgress[$id] = microtime(true);
                 return;
             }
+            $since = self::$lastProgress[$id] ??= $now;
+            $remaining = $timeout - ($now - $since);
+            if ($remaining <= 0.0) {
+                // Silent for its whole read timeout: a blocking read decides it now.
+                $session->pollOnce();
+                self::$lastProgress[$id] = microtime(true);
+                return;
+            }
+            $nearest = min($nearest, $remaining);
             $streams[$id] = $stream;
         }
+
         $read = array_values($streams);
         $write = null;
         $except = null;
-        // A bounded wait: each session's own read timeout still bounds a dead peer, this only keeps
-        // the loop from spinning.
-        $n = @stream_select($read, $write, $except, 1, 0);
+        $sec = (int) $nearest;
+        $usec = (int) (($nearest - $sec) * 1_000_000);
+        $n = @stream_select($read, $write, $except, $sec, max($usec, 1000));
         if ($n === false || $n === 0) {
-            if (++self::$idleSelects >= self::IDLE_SELECTS_BEFORE_BLOCKING_READ) {
-                self::$idleSelects = 0;
-                $first->pollOnce();
-            }
             return;
         }
-        self::$idleSelects = 0;
         foreach ($streams as $id => $stream) {
             if (in_array($stream, $read, true)) {
                 $sessions[$id]->pollOnce();
+                self::$lastProgress[$id] = microtime(true);
             }
         }
     }
