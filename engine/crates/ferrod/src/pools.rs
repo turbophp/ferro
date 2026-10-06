@@ -488,6 +488,27 @@ impl PoolRegistry {
         };
     }
 
+    /// Test seam: record a FAILED probe of `name` just now, so its version reads unknown for the
+    /// back-off window — what an unreachable or misbehaving backend leaves behind.
+    #[cfg(test)]
+    pub(crate) fn seed_failed_probe_for_test(&self, name: &str) {
+        let entry = self.by_name.get(name).expect("a configured pool");
+        entry.lock().state = VersionState::Failed { at: Instant::now() };
+    }
+
+    /// How long a probed server version is trusted ([`VERSION_TTL`] in production). Ferro Queue's
+    /// version gate caches a refusal for exactly this long, so a backend upgrade is noticed when the
+    /// version it was decided on would have been re-probed anyway (M7-G1a review L4).
+    pub fn version_ttl(&self) -> Duration {
+        self.tuning.ttl
+    }
+
+    /// How long a failed probe is not retried ([`VERSION_RETRY_BACKOFF`] in production) — the window
+    /// Ferro Queue warns at most once per when a store's version is unknown (review L3).
+    pub fn version_backoff(&self) -> Duration {
+        self.tuning.backoff
+    }
+
     /// Ferro Queue's stores, when the queue is configured (SPEC §24.3, M7-G1a).
     pub fn queue(&self) -> Option<&Arc<crate::services::queue::QueueStores>> {
         self.queue.as_ref()

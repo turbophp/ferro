@@ -18,11 +18,14 @@
 //! 5. a `tx_id`: RESERVE in a transaction is refused for good (§24.5); every other tx-scoped verb is
 //!    refused until slice G2 builds the TX-actor path;
 //! 6. a MySQL/MariaDB store is refused until slice G6;
-//! 7. **first use per `boot_epoch`:** the version gate against the pool's existing version probe,
-//!    then shape verification over `information_schema` — the FIRST statement, a read, through the
-//!    guarded `Checkout::query` with the request's own `timeout_ms` and CANCEL, classified by the
-//!    shared fate matrix as a read (never `Indeterminate`). A definitive verdict is cached for the
-//!    process — one process is one `boot_epoch` — and an absent table is not (SPEC §24.3 amendment);
+//! 7. **first use per `boot_epoch`:** the version gate against the pool's existing version probe
+//!    (the wait bounded by the request's own deadline and CANCEL), then shape verification — ONE
+//!    catalog read (`to_regclass` on the quoted identifier, so `search_path` is honoured; the
+//!    relation's kind; its columns by oid) — the FIRST statement, a read, through the guarded
+//!    `Checkout::query` with the request's own `timeout_ms` and CANCEL, classified by the shared fate
+//!    matrix as a read (never `Indeterminate`). A definitive verdict is cached for the process — one
+//!    process is one `boot_epoch` — except a gate refusal (reused for the version probe's TTL) and an
+//!    absent table (reused for [`ABSENT_RECHECK`]) (SPEC §24.3 amendment);
 //! 8. every verb then answers `Unsupported` ("not served before slice G1b"): the seven PostgreSQL
 //!    verbs, the fence and the clock rules are G1b's (SPEC §24.14).
 //!
@@ -30,7 +33,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use ferro_pool::backend::PoolBackend;
 use ferro_pool::error::PoolError;
@@ -41,7 +45,7 @@ use ferro_proto::messages::{
     ReserveRequest,
 };
 use ferro_queue::config::{QueueConfig, StoreConfig, StoreKind};
-use ferro_queue::shape::{self, ColumnRow, ShapeError};
+use ferro_queue::shape::{self, PgRelation, ShapeError};
 use ferro_queue::sql::{JobId, Token, Undecodable};
 use ferro_queue::{PoolFamily, checks, version};
 use tokio_util::sync::CancellationToken;
@@ -116,15 +120,32 @@ impl QueueRequest {
     }
 }
 
+/// How long an ABSENT table's verdict is reused before the catalog is read again (M7-G1a review M2).
+/// Short enough to honour "start `ferrod`, then migrate" — a table created now is served within two
+/// seconds — and long enough that a missing table costs one catalog read per store per two seconds,
+/// not one checkout per request while every other request on the store waits for the verdict lock.
+pub const ABSENT_RECHECK: Duration = Duration::from_secs(2);
+
 /// A store's first-use verdict (SPEC §24.3), cached for the process — one process is one
-/// `boot_epoch`, and `ferrod` has no configuration reload in v1.
+/// `boot_epoch`, and `ferrod` has no configuration reload in v1 — with two timed exceptions.
 #[derive(Debug, Clone)]
 enum Verdict {
     Unverified,
     Verified,
-    /// A definitive refusal (the version gate, or a table of the wrong shape): every verb on the
-    /// store answers `Unsupported` with this message until the next restart.
+    /// A table that exists in the wrong form: every verb on the store answers `Unsupported` with
+    /// this message until the next restart (§24.3).
     Refused(String),
+    /// The version gate's refusal, reused for as long as the server version it was decided on is
+    /// trusted (the probe's TTL), so a backend upgraded under a running `ferrod` is noticed (review L4).
+    GateRefused {
+        message: String,
+        at: Instant,
+    },
+    /// No such table: reused for [`QueueStores::absent_recheck`], then the catalog is read again.
+    Absent {
+        message: String,
+        at: Instant,
+    },
 }
 
 /// The configured stores plus each store's verification state.
@@ -133,6 +154,15 @@ pub struct QueueStores {
     /// One per ENABLED store. A `tokio` mutex, held across the verification's awaits, so concurrent
     /// first requests verify ONCE and the rest read the verdict.
     verdicts: HashMap<String, tokio::sync::Mutex<Verdict>>,
+    /// [`ABSENT_RECHECK`] in production; a test shortens it.
+    absent_recheck: Duration,
+    /// `None` in production (the registry's version TTL); a test shortens it.
+    gate_recheck: Option<Duration>,
+    /// Catalog reads ISSUED by shape verification — what makes "an absent table is not re-read on
+    /// every request" a counted claim rather than a timed one.
+    verifications: AtomicU64,
+    /// When each store last warned that its pool's version is unknown (review L3).
+    unknown_version_warned: std::sync::Mutex<HashMap<String, Instant>>,
 }
 
 impl QueueStores {
@@ -142,11 +172,53 @@ impl QueueStores {
             .filter_map(|(name, _)| config.store(name).map(|s| s.name.clone()))
             .map(|name| (name, tokio::sync::Mutex::new(Verdict::Unverified)))
             .collect();
-        QueueStores { config, verdicts }
+        QueueStores {
+            config,
+            verdicts,
+            absent_recheck: ABSENT_RECHECK,
+            gate_recheck: None,
+            verifications: AtomicU64::new(0),
+            unknown_version_warned: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn config(&self) -> &QueueConfig {
         &self.config
+    }
+
+    /// How many shape-verification catalog reads have been issued since boot.
+    pub fn verifications(&self) -> u64 {
+        self.verifications.load(Ordering::Relaxed)
+    }
+
+    /// Whether to warn now that `store`'s pool version is unknown: once per `window` (the probe's
+    /// back-off), so a dead backend is named in the log without one line per request.
+    fn should_warn_unknown_version(&self, store: &str, window: Duration) -> bool {
+        let mut warned = self
+            .unknown_version_warned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        warn_once_per(
+            warned.entry(store.to_string()).or_insert_with(far_past),
+            window,
+        )
+    }
+}
+
+/// An `Instant` old enough that the first warning always fires.
+fn far_past() -> Instant {
+    Instant::now()
+        .checked_sub(Duration::from_secs(86_400 * 365))
+        .unwrap_or_else(Instant::now)
+}
+
+/// The rate limiter, pure: `true` (and the clock reset) iff `window` has passed since `last`.
+fn warn_once_per(last: &mut Instant, window: Duration) -> bool {
+    if last.elapsed() >= window {
+        *last = Instant::now();
+        true
+    } else {
+        false
     }
 }
 
@@ -181,6 +253,16 @@ fn decode_handles(
 /// Steps 4–6 of the module doc: every refusal made before a checkout.
 fn refuse_before_checkout(req: &QueueRequest, store: &StoreConfig) -> Result<(), ErrorPayload> {
     let refusal = |r: checks::Refusal| unsupported(format!("queue store {}: {r}", store.name));
+    // Permanent, so FIRST for RESERVE (review L7): a tx-scoped RESERVE that also has `wait_ms > 0`
+    // must be told the call can never work, not to send `wait_ms = 0`.
+    if let QueueRequest::Reserve(_) = req
+        && req.common().tx_id.is_some()
+    {
+        // SPEC §24.5: a wait would hold the pin, and a rollback would void a delivered token.
+        return Err(unsupported(
+            "RESERVE inside a transaction is refused (SPEC §24.5): send it without a tx_id",
+        ));
+    }
     match req {
         QueueRequest::Enqueue(r) => checks::enqueue(r, store).map_err(refusal)?,
         QueueRequest::Reserve(r) => checks::reserve(r).map_err(refusal)?,
@@ -195,17 +277,10 @@ fn refuse_before_checkout(req: &QueueRequest, store: &StoreConfig) -> Result<(),
         }
     }
     if req.common().tx_id.is_some() {
-        return Err(match req {
-            // Permanent (SPEC §24.5): a wait would hold the pin, and a rollback would void a
-            // delivered token.
-            QueueRequest::Reserve(_) => unsupported(
-                "RESERVE inside a transaction is refused (SPEC §24.5): send it without a tx_id",
-            ),
-            _ => unsupported(format!(
-                "tx-scoped QUEUE {} is not served before slice G2 (SPEC §24.14)",
-                req.verb()
-            )),
-        });
+        return Err(unsupported(format!(
+            "tx-scoped QUEUE {} is not served before slice G2 (SPEC §24.14)",
+            req.verb()
+        )));
     }
     if store.family == PoolFamily::Mysql {
         return Err(unsupported(format!(
@@ -296,20 +371,48 @@ async fn ensure_verified(
     match &*verdict {
         Verdict::Verified => return Ok(()),
         Verdict::Refused(m) => return Err(unsupported(m.clone())),
-        Verdict::Unverified => {}
+        Verdict::GateRefused { message, at }
+            if at.elapsed()
+                < stores
+                    .gate_recheck
+                    .unwrap_or_else(|| registry.version_ttl()) =>
+        {
+            return Err(unsupported(message.clone()));
+        }
+        Verdict::Absent { message, at } if at.elapsed() < stores.absent_recheck => {
+            return Err(unsupported(message.clone()));
+        }
+        Verdict::Unverified | Verdict::GateRefused { .. } | Verdict::Absent { .. } => {}
     }
 
-    // The version gate, against the pool's existing probe.
-    let Some(server_version) = registry.server_version(&store.pool).await else {
+    // The version gate, against the pool's existing probe — bounded by THIS request's deadline and
+    // CANCEL (review L2): the wait can last the probe's whole budget, and the store's verdict lock is
+    // held across it.
+    let version = tokio::select! {
+        biased;
+        v = registry.server_version(&store.pool) => v,
+        () = sleep_until_opt(deadline) => return Err(not_sent(PoolError::Timeout)),
+        () = cancel.cancelled() => return Err(not_sent(cancelled_before_dispatch())),
+    };
+    let Some(server_version) = version else {
+        if stores.should_warn_unknown_version(&store.name, registry.version_backoff()) {
+            tracing::warn!(
+                store = %store.name, pool = %store.pool,
+                "ferrod: Ferro Queue store refused: its pool's server version is unknown (the \
+                 version probe has failed or not answered; the probe's own failure is logged at \
+                 debug)"
+            );
+        }
         return Err(ErrorPayload {
             code: errc::CONNECTION_LOST,
             branch: errc::CONNECTION_LOST_BRANCH,
             sqlstate: None,
             errno: None,
             message: format!(
-                "queue store {}: the server version of its pool is not known (is the backend \
-                 reachable?), so the version gate cannot pass; nothing was sent",
-                store.name
+                "queue store {}: the server version of pool {} is not known — its version probe \
+                 has not succeeded (see the ferrod log) — so the version gate cannot pass; nothing \
+                 was sent",
+                store.name, store.pool
             ),
             detail: None,
             retry_after_ms: None,
@@ -318,12 +421,15 @@ async fn ensure_verified(
     if let Err(refusal) = version::gate(store.family, &server_version) {
         let message = format!("queue store {}: {refusal}", store.name);
         tracing::error!(store = %store.name, refusal = %refusal, "ferrod: queue store refused by the version gate");
-        *verdict = Verdict::Refused(message.clone());
+        *verdict = Verdict::GateRefused {
+            message: message.clone(),
+            at: Instant::now(),
+        };
         return Err(unsupported(message));
     }
 
     let outcome = match registry.get(&store.pool) {
-        Some(AnyPool::Pg(pool)) => verify_pg(pool, store, deadline, cancel).await,
+        Some(AnyPool::Pg(pool)) => verify_pg(pool, stores, store, deadline, cancel).await,
         // Unreachable: `refuse_before_checkout` refused the MySQL family and configuration refused
         // SQLite. Answered rather than asserted, so a future family cannot panic a session.
         Some(_) | None => Err(Verification::Refused(unsupported(format!(
@@ -332,8 +438,8 @@ async fn ensure_verified(
         )))),
     };
     match outcome {
-        Ok(()) => {
-            tracing::info!(store = %store.name, table = %store.table, "ferrod: queue store verified");
+        Ok(schema) => {
+            tracing::info!(store = %store.name, table = %store.table, schema = %schema, "ferrod: queue store verified");
             *verdict = Verdict::Verified;
             Ok(())
         }
@@ -342,6 +448,11 @@ async fn ensure_verified(
             if e.is_definitive() {
                 tracing::error!(store = %store.name, refusal = %e, "ferrod: queue store refused by shape verification");
                 *verdict = Verdict::Refused(message.clone());
+            } else {
+                *verdict = Verdict::Absent {
+                    message: message.clone(),
+                    at: Instant::now(),
+                };
             }
             Err(unsupported(message))
         }
@@ -349,8 +460,8 @@ async fn ensure_verified(
     }
 }
 
-/// The fate context of every statement first-use verification runs: a READ (`information_schema`, the
-/// identity probe), autocommit. So a lost or cancelled verification is never `Indeterminate`, whatever
+/// The fate context of every statement first-use verification runs: a READ (the catalog, the identity
+/// probe), autocommit. So a lost or cancelled verification is never `Indeterminate`, whatever
 /// verb triggered it — the verb itself was never sent (SPEC §24.6: "refused before sending").
 fn verification_context(sent: bool) -> OpContext {
     OpContext {
@@ -371,10 +482,11 @@ enum Verification {
 /// diagnostics-only identity probe.
 async fn verify_pg<B: PoolBackend>(
     pool: &Pool<B>,
+    stores: &QueueStores,
     store: &StoreConfig,
     deadline: Option<tokio::time::Instant>,
     cancel: &CancellationToken,
-) -> Result<(), Verification> {
+) -> Result<String, Verification> {
     let ctx = verification_context;
     // A declared read: on a backend that can enforce the declaration it does (C3-4).
     let checkout = pool.checkout_declared(true);
@@ -406,7 +518,8 @@ async fn verify_pg<B: PoolBackend>(
         }
     };
 
-    let stmt = shape::pg_columns_statement(&store.table);
+    let stmt = shape::pg_relation_statement(&store.table);
+    stores.verifications.fetch_add(1, Ordering::Relaxed);
     let (result, _exec_us) = run_autocommit_exec(
         &mut co,
         stmt.sql,
@@ -416,17 +529,14 @@ async fn verify_pg<B: PoolBackend>(
     )
     .await;
     let qr = result.map_err(|e| Verification::Refused(fate::classify_fate(e, ctx(true))))?;
-    let mut rows = Vec::with_capacity(qr.rows.len());
-    for row in &qr.rows {
-        let Some(r) = ColumnRow::from_values(row) else {
-            return Err(Verification::Refused(unsupported(format!(
-                "queue store {}: information_schema returned an unexpected row shape",
-                store.name
-            ))));
-        };
-        rows.push(r);
-    }
-    shape::verify_pg(&store.table, &rows).map_err(Verification::Shape)?;
+    let Ok(relation) = PgRelation::from_rows(&qr.rows) else {
+        return Err(Verification::Refused(unsupported(format!(
+            "queue store {}: the catalog returned an unexpected row shape",
+            store.name
+        ))));
+    };
+    shape::verify_pg(&store.table, relation.as_ref()).map_err(Verification::Shape)?;
+    let schema = relation.map(|r| r.schema).unwrap_or_default();
 
     // Diagnostics only (SPEC §24.3): a table whose `id` has no sequence default is logged, never
     // refused — ENQUEUE would then fail with `NotNull`, classified like any statement.
@@ -445,7 +555,7 @@ async fn verify_pg<B: PoolBackend>(
             Err(_) => tracing::debug!(store = %store.name, "ferrod: queue identity probe failed"),
         }
     }
-    Ok(())
+    Ok(schema)
 }
 
 #[cfg(test)]
@@ -549,10 +659,15 @@ mod tests {
 
     /// A registry with one PostgreSQL pool nobody listens on, and the `jobs` store on it.
     fn registry_with_dead_pool() -> Arc<PoolRegistry> {
+        registry_at("postgres://ferro:ferro@127.0.0.1:1/ferro", None)
+    }
+
+    /// One PostgreSQL pool `main` at `dsn`, and the `jobs` store on it (with `table`, if given).
+    fn registry_at(dsn: &str, table: Option<&str>) -> Arc<PoolRegistry> {
         let mut config = crate::config::Config {
             pools: vec![crate::config::PoolSpec {
                 name: "main".into(),
-                dsn: "postgres://ferro:ferro@127.0.0.1:1/ferro".into(),
+                dsn: dsn.into(),
                 kind: crate::config::PoolKind::Postgres,
                 pin_functions: Vec::new(),
                 pin_on_unknown: true,
@@ -560,13 +675,237 @@ mod tests {
             }],
             ..crate::config::Config::default()
         };
-        let vars = [
-            ("FERRO_QUEUE_STORES", "jobs"),
-            ("FERRO_QUEUE_JOBS_POOL", "main"),
-        ]
-        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let mut vars = vec![
+            ("FERRO_QUEUE_STORES".to_string(), "jobs".to_string()),
+            ("FERRO_QUEUE_JOBS_POOL".to_string(), "main".to_string()),
+        ];
+        if let Some(t) = table {
+            vars.push(("FERRO_QUEUE_JOBS_TABLE".to_string(), t.to_string()));
+        }
+        let vars = vars
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
         config.queue = Some(Arc::new(crate::queue_config::load(vars, &config)));
         PoolRegistry::build(&config)
+    }
+
+    /// A fresh `QueueStores` over the registry's configuration, with test-sized timers.
+    fn stores_with(
+        registry: &PoolRegistry,
+        absent_recheck: Duration,
+        gate_recheck: Option<Duration>,
+    ) -> QueueStores {
+        let mut stores = QueueStores::new(Arc::clone(&registry.queue().unwrap().config));
+        stores.absent_recheck = absent_recheck;
+        stores.gate_recheck = gate_recheck;
+        stores
+    }
+
+    fn pg_url() -> Option<String> {
+        match std::env::var("FERRO_TEST_PG_URL") {
+            Ok(u) => Some(u),
+            Err(_) => {
+                eprintln!("skip: FERRO_TEST_PG_URL unset");
+                None
+            }
+        }
+    }
+
+    /// Review L7: a tx-scoped RESERVE is told the PERMANENT reason first, even when another of its
+    /// fields would also be refused (here `wait_ms > 0`, whose refusal advises `wait_ms = 0`).
+    #[test]
+    fn a_tx_scoped_reserve_is_refused_for_the_transaction_before_anything_else() {
+        let reserve = QueueRequest::Reserve(ReserveRequest {
+            store: "jobs".into(),
+            queues: vec!["default".into()],
+            max_jobs: 0,
+            wait_ms: 3_000,
+            liveness: true,
+            common: QueueCommon {
+                tx_id: Some(7),
+                ..QueueCommon::default()
+            },
+        });
+        let ep = refuse_before_checkout(&reserve, &store()).unwrap_err();
+        assert!(ep.message.contains("§24.5"), "{}", ep.message);
+    }
+
+    /// Review L3: an unknown version is warned about once per window, not per request.
+    #[tokio::test]
+    async fn the_unknown_version_warning_fires_once_per_window() {
+        let mut last = far_past();
+        let window = Duration::from_millis(40);
+        assert!(warn_once_per(&mut last, window), "the first one fires");
+        assert!(
+            !warn_once_per(&mut last, window),
+            "inside the window: silent"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            warn_once_per(&mut last, window),
+            "after the window: fires again"
+        );
+        let registry = registry_with_dead_pool();
+        let stores = registry.queue().unwrap();
+        assert!(stores.should_warn_unknown_version("jobs", Duration::from_secs(60)));
+        assert!(!stores.should_warn_unknown_version("jobs", Duration::from_secs(60)));
+        assert!(
+            stores.should_warn_unknown_version("other", Duration::from_secs(60)),
+            "per store"
+        );
+    }
+
+    /// Review R7 (a mutation that survived): an UNKNOWN version must refuse — on a LIVE pool, where a
+    /// gate that let it through would reach the database and succeed — before any checkout.
+    #[tokio::test]
+    async fn an_unknown_version_refuses_before_any_checkout_on_a_live_pool() {
+        let Some(url) = pg_url() else { return };
+        let registry = registry_at(&url, None);
+        let stores = stores_with(&registry, ABSENT_RECHECK, None);
+        let store = stores.config().store("jobs").unwrap().clone();
+        registry.seed_failed_probe_for_test("main");
+        let ep = ensure_verified(&stores, &store, &registry, None, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (ep.code, ep.branch),
+            (errc::CONNECTION_LOST, errc::CONNECTION_LOST_BRANCH)
+        );
+        assert!(ep.message.contains("version probe"), "{}", ep.message);
+        assert_eq!(stores.verifications(), 0, "no catalog read");
+        assert_eq!(
+            registry.get("main").unwrap().checkout_histogram().count,
+            0,
+            "no checkout at all"
+        );
+    }
+
+    /// Review L4: the gate's refusal lives as long as the version it was decided on — after the
+    /// probe's TTL (shortened here) an upgraded backend passes.
+    #[tokio::test]
+    async fn a_gate_refusal_expires_with_the_version_it_was_decided_on() {
+        let registry = registry_with_dead_pool();
+        let stores = stores_with(&registry, ABSENT_RECHECK, Some(Duration::from_millis(50)));
+        let store = stores.config().store("jobs").unwrap().clone();
+        let cancel = CancellationToken::new();
+        registry.seed_version_for_test("main", "PostgreSQL 11.22");
+        let ep = ensure_verified(&stores, &store, &registry, None, &cancel)
+            .await
+            .unwrap_err();
+        assert!(ep.message.contains("12"), "{}", ep.message);
+        registry.seed_version_for_test("main", "PostgreSQL 16.4");
+        let still = ensure_verified(&stores, &store, &registry, None, &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            still.message, ep.message,
+            "inside the TTL: the cached refusal"
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let after = ensure_verified(&stores, &store, &registry, None, &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            after.code,
+            errc::CONNECTION_LOST,
+            "after the TTL the upgraded version passes the gate and verification needs the \
+             (unreachable) database: {after:?}"
+        );
+    }
+
+    /// Review L2: the version wait honours the REQUEST's deadline. The backend accepts the TCP
+    /// connection and never answers, so the probe hangs for its whole budget (1.5 s); the request's
+    /// 150 ms deadline answers first, as a known non-execution.
+    #[tokio::test]
+    async fn the_version_wait_is_bounded_by_the_requests_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _hold = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for c in listener.incoming().flatten() {
+                held.push(c); // accept, never speak
+            }
+        });
+        let registry = registry_at(
+            &format!("postgres://ferro:ferro@127.0.0.1:{port}/ferro"),
+            None,
+        );
+        let stores = stores_with(&registry, ABSENT_RECHECK, None);
+        let store = stores.config().store("jobs").unwrap().clone();
+        let started = std::time::Instant::now();
+        let ep = ensure_verified(
+            &stores,
+            &store,
+            &registry,
+            Some(150),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(1_000),
+            "answered after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(ep.code, errc::POOL_TIMEOUT, "{ep:?}");
+        // And CANCEL ends it the same way.
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            c2.cancel();
+        });
+        let started = std::time::Instant::now();
+        let ep = ensure_verified(&stores, &store, &registry, None, &cancel)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(1_000));
+        assert_ne!(
+            ep.branch,
+            ferro_proto::consts::branch::INDETERMINATE,
+            "{ep:?}"
+        );
+    }
+
+    /// Review M2: an absent table is re-read at most once per `absent_recheck`, COUNTED — two uses
+    /// inside the window issue one catalog read — and a table created afterwards is then verified.
+    #[tokio::test]
+    async fn an_absent_table_is_re_read_once_per_window_not_per_request() {
+        let Some(url) = pg_url() else { return };
+        let name = format!("g1a_absent_ttl_{}", std::process::id());
+        let registry = registry_at(&url, Some(&name));
+        let mut stores = stores_with(&registry, Duration::from_secs(3_600), None);
+        let store = stores.config().store("jobs").unwrap().clone();
+        let cancel = CancellationToken::new();
+        registry.seed_version_for_test("main", "PostgreSQL 16.4");
+        for _ in 0..3 {
+            let ep = ensure_verified(&stores, &store, &registry, None, &cancel)
+                .await
+                .unwrap_err();
+            assert!(ep.message.contains("does not exist"), "{}", ep.message);
+        }
+        assert_eq!(stores.verifications(), 1, "one catalog read for three uses");
+
+        // Create the table through the pool, then let the window lapse.
+        let AnyPool::Pg(pool) = registry.get("main").unwrap() else {
+            unreachable!()
+        };
+        let mut co = pool.checkout().await.unwrap();
+        co.exec(&format!(
+            "CREATE TABLE \"{name}\" (id bigserial PRIMARY KEY, queue varchar(255) NOT NULL, \
+             payload text NOT NULL, attempts smallint NOT NULL, reserved_at integer NULL, \
+             available_at integer NOT NULL, created_at integer NOT NULL)"
+        ))
+        .await
+        .unwrap();
+        drop(co);
+        stores.absent_recheck = Duration::ZERO;
+        let verified = ensure_verified(&stores, &store, &registry, None, &cancel).await;
+        let mut co = pool.checkout().await.unwrap();
+        co.exec(&format!("DROP TABLE \"{name}\"")).await.unwrap();
+        drop(co);
+        assert!(verified.is_ok(), "{verified:?}");
+        assert_eq!(stores.verifications(), 2);
     }
 
     /// The version gate is WIRED, not merely written: a pool whose probed version is below the gate
@@ -587,7 +926,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(ep.code, errc::UNSUPPORTED, "{ep:?}");
         assert!(ep.message.contains("12"), "{}", ep.message);
-        // Cached: even a version the gate would pass is not consulted again in this process.
+        // Cached for the probe's TTL (600 s in production): a version the gate would pass is not
+        // consulted again within it.
         registry.seed_version_for_test("main", "PostgreSQL 16.4");
         let again = ensure_verified(&stores, &store, &registry, None, &cancel)
             .await

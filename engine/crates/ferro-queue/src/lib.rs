@@ -15,7 +15,8 @@
 //! - [`sql`] — the `sql` kind's two encodings: the canonical decimal `job_id` (with its strict
 //!   decode, §24.3 prerequisite (a)) and the 8-byte token.
 //! - [`version`] — the version gate (PostgreSQL ≥ 12, MySQL ≥ 8.0.1, MariaDB ≥ 10.6).
-//! - [`shape`] — shape verification: the `information_schema` statement and the verdict on its rows.
+//! - [`shape`] — shape verification: the catalog statement (`to_regclass`, `relkind`, the columns by
+//!   oid) and the verdict on its rows.
 //! - [`checks`] — the per-request refusals made before any checkout (payload, queue name, the
 //!   fields v1 refuses).
 //!

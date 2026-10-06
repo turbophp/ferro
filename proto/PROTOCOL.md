@@ -1052,9 +1052,16 @@ engine's to refuse (SPEC §24.4), never a decoder's. The Rust codec is hand-roll
 byte, everything the engine's decoder would refuse.
 
 Two shapes are shared: `common = [tx_id: u64 | nil, timeout_ms: u32 | nil, traceparent: str | nil]` (a
-fixarray(3), the last element of every request; `tx_id` bounded below 2^63 like every TX id, §2) and
+fixarray(3), the last element of every request) and
 `stats = [queue_us: u64, exec_us: u64]` (a fixarray(2), the last element of every response; both bounded
 below 2^63).
+
+**`common.tx_id` is decoded exactly as `ExecRequest.tx_id` is** (M7-G1a review L6, which corrected an
+overstatement here): the Rust decoder accepts any `u64`, while PHP's encoder refuses a value at or above
+2^63 because it cannot hold one. The engine mints `tx_id`s from a counter that never approaches 2^63, so
+such a value names no transaction; it is not a wire fault. (Tx-scoped verbs are refused `Unsupported`
+before slice G2 in any case.) Pinned by `messages::queue`'s
+`a_tx_id_at_or_above_2_63_decodes_as_exec_s_does`.
 
 ### 14.1 Requests — client → server
 
@@ -1078,7 +1085,7 @@ UTF-8 by construction.
 | `ACK` | 2 | `outcome: u8` — `ACK_OUTCOME_ACKED` (1) or `ACK_OUTCOME_GONE` (2), registry `[ack_outcome]` — `stats` |
 | `RELEASE` | 2 | `new_job_id: bin \| nil` (`nil` = gone, autocommit only), `stats` |
 | `EXTEND` | 2 | `lease_deadline: i64`, `stats` |
-| `SIZE` | 4 | `pending: u64`, `delayed: u64`, `reserved: u64`, `stats` |
+| `SIZE` | 5 | `pending: u64`, `delayed: u64`, `reserved: u64`, `oldest_pending_at: i64 \| nil`, `stats` |
 | `CLEAR` | 2 | `deleted: u64`, `stats` |
 
 `ReservedJob` is a fixarray(7): `[job_id: bin, token: bin, attempts: u32, queue: str, payload: str,
@@ -1086,6 +1093,12 @@ created_at: i64, lease_deadline: i64]`. Times are Unix seconds on the database's
 they are `i64` on the wire because PostgreSQL's `integer` columns are signed, and they ride §2's signed
 ladder. Every `u64` here is bounded below 2^63, so PHP decodes it to a native int and REFUSES a
 decimal-string one.
+
+`SIZE.oldest_pending_at` (added in the M7-G1a review round, before any engine served SIZE) is the
+smallest `available_at` among the queue's PENDING jobs, or `nil` when it has none. It is what Laravel 12's
+`DatabaseQueue::creationTimeOfOldestPendingJob()` returns (checked in `illuminate/queue` v12.69.3,
+which also has `pendingSize`/`delayedSize`/`reservedSize`, matching the three counts); adding it after
+the shapes froze would have needed a registry change, so it is in the frozen shape now.
 
 ### 14.3 The codes
 
@@ -1113,14 +1126,17 @@ maximum (asserted, from the decoded vectors, by
 `golden_vectors.rs::every_queue_handle_position_is_locked_at_the_sql_size_and_at_the_maximum`):
 `queue_enqueue_request` (one job, a dedup key, every `common` field set — a `tx_id` past u32),
 `queue_enqueue_request_batch` (two jobs, a `delay_s` past u16, a multi-byte payload, every nullable
-`nil`), `queue_enqueue_response` (the largest canonical id), `queue_enqueue_response_max`,
-`queue_enqueue_response_batch` (`job_id` `nil`), `queue_reserve_request` (two queues, `max_jobs` past
+`nil`), `queue_enqueue_response` (the largest canonical id; a dedup replay, so `inserted` 0),
+`queue_enqueue_response_max`,
+`queue_enqueue_response_batch` (`job_id` `nil`), `queue_enqueue_request_max_jobs` (exactly 1 000 jobs),
+`queue_reserve_request_max_queues` (exactly 16 queues), `queue_reserve_request` (two queues, `max_jobs` past
 u8, `wait_ms` past u16), `queue_reserve_response` (one job at the `sql` sizes and one at 1 024 bytes for
 both handles, a negative `created_at`), `queue_reserve_response_empty`, `queue_ack_request`,
 `queue_ack_request_max`, `queue_ack_response`, `queue_ack_response_gone`, `queue_release_request`,
 `queue_release_request_max`, `queue_release_response`, `queue_release_response_max`,
 `queue_release_response_gone`, `queue_extend_request`, `queue_extend_request_max`,
-`queue_extend_response`, `queue_size_request`, `queue_size_response` (a count past u32),
+`queue_extend_response`, `queue_size_request`, `queue_size_response` (a count past u32 and an
+`oldest_pending_at`), `queue_size_response_empty` (`oldest_pending_at` `nil`),
 `queue_clear_request`, `queue_clear_response`; and the three error terminals `error_lease_lost`,
 `error_pool_mismatch`, `error_invalid_handle`, each on its request's own `QUEUE`/method header. A
 `1 024`-byte handle is not UTF-8 and holds bytes in the `0xc0` range, so neither a `str` read nor a

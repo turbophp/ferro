@@ -9,7 +9,8 @@
 //!   back as ITS OWN terminal is therefore the proof that it was decided before anything was sent.
 //! - **Live, against PostgreSQL** (`FERRO_TEST_PG_URL`; skips, and the CI no-skip gate fails, when
 //!   unset). Each test owns a fresh schema, so they run in parallel, and each server owns its own
-//!   registry, so each first use is a real first use.
+//!   registry, so each first use is a real first use. An absent table's verdict is reused for
+//!   `ABSENT_RECHECK` (2 s), so a test that creates the table after a first use waits that out.
 //!
 //! Every request is answered by exactly one terminal on its own request id and service, and the
 //! session survives it (charter rule 4).
@@ -394,6 +395,14 @@ async fn sql_ok(c: &mut TestClient, rid: u32, statement: &str) {
     }
 }
 
+/// Past the absent-table negative TTL (SPEC §24.3 amendment, review M2).
+async fn wait_absent_recheck() {
+    tokio::time::sleep(
+        ferrod::services::queue::ABSENT_RECHECK + std::time::Duration::from_millis(100),
+    )
+    .await;
+}
+
 /// The verbs are G1b's, so a fully verified store answers `Unsupported` with this marker.
 const VERIFIED: &str = "is verified";
 
@@ -450,9 +459,13 @@ async fn an_absent_table_is_named_and_re_checked_at_the_next_use() {
     let ep = queue_err(&mut c, 2, method_queue::SIZE, size("jobs")).await;
     assert_code(&ep, errc::UNSUPPORTED, "does not exist");
     assert!(ep.message.contains(&table), "{}", ep.message);
-    // NOT cached: the migration runs after `ferrod` started, and the next use sees it.
+    // Not cached for good: the migration runs after `ferrod` started, and the first use after the
+    // short negative TTL (review M2) sees it. Inside the TTL the cached answer stands.
     sql_ok(&mut c, 3, &format!("CREATE SCHEMA {schema}")).await;
     sql_ok(&mut c, 4, &stock_table(&table)).await;
+    let ep = queue_err(&mut c, 7, method_queue::SIZE, size("jobs")).await;
+    assert_code(&ep, errc::UNSUPPORTED, "does not exist");
+    wait_absent_recheck().await;
     let ep = queue_err(&mut c, 5, method_queue::SIZE, size("jobs")).await;
     assert_code(&ep, errc::UNSUPPORTED, VERIFIED);
     sql_ok(&mut c, 6, &format!("DROP SCHEMA {schema} CASCADE")).await;
@@ -480,13 +493,15 @@ async fn a_wrong_shape_names_the_column_and_is_cached_for_the_process() {
     assert_code(&ep, errc::UNSUPPORTED, "created_at");
     assert!(ep.message.contains("bigint"), "{}", ep.message);
     // Definitive, so cached: repairing the table does not change the answer before a restart
-    // (SPEC §24.3: `ferrod` has no configuration reload in v1).
+    // (SPEC §24.3: `ferrod` has no configuration reload in v1) — not even after the absent-table
+    // TTL, which a wrong shape must not be given.
     sql_ok(
         &mut c,
         5,
         &format!("ALTER TABLE {table} ALTER COLUMN created_at TYPE integer"),
     )
     .await;
+    wait_absent_recheck().await;
     let again = queue_err(&mut c, 6, method_queue::SIZE, size("jobs")).await;
     assert_eq!(again.message, ep.message);
     sql_ok(&mut c, 7, &format!("DROP SCHEMA {schema} CASCADE")).await;
@@ -539,13 +554,14 @@ async fn a_mixed_case_table_is_the_quoted_one_not_the_folded_one() {
     let ep = queue_err(&mut c, 4, method_queue::SIZE, size("jobs")).await;
     assert_code(&ep, errc::UNSUPPORTED, "does not exist");
     sql_ok(&mut c, 5, &stock_table(&format!("{schema}.\"Jobs\""))).await;
+    wait_absent_recheck().await;
     let ep = queue_err(&mut c, 6, method_queue::SIZE, size("jobs")).await;
     assert_code(&ep, errc::UNSUPPORTED, VERIFIED);
     sql_ok(&mut c, 7, &format!("DROP SCHEMA {schema} CASCADE")).await;
 }
 
-/// The default table is `ferro_jobs` in the pool's `current_schema()` (D22 amendment (a)), and an
-/// unqualified `TABLE` resolves there too. Uses a role-private schema on the search path through a
+/// The default table is `ferro_jobs` resolved through the pool's `search_path` (D22 amendment (a);
+/// here the first schema on it), and an unqualified `TABLE` resolves the same way. Uses a role-private schema on the search path through a
 /// dedicated table name, so it cannot collide with another test or a real `ferro_jobs`.
 #[tokio::test]
 async fn an_unqualified_table_is_looked_up_in_current_schema() {
@@ -561,4 +577,88 @@ async fn an_unqualified_table_is_looked_up_in_current_schema() {
     let ep = queue_err(&mut c, 4, method_queue::SIZE, size("jobs")).await;
     assert_code(&ep, errc::UNSUPPORTED, VERIFIED);
     sql_ok(&mut c, 5, &format!("DROP TABLE {name}")).await;
+}
+
+/// Review M1: verification resolves the table the STATEMENTS will touch. With
+/// `search_path = <a>, <b>` and the table only in `<b>`, an unqualified `TABLE` is `<b>`'s table —
+/// the first version looked in `current_schema()` (`<a>`) only and reported it absent, uncached, on
+/// every request.
+#[tokio::test]
+async fn an_unqualified_table_follows_the_pools_search_path() {
+    let Some(url) = pg_url() else { return };
+    let first = fresh_schema("sp_first");
+    let second = fresh_schema("sp_second");
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let dsn = format!("{url}{sep}options=-c%20search_path%3D{first}%2C{second}");
+    let (server, _) = queue_server(
+        &dsn,
+        Some(&store_vars(&[("FERRO_QUEUE_JOBS_TABLE", "ferro_jobs")])),
+    );
+    let mut c = connected(&server).await;
+    sql_ok(&mut c, 2, &format!("CREATE SCHEMA {first}")).await;
+    sql_ok(&mut c, 3, &format!("CREATE SCHEMA {second}")).await;
+    sql_ok(&mut c, 4, &stock_table(&format!("{second}.ferro_jobs"))).await;
+    // The control that the pool really runs with that search_path: `current_schema()` is the first.
+    match exec(&mut c, 5, &req("SELECT current_schema()::text")).await {
+        Outcome::Ok(body) => {
+            let ok = ferro_proto::messages::ExecOk::decode(&body).unwrap();
+            assert_eq!(
+                ok.rows[0][0],
+                ferro_proto::value::Value::Text(first.clone()),
+                "the pool's search_path is in force"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let ep = queue_err(&mut c, 6, method_queue::SIZE, size("jobs")).await;
+    assert_code(&ep, errc::UNSUPPORTED, VERIFIED);
+    sql_ok(&mut c, 7, &format!("DROP SCHEMA {first} CASCADE")).await;
+    sql_ok(&mut c, 8, &format!("DROP SCHEMA {second} CASCADE")).await;
+}
+
+/// Review M1: a VIEW with exactly the right columns is not a table — refused, naming why, and cached
+/// (it exists in the wrong form) — while a PARTITIONED table of the stock layout passes.
+#[tokio::test]
+async fn a_view_is_refused_and_a_partitioned_table_passes() {
+    let Some(url) = pg_url() else { return };
+    let schema = fresh_schema("relkind");
+    let (server, _) = queue_server(
+        &url,
+        Some(&store_vars(&[(
+            "FERRO_QUEUE_JOBS_TABLE",
+            &format!("{schema}.ferro_jobs"),
+        )])),
+    );
+    let mut c = connected(&server).await;
+    sql_ok(&mut c, 2, &format!("CREATE SCHEMA {schema}")).await;
+    sql_ok(&mut c, 3, &stock_table(&format!("{schema}.real_jobs"))).await;
+    sql_ok(
+        &mut c,
+        4,
+        &format!("CREATE VIEW {schema}.ferro_jobs AS SELECT * FROM {schema}.real_jobs"),
+    )
+    .await;
+    let ep = queue_err(&mut c, 5, method_queue::SIZE, size("jobs")).await;
+    assert_code(&ep, errc::UNSUPPORTED, "is not a table");
+    sql_ok(&mut c, 6, &format!("DROP SCHEMA {schema} CASCADE")).await;
+
+    let schema = fresh_schema("partitioned");
+    let (server, _) = queue_server(
+        &url,
+        Some(&store_vars(&[(
+            "FERRO_QUEUE_JOBS_TABLE",
+            &format!("{schema}.ferro_jobs"),
+        )])),
+    );
+    let mut c = connected(&server).await;
+    sql_ok(&mut c, 2, &format!("CREATE SCHEMA {schema}")).await;
+    sql_ok(
+        &mut c,
+        3,
+        &(stock_table(&format!("{schema}.ferro_jobs")) + " PARTITION BY RANGE (id)"),
+    )
+    .await;
+    let ep = queue_err(&mut c, 4, method_queue::SIZE, size("jobs")).await;
+    assert_code(&ep, errc::UNSUPPORTED, VERIFIED);
+    sql_ok(&mut c, 5, &format!("DROP SCHEMA {schema} CASCADE")).await;
 }

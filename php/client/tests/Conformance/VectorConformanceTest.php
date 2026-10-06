@@ -1007,7 +1007,7 @@ final class VectorConformanceTest extends TestCase
             ['outcome', 'stats'],
             ['new_job_id', 'stats'],
             ['lease_deadline', 'stats'],
-            ['pending', 'delayed', 'reserved', 'stats'],
+            ['pending', 'delayed', 'reserved', 'oldest_pending_at', 'stats'],
             ['deleted', 'stats'],
         ];
         $keys = array_keys($out);

@@ -19,7 +19,7 @@ use Ferro\Protocol\Msgpack\PackerInterface;
  *   RELEASE  request  `[store, job_id: bin, token: bin, delay_s: u32, common]`
  *            response `[new_job_id: bin|nil, stats]`
  *   SIZE / CLEAR request `[store, queue, common]` (one shape, "scope")
- *            SIZE response `[pending, delayed, reserved, stats]`; CLEAR response `[deleted, stats]`
+ *            SIZE response `[pending, delayed, reserved, oldest_pending_at: i64|nil, stats]`; CLEAR response `[deleted, stats]`
  *
  * where `common = [tx_id: u64|nil, timeout_ms: u32|nil, traceparent: str|nil]` and
  * `stats = [queue_us: u64, exec_us: u64]`. Response bodies are the `Outcome::Ok` body only; the caller
@@ -35,7 +35,9 @@ use Ferro\Protocol\Msgpack\PackerInterface;
  * **STRICT in both directions**, like {@see HttpWire}: a value the engine's decoder would refuse (a
  * handle of 0 or 1 025 bytes, 0 or 1 001 jobs, a non-UTF-8 payload, a timeout past u32) is refused
  * here before a byte is written, as a {@see CodecException}; a malformed body from the engine is
- * refused on decode rather than coerced. What a value MEANS (a payload with U+0000, a `job_id` the
+ * refused on decode rather than coerced — every `str` field included, which must be UTF-8 on decode
+ * exactly as the Rust decoder requires (M7-G1a review L1), `traceparent` alone excepted (decoded
+ * lossily by the engine, carried as given here). What a value MEANS (a payload with U+0000, a `job_id` the
  * store cannot decode) is the engine's business, never this codec's.
  */
 final class QueueCodec
@@ -79,15 +81,15 @@ final class QueueCodec
         foreach ($jobsW as $i => $j) {
             $j = HttpWire::arity($j, 3, "EnqueueJob {$i}");
             $jobs[] = [
-                'queue' => HttpWire::string($j[0], 'EnqueueJob queue'),
-                'payload' => HttpWire::string($j[1], 'EnqueueJob payload'),
+                'queue' => HttpWire::utf8($j[0], 'EnqueueJob queue'),
+                'payload' => HttpWire::utf8($j[1], 'EnqueueJob payload'),
                 'delay_s' => HttpWire::uint($j[2], HttpWire::U32_MAX, 'EnqueueJob delay_s'),
             ];
         }
         return [
-            'store' => HttpWire::string($w[0], 'EnqueueRequest store'),
+            'store' => HttpWire::utf8($w[0], 'EnqueueRequest store'),
             'jobs' => $jobs,
-            'dedup_key' => HttpWire::nullableString($w[2], 'EnqueueRequest dedup_key'),
+            'dedup_key' => HttpWire::nullableUtf8($w[2], 'EnqueueRequest dedup_key'),
             'common' => self::common($w[3], 'EnqueueRequest'),
         ];
     }
@@ -142,9 +144,9 @@ final class QueueCodec
         if (!is_array($qs) || !array_is_list($qs)) { throw new CodecException('ReserveRequest queues is not an array'); }
         self::count(count($qs), C::QUEUE_RESERVE_MAX_QUEUES, 'ReserveRequest queues');
         $queues = [];
-        foreach ($qs as $q) { $queues[] = HttpWire::string($q, 'ReserveRequest queue'); }
+        foreach ($qs as $q) { $queues[] = HttpWire::utf8($q, 'ReserveRequest queue'); }
         return [
-            'store' => HttpWire::string($w[0], 'ReserveRequest store'),
+            'store' => HttpWire::utf8($w[0], 'ReserveRequest store'),
             'queues' => $queues,
             'max_jobs' => HttpWire::uint($w[2], self::U16_MAX, 'ReserveRequest max_jobs'),
             'wait_ms' => HttpWire::uint($w[3], HttpWire::U32_MAX, 'ReserveRequest wait_ms'),
@@ -188,8 +190,8 @@ final class QueueCodec
                 'job_id' => self::handle($j[0], 'ReservedJob job_id'),
                 'token' => self::handle($j[1], 'ReservedJob token'),
                 'attempts' => HttpWire::uint($j[2], HttpWire::U32_MAX, 'ReservedJob attempts'),
-                'queue' => HttpWire::string($j[3], 'ReservedJob queue'),
-                'payload' => HttpWire::string($j[4], 'ReservedJob payload'),
+                'queue' => HttpWire::utf8($j[3], 'ReservedJob queue'),
+                'payload' => HttpWire::utf8($j[4], 'ReservedJob payload'),
                 'created_at' => self::int($j[5], 'ReservedJob created_at'),
                 'lease_deadline' => self::int($j[6], 'ReservedJob lease_deadline'),
             ];
@@ -214,7 +216,7 @@ final class QueueCodec
     {
         $w = HttpWire::unpackArray($payload, $p, 4, 'FencedRequest');
         return [
-            'store' => HttpWire::string($w[0], 'FencedRequest store'),
+            'store' => HttpWire::utf8($w[0], 'FencedRequest store'),
             'job_id' => self::handle($w[1], 'FencedRequest job_id'),
             'token' => self::handle($w[2], 'FencedRequest token'),
             'common' => self::common($w[3], 'FencedRequest'),
@@ -272,7 +274,7 @@ final class QueueCodec
     {
         $w = HttpWire::unpackArray($payload, $p, 5, 'ReleaseRequest');
         return [
-            'store' => HttpWire::string($w[0], 'ReleaseRequest store'),
+            'store' => HttpWire::utf8($w[0], 'ReleaseRequest store'),
             'job_id' => self::handle($w[1], 'ReleaseRequest job_id'),
             'token' => self::handle($w[2], 'ReleaseRequest token'),
             'delay_s' => HttpWire::uint($w[3], HttpWire::U32_MAX, 'ReleaseRequest delay_s'),
@@ -314,31 +316,38 @@ final class QueueCodec
     {
         $w = HttpWire::unpackArray($payload, $p, 3, 'QueueScopeRequest');
         return [
-            'store' => HttpWire::string($w[0], 'QueueScopeRequest store'),
-            'queue' => HttpWire::string($w[1], 'QueueScopeRequest queue'),
+            'store' => HttpWire::utf8($w[0], 'QueueScopeRequest store'),
+            'queue' => HttpWire::utf8($w[1], 'QueueScopeRequest queue'),
             'common' => self::common($w[2], 'QueueScopeRequest'),
         ];
     }
 
-    /** @param array<string,mixed> $m `pending`, `delayed`, `reserved`, `stats` */
+    /**
+     * `oldest_pending_at` is the earliest `available_at` among the queue's pending jobs (Unix seconds),
+     * or `null` when none is pending — what Laravel 12's `creationTimeOfOldestPendingJob()` returns.
+     * @param array<string,mixed> $m `pending`, `delayed`, `reserved`, `oldest_pending_at`, `stats`
+     */
     public static function encodeSizeResponse(array $m, PackerInterface $p): string
     {
-        return $p->packArrayLen(4)
+        $oldest = $m['oldest_pending_at'] ?? null;
+        return $p->packArrayLen(5)
             . $p->packUint(HttpWire::uint($m['pending'] ?? null, PHP_INT_MAX, 'SizeResponse pending'))
             . $p->packUint(HttpWire::uint($m['delayed'] ?? null, PHP_INT_MAX, 'SizeResponse delayed'))
             . $p->packUint(HttpWire::uint($m['reserved'] ?? null, PHP_INT_MAX, 'SizeResponse reserved'))
+            . ($oldest === null ? $p->packNil() : $p->packInt(self::int($oldest, 'SizeResponse oldest_pending_at')))
             . self::packStats($p, $m['stats'] ?? null, 'SizeResponse');
     }
 
-    /** @return array{pending:int,delayed:int,reserved:int,stats:array{queue_us:int,exec_us:int}} */
+    /** @return array{pending:int,delayed:int,reserved:int,oldest_pending_at:?int,stats:array{queue_us:int,exec_us:int}} */
     public static function decodeSizeResponse(string $body, PackerInterface $p): array
     {
-        $w = HttpWire::unpackArray($body, $p, 4, 'SizeResponse');
+        $w = HttpWire::unpackArray($body, $p, 5, 'SizeResponse');
         return [
             'pending' => HttpWire::uint($w[0], PHP_INT_MAX, 'SizeResponse pending'),
             'delayed' => HttpWire::uint($w[1], PHP_INT_MAX, 'SizeResponse delayed'),
             'reserved' => HttpWire::uint($w[2], PHP_INT_MAX, 'SizeResponse reserved'),
-            'stats' => self::stats($w[3], 'SizeResponse'),
+            'oldest_pending_at' => $w[3] === null ? null : self::int($w[3], 'SizeResponse oldest_pending_at'),
+            'stats' => self::stats($w[4], 'SizeResponse'),
         ];
     }
 

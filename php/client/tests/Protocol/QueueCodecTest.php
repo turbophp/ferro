@@ -98,6 +98,112 @@ final class QueueCodecTest extends TestCase
         }
     }
 
+    /**
+     * The count bounds are INCLUSIVE (review M3: a decoder whose upper bound became exclusive, or used
+     * the other shape's bound, passed every other test). Positive controls at exactly the maximum,
+     * both directions; the golden vectors `queue_enqueue_request_max_jobs` and
+     * `queue_reserve_request_max_queues` lock the same against the Rust bytes.
+     */
+    public function testCountsAtTheMaximumEncodeAndDecode(): void
+    {
+        $p = new PurePacker();
+        $jobs = array_fill(0, C::QUEUE_ENQUEUE_MAX_JOBS, ['queue' => 'q', 'payload' => '{}', 'delay_s' => 0]);
+        $enq = QueueCodec::encodeEnqueueRequest(['store' => 'jobs', 'jobs' => $jobs, 'dedup_key' => null,
+            'common' => self::COMMON], $p);
+        $this->assertCount(1000, QueueCodec::decodeEnqueueRequest($enq, $p)['jobs']);
+        $queues = array_map(static fn (int $i): string => "q{$i}", range(1, C::QUEUE_RESERVE_MAX_QUEUES));
+        $res = QueueCodec::encodeReserveRequest(['store' => 'jobs', 'queues' => $queues, 'max_jobs' => 1,
+            'wait_ms' => 0, 'liveness' => false, 'common' => self::COMMON], $p);
+        $this->assertCount(16, QueueCodec::decodeReserveRequest($res, $p)['queues']);
+        $this->assertSame([1000, 16], [C::QUEUE_ENQUEUE_MAX_JOBS, C::QUEUE_RESERVE_MAX_QUEUES], 'SPEC §24.4, literally');
+    }
+
+    /**
+     * Review L1: a `str` the Rust decoder refuses unless it is UTF-8 is refused by this decoder too —
+     * here a reserved job's payload (the engine never sends one, which is why it is a LOW).
+     */
+    public function testANonUtf8StringIsRefusedOnDecode(): void
+    {
+        $p = new PurePacker();
+        $body = $p->packArrayLen(2) . $p->packArrayLen(1) . $p->packArrayLen(7)
+            . $p->packBin('1') . $p->packBin(str_repeat("\x01", 8)) . $p->packUint(1)
+            . $p->packStr('q') . $p->packStr("\xff") . $p->packInt(1) . $p->packInt(2)
+            . $p->packArrayLen(2) . $p->packUint(1) . $p->packUint(2);
+        try {
+            QueueCodec::decodeReserveResponse($body, $p);
+            $this->fail('a non-UTF-8 payload was decoded');
+        } catch (CodecException $e) {
+            $this->assertStringContainsString('payload is not UTF-8', $e->getMessage());
+        }
+        // The control: the same body with a UTF-8 payload decodes.
+        $ok = str_replace($p->packStr("\xff"), $p->packStr('{}'), $body);
+        $this->assertSame('{}', QueueCodec::decodeReserveResponse($ok, $p)['jobs'][0]['payload']);
+    }
+
+    /**
+     * Review L1, at EVERY `str` position the PHP side decodes (the test above pins one): each field
+     * carries a distinct 4-byte ASCII marker, the frame is encoded, and ONE marker at a time is
+     * replaced by a same-length non-UTF-8 string, so framing is intact and only that field is wrong.
+     * `traceparent` is the control — decoded as it arrives, as the Rust decoder decodes it lossily.
+     */
+    public function testEveryStrPositionRefusesNonUtf8OnDecodeButTraceparent(): void
+    {
+        $p = new PurePacker();
+        $tok = str_repeat("\x01", 8);
+        $common = ['tx_id' => null, 'timeout_ms' => null, 'traceparent' => 'Mtp0'];
+        $stats = ['queue_us' => 1, 'exec_us' => 2];
+        $cases = [
+            'EnqueueRequest' => [QueueCodec::encodeEnqueueRequest(['store' => 'Mst0',
+                'jobs' => [['queue' => 'Mqu0', 'payload' => 'Mpl0', 'delay_s' => 0]],
+                'dedup_key' => 'Mdk0', 'common' => $common], $p),
+                QueueCodec::decodeEnqueueRequest(...), ['Mst0', 'Mqu0', 'Mpl0', 'Mdk0']],
+            'ReserveRequest' => [QueueCodec::encodeReserveRequest(['store' => 'Mst1', 'queues' => ['Mqa1', 'Mqb1'],
+                'max_jobs' => 1, 'wait_ms' => 0, 'liveness' => false, 'common' => $common], $p),
+                QueueCodec::decodeReserveRequest(...), ['Mst1', 'Mqa1', 'Mqb1']],
+            'ReserveResponse' => [QueueCodec::encodeReserveResponse(['jobs' => [['job_id' => '1', 'token' => $tok,
+                'attempts' => 1, 'queue' => 'Mqu2', 'payload' => 'Mpl2', 'created_at' => 1, 'lease_deadline' => 2]],
+                'stats' => $stats], $p),
+                QueueCodec::decodeReserveResponse(...), ['Mqu2', 'Mpl2']],
+            'FencedRequest' => [QueueCodec::encodeFencedRequest(['store' => 'Mst3', 'job_id' => '1', 'token' => $tok,
+                'common' => $common], $p),
+                QueueCodec::decodeFencedRequest(...), ['Mst3']],
+            'ReleaseRequest' => [QueueCodec::encodeReleaseRequest(['store' => 'Mst4', 'job_id' => '1', 'token' => $tok,
+                'delay_s' => 0, 'common' => $common], $p),
+                QueueCodec::decodeReleaseRequest(...), ['Mst4']],
+            'ScopeRequest' => [QueueCodec::encodeScopeRequest(['store' => 'Mst5', 'queue' => 'Mqu5',
+                'common' => $common], $p),
+                QueueCodec::decodeScopeRequest(...), ['Mst5', 'Mqu5']],
+        ];
+        foreach ($cases as $name => [$frame, $decode, $markers]) {
+            $decode($frame, $p); // the control: every marker is valid UTF-8
+            foreach ($markers as $m) {
+                $needle = $p->packStr($m);
+                $this->assertSame(1, substr_count($frame, $needle), "{$name} {$m} is unique");
+                try {
+                    $decode(str_replace($needle, $p->packStr("\xff" . substr($m, 1)), $frame), $p);
+                    $this->fail("{$name}: a non-UTF-8 {$m} was decoded");
+                } catch (CodecException $e) {
+                    $this->assertStringContainsString('not UTF-8', $e->getMessage(), "{$name} {$m}");
+                }
+            }
+            if ($name !== 'ReserveResponse') {
+                $bad = str_replace($p->packStr('Mtp0'), $p->packStr("\xfftp0"), $frame);
+                $decoded = $decode($bad, $p);
+                $this->assertSame("\xfftp0", $decoded['common']['traceparent'], "{$name} traceparent");
+            }
+        }
+    }
+
+    public function testOldestPendingAtIsNullableBothWays(): void
+    {
+        $p = new PurePacker();
+        foreach ([null, 1790000000, -1] as $oldest) {
+            $m = ['pending' => 1, 'delayed' => 2, 'reserved' => 3, 'oldest_pending_at' => $oldest,
+                'stats' => ['queue_us' => 4, 'exec_us' => 5]];
+            $this->assertSame($m, QueueCodec::decodeSizeResponse(QueueCodec::encodeSizeResponse($m, $p), $p));
+        }
+    }
+
     public function testANonUtf8PayloadOrQueueIsRefusedBeforeSending(): void
     {
         $p = new PurePacker();

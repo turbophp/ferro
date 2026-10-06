@@ -938,6 +938,7 @@ fn queue_vectors_decode_to_their_named_message_fields() {
                     pending: m["pending"].as_u64().unwrap(),
                     delayed: m["delayed"].as_u64().unwrap(),
                     reserved: m["reserved"].as_u64().unwrap(),
+                    oldest_pending_at: m["oldest_pending_at"].as_i64(),
                     stats,
                 },
                 "{name}"
@@ -953,7 +954,27 @@ fn queue_vectors_decode_to_their_named_message_fields() {
             other => panic!("{name}: no QUEUE response decoder for method {other}"),
         }
     }
-    assert_eq!(seen_ok, 13, "thirteen QUEUE success-terminal vectors");
+    assert_eq!(seen_ok, 14, "fourteen QUEUE success-terminal vectors");
+    // The count bounds are locked INCLUSIVE in a positive vector (review M3).
+    let at_max = |method: u16| {
+        vectors
+            .iter()
+            .filter(|(_, h, _, _)| h.method == method && h.flags & flags::END == 0)
+            .map(|(_, _, m, _)| m)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        at_max(mq::ENQUEUE)
+            .iter()
+            .any(|m| m["jobs"].as_array().unwrap().len()
+                == ferro_proto::consts::QUEUE_ENQUEUE_MAX_JOBS as usize)
+    );
+    assert!(
+        at_max(mq::RESERVE)
+            .iter()
+            .any(|m| m["queues"].as_array().unwrap().len()
+                == ferro_proto::consts::QUEUE_RESERVE_MAX_QUEUES as usize)
+    );
     // Every registered QUEUE method has at least one request vector AND one success vector, so a
     // method added to `[methods.queue]` without vectors fails here.
     for &(mname, id) in ferro_proto::consts::method_queue::ALL {

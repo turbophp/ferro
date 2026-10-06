@@ -1590,6 +1590,27 @@ fn queue_vectors() {
         batch.encode(),
         enq_json(&batch),
     );
+    // The count bounds INCLUSIVE (review M3: without a positive control at the maximum, a decoder that
+    // made the upper bound exclusive, or used another shape's bound, passed every other vector).
+    let max_batch = EnqueueRequest {
+        store: "jobs".into(),
+        jobs: (0..consts::QUEUE_ENQUEUE_MAX_JOBS)
+            .map(|i| EnqueueJob {
+                queue: "default".into(),
+                payload: format!("{{\"n\":{i}}}"),
+                delay_s: i,
+            })
+            .collect(),
+        dedup_key: None,
+        common: plain.clone(),
+    };
+    write_queue_request(
+        "queue_enqueue_request_max_jobs",
+        method_queue::ENQUEUE,
+        88,
+        max_batch.encode(),
+        enq_json(&max_batch),
+    );
     let enq_resp_json = |r: &EnqueueResponse| {
         serde_json::json!({ "job_id_hex": opt_hex(&r.job_id), "inserted": r.inserted,
                             "deduplicated": r.deduplicated, "stats": qstats_json(&r.stats) })
@@ -1598,9 +1619,11 @@ fn queue_vectors() {
         (
             "queue_enqueue_response",
             70,
+            // A dedup REPLAY (SPEC §24.6): the original `job_id`, nothing inserted. (Review L5: the
+            // first version said `inserted: 1` beside `deduplicated: true`, which no engine sends.)
             EnqueueResponse {
                 job_id: Some(b"9223372036854775807".to_vec()),
-                inserted: 1,
+                inserted: 0,
                 deduplicated: true,
                 stats,
             },
@@ -1652,6 +1675,26 @@ fn queue_vectors() {
         serde_json::json!({ "store": res.store, "queues": res.queues, "max_jobs": res.max_jobs,
                             "wait_ms": res.wait_ms, "liveness": res.liveness,
                             "common": common_json(&res.common) }),
+    );
+    let max_queues = ReserveRequest {
+        store: "jobs".into(),
+        queues: (0..consts::QUEUE_RESERVE_MAX_QUEUES)
+            .map(|i| format!("q{i}"))
+            .collect(),
+        max_jobs: 1,
+        wait_ms: 0,
+        liveness: false,
+        common: plain.clone(),
+    };
+    write_queue_request(
+        "queue_reserve_request_max_queues",
+        method_queue::RESERVE,
+        89,
+        max_queues.encode(),
+        serde_json::json!({ "store": max_queues.store, "queues": max_queues.queues,
+                            "max_jobs": max_queues.max_jobs, "wait_ms": max_queues.wait_ms,
+                            "liveness": max_queues.liveness,
+                            "common": common_json(&max_queues.common) }),
     );
     // Two jobs: one at the `sql` kind's sizes (the largest canonical id, an 8-byte token), one at the
     // registry maximum for both handles. Times past u32 would not be PG `integer`s, but the WIRE is
@@ -1829,20 +1872,42 @@ fn queue_vectors() {
             serde_json::json!({ "store": r.store, "queue": r.queue, "common": common_json(&r.common) }),
         );
     }
-    let size = SizeResponse {
-        pending: 7,
-        delayed: 300,
-        reserved: 5_000_000_000,
-        stats,
-    };
-    write_queue_ok(
-        "queue_size_response",
-        method_queue::SIZE,
-        82,
-        size.encode(),
-        serde_json::json!({ "pending": size.pending, "delayed": size.delayed,
-                            "reserved": size.reserved, "stats": qstats_json(&size.stats) }),
-    );
+    // `oldest_pending_at` set (a value past u16, so the int ladder is locked) and `nil` (nothing pending).
+    for (name, req_id, size) in [
+        (
+            "queue_size_response",
+            82,
+            SizeResponse {
+                pending: 7,
+                delayed: 300,
+                reserved: 5_000_000_000,
+                oldest_pending_at: Some(1_790_000_000),
+                stats,
+            },
+        ),
+        (
+            "queue_size_response_empty",
+            87,
+            SizeResponse {
+                pending: 0,
+                delayed: 300,
+                reserved: 0,
+                oldest_pending_at: None,
+                stats,
+            },
+        ),
+    ] {
+        write_queue_ok(
+            name,
+            method_queue::SIZE,
+            req_id,
+            size.encode(),
+            serde_json::json!({ "pending": size.pending, "delayed": size.delayed,
+                                "reserved": size.reserved,
+                                "oldest_pending_at": size.oldest_pending_at,
+                                "stats": qstats_json(&size.stats) }),
+        );
+    }
     let clear = ClearResponse {
         deleted: 70_000,
         stats,

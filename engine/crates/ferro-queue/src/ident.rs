@@ -129,6 +129,22 @@ mod tests {
         assert!(TableName::parse(&"a".repeat(MAX_PART_LEN)).is_ok());
     }
 
+    /// LITERAL bounds and characters (review M3): the tests above derive the bound from
+    /// `MAX_PART_LEN`, so changing the constant moved the test with it. 63 is PostgreSQL's
+    /// `NAMEDATALEN - 1`, and `$` — legal in an UNQUOTED PostgreSQL identifier — is outside the rule.
+    #[test]
+    fn the_part_bound_is_63_bytes_and_dollar_is_refused_literally() {
+        assert!(TableName::parse(&"a".repeat(63)).is_ok());
+        assert_eq!(TableName::parse(&"a".repeat(64)), Err(IdentError::TooLong));
+        assert_eq!(
+            TableName::parse(&format!("s.{}", "a".repeat(64))),
+            Err(IdentError::TooLong)
+        );
+        for bad in ["jobs$1", "$jobs", "app$.jobs", "app.jo$bs"] {
+            assert_eq!(TableName::parse(bad), Err(IdentError::Characters), "{bad}");
+        }
+    }
+
     #[test]
     fn every_refused_identifier_names_its_rule() {
         for (raw, why) in [

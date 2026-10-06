@@ -575,17 +575,26 @@ impl QueueScopeRequest {
     }
 }
 
-/// `SIZE`'s success terminal body: `[pending: u64, delayed: u64, reserved: u64, stats]`.
+/// `SIZE`'s success terminal body: `[pending: u64, delayed: u64, reserved: u64,
+/// oldest_pending_at: i64 | nil, stats]`.
+///
+/// `oldest_pending_at` (added at the M7-G1a review, before the shapes froze) is the earliest
+/// `available_at` among the queue's PENDING jobs, in Unix seconds, or `nil` when none is pending. It is
+/// exactly what Laravel 12's `DatabaseQueue::creationTimeOfOldestPendingJob()` returns (measured in
+/// `illuminate/queue` v12.69.3: despite its name it selects the oldest pending row's `available_at`),
+/// and the Queue contract declares it with `pendingSize`/`delayedSize`/`reservedSize`, which the three
+/// counts already answer. Absent from the frozen shape, it would have cost a `protocol_version` bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SizeResponse {
     pub pending: u64,
     pub delayed: u64,
     pub reserved: u64,
+    pub oldest_pending_at: Option<i64>,
     pub stats: QueueStats,
 }
 
 impl SizeResponse {
-    pub const ARITY: u32 = 4;
+    pub const ARITY: u32 = 5;
 
     pub fn encode(&self) -> Vec<u8> {
         let counts = [self.pending, self.delayed, self.reserved];
@@ -594,6 +603,12 @@ impl SizeResponse {
         enc::write_array_len(&mut out, Self::ARITY).unwrap();
         for n in counts {
             enc::write_uint(&mut out, n).unwrap();
+        }
+        match self.oldest_pending_at {
+            None => enc::write_nil(&mut out).unwrap(),
+            Some(t) => {
+                enc::write_sint(&mut out, t).unwrap();
+            }
         }
         self.stats.write(&mut out);
         out
@@ -605,12 +620,18 @@ impl SizeResponse {
         let pending = read_count(&mut rd, "pending")?;
         let delayed = read_count(&mut rd, "delayed")?;
         let reserved = read_count(&mut rd, "reserved")?;
+        let oldest_pending_at = if peek_nil(&mut rd)? {
+            None
+        } else {
+            Some(read_i64(&mut rd, "oldest_pending_at")?)
+        };
         let stats = QueueStats::read(&mut rd)?;
         expect_end(rd)?;
         Ok(SizeResponse {
             pending,
             delayed,
             reserved,
+            oldest_pending_at,
             stats,
         })
     }
@@ -856,13 +877,16 @@ mod tests {
             common: common(),
         };
         assert_eq!(QueueScopeRequest::decode(&s.encode()).unwrap(), s);
-        let z = SizeResponse {
-            pending: 1,
-            delayed: 70_000,
-            reserved: 5_000_000_000,
-            stats: stats(),
-        };
-        assert_eq!(SizeResponse::decode(&z.encode()).unwrap(), z);
+        for oldest_pending_at in [None, Some(1_790_000_000), Some(-1)] {
+            let z = SizeResponse {
+                pending: 1,
+                delayed: 70_000,
+                reserved: 5_000_000_000,
+                oldest_pending_at,
+                stats: stats(),
+            };
+            assert_eq!(SizeResponse::decode(&z.encode()).unwrap(), z);
+        }
         let c = ClearResponse {
             deleted: 7,
             stats: stats(),
@@ -1069,6 +1093,42 @@ mod tests {
             U64_WIRE_BOUND - 1,
             "the control: 2^63 - 1 is a count"
         );
+    }
+
+    /// Review L6: `common.tx_id` decodes exactly as `ExecRequest.tx_id` does — any `u64`, 2^63 and
+    /// `u64::MAX` included (PROTOCOL.md §14). It is NOT a count: refusing it here while EXEC accepts
+    /// it would make the same id a wire fault on one service and "no such transaction" on another.
+    #[test]
+    fn a_tx_id_at_or_above_2_63_decodes_as_exec_s_does() {
+        for id in [U64_WIRE_BOUND, u64::MAX] {
+            let q = QueueScopeRequest {
+                store: "jobs".into(),
+                queue: "default".into(),
+                common: QueueCommon {
+                    tx_id: Some(id),
+                    ..QueueCommon::default()
+                },
+            };
+            assert_eq!(QueueScopeRequest::decode(&q.encode()).unwrap(), q);
+            let exec = crate::messages::ExecRequest {
+                pool: "main".into(),
+                sql: Some("SELECT 1".into()),
+                query_id: None,
+                params: Vec::new(),
+                timeout_ms: None,
+                readonly: false,
+                fetch: 0,
+                tx_id: Some(id),
+                traceparent: None,
+            };
+            assert_eq!(
+                crate::messages::ExecRequest::decode(&exec.encode())
+                    .unwrap()
+                    .tx_id,
+                Some(id),
+                "EXEC, the precedent"
+            );
+        }
     }
 
     #[test]

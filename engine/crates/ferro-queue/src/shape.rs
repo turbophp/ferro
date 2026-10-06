@@ -1,7 +1,21 @@
-//! Shape verification (SPEC §24.3): at a store's first use in each `boot_epoch` the engine reads
-//! `information_schema.columns` once and checks the table against the one layout v1 serves —
-//! Laravel's stock `jobs.stub` (§24.17 Q1). A mismatch makes every verb on the store answer
-//! `Unsupported`, naming the column. The engine never repairs a table and never creates one.
+//! Shape verification (SPEC §24.3): at a store's first use in each `boot_epoch` the engine reads the
+//! store table's catalog entry once and checks it against the one layout v1 serves — Laravel's stock
+//! `jobs.stub` (§24.17 Q1). A mismatch makes every verb on the store answer `Unsupported`, naming the
+//! column. The engine never repairs a table and never creates one.
+//!
+//! **The table verified is the table the statements will touch** (M7-G1a review M1). The relation is
+//! resolved with `to_regclass` on the SAME quoted identifier the verbs' statements use, so an
+//! unqualified `TABLE` follows the pool's `search_path` exactly as they do — `pg_temp` and `"$user"`
+//! included. The first version looked the name up in `current_schema()` only, and measured wrong: with
+//! `search_path = app, public` and the table in `public`, the statements reach `public.ferro_jobs`
+//! while verification reported the table absent on every request. The columns are then read by the
+//! resolved OID from `pg_attribute`, through `pg_class_oid_index` and
+//! `pg_attribute_relid_attnum_index` (measured with `EXPLAIN`): the old `information_schema` read
+//! cast `relname` to `text` and scanned the whole of `pg_class` (review M2).
+//!
+//! **Only an ordinary or partitioned table passes** (`relkind` `r` or `p`): a view, a materialised
+//! view or a foreign table named `ferro_jobs` is refused, because a fenced `DELETE` through one is not
+//! the row operation the fence reasons about.
 //!
 //! **The accepted types are the stock layout's, exactly** (PostgreSQL, measured against
 //! laravel/framework v11's `PostgresGrammar`: `bigIncrements` → `bigserial`, `string` →
@@ -12,7 +26,9 @@
 //! the token lossless, and a `bigint` `created_at` would make two rows' tokens collide. `reserved_at`
 //! must be nullable (an unreserved row's is `NULL`); the other columns' nullability is not checked.
 //! Extra columns are allowed — an operator may add one — though one that is `NOT NULL` without a
-//! default makes ENQUEUE fail, classified like any statement.
+//! default makes ENQUEUE fail, classified like any statement. Types are compared as
+//! `format_type(atttypid, NULL)` renders them — the same strings `information_schema.data_type` uses
+//! for these types (`character varying`, `integer`, …).
 //!
 //! The MySQL-family statement and type table land with MySQL stores, at G6 (SPEC §24.14).
 
@@ -26,24 +42,23 @@ pub struct Statement {
     pub params: Vec<Value>,
 }
 
-/// The `information_schema` read on PostgreSQL. Every column it compares and returns is cast to
-/// `text`, so neither the bind (`$1`, `$2` are plain text) nor the decode depends on
-/// `information_schema`'s domain types (`sql_identifier`, `character_data`, `yes_or_no`). An
-/// unqualified table is looked up in `current_schema()` — the schema an unqualified name in the
-/// verbs' own statements would resolve to first.
-pub const PG_COLUMNS_SQL: &str = "SELECT column_name::text, data_type::text, is_nullable::text \
-     FROM information_schema.columns \
-     WHERE table_schema::text = COALESCE($1::text, current_schema()::text) \
-       AND table_name::text = $2::text \
-     ORDER BY ordinal_position";
+/// The catalog read on PostgreSQL: one row per live column of the relation `to_regclass($1)` names —
+/// or one row with NULL column cells for a relation without columns, or NO row when nothing by that
+/// name is visible. `$1` is the store's QUOTED identifier, bound as text. Every returned cell is
+/// `text`, so the decode does not depend on catalog types (`name`, `"char"`).
+pub const PG_RELATION_SQL: &str = "SELECT c.relkind::text, c.relnamespace::regnamespace::text, \
+            a.attname::text, format_type(a.atttypid, NULL), \
+            CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END \
+     FROM pg_class c \
+     LEFT JOIN pg_attribute a \
+            ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+     WHERE c.oid = to_regclass($1::text) \
+     ORDER BY a.attnum";
 
-pub fn pg_columns_statement(table: &TableName) -> Statement {
+pub fn pg_relation_statement(table: &TableName) -> Statement {
     Statement {
-        sql: PG_COLUMNS_SQL,
-        params: vec![
-            table.schema.clone().map_or(Value::Null, Value::Text),
-            Value::Text(table.table.clone()),
-        ],
+        sql: PG_RELATION_SQL,
+        params: vec![Value::Text(table.quoted(crate::Dialect::Postgres))],
     }
 }
 
@@ -58,7 +73,7 @@ pub fn pg_serial_statement(table: &TableName) -> Statement {
     }
 }
 
-/// One `information_schema.columns` row.
+/// One column of the resolved relation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnRow {
     pub name: String,
@@ -66,24 +81,64 @@ pub struct ColumnRow {
     pub nullable: bool,
 }
 
-impl ColumnRow {
-    /// Read one row of [`PG_COLUMNS_SQL`]'s result. `None` for a row that is not three `TEXT` cells
-    /// — which the statement cannot produce, so the caller treats it as a verification failure.
-    pub fn from_values(row: &[Value]) -> Option<ColumnRow> {
-        match row {
-            [
-                Value::Text(name),
-                Value::Text(data_type),
-                Value::Text(nullable),
-            ] => Some(ColumnRow {
-                name: name.clone(),
-                data_type: data_type.clone(),
-                nullable: nullable == "YES",
-            }),
-            _ => None,
+/// The relation [`PG_RELATION_SQL`] resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgRelation {
+    /// `pg_class.relkind`: `r` table, `p` partitioned table, `v` view, `m` materialised view, `f`
+    /// foreign table, …
+    pub relkind: String,
+    /// The schema it resolved in (for the log line saying which table was verified).
+    pub schema: String,
+    pub columns: Vec<ColumnRow>,
+}
+
+impl PgRelation {
+    /// Read [`PG_RELATION_SQL`]'s rows. `Ok(None)`: no such relation. `Err(())`: a row the statement
+    /// cannot produce, which the caller treats as a verification failure.
+    #[allow(clippy::result_unit_err)]
+    pub fn from_rows(rows: &[Vec<Value>]) -> Result<Option<PgRelation>, ()> {
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let (relkind, schema) = match first.as_slice() {
+            [Value::Text(k), Value::Text(s), ..] => (k.clone(), s.clone()),
+            _ => return Err(()),
+        };
+        let mut columns = Vec::with_capacity(rows.len());
+        for row in rows {
+            match row.as_slice() {
+                [
+                    Value::Text(_),
+                    Value::Text(_),
+                    Value::Text(name),
+                    Value::Text(data_type),
+                    Value::Text(nullable),
+                ] => columns.push(ColumnRow {
+                    name: name.clone(),
+                    data_type: data_type.clone(),
+                    nullable: nullable == "YES",
+                }),
+                // The LEFT JOIN's no-column row.
+                [
+                    Value::Text(_),
+                    Value::Text(_),
+                    Value::Null,
+                    Value::Null,
+                    Value::Text(_),
+                ] if rows.len() == 1 => {}
+                _ => return Err(()),
+            }
         }
+        Ok(Some(PgRelation {
+            relkind,
+            schema,
+            columns,
+        }))
     }
 }
+
+/// The relation kinds a store may be: an ordinary table and a partitioned table.
+pub const PG_TABLE_RELKINDS: &[&str] = &["r", "p"];
 
 /// What the table must have, in the order the check walks it (so the column a mismatch names is
 /// deterministic): `(column, accepted data_type values, must be nullable)`.
@@ -97,13 +152,18 @@ pub const PG_EXPECTED: &[(&str, &[&str], bool)] = &[
     ("created_at", &["integer"], false),
 ];
 
-/// Why a table does not have the served shape. Every variant names the table, and all but
-/// [`ShapeError::TableAbsent`] the column; its `Display` is the `Unsupported` message.
+/// Why a table does not have the served shape. Every variant names the table, and the column ones
+/// the column; its `Display` is the `Unsupported` message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShapeError {
-    /// No column rows at all: the table does not exist (or is not visible to the pool's role).
+    /// No relation by that name is visible on the pool's `search_path` (or to its role).
     TableAbsent {
         table: String,
+    },
+    /// The name resolves to something that is not a table (a view, a foreign table, …).
+    NotATable {
+        table: String,
+        relkind: String,
     },
     MissingColumn {
         table: String,
@@ -122,10 +182,11 @@ pub enum ShapeError {
 }
 
 impl ShapeError {
-    /// Whether this verdict may be CACHED for the rest of the `boot_epoch`. An absent table may not:
-    /// G1a's decision (SPEC §24.3 amendment) — the ordinary deploy order is "start `ferrod`, then
-    /// run migrations", and caching "no table" would refuse the store until the next restart. A table
-    /// that EXISTS with the wrong shape is cached, as §24.3 says.
+    /// Whether this verdict may be CACHED for the rest of the `boot_epoch`. An absent table may not
+    /// (G1a's decision, SPEC §24.3 amendment): the ordinary deploy order is "start `ferrod`, then run
+    /// migrations". `ferrod` re-checks it only after a short negative TTL, so a missing table costs
+    /// one catalog read per TTL, not one per request (review M2). Everything else is a table that
+    /// EXISTS in the wrong form, cached as §24.3 says.
     pub fn is_definitive(&self) -> bool {
         !matches!(self, ShapeError::TableAbsent { .. })
     }
@@ -136,8 +197,13 @@ impl std::fmt::Display for ShapeError {
         match self {
             ShapeError::TableAbsent { table } => write!(
                 f,
-                "queue table {table} does not exist or is not visible to the pool's role \
-                 (run the ferro_jobs migration, or set the store's TABLE)"
+                "queue table {table} does not exist on the pool's search_path or is not visible to \
+                 its role (run the ferro_jobs migration, or set the store's TABLE)"
+            ),
+            ShapeError::NotATable { table, relkind } => write!(
+                f,
+                "queue table {table} is not a table (pg_class.relkind {relkind:?}; a view or a \
+                 foreign table cannot be a store)"
             ),
             ShapeError::MissingColumn { table, column } => {
                 write!(f, "queue table {table} has no column {column}")
@@ -159,14 +225,20 @@ impl std::fmt::Display for ShapeError {
     }
 }
 
-/// The verdict on [`PG_COLUMNS_SQL`]'s rows.
-pub fn verify_pg(table: &TableName, rows: &[ColumnRow]) -> Result<(), ShapeError> {
+/// The verdict on the resolved relation (`None` = nothing by that name).
+pub fn verify_pg(table: &TableName, relation: Option<&PgRelation>) -> Result<(), ShapeError> {
     let name = table.to_string();
-    if rows.is_empty() {
+    let Some(rel) = relation else {
         return Err(ShapeError::TableAbsent { table: name });
+    };
+    if !PG_TABLE_RELKINDS.contains(&rel.relkind.as_str()) {
+        return Err(ShapeError::NotATable {
+            table: name,
+            relkind: rel.relkind.clone(),
+        });
     }
     for &(column, accepted, must_be_nullable) in PG_EXPECTED {
-        let Some(row) = rows.iter().find(|r| r.name == column) else {
+        let Some(row) = rel.columns.iter().find(|r| r.name == column) else {
             return Err(ShapeError::MissingColumn {
                 table: name,
                 column,
@@ -213,6 +285,18 @@ mod tests {
         .collect()
     }
 
+    fn rel(relkind: &str, columns: Vec<ColumnRow>) -> PgRelation {
+        PgRelation {
+            relkind: relkind.into(),
+            schema: "public".into(),
+            columns,
+        }
+    }
+
+    fn table(columns: Vec<ColumnRow>) -> Option<PgRelation> {
+        Some(rel("r", columns))
+    }
+
     fn t() -> TableName {
         TableName::parse("ferro_jobs").unwrap()
     }
@@ -238,11 +322,12 @@ mod tests {
                 ("created_at", vec!["integer"], false),
             ]
         );
+        assert_eq!(PG_TABLE_RELKINDS, ["r", "p"]);
     }
 
     #[test]
     fn the_stock_layout_passes_with_a_text_queue_and_an_extra_column() {
-        assert_eq!(verify_pg(&t(), &stock()), Ok(()));
+        assert_eq!(verify_pg(&t(), table(stock()).as_ref()), Ok(()));
         let mut rows = stock();
         rows[1].data_type = "text".into();
         rows.push(ColumnRow {
@@ -251,7 +336,26 @@ mod tests {
             nullable: true,
         });
         rows.reverse(); // order in the result does not matter
-        assert_eq!(verify_pg(&t(), &rows), Ok(()));
+        assert_eq!(verify_pg(&t(), table(rows).as_ref()), Ok(()));
+        // A partitioned table passes too.
+        assert_eq!(verify_pg(&t(), Some(&rel("p", stock()))), Ok(()));
+    }
+
+    /// Review M1: a view (or anything that is not a table) with the right columns is refused, and
+    /// the refusal is cached.
+    #[test]
+    fn a_view_or_foreign_table_with_the_right_columns_is_not_a_table() {
+        for kind in ["v", "m", "f", "S", "c"] {
+            let err = verify_pg(&t(), Some(&rel(kind, stock()))).unwrap_err();
+            assert_eq!(
+                err,
+                ShapeError::NotATable {
+                    table: "ferro_jobs".into(),
+                    relkind: kind.into()
+                }
+            );
+            assert!(err.is_definitive());
+        }
     }
 
     #[test]
@@ -260,7 +364,7 @@ mod tests {
             let mut rows = stock();
             rows.remove(i);
             assert_eq!(
-                verify_pg(&t(), &rows),
+                verify_pg(&t(), table(rows).as_ref()),
                 Err(ShapeError::MissingColumn {
                     table: "ferro_jobs".into(),
                     column
@@ -268,7 +372,7 @@ mod tests {
             );
             let mut rows = stock();
             rows[i].data_type = "numeric".into();
-            let err = verify_pg(&t(), &rows).unwrap_err();
+            let err = verify_pg(&t(), table(rows).as_ref()).unwrap_err();
             assert!(
                 matches!(&err, ShapeError::WrongType { column: c, .. } if *c == column),
                 "{err}"
@@ -283,22 +387,23 @@ mod tests {
         for (i, wide) in [(6, "bigint"), (3, "integer"), (4, "bigint"), (0, "integer")] {
             let mut rows = stock();
             rows[i].data_type = wide.into();
-            assert!(verify_pg(&t(), &rows).is_err(), "{i} {wide}");
+            assert!(verify_pg(&t(), table(rows).as_ref()).is_err(), "{i} {wide}");
         }
     }
 
     #[test]
-    fn reserved_at_must_be_nullable_and_an_empty_result_is_an_absent_table() {
+    fn reserved_at_must_be_nullable_and_no_relation_is_an_absent_table() {
         let mut rows = stock();
         rows[4].nullable = false;
+        let not_null = verify_pg(&t(), table(rows).as_ref()).unwrap_err();
         assert_eq!(
-            verify_pg(&t(), &rows),
-            Err(ShapeError::NotNullable {
+            not_null,
+            ShapeError::NotNullable {
                 table: "ferro_jobs".into(),
                 column: "reserved_at"
-            })
+            }
         );
-        let absent = verify_pg(&t(), &[]).unwrap_err();
+        let absent = verify_pg(&t(), None).unwrap_err();
         assert_eq!(
             absent,
             ShapeError::TableAbsent {
@@ -306,51 +411,102 @@ mod tests {
             }
         );
         assert!(!absent.is_definitive(), "an absent table is re-checked");
-        assert!(
-            verify_pg(&t(), &rows).unwrap_err().is_definitive(),
-            "a wrong shape is cached"
-        );
-    }
-
-    #[test]
-    fn the_statements_bind_the_schema_and_table_as_text() {
-        let s = pg_columns_statement(&t());
+        assert!(not_null.is_definitive(), "a wrong shape is cached");
+        // A table with no columns at all is a table missing `id`, not an absent one.
         assert_eq!(
-            s.params,
-            vec![Value::Null, Value::Text("ferro_jobs".into())]
-        );
-        let q = TableName::parse("app.jobs").unwrap();
-        let s = pg_columns_statement(&q);
-        assert_eq!(
-            s.params,
-            vec![Value::Text("app".into()), Value::Text("jobs".into())]
-        );
-        assert!(s.sql.contains("information_schema.columns"));
-        assert!(s.sql.contains("current_schema()"));
-        assert_eq!(
-            pg_serial_statement(&q).params,
-            vec![Value::Text("\"app\".\"jobs\"".into())]
-        );
-    }
-
-    #[test]
-    fn a_row_of_the_wrong_shape_is_not_a_column_row() {
-        assert_eq!(
-            ColumnRow::from_values(&[
-                Value::Text("id".into()),
-                Value::Text("bigint".into()),
-                Value::Text("NO".into())
-            ]),
-            Some(ColumnRow {
-                name: "id".into(),
-                data_type: "bigint".into(),
-                nullable: false
+            verify_pg(&t(), table(vec![]).as_ref()),
+            Err(ShapeError::MissingColumn {
+                table: "ferro_jobs".into(),
+                column: "id"
             })
         );
-        assert_eq!(ColumnRow::from_values(&[Value::Text("id".into())]), None);
+    }
+
+    /// Review M1: the relation is resolved by `to_regclass` on the QUOTED identifier — the statements'
+    /// own resolution — never by `current_schema()`; and the columns are read by the resolved OID.
+    #[test]
+    fn the_statement_resolves_the_quoted_identifier_through_the_search_path() {
+        let s = pg_relation_statement(&t());
+        assert_eq!(s.params, vec![Value::Text("\"ferro_jobs\"".into())]);
+        let q = TableName::parse("App.Jobs").unwrap();
         assert_eq!(
-            ColumnRow::from_values(&[Value::Null, Value::Null, Value::Null]),
-            None
+            pg_relation_statement(&q).params,
+            vec![Value::Text("\"App\".\"Jobs\"".into())]
+        );
+        assert!(s.sql.contains("to_regclass($1::text)"));
+        assert!(
+            s.sql.contains("c.oid = to_regclass"),
+            "the OID index predicate"
+        );
+        assert!(!s.sql.contains("current_schema"));
+        assert!(!s.sql.contains("information_schema"));
+        assert!(s.sql.contains("NOT a.attisdropped"));
+        assert_eq!(
+            pg_serial_statement(&q).params,
+            vec![Value::Text("\"App\".\"Jobs\"".into())]
+        );
+    }
+
+    fn txt(s: &str) -> Value {
+        Value::Text(s.into())
+    }
+
+    #[test]
+    fn rows_parse_into_a_relation_and_malformed_rows_are_refused() {
+        assert_eq!(PgRelation::from_rows(&[]), Ok(None));
+        let rows = vec![
+            vec![txt("r"), txt("app"), txt("id"), txt("bigint"), txt("NO")],
+            vec![
+                txt("r"),
+                txt("app"),
+                txt("reserved_at"),
+                txt("integer"),
+                txt("YES"),
+            ],
+        ];
+        let rel = PgRelation::from_rows(&rows).unwrap().unwrap();
+        assert_eq!((rel.relkind.as_str(), rel.schema.as_str()), ("r", "app"));
+        assert_eq!(
+            rel.columns,
+            vec![
+                ColumnRow {
+                    name: "id".into(),
+                    data_type: "bigint".into(),
+                    nullable: false
+                },
+                ColumnRow {
+                    name: "reserved_at".into(),
+                    data_type: "integer".into(),
+                    nullable: true
+                },
+            ]
+        );
+        // A relation without columns: one row of NULL column cells.
+        let empty = vec![vec![
+            txt("v"),
+            txt("app"),
+            Value::Null,
+            Value::Null,
+            txt("YES"),
+        ]];
+        assert_eq!(
+            PgRelation::from_rows(&empty),
+            Ok(Some(PgRelation {
+                relkind: "v".into(),
+                schema: "app".into(),
+                columns: vec![]
+            }))
+        );
+        assert_eq!(PgRelation::from_rows(&[vec![txt("r")]]), Err(()));
+        assert_eq!(
+            PgRelation::from_rows(&[vec![
+                Value::Null,
+                txt("a"),
+                txt("id"),
+                txt("bigint"),
+                txt("NO")
+            ]]),
+            Err(())
         );
     }
 }

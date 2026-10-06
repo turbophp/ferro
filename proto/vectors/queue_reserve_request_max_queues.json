@@ -1,0 +1,39 @@
+{
+  "frame_hex": "f704000007000200590000004600000096a46a6f6273dc0010a27130a27131a27132a27133a27134a27135a27136a27137a27138a27139a3713130a3713131a3713132a3713133a3713134a37131350100c293c0c0c0",
+  "header": {
+    "flags": 0,
+    "method": 2,
+    "request_id": 89,
+    "service": 7
+  },
+  "message": {
+    "common": [
+      null,
+      null,
+      null
+    ],
+    "liveness": false,
+    "max_jobs": 1,
+    "queues": [
+      "q0",
+      "q1",
+      "q2",
+      "q3",
+      "q4",
+      "q5",
+      "q6",
+      "q7",
+      "q8",
+      "q9",
+      "q10",
+      "q11",
+      "q12",
+      "q13",
+      "q14",
+      "q15"
+    ],
+    "store": "jobs",
+    "wait_ms": 0
+  },
+  "name": "queue_reserve_request_max_queues"
+}

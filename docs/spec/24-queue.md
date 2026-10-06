@@ -218,7 +218,12 @@ same cache `HELLO_ACK` advertises, starting the probe if none is running. A vers
 FAILS CLOSED. A pool whose version is unknown (an unreachable backend, a failed probe inside its
 back-off) refuses the verb as `ConnectionLost` (Retryable): nothing was sent. MariaDB is told from MySQL
 by the substring `mariadb`, as the Doctrine tier does. Only PostgreSQL stores pass the gate live in G1a;
-MySQL-family stores are refused before it until G6.]* **Cost:** on PostgreSQL this is stricter than Laravel's own
+MySQL-family stores are refused before it until G6. *Review round:* the wait for an in-flight probe is
+bounded by the REQUEST's deadline and CANCEL as well as by the probe's own 1.5 s budget (the store's
+verdict lock is held across it); an unknown version is logged once per probe back-off window (5 s) per
+store, not once per request; and a gate REFUSAL is reused only for the probe's TTL (600 s), the lifetime
+of the version it was decided on, so a backend upgraded under a running `ferrod` is noticed without a
+restart.]* **Cost:** on PostgreSQL this is stricter than Laravel's own
 9.5 gate. PG 9.5–11 are out of support; PG 11 reached end of life in 2023. Accepted (§24.17 Q8).
 
 **The layout is Laravel's stock `jobs` table, unchanged, and it is v1's only layout** (decided,
@@ -392,11 +397,19 @@ restart; until then a verb that fails against the changed table is classified li
   accepted types are the stock layout's exactly — `id bigint`, `queue character varying` or `text`,
   `payload text`, `attempts smallint`, `reserved_at`/`available_at`/`created_at integer` — because the
   `sql` token carries `created_at` in 32 bits and `attempts` in 16, so a wider column would make tokens
-  collide; `reserved_at` must be nullable; extra columns are allowed. **An absent table is NOT cached**:
-  the ordinary deploy order is "start `ferrod`, then migrate", so the next use re-checks it. A table
-  that exists with the wrong shape IS cached until the next restart, as written above. Every compared
-  and returned `information_schema` column is cast to `text`, so neither the bind nor the decode depends
-  on its domain types, and an unqualified table is looked up in `current_schema()`.]*
+  collide; `reserved_at` must be nullable; extra columns are allowed. **An absent table is cached only
+  briefly** (`ABSENT_RECHECK`, 2 s): the ordinary deploy order is "start `ferrod`, then migrate", so a
+  table created after boot is served within two seconds, while a missing table costs one catalog read
+  per store per two seconds rather than a checkout per request. A table that exists with the wrong shape
+  IS cached until the next restart, as written above. *Review round (M1):* the table is resolved the way
+  the verbs' statements will resolve it — `to_regclass($1)` on the QUOTED identifier, so an unqualified
+  `TABLE` follows the pool's whole `search_path` (the first version looked in `current_schema()` only and
+  called a table in the path's second schema absent) — and the columns are read from `pg_attribute` by
+  that oid, with `format_type()` names. The relation must be a table: `relkind` `r` or `p` (partitioned)
+  passes; a view, materialized view or foreign table with exactly the right columns is refused, naming
+  its kind, because the verbs are written for a table: a view need not be updatable or lockable, and a
+  foreign table's locking belongs to the remote server. Every returned column is
+  cast to `text`, so the decode does not depend on catalog domain types.]*
 - The engine also resolves the identity default (PG `pg_get_serial_sequence`) for diagnostics only.
 - It never repairs the table.
 
@@ -445,13 +458,16 @@ could fail the codec's UTF-8 check.
 | `ACK = 3` | `[store, job_id: bin (1..=1024), token: bin (1..=1024), common]` | `[outcome: u8 (1 acked, 2 gone), stats]`. `gone` is never returned in a transaction | yes |
 | `RELEASE = 4` | `[store, job_id, token, delay_s, common]` | `[new_job_id: bin (1..=1024)\|nil, stats]`. `nil` = `gone` (autocommit only) | yes |
 | `EXTEND = 5` | `[store, job_id, token, common]` | `[lease_deadline, stats]` | yes |
-| `SIZE = 6` | `[store, queue, common]` | `[pending, delayed, reserved, stats]` | yes |
+| `SIZE = 6` | `[store, queue, common]` | `[pending, delayed, reserved, oldest_pending_at: i64\|nil, stats]` | yes |
 | `CLEAR = 7` | `[store, queue, common]` | `[deleted: u64, stats]` | yes |
 
 *[Frozen M7-G1a (SPEC §22.2 (df); layouts in `/proto/PROTOCOL.md` §14). Where the table above names no
 type, G1a fixed one: `attempts` is `u32`; `created_at` and `lease_deadline` are `i64` (Unix seconds, signed
 because PostgreSQL's `integer` is); `pending`, `delayed`, `reserved`, `deleted` and both `stats` fields are
-`u64` bounded below 2^63, so PHP reads native ints; `common.tx_id` is a `u64` like `ExecRequest.tx_id`;
+`u64` bounded below 2^63, so PHP reads native ints; SIZE's `oldest_pending_at` is `i64 | nil` (the
+smallest pending `available_at`, Laravel 12's `creationTimeOfOldestPendingJob()` — added in the G1a review
+round after checking `illuminate/queue` v12.69.3); `common.tx_id` is a `u64` decoded exactly as
+`ExecRequest.tx_id` is (any `u64`; PHP cannot send one ≥ 2^63);
 `common.traceparent` decodes lossily, as on EXEC. ACK and EXTEND share one request shape
 (`[store, job_id, token, common]`), and SIZE and CLEAR another (`[store, queue, common]`). The bounds in
 the table (`bin (1..=1024)`, `(1..=1000)`, `(1..=16)`) are enforced by BOTH decoders, so breaking one is
@@ -1145,8 +1161,8 @@ one reviewable slice (the HTTP precedent: `/proto` alone was F2). `/proto` is co
 | slice | delivers | proves |
 |---|---|---|
 | **G0** *(DONE, §22.2 (cn))* | this section; `QUEUE = 7`, `LeaseLost`, `PoolMismatch` and `queue_wait_grace_ms` allocated in the spec (their `/proto` entries land at G1); §21 D21/D22; the §24.16 amendments | review attacked §24.5–§24.8 before any code |
-| **G1a** *(BUILT M7-G1a, SPEC §22.2 (df); DONE when merged)* | `/proto`: `[services] QUEUE = 7`, `[methods.queue]`, `LeaseLost`/`PoolMismatch` and the new `InvalidHandle` (`0x3011`), `queue_wait_grace_ms`, the `[ack_outcome]` table and three shape bounds; PROTOCOL.md §1 and a new **§14**; golden vectors (every handle position at its `sql` size and at 1 024 bytes) and refusal vectors (0 and 1 025 bytes for every handle position; 0 and max + 1 jobs and queues) in both codecs; **all shapes frozen**; §24.3's G1 prerequisites (the canonical decimal `job_id`, the 8-byte token, both with strict decodes; `InvalidHandle`); store config with every refusal; the version gate and shape verification at first use (PostgreSQL; cached per process, an absent table excepted); `ferrod` routing and a QUEUE handler that makes every pre-checkout refusal and the first-use verification, then answers `Unsupported` for every verb | an undecodable handle is `InvalidHandle` before any statement; a wrong shape names its column; the gate and the verdict caching are wired; mutation-proven |
-| **G1b** | ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules; the statement builders in `ferro-queue` | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
+| **G1a** *(BUILT M7-G1a, SPEC §22.2 (df); DONE when merged)* | `/proto`: `[services] QUEUE = 7`, `[methods.queue]`, `LeaseLost`/`PoolMismatch` and the new `InvalidHandle` (`0x3011`), `queue_wait_grace_ms`, the `[ack_outcome]` table and three shape bounds; PROTOCOL.md §1 and a new **§14**; golden vectors (every handle position at its `sql` size and at 1 024 bytes) and refusal vectors (0 and 1 025 bytes for every handle position; 0 and max + 1 jobs and queues) in both codecs; **all shapes frozen**; §24.3's G1 prerequisites (the canonical decimal `job_id`, the 8-byte token, both with strict decodes; `InvalidHandle`); store config with every refusal; the version gate and shape verification at first use (PostgreSQL; cached per process, an absent table excepted); `ferrod` routing and a QUEUE handler that makes every pre-checkout refusal and the first-use verification, then answers `Unsupported` for every verb | an undecodable handle is `InvalidHandle` before any statement; a wrong shape names its column; a view is refused and a partitioned table passes; an unqualified table follows `search_path`; the gate and the verdict caching (including the absent-table TTL, counted) are wired; mutation-proven |
+| **G1b** | ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules; the statement builders in `ferro-queue`. *Carried from the G1a review:* shape verification must also require `id` to be UNIQUE (the primary key or a unique index) — a fence `WHERE id = $1 AND …` over duplicate ids would match several rows; and `now + 1 + delay_s` must be pre-checked against PG `integer` before send, since a `delay_s` near `u32::MAX` otherwise overflows `available_at` as a post-send `22003` (refuse it `Unsupported`, nothing sent); SIZE fills `oldest_pending_at` | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
 | **G2** | tx path: `resolve_active` made `pub(crate)`, `PoolMismatch`, `TxCommand::Queue` + `after_commit`, in-tx `LeaseLost` semantics (R1), refused tx-scoped RESERVE | atomicity both ways; mismatch leaves the transaction usable; chaos rows 2 and 7 |
 | **G3** | the waker (per queue, `LIMIT k`, statement deadlines, register-then-sweep), long-poll, the wait bound, **unreserve**, wake hints, coalesced polls, drain; queue metrics and spans | cost bound (row 11); one END under every CANCEL/deadline race and the deliver-xor-unreserve rule (row 12); idle-polling bench vs stock (A's number); R4 reproduced on the real transport |
 | **G4** | native PHP API, `queueWorker()`, wait clamp, client fate and licensed re-sends; dedup table and purge **after** the dedup spike reproduces §24.6's three paths | chaos rows 1, 3–6, 8, 9 and 15 through the client |
