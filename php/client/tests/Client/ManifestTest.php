@@ -349,4 +349,157 @@ final class ManifestTest extends TestCase
         $this->assertFalse(RetryPolicy::none()->retryIdempotentWrites);
         $this->assertTrue(RetryPolicy::default()->retryIdempotentWrites);
     }
+
+    // ---- M3-D2e review round ----------------------------------------------------------------
+
+    private static function begin(int $rid, int $txId): string
+    {
+        $p = PackerFactory::forEncode();
+        return self::frame(C::FLAG_END, C::SERVICE_TX, C::METHOD_TX_BEGIN, $rid, Outcome::ok(\Ferro\Protocol\BeginResponse::encode(['tx_id' => $txId], $p))->encode($p));
+    }
+
+    private static function txDone(int $rid, int $method): string
+    {
+        return self::frame(C::FLAG_END, C::SERVICE_TX, $method, $rid, Outcome::ok('')->encode(PackerFactory::forEncode()));
+    }
+
+    /** @return list<array<string, mixed>> the EXEC requests the client wrote */
+    private static function execs(FakeTransport $t): array
+    {
+        $out = [];
+        foreach (self::sent($t) as [$h, $w]) {
+            if ($h->service === C::SERVICE_SQL && $h->method === C::METHOD_SQL_EXEC) {
+                $out[] = ExecRequest::mapFromWire($w);
+            }
+        }
+        return $out;
+    }
+
+    /** F4/M3: the licence is for an UNKNOWN fate only — a definite error is never re-sent. */
+    public function testADefiniteErrorOnAnIdempotentWriteIsNotResent(): void
+    {
+        $t = new FakeTransport();
+        [$conn, $dials] = self::connection($t, [], Manifest::fromJson(self::json(self::queries())));
+        $err = new ErrorPayload(C::ERR_UNIQUE, C::BRANCH_NON_RETRYABLE, '23505', null, 'duplicate key', null, null);
+        $t->feed(self::frame(C::FLAG_END, C::SERVICE_SQL, C::METHOD_SQL_EXEC, 1, Outcome::error($err)->encode(PackerFactory::forEncode())));
+        try {
+            $conn->execById('users.upsert', [5]);
+            $this->fail('a definite error must surface');
+        } catch (\Ferro\Client\Error\NonRetryableException) {
+        }
+        $this->assertCount(1, self::execs($t), 'sent once');
+        $this->assertCount(0, $dials);
+    }
+
+    /**
+     * F2: when the licensed re-send cannot reconnect, the caller learns the WRITE's fate
+     * (Indeterminate), not the dial's — a dial failure reads as "nothing was sent".
+     */
+    public function testAFailedReconnectDuringTheLicenceStillReportsIndeterminate(): void
+    {
+        $first = new FakeTransport();
+        $dead = new FakeTransport(); // no HELLO_ACK: the handshake on the "restarted" engine fails
+        [$conn] = self::connection($first, [$dead], Manifest::fromJson(self::json(self::queries())));
+        $this->expectException(IndeterminateException::class);
+        $conn->execById('users.upsert', [5]);
+    }
+
+    /** F3: a query by id in an IMPERATIVE transaction rides the transaction, and is never re-sent. */
+    public function testAQueryByIdInAnImperativeTransactionCarriesTheTxId(): void
+    {
+        $t = new FakeTransport();
+        [$conn] = self::connection($t, [], Manifest::fromJson(self::json(self::queries())));
+        $t->feed(self::begin(1, 42));
+        $t->feed(self::ok(2));
+        $conn->begin();
+        $conn->execById('users.bump');
+        $execs = self::execs($t);
+        $this->assertSame(42, $execs[0]['tx_id']);
+        $this->assertSame('users.bump', $execs[0]['query_id']);
+        // Declared for another pool than the transaction's: refused before sending.
+        $this->expectException(ManifestException::class);
+        $this->expectExceptionMessage('this transaction runs on `default`');
+        $conn->execById('users.upsert');
+    }
+
+    /**
+     * F3: inside a closure transaction, the TxHandle runs a query by id IN the transaction, and the
+     * Connection refuses one — it used to run it outside the transaction, surviving its rollback.
+     */
+    public function testInsideAClosureTransactionQueriesByIdRunOnTheTxHandle(): void
+    {
+        $t = new FakeTransport();
+        [$conn] = self::connection($t, [], Manifest::fromJson(self::json(self::queries())));
+        $t->feed(self::begin(1, 43));
+        $t->feed(self::ok(2));
+        $t->feed(self::txDone(3, C::METHOD_TX_COMMIT));
+        $refused = null;
+        $conn->transaction(static function (\Ferro\Client\TxHandle $tx) use ($conn, &$refused): void {
+            $tx->execById('users.bump');
+            try {
+                $conn->execById('users.bump');
+            } catch (ManifestException $e) {
+                $refused = $e->getMessage();
+            }
+        });
+        $this->assertNotNull($refused);
+        $this->assertStringContainsString('TxHandle', (string) $refused);
+        $execs = self::execs($t);
+        $this->assertCount(1, $execs, 'only the TxHandle statement was sent');
+        $this->assertSame(43, $execs[0]['tx_id']);
+    }
+
+    public function testTheTxHandleRefusesAQueryForAnotherPool(): void
+    {
+        $t = new FakeTransport();
+        [$conn] = self::connection($t, [], Manifest::fromJson(self::json(self::queries())));
+        $t->feed(self::begin(1, 44));
+        $t->feed(self::txDone(2, C::METHOD_TX_ROLLBACK));
+        try {
+            $conn->transaction(static function (\Ferro\Client\TxHandle $tx): void {
+                $tx->execById('users.upsert'); // declared for `reports`
+            }, \Ferro\Client\RetryPolicy::none());
+            $this->fail('refused');
+        } catch (ManifestException $e) {
+            $this->assertStringContainsString('declared for pool `reports`', $e->getMessage());
+        }
+        $this->assertCount(0, self::execs($t));
+    }
+
+    /** F4/M22: the hash covers the pool exactly as written, case included. */
+    public function testThePoolIsHashedVerbatim(): void
+    {
+        $m = Manifest::fromJson(self::json(['a' => ['sql' => 'SELECT 1', 'pool' => 'Reports', 'readonly' => true, 'idempotent' => false]]));
+        $this->assertStringContainsString('"pool":"Reports"', Manifest::canonical(['a' => $m->query('a')]));
+    }
+
+    /** @return array<string, array{0: string, 1: string}> */
+    public static function engineRefusals(): array
+    {
+        $ok = ['sql' => 'SELECT 1', 'pool' => 'default', 'readonly' => true, 'idempotent' => false];
+        return [
+            'id with a trailing newline' => [self::json(["abc\n" => $ok]), 'invalid query id'],
+            'untrimmed sql' => [self::json(['a' => ['sql' => " SELECT 1"] + $ok]), 'trimmed'],
+            'non-breaking-space sql' => [self::json(['a' => ['sql' => "SELECT 1\u{a0}"] + $ok]), 'trimmed'],
+            'pool with a space' => [self::json(['a' => ['pool' => 'de fault'] + $ok]), 'invalid pool'],
+            'non-string source' => [self::json(['a' => $ok + ['source' => 3]]), 'needs'],
+        ];
+    }
+
+    /** F1: the client refuses what the engine's loader refuses. */
+    #[DataProvider('engineRefusals')]
+    public function testTheClientRefusesWhatTheEngineRefuses(string $json, string $message): void
+    {
+        $this->expectException(ManifestException::class);
+        $this->expectExceptionMessage($message);
+        Manifest::fromJson($json);
+    }
+
+    public function testANullRecordedHashIsAcceptedAsTheEngineAcceptsIt(): void
+    {
+        $doc = json_decode(self::json(self::queries()), true);
+        $doc['hash'] = null;
+        $this->assertSame(Manifest::fromJson(self::json(self::queries()))->hash(), Manifest::fromJson(json_encode($doc, JSON_THROW_ON_ERROR))->hash());
+    }
 }
+

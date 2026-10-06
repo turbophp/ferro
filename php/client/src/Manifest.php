@@ -21,6 +21,12 @@ use Ferro\Client\Error\ManifestException;
  * escapes them (raw UTF-8, `/` unescaped, U+2028/9 unescaped, control characters as `\u00xx`). A
  * file whose recorded `hash` differs from the recomputed one was edited after `ferro manifest` wrote
  * it — perhaps an `idempotent` flipped — and is refused rather than believed.
+ *
+ * **Known difference from the engine's loader:** PHP's JSON decoder keeps the LAST of two equal
+ * keys silently, where the engine refuses such a file. It cannot make the client act on a different
+ * declaration than the engine's: the hash is computed from what PHP kept, and the engine admits a
+ * client only if that hash equals its own, which no file with a repeated key can produce on the
+ * engine side.
  */
 final class Manifest
 {
@@ -68,14 +74,16 @@ final class Manifest
         $queries = [];
         foreach ($raw as $id => $q) {
             $id = (string) $id;
-            if (preg_match('/^[a-z][a-z0-9_.-]{0,127}$/', $id) !== 1) {
+            // `\z`, not `$`: `$` also matches before a final newline, so `"abc\n"` passed (review F1).
+            if (preg_match('/\A[a-z][a-z0-9_.-]{0,127}\z/', $id) !== 1) {
                 throw new ManifestException("invalid query id `{$id}`");
             }
             $queries[$id] = self::parseQuery($id, $q);
         }
         ksort($queries, SORT_STRING);
         $hash = hash('sha256', self::canonical($queries));
-        if (array_key_exists('hash', $doc) && $doc['hash'] !== $hash) {
+        // `"hash": null` is accepted, as the engine accepts it: the field is informational.
+        if (($doc['hash'] ?? null) !== null && $doc['hash'] !== $hash) {
             throw new ManifestException(
                 'the manifest\'s recorded hash is not the hash of its queries: it was edited after '
                 . '`ferro manifest` wrote it. Regenerate it rather than editing it.',
@@ -98,12 +106,22 @@ final class Manifest
         $readonly = $q['readonly'] ?? null;
         $idempotent = $q['idempotent'] ?? null;
         $dto = $q['dto'] ?? null;
+        $source = $q['source'] ?? null;
         if (!is_string($sql) || $sql === '' || !is_string($pool) || $pool === ''
             || !is_bool($readonly) || !is_bool($idempotent) || !($dto === null || is_string($dto))
+            || !($source === null || is_string($source))
         ) {
             throw new ManifestException(
                 "query `{$id}` needs a non-empty `sql` and `pool`, boolean `readonly` and `idempotent`",
             );
+        }
+        // The engine's own rules (`ferro_manifest::Manifest::validate`), so the client never accepts
+        // a file the engine would refuse (M3-D2e review F1).
+        if (preg_match('/\A[A-Za-z0-9_-]+\z/', $pool) !== 1) {
+            throw new ManifestException("query `{$id}` has an invalid pool name");
+        }
+        if (preg_match('/\A[\s\p{Z}]|[\s\p{Z}]\z/u', $sql) === 1) {
+            throw new ManifestException("query `{$id}`'s SQL has surrounding whitespace (it must be stored trimmed)");
         }
         return new ManifestQuery($id, $sql, $pool, $readonly, $idempotent, $dto);
     }

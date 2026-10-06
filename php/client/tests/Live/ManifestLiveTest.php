@@ -27,7 +27,9 @@ final class ManifestLiveTest extends LiveTestCase
 
     private const QUERIES = [
         'kv.put' => [
-            'sql' => "INSERT INTO d2e_kv(k, v) SELECT \$1, \$2 FROM pg_sleep(CASE WHEN nextval('d2e_put_attempts') = 1 THEN 1 ELSE 0 END) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+            // `hits` counts APPLICATIONS (review F5: `SET v = EXCLUDED.v` alone passes whether the
+            // statement applied once or twice, so "applied once" was asserted by nothing).
+            'sql' => "INSERT INTO d2e_kv(k, v, hits) SELECT \$1, \$2, 1 FROM pg_sleep(CASE WHEN nextval('d2e_put_attempts') = 1 THEN 1 ELSE 0 END) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, hits = d2e_kv.hits + 1",
             'pool' => 'default', 'readonly' => false, 'idempotent' => true,
         ],
         'log.add' => [
@@ -61,7 +63,7 @@ final class ManifestLiveTest extends LiveTestCase
         foreach ([
             'DROP TABLE IF EXISTS d2e_kv', 'DROP TABLE IF EXISTS d2e_log',
             'DROP SEQUENCE IF EXISTS d2e_put_attempts', 'DROP SEQUENCE IF EXISTS d2e_add_attempts',
-            'CREATE TABLE d2e_kv (k int PRIMARY KEY, v text NOT NULL)',
+            'CREATE TABLE d2e_kv (k int PRIMARY KEY, v text NOT NULL, hits int NOT NULL)',
             'CREATE TABLE d2e_log (id serial PRIMARY KEY, v text NOT NULL)',
             'CREATE SEQUENCE d2e_put_attempts', 'CREATE SEQUENCE d2e_add_attempts',
         ] as $sql) {
@@ -103,6 +105,26 @@ final class ManifestLiveTest extends LiveTestCase
         $check = $this->connectConnection();
         $this->assertSame(1, (int) $check->scalar('SELECT count(*) FROM d2e_kv WHERE k = 7', []));
         $this->assertSame('seven', $check->scalar('SELECT v FROM d2e_kv WHERE k = 7', []));
+        // Two sends, ONE application: the first send's statement was cancelled by `ferrod` when the
+        // client's read deadline closed the socket mid-sleep, so the licensed re-send is the only
+        // one that applied. (Had it applied too, the declared-idempotent upsert would still leave
+        // one row — which is why the licence is safe — but `hits` would read 2.)
+        $this->assertSame(1, (int) $check->scalar('SELECT hits FROM d2e_kv WHERE k = 7', []));
+    }
+
+    /** Review F3: inside a closure transaction a query by id runs IN it, and its rollback undoes it. */
+    public function testAQueryByIdInAClosureTransactionIsRolledBackWithIt(): void
+    {
+        $this->setUpTables();
+        $c = $this->withManifest();
+        try {
+            $c->transaction(static function (\Ferro\Client\TxHandle $tx): void {
+                $tx->execById('kv.put', [4, 'four']);
+                throw new \LogicException('roll it back');
+            }, RetryPolicy::none());
+        } catch (\LogicException) {
+        }
+        $this->assertSame(0, (int) $this->connectConnection()->scalar('SELECT count(*) FROM d2e_kv WHERE k = 4', []));
     }
 
     /** **The control.** The identical loss on a write NOT declared idempotent surfaces; one send. */

@@ -72,6 +72,9 @@ final class Connection
 
     private readonly ExecCodec $codec;
     private readonly RetryPolicy $policy;
+
+    /** How many `transaction()` closures are running on this connection (M3-D2e review F3). */
+    private int $closureTxDepth = 0;
     private readonly FateClassifier $fate;
     private readonly PackerInterface $encodePacker;
     private readonly PackerInterface $decodePacker;
@@ -445,6 +448,15 @@ final class Connection
      */
     private function dispatchById(string $id, array $params, int $fetch): array
     {
+        if ($this->closureTxDepth > 0) {
+            // M3-D2e review F3: inside `transaction()` a statement belongs to the TxHandle the closure
+            // was given. On the Connection it would run OUTSIDE the transaction — and survive its
+            // rollback — with the idempotent licence armed besides.
+            throw new \Ferro\Client\Error\ManifestException(
+                'inside transaction(), run a query by id on the TxHandle the closure receives '
+                . '($tx->execById(…)), not on the Connection: here it would run outside the transaction',
+            );
+        }
         if ($this->manifest === null) {
             throw new \Ferro\Client\Error\ManifestException(
                 'a query by id needs a manifest: connect with Ferro::connect(manifest: Manifest::fromFile(…))',
@@ -1273,11 +1285,16 @@ final class Connection
                 throw $ex;
             }
             $txId = $this->decodeTxId($outcome);
-            $tx = new TxHandle($session, $this->codec, $this->pool, $txId, $this->encodePacker);
+            $tx = new TxHandle($session, $this->codec, $this->pool, $txId, $this->encodePacker, $this->manifest);
 
             // ---- 2. run the closure ----
             try {
-                $result = $fn($tx);
+                ++$this->closureTxDepth;
+                try {
+                    $result = $fn($tx);
+                } finally {
+                    --$this->closureTxDepth;
+                }
             } catch (\Throwable $closureError) {
                 // Best-effort rollback; the original error is what matters.
                 try {
@@ -1560,10 +1577,24 @@ final class Connection
                 );
                 if ($this->reconnect !== null
                     && $attempt + 1 < $this->policy->maxAttempts
-                    && ($this->fate->mayRetryException($fate, $readonly, $opKind)
-                        || $this->idempotentLicence($fate, $byId))
+                    && $this->fate->mayRetryException($fate, $readonly, $opKind)
                 ) {
                     $this->reconnect->reconnect();
+                    ++$attempt;
+                    continue;
+                }
+                if ($this->reconnect !== null
+                    && $attempt + 1 < $this->policy->maxAttempts
+                    && $this->idempotentLicence($fate, $byId)
+                ) {
+                    // The licensed re-send. If the session cannot be re-established, the caller is
+                    // told the WRITE's fate — Indeterminate — not the dial's, which callers read as
+                    // "nothing was sent" (M3-D2e review F2).
+                    try {
+                        $this->reconnect->reconnect();
+                    } catch (FerroException $dial) {
+                        throw $fate;
+                    }
                     ++$attempt;
                     continue;
                 }
