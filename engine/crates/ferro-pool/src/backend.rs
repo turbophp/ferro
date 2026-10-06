@@ -153,6 +153,70 @@ pub trait BackendRows: Send {
     fn rows_affected(&self) -> u64;
 }
 
+/// The data half of a `COPY … FROM STDIN` (M3-D4, SPEC §6.1): produced by
+/// [`PoolBackend::copy_in`] once the server is in copy-in mode, and driven by `Checkout`'s
+/// `CopyInHandle`. The bytes are opaque — whatever the statement's format says they are.
+///
+/// **The one fact the engine's fate rules stand on:** the server cannot complete the COPY — and
+/// nothing of it can commit — until [`BackendCopyIn::finish`] has sent the end-of-data. Until then,
+/// [`BackendCopyIn::abort`] ends it with nothing applied, whatever else happens.
+#[async_trait]
+pub trait BackendCopyIn: Send {
+    /// Forward one chunk. An `Err` means the copy has FAILED (a server error such as a malformed
+    /// row — reported as early as the backend can see it — or a lost connection); the caller then
+    /// calls [`BackendCopyIn::abort`] and reports the error.
+    async fn send(&mut self, chunk: bytes::Bytes) -> Result<(), PoolError>;
+
+    /// Send the end-of-data and wait for the server's verdict through the end of the statement —
+    /// for an implicit transaction, through its COMMIT. `Ok(rows)` = copied; `Err` = the server's
+    /// error, or a lost connection (fate unknown).
+    async fn finish(&mut self) -> Result<u64, PoolError>;
+
+    /// Abandon the copy before its end-of-data and wait for the server to acknowledge it, leaving
+    /// the connection in step. `Err` means the acknowledgement never came (the connection is not
+    /// fit for reuse); the copy is still not applied.
+    async fn abort(&mut self) -> Result<(), PoolError>;
+}
+
+/// The data half of a `COPY … TO STDOUT` (M3-D4): chunks of raw COPY bytes, pulled one at a time.
+#[async_trait]
+pub trait BackendCopyOut: Send {
+    /// The next chunk; `Some(Err)` on a failure (after which the stream is done); `None` at the end
+    /// of the statement — for an implicit transaction, after its COMMIT.
+    async fn next(&mut self) -> Option<Result<bytes::Bytes, PoolError>>;
+
+    /// The `COPY n` row count, valid only after `next()` has returned `None`.
+    fn rows_affected(&self) -> u64;
+}
+
+/// The COPY halves of a backend that has no COPY sub-protocol (MySQL, SQLite, the fake): an
+/// uninhabited type, so "this backend cannot produce one" is a fact of the TYPE rather than an
+/// `unimplemented!()` nobody has run (the `SqliteRowStream` precedent, §22.2 (bg)).
+pub enum NoCopy {}
+
+#[async_trait]
+impl BackendCopyIn for NoCopy {
+    async fn send(&mut self, _chunk: bytes::Bytes) -> Result<(), PoolError> {
+        match *self {}
+    }
+    async fn finish(&mut self) -> Result<u64, PoolError> {
+        match *self {}
+    }
+    async fn abort(&mut self) -> Result<(), PoolError> {
+        match *self {}
+    }
+}
+
+#[async_trait]
+impl BackendCopyOut for NoCopy {
+    async fn next(&mut self) -> Option<Result<bytes::Bytes, PoolError>> {
+        match *self {}
+    }
+    fn rows_affected(&self) -> u64 {
+        match *self {}
+    }
+}
+
 /// A pooled backend: connection factory + per-connection operations. `#[async_trait]` (not bare
 /// async-fn-in-trait) so the futures are `Send` for the background reaper's `tokio::spawn` (Task
 /// 3) — this is mandated by plan v2/B2, not a per-toolchain style choice.
@@ -175,6 +239,11 @@ pub trait PoolBackend: Send + Sync + 'static {
     /// `ferro-pool` stays backend-agnostic (no pg type in the trait); for Postgres it is a
     /// `tokio_postgres::CancelToken`.
     type CancelHandle: Cancel;
+
+    /// The COPY halves (M3-D4). A backend without a COPY sub-protocol names [`NoCopy`] for both and
+    /// keeps the `Unsupported` defaults of [`PoolBackend::copy_in`]/[`PoolBackend::copy_out`].
+    type CopyIn: BackendCopyIn + Send;
+    type CopyOut: BackendCopyOut + Send;
 
     /// Establish a brand-new backend connection.
     async fn connect(&self) -> Result<Self::Conn, PoolError>;
@@ -304,6 +373,35 @@ pub trait PoolBackend: Send + Sync + 'static {
     /// **Default `true`** — Postgres and the `FakeBackend` stream today and are unchanged.
     fn supports_row_streaming(&self) -> bool {
         true
+    }
+
+    /// Can this backend run the COPY sub-protocol ([`PoolBackend::copy_in`] /
+    /// [`PoolBackend::copy_out`]) at all? The ONE authority `ferrod` reads to refuse a COPY EARLY —
+    /// before a checkout — on both its autocommit and tx-scoped arms (the `supports_row_streaming`
+    /// shape). **Default `false`**, unlike streaming: only PostgreSQL has a COPY sub-protocol here,
+    /// and a backend that gains one flips this and implements the two methods in one change.
+    fn supports_copy(&self) -> bool {
+        false
+    }
+
+    /// Start a `COPY … FROM STDIN` (M3-D4): run `sql` — the client's statement, byte for byte — and
+    /// return once the server is in copy-in mode. UNGUARDED at the trait level: `Checkout::copy_in`
+    /// checks the statement's shape first. Default: `Unsupported`.
+    async fn copy_in(&self, _conn: &mut Self::Conn, _sql: &str) -> Result<Self::CopyIn, PoolError> {
+        Err(PoolError::Unsupported(
+            "COPY is not supported on this backend".into(),
+        ))
+    }
+
+    /// Start a `COPY … TO STDOUT` (M3-D4). As [`PoolBackend::copy_in`]. Default: `Unsupported`.
+    async fn copy_out(
+        &self,
+        _conn: &mut Self::Conn,
+        _sql: &str,
+    ) -> Result<Self::CopyOut, PoolError> {
+        Err(PoolError::Unsupported(
+            "COPY is not supported on this backend".into(),
+        ))
     }
 
     /// Hygiene reset, run at checkout before a recycled conn is handed to a new caller (v2/B1;

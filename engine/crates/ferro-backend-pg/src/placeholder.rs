@@ -40,9 +40,23 @@ pub fn scan(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len() + 8);
     let mut i = 0;
     let mut next_param = 1u32;
+    // PostgreSQL continues an identifier with `$` (`x$b$` is ONE name), so a `$` right after an
+    // identifier character opens no dollar-quote (M3-D4 review round 2, L1 — the same rule as
+    // `ferro-classify`'s scanner). Every arm below ends back in code, so this is the state for the
+    // NEXT byte.
+    let mut in_ident = false;
 
     while i < bytes.len() {
         let c = bytes[i];
+        if c == b'$' && in_ident {
+            push_byte(&mut out, sql, &mut i);
+            continue;
+        }
+        in_ident = if in_ident {
+            is_dolq_cont(c) || c == b'$'
+        } else {
+            c.is_ascii_alphabetic() || c == b'_' || c >= 0x80
+        };
         match c {
             // --- single-quoted string literal (with '' escape) ---
             b'\'' => {
@@ -168,8 +182,9 @@ fn push_byte(out: &mut String, sql: &str, i: &mut usize) {
 }
 
 /// If a `$tag$` dollar-quote *opens* at `bytes[start]` (`bytes[start] == b'$'`), returns the index
-/// just past the closing `$` of the opening delimiter. The tag is `[A-Za-z_][A-Za-z0-9_]*` or
-/// empty; a digit right after `$` (e.g. `$1`) is a positional param, NOT a dollar-quote.
+/// just past the closing `$` of the opening delimiter. The tag is PostgreSQL's
+/// `[A-Za-z\x80-\xFF_][A-Za-z\x80-\xFF_0-9]*` or empty — the high bytes included, so `$é$` is a
+/// tag; a digit right after `$` (e.g. `$1`) is a positional param, NOT a dollar-quote.
 fn dollar_quote_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
     debug_assert_eq!(bytes[start], b'$');
     let mut j = start + 1;
@@ -177,7 +192,7 @@ fn dollar_quote_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
     if j < bytes.len() && bytes[j].is_ascii_digit() {
         return None;
     }
-    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+    while j < bytes.len() && is_dolq_cont(bytes[j]) {
         j += 1;
     }
     // Must be terminated by a second `$` to be a dollar-quote open.
@@ -186,6 +201,11 @@ fn dollar_quote_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// PostgreSQL's `dolq_cont`: `[A-Za-z\x80-\xFF_0-9]`.
+fn is_dolq_cont(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
 
 /// First index at or after `from` where `needle` occurs in `haystack`.
@@ -239,6 +259,20 @@ impl PlaceholderCache {
 
 #[cfg(test)]
 mod tests {
+
+    /// `$` as PostgreSQL reads it (M3-D4 review round 2, L1): a `?` inside a `$é$` body is text and
+    /// is NOT rewritten (it would silently change a literal), and a `?` after `x$b$` — one
+    /// identifier, no quote — IS a placeholder.
+    #[test]
+    fn dollar_quotes_open_where_postgresql_opens_them() {
+        assert_eq!(scan("SELECT $é$what?$é$, ?"), "SELECT $é$what?$é$, $1");
+        assert_eq!(
+            scan("SELECT x$b$ FROM t WHERE a = ?"),
+            "SELECT x$b$ FROM t WHERE a = $1"
+        );
+        assert_eq!(scan("SELECT 1, $$?$$, ?"), "SELECT 1, $$?$$, $1");
+    }
+
     use super::*;
 
     #[test]

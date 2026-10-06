@@ -12,14 +12,23 @@
 //! - [`address`]: the address guard's classification (§23.8.5). Slice F4 resolves and pins; the
 //!   decision lives here so it can be tested without a resolver.
 //!
-//! Nothing here is wired into `ferrod` yet (slice F4 does that, behind the default-on `http`
-//! feature, §23.13). Choices §23 left open are recorded in SPEC §22.2 (cw).
+//! **Slice M6-F4a adds** [`fate`] (§23.7.1's table, pure and total) and, behind the `engine`
+//! feature, [`engine`]: the HTTP/1.1 plaintext request lifecycle `ferrod` serves service `HTTP`
+//! with (DNS, the address guard with pinning, the keep-alive pool, the write tracker, `HEAD`/`BODY`
+//! under credit, `CANCEL` and deadlines). Choices §23 left open are recorded in SPEC §22.2 (cw) and
+//! (cz).
 
 pub mod address;
 pub mod attach;
 pub mod config;
+pub mod fate;
 pub mod origin;
 pub mod validate;
+
+/// The HTTP/1.1 plaintext engine (slice M6-F4a), behind this crate's `engine` feature, which
+/// `ferrod`'s default-on `http` feature enables. Off by default so the fuzz targets stay tokio-free.
+#[cfg(feature = "engine")]
+pub mod engine;
 
 #[doc(hidden)]
 pub mod fuzzing;

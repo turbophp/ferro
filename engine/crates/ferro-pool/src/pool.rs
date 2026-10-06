@@ -24,6 +24,9 @@ use crate::pin::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+mod copy;
+pub use copy::{CopyEnd, CopyInHandle, CopyOutHandle};
+
 /// A connection sitting idle in the pool, plus the bookkeeping needed to recycle it safely on
 /// the next checkout.
 ///
@@ -800,6 +803,17 @@ impl<B: PoolBackend> Checkout<B> {
         params: &[Value],
         entry: &str,
     ) -> Result<TxControlVerdict, PoolError> {
+        // M3-D4: the statement entries cannot carry the COPY STDIN/STDOUT sub-protocol. Before this
+        // guard a `COPY … FROM STDIN` sent through EXEC left the backend in copy mode under a
+        // driver expecting rows: measured, the connection was killed and the statement — which
+        // cannot have applied — was reported `Indeterminate`. Refused before dispatch instead,
+        // pointing at the methods that speak it. Protocol shape, not inference (charter rule 6).
+        if self.pool.backend.supports_copy() && ferro_classify::speaks_copy_stdio(sql) {
+            return Err(PoolError::Unsupported(format!(
+                "COPY … FROM STDIN / TO STDOUT is not allowed via {entry}(): it runs through the \
+                 SQL service's COPY_IN / COPY_OUT methods (Ferro\\Pg\\Copy in the PHP client)"
+            )));
+        }
         match pin::tx_control_class(sql) {
             None => Ok(TxControlVerdict::Proceed),
             Some(pin::TxControlClass::Savepoint) if self.tx_open => {

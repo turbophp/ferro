@@ -37,9 +37,13 @@
       "REQUEST": 1
     },
     "sql": {
+      "COPY_IN": 2,
+      "COPY_OUT": 3,
       "EXEC": 1
     },
     "stream": {
+      "COPY_DATA": 3,
+      "COPY_DONE": 4,
       "DATA": 2,
       "HEAD": 1
     },

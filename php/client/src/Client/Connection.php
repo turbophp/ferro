@@ -21,6 +21,7 @@ use Ferro\Protocol\BackupResponse;
 use Ferro\Protocol\BeginRequest;
 use Ferro\Protocol\BeginResponse;
 use Ferro\Protocol\CodecException;
+use Ferro\Protocol\CopyRequest;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Isolation;
 use Ferro\Protocol\Msgpack\PackerFactory;
@@ -902,6 +903,91 @@ final class Connection
                 $session->abandonStream($rid);
             }
         }
+    }
+
+    // ---- COPY (M3-D4, SPEC §6.1) ------------------------------------------------------------------
+
+    /**
+     * PostgreSQL `COPY … FROM STDIN`: stream `$data` — raw COPY bytes in the format `$sql` names
+     * (text, CSV, binary), as many strings as you like, from any iterable, generators included — to
+     * the server and return the number of rows copied. Never buffers: the iterable is pulled only as
+     * the engine grants room (see {@see CopyRunner}). {@see \Ferro\Pg\Copy::textRow} formats a row for
+     * the default text format; anything else is the caller's to format.
+     *
+     * `$sql` goes to the server unmodified and must be exactly one `COPY … FROM STDIN` statement; the
+     * engine refuses anything else before it reaches the server ({@see Error\NonRetryableException},
+     * `ERR_UNSUPPORTED`). PostgreSQL pools only.
+     *
+     * Atomic, like the statement: a malformed row, a constraint, or a failure at the implicit COMMIT
+     * (a deferred constraint) applies NOTHING and throws the server's error. A COPY stopped before its
+     * end-of-data — your iterable throws, a CANCEL, a lost connection — applies nothing either, and a
+     * lost one is {@see Error\RetryableException}; lost AFTER the end-of-data went out it is
+     * {@see Error\IndeterminateException}, like any unconfirmed write, and nothing here re-sends it.
+     *
+     * Inside an imperative transaction ({@see begin}) the COPY runs in it, on its session.
+     *
+     * @param iterable<mixed, string> $data
+     */
+    public function copyIn(string $sql, iterable $data): int
+    {
+        $tx = $this->ownTx();
+        $session = $tx?->session() ?? $this->requestSession(OpKind::Write, false);
+        $this->lastInsertId = null; // a COPY reports no generated key
+        return $this->copyRunner($tx !== null)->in(
+            self::copySession($session),
+            $this->copyPayload($sql, false, $tx?->txId()),
+            $data,
+        );
+    }
+
+    /**
+     * PostgreSQL `COPY … TO STDOUT`, lazily: a Generator yielding chunks of raw COPY bytes as they
+     * arrive, never buffering the export; its return value (`getReturn()`) is the number of rows
+     * exported. Stop iterating early and the COPY is cancelled and drained, so the session stays usable.
+     *
+     * `$readonly` is your §19.3 declaration and is never inferred: `COPY (DELETE … RETURNING *) TO
+     * STDOUT` writes. Leave it `false` (a lost export is then `Indeterminate`, the safe answer) unless
+     * the statement only reads; `true` makes a lost or cancelled export a plain read loss.
+     *
+     * @return \Generator<int, string, mixed, int>
+     */
+    public function copyOut(string $sql, bool $readonly = false): \Generator
+    {
+        $tx = $this->ownTx();
+        $session = $tx?->session() ?? $this->requestSession($readonly ? OpKind::Read : OpKind::Write, $readonly);
+        $this->lastInsertId = null;
+        return $this->copyRunner($tx !== null)->out(
+            self::copySession($session),
+            $this->copyPayload($sql, $readonly, $tx?->txId()),
+            $readonly,
+        );
+    }
+
+    private function copyRunner(bool $inTx): CopyRunner
+    {
+        return new CopyRunner(
+            $this->fate,
+            $this->codec,
+            $inTx,
+            fn (): bool => $this->reconnect?->lastEpochChanged() ?? false,
+        );
+    }
+
+    private function copyPayload(string $sql, bool $readonly, ?int $txId): string
+    {
+        return CopyRequest::encode(
+            ['pool' => $this->pool, 'sql' => $sql, 'readonly' => $readonly, 'timeout_ms' => null, 'tx_id' => $txId],
+            $this->encodePacker,
+        );
+    }
+
+    /** @internal shared with {@see TxHandle} */
+    public static function copySession(SessionInterface $session): CopySessionInterface
+    {
+        if (!$session instanceof CopySessionInterface) {
+            throw new ProtocolException('COPY requires a session implementing CopySessionInterface (the concrete Session)');
+        }
+        return $session;
     }
 
     // ---- admin service (SPEC §7.6, D15) -----------------------------------------------------------

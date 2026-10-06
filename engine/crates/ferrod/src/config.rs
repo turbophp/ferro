@@ -30,6 +30,14 @@ const DEFAULT_SESSION_CAP_BYTES: usize = 16 * 1024 * 1024;
 /// `MEMFD_RX`. §5.1's own default.
 pub const DEFAULT_MEMFD_THRESHOLD_BYTES: usize = 1024 * 1024;
 
+/// M3-D4: the client-to-engine credit window one `COPY_IN` is granted, in frames and bytes. Every
+/// open COPY_IN reserves its byte window against a per-session INBOUND cap of `session_cap_bytes`,
+/// so these bound the COPY data a session can make the engine hold: one window per COPY, at most
+/// `session_cap_bytes` in all. COPY data is divisible — the client splits a chunk to fit — so,
+/// unlike `credit_bytes`, nothing requires the window to fit a maximal frame.
+pub const DEFAULT_COPY_IN_WINDOW_FRAMES: u32 = 32;
+pub const DEFAULT_COPY_IN_WINDOW_BYTES: u32 = 2 * 1024 * 1024;
+
 /// Default cap on concurrently in-flight requests per session.
 const DEFAULT_MAX_INFLIGHT: usize = 1024;
 
@@ -210,6 +218,16 @@ pub enum ConfigError {
         session_cap_bytes: usize,
         max_frame_payload: usize,
     },
+    /// M3-D4: a `COPY_IN` window that is empty in either dimension could never admit a chunk, and
+    /// one larger than the session's inbound cap could never be reserved — both a permanent hang.
+    #[error(
+        "copy_in window ({frames} frames, {bytes} bytes) must be non-empty and its bytes must fit          session_cap_bytes ({session_cap_bytes})"
+    )]
+    CopyInWindowUnusable {
+        frames: u32,
+        bytes: u32,
+        session_cap_bytes: usize,
+    },
 }
 
 /// SPEC §13 / product-vision §5: how much of a slow statement's PARAMETERS the slow log may carry.
@@ -315,6 +333,18 @@ pub struct Config {
     /// From `FERRO_MEMFD_THRESHOLD_BYTES` (see [`parse_memfd_threshold`]); default
     /// [`DEFAULT_MEMFD_THRESHOLD_BYTES`].
     pub memfd_threshold: Option<usize>,
+    /// SPEC §23.3.1 (M6-F4a): the Ferro HTTP configuration (`FERRO_UPSTREAMS` /
+    /// `FERRO_UPSTREAM_<NAME>_*` / `FERRO_HTTP_*`), loaded once at start by `main` when
+    /// `FERRO_UPSTREAMS` is set. `None`: HTTP is not configured, so the route answers `Unsupported`
+    /// and `HELLO_ACK` does not advertise `HTTP`. A refused configuration never takes the daemon down
+    /// (§23.3.1): it disables an upstream, or — for a daemon-wide key — the whole HTTP service.
+    /// Here, beside `manifest`, for the same reason: the registry builds the engine from it.
+    #[cfg(feature = "http")]
+    pub http: Option<std::sync::Arc<ferro_http::HttpConfig>>,
+    /// M3-D4: the per-`COPY_IN` client-to-engine credit window (see
+    /// [`DEFAULT_COPY_IN_WINDOW_BYTES`]). Not an environment knob: injectable for tests.
+    pub copy_in_window_frames: u32,
+    pub copy_in_window_bytes: u32,
 }
 
 impl Default for Config {
@@ -340,6 +370,10 @@ impl Default for Config {
             manifest_path: None,
             manifest: None,
             memfd_threshold: Some(DEFAULT_MEMFD_THRESHOLD_BYTES),
+            #[cfg(feature = "http")]
+            http: None,
+            copy_in_window_frames: DEFAULT_COPY_IN_WINDOW_FRAMES,
+            copy_in_window_bytes: DEFAULT_COPY_IN_WINDOW_BYTES,
         }
     }
 }
@@ -441,6 +475,16 @@ impl Config {
             return Err(ConfigError::SessionCapBelowMaxFramePayload {
                 session_cap_bytes: self.session_cap_bytes,
                 max_frame_payload: max_frame_payload as usize,
+            });
+        }
+        if self.copy_in_window_frames == 0
+            || self.copy_in_window_bytes == 0
+            || self.copy_in_window_bytes as usize > self.session_cap_bytes
+        {
+            return Err(ConfigError::CopyInWindowUnusable {
+                frames: self.copy_in_window_frames,
+                bytes: self.copy_in_window_bytes,
+                session_cap_bytes: self.session_cap_bytes,
             });
         }
         Ok(())

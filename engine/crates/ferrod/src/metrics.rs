@@ -289,6 +289,29 @@ pub fn render(registry: &PoolRegistry, boot_epoch: u64) -> String {
         let _ = writeln!(out, "# TYPE {name} counter");
         let _ = writeln!(out, "{name} {value}");
     }
+    // M3-D4 COPY. Present — as zeroes — on a daemon that never ran one.
+    let copy = &crate::services::copy::COUNTERS;
+    for (name, help, value) in [
+        (
+            "ferro_copy_in_bytes_total",
+            "COPY FROM STDIN data bytes forwarded to a backend (SPEC §6.1).",
+            copy.in_bytes(),
+        ),
+        (
+            "ferro_copy_out_bytes_total",
+            "COPY TO STDOUT data bytes sent to clients (SPEC §6.1).",
+            copy.out_bytes(),
+        ),
+        (
+            "ferro_copy_violations_total",
+            "Sessions closed for breaking the COPY_IN flow-control contract: data beyond the engine's grant, or for a request that is not an open COPY_IN (SPEC §6.1).",
+            copy.violations(),
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        let _ = writeln!(out, "{name} {value}");
+    }
     // SPEC §13 OTLP export (M2-C4c-2). Present — as zeroes — when export is off, like every other
     // series here: "no data" and "nothing happened" must not be the same observation to an alert.
     let otlp = &crate::otlp::COUNTERS;

@@ -176,6 +176,38 @@ accessor existed). SPEC §22.2 (m);
 
 ---
 
+## Addendum (M3-D4) — COPY: four behaviour fixes, two of them silent
+
+Unlike the accessors above, these CHANGE behaviour, and each is a separate upstream bug report first
+(`vendor/tokio-postgres/src/copy_in.rs`, `copy_out.rs`, every change marked `FERRO M3-D4 fork`). Each is
+pinned by `ferro-backend-pg/tests/pg_copy_fork_it.rs`, which drives the driver directly, and each was
+mutation-tested back to the upstream behaviour (SPEC §22.2 (cx)).
+
+1. **`CopyInSink::finish` reports success before the implicit transaction commits.** It returns at
+   `CommandComplete`; an autocommit COPY's implicit transaction commits at the `Sync` after it, and a
+   commit-time failure (a `DEFERRABLE INITIALLY DEFERRED` constraint) arrives as an `ErrorResponse`
+   between the two — unread. Measured on 0.7.18: a COPY whose row violated a deferred foreign key
+   returned `Ok(1)` and the row was not there. `finish` now reads through `ReadyForQuery` and reports
+   that error (reading on to `ReadyForQuery` first, so the connection is in step).
+2. **`CopyOutStream` ends at `CopyDone`,** so `CommandComplete`'s row count is unreachable and a
+   writing `COPY (INSERT … RETURNING …) TO STDOUT` whose commit fails ends cleanly. It now ends at
+   `ReadyForQuery`, reports a late error, and exposes `rows_affected()` like `RowStream`.
+3. **A `copy_in` the server rejects before copy mode kills the connection.** `Bind`/`Execute`/`Sync`
+   go out together; for an unknown table the server answers the `Sync` with `ReadyForQuery`, then the
+   dropped sender's `CopyFail` + second `Sync` draws a SECOND `ReadyForQuery` with no request waiting,
+   and the connection errors out ("unexpected message from server"). Measured: the next query on that
+   client fails. The data stream is now abandoned without those two messages.
+4. **A failed COPY is learned only at `finish`.** During copy-in the only thing the server can say is
+   that the copy failed; it then discards everything up to the `Sync` the driver sends only at the
+   end. `poll_ready` now surfaces such an `ErrorResponse` to the next `send`, and a new
+   `CopyInSink::abort()` sends `CopyFail` + `Sync` and waits for the acknowledgement — upstream offers
+   only the drop, which sends the same messages and reads nothing, leaving the caller unable to tell
+   when the connection is usable again.
+
+Ferro-side consumer: `ferro-backend-pg/src/copy.rs` (`PgCopyIn`/`PgCopyOut`), behind
+`ferro-pool`'s `Checkout::copy_in`/`copy_out`. When this lands upstream, re-run `pg_copy_fork_it.rs`,
+`pg_copy_it.rs` and `ferrod`'s `copy_it.rs` against the released crate.
+
 ## Status and next step
 
 **DRAFT.** This PR has not been opened. Filing it against `github.com/sfackler/rust-postgres` is a

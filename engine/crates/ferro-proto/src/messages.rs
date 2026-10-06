@@ -129,6 +129,9 @@ pub use tx::{BeginRequest, BeginResponse, Isolation, SavepointRequest, TxControl
 pub mod admin;
 pub use admin::{BackupRequest, BackupResponse};
 
+pub mod copy;
+pub use copy::{CopyData, CopyDone, CopyRequest};
+
 /// HTTP-service messages (M6-F2, SPEC §23.5): `Value`-free but `bin`-bearing, so — like `sql` — a
 /// hand-rolled positional codec rather than `msg!`.
 pub mod http;

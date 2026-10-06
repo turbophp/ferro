@@ -218,6 +218,11 @@ pub struct SessionInfo {
     /// check, but NOT `idempotent` — the client's retry licence (§9.2) — so the hash is the only
     /// thing that proves the client read the engine's declaration of it.
     pub manifest_agreed: bool,
+    /// The peer's KERNEL-ATTESTED uid (`SO_PEERCRED`), `None` when the transport attests none.
+    /// Read once per session (it cannot change for the socket's life). Ferro HTTP's per-upstream
+    /// `ALLOW_UIDS` and `PARTITION=uid` key on it (§23.3.1, §23.8.1, M6-F4a); an upstream with
+    /// `ALLOW_UIDS` refuses a peer with none.
+    pub peer_uid: Option<u32>,
 }
 
 /// The session task's entry point, one call per accepted connection.
@@ -306,6 +311,11 @@ impl Session {
         // `CapReserve` were built in Task 2 with no instantiation site until now. Non-streamed
         // requests carry the same handle but never reserve against it.
         let session_cap = Arc::new(SessionCap::new(config.session_cap_bytes as u64));
+        // M3-D4: the INBOUND counterpart — every open COPY_IN reserves its client-to-engine window
+        // here for its life, so the COPY data a session can make the engine hold is bounded however
+        // many COPYs it opens. Separate from `session_cap` on purpose: an inbound reservation is held
+        // for a whole COPY, and sharing one cap would let open COPYs starve every stream's DATA.
+        let inbound_cap = Arc::new(SessionCap::new(config.session_cap_bytes as u64));
 
         // 1. The mandatory first frame must arrive within `config.handshake_timeout` and decode as
         // core/HELLO. Whatever the read's outcome, route it through the SAME `classify` split the
@@ -391,6 +401,7 @@ impl Session {
             session_id,
             SessionInfo {
                 manifest_agreed: hello.manifest_hash.is_some(),
+                peer_uid,
             },
         );
 
@@ -412,6 +423,7 @@ impl Session {
             pool_registry.pool_info().await,
             pool_registry.manifest().is_some(),
             config.memfd_threshold.is_some(),
+            pool_registry.http_served(),
         );
 
         // SPEC §5.1 (M3-D3): a success terminal may move into a sealed memfd only when the client
@@ -510,6 +522,38 @@ impl Session {
                     // reserved permit is consumed (see this module's top doc comment).
                     break;
                 }
+                Route::CopyData { done } => {
+                    // M3-D4: client COPY data for an in-flight COPY_IN. Routed, never awaited: the
+                    // reader loop must keep answering every other request on this session. A frame
+                    // that breaks the flow-control contract is session-fatal — the request it targets
+                    // is in flight with its own handler, so a per-request error would be a SECOND
+                    // terminal for it.
+                    let item = if done {
+                        if ferro_proto::messages::CopyDone::decode(&frame.payload).is_err() {
+                            Err("malformed CopyDone")
+                        } else {
+                            Ok(registry::Inbound::Done)
+                        }
+                    } else {
+                        match ferro_proto::messages::CopyData::data_range(&frame.payload) {
+                            Ok(r) => Ok(registry::Inbound::Data(frame.payload.slice(r))),
+                            Err(_) => Err("malformed CopyData"),
+                        }
+                    };
+                    let violation = match item {
+                        Err(why) => Some(why),
+                        Ok(item) => match registry.deliver(frame.header.request_id, item) {
+                            registry::Delivery::Delivered | registry::Delivery::Discarded => None,
+                            registry::Delivery::Violation(why) => Some(why),
+                        },
+                    };
+                    if let Some(why) = violation {
+                        crate::services::copy::COUNTERS.record_violation();
+                        let fatal = SessionError::protocol_fatal(why).into_out_frame();
+                        let _ = control_tx.send(ControlMsg::bare(fatal)).await;
+                        break;
+                    }
+                }
                 Route::CoreControl(CoreMethod::WindowUpdate) => {
                     if let Ok(wu) = WindowUpdate::decode(&frame.payload) {
                         registry.replenish(frame.header.request_id, wu.frames, wu.bytes);
@@ -521,6 +565,7 @@ impl Session {
                         &registry,
                         &control_tx,
                         &session_cap,
+                        &inbound_cap,
                         &handler,
                         &config,
                         &mut supervisors,
@@ -544,6 +589,7 @@ impl Session {
                                 &registry,
                                 &control_tx,
                                 &session_cap,
+                                &inbound_cap,
                                 &handler,
                                 &config,
                                 &mut supervisors,
@@ -656,6 +702,7 @@ async fn handle_request_frame(
     registry: &Arc<Registry>,
     control_tx: &mpsc::Sender<ControlMsg>,
     session_cap: &Arc<SessionCap>,
+    inbound_cap: &Arc<SessionCap>,
     handler: &HandlerFn,
     config: &Config,
     supervisors: &mut JoinSet<()>,
@@ -709,6 +756,11 @@ async fn handle_request_frame(
     // handler simply never calls those and declares its one terminal exactly as before.
     let (responder, cell) =
         Responder::new_streaming(id, credit_cell, Arc::clone(session_cap), control_tx.clone());
+    let responder = responder.with_inbound(
+        Arc::clone(registry),
+        Arc::clone(inbound_cap),
+        Credit::new(config.copy_in_window_frames, config.copy_in_window_bytes),
+    );
     let handler = handler.clone();
     let handle = tokio::spawn(async move { handler(frame, responder, cancel).await });
 

@@ -45,8 +45,13 @@ GOODBYE       = 5
 WINDOW_UPDATE = 6
 
 # SQL service (§6). EXEC is the single request-bearing autocommit statement method (S5).
+# COPY_IN / COPY_OUT (M3-D4, SPEC §6.1): PostgreSQL `COPY … FROM STDIN` / `COPY … TO STDOUT`, the
+# user's statement passed through unmodified. Their raw bytes ride STREAM/COPY_DATA below; COPY_IN's
+# inbound credit is granted by the ENGINE with a CORE/WINDOW_UPDATE on the request's id.
 [methods.sql]
-EXEC = 1
+EXEC     = 1
+COPY_IN  = 2
+COPY_OUT = 3
 
 # TX service (§6/§7, S6). Transaction lifecycle over a connection pinned to a `tx_id` (NOT the
 # client socket). BEGIN mints a tx_id; COMMIT/ROLLBACK end it and release the pinned conn;
@@ -64,9 +69,15 @@ ROLLBACK_TO = 6
 # each DATA frame sets the `STREAM` flag (`flags::STREAM = 0x01`), and the terminal `END` is the
 # unchanged `Outcome::Ok({affected, stats})` (no rows — they already went out as DATA). (Service
 # `STREAM = 4` above.)
+# COPY_DATA (M3-D4): one chunk of raw COPY bytes, `STREAM` flag set, in EITHER direction — engine →
+# client for COPY_OUT (under the request's credit window, like DATA), client → engine for COPY_IN
+# (under the window the engine granted). COPY_DONE: client → engine, "no more COPY_IN data" — the
+# only frame that lets PostgreSQL complete the COPY.
 [methods.stream]
-HEAD = 1
-DATA = 2
+HEAD      = 1
+DATA      = 2
+COPY_DATA = 3
+COPY_DONE = 4
 
 # ADMIN service (M2-C3-7b, SPEC §7.6 + D15). Served only on the engine's Unix socket and gated per
 # VERB by the peer's kernel-attested uid in the SESSION layer, before any handler runs: a READ verb

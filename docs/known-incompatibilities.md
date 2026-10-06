@@ -506,8 +506,15 @@ because Doctrine's stock type layer is, measured on 4.4.4, a silently-corrupting
   `rowCount()` after an `INSERT`/`UPDATE`/`DELETE` is always correct on both families.
 - **`free()` keeps `rowCount()`** while emptying rows and columns. Upstream is split on this
   (SQLite3 keeps its count, PgSQL answers `0`); ours is a choice.
-- **`Ferro\Pg\Copy`** — the first-class replacement for `pdo_pgsql` COPY hacks named in SPEC §14 —
-  does not exist yet. Deferred.
+- **FIXED at M3-D4 — `Ferro\Pg\Copy` exists.** This page used to say the first-class replacement for
+  `pdo_pgsql`'s `pgsqlCopyFromArray()`/`pgsqlCopyToArray()` named in SPEC §14 did not exist. It does
+  (SPEC §6.1, §22.2 (cx)): `COPY … FROM STDIN` from any iterable of strings and `COPY … TO STDOUT` as a
+  lazy Generator, neither buffering in PHP. What still differs: DBAL has no COPY surface, so a Doctrine
+  application reaches it through `getNativeConnection()` (a `Ferro\Client\Connection`; the driver's
+  transaction is that connection's imperative one, so a COPY there joins an open DBAL transaction —
+  by construction, not yet by a Doctrine-tier test); Ferro
+  moves raw COPY bytes and formats nothing but the default text format (`Copy::textRow`); and a
+  `COPY … FROM STDIN` sent through `executeStatement()` is refused (`Unsupported`) rather than run.
 
 ---
 

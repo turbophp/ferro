@@ -2,6 +2,8 @@ pub mod admin;
 pub mod config;
 pub mod dispatch;
 pub mod epoch;
+#[cfg(feature = "http")]
+pub mod http_config;
 pub mod listener;
 pub mod manifest;
 pub mod metrics;

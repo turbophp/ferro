@@ -43,6 +43,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(queries = loaded.len(), hash = %loaded.hash(), "ferrod: manifest loaded");
         config.manifest = Some(loaded);
     }
+    // SPEC §23.3.1 (M6-F4a): Ferro HTTP's configuration, read once. A refused configuration never
+    // stops the daemon — it disables an upstream, or the whole HTTP service — so this cannot fail.
+    #[cfg(feature = "http")]
+    {
+        config.http = ferrod::http_config::load_and_log(&config);
+    }
     let listener = bind_uds(&config)?;
     tracing::info!(socket = %config.socket_path.display(), "ferrod listening");
 
