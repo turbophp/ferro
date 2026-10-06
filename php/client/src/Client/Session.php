@@ -173,7 +173,9 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             typeRegistryHash: C::TYPE_REGISTRY_HASH,
             manifestHash: null,
             pid: getmypid() ?: 0,
-            features: 0,
+            // Informational: this client can multiplex requests over the session (M3-D1). The engine
+            // has always served requests concurrently and does not read this bit.
+            features: C::FEATURE_CLIENT_FIBERS,
         );
         $payload = $hello->encode($this->encodePacker);
         $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_HELLO, $payload, 0, true);
@@ -299,6 +301,50 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         unset($this->inbox[$requestId]);
         if (isset($this->inFlight[$requestId])) {
             $this->discarded[$requestId] = true;
+        }
+    }
+
+    /**
+     * Whether awaiting `$requestId` now would NOT need to read the wire (M3-D1b): its next frame has
+     * arrived, or the session has failed so awaiting it fails at once. A scheduler resumes a Fiber
+     * waiting on this id only once it is ready.
+     */
+    public function isReady(int $requestId): bool
+    {
+        return ($this->inbox[$requestId] ?? []) !== []
+            || !isset($this->inFlight[$requestId])
+            || $this->poisoned !== null;
+    }
+
+    /**
+     * The stream a scheduler can select on, or null when the transport cannot be selected (a test
+     * double) or the session is closed — the scheduler then reads with {@see pollOnce} directly.
+     *
+     * @return resource|null
+     */
+    public function selectableStream(): mixed
+    {
+        if ($this->poisoned !== null || !$this->transport instanceof SelectableTransportInterface) {
+            return null;
+        }
+        return $this->transport->stream();
+    }
+
+    /**
+     * Read ONE frame and file it (M3-D1b), for a scheduler that has seen this session's stream
+     * become readable or that cannot select on it. A failure is recorded on the session, never
+     * thrown: each awaiter then meets it through its own {@see awaitTerminal}, with its own fate.
+     */
+    public function pollOnce(): void
+    {
+        if ($this->poisoned !== null || $this->inFlight === []) {
+            return;
+        }
+        try {
+            $this->pump();
+        } catch (TransportException | ProtocolException) {
+            // `pump` has already poisoned the session (or recorded a fatal before EOF): every
+            // pending request is now ready, and fails at its own await.
         }
     }
 

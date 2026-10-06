@@ -15,7 +15,7 @@ use Ferro\Client\Error\TransportException;
  * `stream_socket_client`'s `resource|false` and `fread`'s `string|false` are handled explicitly so
  * the type stays a bare `resource` for PHPStan level 9.
  */
-final class Transport implements TransportInterface
+final class Transport implements SelectableTransportInterface
 {
     private const DEFAULT_CONNECT_TIMEOUT = 5.0;
     private const DEFAULT_READ_TIMEOUT = 30.0;
@@ -137,6 +137,11 @@ final class Transport implements TransportInterface
         if (!is_resource($this->sock)) {
             throw new TransportException("{$op} on a closed transport");
         }
+    }
+
+    public function stream(): mixed
+    {
+        return is_resource($this->sock) ? $this->sock : null;
     }
 
     public function close(): void

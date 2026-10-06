@@ -1360,7 +1360,10 @@ final class Connection
                 return $shape($this->dispatchAutocommit($sql, $params, $readonly, $fetch, 1));
             }
             throw $ex;
-        }), static fn () => $session instanceof Session ? $session->discard($rid) : null);
+        }),
+            static fn () => $session instanceof Session ? $session->discard($rid) : null,
+            $session instanceof Session ? new Waiter($session, $rid) : null,
+        );
     }
 
     /**

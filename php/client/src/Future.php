@@ -28,16 +28,22 @@ final class Future
     /** @var (\Closure(): void)|null */
     private ?\Closure $onDrop;
 
+    /** What a Fiber awaiting this Future waits for under {@see Loop} (M3-D1b); null when it cannot suspend. */
+    private ?\Ferro\Client\Waiter $waiter;
+
     /**
      * @param \Closure(): T          $resolver reads the terminal and produces the value (or throws).
      * @param (\Closure(): void)|null $onDrop  runs if this Future is destroyed before it settled, so
      *                                         the session can throw its terminal away on arrival
      *                                         instead of keeping it forever (M3-D1a review F6).
+     * @param \Ferro\Client\Waiter|null $waiter what a Fiber running under {@see Loop} waits for
+     *                                         before resolving, so it suspends instead of blocking.
      */
-    public function __construct(\Closure $resolver, ?\Closure $onDrop = null)
+    public function __construct(\Closure $resolver, ?\Closure $onDrop = null, ?\Ferro\Client\Waiter $waiter = null)
     {
         $this->resolver = $resolver;
         $this->onDrop = $onDrop;
+        $this->waiter = $waiter;
     }
 
     public function __destruct()
@@ -74,6 +80,11 @@ final class Future
      */
     public function await(): mixed
     {
+        if (!$this->settled && $this->waiter !== null) {
+            // Inside a Fiber that {@see Loop} runs, suspend until the terminal has arrived; the loop
+            // reads the socket for every waiting Fiber meanwhile. Anywhere else, resolving blocks.
+            Loop::waitFor($this->waiter);
+        }
         $this->settle();
         if ($this->error !== null) {
             throw $this->error;
@@ -96,6 +107,7 @@ final class Future
         $resolver = $this->resolver;
         $this->resolver = null;
         $this->onDrop = null;
+        $this->waiter = null;
         try {
             $this->value = $resolver !== null ? $resolver() : null;
         } catch (\Throwable $e) {
