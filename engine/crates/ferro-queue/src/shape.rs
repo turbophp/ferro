@@ -35,10 +35,12 @@
 use crate::ident::TableName;
 use ferro_proto::value::Value;
 
-/// One engine-authored statement and its bound parameters.
+/// One engine-authored statement and its bound parameters. The SQL is owned because every verb's
+/// statement interpolates the store's QUOTED table identifier (validated at configuration, never a
+/// client value) and an ENQUEUE's row count; nothing a client sends is ever spliced into it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Statement {
-    pub sql: &'static str,
+    pub sql: String,
     pub params: Vec<Value>,
 }
 
@@ -46,7 +48,21 @@ pub struct Statement {
 /// or one row with NULL column cells for a relation without columns, or NO row when nothing by that
 /// name is visible. `$1` is the store's QUOTED identifier, bound as text. Every returned cell is
 /// `text`, so the decode does not depend on catalog types (`name`, `"char"`).
+///
+/// The third cell (M7-G1b, carried from the G1a review) says whether `id` is UNIQUE: a fence
+/// `WHERE id = $1 AND attempts = $2 AND created_at = $3` over duplicate ids would match several rows,
+/// so one ACK could delete two jobs. It is `true` iff some index on the relation is unique, VALID (a
+/// `CREATE UNIQUE INDEX CONCURRENTLY` that failed leaves an invalid one that enforces nothing),
+/// IMMEDIATE (a `DEFERRABLE` constraint admits duplicates until commit), not partial, not on an
+/// expression, and has exactly one key column, `id` (`INCLUDE` columns do not weaken uniqueness; a
+/// composite key such as `(id, queue)` does). Measured against PostgreSQL 16 for each of those cases
+/// and for a partitioned table's primary key.
 pub const PG_RELATION_SQL: &str = "SELECT c.relkind::text, c.relnamespace::regnamespace::text, \
+            (EXISTS (SELECT 1 FROM pg_index i \
+                     JOIN pg_attribute ia ON ia.attrelid = i.indrelid AND ia.attnum = i.indkey[0] \
+                     WHERE i.indrelid = c.oid AND i.indisunique AND i.indisvalid AND i.indimmediate \
+                       AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indnkeyatts = 1 \
+                       AND ia.attname = 'id'))::text, \
             a.attname::text, format_type(a.atttypid, NULL), \
             CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END \
      FROM pg_class c \
@@ -57,7 +73,7 @@ pub const PG_RELATION_SQL: &str = "SELECT c.relkind::text, c.relnamespace::regna
 
 pub fn pg_relation_statement(table: &TableName) -> Statement {
     Statement {
-        sql: PG_RELATION_SQL,
+        sql: PG_RELATION_SQL.to_string(),
         params: vec![Value::Text(table.quoted(crate::Dialect::Postgres))],
     }
 }
@@ -68,7 +84,7 @@ pub const PG_SERIAL_SQL: &str = "SELECT pg_get_serial_sequence($1::text, 'id')";
 
 pub fn pg_serial_statement(table: &TableName) -> Statement {
     Statement {
-        sql: PG_SERIAL_SQL,
+        sql: PG_SERIAL_SQL.to_string(),
         params: vec![Value::Text(table.quoted(crate::Dialect::Postgres))],
     }
 }
@@ -89,6 +105,9 @@ pub struct PgRelation {
     pub relkind: String,
     /// The schema it resolved in (for the log line saying which table was verified).
     pub schema: String,
+    /// Whether `id` carries a single-column, valid, immediate, non-partial unique index (see
+    /// [`PG_RELATION_SQL`]).
+    pub id_unique: bool,
     pub columns: Vec<ColumnRow>,
 }
 
@@ -100,14 +119,23 @@ impl PgRelation {
         let Some(first) = rows.first() else {
             return Ok(None);
         };
-        let (relkind, schema) = match first.as_slice() {
-            [Value::Text(k), Value::Text(s), ..] => (k.clone(), s.clone()),
+        let (relkind, schema, id_unique) = match first.as_slice() {
+            [Value::Text(k), Value::Text(s), Value::Text(u), ..] => (
+                k.clone(),
+                s.clone(),
+                match u.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(()),
+                },
+            ),
             _ => return Err(()),
         };
         let mut columns = Vec::with_capacity(rows.len());
         for row in rows {
             match row.as_slice() {
                 [
+                    Value::Text(_),
                     Value::Text(_),
                     Value::Text(_),
                     Value::Text(name),
@@ -122,6 +150,7 @@ impl PgRelation {
                 [
                     Value::Text(_),
                     Value::Text(_),
+                    Value::Text(_),
                     Value::Null,
                     Value::Null,
                     Value::Text(_),
@@ -132,6 +161,7 @@ impl PgRelation {
         Ok(Some(PgRelation {
             relkind,
             schema,
+            id_unique,
             columns,
         }))
     }
@@ -179,6 +209,10 @@ pub enum ShapeError {
         table: String,
         column: &'static str,
     },
+    /// `id` has no single-column unique index (M7-G1b): the fence would not name one row.
+    IdNotUnique {
+        table: String,
+    },
 }
 
 impl ShapeError {
@@ -221,6 +255,12 @@ impl std::fmt::Display for ShapeError {
             ShapeError::NotNullable { table, column } => {
                 write!(f, "queue table {table} column {column} must be nullable")
             }
+            ShapeError::IdNotUnique { table } => write!(
+                f,
+                "queue table {table} column id is not unique (it needs a primary key or a valid, \
+                 immediate, non-partial unique index on id alone; a fence over duplicate ids would \
+                 match several rows)"
+            ),
         }
     }
 }
@@ -259,6 +299,10 @@ pub fn verify_pg(table: &TableName, relation: Option<&PgRelation>) -> Result<(),
             });
         }
     }
+    // After the columns, so a table missing `id` is named for that first.
+    if !rel.id_unique {
+        return Err(ShapeError::IdNotUnique { table: name });
+    }
     Ok(())
 }
 
@@ -289,6 +333,7 @@ mod tests {
         PgRelation {
             relkind: relkind.into(),
             schema: "public".into(),
+            id_unique: true,
             columns,
         }
     }
@@ -391,6 +436,51 @@ mod tests {
         }
     }
 
+    /// M7-G1b: a table whose `id` is not unique is refused, definitively, naming `id`; and the check
+    /// runs after the columns, so a table missing `id` is named for THAT.
+    #[test]
+    fn an_id_without_a_unique_index_is_refused() {
+        let mut r = rel("r", stock());
+        r.id_unique = false;
+        let err = verify_pg(&t(), Some(&r)).unwrap_err();
+        assert_eq!(
+            err,
+            ShapeError::IdNotUnique {
+                table: "ferro_jobs".into()
+            }
+        );
+        assert!(err.is_definitive());
+        assert!(err.to_string().contains("column id is not unique"), "{err}");
+        let mut cols = stock();
+        cols.remove(0);
+        let mut r = rel("r", cols);
+        r.id_unique = false;
+        assert!(matches!(
+            verify_pg(&t(), Some(&r)),
+            Err(ShapeError::MissingColumn { column: "id", .. })
+        ));
+    }
+
+    /// The uniqueness predicate's every clause is load-bearing (each was measured against a table
+    /// that only it refuses: an invalid index, a DEFERRABLE constraint, a partial index, an
+    /// expression index, a composite key, a key on another column).
+    #[test]
+    fn the_uniqueness_predicate_has_every_clause() {
+        for clause in [
+            "i.indisunique",
+            "i.indisvalid",
+            "i.indimmediate",
+            "i.indpred IS NULL",
+            "i.indexprs IS NULL",
+            "i.indnkeyatts = 1",
+            "ia.attnum = i.indkey[0]",
+            "ia.attname = 'id'",
+            "i.indrelid = c.oid",
+        ] {
+            assert!(PG_RELATION_SQL.contains(clause), "{clause}");
+        }
+    }
+
     #[test]
     fn reserved_at_must_be_nullable_and_no_relation_is_an_absent_table() {
         let mut rows = stock();
@@ -455,10 +545,18 @@ mod tests {
     fn rows_parse_into_a_relation_and_malformed_rows_are_refused() {
         assert_eq!(PgRelation::from_rows(&[]), Ok(None));
         let rows = vec![
-            vec![txt("r"), txt("app"), txt("id"), txt("bigint"), txt("NO")],
             vec![
                 txt("r"),
                 txt("app"),
+                txt("true"),
+                txt("id"),
+                txt("bigint"),
+                txt("NO"),
+            ],
+            vec![
+                txt("r"),
+                txt("app"),
+                txt("true"),
                 txt("reserved_at"),
                 txt("integer"),
                 txt("YES"),
@@ -466,6 +564,7 @@ mod tests {
         ];
         let rel = PgRelation::from_rows(&rows).unwrap().unwrap();
         assert_eq!((rel.relkind.as_str(), rel.schema.as_str()), ("r", "app"));
+        assert!(rel.id_unique);
         assert_eq!(
             rel.columns,
             vec![
@@ -485,6 +584,7 @@ mod tests {
         let empty = vec![vec![
             txt("v"),
             txt("app"),
+            txt("false"),
             Value::Null,
             Value::Null,
             txt("YES"),
@@ -494,14 +594,28 @@ mod tests {
             Ok(Some(PgRelation {
                 relkind: "v".into(),
                 schema: "app".into(),
+                id_unique: false,
                 columns: vec![]
             }))
+        );
+        // The uniqueness cell is a closed vocabulary.
+        assert_eq!(
+            PgRelation::from_rows(&[vec![
+                txt("r"),
+                txt("a"),
+                txt("t"),
+                txt("id"),
+                txt("bigint"),
+                txt("NO")
+            ]]),
+            Err(())
         );
         assert_eq!(PgRelation::from_rows(&[vec![txt("r")]]), Err(()));
         assert_eq!(
             PgRelation::from_rows(&[vec![
                 Value::Null,
                 txt("a"),
+                txt("true"),
                 txt("id"),
                 txt("bigint"),
                 txt("NO")
