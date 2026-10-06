@@ -435,7 +435,15 @@ fn load_client_auth(
     }
     let mut bytes = read_file(key_path)
         .map_err(|e| err("CLIENT_KEY_FILE", format!("cannot be read ({})", e.kind())))?;
-    let mut keys = PrivateKeyDer::pem_slice_iter(&bytes);
+    let key = take_key(&mut bytes).map_err(|r| err("CLIENT_KEY_FILE", r.into()))?;
+    Ok(Some(ClientAuth { chain, key }))
+}
+
+/// Parse `CLIENT_KEY_FILE`'s bytes — exactly one PEM private key (PKCS#8, PKCS#1 or SEC1) — and
+/// [`wipe`] them, on every path, before returning.
+fn take_key(bytes: &mut [u8]) -> Result<PrivateKeyDer<'static>, &'static str> {
+    use rustls::pki_types::pem::PemObject;
+    let mut keys = PrivateKeyDer::pem_slice_iter(bytes);
     let key = match (keys.next(), keys.next()) {
         (Some(Ok(k)), None) => Ok(k),
         (None, _) => Err("holds no PEM private key"),
@@ -443,9 +451,8 @@ fn load_client_auth(
         (Some(Ok(_)), Some(Ok(_))) => Err("holds more than one private key"),
     };
     drop(keys);
-    wipe(&mut bytes);
-    let key = key.map_err(|r| err("CLIENT_KEY_FILE", r.into()))?;
-    Ok(Some(ClientAuth { chain, key }))
+    wipe(bytes);
+    key
 }
 
 fn build_upstream(
@@ -920,6 +927,28 @@ mod tests {
             client_auth_alert(&Wrap(io::ErrorKind::ConnectionReset.into())),
             None
         );
+    }
+
+    /// Key custody (§23.3.2): the key file's buffer is overwritten once it is parsed — on success
+    /// and on every refusal — so the PEM does not linger in the buffer this crate owns.
+    #[test]
+    fn the_key_file_buffer_is_wiped_on_every_path() {
+        let ca = testcert::ca("Ferro Test CA");
+        let a = ca.sign(&Spec::new("a", Usage::Client)).key_pem();
+        let b = ca.sign(&Spec::new("b", Usage::Client)).key_pem();
+        let cases: [(Vec<u8>, bool); 4] = [
+            (a.clone().into_bytes(), true),
+            ([a.as_bytes(), b.as_bytes()].concat(), false),
+            (b"no key here".to_vec(), false),
+            (
+                b"-----BEGIN PRIVATE KEY-----\n!!!!\n-----END PRIVATE KEY-----\n".to_vec(),
+                false,
+            ),
+        ];
+        for (mut buf, ok) in cases {
+            assert_eq!(take_key(&mut buf).is_ok(), ok);
+            assert!(!buf.is_empty() && buf.iter().all(|b| *b == 0), "wiped");
+        }
     }
 
     /// M6-F5c: client certificate or key material that cannot be loaded DISABLES the upstream at
