@@ -400,6 +400,14 @@ Not terminal and not flagged `STREAM`. It debits the request's credit like `STRE
 
 `eof_empty` means the connection closed after the request was sent with zero response bytes received, which is curl's `GOT_NOTHING`. `reset`, `write` and `eof_partial_head` are curl's `RECV_ERROR`/`SEND_ERROR`/`WEIRD_SERVER_REPLY` class. Distinguishing them through `hyper` is premise P14.
 
+*[Amended 2026-10-06 (M6-F1a, P14 measured, §22.2 (ct)): **how each token is derived, because `hyper`'s error alone does not separate them.** P14 holds with three caveats, none of which changes a fate or a Guzzle class.*
+
+- *`eof_empty` and `eof_partial_head` are the **same** `hyper` error (`IncompleteMessage`). The write tracker's **read count** separates them: zero response bytes means `eof_empty`, more than zero means `eof_partial_head`. They map to different Guzzle classes (§23.11.3), so the tracker counts reads as well as writes. That count is `HttpStats.bytes_received`.*
+- *`oversize_head` and `malformed_head` are both `is_parse()`. `hyper::Error::is_parse_too_large()` is compiled only with `hyper`'s `server` feature, which D20 does not enable. The separating signal is the error's `Display` text, `"message head is too large"`. Slice F4 pins it with a test, so an upgrade that changes the text fails loudly. If it ever drifts unnoticed, the result degrades to `malformed_head`, which has the same class and the same fate.*
+- *`write` is named only when the tracker saw the **write** side fail first. `hyper`'s h1 client reads for an early head while it writes the body, so a reset during the body write is normally observed on the read side and classified `reset` (5 of 5 runs). Both tokens are `RequestException` and both are "sent, no head", so P14's "stricter class for both" rule is already met and §23.11.3 is unchanged.*
+
+*Measured besides: `hyper` returns a **101** as an ordinary response head, so the engine itself must turn it into `informational_101`. Other 1xx responses are consumed by `hyper` and never surface. On HTTP/2, an over-limit head is a library-initiated `RST_STREAM(PROTOCOL_ERROR)`, identical to a malformed header block, so it is `h2_stream_error` (§23.9.1). Evidence: `engine/crates/ferro-http-spike/`.]*
+
 ---
 
 ### 23.6 Request lifecycle
@@ -455,6 +463,14 @@ Operators bound the damage by scheduling restarts and by keeping the drain above
 **`sent` is a measured fact.**
 
 - **HTTP/1.1** (every non-idempotent request in v1). The connection carries one exchange at a time. A tracker wraps the connection's *plaintext* I/O, below `hyper` and above TLS, and is armed at dispatch. The first `poll_write` that accepts one or more bytes sets `sent = true`. TLS handshake bytes precede arming. Bytes buffered into rustls count as sent, which is conservative (P1). `hyper`'s `try_send_request`, which returns an unserialised message, is a cross-check (P19).
+
+  *[Amended 2026-10-06 (M6-F1a, §22.2 (ct)): **P1 holds; P19 holds in one direction only.** Measured:*
+  - *Through `hyper::client::conn::http1`, no byte reaches the I/O between handshake and dispatch.*
+  - *Once armed, the tracker's count equals the bytes the upstream received, over TCP and through TLS (where it counts plaintext).*
+  - *A connection dead at its first write, or reset before dispatch, reports `sent = false`.*
+  - *`hyper` writes **vectored** on both transports, so the tracker must count `poll_write_vectored` as well as `poll_write`.*
+
+  *`try_send_request` returns the message only when the dispatcher never dequeued it. A request that `hyper` has already serialised into its own buffer is lost to the caller even when the first I/O write then fails with no byte sent. So the only valid cross-check is **message returned ⇒ not sent**. "No message" never implies "sent", and the tracker stays the sole authority for `sent = true`.]*
 - **HTTP/2** (effectively-idempotent requests only in v1). A request is `sent` once it is handed to a ready `SendRequest`. No post-send failure of an idempotent request is `Indeterminate` — a link-level one is `Retryable`, and a timeout or cancel follows §9.2's read rule (the table below) — so v1 needs no HTTP/2 not-processed licence (§23.8.3).
 - **No partial-write refinement.** The first byte is the line.
 
@@ -685,6 +701,19 @@ There is one shape: `HEAD`, `BODY`*, `END`. A buffered shape would need a size f
 A head over a limit is `oversize_head`, which is the "malformed or oversize head" row (sent, no head). A maximal permitted head encodes to well under 1 MiB, far below the global window's floor (`credit_bytes` ≥ `MAX_FRAME_PAYLOAD` = 16 MiB, enforced by `Config::validate`). A `HEAD` frame therefore always fits, which is §5.2's rule, held by construction.
 
 **Test (slice F4):** with `credit_bytes` at its validated floor, a response carrying the maximal permitted head is delivered, and a head one byte over is refused as `oversize_head`. Curl's own response-head limits are measured for the incompatibility entry (P20).
+
+*[Amended 2026-10-06 (M6-F1a, P15 measured, §22.2 (ct)): **all three setters exist, and an oversize head is always an error, never a truncation. But `max_buf_size` is not an exact head limit,** so the one-byte-over test cannot rest on `hyper`.*
+
+- *`max_headers` = 256 is exact at every read chunking.*
+- *`max_buf_size` = 256 KiB is exact only when the head arrives in small reads. `hyper` checks the buffer's length after a failed parse, and one read can fill the buffer's whole spare capacity. Delivered in a single read, heads up to **507 904 B** passed.*
+- *The ceiling is hard. The buffer reallocates only while it is below `max_buf_size`, and each reallocation at most doubles it. So a head `hyper` delivers is always **< 2 × `max_buf_size`** (< 512 KiB), and a 512 KiB head was refused under every delivery shape tried. §5.2's "a `HEAD` frame always fits" therefore still holds by a factor of more than 30.*
+
+*The exact 256 KiB limit is the **engine's** check, applied to the parsed head before `HEAD` is sent: the status line, plus each field's name, value and 4 bytes (`": "` and CRLF), plus the final CRLF. A head over it is `oversize_head` (sent, no head), and `max_buf_size` is the memory backstop. F4's test is written against that measure.*
+
+*On HTTP/2:*
+- *`hyper`'s own default `max_header_list_size` is **16 KiB** (not `h2`'s 16 MiB), so setting it is load-bearing.*
+- *An over-limit head is a library `RST_STREAM(PROTOCOL_ERROR)`, indistinguishable from a malformed block, so its cause is `h2_stream_error` (§23.5.6).*
+- *Far over the limit, `h2`'s CONTINUATION cap answers with a **connection-level** `GOAWAY(ENHANCE_YOUR_CALM)`, failing every stream on that connection. That is §23.1's cross-tenant coupling, which in v1 reaches only effectively-idempotent requests (Retryable).]*
 
 **`BODY` chunks are ≤ 256 KiB,** so the default 64-frame window holds at most 16 MiB of unread body per stream. That is also **the client-side memory bound per open HTTP stream** whose frames the application has not consumed. It is stated as a cost of lifting (cj)'s stream exclusivity (§23.11.1): N open, unread streams can hold N × 16 MiB in PHP.
 
@@ -1084,6 +1113,14 @@ Until then the documentation says the Symfony seam does not exist in v1, rather 
 
 `flate2` is already locked.
 
+*[Amended 2026-10-06 (M6-F1a, P3 measured, §22.2 (ct)): **`tokio-rustls` must be declared with `default-features = false, features = ["ring", "tls12"]`.** Its default features select `aws_lc_rs`, the backend argument 3 rejects, so a plain `tokio-rustls = "0.26"` would quietly bring back CMake and the `OpenSSL` licence. With that declaration, the measured tree is as follows:*
+- *It holds no `aws-lc-*`, `cmake`, `webpki-roots` or OpenSSL crate.*
+- *It holds no `httpdate`, so `hyper` is client-only.*
+- *`ring` builds through `cc` with a failing `cmake` shim on `PATH` and as `$CMAKE`, which it never invoked.*
+- *Every licence in it is on `deny.toml`'s allow-list, unchanged.*
+
+*The full `cargo deny check` is CI's `deny` job, over the whole workspace, dev-dependencies included.]*
+
 All of it sits in `engine/crates/ferro-http`, behind the default-on cargo feature `http`. `--no-default-features` builds a database-only daemon, and CI builds and `cargo deny`s both configurations.
 
 **The argument:**
@@ -1132,7 +1169,7 @@ Every slice runs the adversarial review before push (D15's process note). Every 
 |---|---|---|
 | **F0** *(DONE, §22.2 (cn))* | This section; D19–D21 in §21 (D21 merged with Queue's licence decision); the §23.17 amendments; §17 M6 aligned. | The admission test passes in writing; every open choice is decided (§23.18). |
 | **D1c** *(M3, prerequisite)* | Per-request client deadlines and PING liveness (§23.11.0). | A slow request no longer poisons a session (SQL and HTTP). Must land before F8. |
-| **F1a** | Spike `engine/crates/ferro-http-spike` (ships no library code), **v1 critical path:** P1, P14, P15, P19, P7 (h1), P3, P16, P17 (P18 is measured with D1c). | `sent` is exact on HTTP/1.1; causes are distinguishable; head limits are settable; backpressure is bounded; deps pass cargo-deny. **A false premise here changes §23.7 before F2.** |
+| **F1a** *(DONE, §22.2 (ct))* | Spike `engine/crates/ferro-http-spike` (ships no library code), **v1 critical path:** P1, P14, P15, P19, P7 (h1), P3, P16, P17 (P18 is measured with D1c). | `sent` is exact on HTTP/1.1; causes are distinguishable; head limits are settable; backpressure is bounded; deps pass cargo-deny. **A false premise here changes §23.7 before F2.** |
 | **F1b** | Spike, off the critical path: P2 (with the library-GOAWAY negative control), P5, P7 (h2), P4, P6, P20. | Evidence for F5b and for the post-v1 HTTP/2-writes slice; incompatibility entries measured. |
 | **F2** | `/proto`: the registry entries for what F0 allocated in the spec — `HTTP = 6`, three methods, the four codes, `[http.causes]`, the feature bit — plus vectors, both codecs, and PROTOCOL.md §1, §5 (the `detail` sentence) and a new §12 (Queue's messages take §13). `ferrod` routes `HTTP/REQUEST` and answers `Unsupported`; the other HTTP methods route `Unsupported` (tested). | The wire is pinned before behaviour. |
 | **F3** | `ferro-http` configuration and the validator (§23.4), with the fuzz target, property gate and refusal corpus. No network. | The SSRF rule in isolation. |
@@ -1246,6 +1283,21 @@ Every premise below is owed by the slice that names it, and none may be relied o
 - **P3.** The dependency set passes `deny.toml` unchanged and builds with no CMake and no toolchain beyond the existing C compiler. `ring` is `Apache-2.0 AND ISC`; `rustls-native-certs` is `Apache-2.0 OR ISC OR MIT`.
 - **P16.** `unicode-normalization`'s licence is on the allow-list. If it is not, `PATH_ENCODING=utf8` ships with a fixed code-point refusal table instead, generated from Unicode data at build time.
 - **P17.** During `ferrod`'s drain, an existing session keeps reading frames, so a new HTTP `REQUEST` can be refused with `draining` rather than lost. Measured against `serve.rs`/`session`.
+
+*[Amended 2026-10-06 (M6-F1a, §22.2 (ct)): **F1a's premises are MEASURED, none is refuted, and §23.7.1's fate table stands unchanged.** Evidence: `engine/crates/ferro-http-spike/`, 21 tests, each with a negative control and all 14 mutations killed. Verdicts:*
+
+| *Premise* | *Verdict* | *Where the text changed* |
+|---|---|---|
+| *P1* | *HOLDS* | *§23.7.1 (the tracker counts vectored writes)* |
+| *P19* | *HOLDS in one direction only:* message returned ⇒ not sent *(a request serialised into `hyper`'s buffer whose first I/O write fails returns no message)* | *§23.7.1* |
+| *P14* | *HOLDS WITH CAVEAT: `eof_empty`/`eof_partial_head` need the tracker's read count; `oversize_head`/`malformed_head` need `hyper`'s `Display` text; `write` vs `reset` is not reliably separable (same class, same fate); a 101 arrives as a head* | *§23.5.6* |
+| *P15* | *HOLDS WITH CAVEAT: `max_buf_size` is not exact (heads up to 507 904 B delivered at 256 KiB; hard ceiling < 2×); the exact limit is the engine's own check; `hyper`'s HTTP/2 default is 16 KiB* | *§23.9.1* |
+| *P7 (h1)* | *HOLDS: ~0.6 MB past the credit with pinned 128 KiB socket buffers, against 511 MiB for the read-ahead control; a throttled (~25 MB/s) read-ahead mutation is also caught* | *—* |
+| *P3* | *HOLDS WITH CAVEAT: `tokio-rustls` defaults to `aws_lc_rs`; no CMake (measured with a failing shim); every licence allowed; the full `cargo deny check` is CI's* | *§23.13* |
+| *P16* | *HOLDS: `MIT OR Apache-2.0` (`tinyvec`: `Zlib OR Apache-2.0 OR MIT`); NFKC folds U+FF0E/U+2024/U+2025, NFC does not* | *—* |
+| *P17* | *HOLDS, bounded by `drain_deadline`: busy and idle sessions answer new frames after the drain starts; after the hard close a request is lost, which is why §23.6.1's chassis change 2 is needed* | *—* |
+
+*Observation for §23.6.1's chassis change 1: the HTTP service can refuse with `draining` by capturing the `Drain` handle in the `HandlerFactory` `main` builds, with no session-layer change. Today `main` builds the factory before the `Drain`, so this is a reorder. The queue waker is separate and was not measured.]*
 
 **Owned by D1c (M3), not by F1a:**
 

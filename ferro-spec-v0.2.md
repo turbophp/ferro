@@ -1374,6 +1374,43 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
   - **The adversarial review is why the guard asks the server.** It confirmed 12 findings, two BLOCKERS: the first guard parsed the DSN itself, and the drivers parse differently — on PostgreSQL `…/rv_shadow?dbname=victim` (tokio-postgres applies `dbname` over the path), a `@`/`/` inside a query value, and a libpq key=value DSN; on MariaDB `…/victim/x_shadow` and `…/victim#_shadow` (mysql_async reads the first path segment and ignores the fragment) — each EMPTIED a non-shadow database with exit 0, reproduced against a throwaway victim. Also fixed: the SQLite "reset" was a file delete whose failure was ignored (and a `?` in the path pointed the delete and the open at different files); the refusal message printed DSN text including a password; the MySQL reset left routines, events, sequences and versioned tables (re-sync failed); a migration's open transaction was silently lost; the PostgreSQL reset left publications, large objects and database settings; the pool name was printed twice and the backend's reason was lost (`RUST_LOG=warn` now shows it). Both bypass shapes are pinned against the real servers in CI, along with a non-trivial reset (a publication; a procedure). 13 mutations re-run in the main tree, all killed.
   - **Not established:** `ferro gen` (D2c), which turns the recorded `columns` into DTOs; checking binds against parameter types (nothing in PHP declares a bind's type).
 
+  **(ct) M6-F1a — the Ferro HTTP premise spike: none of §23.19's v1-critical premises is refuted, so §23.7's fate table stands. Four premises hold only with caveats, and each caveat changes text around the table (2026-10-06).** `engine/crates/ferro-http-spike/` ships no library code (the `ferro-sqlite-spike` precedent, (ba)). It tests §23.19's F1a premises (P1, P14, P15, P19, P7 (h1), P3, P16, P17) against the real `hyper` 1.11.1, `h2` 0.4.19 and `rustls` 0.23.45 on `ring`, and against `ferrod`'s real `serve`. There are 21 tests, each with a negative control, and 14 mutations, all killed. The crate's README carries every verdict, measurement and mutation. P18 stays with D1c.
+  - **`sent` is exact on HTTP/1.1 (P1 holds).**
+    - No byte reaches the I/O between handshake and dispatch.
+    - After arming, the tracker's count equals the upstream's received count, over TCP and through TLS, where it counts plaintext.
+    - The required controls report `sent = false`: dead at the first write, and reset before dispatch.
+    - A third control proves the probe is not blind: on `hyper`'s HTTP/2 client it sees the preface written before any request.
+    - `hyper` writes vectored on both transports. A tracker that counted only `poll_write` sees nothing, and a mutation proves it.
+  - **`try_send_request` is a cross-check in one direction only (P19 holds with a caveat).** It returns the message only if the dispatcher never dequeued it. A request already serialised into `hyper`'s buffer, whose first I/O write then fails, comes back with no message and no byte sent. So *message ⇒ not sent* holds, and *no message ⇒ sent* does not (§23.7.1 amended).
+  - **The "sent, no head" causes are distinguishable, but not from `hyper`'s error alone (P14 holds with caveats; §23.5.6 amended).**
+    - `eof_empty` and `eof_partial_head` are the same `IncompleteMessage`. The tracker's read count separates them, and they map to different Guzzle classes.
+    - `is_parse_too_large()` is compiled only with `hyper`'s `server` feature, which D20 leaves off. **The spike's first draft called it and did not build.** The oversize/malformed split is therefore `hyper`'s `Display` text, pinned by a test.
+    - A reset during the body write is seen on the read side (5 of 5 runs), so `write` and `reset` are not reliably separable. Both are the same class and the same fate, so §23.11.3 is unchanged.
+    - A 101 comes back from `hyper` as an ordinary head, which the engine must intercept.
+  - **The head limits are settable, but `max_buf_size` is not an exact limit (P15 holds with a caveat; §23.9.1 amended).**
+    - The tests run over a scripted in-memory I/O, so chunking is fixed and the results are deterministic.
+    - `max_headers` = 256 is exact at every chunking.
+    - `max_buf_size` = 256 KiB is exact only for small reads. **In one read, heads up to 507 904 B were delivered.** `bytes`' growth keeps a delivered head strictly below 2× the limit, so §5.2's rule still holds by more than 30×.
+    - F4's one-byte-over test must rest on an engine-side check of the parsed head.
+    - On HTTP/2, `hyper`'s own default `max_header_list_size` is 16 KiB, not `h2`'s 16 MiB.
+    - An over-limit HTTP/2 head is a library `RST_STREAM(PROTOCOL_ERROR)`, identical to a malformed block. (`h2`'s comment promising `REFUSED_STREAM` is stale.) Far over the limit, it is a connection-level `GOAWAY(ENHANCE_YOUR_CALM)`.
+  - **Backpressure is bounded (P7 (h1) holds).**
+    - Both sockets pin 128 KiB buffers. A credit-gated reader lets the upstream write only ~0.6 MB past the credit, for both body framings, and new credit resumes it.
+    - The same probe on a read-ahead client sees 511 MiB.
+    - A read-ahead throttled to ~25 MB/s is also caught: it never stalls, with 118 MiB in 5 s. That is (bj)'s "merely slow" rule, applied on purpose.
+  - **The dependency set (P3 holds with a caveat; §23.13 amended).**
+    - **`tokio-rustls`'s default features select `aws_lc_rs`**, the backend D20 rejects, so `default-features = false, features = ["ring", "tls12"]` is load-bearing.
+    - With it, the lock holds no `aws-lc-*`, `cmake`, `webpki-roots`, OpenSSL crate or `httpdate`.
+    - `ring` rebuilt from clean with a failing `cmake` shim on `PATH` and as `$CMAKE`, and never invoked it.
+    - Every licence, read from the crate manifests, is on `deny.toml`'s list, unchanged.
+  - **P16 holds.** `unicode-normalization` is `MIT OR Apache-2.0`. NFKC folds U+FF0E, U+2024 and U+2025 into dots, and NFC does not, so §23.4.2 step 8 is right to name NFKC.
+  - **P17 holds, and its bound is the measurement.**
+    - Through the real `serve`, busy and idle sessions read and answer new frames after the drain starts. A handler that captured the `Drain` refuses with `draining`, and a service-6 frame is answered `Unsupported` today.
+    - After `drain_deadline`, `serve` aborts the sessions and a request is lost. That is the case for §23.6.1's chassis change 2.
+    - Chassis change 1 needs no session-layer plumbing for HTTP: `main` can hand the `Drain` to the `HandlerFactory`, which today it builds first.
+    - Two of the mutations edited `ferrod`'s `serve.rs` itself, and both were killed.
+  - **Not established:** **`cargo deny check` was not run in this container.** `cargo-deny` is not installed; the GitHub release download is refused by the egress proxy; and building it from crates.io was impossible because the shared disk reached 100%, filled by other work, during the slice. CI's `deny` job runs the full check over the whole workspace, this crate's dev-dependencies included, and is the authority for that half of P3. *(This entry's letter may need renumbering at merge: (cr)/(cs) may be taken by slices in flight.)*
+
 ### 22.3 M2 exit record (2026-10-02)
 
 **M2's deliverables are built and on `main`. Its acceptance bars are NOT met as written.** Both halves are stated here, because a milestone record that restates a bar without its measurement, or drops the part not met, is how this project's records have gone wrong before (§22.2 (z), (bq)).
