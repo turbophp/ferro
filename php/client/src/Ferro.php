@@ -50,13 +50,15 @@ final class Ferro
         ?RetryPolicy $policy = null,
         ?TypePolicyOptions $types = null,
         ?ValuePolicy $values = null,
+        ?Manifest $manifest = null,
     ): Connection {
-        $factory = static function () use ($socketPath, $connectTimeout, $ioTimeout): SessionInterface {
+        $hash = $manifest?->hash();
+        $factory = static function () use ($socketPath, $connectTimeout, $ioTimeout, $hash): SessionInterface {
             $session = new Session(Transport::connectUnix($socketPath, $connectTimeout, $ioTimeout));
-            $session->hello();
+            $session->hello($hash);
             return $session;
         };
-        return self::assemble($factory, $pool, $policy, $types, $values);
+        return self::assemble($factory, $pool, $policy, $types, $values, $manifest);
     }
 
     /**
@@ -74,13 +76,15 @@ final class Ferro
         ?RetryPolicy $policy = null,
         ?TypePolicyOptions $types = null,
         ?ValuePolicy $values = null,
+        ?Manifest $manifest = null,
     ): Connection {
-        $factory = static function () use ($host, $port, $connectTimeout, $ioTimeout): SessionInterface {
+        $hash = $manifest?->hash();
+        $factory = static function () use ($host, $port, $connectTimeout, $ioTimeout, $hash): SessionInterface {
             $session = new Session(Transport::connectTcp($host, $port, $connectTimeout, $ioTimeout));
-            $session->hello();
+            $session->hello($hash);
             return $session;
         };
-        return self::assemble($factory, $pool, $policy, $types, $values);
+        return self::assemble($factory, $pool, $policy, $types, $values, $manifest);
     }
 
     /**
@@ -108,6 +112,7 @@ final class Ferro
         ?RetryPolicy $policy,
         ?TypePolicyOptions $types,
         ?ValuePolicy $values,
+        ?Manifest $manifest,
     ): Connection {
         $policy ??= RetryPolicy::default();
         $session = $factory();
@@ -125,6 +130,7 @@ final class Ferro
             fate: new FateClassifier($policy->retryReads),
             values: $values,
             types: $types,
+            manifest: $manifest,
         );
     }
 }

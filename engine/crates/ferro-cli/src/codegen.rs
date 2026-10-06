@@ -874,7 +874,8 @@ mod tests {
         if ok {
             Some(std::process::Command::new("php"))
         } else {
-            eprintln!("note: no `php` on PATH; the live PHP comparison did not run");
+            // "skip:" so CI's no-skip gate (ci/assert-no-skips.sh) fails the lane if PHP is missing.
+            eprintln!("skip: no `php` on PATH; the live PHP comparison did not run");
             None
         }
     }

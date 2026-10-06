@@ -9,7 +9,10 @@ namespace Ferro\Client;
  *
  * `maxAttempts` counts the FIRST try plus retries — `maxAttempts = 1` means "never retry". It never
  * licenses retrying an `Indeterminate`/lost-COMMIT/write; that ban lives in {@see FateClassifier} and
- * no policy value can override it (§19.3).
+ * no policy value can override it (§19.3) — with ONE exception that is a declaration, not a policy:
+ * a manifest query declared `idempotent: true`, run by id on a session that agreed on the manifest
+ * (§9.2, §11, M3-D2e). `retryIdempotentWrites` (default true) only lets a caller switch that licence
+ * OFF; nothing here can extend it to an undeclared write.
  */
 final class RetryPolicy
 {
@@ -18,6 +21,7 @@ final class RetryPolicy
         public readonly int $maxAttempts = 3,
         public readonly float $baseDelaySeconds = 0.05,
         public readonly float $maxDelaySeconds = 2.0,
+        public readonly bool $retryIdempotentWrites = true,
     ) {
         if ($maxAttempts < 1) {
             throw new \InvalidArgumentException("maxAttempts must be >= 1, got {$maxAttempts}");
@@ -36,7 +40,7 @@ final class RetryPolicy
     /** A policy that never retries anything (first attempt only). */
     public static function none(): self
     {
-        return new self(retryReads: false, maxAttempts: 1);
+        return new self(retryReads: false, maxAttempts: 1, retryIdempotentWrites: false);
     }
 
     /** Build the {@see Backoff} this policy's bounds describe, optionally with injected RNG/sleep. */

@@ -46,6 +46,7 @@ final class TxHandle
         private readonly string $pool,
         private readonly int $txId,
         private readonly PackerInterface $encodePacker,
+        private readonly ?\Ferro\Manifest $manifest = null,
     ) {}
 
     /** This transaction's engine-assigned id (monotonic, never reused; native int, < 2^63). */
@@ -142,6 +143,65 @@ final class TxHandle
         return $this->codec->assocRows($this->run($sql, $params, true, ExecCodec::FETCH_ROWS));
     }
 
+    // ---- checked queries by manifest id, inside the transaction (M3-D2e review F3) ----------
+    //
+    // The same contract as `Connection::…ById`, minus the idempotent licence: inside a transaction
+    // a lost statement is the TRANSACTION's fate (it will never commit), which the closure runner
+    // already handles, so nothing here ever re-sends.
+
+    /** @param list<mixed> $params */
+    public function execById(string $id, array $params = []): int
+    {
+        return $this->runById($id, $params, ExecCodec::FETCH_NONE)['affected'];
+    }
+
+    /**
+     * @template T of object
+     * @param list<mixed> $params
+     * @param class-string<T>|null $dto
+     * @return ($dto is null ? list<array<string,mixed>> : list<T>)
+     */
+    public function queryById(string $id, array $params = [], ?string $dto = null): array
+    {
+        $res = $this->runById($id, $params, ExecCodec::FETCH_ROWS);
+        if ($dto === null) {
+            return $this->codec->assocRows($res);
+        }
+        $out = [];
+        foreach ($res['rows'] as $row) {
+            $out[] = $this->codec->hydrateDto($dto, $res['cols'], $row);
+        }
+        return $out;
+    }
+
+    /** @param list<mixed> $params */
+    public function scalarById(string $id, array $params = []): mixed
+    {
+        $res = $this->runById($id, $params, ExecCodec::FETCH_ROWS);
+        $firstRow = $res['rows'][0] ?? null;
+        return $firstRow === null ? null : ($firstRow[0] ?? null);
+    }
+
+    /**
+     * @param list<mixed> $params
+     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
+     */
+    private function runById(string $id, array $params, int $fetch): array
+    {
+        if ($this->manifest === null) {
+            throw new \Ferro\Client\Error\ManifestException(
+                'a query by id needs a manifest: connect with Ferro::connect(manifest: Manifest::fromFile(…))',
+            );
+        }
+        $q = $this->manifest->query($id);
+        if ($q->pool !== $this->pool) {
+            throw new \Ferro\Client\Error\ManifestException(
+                "query `{$id}` is declared for pool `{$q->pool}`, and this transaction runs on `{$this->pool}`",
+            );
+        }
+        return $this->run($q->sql, $params, $q->readonly, $fetch, $q->id);
+    }
+
     /** Open a savepoint (engine-named when `$name` is null: an `sp_<n>` stack). */
     public function savepoint(?string $name = null): void
     {
@@ -197,9 +257,9 @@ final class TxHandle
      * @param list<mixed> $params
      * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
      */
-    public function runForConnection(string $sql, array $params, bool $readonly, int $fetch): array
+    public function runForConnection(string $sql, array $params, bool $readonly, int $fetch, ?string $queryId = null): array
     {
-        return $this->run($sql, $params, $readonly, $fetch);
+        return $this->run($sql, $params, $readonly, $fetch, $queryId);
     }
 
     /**
@@ -209,14 +269,14 @@ final class TxHandle
      * @param list<mixed> $params
      * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
      */
-    private function run(string $sql, array $params, bool $readonly, int $fetch): array
+    private function run(string $sql, array $params, bool $readonly, int $fetch, ?string $queryId = null): array
     {
         // CLEAR FIRST, exactly as `Connection::dispatch` does: {@see lastInsertId} promises the
         // SAME contract as the Connection's, so a statement that fails here must not leave the
         // previous statement's key readable either.
         $this->lastInsertId = null;
 
-        $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, $this->txId);
+        $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, $this->txId, $queryId);
         try {
             $outcome = $this->session->sendRequest(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
         } catch (CodecException $e) {

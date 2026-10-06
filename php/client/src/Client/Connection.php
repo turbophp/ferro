@@ -72,6 +72,9 @@ final class Connection
 
     private readonly ExecCodec $codec;
     private readonly RetryPolicy $policy;
+
+    /** How many `transaction()` closures are running on this connection (M3-D2e review F3). */
+    private int $closureTxDepth = 0;
     private readonly FateClassifier $fate;
     private readonly PackerInterface $encodePacker;
     private readonly PackerInterface $decodePacker;
@@ -117,6 +120,7 @@ final class Connection
         ?PackerInterface $encodePacker = null,
         ?PackerInterface $decodePacker = null,
         ?TypePolicyOptions $types = null,
+        private readonly ?\Ferro\Manifest $manifest = null,
     ) {
         // A supplied ExecCodec already carries its own ValuePolicy and PlanCache, so `values:`,
         // `plans:` and `types:` have nowhere to go — they used to be accepted and DROPPED, which
@@ -368,6 +372,103 @@ final class Connection
     public function rows(string $sql, array $params = []): array
     {
         return $this->codec->assocRows($this->dispatch($sql, $params, true, ExecCodec::FETCH_ROWS));
+    }
+
+    // ---- checked queries, run by manifest id (M3-D2e, SPEC §11) --------------------------------
+
+    /**
+     * Run the manifest query `$id` (a write, or anything declared `readonly: false`) and return the
+     * affected-row count. The SQL, the pool and `readonly` come from the manifest; the engine runs
+     * its own copy of the SQL and refuses the request unless the declarations agree.
+     *
+     * **The one licensed auto-retry (§9.2).** If the query is declared `idempotent: true` and its
+     * fate comes back `Indeterminate` — the request was sent and the answer lost — it is re-sent,
+     * within the policy's `maxAttempts` (after a reconnect when the session died). Nothing else ever
+     * re-sends a write: an undeclared one surfaces its {@see IndeterminateException}.
+     *
+     * @param list<mixed> $params
+     */
+    public function execById(string $id, array $params = []): int
+    {
+        return $this->dispatchById($id, $params, ExecCodec::FETCH_NONE)['affected'];
+    }
+
+    /**
+     * @template T of object
+     * @param list<mixed> $params
+     * @param class-string<T>|null $dto
+     * @return ($dto is null ? list<array<string,mixed>> : list<T>)
+     */
+    public function queryById(string $id, array $params = [], ?string $dto = null): array
+    {
+        $res = $this->dispatchById($id, $params, ExecCodec::FETCH_ROWS);
+        if ($dto === null) {
+            return $this->codec->assocRows($res);
+        }
+        $out = [];
+        foreach ($res['rows'] as $row) {
+            $out[] = $this->codec->hydrateDto($dto, $res['cols'], $row);
+        }
+        return $out;
+    }
+
+    /**
+     * @template T of object
+     * @param list<mixed> $params
+     * @param class-string<T>|null $dto
+     * @return ($dto is null ? array<string,mixed>|null : T|null)
+     */
+    public function queryOneById(string $id, array $params = [], ?string $dto = null): array|object|null
+    {
+        $res = $this->dispatchById($id, $params, ExecCodec::FETCH_ROWS);
+        $firstRow = $res['rows'][0] ?? null;
+        if ($firstRow === null) {
+            return null;
+        }
+        return $dto === null
+            ? $this->codec->assocRow($res['cols'], $firstRow)
+            : $this->codec->hydrateDto($dto, $res['cols'], $firstRow);
+    }
+
+    /** @param list<mixed> $params */
+    public function scalarById(string $id, array $params = []): mixed
+    {
+        $res = $this->dispatchById($id, $params, ExecCodec::FETCH_ROWS);
+        $firstRow = $res['rows'][0] ?? null;
+        return $firstRow === null ? null : ($firstRow[0] ?? null);
+    }
+
+    /**
+     * Resolve `$id` against this connection's manifest and dispatch it. Refused before anything is
+     * sent when there is no manifest, the id is unknown, or — inside a transaction — the query is
+     * declared for another pool (the engine would refuse it; this says why without a round trip).
+     *
+     * @param list<mixed> $params
+     * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
+     */
+    private function dispatchById(string $id, array $params, int $fetch): array
+    {
+        if ($this->closureTxDepth > 0) {
+            // M3-D2e review F3: inside `transaction()` a statement belongs to the TxHandle the closure
+            // was given. On the Connection it would run OUTSIDE the transaction — and survive its
+            // rollback — with the idempotent licence armed besides.
+            throw new \Ferro\Client\Error\ManifestException(
+                'inside transaction(), run a query by id on the TxHandle the closure receives '
+                . '($tx->execById(…)), not on the Connection: here it would run outside the transaction',
+            );
+        }
+        if ($this->manifest === null) {
+            throw new \Ferro\Client\Error\ManifestException(
+                'a query by id needs a manifest: connect with Ferro::connect(manifest: Manifest::fromFile(…))',
+            );
+        }
+        $q = $this->manifest->query($id);
+        if ($this->ownTx() !== null && $q->pool !== $this->pool) {
+            throw new \Ferro\Client\Error\ManifestException(
+                "query `{$id}` is declared for pool `{$q->pool}`, and this transaction runs on `{$this->pool}`",
+            );
+        }
+        return $this->dispatch($q->sql, $params, $q->readonly, $fetch, $q);
     }
 
     // ---- asynchronous calls (M3-D1, SPEC §10.1) ---------------------------------------------------
@@ -1184,11 +1285,16 @@ final class Connection
                 throw $ex;
             }
             $txId = $this->decodeTxId($outcome);
-            $tx = new TxHandle($session, $this->codec, $this->pool, $txId, $this->encodePacker);
+            $tx = new TxHandle($session, $this->codec, $this->pool, $txId, $this->encodePacker, $this->manifest);
 
             // ---- 2. run the closure ----
             try {
-                $result = $fn($tx);
+                ++$this->closureTxDepth;
+                try {
+                    $result = $fn($tx);
+                } finally {
+                    --$this->closureTxDepth;
+                }
             } catch (\Throwable $closureError) {
                 // Best-effort rollback; the original error is what matters.
                 try {
@@ -1286,7 +1392,7 @@ final class Connection
      * @param list<mixed> $params
      * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
      */
-    private function dispatch(string $sql, array $params, bool $readonly, int $fetch): array
+    private function dispatch(string $sql, array $params, bool $readonly, int $fetch, ?\Ferro\ManifestQuery $byId = null): array
     {
         // CLEAR FIRST, on the way IN — this is what makes `lastInsertId()`'s "never a stale key"
         // invariant true on the FAILURE path, and it is a deliberate divergence from PDO. See
@@ -1297,9 +1403,9 @@ final class Connection
 
         $tx = $this->ownTx();
         if ($tx === null) {
-            return $this->dispatchAutocommit($sql, $params, $readonly, $fetch);
+            return $this->dispatchAutocommit($sql, $params, $readonly, $fetch, 0, $byId);
         }
-        $res = $tx->runForConnection($sql, $params, $readonly, $fetch);
+        $res = $tx->runForConnection($sql, $params, $readonly, $fetch, $byId?->id);
         // Propagate the generated key to the connection level (M1-S8a Task 9): a driver's
         // `lastInsertId()` is read off the Connection, and nearly every real INSERT happens inside a
         // transaction. The closure form deliberately does NOT propagate — see {@see lastInsertId}.
@@ -1445,9 +1551,11 @@ final class Connection
         bool $readonly,
         int $fetch,
         int $startAttempt = 0,
+        ?\Ferro\ManifestQuery $byId = null,
     ): array {
         $opKind = $readonly ? OpKind::Read : OpKind::Write;
-        $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, null);
+        // A query by id runs on the pool its manifest entry declares (M3-D2e).
+        $payload = $this->codec->encode($byId->pool ?? $this->pool, $sql, $params, $readonly, $fetch, null, $byId?->id);
         $attempt = $startAttempt;
 
         while (true) {
@@ -1475,6 +1583,21 @@ final class Connection
                     ++$attempt;
                     continue;
                 }
+                if ($this->reconnect !== null
+                    && $attempt + 1 < $this->policy->maxAttempts
+                    && $this->idempotentLicence($fate, $byId)
+                ) {
+                    // The licensed re-send. If the session cannot be re-established, the caller is
+                    // told the WRITE's fate — Indeterminate — not the dial's, which callers read as
+                    // "nothing was sent" (M3-D2e review F2).
+                    try {
+                        $this->reconnect->reconnect();
+                    } catch (FerroException $dial) {
+                        throw $fate;
+                    }
+                    ++$attempt;
+                    continue;
+                }
                 throw $fate;
             } catch (CodecException $e) {
                 throw new ProtocolException('failed to decode SQL terminal: ' . $e->getMessage(), 0, $e);
@@ -1494,14 +1617,32 @@ final class Connection
             $ex = ErrorMapper::fromOutcome($outcome);
             if ($this->reconnect !== null
                 && $attempt + 1 < $this->policy->maxAttempts
-                && $this->fate->mayRetryException($ex, $readonly, $opKind)
+                && ($this->fate->mayRetryException($ex, $readonly, $opKind)
+                    || $this->idempotentLicence($ex, $byId))
             ) {
-                // A server-declared Retryable READ: the session is alive → re-issue, no reconnect.
+                // A server-declared Retryable READ (or a declared-idempotent query whose write the
+                // engine reported Indeterminate): the session is alive → re-issue, no reconnect.
                 ++$attempt;
                 continue;
             }
             throw $ex;
         }
+    }
+
+    /**
+     * SPEC §9.2's one licence to re-send a write whose fate is unknown: a manifest query declared
+     * `idempotent: true`, run by id. The declaration is the ENGINE's — this connection's manifest
+     * hash was accepted at HELLO, and the engine runs a query by id only on such a session — so a
+     * client holding a stale manifest is refused at connect rather than retrying under a stale
+     * flag. A policy can switch the licence off (`retryIdempotentWrites: false`); nothing extends
+     * it to an undeclared write.
+     */
+    private function idempotentLicence(\Throwable $fate, ?\Ferro\ManifestQuery $byId): bool
+    {
+        return $byId !== null
+            && $byId->idempotent
+            && $this->policy->retryIdempotentWrites
+            && $fate instanceof IndeterminateException;
     }
 
     /**
