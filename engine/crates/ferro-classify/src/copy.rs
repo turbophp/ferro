@@ -137,7 +137,9 @@ fn tokenize(masked: &str) -> Option<Vec<Tok>> {
             out.push(Tok::Quoted);
         } else if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
             let start = i;
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] >= 0x80) {
+            while i < b.len()
+                && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] >= 0x80)
+            {
                 i += 1;
             }
             out.push(Tok::Word(masked[start..i].to_ascii_uppercase()));
@@ -164,7 +166,10 @@ mod tests {
         for (sql, want) in [
             ("COPY t FROM STDIN", In),
             ("copy t from stdin", In),
-            ("COPY public.items (id, name) FROM STDIN WITH (FORMAT csv, HEADER true)", In),
+            (
+                "COPY public.items (id, name) FROM STDIN WITH (FORMAT csv, HEADER true)",
+                In,
+            ),
             ("COPY t FROM STDIN;", In),
             ("  -- load\n COPY t FROM STDIN", In),
             ("COPY BINARY t FROM STDIN", In),
@@ -172,8 +177,14 @@ mod tests {
             ("COPY \"from\" FROM STDIN", In),
             ("COPY \"weird\"\"name\" (\"to\") FROM STDIN", In),
             ("COPY t TO STDOUT", Out),
-            ("COPY (SELECT a FROM t WHERE b = 'x TO STDOUT') TO STDOUT", Out),
-            ("COPY (DELETE FROM t RETURNING *) TO STDOUT WITH (FORMAT binary)", Out),
+            (
+                "COPY (SELECT a FROM t WHERE b = 'x TO STDOUT') TO STDOUT",
+                Out,
+            ),
+            (
+                "COPY (DELETE FROM t RETURNING *) TO STDOUT WITH (FORMAT binary)",
+                Out,
+            ),
             ("COPY t TO STDOUT WITH (DELIMITER E'\\t')", Out),
             ("COPY t TO STDOUT /* trailing */ ;", Out),
         ] {
@@ -234,7 +245,15 @@ mod tests {
 
     #[test]
     fn total_on_arbitrary_bytes() {
-        for sql in ["\"", "((((", "))))", "COPY \u{1F600} FROM STDIN", "COPY é FROM STDIN", "$$", "COPY t FROM STDIN $$ x"] {
+        for sql in [
+            "\"",
+            "((((",
+            "))))",
+            "COPY \u{1F600} FROM STDIN",
+            "COPY é FROM STDIN",
+            "$$",
+            "COPY t FROM STDIN $$ x",
+        ] {
             let _ = copy_direction(sql);
         }
         assert_eq!(copy_direction("COPY é FROM STDIN"), Some(In));

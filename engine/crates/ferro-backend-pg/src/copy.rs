@@ -52,10 +52,7 @@ pub async fn copy_out(client: &Client, sql: &str) -> Result<PgCopyOut, PoolError
 #[async_trait]
 impl BackendCopyIn for PgCopyIn {
     async fn send(&mut self, chunk: Bytes) -> Result<(), PoolError> {
-        self.sink
-            .send(chunk)
-            .await
-            .map_err(|e| error_map::map(&e))
+        self.sink.send(chunk).await.map_err(|e| error_map::map(&e))
     }
 
     async fn finish(&mut self) -> Result<u64, PoolError> {

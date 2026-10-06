@@ -269,7 +269,12 @@ impl Responder {
     /// M3-D4: grant the client (frames, bytes) more COPY credit — the engine's own accounting FIRST,
     /// then a `CORE/WINDOW_UPDATE` on this request's id (the first one also says "the COPY has
     /// started"). Not debited from any window: it is a control frame.
-    pub async fn grant(&self, inbound: &InboundRx, frames: u32, bytes: u32) -> Result<(), StreamSendError> {
+    pub async fn grant(
+        &self,
+        inbound: &InboundRx,
+        frames: u32,
+        bytes: u32,
+    ) -> Result<(), StreamSendError> {
         inbound.cell.replenish(frames, bytes);
         let payload = ferro_proto::messages::WindowUpdate { frames, bytes }.encode();
         let frame = OutFrame {

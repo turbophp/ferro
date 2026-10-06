@@ -537,7 +537,8 @@ pub async fn run<B: PoolBackend>(
                     None => max_instant,
                 });
                 let ended = crate::services::copy::run_copy(
-                    &mut co, direction, &sql, responder, inbound, &child, deadline, readonly, true, 0,
+                    &mut co, direction, &sql, responder, inbound, &child, deadline, readonly, true,
+                    0,
                 )
                 .await;
                 linker.abort();
@@ -604,8 +605,7 @@ fn drain_buffered_on_teardown(cmd_rx: &mut mpsc::Receiver<TxCommand>, end: TxEnd
             } => Some((responder, done)),
             _ => None,
         };
-        if let Some((responder, done)) = moved
-        {
+        if let Some((responder, done)) = moved {
             let ep = match end {
                 TxEnd::Deadline | TxEnd::Abort => crate::services::sql::tx_deadline(
                     "transaction torn down before this queued streamed statement ran \
@@ -974,7 +974,7 @@ mod tests {
                 // Derived from the ONE authority, exactly as `begin_on_pool` does (FakeBackend
                 // inherits the `true` default) — never a literal restated here.
                 streaming: pool.backend().supports_row_streaming(),
-            copy: pool.backend().supports_copy(),
+                copy: pool.backend().supports_copy(),
                 pool: "default".into(),
                 dialect: pool.backend().dialect(),
             },
@@ -1551,7 +1551,7 @@ mod tests {
                 done: done_rx,
                 // Derived from the ONE authority, exactly as `begin_on_pool` does.
                 streaming: pool.backend().supports_row_streaming(),
-            copy: pool.backend().supports_copy(),
+                copy: pool.backend().supports_copy(),
                 pool: "default".into(),
                 dialect: pool.backend().dialect(),
             },

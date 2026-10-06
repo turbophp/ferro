@@ -66,7 +66,11 @@ async fn a_deferred_constraint_failing_at_the_implicit_commit_is_not_reported_as
         sink.send(Bytes::from_static(b"1\t1\n")).await.unwrap();
         assert_eq!(sink.as_mut().finish().await.unwrap(), 1);
     }
-    assert_eq!(count(&client, "d4_fork_child").await, 1, "control row landed");
+    assert_eq!(
+        count(&client, "d4_fork_child").await,
+        1,
+        "control row landed"
+    );
 
     // A row whose parent does not exist: the FK is checked at the implicit COMMIT, not per row.
     let sink = client
@@ -147,9 +151,7 @@ async fn abort_before_done_is_acknowledged_and_applies_nothing() {
     };
     let client = connect(&url).await;
     client
-        .batch_execute(
-            "DROP TABLE IF EXISTS d4_fork_abort; CREATE TABLE d4_fork_abort (id int);",
-        )
+        .batch_execute("DROP TABLE IF EXISTS d4_fork_abort; CREATE TABLE d4_fork_abort (id int);")
         .await
         .unwrap();
     let sink = client
@@ -158,7 +160,10 @@ async fn abort_before_done_is_acknowledged_and_applies_nothing() {
         .unwrap();
     pin_mut!(sink);
     sink.send(Bytes::from_static(b"1\n2\n3\n")).await.unwrap();
-    sink.as_mut().abort().await.expect("the server acknowledges the abort");
+    sink.as_mut()
+        .abort()
+        .await
+        .expect("the server acknowledges the abort");
     assert_eq!(client.transaction_status(), b'I', "ReadyForQuery consumed");
     assert_eq!(count(&client, "d4_fork_abort").await, 0);
 }
@@ -170,9 +175,7 @@ async fn a_server_error_mid_copy_is_reported_by_the_next_send() {
     };
     let client = connect(&url).await;
     client
-        .batch_execute(
-            "DROP TABLE IF EXISTS d4_fork_early; CREATE TABLE d4_fork_early (id int);",
-        )
+        .batch_execute("DROP TABLE IF EXISTS d4_fork_early; CREATE TABLE d4_fork_early (id int);")
         .await
         .unwrap();
     let sink = client
@@ -198,7 +201,10 @@ async fn a_server_error_mid_copy_is_reported_by_the_next_send() {
     }
     let e = early.expect("the server's 22P02 surfaces before the end of data");
     assert_eq!(e.as_db_error().map(|d| d.code().code()), Some("22P02"));
-    sink.as_mut().abort().await.expect("abort after an early error");
+    sink.as_mut()
+        .abort()
+        .await
+        .expect("abort after an early error");
     assert_eq!(client.transaction_status(), b'I');
     assert_eq!(count(&client, "d4_fork_early").await, 0);
 }
@@ -221,7 +227,11 @@ async fn a_copy_rejected_before_copy_mode_does_not_kill_the_connection() {
         Err(e) => e,
     };
     assert_eq!(err.as_db_error().map(|d| d.code().code()), Some("42P01"));
-    let one: i32 = client.query_one("SELECT 1", &[]).await.expect("still usable").get(0);
+    let one: i32 = client
+        .query_one("SELECT 1", &[])
+        .await
+        .expect("still usable")
+        .get(0);
     assert_eq!(one, 1);
     assert!(!client.is_closed());
 }

@@ -16,7 +16,9 @@ mod common;
 
 use std::time::Duration;
 
-use ferro_proto::consts::{errc, flags, method_core, method_sql, method_stream, method_tx, service};
+use ferro_proto::consts::{
+    errc, flags, method_core, method_sql, method_stream, method_tx, service,
+};
 use ferro_proto::header::Header;
 use ferro_proto::messages::sql::{ExecOk, ExecRequest};
 use ferro_proto::messages::tx::{BeginRequest, BeginResponse, TxControl};
@@ -122,7 +124,11 @@ async fn open_in(
         assert_eq!(f.header.method, method_sql::COPY_IN);
         return Err(Outcome::decode(&f.payload).unwrap());
     }
-    assert_eq!(f.header.service, service::CORE, "the grant is a CORE/WINDOW_UPDATE");
+    assert_eq!(
+        f.header.service,
+        service::CORE,
+        "the grant is a CORE/WINDOW_UPDATE"
+    );
     assert_eq!(f.header.method, method_core::WINDOW_UPDATE);
     Ok(WindowUpdate::decode(&f.payload).unwrap())
 }
@@ -146,7 +152,13 @@ async fn send_data(client: &mut TestClient, rid: u32, data: &[u8]) {
     }
     .encode();
     client
-        .send(frame(service::STREAM, method_stream::COPY_DATA, flags::STREAM, rid, p))
+        .send(frame(
+            service::STREAM,
+            method_stream::COPY_DATA,
+            flags::STREAM,
+            rid,
+            p,
+        ))
         .await;
 }
 
@@ -175,7 +187,13 @@ async fn terminal(client: &mut TestClient, rid: u32) -> Outcome {
 
 /// A conforming COPY_IN sender: never more than its credit; chunks split to fit. Returns the
 /// terminal and how many grants (after the first) it took.
-async fn copy_in_all(client: &mut TestClient, rid: u32, mut grant: WindowUpdate, data: &[u8], chunk: usize) -> (Outcome, u32) {
+async fn copy_in_all(
+    client: &mut TestClient,
+    rid: u32,
+    mut grant: WindowUpdate,
+    data: &[u8],
+    chunk: usize,
+) -> (Outcome, u32) {
     let (mut frames, mut bytes) = (grant.frames, grant.bytes as usize);
     let mut regrants = 0;
     let mut off = 0;
@@ -239,22 +257,47 @@ async fn copy_in_then_copy_out_round_trips_byte_identical_under_small_windows() 
     let server = small_windows(url);
     let mut c = server.connect().await;
     c.hello(1).await;
-    exec_ok(&mut c, 2, "DROP TABLE IF EXISTS d4_e2e_rt; CREATE TABLE d4_e2e_rt (id int PRIMARY KEY, name text)").await;
+    exec_ok(
+        &mut c,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_rt; CREATE TABLE d4_e2e_rt (id int PRIMARY KEY, name text)",
+    )
+    .await;
 
     let data = rows(100_000);
-    let grant = open_in(&mut c, 3, &copy_req("COPY d4_e2e_rt (id, name) FROM STDIN", false, None))
-        .await
-        .expect("the COPY starts");
-    assert_eq!((grant.frames, grant.bytes), (8, 64 * 1024), "the configured window is granted");
+    let grant = open_in(
+        &mut c,
+        3,
+        &copy_req("COPY d4_e2e_rt (id, name) FROM STDIN", false, None),
+    )
+    .await
+    .expect("the COPY starts");
+    assert_eq!(
+        (grant.frames, grant.bytes),
+        (8, 64 * 1024),
+        "the configured window is granted"
+    );
     let (t, regrants) = copy_in_all(&mut c, 3, grant, &data, 16 * 1024).await;
     let ok = ok_body(t);
     assert_eq!(ok.affected, 100_000);
-    assert_eq!(ok.stats.bytes, data.len() as u64, "stats.bytes = COPY bytes received");
-    assert!(regrants > 20, "the window was re-granted many times ({regrants})");
+    assert_eq!(
+        ok.stats.bytes,
+        data.len() as u64,
+        "stats.bytes = COPY bytes received"
+    );
+    assert!(
+        regrants > 20,
+        "the window was re-granted many times ({regrants})"
+    );
 
     // COPY_OUT under a 2-frame credit window: replenish as we go.
-    let out_req = copy_req("COPY (SELECT id, name FROM d4_e2e_rt ORDER BY id) TO STDOUT", true, None);
-    c.send_request(4, service::SQL, method_sql::COPY_OUT, out_req.encode()).await;
+    let out_req = copy_req(
+        "COPY (SELECT id, name FROM d4_e2e_rt ORDER BY id) TO STDOUT",
+        true,
+        None,
+    );
+    c.send_request(4, service::SQL, method_sql::COPY_OUT, out_req.encode())
+        .await;
     let mut got = Vec::new();
     let mut data_frames = 0;
     let end = loop {
@@ -274,7 +317,10 @@ async fn copy_in_then_copy_out_round_trips_byte_identical_under_small_windows() 
     let ok = ok_body(end);
     assert_eq!(ok.affected, 100_000);
     assert_eq!(got, data, "byte-identical");
-    assert!(data_frames > 2, "more frames than the window: replenishment was required");
+    assert!(
+        data_frames > 2,
+        "more frames than the window: replenishment was required"
+    );
 }
 
 /// No byte may be sent into a COPY that has not started: while another session holds a lock the
@@ -286,9 +332,25 @@ async fn nothing_is_granted_before_the_copy_has_started() {
     let server = small_windows(url);
     let mut a = server.connect().await;
     a.hello(1).await;
-    exec_ok(&mut a, 2, "DROP TABLE IF EXISTS d4_e2e_lock; CREATE TABLE d4_e2e_lock (id int)").await;
+    exec_ok(
+        &mut a,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_lock; CREATE TABLE d4_e2e_lock (id int)",
+    )
+    .await;
     // Session A: a transaction holding the table's ACCESS EXCLUSIVE lock.
-    a.send_request(3, service::TX, method_tx::BEGIN, BeginRequest { pool: "default".into(), isolation: None, readonly: false }.encode()).await;
+    a.send_request(
+        3,
+        service::TX,
+        method_tx::BEGIN,
+        BeginRequest {
+            pool: "default".into(),
+            isolation: None,
+            readonly: false,
+        }
+        .encode(),
+    )
+    .await;
     let tx = match Outcome::decode(&recv_for(&mut a, 3).await.payload).unwrap() {
         Outcome::Ok(b) => BeginResponse::decode(&b).unwrap().tx_id,
         o => panic!("{o:?}"),
@@ -299,15 +361,31 @@ async fn nothing_is_granted_before_the_copy_has_started() {
 
     let mut b = server.connect().await;
     b.hello(1).await;
-    b.send_request(5, service::SQL, method_sql::COPY_IN, copy_req("COPY d4_e2e_lock FROM STDIN", false, None).encode()).await;
+    b.send_request(
+        5,
+        service::SQL,
+        method_sql::COPY_IN,
+        copy_req("COPY d4_e2e_lock FROM STDIN", false, None).encode(),
+    )
+    .await;
     assert!(
         b.recv_or_none(Duration::from_millis(600)).await.is_none(),
         "no grant while the COPY cannot start"
     );
-    a.send_request(6, service::TX, method_tx::ROLLBACK, TxControl { tx_id: tx }.encode()).await;
+    a.send_request(
+        6,
+        service::TX,
+        method_tx::ROLLBACK,
+        TxControl { tx_id: tx }.encode(),
+    )
+    .await;
     let _ = recv_for(&mut a, 6).await;
     let f = recv_for(&mut b, 5).await;
-    assert_eq!(f.header.method, method_core::WINDOW_UPDATE, "the grant comes once it starts");
+    assert_eq!(
+        f.header.method,
+        method_core::WINDOW_UPDATE,
+        "the grant comes once it starts"
+    );
     send_data(&mut b, 5, b"1\n").await;
     send_done(&mut b, 5).await;
     assert_eq!(ok_body(terminal(&mut b, 5).await).affected, 1);
@@ -322,8 +400,24 @@ async fn grants_stop_while_the_backend_stops_consuming() {
     let server = small_windows(url);
     let mut a = server.connect().await;
     a.hello(1).await;
-    exec_ok(&mut a, 2, "DROP TABLE IF EXISTS d4_e2e_bp; CREATE TABLE d4_e2e_bp (id int PRIMARY KEY, pad text)").await;
-    a.send_request(3, service::TX, method_tx::BEGIN, BeginRequest { pool: "default".into(), isolation: None, readonly: false }.encode()).await;
+    exec_ok(
+        &mut a,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_bp; CREATE TABLE d4_e2e_bp (id int PRIMARY KEY, pad text)",
+    )
+    .await;
+    a.send_request(
+        3,
+        service::TX,
+        method_tx::BEGIN,
+        BeginRequest {
+            pool: "default".into(),
+            isolation: None,
+            readonly: false,
+        }
+        .encode(),
+    )
+    .await;
     let tx = match Outcome::decode(&recv_for(&mut a, 3).await.payload).unwrap() {
         Outcome::Ok(b) => BeginResponse::decode(&b).unwrap().tx_id,
         o => panic!("{o:?}"),
@@ -334,7 +428,13 @@ async fn grants_stop_while_the_backend_stops_consuming() {
 
     let mut b = server.connect().await;
     b.hello(1).await;
-    let grant = open_in(&mut b, 5, &copy_req("COPY d4_e2e_bp FROM STDIN", false, None)).await.unwrap();
+    let grant = open_in(
+        &mut b,
+        5,
+        &copy_req("COPY d4_e2e_bp FROM STDIN", false, None),
+    )
+    .await
+    .unwrap();
     // Row 0 conflicts with A's uncommitted row: PostgreSQL waits on A and stops reading. Then pad
     // rows, so the data outruns every socket buffer between here and the server.
     let pad = "p".repeat(1000);
@@ -367,10 +467,23 @@ async fn grants_stop_while_the_backend_stops_consuming() {
         frames -= 1;
         bytes -= n;
     }
-    assert!(stalled, "the grants must stop while the backend is not consuming");
-    assert!(off < data.len(), "the client could not send everything ({off} of {})", data.len());
+    assert!(
+        stalled,
+        "the grants must stop while the backend is not consuming"
+    );
+    assert!(
+        off < data.len(),
+        "the client could not send everything ({off} of {})",
+        data.len()
+    );
     // A commits its row: the COPY's row 0 now violates the key, the COPY fails — known fate.
-    a.send_request(6, service::TX, method_tx::COMMIT, TxControl { tx_id: tx }.encode()).await;
+    a.send_request(
+        6,
+        service::TX,
+        method_tx::COMMIT,
+        TxControl { tx_id: tx }.encode(),
+    )
+    .await;
     let _ = recv_for(&mut a, 6).await;
     let t = loop {
         let f = recv_for(&mut b, 5).await;
@@ -391,12 +504,23 @@ async fn data_beyond_the_grant_is_session_fatal_and_data_for_a_finished_id_is_di
     let server = small_windows(url);
     let mut c = server.connect().await;
     c.hello(1).await;
-    exec_ok(&mut c, 2, "DROP TABLE IF EXISTS d4_e2e_v; CREATE TABLE d4_e2e_v (id int)").await;
+    exec_ok(
+        &mut c,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_v; CREATE TABLE d4_e2e_v (id int)",
+    )
+    .await;
     // A chunk for an id that is not in flight is discarded, not fatal.
     send_data(&mut c, 99, b"1\n").await;
     assert_session_alive(&mut c, 7).await;
 
-    let grant = open_in(&mut c, 3, &copy_req("COPY d4_e2e_v FROM STDIN", false, None)).await.unwrap();
+    let grant = open_in(
+        &mut c,
+        3,
+        &copy_req("COPY d4_e2e_v FROM STDIN", false, None),
+    )
+    .await
+    .unwrap();
     // One byte beyond the grant in a single frame.
     let too_much = vec![b'\n'; grant.bytes as usize + 1];
     send_data(&mut c, 3, &too_much).await;
@@ -426,7 +550,13 @@ async fn data_beyond_the_grant_is_session_fatal_and_data_for_a_finished_id_is_di
     assert_eq!(count(&mut d, 2, "d4_e2e_v").await, 0);
 
     // COPY data for an in-flight request that is not a COPY_IN is a violation too.
-    d.send_request(3, service::SQL, method_sql::EXEC, write("SELECT 1 FROM pg_sleep(0.5)").encode()).await;
+    d.send_request(
+        3,
+        service::SQL,
+        method_sql::EXEC,
+        write("SELECT 1 FROM pg_sleep(0.5)").encode(),
+    )
+    .await;
     send_data(&mut d, 3, b"x").await;
     let f = d.recv().await;
     assert_eq!(f.header.request_id, 0, "fatal");
@@ -438,19 +568,40 @@ async fn cancel_before_copy_done_applies_nothing_and_is_a_known_retryable() {
     let server = small_windows(url);
     let mut c = server.connect().await;
     c.hello(1).await;
-    exec_ok(&mut c, 2, "DROP TABLE IF EXISTS d4_e2e_cx; CREATE TABLE d4_e2e_cx (id int)").await;
-    let grant = open_in(&mut c, 3, &copy_req("COPY d4_e2e_cx FROM STDIN", false, None)).await.unwrap();
+    exec_ok(
+        &mut c,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_cx; CREATE TABLE d4_e2e_cx (id int)",
+    )
+    .await;
+    let grant = open_in(
+        &mut c,
+        3,
+        &copy_req("COPY d4_e2e_cx FROM STDIN", false, None),
+    )
+    .await
+    .unwrap();
     let n = (grant.bytes as usize).min(30_000);
     let data: Vec<u8> = rows_ints(5000).into_iter().take(n).collect();
     send_data(&mut c, 3, &data).await;
     c.cancel(3).await;
     let e = err_body(terminal(&mut c, 3).await);
-    assert_eq!(e.code, errc::CONNECTION_LOST, "a known did-not-apply: {e:?}");
+    assert_eq!(
+        e.code,
+        errc::CONNECTION_LOST,
+        "a known did-not-apply: {e:?}"
+    );
     assert_eq!(e.branch, errc::CONNECTION_LOST_BRANCH);
     assert!(e.message.contains("end-of-data"), "{}", e.message);
     assert_eq!(count(&mut c, 4, "d4_e2e_cx").await, 0, "nothing applied");
     // The session and the pool go on: a second COPY on the same session works.
-    let g = open_in(&mut c, 5, &copy_req("COPY d4_e2e_cx FROM STDIN", false, None)).await.unwrap();
+    let g = open_in(
+        &mut c,
+        5,
+        &copy_req("COPY d4_e2e_cx FROM STDIN", false, None),
+    )
+    .await
+    .unwrap();
     let (t, _) = copy_in_all(&mut c, 5, g, b"1\n2\n", 1024).await;
     assert_eq!(ok_body(t).affected, 2);
 }
@@ -477,14 +628,22 @@ async fn cancel_after_copy_done_is_indeterminate() {
            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION d4_e2e_sleep()",
     )
     .await;
-    let _ = open_in(&mut c, 3, &copy_req("COPY d4_e2e_slow FROM STDIN", false, None)).await.unwrap();
+    let _ = open_in(
+        &mut c,
+        3,
+        &copy_req("COPY d4_e2e_slow FROM STDIN", false, None),
+    )
+    .await
+    .unwrap();
     send_data(&mut c, 3, b"1\n").await;
     send_done(&mut c, 3).await;
     tokio::time::sleep(Duration::from_millis(300)).await; // inside the commit-time trigger
     c.cancel(3).await;
     let t = loop {
         match c.recv_or_none(Duration::from_secs(10)).await {
-            Some(f) if f.header.flags & flags::END != 0 => break Outcome::decode(&f.payload).unwrap(),
+            Some(f) if f.header.flags & flags::END != 0 => {
+                break Outcome::decode(&f.payload).unwrap();
+            }
             Some(_) => {}
             None => panic!("no terminal"),
         }
@@ -502,14 +661,35 @@ async fn a_malformed_row_is_the_servers_known_error_and_the_session_goes_on() {
     let server = small_windows(url);
     let mut c = server.connect().await;
     c.hello(1).await;
-    exec_ok(&mut c, 2, "DROP TABLE IF EXISTS d4_e2e_bad; CREATE TABLE d4_e2e_bad (id int)").await;
-    let g = open_in(&mut c, 3, &copy_req("COPY d4_e2e_bad FROM STDIN", false, None)).await.unwrap();
+    exec_ok(
+        &mut c,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_bad; CREATE TABLE d4_e2e_bad (id int)",
+    )
+    .await;
+    let g = open_in(
+        &mut c,
+        3,
+        &copy_req("COPY d4_e2e_bad FROM STDIN", false, None),
+    )
+    .await
+    .unwrap();
     let (t, _) = copy_in_all(&mut c, 3, g, b"1\n2\nnot-an-int\n3\n", 1024).await;
     let e = err_body(t);
     assert_eq!(e.sqlstate.as_deref(), Some("22P02"));
-    assert_eq!(e.branch, errc::PROTOCOL_BRANCH, "NonRetryable, known fate: {e:?}");
+    assert_eq!(
+        e.branch,
+        errc::PROTOCOL_BRANCH,
+        "NonRetryable, known fate: {e:?}"
+    );
     assert_eq!(count(&mut c, 4, "d4_e2e_bad").await, 0, "atomic");
-    let g = open_in(&mut c, 5, &copy_req("COPY d4_e2e_bad FROM STDIN", false, None)).await.unwrap();
+    let g = open_in(
+        &mut c,
+        5,
+        &copy_req("COPY d4_e2e_bad FROM STDIN", false, None),
+    )
+    .await
+    .unwrap();
     let (t, _) = copy_in_all(&mut c, 5, g, b"7\n", 1024).await;
     assert_eq!(ok_body(t).affected, 1);
 }
@@ -520,39 +700,121 @@ async fn copy_in_inside_a_transaction_rolls_back_and_a_cancel_kills_the_transact
     let server = small_windows(url);
     let mut c = server.connect().await;
     c.hello(1).await;
-    exec_ok(&mut c, 2, "DROP TABLE IF EXISTS d4_e2e_tx; CREATE TABLE d4_e2e_tx (id int)").await;
-    let begin = || BeginRequest { pool: "default".into(), isolation: None, readonly: false }.encode();
+    exec_ok(
+        &mut c,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_tx; CREATE TABLE d4_e2e_tx (id int)",
+    )
+    .await;
+    let begin = || {
+        BeginRequest {
+            pool: "default".into(),
+            isolation: None,
+            readonly: false,
+        }
+        .encode()
+    };
     // BEGIN; COPY; ROLLBACK -> nothing.
-    c.send_request(3, service::TX, method_tx::BEGIN, begin()).await;
-    let tx = BeginResponse::decode(match &Outcome::decode(&recv_for(&mut c, 3).await.payload).unwrap() { Outcome::Ok(b) => b, o => panic!("{o:?}") }).unwrap().tx_id;
-    let g = open_in(&mut c, 4, &copy_req("COPY d4_e2e_tx FROM STDIN", false, Some(tx))).await.unwrap();
+    c.send_request(3, service::TX, method_tx::BEGIN, begin())
+        .await;
+    let tx = BeginResponse::decode(
+        match &Outcome::decode(&recv_for(&mut c, 3).await.payload).unwrap() {
+            Outcome::Ok(b) => b,
+            o => panic!("{o:?}"),
+        },
+    )
+    .unwrap()
+    .tx_id;
+    let g = open_in(
+        &mut c,
+        4,
+        &copy_req("COPY d4_e2e_tx FROM STDIN", false, Some(tx)),
+    )
+    .await
+    .unwrap();
     let (t, _) = copy_in_all(&mut c, 4, g, &rows_ints(1000), 4096).await;
     assert_eq!(ok_body(t).affected, 1000);
-    c.send_request(5, service::TX, method_tx::ROLLBACK, TxControl { tx_id: tx }.encode()).await;
-    assert!(matches!(Outcome::decode(&recv_for(&mut c, 5).await.payload).unwrap(), Outcome::Ok(_)));
+    c.send_request(
+        5,
+        service::TX,
+        method_tx::ROLLBACK,
+        TxControl { tx_id: tx }.encode(),
+    )
+    .await;
+    assert!(matches!(
+        Outcome::decode(&recv_for(&mut c, 5).await.payload).unwrap(),
+        Outcome::Ok(_)
+    ));
     assert_eq!(count(&mut c, 6, "d4_e2e_tx").await, 0, "rolled back");
 
     // BEGIN; COPY (cancelled before DONE) -> TxDeadline; the transaction is gone.
-    c.send_request(7, service::TX, method_tx::BEGIN, begin()).await;
-    let tx = BeginResponse::decode(match &Outcome::decode(&recv_for(&mut c, 7).await.payload).unwrap() { Outcome::Ok(b) => b, o => panic!("{o:?}") }).unwrap().tx_id;
-    let _ = open_in(&mut c, 8, &copy_req("COPY d4_e2e_tx FROM STDIN", false, Some(tx))).await.unwrap();
+    c.send_request(7, service::TX, method_tx::BEGIN, begin())
+        .await;
+    let tx = BeginResponse::decode(
+        match &Outcome::decode(&recv_for(&mut c, 7).await.payload).unwrap() {
+            Outcome::Ok(b) => b,
+            o => panic!("{o:?}"),
+        },
+    )
+    .unwrap()
+    .tx_id;
+    let _ = open_in(
+        &mut c,
+        8,
+        &copy_req("COPY d4_e2e_tx FROM STDIN", false, Some(tx)),
+    )
+    .await
+    .unwrap();
     send_data(&mut c, 8, b"1\n").await;
     c.cancel(8).await;
     let e = err_body(terminal(&mut c, 8).await);
     assert_eq!(e.code, errc::TX_DEADLINE, "{e:?}");
-    c.send_request(9, service::TX, method_tx::COMMIT, TxControl { tx_id: tx }.encode()).await;
+    c.send_request(
+        9,
+        service::TX,
+        method_tx::COMMIT,
+        TxControl { tx_id: tx }.encode(),
+    )
+    .await;
     let e = err_body(Outcome::decode(&recv_for(&mut c, 9).await.payload).unwrap());
-    assert_eq!(e.code, errc::TX_DEADLINE, "the transaction was rolled back and tombstoned: {e:?}");
+    assert_eq!(
+        e.code,
+        errc::TX_DEADLINE,
+        "the transaction was rolled back and tombstoned: {e:?}"
+    );
     assert_eq!(count(&mut c, 10, "d4_e2e_tx").await, 0);
 
     // BEGIN; COPY; COMMIT -> applied.
-    c.send_request(11, service::TX, method_tx::BEGIN, begin()).await;
-    let tx = BeginResponse::decode(match &Outcome::decode(&recv_for(&mut c, 11).await.payload).unwrap() { Outcome::Ok(b) => b, o => panic!("{o:?}") }).unwrap().tx_id;
-    let g = open_in(&mut c, 12, &copy_req("COPY d4_e2e_tx FROM STDIN", false, Some(tx))).await.unwrap();
+    c.send_request(11, service::TX, method_tx::BEGIN, begin())
+        .await;
+    let tx = BeginResponse::decode(
+        match &Outcome::decode(&recv_for(&mut c, 11).await.payload).unwrap() {
+            Outcome::Ok(b) => b,
+            o => panic!("{o:?}"),
+        },
+    )
+    .unwrap()
+    .tx_id;
+    let g = open_in(
+        &mut c,
+        12,
+        &copy_req("COPY d4_e2e_tx FROM STDIN", false, Some(tx)),
+    )
+    .await
+    .unwrap();
     let (t, _) = copy_in_all(&mut c, 12, g, &rows_ints(10), 4096).await;
     assert_eq!(ok_body(t).affected, 10);
-    c.send_request(13, service::TX, method_tx::COMMIT, TxControl { tx_id: tx }.encode()).await;
-    assert!(matches!(Outcome::decode(&recv_for(&mut c, 13).await.payload).unwrap(), Outcome::Ok(_)));
+    c.send_request(
+        13,
+        service::TX,
+        method_tx::COMMIT,
+        TxControl { tx_id: tx }.encode(),
+    )
+    .await;
+    assert!(matches!(
+        Outcome::decode(&recv_for(&mut c, 13).await.payload).unwrap(),
+        Outcome::Ok(_)
+    ));
     assert_eq!(count(&mut c, 14, "d4_e2e_tx").await, 10);
 }
 
@@ -569,11 +831,21 @@ async fn the_shape_guard_and_the_readonly_refusal_touch_nothing() {
         (5, method_sql::COPY_IN, "COPY d4_e2e_g FROM STDIN", true),
         (6, method_sql::COPY_OUT, "COPY d4_e2e_g TO '/tmp/x'", true),
     ] {
-        c.send_request(rid, service::SQL, method, copy_req(sql, readonly, None).encode()).await;
+        c.send_request(
+            rid,
+            service::SQL,
+            method,
+            copy_req(sql, readonly, None).encode(),
+        )
+        .await;
         let e = err_body(Outcome::decode(&recv_for(&mut c, rid).await.payload).unwrap());
         assert_eq!(e.code, errc::UNSUPPORTED, "{sql}: {e:?}");
     }
-    assert_eq!(count(&mut c, 7, "d4_e2e_g").await, 1, "the DELETE never ran");
+    assert_eq!(
+        count(&mut c, 7, "d4_e2e_g").await,
+        1,
+        "the DELETE never ran"
+    );
 }
 
 /// D1a: one session, a COPY_IN open (granted, not yet done) — an EXEC and a PING on the same
@@ -584,8 +856,19 @@ async fn other_requests_are_served_while_a_copy_is_open() {
     let server = small_windows(url);
     let mut c = server.connect().await;
     c.hello(1).await;
-    exec_ok(&mut c, 2, "DROP TABLE IF EXISTS d4_e2e_mx; CREATE TABLE d4_e2e_mx (id int)").await;
-    let _ = open_in(&mut c, 3, &copy_req("COPY d4_e2e_mx FROM STDIN", false, None)).await.unwrap();
+    exec_ok(
+        &mut c,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_mx; CREATE TABLE d4_e2e_mx (id int)",
+    )
+    .await;
+    let _ = open_in(
+        &mut c,
+        3,
+        &copy_req("COPY d4_e2e_mx FROM STDIN", false, None),
+    )
+    .await
+    .unwrap();
     send_data(&mut c, 3, b"1\n2\n").await;
     let ok = exec_ok(&mut c, 4, "SELECT 42").await;
     assert_eq!(ok.rows[0][0], Value::I64(42));
@@ -601,8 +884,13 @@ async fn abandoning_a_copy_out_with_cancel_leaves_the_session_usable() {
     let server = small_windows(url);
     let mut c = server.connect().await;
     c.hello(1).await;
-    let req = copy_req("COPY (SELECT g, repeat('x', 200) FROM generate_series(1, 200000) g) TO STDOUT", true, None);
-    c.send_request(3, service::SQL, method_sql::COPY_OUT, req.encode()).await;
+    let req = copy_req(
+        "COPY (SELECT g, repeat('x', 200) FROM generate_series(1, 200000) g) TO STDOUT",
+        true,
+        None,
+    );
+    c.send_request(3, service::SQL, method_sql::COPY_OUT, req.encode())
+        .await;
     let first = recv_for(&mut c, 3).await;
     assert_eq!(first.header.method, method_stream::COPY_DATA);
     c.cancel(3).await;
@@ -614,7 +902,11 @@ async fn abandoning_a_copy_out_with_cancel_leaves_the_session_usable() {
         c.window_update(3, 1, f.payload.len() as u32).await;
     };
     let e = err_body(t);
-    assert_eq!(e.code, errc::CANCELLED, "a declared-readonly COPY_OUT that was cancelled: {e:?}");
+    assert_eq!(
+        e.code,
+        errc::CANCELLED,
+        "a declared-readonly COPY_OUT that was cancelled: {e:?}"
+    );
     let ok = exec_ok(&mut c, 4, "SELECT 1").await;
     assert_eq!(ok.rows[0][0], Value::I64(1));
 }
@@ -625,17 +917,29 @@ async fn abandoning_a_copy_out_with_cancel_leaves_the_session_usable() {
 async fn copy_on_a_non_postgres_pool_is_unsupported() {
     let dir = std::env::temp_dir().join(format!("d4-copy-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut pools = vec![("lite".to_string(), format!("sqlite://{}", dir.join("db.sqlite").display()))];
-    if let Some(m) = std::env::var("FERRO_TEST_MARIADB_URL").ok().or_else(|| std::env::var("FERRO_TEST_MYSQL_URL").ok()) {
+    let mut pools = vec![(
+        "lite".to_string(),
+        format!("sqlite://{}", dir.join("db.sqlite").display()),
+    )];
+    if let Some(m) = std::env::var("FERRO_TEST_MARIADB_URL")
+        .ok()
+        .or_else(|| std::env::var("FERRO_TEST_MYSQL_URL").ok())
+    {
         pools.push(("my".to_string(), m));
     }
-    let refs: Vec<(&str, &str)> = pools.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let refs: Vec<(&str, &str)> = pools
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
     let (server, _) = common::pools_server(&refs);
     let mut c = server.connect().await;
     c.hello(1).await;
     let mut rid = 2;
     for (pool, _) in &pools {
-        for (method, sql) in [(method_sql::COPY_IN, "COPY t FROM STDIN"), (method_sql::COPY_OUT, "COPY t TO STDOUT")] {
+        for (method, sql) in [
+            (method_sql::COPY_IN, "COPY t FROM STDIN"),
+            (method_sql::COPY_OUT, "COPY t TO STDOUT"),
+        ] {
             let mut r = copy_req(sql, method == method_sql::COPY_OUT, None);
             r.pool = pool.clone();
             c.send_request(rid, service::SQL, method, r.encode()).await;
@@ -657,12 +961,24 @@ async fn exec_refuses_a_copy_statement_and_points_at_the_copy_methods() {
     let server = exec_server_with_session_config(url, |_| {});
     let mut c = server.connect().await;
     c.hello(1).await;
-    exec_ok(&mut c, 2, "DROP TABLE IF EXISTS d4_e2e_ex; CREATE TABLE d4_e2e_ex (id int)").await;
-    for (rid, sql) in [(3, "COPY d4_e2e_ex FROM STDIN"), (4, "COPY d4_e2e_ex TO STDOUT")] {
+    exec_ok(
+        &mut c,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_ex; CREATE TABLE d4_e2e_ex (id int)",
+    )
+    .await;
+    for (rid, sql) in [
+        (3, "COPY d4_e2e_ex FROM STDIN"),
+        (4, "COPY d4_e2e_ex TO STDOUT"),
+    ] {
         let started = std::time::Instant::now();
         let e = err_body(exec(&mut c, rid, &write(sql)).await);
         assert_eq!(e.code, errc::UNSUPPORTED, "{sql}: {e:?}");
-        assert!(e.message.contains("COPY_IN") || e.message.contains("COPY_OUT"), "{}", e.message);
+        assert!(
+            e.message.contains("COPY_IN") || e.message.contains("COPY_OUT"),
+            "{}",
+            e.message
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
     }
     for rid in 5..30 {

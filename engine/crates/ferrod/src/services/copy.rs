@@ -149,14 +149,14 @@ pub(crate) async fn handle_copy(
                 responder.end_error(copy_unsupported());
                 return;
             }
-            let inbound = match open_inbound_for(direction, &responder, &cancel, deadline, true).await
-            {
-                Ok(i) => i,
-                Err(ep) => {
-                    responder.end_error(ep);
-                    return;
-                }
-            };
+            let inbound =
+                match open_inbound_for(direction, &responder, &cancel, deadline, true).await {
+                    Ok(i) => i,
+                    Err(ep) => {
+                        responder.end_error(ep);
+                        return;
+                    }
+                };
             let (done_tx, done_rx) = oneshot::channel::<()>();
             let cmd = TxCommand::Copy {
                 direction,
@@ -319,10 +319,16 @@ pub(crate) async fn run_copy<B: PoolBackend>(
 ) -> StreamEnded {
     match (direction, inbound) {
         (CopyDirection::In, Some(inbound)) => {
-            run_copy_in(co, sql, responder, inbound, cancel, deadline, in_tx, queue_us).await
+            run_copy_in(
+                co, sql, responder, inbound, cancel, deadline, in_tx, queue_us,
+            )
+            .await
         }
         (CopyDirection::Out, _) => {
-            run_copy_out(co, sql, responder, cancel, deadline, readonly, in_tx, queue_us).await
+            run_copy_out(
+                co, sql, responder, cancel, deadline, readonly, in_tx, queue_us,
+            )
+            .await
         }
         (CopyDirection::In, None) => {
             responder.end_error(protocol("COPY_IN without a data channel"));
@@ -418,7 +424,11 @@ async fn run_copy_in<B: PoolBackend>(
 
     // (2) The COPY has started: grant the client its window. This frame IS "go".
     let w = inbound.window();
-    if responder.grant(&inbound, w.frames(), w.bytes()).await.is_err() {
+    if responder
+        .grant(&inbound, w.frames(), w.bytes())
+        .await
+        .is_err()
+    {
         handle.abort().await;
         responder.end_error(not_applied("the session ended"));
         return StreamEnded::Broken;

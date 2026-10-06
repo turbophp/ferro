@@ -120,7 +120,10 @@ mod tests {
         assert_eq!(route(service::STREAM, method_stream::DATA), Route::Request);
         assert_eq!(route(service::STREAM, method_stream::HEAD), Route::Request);
         // A SQL method with the same number is a request.
-        assert_eq!(route(service::SQL, method_stream::COPY_DATA), Route::Request);
+        assert_eq!(
+            route(service::SQL, method_stream::COPY_DATA),
+            Route::Request
+        );
     }
 
     #[test]

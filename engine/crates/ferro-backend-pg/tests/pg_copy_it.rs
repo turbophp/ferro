@@ -38,7 +38,12 @@ fn pool(url: String) -> Pool<PgBackend> {
 }
 
 async fn pid(co: &mut Checkout<PgBackend>) -> i64 {
-    match &co.query("SELECT pg_backend_pid()::int8", &[]).await.unwrap().rows[0][0] {
+    match &co
+        .query("SELECT pg_backend_pid()::int8", &[])
+        .await
+        .unwrap()
+        .rows[0][0]
+    {
         ferro_proto::value::Value::I64(n) => *n,
         other => panic!("pid: {other:?}"),
     }
@@ -76,7 +81,10 @@ async fn copy_in_then_copy_out_round_trips_and_leaves_the_connection_clean() {
         data.extend_from_slice(format!("{i}\tname\\t{i}\n").as_bytes());
     }
     let end = {
-        let mut h = co.copy_in("COPY d4_pool_rt (id, name) FROM STDIN").await.unwrap();
+        let mut h = co
+            .copy_in("COPY d4_pool_rt (id, name) FROM STDIN")
+            .await
+            .unwrap();
         for piece in data.chunks(777) {
             h.send(Bytes::copy_from_slice(piece)).await.unwrap();
         }
@@ -108,7 +116,9 @@ async fn the_shape_guard_refuses_before_anything_reaches_the_server() {
     let pool = pool(url);
     fresh_table(&pool, "d4_pool_guard").await;
     let mut co = pool.checkout().await.unwrap();
-    co.exec("INSERT INTO d4_pool_guard VALUES (1, 'keep')").await.unwrap();
+    co.exec("INSERT INTO d4_pool_guard VALUES (1, 'keep')")
+        .await
+        .unwrap();
 
     // A non-COPY on the copy-in path would EXECUTE and COMMIT before the driver noticed.
     match co.copy_in("DELETE FROM d4_pool_guard").await {
@@ -116,7 +126,11 @@ async fn the_shape_guard_refuses_before_anything_reaches_the_server() {
         Err(e) => panic!("expected Unsupported, got {e:?}"),
         Ok(_) => panic!("a DELETE must not be accepted as a COPY"),
     }
-    assert_eq!(count(&mut co, "d4_pool_guard").await, 1, "the DELETE never ran");
+    assert_eq!(
+        count(&mut co, "d4_pool_guard").await,
+        1,
+        "the DELETE never ran"
+    );
     // A COPY FROM on the copy-out path would leave the server waiting for data forever.
     assert!(matches!(
         co.copy_out("COPY d4_pool_guard FROM STDIN").await,
@@ -139,7 +153,10 @@ async fn abort_applies_nothing_and_the_same_connection_is_recycled_usable() {
         let mut co = pool.checkout().await.unwrap();
         let p = pid(&mut co).await;
         {
-            let mut h = co.copy_in("COPY d4_pool_abort (id, name) FROM STDIN").await.unwrap();
+            let mut h = co
+                .copy_in("COPY d4_pool_abort (id, name) FROM STDIN")
+                .await
+                .unwrap();
             let mut big = Vec::new();
             for i in 0..5000 {
                 big.extend_from_slice(format!("{i}\tx\n").as_bytes());
@@ -163,13 +180,20 @@ async fn a_dropped_handle_discards_the_connection() {
     let first_pid = {
         let mut co = pool.checkout().await.unwrap();
         let p = pid(&mut co).await;
-        let mut h = co.copy_in("COPY d4_pool_drop (id, name) FROM STDIN").await.unwrap();
+        let mut h = co
+            .copy_in("COPY d4_pool_drop (id, name) FROM STDIN")
+            .await
+            .unwrap();
         h.send(Bytes::from_static(b"1\tx\n")).await.unwrap();
         drop(h); // neither finished nor aborted
         p
     };
     let mut co = pool.checkout().await.unwrap();
-    assert_ne!(pid(&mut co).await, first_pid, "a mid-COPY connection is never reused");
+    assert_ne!(
+        pid(&mut co).await,
+        first_pid,
+        "a mid-COPY connection is never reused"
+    );
     assert_eq!(count(&mut co, "d4_pool_drop").await, 0);
 }
 
@@ -181,8 +205,13 @@ async fn a_malformed_row_is_the_servers_error_and_the_connection_recycles() {
     let first_pid = {
         let mut co = pool.checkout().await.unwrap();
         let p = pid(&mut co).await;
-        let mut h = co.copy_in("COPY d4_pool_bad (id, name) FROM STDIN").await.unwrap();
-        h.send(Bytes::from_static(b"1\tok\nnot-an-int\tbad\n")).await.unwrap();
+        let mut h = co
+            .copy_in("COPY d4_pool_bad (id, name) FROM STDIN")
+            .await
+            .unwrap();
+        h.send(Bytes::from_static(b"1\tok\nnot-an-int\tbad\n"))
+            .await
+            .unwrap();
         match h.finish().await {
             Err(PoolError::Sql { sqlstate, .. }) => assert_eq!(sqlstate.as_deref(), Some("22P02")),
             other => panic!("expected the server's 22P02, got {other:?}"),
@@ -192,7 +221,11 @@ async fn a_malformed_row_is_the_servers_error_and_the_connection_recycles() {
     };
     let mut co = pool.checkout().await.unwrap();
     assert_eq!(pid(&mut co).await, first_pid, "recycled");
-    assert_eq!(count(&mut co, "d4_pool_bad").await, 0, "atomic: the good row did not land either");
+    assert_eq!(
+        count(&mut co, "d4_pool_bad").await,
+        0,
+        "atomic: the good row did not land either"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -234,5 +267,9 @@ async fn an_open_error_is_known_and_recycles() {
         p
     };
     let mut co = pool.checkout().await.unwrap();
-    assert_eq!(pid(&mut co).await, first_pid, "a server error keeps the connection");
+    assert_eq!(
+        pid(&mut co).await,
+        first_pid,
+        "a server error keeps the connection"
+    );
 }
