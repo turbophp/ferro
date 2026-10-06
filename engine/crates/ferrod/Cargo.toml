@@ -64,3 +64,10 @@ tempfile = "3"
 # The Ferro HTTP decoding suites (M6-F4b, `tests/http_f4b_it.rs`, `tests/http_rss_it.rs`) build gzip
 # and deflate response bodies. The SAME `flate2` `ferro-http` decodes with (already in the lock).
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# The Ferro HTTP TLS suite (M6-F5a, `tests/http_tls_it.rs`): certificates generated IN-TEST
+# (`ferro_http::testcert`, the non-default `test-certs` feature — `ring`, already in the lock; `rcgen`
+# is not, and D20 does not list it), and local TLS upstreams built on the SAME `rustls`/`tokio-rustls`
+# the engine uses, with D20's selections (`default-features = false` keeps `aws-lc-rs` out, §23.13).
+ferro-http = { path = "../ferro-http", features = ["test-certs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

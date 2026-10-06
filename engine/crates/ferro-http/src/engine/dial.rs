@@ -93,7 +93,11 @@ pub enum DialFailure {
     Address(AddressRefusal),
     ConnectRefused,
     ConnectUnreachable,
+    /// The connect bound (DNS + TCP + TLS, §23.8.4) ran out — during the TLS handshake included.
     ConnectTimeout,
+    /// The TLS handshake failed (M6-F5a, `tls`): every handshake byte precedes dispatch, so this
+    /// is always "before dispatch", never `Indeterminate`.
+    Tls(super::tls::TlsCause),
 }
 
 /// A connected socket, pinned to the address that was checked.

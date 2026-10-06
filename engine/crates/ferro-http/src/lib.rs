@@ -33,6 +33,12 @@ pub mod engine;
 #[doc(hidden)]
 pub mod fuzzing;
 
+/// Test scaffolding: certificates generated in-test (M6-F5a). Feature `test-certs` only — never in a
+/// daemon build.
+#[cfg(any(feature = "test-certs", all(test, feature = "engine")))]
+#[doc(hidden)]
+pub mod testcert;
+
 mod syntax;
 
 pub use config::{HttpConfig, Upstream};
