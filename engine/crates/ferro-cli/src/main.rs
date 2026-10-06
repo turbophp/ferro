@@ -16,7 +16,8 @@
 //!
 //! Both read their database connections exactly as `ferrod` does (`FERRO_POOLS` +
 //! `FERRO_POOL_<NAME>_DSN`), so a DSN is never on a command line and never printed (`db.rs`).
-//! `ferro gen` (DTOs, stubs) follows in D2c. Arguments are parsed by hand: a dozen flags do not
+//! `ferro gen` (M3-D2c) turns a checked manifest into DTOs and a query-id constants class
+//! (`codegen.rs`); it needs no connection. Arguments are parsed by hand: a dozen flags do not
 //! justify a dependency in a binary that ships beside a credential-holding daemon.
 //!
 //! Exit codes: 0 success, 1 the queries or manifest are invalid (every problem is printed), 2 usage.
@@ -26,6 +27,7 @@ use std::process::ExitCode;
 
 use ferro_manifest::{Column, Manifest, Problem, collect_sql_dir};
 
+mod codegen;
 mod db;
 
 const USAGE: &str = "\
@@ -45,6 +47,9 @@ usage:
       PREPARE every query against its pool's (shadow) database without running it: a syntax error,
       an unknown relation or a column type the engine cannot carry fails, every problem listed.
       --write records each query's parameter and column descriptions (not part of the hash).
+  ferro gen --manifest <checked manifest.json> --out <dir> [--queries-class <FQCN>]
+      Generate PHP: one readonly DTO per declared `dto` (from the columns `ferro check --write`
+      recorded), a class of query-id constants (default `Ferro\\Gen\\Queries`) and manifest.json.
 ";
 
 fn main() -> ExitCode {
@@ -72,6 +77,7 @@ fn main() -> ExitCode {
         Some("manifest-hash") => cmd_manifest_hash(&args[1..]),
         Some("check") => block_on(cmd_check(&args[1..])),
         Some("schema-sync") => block_on(cmd_schema_sync(&args[1..])),
+        Some("gen") => cmd_gen(&args[1..]),
         Some("-V" | "--version") => {
             println!("ferro {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -597,4 +603,76 @@ async fn reset(conn: &mut db::Db, name: &str) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn cmd_gen(args: &[String]) -> ExitCode {
+    let mut manifest_path: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut queries_class = "Ferro\\Gen\\Queries".to_string();
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let Some(v) = it.next() else {
+            return usage_error(&format!("`{flag}` needs a value"));
+        };
+        match flag.as_str() {
+            "--manifest" if manifest_path.is_none() => manifest_path = Some(PathBuf::from(v)),
+            "--out" if out.is_none() => out = Some(PathBuf::from(v)),
+            // One leading `\` (a fully-qualified spelling) is accepted; `gen` checks the rest.
+            "--queries-class" => queries_class = v.strip_prefix('\\').unwrap_or(v).to_string(),
+            "--manifest" | "--out" => return usage_error(&format!("`{flag}` given twice")),
+            other => return usage_error(&format!("unknown flag `{other}`")),
+        }
+    }
+    let (Some(manifest_path), Some(out)) = (manifest_path, out) else {
+        return usage_error("`--manifest` and `--out` are required");
+    };
+    let manifest = match std::fs::read(&manifest_path)
+        .map_err(|e| {
+            vec![Problem {
+                at: manifest_path.display().to_string(),
+                message: format!("cannot read: {e}"),
+            }]
+        })
+        .and_then(|b| Manifest::from_json(&b))
+    {
+        Ok(m) => m,
+        Err(problems) => return report(&problems),
+    };
+    let files = match codegen::generate(&manifest, &queries_class) {
+        Ok(f) => f,
+        Err(problems) => return report(&problems),
+    };
+    match codegen::write_out(&out, &files, |a, b| std::fs::rename(a, b)) {
+        Ok(w) => {
+            eprintln!(
+                "ferro: wrote {} file(s) to {}",
+                w.written.len(),
+                out.display()
+            );
+            if !w.removed.is_empty() {
+                eprintln!(
+                    "ferro: removed {} file(s) a previous run generated and this one does not: {}",
+                    w.removed.len(),
+                    w.removed.join(", ")
+                );
+            }
+        }
+        Err(codegen::WriteError::Untouched(p)) => return report(&[p]),
+        Err(codegen::WriteError::Partial {
+            problem,
+            written,
+            not_written,
+        }) => {
+            eprintln!("error: {problem}");
+            eprintln!(
+                "ferro: {} is PARTIALLY updated — written: [{}]; NOT written: [{}]. Fix the \
+                 problem and re-run `ferro gen`.",
+                out.display(),
+                written.join(", "),
+                not_written.join(", ")
+            );
+            return ExitCode::from(1);
+        }
+    }
+    ExitCode::SUCCESS
 }
