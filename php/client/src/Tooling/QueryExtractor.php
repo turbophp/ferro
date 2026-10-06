@@ -14,9 +14,18 @@ namespace Ferro\Tooling;
  *    backslash and no interpolation, or a nowdoc. A concatenation, constant or expression is refused;
  *  - `readonly`/`idempotent` must be the literal `true` or `false`.
  *
- * The attribute is recognised by its short name `FerroQuery` or the fully-qualified
- * `\Ferro\Attribute\FerroQuery`. An alias (`use … as Q`) is not resolved and is therefore not seen —
- * a known limit, stated here rather than guessed around.
+ * The attribute is recognised by RESOLVING its name exactly as PHP does — against the file's
+ * `namespace` and its `use` imports (aliases and group imports included), case-insensitively — so
+ * `#[Q(...)]` after `use Ferro\Attribute\FerroQuery as Q` is seen, and a `FerroQuery` that PHP would
+ * resolve to some other class is not (M3-D2a review F3/F4). Only a top-level attribute of an
+ * attribute group counts: `#[Other(new FerroQuery(...))]` or `#[CoversClass(FerroQuery::class)]`
+ * declares nothing.
+ *
+ * Every string must be valid UTF-8 (the manifest is JSON), and a heredoc/nowdoc body keeps its
+ * line terminators byte for byte.
+ *
+ * Known leniency: the attribute's TARGET is not checked, so a declaration on a function or a
+ * parameter, which PHP refuses when the attribute is instantiated, is still extracted.
  *
  * Kept free of `ferro/client`'s other classes so the CLI script can `require` it alone.
  */
@@ -25,29 +34,30 @@ final class QueryExtractor
     private const ALLOWED = ['id', 'sql', 'pool', 'readonly', 'idempotent', 'dto'];
 
     /**
-     * @param list<string> $paths files or directories (directories are searched for `*.php`)
+     * @param list<string> $paths files or directories (directories are searched for `*.php`,
+     *                            case-insensitively, following symlinked directories once each)
      * @return array{0: list<array<string, mixed>>, 1: list<string>} the queries, and every problem
      */
     public static function extractPaths(array $paths): array
     {
         $files = [];
+        $problems = [];
+        $seen = [];
         foreach ($paths as $path) {
             if (is_dir($path)) {
-                $it = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($path, \FilesystemIterator::SKIP_DOTS));
-                foreach ($it as $file) {
-                    if ($file instanceof \SplFileInfo && $file->isFile() && $file->getExtension() === 'php') {
-                        $files[] = $file->getPathname();
-                    }
-                }
+                self::walk($path, $files, $seen, $problems);
             } elseif (is_file($path)) {
                 $files[] = $path;
             } else {
-                return [[], ["{$path}: no such file or directory"]];
+                $problems[] = "{$path}: no such file or directory";
             }
         }
+        if ($problems !== []) {
+            return [[], $problems];
+        }
+        $files = array_values(array_unique($files));
         sort($files);
         $queries = [];
-        $problems = [];
         foreach ($files as $file) {
             $code = file_get_contents($file);
             if ($code === false) {
@@ -62,6 +72,43 @@ final class QueryExtractor
     }
 
     /**
+     * The same walk as the Rust side's `collect_sql_dir`: symlinked directories are followed, each
+     * real directory at most once, so a link cycle cannot hang it (M3-D2a review F5).
+     *
+     * @param list<string> $files
+     * @param array<string, true> $seen
+     * @param list<string> $problems
+     */
+    private static function walk(string $dir, array &$files, array &$seen, array &$problems): void
+    {
+        $real = realpath($dir);
+        if ($real === false) {
+            $problems[] = "{$dir}: cannot read directory";
+            return;
+        }
+        if (isset($seen[$real])) {
+            return;
+        }
+        $seen[$real] = true;
+        $entries = scandir($dir);
+        if ($entries === false) {
+            $problems[] = "{$dir}: cannot read directory";
+            return;
+        }
+        foreach ($entries as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+            $path = rtrim($dir, '/') . '/' . $entry;
+            if (is_dir($path)) {
+                self::walk($path, $files, $seen, $problems);
+            } elseif (is_file($path) && strcasecmp(pathinfo($path, PATHINFO_EXTENSION), 'php') === 0) {
+                $files[] = $path;
+            }
+        }
+    }
+
+    /**
      * @return array{0: list<array<string, mixed>>, 1: list<string>}
      */
     public static function extractSource(string $file, string $code): array
@@ -70,22 +117,86 @@ final class QueryExtractor
         $queries = [];
         $problems = [];
         $n = count($tokens);
+
+        $namespace = '';
+        /** @var array<string, string> $imports lower-cased alias => fully-qualified class name */
+        $imports = [];
+        $depth = 0;          // `{` nesting
+        $nsDepth = 0;        // the depth namespace-level code lives at (1 inside `namespace X { }`)
+
         for ($i = 0; $i < $n; ++$i) {
-            if (!$tokens[$i]->is(T_ATTRIBUTE)) {
+            $t = $tokens[$i];
+            if ($t->text === '{' || $t->is([T_CURLY_OPEN, T_DOLLAR_OPEN_CURLY_BRACES])) {
+                ++$depth;
                 continue;
             }
-            // Inside `#[ … ]`: a comma-separated list of attributes. Walk to the matching `]`.
-            $depth = 1;
-            $j = $i + 1;
-            for (; $j < $n && $depth > 0; ++$j) {
-                $t = $tokens[$j];
-                if ($t->text === '[' || $t->is(T_ATTRIBUTE)) {
+            if ($t->text === '}') {
+                --$depth;
+                if ($depth < $nsDepth) {
+                    // The end of a braced `namespace X { }`.
+                    $nsDepth = 0;
+                    $namespace = '';
+                    $imports = [];
+                }
+                continue;
+            }
+            if ($t->is(T_NAMESPACE)) {
+                $j = self::skipTrivia($tokens, $i + 1);
+                $next = $tokens[$j] ?? null;
+                if ($next !== null && $next->is([T_STRING, T_NAME_QUALIFIED])) {
+                    $namespace = $next->text;
+                    $j = self::skipTrivia($tokens, $j + 1);
+                } elseif ($next === null || $next->text !== '{') {
+                    continue; // not a declaration
+                } else {
+                    $namespace = '';
+                }
+                $imports = [];
+                if (($tokens[$j] ?? null)?->text === '{') {
                     ++$depth;
-                } elseif ($t->text === ']') {
-                    --$depth;
-                } elseif ($depth === 1 && $t->is([T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED]) && self::isFerroQuery($t->text)) {
+                    $nsDepth = $depth;
+                }
+                $i = $j;
+                continue;
+            }
+            if ($t->is(T_USE) && $depth === $nsDepth) {
+                $i = self::parseUse($tokens, $i + 1, $imports);
+                continue;
+            }
+            if (!$t->is(T_ATTRIBUTE)) {
+                continue;
+            }
+
+            // Inside `#[ … ]`: a comma-separated list of attributes. Walk to the matching `]`,
+            // considering only names that START an attribute (after `#[` or a top-level `,`).
+            $brackets = 1;
+            $parens = 0;
+            $atStart = true;
+            $j = $i + 1;
+            for (; $j < $n && $brackets > 0; ++$j) {
+                $u = $tokens[$j];
+                if ($u->is([T_WHITESPACE, T_COMMENT, T_DOC_COMMENT])) {
+                    continue;
+                }
+                $starts = $atStart;
+                $atStart = false;
+                if ($u->text === '[' || $u->is(T_ATTRIBUTE)) {
+                    ++$brackets;
+                } elseif ($u->text === ']') {
+                    --$brackets;
+                } elseif ($u->text === '(') {
+                    ++$parens;
+                } elseif ($u->text === ')') {
+                    --$parens;
+                } elseif ($u->text === ',' && $brackets === 1 && $parens === 0) {
+                    $atStart = true;
+                } elseif (
+                    $starts && $brackets === 1 && $parens === 0
+                    && $u->is([T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED, T_NAME_RELATIVE])
+                    && strcasecmp(self::resolve($u, $namespace, $imports), 'Ferro\\Attribute\\FerroQuery') === 0
+                ) {
                     [$args, $next, $err] = self::parseArgs($tokens, $j + 1);
-                    $at = "{$file}:{$t->line}";
+                    $at = "{$file}:{$u->line}";
                     if ($err !== null) {
                         $problems[] = "{$at}: {$err}";
                     } else {
@@ -102,9 +213,108 @@ final class QueryExtractor
         return [$queries, $problems];
     }
 
-    private static function isFerroQuery(string $name): bool
+    /**
+     * The fully-qualified class name PHP gives `$name` in `$namespace` with `$imports` (the rules of
+     * https://www.php.net/manual/en/language.namespaces.rules.php for class names).
+     *
+     * @param array<string, string> $imports
+     */
+    private static function resolve(\PhpToken $name, string $namespace, array $imports): string
     {
-        return $name === 'FerroQuery' || ltrim($name, '\\') === 'Ferro\\Attribute\\FerroQuery';
+        $text = $name->text;
+        if ($name->is(T_NAME_FULLY_QUALIFIED)) {
+            return substr($text, 1);
+        }
+        if ($name->is(T_NAME_RELATIVE)) {
+            // `namespace\X`
+            $rest = substr($text, strlen('namespace\\'));
+            return $namespace === '' ? $rest : $namespace . '\\' . $rest;
+        }
+        $first = explode('\\', $text, 2);
+        $alias = strtolower($first[0]);
+        if (isset($imports[$alias])) {
+            return $imports[$alias] . (isset($first[1]) ? '\\' . $first[1] : '');
+        }
+        return $namespace === '' ? $text : $namespace . '\\' . $text;
+    }
+
+    /**
+     * Parse a namespace-level `use` statement starting after the `use` keyword, recording class
+     * imports in `$imports`, and return the index of its `;`. `use function`/`use const` import no
+     * class and are skipped, as is a closure's `use (…)`.
+     *
+     * @param list<\PhpToken> $tokens
+     * @param array<string, string> $imports
+     */
+    private static function parseUse(array $tokens, int $i, array &$imports): int
+    {
+        $n = count($tokens);
+        $i = self::skipTrivia($tokens, $i);
+        if (($tokens[$i] ?? null)?->text === '(') {
+            return $i - 1; // a closure's `use (…)`
+        }
+        $kind = 'class';
+        if (($tokens[$i] ?? null)?->is([T_FUNCTION, T_CONST]) === true) {
+            $kind = 'other';
+            ++$i;
+        }
+        $prefix = '';
+        $name = '';
+        $alias = null;
+        $inGroup = false;
+        $entryKind = $kind;
+        for (; $i < $n; ++$i) {
+            $t = $tokens[$i];
+            if ($t->is([T_WHITESPACE, T_COMMENT, T_DOC_COMMENT])) {
+                continue;
+            }
+            if ($t->text === ';') {
+                self::addImport($imports, $entryKind, $prefix, $name, $alias);
+                return $i;
+            }
+            if ($t->text === '{') {
+                $prefix = rtrim($name, '\\') . '\\';
+                $name = '';
+                $inGroup = true;
+                continue;
+            }
+            if ($t->text === '}') {
+                self::addImport($imports, $entryKind, $prefix, $name, $alias);
+                [$name, $alias, $inGroup] = ['', null, false];
+                continue;
+            }
+            if ($t->text === ',') {
+                self::addImport($imports, $entryKind, $prefix, $name, $alias);
+                [$name, $alias] = ['', null];
+                $entryKind = $kind;
+                if (!$inGroup) {
+                    $prefix = '';
+                }
+                continue;
+            }
+            if ($t->is(T_AS)) {
+                $i = self::skipTrivia($tokens, $i + 1);
+                $alias = $tokens[$i]->text ?? null;
+                continue;
+            }
+            if ($inGroup && $name === '' && $t->is([T_FUNCTION, T_CONST])) {
+                $entryKind = 'other';
+                continue;
+            }
+            $name .= $t->text;
+        }
+        return $n;
+    }
+
+    /** @param array<string, string> $imports */
+    private static function addImport(array &$imports, string $kind, string $prefix, string $name, ?string $alias): void
+    {
+        if ($name === '' || $kind !== 'class') {
+            return;
+        }
+        $fq = ltrim($prefix . $name, '\\');
+        $short = $alias ?? substr((string) strrchr('\\' . $fq, '\\'), 1);
+        $imports[strtolower($short)] = $fq;
     }
 
     /**
@@ -173,6 +383,11 @@ final class QueryExtractor
         }
         if ($t->is(T_CONSTANT_ENCAPSED_STRING)) {
             $raw = $t->text;
+            // A binary-string prefix (`b'…'`, `B"…"`) changes nothing in PHP 8; strip it before
+            // reading the quote (M3-D2a review F2: it was read as part of the string).
+            if ($raw[0] === 'b' || $raw[0] === 'B') {
+                $raw = substr($raw, 1);
+            }
             if ($raw[0] === "'") {
                 return [str_replace(['\\\\', "\\'"], ['\\', "'"], substr($raw, 1, -1)), $i + 1, null];
             }
@@ -184,6 +399,7 @@ final class QueryExtractor
         }
         if ($t->is(T_START_HEREDOC)) {
             $isNowdoc = str_contains($t->text, "'");
+            // The binary-prefixed form `b<<<…` arrives as the same token with a leading `b`.
             $body = '';
             for ($j = $i + 1; isset($tokens[$j]); ++$j) {
                 $u = $tokens[$j];
@@ -212,19 +428,30 @@ final class QueryExtractor
         return [null, $i, 'must be a literal string, true, false or null (no constant or expression)'];
     }
 
-    /** PHP's flexible heredoc: strip the closing marker's indentation from every line, and the final newline. */
+    /**
+     * PHP's flexible heredoc: strip the closing marker's indentation from every line, and the final
+     * line terminator. Line terminators are KEPT byte for byte (`\r\n`, `\n`, `\r`): splitting on
+     * PCRE's `\R` turned CRLF into LF, `\f`/`\v` into a newline, and — without `/u` — byte 0x85
+     * inside a UTF-8 character into a line break (M3-D2a review F1).
+     */
     private static function dedent(string $body, string $endToken): string
     {
         $indent = strlen($endToken) - strlen(ltrim($endToken, " \t"));
-        $body = preg_replace('/\R\z/', '', $body) ?? $body;
+        $body = preg_replace('/(?:\r\n|\n|\r)\z/', '', $body) ?? $body;
         if ($indent === 0) {
             return $body;
         }
-        $lines = preg_split('/\R/', $body) ?: [$body];
-        return implode("\n", array_map(
-            static fn (string $l): string => substr($l, min($indent, strlen($l) - strlen(ltrim($l, " \t")))),
-            $lines,
-        ));
+        $parts = preg_split('/(\r\n|\n|\r)/', $body, -1, PREG_SPLIT_DELIM_CAPTURE) ?: [$body];
+        $out = '';
+        foreach ($parts as $k => $part) {
+            if ($k % 2 === 1) {
+                $out .= $part; // a terminator, as written
+                continue;
+            }
+            $lead = strlen($part) - strlen(ltrim($part, " \t"));
+            $out .= substr($part, min($indent, $lead));
+        }
+        return $out;
     }
 
     /** @param list<\PhpToken> $tokens */
@@ -256,9 +483,17 @@ final class QueryExtractor
                 $ok = false;
             }
         }
-        foreach (['pool', 'dto'] as $str) {
-            if (array_key_exists($str, $args) && $args[$str] !== null && !is_string($args[$str])) {
-                $problems[] = "{$at}: `{$str}:` must be a string";
+        if (array_key_exists('pool', $args) && !is_string($args['pool'])) {
+            $problems[] = "{$at}: `pool:` must be a string";
+            $ok = false;
+        }
+        if (array_key_exists('dto', $args) && $args['dto'] !== null && !is_string($args['dto'])) {
+            $problems[] = "{$at}: `dto:` must be a string or null";
+            $ok = false;
+        }
+        foreach ($args as $k => $v) {
+            if (is_string($v) && preg_match('//u', $v) !== 1) {
+                $problems[] = "{$at}: `{$k}:` is not valid UTF-8";
                 $ok = false;
             }
         }

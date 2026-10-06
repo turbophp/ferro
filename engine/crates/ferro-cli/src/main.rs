@@ -30,7 +30,17 @@ usage:
 ";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `args_os`, not `args`: `std::env::args` PANICS on a non-UTF-8 argument (exit 101, outside
+    // the documented codes). A path that is not UTF-8 is a usage error here (M3-D2a review F13).
+    let mut args = Vec::new();
+    for a in std::env::args_os().skip(1) {
+        match a.into_string() {
+            Ok(s) => args.push(s),
+            Err(a) => {
+                return usage_error(&format!("argument is not UTF-8: {}", a.to_string_lossy()));
+            }
+        }
+    }
     match args.first().map(String::as_str) {
         Some("manifest") => cmd_manifest(&args[1..]),
         Some("manifest-hash") => cmd_manifest_hash(&args[1..]),
@@ -115,17 +125,12 @@ fn cmd_manifest(args: &[String]) -> ExitCode {
             }),
         }
     }
+    // `validate` also refuses an empty manifest.
     problems.extend(manifest.validate());
     if !problems.is_empty() {
         return report(&problems);
     }
-    if manifest.queries.is_empty() {
-        return report(&[Problem {
-            at: "manifest".into(),
-            message: "no queries were found".into(),
-        }]);
-    }
-    if let Err(e) = std::fs::write(&out, manifest.to_json_with_hash()) {
+    if let Err(e) = write_atomically(&out, manifest.to_json_with_hash().as_bytes()) {
         return report(&[Problem {
             at: out.display().to_string(),
             message: format!("cannot write: {e}"),
@@ -143,6 +148,36 @@ fn cmd_manifest(args: &[String]) -> ExitCode {
         out.display()
     );
     ExitCode::SUCCESS
+}
+
+/// Write `bytes` to `path` so a reader sees the old file or the new one, never a truncated mix:
+/// write a temporary beside it, flush it to disk, then rename over the target. `fs::write`
+/// truncates first, so a failed write (a full disk, a file-size limit) used to replace a good
+/// manifest with a partial one while the tool reported "nothing was written" (M3-D2a review F11).
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "manifest.json".into());
+    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    let result = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn cmd_manifest_hash(args: &[String]) -> ExitCode {
