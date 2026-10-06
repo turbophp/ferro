@@ -1,0 +1,42 @@
+[package]
+name = "ferro-http-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# SPEC §23.4's fuzz targets (slice M6-F3). Each is a thin wrapper over `ferro_http::fuzzing`, whose
+# bodies also run deterministically under `cargo test -p ferro-http` (`tests/property_it.rs`), so a
+# property this nightly-only job checks is never one stable CI skips. `ferro-http` has no tokio
+# dependency, so these build under coverage instrumentation (the `ferrod` target's ICE does not
+# apply).
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ferro-http]
+path = ".."
+
+[[bin]]
+name = "validate_request"
+path = "fuzz_targets/validate_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_origin"
+path = "fuzz_targets/parse_origin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "classify_address"
+path = "fuzz_targets/classify_address.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

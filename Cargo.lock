@@ -373,6 +373,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferro-http"
+version = "0.0.0"
+dependencies = [
+ "unicode-normalization",
+]
+
+[[package]]
 name = "ferro-manifest"
 version = "0.0.0"
 dependencies = [
