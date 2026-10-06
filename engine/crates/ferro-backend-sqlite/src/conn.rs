@@ -1077,6 +1077,37 @@ impl PoolBackend for SqliteBackend {
         SqliteBackend::query(self, conn, sql, params).await
     }
 
+    /// M3-D2b (`ferro check`): prepare without stepping. SQLite types each VALUE, not the column
+    /// (see [`crate::rowmap`]), so a column's §9 tag is unknowable here and reported as `None`; the
+    /// declared type, where the column has one, is passed through as the type name. Parameters are
+    /// counted, never typed.
+    async fn describe(
+        &self,
+        conn: &mut Self::Conn,
+        sql: &str,
+    ) -> Result<ferro_pool::backend::Describe, PoolError> {
+        let sql = sql.to_string();
+        Self::with_conn(conn, move |c| {
+            let stmt = c.prepare(&sql).map_err(|e| crate::error_map::map(&e))?;
+            let cols = stmt
+                .columns()
+                .into_iter()
+                .map(|c| ferro_pool::backend::DescribedColumn {
+                    name: c.name().to_string(),
+                    tag: None,
+                    // The declared type, when the column is a table column that has one; an
+                    // expression column has none.
+                    type_name: c.decl_type().unwrap_or_default().to_string(),
+                })
+                .collect();
+            Ok(ferro_pool::backend::Describe {
+                params: vec![None; stmt.parameter_count()],
+                cols,
+            })
+        })
+        .await
+    }
+
     /// C3-5. The connection is MOVED into a blocking task that owns it for the stream's life —
     /// forced, not chosen: `Statement` and `Rows` borrow the `Connection`, and `Connection` is
     /// `Send` but not `Sync`. That makes SQLite a conn-owning backend in exactly MySQL's sense, so

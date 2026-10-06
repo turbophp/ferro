@@ -215,6 +215,8 @@ mod tests {
                 idempotent: false,
                 dto: None,
                 source: None,
+                params: None,
+                columns: None,
             },
         )
         .unwrap();
@@ -227,6 +229,8 @@ mod tests {
                 idempotent: true,
                 dto: None,
                 source: None,
+                params: None,
+                columns: None,
             },
         )
         .unwrap();

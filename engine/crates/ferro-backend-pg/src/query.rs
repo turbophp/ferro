@@ -58,6 +58,36 @@ use tokio_postgres::types::Oid;
 use crate::Value;
 use crate::{bind, error_map, placeholder, rowmap};
 
+/// Prepares `sql` (with `?` placeholders) without running it and reports PostgreSQL's own
+/// description: each parameter's type, and each column's name, type and §9 tag (`ferro check`,
+/// M3-D2b). A column type outside §9 is the same loud `Unsupported` a query would raise.
+pub async fn describe(
+    client: &Client,
+    sql: &str,
+) -> Result<ferro_pool::backend::Describe, PoolError> {
+    let normalized = placeholder::normalize(sql);
+    let stmt = client
+        .prepare(&normalized)
+        .await
+        .map_err(|e| error_map::map(&e))?;
+    let mut cols = Vec::with_capacity(stmt.columns().len());
+    for col in stmt.columns() {
+        cols.push(ferro_pool::backend::DescribedColumn {
+            name: col.name().to_string(),
+            tag: Some(rowmap::oid_to_tag(col.name(), col.type_())?),
+            type_name: col.type_().name().to_string(),
+        });
+    }
+    Ok(ferro_pool::backend::Describe {
+        params: stmt
+            .params()
+            .iter()
+            .map(|t| Some(t.name().to_string()))
+            .collect(),
+        cols,
+    })
+}
+
 /// Runs `sql` (with `?` placeholders) and `params` against `client`, buffering the full result.
 pub async fn run(client: &Client, sql: &str, params: &[Value]) -> Result<QueryResult, PoolError> {
     let normalized = placeholder::normalize(sql);

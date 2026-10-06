@@ -349,7 +349,16 @@ version = "0.0.0"
 name = "ferro-cli"
 version = "0.0.0"
 dependencies = [
+ "ferro-backend-mysql",
+ "ferro-backend-pg",
+ "ferro-backend-sqlite",
  "ferro-manifest",
+ "ferro-pool",
+ "ferro-proto",
+ "ferrod",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

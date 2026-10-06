@@ -473,6 +473,14 @@ impl PoolBackend for MysqlBackend {
         crate::query::run(conn, sql, params).await
     }
 
+    async fn describe(
+        &self,
+        conn: &mut Self::Conn,
+        sql: &str,
+    ) -> Result<ferro_pool::backend::Describe, PoolError> {
+        crate::query::describe(conn, sql).await
+    }
+
     /// The INCREMENTAL row path (B2b-2b) — see [`crate::stream`] for the ownership handshake and
     /// why a no-result-set statement must never take the owned route.
     async fn query_stream(
