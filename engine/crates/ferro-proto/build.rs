@@ -29,6 +29,13 @@ struct Registry {
     tags: BTreeMap<String, u8>,
     branches: BTreeMap<String, u8>,
     codes: BTreeMap<String, ErrCode>,
+    http: HttpVocab,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpVocab {
+    causes: BTreeMap<String, String>,
 }
 
 fn lock_path() -> PathBuf {
@@ -122,6 +129,32 @@ fn main() {
     writeln!(o, "    pub const ALL: &[(&str, u16, u8)] = &[").unwrap();
     for (name, ec) in &reg.codes {
         writeln!(o, "        (\"{name}\", 0x{:04X}, {}),", ec.code, ec.branch).unwrap();
+    }
+    writeln!(o, "    ];").unwrap();
+    writeln!(o, "}}").unwrap();
+
+    // Ferro HTTP's cause vocabulary (M6-F2, SPEC §23.5.6): `NAME: &str = "token"` per cause, plus
+    // `ALL`, every token in the table's (alphabetical-by-name) order, so a consumer can test a
+    // `detail` for membership instead of keeping its own list. The shape rule is re-checked here,
+    // against the LOCK, because the lock is what this build reads: a hand-edited lock that slipped a
+    // second spelling past `Registry::from_toml_dir` must not compile into a constant.
+    writeln!(o, "pub mod http_cause {{").unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, token) in &reg.http.causes {
+        assert!(
+            !token.is_empty()
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                && *name == token.to_ascii_uppercase()
+                && seen.insert(token.clone()),
+            "registry.lock.json http.causes: {name} = {token:?} breaks the shape rule"
+        );
+        writeln!(o, "    pub const {name}: &str = \"{token}\";").unwrap();
+    }
+    writeln!(o, "    pub const ALL: &[&str] = &[").unwrap();
+    for token in reg.http.causes.values() {
+        writeln!(o, "        \"{token}\",").unwrap();
     }
     writeln!(o, "    ];").unwrap();
     writeln!(o, "}}").unwrap();

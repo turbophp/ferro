@@ -70,6 +70,29 @@ foreach ($lock['codes'] as $name => $ec) {
     $out .= "    public const ERR_{$u}_BRANCH = {$ec['branch']};\n";
 }
 $out .= "\n";
+// Ferro HTTP's cause vocabulary (M6-F2, SPEC §23.5.6): one HTTP_CAUSE_<NAME> = '<token>' per cause,
+// plus HTTP_CAUSES, every token in the lock's (alphabetical-by-name) order, so a client tests a
+// `detail` for membership instead of keeping its own list. The shape rule mirrors ferro-proto's
+// `registry::check_http_causes` and its build.rs re-check: refuse rather than emit a second spelling.
+$causes = $lock['http']['causes'] ?? null;
+if (!is_array($causes) || $causes === []) {
+    fwrite(STDERR, "registry.lock.json has no http.causes table\n");
+    exit(1);
+}
+$seen = [];
+foreach ($causes as $name => $token) {
+    if (!is_string($token) || !preg_match('/^[a-z0-9_]+$/', $token) || $name !== strtoupper($token)
+        || isset($seen[$token])) {
+        fwrite(STDERR, "registry.lock.json http.causes: {$name} breaks the shape rule\n");
+        exit(1);
+    }
+    $seen[$token] = true;
+    $out .= "    public const HTTP_CAUSE_{$name} = '{$token}';\n";
+}
+$out .= "    public const HTTP_CAUSES = [\n";
+foreach ($causes as $token) { $out .= "        '{$token}',\n"; }
+$out .= "    ];\n";
+$out .= "\n";
 $out .= "    public const TYPE_REGISTRY_HASH = '" . $fnv1a64_hex($raw) . "';\n";
 $out .= "}\n";
 $dir = "$root/php/client/src/Protocol/Generated";

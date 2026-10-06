@@ -24,6 +24,18 @@ branch = 1
 [codes.ReplicaUnavailable]
 code = 0x1006
 branch = 1
+# Ferro HTTP (SPEC §23.7.1, M6-F2). The upstream cannot be reached or is held off BEFORE any byte of
+# the request exists on a connection: DNS, the dial, a TLS transport failure (`tls_handshake`), an
+# open breaker, a busy breaker probe, or the HTTP drain. Retryable because nothing was sent; a
+# breaker's refusal carries `retry_after_ms`. The `detail` says which (`[http.causes]` below).
+[codes.UpstreamUnavailable]
+code = 0x1007
+branch = 1
+# Ferro HTTP (SPEC §23.7.1): refused before sending by a host-level rate limit (`rate_limited`) or
+# by an upstream's own Retry-After hold (`retry_after_hold`); always carries `retry_after_ms`.
+[codes.RateLimited]
+code = 0x1008
+branch = 1
 [codes.WriteUnconfirmed]
 code = 0x2001
 branch = 2
@@ -69,17 +81,100 @@ branch = 3
 # kernel-attested uid is not authorized for (SPEC D15 — including every OPERATE verb while
 # `FERRO_ADMIN_UIDS` is empty, and every admin verb on a connection with no attested uid), or an
 # admin destination outside the verb's policy (a backup target that is not a plain file name, or that
-# is a symlink). NonRetryable: retrying the same request as the same peer is refused the same way.
+# is a symlink). Widened by SPEC §23 (C6, keyed at M6-F2): also every Ferro HTTP policy refusal, made
+# BEFORE anything is sent — an unknown upstream or one this uid may not use (indistinguishable by
+# design, D15), an origin, target, method, header or body the §23.4 validator refuses, or a resolved
+# address outside the upstream's class; the `detail` is the `forbidden_*` token that names which.
+# NonRetryable: retrying the same request as the same peer is refused the same way.
 # Distinct from `Auth`, which is the BACKEND refusing the pool's own credentials.
 [codes.Forbidden]
 code = 0x300C
 branch = 3
+# Ferro HTTP (SPEC §23.7.1, §23.8.8): the upstream's TLS identity or parameters were refused before
+# sending — certificate verification (`tls_verify`), protocol version (`tls_version`) or ALPN
+# (`tls_alpn`). NonRetryable: the same dial is refused the same way until the operator acts. A TLS
+# TRANSPORT failure (`tls_handshake`) is `UpstreamUnavailable` instead.
+[codes.TlsRefused]
+code = 0x300D
+branch = 3
+# Ferro HTTP (SPEC §23.7.1): the upstream sent a response head and the exchange then failed, so the
+# TRANSPORT fate is known — the request was received and answered. It does NOT mean "nothing
+# happened": after a 2xx head the request was applied. For an idempotent request a body-level link
+# failure is `ConnectionLost` instead; a decode failure or `max_response_bytes` is this code either
+# way.
+[codes.ResponseIncomplete]
+code = 0x300E
+branch = 3
 
 # RESERVED codes, comments only (no keys, so no generated constant and no registry-hash change).
-# Allocated by SPEC §23/§24; each key lands with its engine's first code slice (F2/G1). Do not reuse.
-#   0x1007  UpstreamUnavailable  Retryable     Ferro HTTP  (SPEC §23, docs/spec/23-http.md)
-#   0x1008  RateLimited          Retryable     Ferro HTTP  (SPEC §23)
-#   0x300D  TlsRefused           NonRetryable  Ferro HTTP  (SPEC §23)
-#   0x300E  ResponseIncomplete   NonRetryable  Ferro HTTP  (SPEC §23)
+# Allocated by SPEC §24; each key lands with Ferro Queue's first code slice (G1). Do not reuse.
+# (SPEC §23's four HTTP codes, reserved here at M6-F0, were keyed above at M6-F2.)
 #   0x300F  LeaseLost            NonRetryable  Ferro Queue (SPEC §24, docs/spec/24-queue.md)
 #   0x3010  PoolMismatch         NonRetryable  Ferro Queue (SPEC §24)
+
+# The Ferro HTTP CAUSE vocabulary (SPEC §23.5.6, M6-F2). On service `HTTP`, an `ErrorPayload.detail`
+# is EXACTLY one of these tokens — never free text and never a PHP-supplied value — because a Guzzle
+# handler picks its exception class by cause (§23.11.3) and `message` is not for programmatic
+# matching (/proto/PROTOCOL.md §5). `sqlstate` and `errno` are `nil` on HTTP terminals. A closed
+# vocabulary, generated into both codecs (charter rule 2), so the engine and the client name a cause
+# only through a constant.
+#
+# Shape: `KEY = "token"`, where the KEY is the constant's name and the VALUE is the wire token. The
+# key MUST be the token upper-cased — `Registry::from_toml_dir` and both generators refuse anything
+# else — so the table cannot drift into two spellings of one cause. A token is lowercase ASCII
+# letters, digits and `_`, and appears once. The table is unordered on the wire; it is grouped here by
+# §23.5.6's phase only to make review easier, and a token named in two phases there (`deadline`,
+# `timeout`, `cancelled`) is listed once, at its first group.
+[http.causes]
+# Not sent: policy (`Forbidden`)
+FORBIDDEN_UPSTREAM  = "forbidden_upstream"
+FORBIDDEN_ORIGIN    = "forbidden_origin"
+FORBIDDEN_TARGET    = "forbidden_target"
+FORBIDDEN_METHOD    = "forbidden_method"
+FORBIDDEN_HEADER    = "forbidden_header"
+FORBIDDEN_BODY      = "forbidden_body"
+FORBIDDEN_ADDRESS   = "forbidden_address"
+# Not sent: admission
+BREAKER_OPEN        = "breaker_open"
+BREAKER_PROBE_BUSY  = "breaker_probe_busy"
+RATE_LIMITED        = "rate_limited"
+RETRY_AFTER_HOLD    = "retry_after_hold"
+QUEUE_FULL          = "queue_full"
+QUEUE_TIMEOUT       = "queue_timeout"
+BODY_BUDGET         = "body_budget"
+DEADLINE            = "deadline"
+DRAINING            = "draining"
+# Not sent: dial
+DNS                 = "dns"
+CONNECT_REFUSED     = "connect_refused"
+CONNECT_UNREACHABLE = "connect_unreachable"
+CONNECT_TIMEOUT     = "connect_timeout"
+TLS_HANDSHAKE       = "tls_handshake"
+TLS_VERSION         = "tls_version"
+TLS_ALPN            = "tls_alpn"
+TLS_VERIFY          = "tls_verify"
+# Dispatched, not sent (§22.2 (ct), review F-3); also `deadline` and `cancelled`
+UNSENT_WRITE        = "unsent_write"
+UNSENT_CLOSED       = "unsent_closed"
+# Sent, no head
+WRITE               = "write"
+RESET               = "reset"
+EOF_EMPTY           = "eof_empty"
+EOF_PARTIAL_HEAD    = "eof_partial_head"
+MALFORMED_HEAD      = "malformed_head"
+OVERSIZE_HEAD       = "oversize_head"
+INFORMATIONAL_101   = "informational_101"
+TIMEOUT             = "timeout"
+CANCELLED           = "cancelled"
+# HTTP/2 (an effectively-idempotent request only, in v1)
+H2_REFUSED_STREAM   = "h2_refused_stream"
+H2_GOAWAY_ABOVE_LAST = "h2_goaway_above_last"
+H2_STREAM_ERROR     = "h2_stream_error"
+H2_CONNECTION_ERROR = "h2_connection_error"
+# After head; also `timeout` and `cancelled`
+BODY_RESET          = "body_reset"
+BODY_EOF            = "body_eof"
+BODY_FRAMING        = "body_framing"
+DECODE              = "decode"
+MAX_RESPONSE_BYTES  = "max_response_bytes"
+READ_IDLE           = "read_idle"

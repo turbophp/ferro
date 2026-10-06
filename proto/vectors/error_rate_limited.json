@@ -1,0 +1,22 @@
+{
+  "frame_hex": "f704020006000100400000003f000000920197cd100801c0c0d924757073747265616d2062696c6c696e673a2072617465206c696d69742072656163686564ac726174655f6c696d69746564cd05dc",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 64,
+    "service": 6
+  },
+  "message": {
+    "error": {
+      "branch": 1,
+      "code": 4104,
+      "detail": "rate_limited",
+      "errno": null,
+      "message": "upstream billing: rate limit reached",
+      "retry_after_ms": 1500,
+      "sqlstate": null
+    },
+    "status": 1
+  },
+  "name": "error_rate_limited"
+}

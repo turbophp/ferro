@@ -26,7 +26,7 @@ alignment — the payload starts at byte 16.
 | 0 | `magic` | `u8` | always `0xF7` (`consts::MAGIC`) |
 | 1 | `version` | `u8` | protocol major version, currently `4` (`consts::PROTOCOL_VERSION`) |
 | 2 | `flags` | `u16` | bitfield: `STREAM 0x01`, `END 0x02`, `CANCEL 0x04`, `OOB_FD 0x08` (engine → client only, §1.1), `COMPRESSED 0x10` (reserved, unimplemented before post-M3) |
-| 4 | `service` | `u16` | `CORE 1`, `SQL 2`, `TX 3`, `STREAM 4`, `ADMIN 5` |
+| 4 | `service` | `u16` | `CORE 1`, `SQL 2`, `TX 3`, `STREAM 4`, `ADMIN 5`, `HTTP 6` (§12, M6-F2). `7` is reserved for Ferro Queue (SPEC §24; its messages take §13) |
 | 6 | `method` | `u16` | per-service method id, registry `/proto/methods.toml` |
 | 8 | `request_id` | `u32` | client-assigned multiplexing key |
 | 12 | `payload_len` | `u32` | MessagePack payload length in bytes |
@@ -292,7 +292,7 @@ service's terminal frame carries.
 |---|---|---|---|
 | 1 | `engine_version` | `u32` | |
 | 2 | `boot_epoch` | `u64` | unique per daemon start (§19.1); see §2 uint64-overflow note |
-| 3 | `features` | `u32` | engine feature bitfield: `MEMFD 0x01` (the §1.1 path is enabled; informational — a client reacts to the `OOB_FD` flag, not to this), `LISTEN_STREAMS 0x02`, `MANIFEST 0x04` |
+| 3 | `features` | `u32` | engine feature bitfield: `MEMFD 0x01` (the §1.1 path is enabled; informational — a client reacts to the `OOB_FD` flag, not to this), `LISTEN_STREAMS 0x02`, `MANIFEST 0x04`, `HTTP 0x08` (this engine SERVES the HTTP service, §12; a client must check it before sending an HTTP `REQUEST`, because an engine built without the cargo feature `http` has the same registry hash. No engine sets it yet: it is first set by the slice that serves a request, M6-F4) |
 | 4 | `pools` | `array<[str, str, str \| nil, bool \| nil]>` | one nested positional entry per pool available on this engine — `[name, kind, server_version, literals_are_standard]`; see below (M1-S8a; fourth element M2-C2g) |
 | 5 | `type_registry_hash` | `str` | echoed back; mismatch vs. the client's hash is a hard error |
 
@@ -395,7 +395,7 @@ normalized shape for every backend/engine error (SPEC §9.2), positional array:
 | 3 | `sqlstate` | `str \| nil` | raw backend SQLSTATE, when the backend provides one |
 | 4 | `errno` | `i32 \| nil` | raw backend errno, when the backend provides one |
 | 5 | `message` | `str` | human-readable, not for programmatic matching |
-| 6 | `detail` | `str \| nil` | backend detail/hint text, if any |
+| 6 | `detail` | `str \| nil` | backend detail/hint text, if any. **On service `HTTP` it is never free text:** it is either `nil` or EXACTLY one token of the registry's `[http.causes]` vocabulary (`consts::http_cause::*` / `Constants::HTTP_CAUSE_*`, SPEC §23.5.6), and `sqlstate` and `errno` are `nil`. It is `nil` only on an HTTP terminal that is not an exchange fate — `Protocol` (a malformed frame) and `Unsupported` (not served) — and a cause token on every other HTTP error (§12.6) |
 | 7 | `retry_after_ms` | `u32 \| nil` | advisory backoff hint (e.g. for `PoolTimeout`) |
 
 ## 6. Terminal outcome envelope
@@ -445,7 +445,7 @@ NOT NULL violation (`1048`), so a consumer keyed on the SQLSTATE alone cannot te
 `errno` rides the §2 signed/unsigned narrowing ladder like any other integer field (`1062` ⇒
 `cd 04 26`, a `uint16`), NOT a fixed width.
 
-**Per-service indexes:** SQL `EXEC` → §8.3 · TX → §9.6 · STREAM `HEAD`/`DATA` → §10.3 · ADMIN → §11.3.
+**Per-service indexes:** SQL `EXEC` → §8.3 · TX → §9.6 · STREAM `HEAD`/`DATA` → §10.3 · ADMIN → §11.3 · HTTP → §12.5.
 
 **M3-D3:** `oob_ref` — an `END | OOB_FD` SQL/`EXEC` terminal whose payload is the §1.1 `OobRef`
 (`len = 1048578`, past u16, so the width is locked), NOT an `Outcome`: the `Outcome` is what the memfd
@@ -464,7 +464,8 @@ required set from the registry rather than a parallel hardcoded list, and which 
 vector whose `message` and `frame_hex` disagree.
 
 **Byte-lock coverage is keyed on the vector NAME.** The PHP conformance suite selects its
-cross-language byte-lock cases by prefix (`sql_exec_`, `stream_head_`, `stream_data_`); a vector
+cross-language byte-lock cases by prefix (`sql_exec_`, `stream_head_`, `stream_data_`, `http_` — the
+last since M6-F2); a vector
 named outside those prefixes silently receives only the generic header/unpack tests. New SQL and
 STREAM vectors MUST use those prefixes (asserted by
 `VectorConformanceTest::testEveryCommittedVectorIsByteLocked`). A vector outside those prefixes
@@ -784,3 +785,154 @@ the handshake — so a skewed pair fails at the first frame rather than mid-requ
 moves when an EXISTING message changes shape (§1); these are new messages on a new method, and a new
 error code that an older decoder would classify correctly by its explicit `branch` (§5).
 
+## 12. HTTP service messages (`REQUEST`/`HEAD`/`BODY`)
+
+The HTTP service (`SERVICE_HTTP = 6`, M6-F2; SPEC §23) carries Ferro HTTP: a PHP worker hands the
+engine a request addressed to an operator-declared UPSTREAM by name, and the engine sends it at most
+once and streams the response back. Its methods are registry `methods.http`
+(`/proto/registry.lock.json`): `REQUEST = 1` (client → engine), `HEAD = 2` and `BODY = 3` (engine →
+client only). The engine routes a client frame carrying `HEAD`, `BODY` or any other HTTP method id
+to `Unsupported` (SPEC §23.5, review F26).
+
+**A response always streams.** One `HEAD`, zero or more `BODY` frames (each with the `STREAM` flag),
+then the request's one `END`. A completed exchange is `Outcome::Ok(HttpDone)` WHATEVER its status —
+a 500 is a completed exchange, not an error (SPEC §23.7.4). An exchange that fails is
+`Outcome::Error` with a `[http.causes]` token in `detail` (§5, §12.6), or `Outcome::Cancelled`.
+HTTP does **not** reuse STREAM's `HEAD`/`DATA` (§10), whose payloads are SQL `ColMeta` and `Value`
+rows; all four messages share the request's `request_id` (§5.2). Credit is keyed by `request_id` and
+the `STREAM` flag, not by service, and HTTP uses the session's global window (SPEC §23.5).
+
+**The messages are `Value`-free but carry `bin`.** Header values, a reason phrase and bodies are not
+guaranteed UTF-8, so they ride the msgpack **`bin`** family; header NAMES are `str`. Every message is
+a positional fixarray with strict arity (§8's rules apply: the declared length must match, every
+array and `str`/`bin` length is bounded by the bytes remaining before anything is allocated, and
+trailing bytes are refused). The Rust codec is hand-rolled (`ferro-proto` `messages::http`), because
+rmp-serde writes a `Vec<u8>` as an array of integers, not `bin`. A header is the 2-element array
+`[name: str, value: bin]`, and a header block is an array of them in wire order — duplicates and order
+are preserved; it is never a map.
+
+**The codec checks the wire's types and widths, never HTTP semantics.** A `u16` that does not fit,
+a `str` that is not UTF-8, a `bin` where a `str` belongs (Rust) or a value of the wrong type (PHP) is a
+malformed frame. What is ALLOWED — a method, a target, a header name, a status range, a version, a
+chunk size — is the engine's validator (SPEC §23.4, slice F3) and producer's (F4) business, never a
+decoder's. (PHP cannot tell a msgpack `str` from a `bin` after unpack, both arrive as a PHP string,
+so on the PHP side that one check is the encoder's: it always writes the right family, which the
+vectors lock.)
+
+### 12.1 `HttpRequest` (service `HTTP`, method `REQUEST` = 1) — client → server
+
+A positional fixarray of 13:
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `upstream` | `str` | the upstream's NAME (SPEC §23.3), never a URL |
+| 2 | `method` | `str` | SPEC §23.4.1 |
+| 3 | `target` | `str` | origin-form (SPEC §23.4.2); strict UTF-8, so a non-UTF-8 target is `Protocol` |
+| 4 | `origin` | `str \| nil` | the origin the caller believes the upstream has — checked, never used |
+| 5 | `headers` | `array<[str, bin]>` | SPEC §23.4.3 |
+| 6 | `body` | `bin \| nil` | `nil` = no body; a zero-length `bin` = a present, empty body (`c4 00`) — distinct on the wire. Bounded by `MAX_FRAME_PAYLOAD` minus the rest of the frame (SPEC §23.4.4) |
+| 7 | `timeout_ms` | `u32 \| nil` | the whole exchange; `nil` means the upstream's `TIMEOUT_MS`, and it is always capped by it |
+| 8 | `connect_timeout_ms` | `u32 \| nil` | capped by `CONNECT_TIMEOUT_MS` |
+| 9 | `read_timeout_ms` | `u32 \| nil` | the idle bound between body bytes |
+| 10 | `idempotent` | `bool \| nil` | the CALLER's declaration (SPEC §23.7.2): `true` declares, `false` downgrades, `nil` defers to the operator |
+| 11 | `decode` | `bool` | decode `gzip`/`deflate` (SPEC §23.9.2) |
+| 12 | `route` | `str \| nil` | observability only; never sent upstream |
+| 13 | `traceparent` | `str \| nil` | §8.1 field 9's rule exactly: the framing is strict, the BYTES are decoded lossily (the Rust codec substitutes U+FFFD), and a value that does not parse is ignored and counted, never refused. Never forwarded upstream |
+
+A client refuses, before sending, what the engine's decoder would refuse: a non-UTF-8 strict `str`, a
+timeout outside `u32`, a value of the wrong type (`Ferro\Protocol\HttpRequest::encode` throws
+`CodecException`).
+
+### 12.2 `HttpHead` (service `HTTP`, method `HEAD` = 2) — server → client
+
+Sent once, before any `BODY`; NOT terminal and NOT flagged `STREAM` (its frame's flags are `0`).
+A positional fixarray of 6:
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `status` | `u16` | the producer sends `200..=599` (a 1xx is consumed; a 101 is malformed, SPEC §23.5.6) |
+| 2 | `version` | `u8` | `10`, `11` or `20` |
+| 3 | `reason` | `bin \| nil` | the HTTP/1.x reason phrase as received; `nil` on HTTP/2 |
+| 4 | `headers` | `array<[str, bin]>` | as received, minus hop-by-hop, plus SPEC §23.9.2's changes; names lowercase |
+| 5 | `decoded` | `[str, u64 \| nil] \| nil` | when the engine decoded the body: the `Content-Encoding` it removed and the `Content-Length` it removed with it. The length is bounded < 2^63 (a native PHP int, §2); the engine sends `nil` for one it cannot represent so |
+| 6 | `idempotent` | `bool` | the engine's EFFECTIVE idempotency (SPEC §23.7.2) — the authority a client classifies against after `HEAD` (SPEC §23.7.3) |
+
+### 12.3 `HttpBody` (service `HTTP`, method `BODY` = 3) — server → client, flag `STREAM`
+
+`[chunk: bin]`, a positional fixarray of 1. The producer sends a NON-EMPTY chunk of at most 256 KiB,
+carrying what was readable when it was built (SPEC §23.5.3); that bound is the producer's contract,
+not a codec check, and it is not a registry constant because no receiver enforces it — if one ever
+must, it becomes a `/proto` key first (charter rule 2).
+
+### 12.4 `HttpDone` — terminal `Outcome::Ok` body — server → client
+
+`[OUTCOME_OK, <HttpDone>]` on the request's `HTTP`/`REQUEST` header with `END`. `HttpDone` is a
+positional fixarray of 2, `[trailers: array<[str, bin]>, stats: HttpStats]`, and
+`HttpStats` a positional fixarray of 8:
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `queue_us` | `u64` | admission to dispatch (SPEC §23.6 step 4) |
+| 2 | `connect_us` | `u64` | |
+| 3 | `tls_us` | `u64` | |
+| 4 | `ttfb_us` | `u64` | |
+| 5 | `total_us` | `u64` | |
+| 6 | `bytes_sent` | `u64` | HTTP/1.1: the write tracker's PLAINTEXT count since this exchange's dispatch (SPEC §23.5.4, §22.2 (ct)) |
+| 7 | `bytes_received` | `u64` | same; the count that tells `eof_empty` from `eof_partial_head` |
+| 8 | `reused` | `bool` | the exchange rode a reused connection |
+
+Every `u64` here is contractually bounded < 2^63 (§2), so PHP decodes each to a native int and
+REFUSES a decimal-string one rather than inventing a number.
+
+### 12.5 HTTP vector index
+
+Every vector named in SPEC §23.5.5, and only those (asserted by
+`ferro-proto/tests/golden_vectors.rs::the_http_vectors_are_exactly_the_spec_list`, which parses the
+spec's list):
+
+- `http_request_get` — the smallest real request: every optional field `nil`, so each nil arm is
+  locked.
+- `http_request_post` — every field set, each to a distinct value: a body whose first byte is the
+  `0xc0` nil marker (a `bin` that must not be read as `nil`), a header value carrying `0x80`, a
+  `read_timeout_ms` past u16, and the W3C specification's example `traceparent`.
+- `http_head` — HTTP/1.1, a reason phrase, a non-UTF-8 header value, `decoded = ["gzip", 70000]`.
+- `http_head_h2` — HTTP/2, `reason` and `decoded` both `nil`, effective idempotency `true`.
+- `http_body` — a `STREAM`-flagged 260-byte chunk holding every byte value (so `bin16` is locked).
+- `http_done` — `Outcome::Ok(HttpDone)` with a trailer and `stats` in every uint width (fixint,
+  uint8, uint16, uint32, uint64).
+- `error_upstream_unavailable` (`breaker_open`, `retry_after_ms` set), `error_rate_limited`
+  (`rate_limited`, `retry_after_ms` set), `error_tls_refused` (`tls_verify`),
+  `error_response_incomplete` (`body_eof`), `error_forbidden_http` (`forbidden_target`) — handler-built
+  terminals, so each rides the request's own `HTTP`/`REQUEST` header with `END` (unlike
+  `error_forbidden`'s session-built `CORE`/0), with `sqlstate`/`errno` `nil` and one cause token in
+  `detail`.
+
+The `http_` vectors are byte-locked in PHP by the `httpVectors()` prefix provider, which picks the
+codec from each vector's HEADER method, never its name; the five error vectors by a name-keyed test.
+In Rust, besides the decode→encode fixpoint every vector gets, each HTTP message is decoded and
+compared against its vector's NAMED fields — a fixpoint alone passes a symmetric field swap.
+
+### 12.6 The cause vocabulary, and the codes
+
+On service `HTTP`, `ErrorPayload.detail` is exactly one token of `[http.causes]` (`/proto/errors.toml`,
+SPEC §23.5.6) — 45 tokens, generated into both codecs as `consts::http_cause::*` (+ `ALL`) and
+`Constants::HTTP_CAUSE_*` (+ `HTTP_CAUSES`); the registry table maps each constant NAME to its
+token, and the name must be the token upper-cased. A Guzzle handler picks its exception class by
+the cause (SPEC §23.11.3), which `message` must never be used for. The registry's table is checked
+against SPEC §23.5.6's own table by `registry_sync.rs::http_causes_are_exactly_the_spec_table`.
+`detail` is `nil` on exactly two HTTP terminals, neither of which is an exchange fate: `Protocol`
+(the frame was malformed) and `Unsupported` (nothing serves it — every HTTP `REQUEST` in this build,
+since no engine serves HTTP until M6-F4).
+
+The codes HTTP added (SPEC §23.7.1): `UpstreamUnavailable` `0x1007` and `RateLimited` `0x1008`
+(Retryable — refused before any byte existed on a connection; a breaker's refusal and every
+`RateLimited` carry `retry_after_ms`), `TlsRefused` `0x300D` and `ResponseIncomplete` `0x300E`
+(NonRetryable). `Forbidden` `0x300C` was widened to the HTTP policy refusals (C6). The other fates
+reuse §9.2's existing codes (`ConnectionLost`, `PoolTimeout`, `QueryTimeout`, `WriteUnconfirmed`).
+
+**No `protocol_version` bump** (the §11 ADMIN precedent): no existing message changed shape. These
+are new messages on a new service, the registry hash moved with them and is checked at the handshake,
+so a skewed engine/client pair fails at the first frame, and an older decoder classifies a new code
+correctly by its explicit `branch` (§5).
+
+*(§13 is reserved for Ferro Queue's messages, SPEC §24.)*

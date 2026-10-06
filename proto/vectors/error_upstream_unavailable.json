@@ -1,0 +1,22 @@
+{
+  "frame_hex": "f7040200060001003f00000041000000920197cd100701c0c0d926757073747265616d2062696c6c696e673a206369726375697420627265616b6572206f70656eac627265616b65725f6f70656ecd7530",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 63,
+    "service": 6
+  },
+  "message": {
+    "error": {
+      "branch": 1,
+      "code": 4103,
+      "detail": "breaker_open",
+      "errno": null,
+      "message": "upstream billing: circuit breaker open",
+      "retry_after_ms": 30000,
+      "sqlstate": null
+    },
+    "status": 1
+  },
+  "name": "error_upstream_unavailable"
+}

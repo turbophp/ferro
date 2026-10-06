@@ -1,0 +1,25 @@
+{
+  "frame_hex": "f7040000060002003e0000001900000096cd01f714c09192ab72657472792d6166746572c40135c0c3",
+  "header": {
+    "flags": 0,
+    "method": 2,
+    "request_id": 62,
+    "service": 6
+  },
+  "message": {
+    "decoded": null,
+    "headers": [
+      [
+        "retry-after",
+        [
+          53
+        ]
+      ]
+    ],
+    "idempotent": true,
+    "reason": null,
+    "status": 503,
+    "version": 20
+  },
+  "name": "http_head_h2"
+}

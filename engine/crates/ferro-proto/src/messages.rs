@@ -129,6 +129,13 @@ pub use tx::{BeginRequest, BeginResponse, Isolation, SavepointRequest, TxControl
 pub mod admin;
 pub use admin::{BackupRequest, BackupResponse};
 
+/// HTTP-service messages (M6-F2, SPEC §23.5): `Value`-free but `bin`-bearing, so — like `sql` — a
+/// hand-rolled positional codec rather than `msg!`.
+pub mod http;
+pub use http::{
+    HttpBody, HttpDecoded, HttpDone, HttpHead, HttpHeaderField, HttpRequest, HttpStats,
+};
+
 /// Terminal outcome envelope `[status, body]` (decision W-4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
