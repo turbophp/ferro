@@ -1059,8 +1059,9 @@ below 2^63).
 **`common.tx_id` is decoded exactly as `ExecRequest.tx_id` is** (M7-G1a review L6, which corrected an
 overstatement here): the Rust decoder accepts any `u64`, while PHP's encoder refuses a value at or above
 2^63 because it cannot hold one. The engine mints `tx_id`s from a counter that never approaches 2^63, so
-such a value names no transaction; it is not a wire fault. (Tx-scoped verbs are refused `Unsupported`
-before slice G2 in any case.) Pinned by `messages::queue`'s
+such a value names no transaction; it is not a wire fault — since M7-G2 it is resolved like any
+`tx_id` and answered `TxNotFound` (a tx-scoped `RESERVE` is refused `Unsupported` first, for good;
+SPEC §24.5). Pinned by `messages::queue`'s
 `a_tx_id_at_or_above_2_63_decodes_as_exec_s_does`.
 
 ### 14.1 Requests — client → server

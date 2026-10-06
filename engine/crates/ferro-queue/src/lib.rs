@@ -26,7 +26,12 @@
 //! - [`pg`] — the seven verbs' PostgreSQL statements in autocommit, one builder per verb (the CLOSED
 //!   set D22's mitigation names), the database clock and the rounding rules, the widened fence, and
 //!   the decoders that turn each statement's rows into the verb's outcome. MySQL-family builders are
-//!   G6's; the tx-scoped forms G2's.
+//!   G6's.
+//!
+//! What M7-G2 adds: the two tx-scoped forms that differ from autocommit, `pg::ack_in_tx` and
+//! `pg::release_in_tx` — the fence WITHOUT the probe, because inside a client transaction an
+//! unmatched fence is always `LeaseLost` (SPEC §24.4, R1) — and their decoders. Every other verb runs
+//! its autocommit statement unchanged inside a transaction.
 
 pub mod checks;
 pub mod config;

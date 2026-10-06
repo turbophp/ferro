@@ -15,8 +15,8 @@
 //!    `Unsupported`, as an unknown pool is;
 //! 4. the per-request refusals of `ferro_queue::checks` (`Unsupported`), and the store KIND's decode
 //!    of `job_id` and `token` (`InvalidHandle`, SPEC §24.3 prerequisite (c));
-//! 5. a `tx_id`: RESERVE in a transaction is refused for good (§24.5); every other tx-scoped verb is
-//!    refused until slice G2 builds the TX-actor path;
+//! 5. a `tx_id` on a RESERVE: refused for good (§24.5 — a wait would hold the pin, and a rollback
+//!    would void a delivered token);
 //! 6. a MySQL/MariaDB store is refused until slice G6;
 //! 7. **first use per `boot_epoch`:** the version gate against the pool's existing version probe
 //!    (the wait bounded by the request's own deadline and CANCEL), then shape verification — ONE
@@ -35,6 +35,14 @@
 //!    (RESERVE writes `attempts` and a lease), `sent` honest per statement, `in_tx: false`. The engine
 //!    never re-sends anything (charter rule 3, §24.2 I4).
 //!
+//! **A `tx_id` on any verb but RESERVE (M7-G2, §24.5)** inserts two steps between 6 and 7: resolve
+//! the transaction exactly as a tx-scoped EXEC does ([`resolve_active`]: a missing or foreign id is
+//! `TxNotFound`, the owner's tombstoned one `TxDeadline`), then compare the store's pool with the
+//! transaction's — a mismatch is `PoolMismatch`, before anything is sent, so the transaction is
+//! untouched (D22 (b): a `sql` store composes with a transaction only in that transaction's own
+//! pool). Step 7 follows, and step 8 is replaced: the verb runs on the transaction's PINNED connection
+//! as ONE [`TxCommand::Queue`] (see [`serve_tx`]).
+//!
 //! RESERVE serves its queues in the given order and answers from the FIRST queue that yields any job
 //! (one statement per queue tried, on the one checkout), so every job in a reply comes from one queue
 //! and a failure on queue *i* means queues before it reserved nothing — the failure's fate is that one
@@ -42,6 +50,14 @@
 //! ([`checks::reserve_limit`]). **Not in G1b:** the unreserve of §24.8 — a RESERVE whose terminal is
 //! raced by session teardown leaves its lease to expire (a stock-equivalent phantom) until slice G3
 //! builds unreserve.
+//!
+//! **Tx-scoped verbs (M7-G2, SPEC §24.5).** The verb's statements are built here, run by the TX
+//! actor on the pinned connection, decoded by the actor (`TxVerb::decode`), and classified with
+//! `in_tx: true`. Differences from autocommit, each §24's: an unmatched fence is ALWAYS `LeaseLost`
+//! (R1 — no probe, no `gone`); a cancel, timeout or `57014` rolls the transaction back and tombstones
+//! it (`TxDeadline{Retryable}`); a WRITE whose result is unreadable does the same rather than answer
+//! `Indeterminate`, because inside a transaction the engine CAN make the effect's fate known — by
+//! rolling back — and must not let it commit unseen; and a verb's wake hint fires only on COMMIT.
 //!
 //! Never logged or put in a terminal: a payload, a dedup key, a token or a DSN.
 
@@ -70,10 +86,13 @@ use tokio_util::sync::CancellationToken;
 use crate::pools::{AnyPool, PoolRegistry};
 use crate::services::fate::{self, OpContext};
 use crate::services::sql::{
-    cancelled_before_dispatch, protocol, run_autocommit_exec, sleep_until_opt, unsupported,
+    actor_gone_terminal, cancelled_before_dispatch, protocol, resolve_active, run_autocommit_exec,
+    sleep_until_opt, tx_deadline, unsupported,
 };
+use crate::session::SessionId;
 use crate::session::codec::InFrame;
 use crate::session::responder::Responder;
+use crate::tx::{QueueReply, TxCommand, TxRegistry};
 
 /// One decoded QUEUE request.
 #[derive(Debug)]
@@ -180,6 +199,10 @@ pub struct QueueStores {
     verifications: AtomicU64,
     /// When each store last warned that its pool's version is unknown (review L3).
     unknown_version_warned: std::sync::Mutex<HashMap<String, Instant>>,
+    /// Wake hints FIRED (M7-G2: by a tx-scoped verb's successful COMMIT, SPEC §24.5 step 4). The hint
+    /// has no consumer until slice G3 builds the waker (§24.8), so today this count is all a hint
+    /// does — and it is what makes "fired only on a successful COMMIT" a counted claim.
+    wake_hints: AtomicU64,
 }
 
 impl QueueStores {
@@ -196,7 +219,19 @@ impl QueueStores {
             gate_recheck: None,
             verifications: AtomicU64::new(0),
             unknown_version_warned: std::sync::Mutex::new(HashMap::new()),
+            wake_hints: AtomicU64::new(0),
         }
+    }
+
+    /// How many wake hints have fired since boot (see the field).
+    pub fn wake_hints(&self) -> u64 {
+        self.wake_hints.load(Ordering::Relaxed)
+    }
+
+    /// Fire one wake hint for `(store, queue)` (SPEC §24.8 trigger 1). Counted only, until slice G3
+    /// routes it to the store's waker; a hint is never correctness (§24.5).
+    fn wake(&self, _store: &str, _queue: &str) {
+        self.wake_hints.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn config(&self) -> &QueueConfig {
@@ -307,12 +342,6 @@ fn refuse_before_checkout(
             checks::queue_name(&r.queue).map_err(refusal)?
         }
     }
-    if req.common().tx_id.is_some() {
-        return Err(unsupported(format!(
-            "tx-scoped QUEUE {} is not served before slice G2 (SPEC §24.14)",
-            req.verb()
-        )));
-    }
     if store.family == PoolFamily::Mysql {
         return Err(unsupported(format!(
             "queue store {}: MySQL/MariaDB stores are not served before slice G6 (SPEC §24.14)",
@@ -327,6 +356,8 @@ pub async fn handle(
     frame: InFrame,
     responder: Responder,
     registry: &PoolRegistry,
+    tx_registry: &TxRegistry,
+    session_id: SessionId,
     cancel: CancellationToken,
 ) {
     let method = frame.header.method;
@@ -367,6 +398,18 @@ pub async fn handle(
     // ONE deadline for the whole request — the first-use verification, the checkout and every
     // statement — as on EXEC (M3-D1c review F1).
     let deadline = deadline_of(req.common().timeout_ms);
+    if let Some(tx_id) = req.common().tx_id {
+        let tx = TxScope {
+            tx_registry,
+            session_id,
+            tx_id,
+        };
+        serve_tx(
+            stores, store, registry, tx, req, deadline, cancel, responder,
+        )
+        .await;
+        return;
+    }
     if let Err(ep) = ensure_verified(stores, store, registry, deadline, &cancel).await {
         responder.end_error(ep);
         return;
@@ -388,7 +431,7 @@ fn deadline_of(timeout_ms: Option<u32>) -> Option<tokio::time::Instant> {
 }
 
 /// SPEC §24.6's `OpContext` for an autocommit verb: `readonly` for SIZE ONLY — every other verb
-/// writes, RESERVE included (`attempts` and a lease) — and never `in_tx` (tx-scoped verbs are G2's).
+/// writes, RESERVE included (`attempts` and a lease) — and never `in_tx` here (a tx-scoped verb is [`tx_verb_context`]'s).
 fn verb_context(req: &QueueRequest, sent: bool) -> OpContext {
     OpContext {
         readonly: matches!(req, QueueRequest::Size(_)),
@@ -423,16 +466,22 @@ fn malformed(req: &QueueRequest, store: &StoreConfig) -> ErrorPayload {
     }
 }
 
-fn lease_lost(store: &StoreConfig, verb: &str) -> ErrorPayload {
+/// `LeaseLost` (SPEC §24.4): the verb did nothing. In a transaction (R1) it also says the
+/// transaction is still open — no SQL error occurred — and must be rolled back (§24.5, §24.6).
+fn lease_lost(store: &str, verb: &str, in_tx: bool) -> ErrorPayload {
+    let tx = if in_tx {
+        "; the transaction is still open: roll it back (SPEC §24.5)"
+    } else {
+        ""
+    };
     ErrorPayload {
         code: errc::LEASE_LOST,
         branch: errc::LEASE_LOST_BRANCH,
         sqlstate: None,
         errno: None,
         message: format!(
-            "queue store {}: QUEUE {verb} did nothing: the token names no current reservation \
-             (another holder has the job, or it was reserved again after this lease expired)",
-            store.name
+            "queue store {store}: QUEUE {verb} did nothing: the token names no current reservation \
+             (another holder has the job, or it was reserved again after this lease expired){tx}"
         ),
         detail: None,
         retry_after_ms: None,
@@ -509,8 +558,9 @@ async fn serve_pg<B: PoolBackend>(
     }
 }
 
-/// A verb's success, before its `stats` are known.
-enum VerbOk {
+/// A verb's success, before its `stats` are known. Its `Debug` names the verb only: a RESERVE's jobs
+/// carry payloads, which are never logged (§24.9).
+pub enum VerbOk {
     Enqueue(pgq::Enqueued),
     Reserve(Vec<pgq::Reserved>),
     Ack { gone: bool },
@@ -518,6 +568,21 @@ enum VerbOk {
     Extend(i64),
     Size(pgq::Sizes),
     Clear(u64),
+}
+
+impl std::fmt::Debug for VerbOk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let verb = match self {
+            VerbOk::Enqueue(_) => "Enqueue",
+            VerbOk::Reserve(_) => "Reserve",
+            VerbOk::Ack { .. } => "Ack",
+            VerbOk::Release(_) => "Release",
+            VerbOk::Extend(_) => "Extend",
+            VerbOk::Size(_) => "Size",
+            VerbOk::Clear(_) => "Clear",
+        };
+        write!(f, "VerbOk::{verb}")
+    }
 }
 
 impl VerbOk {
@@ -620,7 +685,7 @@ async fn run_pg_verb<B: PoolBackend>(
             match pgq::decode_ack(&qr.rows, token).map_err(bad)? {
                 Ok(()) => Ok(VerbOk::Ack { gone: false }),
                 Err(NoMatch::Gone) => Ok(VerbOk::Ack { gone: true }),
-                Err(NoMatch::LeaseLost) => Err(lease_lost(store, req.verb())),
+                Err(NoMatch::LeaseLost) => Err(lease_lost(&store.name, req.verb(), false)),
             }
         }
         QueueRequest::Release(r) => {
@@ -630,7 +695,7 @@ async fn run_pg_verb<B: PoolBackend>(
             match pgq::decode_release(&qr.rows, token).map_err(bad)? {
                 Ok(new_id) => Ok(VerbOk::Release(Some(new_id))),
                 Err(NoMatch::Gone) => Ok(VerbOk::Release(None)),
-                Err(NoMatch::LeaseLost) => Err(lease_lost(store, req.verb())),
+                Err(NoMatch::LeaseLost) => Err(lease_lost(&store.name, req.verb(), false)),
             }
         }
         QueueRequest::Extend(r) => {
@@ -639,7 +704,7 @@ async fn run_pg_verb<B: PoolBackend>(
             let qr = run_verb_statement(co, &stmt, deadline, cancel, ctx, exec_us).await?;
             match pgq::decode_extend(&qr.rows).map_err(bad)? {
                 Some(lease_deadline) => Ok(VerbOk::Extend(lease_deadline)),
-                None => Err(lease_lost(store, req.verb())),
+                None => Err(lease_lost(&store.name, req.verb(), false)),
             }
         }
         QueueRequest::Size(r) => {
@@ -653,6 +718,361 @@ async fn run_pg_verb<B: PoolBackend>(
                 run_verb_statement(co, &pgq::clear(t, &r.queue), deadline, cancel, ctx, exec_us)
                     .await?;
             Ok(VerbOk::Clear(qr.affected))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tx-scoped verbs (M7-G2, SPEC §24.5)
+// ---------------------------------------------------------------------------------------------
+
+/// The transaction a tx-scoped verb names, and the session asking.
+struct TxScope<'a> {
+    tx_registry: &'a TxRegistry,
+    session_id: SessionId,
+    tx_id: u64,
+}
+
+/// `PoolMismatch` (SPEC §24.4, §24.5 step 2; NonRetryable): the store's pool is not the
+/// transaction's. Decided before anything is sent, so the transaction is untouched. Both names are
+/// pool names — operator configuration the client already addresses — never a DSN.
+fn pool_mismatch(store: &StoreConfig, tx_pool: &str) -> ErrorPayload {
+    ErrorPayload {
+        code: errc::POOL_MISMATCH,
+        branch: errc::POOL_MISMATCH_BRANCH,
+        sqlstate: None,
+        errno: None,
+        message: format!(
+            "queue store {} is on pool {}, but the transaction is on pool {tx_pool}: a tx-scoped \
+             QUEUE verb composes only with a store in the transaction's own pool (SPEC §24.5); \
+             nothing was sent and the transaction is unaffected",
+            store.name, store.pool
+        ),
+        detail: None,
+        retry_after_ms: None,
+    }
+}
+
+/// SPEC §24.6's `OpContext` for a TX-SCOPED verb: as [`verb_context`] (`readonly` for SIZE only),
+/// with `in_tx: true` — a lost in-transaction statement means the transaction is dead (it will never
+/// commit), a known fate, never `Indeterminate` for the statement itself.
+fn tx_verb_context(req: &QueueRequest, sent: bool) -> OpContext {
+    OpContext {
+        in_tx: true,
+        ..verb_context(req, sent)
+    }
+}
+
+/// A tx-scoped verb (§24.5; the module doc's tx-scoped steps): resolve the transaction, check its pool,
+/// verify the store at first use, then send ONE [`TxCommand::Queue`] to the transaction's actor and
+/// declare the terminal from its reply.
+///
+/// First-use verification runs on a SEPARATE checkout of the store's pool, never inside the
+/// application's transaction: a failed catalog statement there would abort the transaction, and its
+/// snapshot (at REPEATABLE READ) is the application's, not the catalog's latest. Verification happens
+/// once per store per process, so this costs a second connection at most once; on a pool whose every
+/// connection is pinned it waits within the request's deadline and answers `PoolTimeout` (nothing
+/// sent, the transaction untouched).
+#[allow(clippy::too_many_arguments)]
+async fn serve_tx(
+    stores: &Arc<QueueStores>,
+    store: &StoreConfig,
+    registry: &PoolRegistry,
+    tx: TxScope<'_>,
+    req: QueueRequest,
+    deadline: Option<tokio::time::Instant>,
+    cancel: CancellationToken,
+    responder: Responder,
+) {
+    // 1. The transaction, exactly as a tx-scoped EXEC resolves it (R2).
+    let handle = match resolve_active(tx.tx_registry, tx.tx_id, tx.session_id) {
+        Ok(h) => h,
+        Err(ep) => {
+            responder.end_error(ep);
+            return;
+        }
+    };
+    // 2. Its pool against the store's — before anything is sent (D22 (b)).
+    if *handle.pool != *store.pool {
+        responder.end_error(pool_mismatch(store, &handle.pool));
+        return;
+    }
+    if let Err(ep) = ensure_verified(stores, store, registry, deadline, &cancel).await {
+        responder.end_error(ep);
+        return;
+    }
+    // What is left of the request's ONE deadline bounds the verb on the actor. None left: answered
+    // unsent (the transaction untouched), never dispatched with no time.
+    let timeout_ms = match deadline {
+        None => None,
+        Some(d) => {
+            let left = d
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis();
+            if left == 0 {
+                responder.end_error(fate::classify_fate(
+                    PoolError::Timeout,
+                    tx_verb_context(&req, false),
+                ));
+                return;
+            }
+            Some(u32::try_from(left).unwrap_or(u32::MAX))
+        }
+    };
+    let verb = match TxVerb::new(&req, store, Arc::clone(stores)) {
+        Ok(v) => v,
+        Err(ep) => {
+            responder.end_error(ep);
+            return;
+        }
+    };
+    // 3. One actor command per verb.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let cmd = TxCommand::Queue {
+        verb: Box::new(verb),
+        timeout_ms,
+        cancel,
+        reply: reply_tx,
+    };
+    if handle.cmd_tx.send(cmd).await.is_err() {
+        responder.end_error(actor_gone_terminal(tx.tx_registry, tx.tx_id, tx.session_id));
+        return;
+    }
+    match reply_rx.await {
+        // A pinned connection is never queued for: `queue_us` is 0, as on a tx-scoped EXEC.
+        Ok(QueueReply::Done {
+            outcome: Ok(ok),
+            exec_us,
+        }) => responder.end_ok(Bytes::from(ok.encode(QueueStats {
+            queue_us: 0,
+            exec_us,
+        }))),
+        Ok(QueueReply::Done {
+            outcome: Err(ep), ..
+        })
+        | Ok(QueueReply::RolledBack(ep)) => responder.end_error(ep),
+        // The statement WAS sent on the pinned connection, inside the transaction.
+        Ok(QueueReply::Failed { error, .. }) => {
+            responder.end_error(fate::classify_fate(error, tx_verb_context(&req, true)))
+        }
+        // The actor dropped the reply: a session abort, or a teardown that raced the command.
+        Err(_) => responder.end_error(actor_gone_terminal(tx.tx_registry, tx.tx_id, tx.session_id)),
+    }
+}
+
+/// How the actor decodes a tx-scoped verb's result (one step per verb on PostgreSQL).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TxDecode {
+    /// `queues`: the request's distinct queues, one wake hint each on COMMIT.
+    Enqueue {
+        jobs: usize,
+        queues: Vec<String>,
+    },
+    Ack,
+    Release {
+        delay_s: u32,
+    },
+    Extend,
+    Size,
+    Clear,
+}
+
+/// A tx-scoped verb as the TX actor runs it (SPEC §24.5 step 3): the verb's whole engine-authored
+/// statement list, built by `ferro_queue::pg`'s pure builders, plus how to decode the results.
+///
+/// **Every PostgreSQL verb is ONE step**, so G2 builds no per-step stop condition: the actor stops at
+/// the first failing step, and a stop condition such as "the previous step matched no row" lands
+/// with the first verb that has more than one step (G4's dedup ENQUEUE, G6's MySQL RELEASE). The
+/// in-transaction ACK and RELEASE are `ack_in_tx`/`release_in_tx`: the fence without the probe,
+/// because in a transaction an unmatched fence is always `LeaseLost` (R1).
+pub struct TxVerb {
+    pub(crate) steps: Vec<Statement>,
+    decode: TxDecode,
+    verb: &'static str,
+    store: String,
+    stores: Arc<QueueStores>,
+}
+
+/// Names the verb and its step count only — never a statement's parameters, which carry payloads.
+impl std::fmt::Debug for TxVerb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxVerb")
+            .field("verb", &self.verb)
+            .field("steps", &self.steps.len())
+            .finish()
+    }
+}
+
+/// What the actor does with a tx-scoped verb's decoded result.
+pub enum TxVerdict {
+    /// The verb took effect: its success, and its wake hints, kept for COMMIT (§24.5 step 4).
+    Applied { ok: VerbOk, wake: Vec<WakeHint> },
+    /// The verb did nothing, or only read: its terminal, and the transaction stays open. A fenced
+    /// verb's `LeaseLost` lands here — "the transaction stays open, since no SQL error occurred"
+    /// (§24.6), and the caller rolls back.
+    NoEffect(Result<VerbOk, ErrorPayload>),
+    /// A WRITE ran but its result is unreadable: the actor rolls the transaction back and
+    /// tombstones it, answering this payload (`TxDeadline{Retryable}`).
+    Unreadable(ErrorPayload),
+}
+
+/// One wake hint for `(store, queue)`, held by the TX actor until COMMIT (SPEC §24.5 step 4, §24.8).
+pub struct WakeHint {
+    stores: Arc<QueueStores>,
+    store: String,
+    queue: String,
+}
+
+impl WakeHint {
+    /// Fire it: only ever called after a SUCCESSFUL COMMIT.
+    pub fn fire(self) {
+        self.stores.wake(&self.store, &self.queue);
+    }
+}
+
+/// Names the store only: a queue name is a label only when the operator lists it (§24.9).
+impl std::fmt::Debug for WakeHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WakeHint")
+            .field("store", &self.store)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TxVerb {
+    /// Build the verb's steps. Every refusal here was already made before any checkout (the
+    /// handles decode; a RESERVE never gets here), so an `Err` is answered rather than asserted.
+    fn new(
+        req: &QueueRequest,
+        store: &StoreConfig,
+        stores: Arc<QueueStores>,
+    ) -> Result<TxVerb, ErrorPayload> {
+        let t = &store.table;
+        let (step, decode) = match req {
+            QueueRequest::Enqueue(r) => {
+                let mut queues: Vec<String> = r.jobs.iter().map(|j| j.queue.clone()).collect();
+                queues.sort();
+                queues.dedup();
+                (
+                    pgq::enqueue(t, r.jobs.clone()),
+                    TxDecode::Enqueue {
+                        jobs: r.jobs.len(),
+                        queues,
+                    },
+                )
+            }
+            QueueRequest::Reserve(_) => {
+                return Err(unsupported(
+                    "RESERVE inside a transaction is refused (SPEC §24.5): send it without a tx_id",
+                ));
+            }
+            QueueRequest::Ack(r) => {
+                let (id, token) = decode_handles(store, &r.job_id, &r.token)?;
+                (pgq::ack_in_tx(t, id, token), TxDecode::Ack)
+            }
+            QueueRequest::Release(r) => {
+                let (id, token) = decode_handles(store, &r.job_id, &r.token)?;
+                (
+                    pgq::release_in_tx(t, id, token, r.delay_s),
+                    TxDecode::Release { delay_s: r.delay_s },
+                )
+            }
+            QueueRequest::Extend(r) => {
+                let (id, token) = decode_handles(store, &r.job_id, &r.token)?;
+                (pgq::extend(t, id, token, store.lease_s), TxDecode::Extend)
+            }
+            QueueRequest::Size(r) => (pgq::size(t, &r.queue), TxDecode::Size),
+            QueueRequest::Clear(r) => (pgq::clear(t, &r.queue), TxDecode::Clear),
+        };
+        Ok(TxVerb {
+            steps: vec![step],
+            decode,
+            verb: req.verb(),
+            store: store.name.clone(),
+            stores,
+        })
+    }
+
+    fn hint(&self, queue: &str) -> WakeHint {
+        WakeHint {
+            stores: Arc::clone(&self.stores),
+            store: self.store.clone(),
+            queue: queue.to_string(),
+        }
+    }
+
+    /// Decode the steps' results (one per step, in order). Called by the TX actor, which acts on the
+    /// verdict before it serves the transaction's next command.
+    pub fn decode(&self, results: &[QueryResult]) -> TxVerdict {
+        let [qr] = results else {
+            return self.unreadable();
+        };
+        let applied = |ok| TxVerdict::Applied {
+            ok,
+            wake: Vec::new(),
+        };
+        let lost = || TxVerdict::NoEffect(Err(lease_lost(&self.store, self.verb, true)));
+        match &self.decode {
+            TxDecode::Enqueue { jobs, queues } => {
+                match pgq::decode_enqueue(&qr.rows, qr.affected, *jobs) {
+                    Ok(e) => TxVerdict::Applied {
+                        ok: VerbOk::Enqueue(e),
+                        wake: queues.iter().map(|q| self.hint(q)).collect(),
+                    },
+                    Err(pgq::Malformed) => self.unreadable(),
+                }
+            }
+            TxDecode::Ack => match pgq::decode_ack_in_tx(&qr.rows, qr.affected) {
+                Ok(true) => applied(VerbOk::Ack { gone: false }),
+                Ok(false) => lost(),
+                Err(pgq::Malformed) => self.unreadable(),
+            },
+            TxDecode::Release { delay_s } => match pgq::decode_release_in_tx(&qr.rows) {
+                // §24.8: only a RELEASE with `delay_s = 0` makes a job available now.
+                Ok(Some((new_id, queue))) => TxVerdict::Applied {
+                    ok: VerbOk::Release(Some(new_id)),
+                    wake: if *delay_s == 0 {
+                        vec![self.hint(&queue)]
+                    } else {
+                        Vec::new()
+                    },
+                },
+                Ok(None) => lost(),
+                Err(pgq::Malformed) => self.unreadable(),
+            },
+            TxDecode::Extend => match pgq::decode_extend(&qr.rows) {
+                Ok(Some(lease_deadline)) => applied(VerbOk::Extend(lease_deadline)),
+                Ok(None) => lost(),
+                Err(pgq::Malformed) => self.unreadable(),
+            },
+            TxDecode::Size => match pgq::decode_size(&qr.rows) {
+                Ok(sizes) => TxVerdict::NoEffect(Ok(VerbOk::Size(sizes))),
+                Err(pgq::Malformed) => self.unreadable(),
+            },
+            TxDecode::Clear => applied(VerbOk::Clear(qr.affected)),
+        }
+    }
+
+    /// The statement ran but its rows do not have the builder's shape. SIZE (a read, no effect) is a
+    /// plain refusal and the transaction stays open; a WRITE's effect is real and unreportable, so
+    /// the actor rolls the transaction back — the one in-transaction way to make that effect's fate
+    /// KNOWN (it will never commit) — and the answer is `TxDeadline{Retryable}`, never a known-fate
+    /// code claiming the verb did nothing and never an `Indeterminate` the client could follow with
+    /// a COMMIT of the unseen effect.
+    fn unreadable(&self) -> TxVerdict {
+        let message = format!(
+            "queue store {}: the tx-scoped QUEUE {} statement ran but its result did not have the \
+             expected shape (was the table altered after it was verified? ferrod re-verifies at \
+             restart)",
+            self.store, self.verb
+        );
+        if self.decode == TxDecode::Size {
+            TxVerdict::NoEffect(Err(unsupported(message)))
+        } else {
+            TxVerdict::Unreadable(tx_deadline(format!(
+                "{message}; the transaction was rolled back so the unreported effect cannot commit \
+                 (retryable — the engine never re-runs)"
+            )))
         }
     }
 }
@@ -888,6 +1308,12 @@ mod tests {
         cfg.store("jobs").cloned().unwrap()
     }
 
+    fn my_store() -> StoreConfig {
+        let mut s = store();
+        s.family = PoolFamily::Mysql;
+        s
+    }
+
     fn fenced(job_id: &[u8], token: &[u8]) -> QueueRequest {
         QueueRequest::Ack(FencedRequest {
             store: "jobs".into(),
@@ -957,9 +1383,17 @@ mod tests {
             dedup_key: None,
             common: tx,
         });
-        let ep = refuse_before_checkout(&enq, &store(), NOW).unwrap_err();
-        assert!(ep.message.contains("G2"), "{}", ep.message);
+        // M7-G2: a tx-scoped ENQUEUE is no longer refused here — it is resolved against the TX
+        // registry, its pool checked and served on the pinned connection (`serve_tx`).
+        assert!(refuse_before_checkout(&enq, &store(), NOW).is_ok());
         let mut my = store();
+        // A MySQL-family store is still refused (G6), tx-scoped or not.
+        assert!(
+            refuse_before_checkout(&enq, &my_store(), NOW)
+                .unwrap_err()
+                .message
+                .contains("G6")
+        );
         my.family = PoolFamily::Mysql;
         let size = QueueRequest::Size(QueueScopeRequest {
             store: "jobs".into(),
@@ -1447,7 +1881,7 @@ mod tests {
     /// `LeaseLost` is the registry's known-fate code, and its message names the verb, never a token.
     #[test]
     fn lease_lost_is_the_known_fate_code() {
-        let ep = lease_lost(&store(), "ACK");
+        let ep = lease_lost("jobs", "ACK", false);
         assert_eq!(
             (ep.code, ep.branch),
             (errc::LEASE_LOST, errc::LEASE_LOST_BRANCH)
@@ -1474,5 +1908,485 @@ mod tests {
         }
         assert!(QueueRequest::decode(0, &[]).is_none());
         assert!(QueueRequest::decode(8, &[]).is_none());
+    }
+
+    // ---- M7-G2: tx-scoped verbs ---------------------------------------------------------------
+
+    fn stores_arc() -> Arc<QueueStores> {
+        let cfg = QueueConfig::load(
+            [
+                ("FERRO_QUEUE_STORES", "jobs"),
+                ("FERRO_QUEUE_JOBS_POOL", "main"),
+            ]
+            .map(|(k, v)| (OsString::from(k), OsString::from(v))),
+            &|_| Some(PoolFamily::Postgres),
+        );
+        Arc::new(QueueStores::new(Arc::new(cfg)))
+    }
+
+    fn in_tx(common: QueueCommon) -> QueueCommon {
+        QueueCommon {
+            tx_id: Some(7),
+            ..common
+        }
+    }
+
+    fn enqueue_of(queues: &[&str]) -> QueueRequest {
+        QueueRequest::Enqueue(EnqueueRequest {
+            store: "jobs".into(),
+            jobs: queues
+                .iter()
+                .map(|q| EnqueueJob {
+                    queue: (*q).into(),
+                    payload: "{}".into(),
+                    delay_s: 0,
+                })
+                .collect(),
+            dedup_key: None,
+            common: in_tx(QueueCommon::default()),
+        })
+    }
+
+    fn release_of(delay_s: u32) -> QueueRequest {
+        QueueRequest::Release(ReleaseRequest {
+            store: "jobs".into(),
+            job_id: b"9".to_vec(),
+            token: Token::from_pg(100, 2).encode().to_vec(),
+            delay_s,
+            common: in_tx(QueueCommon::default()),
+        })
+    }
+
+    fn qr(rows: Vec<Vec<ferro_proto::value::Value>>, affected: u64) -> QueryResult {
+        QueryResult {
+            rows,
+            affected,
+            ..QueryResult::default()
+        }
+    }
+
+    fn int(n: i64) -> ferro_proto::value::Value {
+        ferro_proto::value::Value::I64(n)
+    }
+
+    fn text(s: &str) -> ferro_proto::value::Value {
+        ferro_proto::value::Value::Text(s.into())
+    }
+
+    /// The step each tx-scoped verb runs is the closed builder set's — the in-transaction ACK and
+    /// RELEASE are the probe-less forms (R1), the rest are the autocommit statements — and RESERVE
+    /// cannot be built at all.
+    #[test]
+    fn a_tx_verb_runs_the_in_tx_statement_of_its_verb() {
+        let s = store();
+        let t = &s.table;
+        let id = JobId(9);
+        let tok = Token::from_pg(100, 2);
+        let fenced_tx = |r: QueueRequest| r;
+        let ack = fenced_tx(QueueRequest::Ack(FencedRequest {
+            store: "jobs".into(),
+            job_id: b"9".to_vec(),
+            token: tok.encode().to_vec(),
+            common: in_tx(QueueCommon::default()),
+        }));
+        let extend = QueueRequest::Extend(FencedRequest {
+            store: "jobs".into(),
+            job_id: b"9".to_vec(),
+            token: tok.encode().to_vec(),
+            common: in_tx(QueueCommon::default()),
+        });
+        let scope = QueueScopeRequest {
+            store: "jobs".into(),
+            queue: "q".into(),
+            common: in_tx(QueueCommon::default()),
+        };
+        let cases = [
+            (
+                enqueue_of(&["a"]),
+                pgq::enqueue(
+                    t,
+                    vec![EnqueueJob {
+                        queue: "a".into(),
+                        payload: "{}".into(),
+                        delay_s: 0,
+                    }],
+                ),
+            ),
+            (ack, pgq::ack_in_tx(t, id, tok)),
+            (release_of(5), pgq::release_in_tx(t, id, tok, 5)),
+            (extend, pgq::extend(t, id, tok, s.lease_s)),
+            (QueueRequest::Size(scope.clone()), pgq::size(t, "q")),
+            (QueueRequest::Clear(scope), pgq::clear(t, "q")),
+        ];
+        for (req, want) in cases {
+            let verb = TxVerb::new(&req, &s, stores_arc()).unwrap();
+            assert_eq!(verb.steps, vec![want], "{}", req.verb());
+            // The Debug never prints a statement (a payload is a parameter).
+            assert!(!format!("{verb:?}").contains("{}"), "{verb:?}");
+        }
+        let reserve = QueueRequest::Reserve(ReserveRequest {
+            store: "jobs".into(),
+            queues: vec!["q".into()],
+            max_jobs: 1,
+            wait_ms: 0,
+            liveness: false,
+            common: in_tx(QueueCommon::default()),
+        });
+        assert_eq!(
+            TxVerb::new(&reserve, &s, stores_arc()).unwrap_err().code,
+            errc::UNSUPPORTED
+        );
+    }
+
+    fn verdict_kind(v: &TxVerdict) -> (&'static str, usize) {
+        match v {
+            TxVerdict::Applied { wake, .. } => ("applied", wake.len()),
+            TxVerdict::NoEffect(Ok(_)) => ("read", 0),
+            TxVerdict::NoEffect(Err(ep)) if ep.code == errc::LEASE_LOST => ("lease_lost", 0),
+            TxVerdict::NoEffect(Err(ep)) if ep.code == errc::UNSUPPORTED => ("refused", 0),
+            TxVerdict::NoEffect(Err(_)) => ("other", 0),
+            TxVerdict::Unreadable(ep) => {
+                assert_eq!(
+                    (ep.code, ep.branch),
+                    (errc::TX_DEADLINE, errc::TX_DEADLINE_BRANCH)
+                );
+                assert_eq!(ep.branch, ferro_proto::consts::branch::RETRYABLE);
+                ("rolled_back", 0)
+            }
+        }
+    }
+
+    /// SPEC §24.4/§24.5/§24.6 for every tx-scoped verb: an applied verb keeps its wake hints (one per
+    /// distinct ENQUEUE queue; a RELEASE's only at `delay_s = 0`); an unmatched fence is ALWAYS
+    /// `LeaseLost` in a transaction (R1), with the "roll it back" message; an unreadable WRITE result
+    /// rolls the transaction back (`TxDeadline{Retryable}`) while an unreadable SIZE is only refused.
+    #[test]
+    fn a_tx_verbs_decode_keeps_hints_only_when_applied_and_never_answers_gone() {
+        let s = store();
+        let verb = |req: QueueRequest| TxVerb::new(&req, &s, stores_arc()).unwrap();
+        let fenced = |ack: bool| {
+            let r = FencedRequest {
+                store: "jobs".into(),
+                job_id: b"9".to_vec(),
+                token: Token::from_pg(100, 2).encode().to_vec(),
+                common: in_tx(QueueCommon::default()),
+            };
+            if ack {
+                QueueRequest::Ack(r)
+            } else {
+                QueueRequest::Extend(r)
+            }
+        };
+        let scope = |clear: bool| {
+            let r = QueueScopeRequest {
+                store: "jobs".into(),
+                queue: "q".into(),
+                common: in_tx(QueueCommon::default()),
+            };
+            if clear {
+                QueueRequest::Clear(r)
+            } else {
+                QueueRequest::Size(r)
+            }
+        };
+        let e = verb(enqueue_of(&["b", "a", "b"]));
+        assert_eq!(
+            verdict_kind(&e.decode(&[qr(vec![], 3)])),
+            ("applied", 2),
+            "one hint per DISTINCT queue"
+        );
+        assert_eq!(
+            verdict_kind(&verb(enqueue_of(&["a"])).decode(&[qr(vec![vec![int(41)]], 1)])),
+            ("applied", 1)
+        );
+        assert_eq!(
+            verdict_kind(&e.decode(&[qr(vec![], 2)])),
+            ("rolled_back", 0)
+        );
+        assert_eq!(
+            verdict_kind(&e.decode(&[qr(vec![], 3), qr(vec![], 3)])),
+            ("rolled_back", 0),
+            "a result per step, and one step"
+        );
+        assert_eq!(verdict_kind(&e.decode(&[])), ("rolled_back", 0));
+
+        let a = verb(fenced(true));
+        assert_eq!(verdict_kind(&a.decode(&[qr(vec![], 1)])), ("applied", 0));
+        let lost = a.decode(&[qr(vec![], 0)]);
+        assert_eq!(verdict_kind(&lost), ("lease_lost", 0), "absent → LeaseLost");
+        let TxVerdict::NoEffect(Err(ep)) = lost else {
+            unreachable!()
+        };
+        assert!(ep.message.contains("roll it back"), "{}", ep.message);
+        assert_eq!(
+            verdict_kind(&a.decode(&[qr(vec![], 2)])),
+            ("rolled_back", 0)
+        );
+
+        let now = verb(release_of(0));
+        let later = verb(release_of(30));
+        let moved = [qr(vec![vec![int(55), text("emails")]], 1)];
+        assert_eq!(verdict_kind(&now.decode(&moved)), ("applied", 1));
+        assert_eq!(
+            verdict_kind(&later.decode(&moved)),
+            ("applied", 0),
+            "a delayed job wakes nobody"
+        );
+        assert_eq!(
+            verdict_kind(&now.decode(&[qr(vec![], 0)])),
+            ("lease_lost", 0)
+        );
+        assert_eq!(
+            verdict_kind(&now.decode(&[qr(vec![vec![int(55)]], 1)])),
+            ("rolled_back", 0)
+        );
+
+        let x = verb(fenced(false));
+        assert_eq!(
+            verdict_kind(&x.decode(&[qr(vec![vec![int(1091)]], 1)])),
+            ("applied", 0)
+        );
+        assert_eq!(verdict_kind(&x.decode(&[qr(vec![], 0)])), ("lease_lost", 0));
+        assert_eq!(
+            verdict_kind(&x.decode(&[qr(vec![vec![text("x")]], 1)])),
+            ("rolled_back", 0)
+        );
+
+        let size = verb(scope(false));
+        assert_eq!(
+            verdict_kind(&size.decode(&[qr(
+                vec![vec![
+                    int(1),
+                    int(0),
+                    int(0),
+                    ferro_proto::value::Value::Null
+                ]],
+                1
+            )])),
+            ("read", 0)
+        );
+        assert_eq!(
+            verdict_kind(&size.decode(&[qr(vec![], 0)])),
+            ("refused", 0),
+            "an unreadable READ is refused, the transaction stays"
+        );
+        assert_eq!(
+            verdict_kind(&verb(scope(true)).decode(&[qr(vec![], 4)])),
+            ("applied", 0)
+        );
+    }
+
+    /// The tx-scoped `OpContext`: SIZE alone is a read, and every verb is `in_tx`.
+    #[test]
+    fn a_tx_scoped_verb_is_classified_in_tx() {
+        for req in every_verb() {
+            for sent in [false, true] {
+                let ctx = tx_verb_context(&req, sent);
+                assert!(ctx.in_tx, "{}", req.verb());
+                assert_eq!(ctx.sent, sent);
+                assert_eq!(ctx.readonly, matches!(req, QueueRequest::Size(_)));
+            }
+        }
+        // A link lost under an in-tx write is Retryable (the transaction is dead), never Indeterminate.
+        let enq = enqueue_of(&["a"]);
+        let ep = fate::classify_fate(PoolError::ConnectionLost, tx_verb_context(&enq, true));
+        assert_eq!(
+            (ep.code, ep.branch),
+            (errc::CONNECTION_LOST, errc::CONNECTION_LOST_BRANCH)
+        );
+    }
+
+    #[test]
+    fn pool_mismatch_is_the_known_fate_code_and_names_both_pools() {
+        let ep = pool_mismatch(&store(), "other");
+        assert_eq!(
+            (ep.code, ep.branch),
+            (errc::POOL_MISMATCH, errc::POOL_MISMATCH_BRANCH)
+        );
+        assert_eq!(ep.branch, ferro_proto::consts::branch::NON_RETRYABLE);
+        assert!(ep.message.contains("pool main"), "{}", ep.message);
+        assert!(ep.message.contains("pool other"), "{}", ep.message);
+    }
+
+    /// One transaction actor on a one-connection `FakeBackend` pool, exactly as `begin_on_pool`
+    /// spawns it.
+    async fn spawn_fake_tx(
+        pool: &Pool<ferro_pool::fake::FakeBackend>,
+        registry: &TxRegistry,
+        owner: SessionId,
+    ) -> (u64, tokio::sync::mpsc::Sender<TxCommand>) {
+        let mut co = pool.checkout().await.expect("checkout");
+        let tx_id = crate::tx::next_tx_id();
+        co.begin_tx_with(ferro_pool::pin::TxId(tx_id), "BEGIN")
+            .await
+            .expect("begin");
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+        let abort = CancellationToken::new();
+        registry.register(
+            tx_id,
+            crate::tx::TxHandle {
+                owner,
+                cmd_tx: cmd_tx.clone(),
+                abort: abort.clone(),
+                done: done_rx,
+                streaming: true,
+                copy: true,
+                pool: "main".into(),
+                dialect: ferro_classify::Dialect::Postgres,
+            },
+        );
+        tokio::spawn(crate::tx::actor::run(
+            tx_id,
+            co,
+            cmd_rx,
+            abort,
+            done_tx,
+            registry.clone(),
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            Duration::from_secs(5),
+        ));
+        (tx_id, cmd_tx)
+    }
+
+    async fn queue_cmd(
+        cmd_tx: &tokio::sync::mpsc::Sender<TxCommand>,
+        req: &QueueRequest,
+        stores: &Arc<QueueStores>,
+    ) -> QueueReply {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(TxCommand::Queue {
+                verb: Box::new(TxVerb::new(req, &store(), Arc::clone(stores)).unwrap()),
+                timeout_ms: None,
+                cancel: CancellationToken::new(),
+                reply,
+            })
+            .await
+            .unwrap();
+        rx.await.expect("the actor replies")
+    }
+
+    async fn ctl(cmd_tx: &tokio::sync::mpsc::Sender<TxCommand>, commit: bool) -> bool {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let cmd = if commit {
+            TxCommand::Commit { reply }
+        } else {
+            TxCommand::Rollback { reply }
+        };
+        cmd_tx.send(cmd).await.unwrap();
+        matches!(rx.await.unwrap(), crate::tx::CtlReply::Ok)
+    }
+
+    /// SPEC §24.5 step 4 through the REAL actor: a verb's wake hint fires only on a successful COMMIT
+    /// (never on ROLLBACK, never for a verb that failed or did nothing), and a WRITE whose result is
+    /// unreadable rolls the transaction back and tombstones it.
+    #[tokio::test]
+    async fn the_actor_fires_hints_only_on_commit_and_rolls_back_an_unreadable_write() {
+        use ferro_pool::config::PoolConfig;
+        use ferro_pool::fake::FakeBackend;
+        let backend = FakeBackend::new();
+        let pool = Pool::new(
+            backend,
+            PoolConfig {
+                max_size: 1,
+                reap_interval: None,
+                ..PoolConfig::default()
+            },
+        );
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let stores = stores_arc();
+        let one_id = qr(vec![vec![int(41)]], 1);
+
+        // Applied, then COMMIT: the hint fires — once, and only at COMMIT.
+        pool.backend().set_query_result(one_id.clone());
+        let (_, tx) = spawn_fake_tx(&pool, &registry, owner).await;
+        let r = queue_cmd(&tx, &enqueue_of(&["a"]), &stores).await;
+        assert!(
+            matches!(
+                r,
+                QueueReply::Done {
+                    outcome: Ok(VerbOk::Enqueue(_)),
+                    ..
+                }
+            ),
+            "{r:?}"
+        );
+        assert_eq!(stores.wake_hints(), 0, "nothing fires before COMMIT");
+        assert!(ctl(&tx, true).await);
+        assert_eq!(stores.wake_hints(), 1);
+
+        // Applied, then ROLLBACK: dropped.
+        let (_, tx) = spawn_fake_tx(&pool, &registry, owner).await;
+        queue_cmd(&tx, &enqueue_of(&["a"]), &stores).await;
+        assert!(ctl(&tx, false).await);
+        assert_eq!(stores.wake_hints(), 1, "a rollback fires nothing");
+
+        // A failed step: no hint, the transaction stays registered, then COMMIT fires nothing.
+        let (tx_id, tx) = spawn_fake_tx(&pool, &registry, owner).await;
+        pool.backend().arm_next_query_err(PoolError::Sql {
+            code: errc::NOT_NULL,
+            branch: errc::NOT_NULL_BRANCH,
+            sqlstate: Some("23502".into()),
+            errno: None,
+            message: "null value".into(),
+        });
+        let r = queue_cmd(&tx, &enqueue_of(&["a"]), &stores).await;
+        assert!(matches!(r, QueueReply::Failed { .. }), "{r:?}");
+        assert!(registry.lookup(tx_id, owner).is_ok(), "still open");
+        assert!(ctl(&tx, true).await);
+        assert_eq!(stores.wake_hints(), 1, "a failed verb keeps no hint");
+
+        // An in-tx LeaseLost: no hint, the transaction stays open.
+        let (tx_id, tx) = spawn_fake_tx(&pool, &registry, owner).await;
+        pool.backend().set_query_result(qr(vec![], 0));
+        let ack = QueueRequest::Ack(FencedRequest {
+            store: "jobs".into(),
+            job_id: b"9".to_vec(),
+            token: Token::from_pg(100, 2).encode().to_vec(),
+            common: in_tx(QueueCommon::default()),
+        });
+        let r = queue_cmd(&tx, &ack, &stores).await;
+        assert!(
+            matches!(r, QueueReply::Done { outcome: Err(ref ep), .. } if ep.code == errc::LEASE_LOST),
+            "{r:?}"
+        );
+        assert!(
+            registry.lookup(tx_id, owner).is_ok(),
+            "LeaseLost leaves the transaction open"
+        );
+        assert!(ctl(&tx, true).await);
+        assert_eq!(stores.wake_hints(), 1);
+
+        // An unreadable WRITE result: rolled back + tombstoned, its hint never kept.
+        let (tx_id, tx) = spawn_fake_tx(&pool, &registry, owner).await;
+        pool.backend().set_query_result(qr(vec![], 0)); // an ENQUEUE of one job returns its id
+        let r = queue_cmd(&tx, &enqueue_of(&["a"]), &stores).await;
+        let QueueReply::RolledBack(ep) = r else {
+            panic!("expected RolledBack, got {r:?}")
+        };
+        assert_eq!(
+            (ep.code, ep.branch),
+            (errc::TX_DEADLINE, errc::TX_DEADLINE_BRANCH)
+        );
+        let mut waited = 0;
+        while registry.lookup(tx_id, owner).is_ok() && waited < 200 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            waited += 1;
+        }
+        assert_eq!(
+            registry.lookup(tx_id, owner).unwrap_err(),
+            crate::tx::TxLookupErr::Tombstoned
+        );
+        let co = pool.checkout().await.expect("the connection came back");
+        assert!(
+            co.conn().recorded.iter().any(|s| s == "ROLLBACK"),
+            "{:?}",
+            co.conn().recorded
+        );
+        drop(co);
+        assert_eq!(stores.wake_hints(), 1);
     }
 }

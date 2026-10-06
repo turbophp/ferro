@@ -516,6 +516,9 @@ it; the bound is what makes the RESERVE reply envelope finite — and is refused
 checkout, as the "queue name" refusal below says. Until the slices that build them land, a RESERVE with
 `wait_ms > 0` (G3), a dedup-keyed ENQUEUE (G4), a tx-scoped verb (G2) and any verb on a MySQL-family store
 (G6) are refused `Unsupported` before any checkout, never silently served without the behaviour asked for.]*
+*[Amended M7-G2 (SPEC §22.2 (dh)): tx-scoped ENQUEUE, ACK, RELEASE, EXTEND, SIZE and CLEAR are SERVED
+(§24.5); a tx-scoped RESERVE stays refused `Unsupported`, for good, and is refused before its `tx_id` is
+even resolved.]*
 
 **Verb semantics.**
 
@@ -690,6 +693,45 @@ after COMMIT. v1 builds only the `sql` kind, so in v1 this rule refuses nothing 
    - Hints are never correctness.
 
 This is **two additions** to the actor: the `Queue` command and the after-commit list.
+
+*[Amended M7-G2 (SPEC §22.2 (dh)): **built on PostgreSQL**, with these choices the text above left
+open or the implementation forced:*
+
+- ***Order of the pre-send steps.*** *The per-request refusals of §24.4 (a tx-scoped RESERVE first, for
+  good), then step 1 (`resolve_active`, unchanged), then step 2 (`PoolMismatch`), then the store's
+  first-use verification (§24.3), then step 3. `PoolMismatch` therefore precedes any checkout,
+  verification's included — pinned live against a store whose pool nobody listens on.*
+- ***First-use verification runs on a SEPARATE checkout***, never inside the application's
+  transaction: a failed catalog statement there would abort it, and at REPEATABLE READ its snapshot is
+  the application's. It happens once per store per process. On a pool whose every connection is pinned
+  it waits within the request's deadline and answers `PoolTimeout` (nothing sent, the transaction
+  untouched).
+- ***The deadline.*** *What is left of the request's one `timeout_ms` after verification bounds the
+  verb's whole step list, timed from when the actor starts the verb — as `Exec`'s per-statement timer
+  starts when the actor runs the statement. None left after verification → `PoolTimeout`, unsent, the
+  transaction untouched. A CANCEL that arrives while the command waits behind the transaction's earlier
+  commands is handled as `Exec` handles it: the actor's select is biased toward the statement, so the
+  statement is dispatched and then cancelled, and the transaction rolls back (`TxDeadline`).*
+- ***Steps.*** *Every PostgreSQL verb is ONE step, so G2 builds no per-step stop condition: the actor
+  runs the steps back to back, stops at the first failing step, and a stop condition such as "the
+  previous step matched no row" lands with the first verb that has more than one step (G4's dedup
+  ENQUEUE, G6's MySQL RELEASE). The in-transaction ACK and RELEASE are their own builders
+  (`ack_in_tx`, `release_in_tx`): the fence without the probe (R1).*
+- ***The actor decodes.*** *The verb's result is decoded INSIDE the actor, before it serves the
+  transaction's next command, because two outcomes act on the transaction and nothing may slip in
+  between: an applied verb's wake hint is kept for COMMIT, and an unreadable WRITE result rolls the
+  transaction back (§24.6 amendment).*
+- ***The hint comes from the result, not the request.*** *A RELEASE request carries no queue — the
+  queue is in the row — so the in-transaction RELEASE returns the new row's queue, and the hint is
+  produced by the decode: one per distinct queue of an ENQUEUE (§24.8 trigger 1 names "an ENQUEUE",
+  any delay), one for a RELEASE only at `delay_s = 0`, none for ACK, EXTEND, SIZE, CLEAR, a verb that
+  failed, or a `LeaseLost`. A `ROLLBACK_TO` leaves a stale hint (pinned live); ROLLBACK, a failed or
+  lost COMMIT, abort and deadline drop them.*
+- ***The hint has no consumer until G3.*** *Firing it increments a counter
+  (`QueueStores::wake_hints`); G3 routes it to the store's waker (§24.8). Autocommit verbs fire no hint
+  yet — the autocommit hints are G3's.*
+- *`queue_us` is 0 on a tx-scoped verb, as on a tx-scoped EXEC: a pinned connection is never queued
+  for.]*
 
 **What is atomic and what is not:**
 
