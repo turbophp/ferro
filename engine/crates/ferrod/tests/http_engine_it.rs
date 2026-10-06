@@ -1911,7 +1911,10 @@ async fn an_https_upstream_is_served_from_f5a() {
     let ep = r.error();
     assert_eq!(
         (ep.code, ep.detail.as_deref()),
-        (errc::UPSTREAM_UNAVAILABLE, Some(http_cause::CONNECT_REFUSED)),
+        (
+            errc::UPSTREAM_UNAVAILABLE,
+            Some(http_cause::CONNECT_REFUSED)
+        ),
         "{ep:?}"
     );
 }

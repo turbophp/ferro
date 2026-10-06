@@ -737,6 +737,10 @@ mod tests {
         t.flush().await.unwrap();
         assert!(state.cipher_armed() > 0);
         assert!(state.sent());
+        // A reused connection's next exchange starts from zero (review F-4's rule, ciphertext half).
+        state.arm();
+        assert_eq!(state.cipher_armed(), 0);
+        assert!(!state.sent());
     }
 
     /// F1a's review F-1, on the engine's stack: a plaintext write that FAILS after an earlier part

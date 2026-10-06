@@ -438,6 +438,14 @@ async fn https_round_trip_verifies_the_name_while_the_connect_goes_to_the_checke
         stats.tls_us > 0,
         "the handshake is timed (HttpStats.tls_us)"
     );
+    // `queue_us` excludes the handshake (§23.5.4 as amended): with nothing queued it is far below
+    // a handshake's duration, which it would exceed if the handshake were counted in it.
+    assert!(
+        stats.queue_us < stats.tls_us,
+        "queue_us {} counts the handshake ({} us)",
+        stats.queue_us,
+        stats.tls_us
+    );
     let seen = rec.requests();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].body, b"charge");
@@ -698,6 +706,52 @@ async fn handshake_transport_failures_are_retryable_tls_handshake() {
     assert_both(
         &p,
         &g,
+        errc::UPSTREAM_UNAVAILABLE,
+        branch::RETRYABLE,
+        http_cause::TLS_HANDSHAKE,
+    );
+}
+
+/// A LEGACY server — one that ignores `supported_versions` and answers TLS 1.2 to any offer, as a
+/// pre-TLS-1.3 stack does — against `MIN_TLS=1.3`: the CLIENT refuses the version
+/// (`PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig`), which is `tls_version`. The
+/// upstream is a raw socket that answers the ClientHello with a bare TLS 1.2 ServerHello record.
+/// Control: at the default `MIN_TLS=1.2` the client accepts the version and then fails on the
+/// missing rest of the handshake — `tls_handshake`, not `tls_version`.
+#[tokio::test]
+async fn a_legacy_tls12_server_hello_to_a_tls13_only_offer_is_tls_version() {
+    let pki = Pki::new();
+    let ca_file = pki.ca_file().display().to_string();
+    let (addr, _) = raw_upstream(|mut s| async move {
+        let mut b = [0u8; 4096];
+        let _ = s.read(&mut b).await; // the ClientHello
+        let mut body = vec![0x03, 0x03]; // legacy_version TLS 1.2, no supported_versions
+        body.extend_from_slice(&[0x11; 32]); // random (no downgrade sentinel)
+        body.push(0x00); // empty session id
+        body.extend_from_slice(&[0xc0, 0x2f]); // ECDHE-RSA-AES128-GCM-SHA256
+        body.push(0x00); // null compression; no extensions
+        let mut hs = vec![0x02, 0x00, 0x00, body.len() as u8];
+        hs.extend_from_slice(&body);
+        let mut rec = vec![0x16, 0x03, 0x03, 0x00, hs.len() as u8];
+        rec.extend_from_slice(&hs);
+        let _ = s.write_all(&rec).await;
+        // …and nothing else: the rest of a TLS 1.2 handshake never comes.
+    })
+    .await;
+    let d = daemon_over(engine(env(
+        addr.port(),
+        &[("CA_FILE", ca_file.clone()), ("MIN_TLS", "1.3".into())],
+    )));
+    let (p, g) = both(&d).await;
+    assert_both(
+        &p,
+        &g,
+        errc::TLS_REFUSED,
+        branch::NON_RETRYABLE,
+        http_cause::TLS_VERSION,
+    );
+    let d = daemon_over(engine(env(addr.port(), &[("CA_FILE", ca_file)])));
+    one(&d, &post("api", b"x")).await.assert_error(
         errc::UPSTREAM_UNAVAILABLE,
         branch::RETRYABLE,
         http_cause::TLS_HANDSHAKE,
