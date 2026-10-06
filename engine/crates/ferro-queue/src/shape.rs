@@ -57,12 +57,24 @@ pub struct Statement {
 /// expression, and has exactly one key column, `id` (`INCLUDE` columns do not weaken uniqueness; a
 /// composite key such as `(id, queue)` does). Measured against PostgreSQL 16 for each of those cases
 /// and for a partitioned table's primary key.
+///
+/// **A unique index does not reach an inheritance child** (M7-G1b review F1), so the fourth cell says
+/// whether an ORDINARY table (`relkind` `r`) has any: `CREATE TABLE child () INHERITS (jobs)` leaves
+/// the parent's primary key in place, every statement without `ONLY` reaches the child's rows too, and
+/// measured on PostgreSQL 16 one ACK then deleted the same `(id, attempts, created_at)` from parent
+/// AND child. A PARTITIONED table (`p`) is exempt — its partitions are `pg_inherits` children, but
+/// PostgreSQL requires a unique index on a partitioned table to include every partition-key column,
+/// so a unique index on `id` ALONE means the table is partitioned by `id` and uniqueness holds across
+/// every partition (measured: a duplicate id across hash sub-partitions is refused, `PRIMARY KEY (id)`
+/// on a table partitioned by `queue` is refused, an index created `ON ONLY` the parent is invalid, and
+/// neither a partitioned table nor a partition can be an inheritance parent).
 pub const PG_RELATION_SQL: &str = "SELECT c.relkind::text, c.relnamespace::regnamespace::text, \
             (EXISTS (SELECT 1 FROM pg_index i \
                      JOIN pg_attribute ia ON ia.attrelid = i.indrelid AND ia.attnum = i.indkey[0] \
                      WHERE i.indrelid = c.oid AND i.indisunique AND i.indisvalid AND i.indimmediate \
                        AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indnkeyatts = 1 \
                        AND ia.attname = 'id'))::text, \
+            (c.relkind = 'r' AND EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = c.oid))::text, \
             a.attname::text, format_type(a.atttypid, NULL), \
             CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END \
      FROM pg_class c \
@@ -108,6 +120,8 @@ pub struct PgRelation {
     /// Whether `id` carries a single-column, valid, immediate, non-partial unique index (see
     /// [`PG_RELATION_SQL`]).
     pub id_unique: bool,
+    /// Whether an ordinary table has inheritance children (see [`PG_RELATION_SQL`]).
+    pub inheritance_children: bool,
     pub columns: Vec<ColumnRow>,
 }
 
@@ -119,22 +133,26 @@ impl PgRelation {
         let Some(first) = rows.first() else {
             return Ok(None);
         };
-        let (relkind, schema, id_unique) = match first.as_slice() {
-            [Value::Text(k), Value::Text(s), Value::Text(u), ..] => (
-                k.clone(),
-                s.clone(),
-                match u.as_str() {
-                    "true" => true,
-                    "false" => false,
-                    _ => return Err(()),
-                },
-            ),
+        let flag = |v: &str| match v {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(()),
+        };
+        let (relkind, schema, id_unique, inheritance_children) = match first.as_slice() {
+            [
+                Value::Text(k),
+                Value::Text(s),
+                Value::Text(u),
+                Value::Text(i),
+                ..,
+            ] => (k.clone(), s.clone(), flag(u)?, flag(i)?),
             _ => return Err(()),
         };
         let mut columns = Vec::with_capacity(rows.len());
         for row in rows {
             match row.as_slice() {
                 [
+                    Value::Text(_),
                     Value::Text(_),
                     Value::Text(_),
                     Value::Text(_),
@@ -151,6 +169,7 @@ impl PgRelation {
                     Value::Text(_),
                     Value::Text(_),
                     Value::Text(_),
+                    Value::Text(_),
                     Value::Null,
                     Value::Null,
                     Value::Text(_),
@@ -162,6 +181,7 @@ impl PgRelation {
             relkind,
             schema,
             id_unique,
+            inheritance_children,
             columns,
         }))
     }
@@ -213,6 +233,11 @@ pub enum ShapeError {
     IdNotUnique {
         table: String,
     },
+    /// An ordinary table with inheritance children (M7-G1b review F1): its unique index does not
+    /// reach the children's rows, which every statement also touches.
+    InheritanceChildren {
+        table: String,
+    },
 }
 
 impl ShapeError {
@@ -261,6 +286,12 @@ impl std::fmt::Display for ShapeError {
                  immediate, non-partial unique index on id alone; a fence over duplicate ids would \
                  match several rows)"
             ),
+            ShapeError::InheritanceChildren { table } => write!(
+                f,
+                "queue table {table} has inheritance children (CREATE TABLE … INHERITS): its unique \
+                 index on id does not cover their rows, which every queue statement also reaches, so \
+                 a fence could match several rows (a partitioned table is accepted)"
+            ),
         }
     }
 }
@@ -276,6 +307,9 @@ pub fn verify_pg(table: &TableName, relation: Option<&PgRelation>) -> Result<(),
             table: name,
             relkind: rel.relkind.clone(),
         });
+    }
+    if rel.inheritance_children {
+        return Err(ShapeError::InheritanceChildren { table: name });
     }
     for &(column, accepted, must_be_nullable) in PG_EXPECTED {
         let Some(row) = rel.columns.iter().find(|r| r.name == column) else {
@@ -334,6 +368,7 @@ mod tests {
             relkind: relkind.into(),
             schema: "public".into(),
             id_unique: true,
+            inheritance_children: false,
             columns,
         }
     }
@@ -481,6 +516,43 @@ mod tests {
         }
     }
 
+    /// Review F1: an ordinary table with inheritance children is refused, definitively, by name —
+    /// before its columns are read (the parent's columns are fine; the CHILDREN are the defect).
+    #[test]
+    fn an_ordinary_table_with_inheritance_children_is_refused() {
+        let mut r = rel("r", stock());
+        r.inheritance_children = true;
+        let err = verify_pg(&t(), Some(&r)).unwrap_err();
+        assert_eq!(
+            err,
+            ShapeError::InheritanceChildren {
+                table: "ferro_jobs".into()
+            }
+        );
+        assert!(err.is_definitive());
+        assert!(err.to_string().contains("inheritance children"), "{err}");
+        // The catalog cell is gated on relkind 'r' (a partitioned table's partitions are
+        // pg_inherits children too) and the flag parses from the fourth cell.
+        assert!(PG_RELATION_SQL.contains(
+            "(c.relkind = 'r' AND EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = c.oid))"
+        ));
+        let rows = vec![vec![
+            txt("r"),
+            txt("app"),
+            txt("true"),
+            txt("true"),
+            txt("id"),
+            txt("bigint"),
+            txt("NO"),
+        ]];
+        assert!(
+            PgRelation::from_rows(&rows)
+                .unwrap()
+                .unwrap()
+                .inheritance_children
+        );
+    }
+
     #[test]
     fn reserved_at_must_be_nullable_and_no_relation_is_an_absent_table() {
         let mut rows = stock();
@@ -549,6 +621,7 @@ mod tests {
                 txt("r"),
                 txt("app"),
                 txt("true"),
+                txt("false"),
                 txt("id"),
                 txt("bigint"),
                 txt("NO"),
@@ -557,6 +630,7 @@ mod tests {
                 txt("r"),
                 txt("app"),
                 txt("true"),
+                txt("false"),
                 txt("reserved_at"),
                 txt("integer"),
                 txt("YES"),
@@ -585,6 +659,7 @@ mod tests {
             txt("v"),
             txt("app"),
             txt("false"),
+            txt("false"),
             Value::Null,
             Value::Null,
             txt("YES"),
@@ -595,6 +670,7 @@ mod tests {
                 relkind: "v".into(),
                 schema: "app".into(),
                 id_unique: false,
+                inheritance_children: false,
                 columns: vec![]
             }))
         );
@@ -604,6 +680,7 @@ mod tests {
                 txt("r"),
                 txt("a"),
                 txt("t"),
+                txt("false"),
                 txt("id"),
                 txt("bigint"),
                 txt("NO")
@@ -616,6 +693,7 @@ mod tests {
                 Value::Null,
                 txt("a"),
                 txt("true"),
+                txt("false"),
                 txt("id"),
                 txt("bigint"),
                 txt("NO")

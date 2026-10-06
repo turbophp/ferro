@@ -13,9 +13,16 @@
 //!
 //! Every verb computes `now` ONCE, as integer seconds on the DATABASE's clock, in its first statement:
 //! [`NOW_CTE`], `floor(extract(epoch FROM statement_timestamp()))::bigint` — statement time, not the
-//! wall-clock `clock_timestamp()`. On PostgreSQL every autocommit verb is ONE statement, so "the first
-//! statement" is the statement, and every rule below reads `n.s`. `MATERIALIZED` makes the CTE an
-//! optimisation fence: `n` is evaluated once and every reference reads the same row.
+//! wall-clock `clock_timestamp()`. On PostgreSQL every autocommit verb is ONE statement per unit of
+//! work, so "the first statement" is the statement, and every rule below reads `n.s`. `MATERIALIZED`
+//! makes the CTE an optimisation fence: `n` is evaluated once and every reference reads the same row.
+//! **The one multi-statement verb is a multi-queue RESERVE**, and it is NOT one unit (SPEC §24.3 as
+//! amended at the G1b review, F3): the queues are tried in order, one [`reserve`] statement each, and
+//! the FIRST that reserves anything answers alone (§24.4) — so each queue's statement is its own
+//! unit with its own `now`, every job in a reply was reserved by one statement under one `now`, and a
+//! later queue's statement reads a later clock (which can only make more jobs available, never
+//! fewer, and is never early). No `now` is bound across them: an empty statement would have to
+//! report its `now`, restructuring the one statement §24.4 writes verbatim.
 //!
 //! # The rounding rules (§24.3, normative)
 //!

@@ -641,6 +641,107 @@ async fn a_table_whose_id_is_not_unique_is_refused() {
         }
         w.drop_schema().await;
     }
+
+    // An INVALID unique index (review RV3): a `CREATE UNIQUE INDEX CONCURRENTLY` that FAILED on
+    // duplicate ids leaves an index in the catalog that enforces nothing — `indisvalid` is what
+    // refuses it.
+    let Some(mut w) = World::new("invalid", &[]).await else {
+        return;
+    };
+    w.exec(&format!(
+        "ALTER TABLE {t} DROP CONSTRAINT ferro_jobs_pkey; \
+         INSERT INTO {t} (id, queue, payload, attempts, available_at, created_at) \
+         VALUES (7, 'other', 'a', 0, 0, 0), (7, 'other', 'b', 0, 0, 0)",
+        t = w.table
+    ))
+    .await;
+    let failed = w
+        .raw
+        .batch_execute(&format!(
+            "CREATE UNIQUE INDEX CONCURRENTLY ferro_jobs_id_cc ON {} (id)",
+            w.table
+        ))
+        .await;
+    assert!(
+        failed.is_err(),
+        "the concurrent build must fail on the duplicates"
+    );
+    let valid: bool = w
+        .raw
+        .query_one(
+            &format!(
+                "SELECT indisvalid FROM pg_index WHERE indexrelid = '{}.ferro_jobs_id_cc'::regclass",
+                w.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        !valid,
+        "premise: the failed build left an INVALID index behind"
+    );
+    let ep =
+        w.c.err(method_queue::SIZE, scope_req("default", None))
+            .await;
+    assert!(ep.message.contains("column id is not unique"), "{ep:?}");
+    w.drop_schema().await;
+}
+
+/// Review F1: a unique index does not reach an INHERITANCE child, and every queue statement (no
+/// `ONLY`) reaches the child's rows — measured, one ACK deleted the same `(id, attempts,
+/// created_at)` from parent AND child. An ordinary table with inheritance children is refused before
+/// any verb runs, naming the reason; the parent's own primary key does not save it. (A partitioned
+/// table, whose partitions are `pg_inherits` children too, passes: `queue_g1a_it`'s
+/// `a_view_is_refused_and_a_partitioned_table_passes`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ordinary_table_with_inheritance_children_is_refused() {
+    let Some(mut w) = World::new("inherits", &[]).await else {
+        return;
+    };
+    w.exec(&format!(
+        "CREATE TABLE {s}.ferro_jobs_child () INHERITS ({t}); \
+         INSERT INTO {s}.ferro_jobs_child (id, queue, payload, attempts, available_at, created_at) \
+         VALUES (1, 'default', 'child', 0, 0, 0)",
+        s = w.schema,
+        t = w.table
+    ))
+    .await;
+    for (method, body) in [
+        (method_queue::SIZE, scope_req("default", None)),
+        (method_queue::RESERVE, reserve_req(&["default"], 1, None)),
+        (method_queue::CLEAR, scope_req("default", None)),
+        (
+            method_queue::ENQUEUE,
+            enqueue_req(&[("default", "{}", 0)], None),
+        ),
+    ] {
+        let ep = w.c.err(method, body).await;
+        assert_eq!(ep.code, errc::UNSUPPORTED, "{ep:?}");
+        assert!(
+            ep.message.contains("has inheritance children"),
+            "{method}: {}",
+            ep.message
+        );
+    }
+    // Nothing ran: the child's row is untouched and the parent is empty.
+    let child: i64 = w
+        .raw
+        .query_one(
+            &format!("SELECT count(*) FROM ONLY {}.ferro_jobs_child", w.schema),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(child, 1);
+    assert_eq!(
+        w.count().await,
+        1,
+        "the parent scan (with the child) still sees one row"
+    );
+    w.drop_schema().await;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -959,7 +1060,9 @@ async fn size_counts_by_state_and_clear_deletes_one_queue() {
 }
 
 /// RESERVE serves its queues in priority order and answers from the FIRST queue that has a job — so a
-/// reply's jobs all come from one queue — and FIFO by id within it.
+/// reply's jobs all come from one queue — and FIFO by id within it. Each queue's statement is its own
+/// unit with its own `now` (SPEC §24.3 as amended at the G1b review, F3): a reply's jobs all come from
+/// ONE statement, so they share one `now` — one `lease_deadline`, one `reserved_at`.
 #[tokio::test]
 async fn reserve_serves_the_first_non_empty_queue_in_priority_order() {
     let Some(mut w) = World::new("prio", &[]).await else {
@@ -972,6 +1075,10 @@ async fn reserve_serves_the_first_non_empty_queue_in_priority_order() {
         jobs.iter().map(id_of).collect::<Vec<_>>(),
         vec![d1, d2],
         "high is empty, so default answers"
+    );
+    assert_eq!(
+        jobs[0].lease_deadline, jobs[1].lease_deadline,
+        "one statement, one now"
     );
     let h = w.c.enqueue_one("high", "h").await;
     let d3 = w.c.enqueue_one("default", "d3").await;

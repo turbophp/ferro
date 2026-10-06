@@ -1295,6 +1295,75 @@ mod tests {
         );
     }
 
+    /// A two-queue RESERVE on a one-connection `FakeBackend` pool whose every statement answers no
+    /// rows — so, unguarded, the verb would run BOTH queues' statements and answer `Ok(empty)`.
+    async fn two_queue_reserve(
+        deadline: Option<tokio::time::Instant>,
+        cancel: &CancellationToken,
+    ) -> Result<VerbOk, ErrorPayload> {
+        use ferro_pool::config::PoolConfig;
+        use ferro_pool::fake::FakeBackend;
+        let backend = FakeBackend::new();
+        backend.set_query_result(QueryResult::default());
+        let pool = Pool::new(
+            backend,
+            PoolConfig {
+                max_size: 1,
+                reap_interval: None,
+                ..PoolConfig::default()
+            },
+        );
+        let mut co = pool.checkout().await.expect("checkout");
+        let req = QueueRequest::Reserve(ReserveRequest {
+            store: "jobs".into(),
+            queues: vec!["high".into(), "default".into()],
+            max_jobs: 1,
+            wait_ms: 0,
+            liveness: false,
+            common: QueueCommon::default(),
+        });
+        let mut exec_us = 0;
+        run_pg_verb(&mut co, &req, &store(), deadline, cancel, &mut exec_us).await
+    }
+
+    /// Review F2 (mutation T7): a CANCEL that arrived before a statement is SENT answers the verb
+    /// unsent — a known non-execution (`Retryable{ConnectionLost}`), never `Indeterminate` and never
+    /// a statement sent after the client gave up.
+    #[tokio::test]
+    async fn a_cancel_before_the_statement_is_sent_answers_unsent() {
+        let cancel = CancellationToken::new();
+        let control = two_queue_reserve(None, &cancel).await;
+        assert!(
+            matches!(control, Ok(VerbOk::Reserve(ref j)) if j.is_empty()),
+            "control: an uncancelled RESERVE runs both queues and answers empty"
+        );
+        cancel.cancel();
+        let ep = two_queue_reserve(None, &cancel)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a cancelled RESERVE must not answer Ok"));
+        assert_ne!(ep.branch, ferro_proto::consts::branch::INDETERMINATE);
+        assert_eq!(
+            (ep.code, ep.branch),
+            (errc::CONNECTION_LOST, errc::CONNECTION_LOST_BRANCH),
+            "{ep:?}"
+        );
+    }
+
+    /// Review F2 (mutation T8): a request whose deadline has already passed sends no statement and
+    /// answers `PoolTimeout` — a write is never dispatched with no time left (which could only end
+    /// `Indeterminate`).
+    #[tokio::test]
+    async fn no_time_left_answers_pool_timeout_unsent() {
+        let past = tokio::time::Instant::now() - Duration::from_millis(5);
+        let ep = two_queue_reserve(Some(past), &CancellationToken::new())
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("an expired deadline must not answer Ok"));
+        assert_eq!(ep.code, errc::POOL_TIMEOUT, "{ep:?}");
+        assert_ne!(ep.branch, ferro_proto::consts::branch::INDETERMINATE);
+    }
+
     /// One request of every verb, autocommit.
     fn every_verb() -> Vec<QueueRequest> {
         let token = Token::from_pg(1, 1).encode().to_vec();
