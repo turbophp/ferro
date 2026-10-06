@@ -195,6 +195,13 @@ final class HttpFateTest extends TestCase
         $this->assertInstanceOf(CancelledException::class, $e);
         $this->assertSame(C::HTTP_CAUSE_CANCELLED, $e->cause());
         $this->assertSame(FateClass::NonRetryable, $e->fate());
+        // It keeps the head it was cancelled after (review LOW): applied, if that was a 2xx.
+        $this->assertSame(200, $e->head()?->status);
+        $this->assertTrue($e->wasApplied());
+        $before = HttpFates::fromOutcome(Outcome::cancelled(), null);
+        $this->assertInstanceOf(HttpCancelledException::class, $before);
+        $this->assertNull($before->head());
+        $this->assertNull($before->wasApplied(), 'never false');
     }
 
     public function testATerminalWithoutACauseIsNotAnExchangeFate(): void

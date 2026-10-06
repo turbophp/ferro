@@ -511,11 +511,11 @@ final class Transport implements DuplexTransportInterface, FdReceivingTransportI
         $deadline = microtime(true) + $this->readTimeout;
         while ($written < $len) {
             $this->assertOpen('write');
-            if (stream_get_meta_data($this->sock)['unread_bytes'] > 0) {
-                $onReadable(); // already in PHP's buffer: select would not report it
-                continue;
-            }
-            [$readable, $writable] = $this->selectReadWrite(max(0.0, $deadline - microtime(true)));
+            // Bytes already in PHP's read buffer are invisible to select: if the socket will not
+            // take ours, those are what we read first. Never read while the write can progress.
+            $buffered = stream_get_meta_data($this->sock)['unread_bytes'] > 0;
+            [$readable, $writable] = $this->selectReadWrite($buffered ? 0.0 : max(0.0, $deadline - microtime(true)));
+            $readable = $readable || $buffered;
             if ($writable) {
                 stream_set_blocking($this->sock, false);
                 try {

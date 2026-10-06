@@ -588,7 +588,8 @@ The client does not know the upstream's configuration. Before `HEAD`, it counts 
 
 - *The table is implemented as written, with one change of label: **a client-synthesised cause is `link_lost`, never `engine_restart`.** The client can tell a restart from a lost link only by reconnecting and comparing `boot_epoch`, and the HTTP path re-sends nothing, so it never reconnects to learn it. Every client-synthesised failure is `clientSynthesised()`, with `cause()` = `link_lost`, which is not an `[http.causes]` token.*
 - ***Deadline expiry follows D1c's wait, not the sentence above.** Past `timeout_ms` + 2 s the client sends `CANCEL` and waits one liveness interval for the ENGINE's terminal, which decides the fate exactly; only if none arrives does the session close, and then every request on it takes this table's cell. Failing the request locally at expiry would have to guess, where the engine knows. Cost: a declared-idempotent request whose backstop fires surfaces as the engine's answer to a `CANCEL` (`Cancelled`), not as a `timeout`. This happens only when the engine has been silent for 2 s past its own deadline; normally the engine answers at `timeout_ms` itself.*
-- *"Never re-issues" is pinned by chaos 8 (§23.14) under `Ferro::connect`'s reconnect loop and default retry policy.]*
+- *"Never re-issues" is pinned by chaos 8 (§23.14) under `Ferro::connect`'s reconnect loop and default retry policy.*
+- ***The backstop runs only until the HEAD, and only on silence** (review round, §22.2 (dd)). A request's client deadline ends when its HEAD is filed: from then on the engine bounds the exchange and PING liveness bounds a dead engine. An expired deadline is acted on only when nothing is readable, so an answer already waiting is read first. The first version measured the consumer's wall time, and a slow reader of a completed stream closed the session under every other request.]*
 
 #### 23.7.4 Status codes are not transport errors (decided)
 
@@ -981,7 +982,8 @@ $s->close();                                 // CANCEL + drain: the RawStream co
 - ***Exclusivity is lifted in both directions.** An HTTP request may be sent while a SQL stream is open, and an open HTTP stream never blocks SQL or other HTTP. A SQL stream stays exclusive against SQL requests.*
 - ***Fiber suspension happens per frame,** not only until the head. A body read under `Ferro\Loop` or the Revolt adapter lets other Fibers run between chunks.*
 - ***Abandonment.** `close()`, an early exit from `foreach`, or a buffered read that fails part-way sends `CANCEL` and drains to the terminal. A stream or Future that is dropped instead sends `CANCEL` and discards, without blocking.*
-- ***Refused before sending:** an engine without the `HTTP` feature bit (`Unsupported`), and a frame over the cap (`RequestTooLargeException`).]*
+- ***Refused before sending:** an engine without the `HTTP` feature bit (`Unsupported`), and a frame over the cap (`RequestTooLargeException`).*
+- ***Review round (§22.2 (dd)):** a buffered request returns its credit as its frames are filed, half a window at a time. It therefore holds its whole body as it arrives, not one window. When every in-flight slot is a stream parked on credit, the next request is refused (`InFlightLimitException`, Retryable, not sent) instead of blocking. The client keeps reading while a write cannot progress (full duplex): `ferrod`'s session reader stops reading while its writer is full, and a client that only wrote deadlocked against it. A HEAD whose status is not an HTTP status fails only its exchange.]*
 
 #### 23.11.2 The Guzzle handler (`ferro/guzzle`)
 

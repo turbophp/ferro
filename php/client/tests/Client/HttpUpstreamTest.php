@@ -210,6 +210,7 @@ final class HttpUpstreamTest extends TestCase
         $session = $conn->session();
         $this->assertInstanceOf(Session::class, $session);
         $this->assertFalse($session->isPending(1), 'drained to its terminal');
+        $this->assertFalse($session->hasRequestsInFlight(), 'its terminal was READ, not left to arrive (the drain, not a discard)');
         $this->assertTrue($s->isClosed());
         $this->assertFalse($s->isComplete());
         // The C1d lesson: the abandoned exchange must not damage the NEXT request.
@@ -777,5 +778,61 @@ final class HttpUpstreamTest extends TestCase
         $this->assertFalse($session->isPending(1), 'discarded');
         $inner->feed(F::body(1, 'late') . F::cancelled(1) . self::sqlOk(3, 6));
         $this->assertSame(6, $conn->scalar('SELECT 6'), 'its late frames were thrown away');
+    }
+
+    /**
+     * The same, when ONLY the stream's generator is collected (the stream object itself is still
+     * held), so it is the generator's `finally` — not the stream's destructor — that abandons the
+     * exchange: `abandonHttp` itself must see the read in progress and only discard.
+     */
+    public function testAGeneratorCollectedMidReadOnlyDiscards(): void
+    {
+        $inner = new FakeTransport();
+        $hooked = new class ($inner) implements TransportInterface {
+            public ?\Closure $onPayloadRead = null;
+
+            public function __construct(public readonly FakeTransport $inner) {}
+
+            public function readExact(int $n): string
+            {
+                $bytes = $this->inner->readExact($n);
+                if ($n !== 16 && $this->onPayloadRead !== null) {
+                    $hook = $this->onPayloadRead;
+                    $this->onPayloadRead = null;
+                    $hook();
+                }
+                return $bytes;
+            }
+
+            public function writeAll(string $bytes): void { $this->inner->writeAll($bytes); }
+
+            public function close(): void { $this->inner->close(); }
+        };
+        $inner->feed(F::helloAck());
+        $session = new Session($hooked, new RequestIdAllocator(0));
+        $session->hello();
+        $conn = new Connection($session, 'default');
+        $inner->feed(F::head(1) . F::body(1, 'one'));
+        $s = $conn->upstream('up')->stream('GET', '/s');
+        $it = $s->getIterator();
+        $this->assertSame('one', $it->current());
+        $cycle = new \stdClass();
+        $cycle->self = $cycle;
+        $cycle->it = $it;
+        unset($it, $cycle); // the generator alone is garbage; $s is still held
+
+        $inner->feed(self::sqlOk(2, 5));
+        $f = $conn->scalarAsync('SELECT 5');
+        $writesBefore = $inner->writeCalls;
+        $writesDuringRead = null;
+        $hooked->onPayloadRead = static function () use ($inner, &$writesDuringRead, &$writesBefore): void {
+            gc_collect_cycles();
+            $writesDuringRead = $inner->writeCalls - $writesBefore;
+        };
+        $this->assertSame(5, $f->await(), 'the outer read was not disturbed');
+        $this->assertSame(0, $writesDuringRead, 'nothing was written in the middle of the read');
+        $this->assertSame([1], F::cancels($inner->written), 'the CANCEL followed the read');
+        $this->assertTrue($s->isClosed());
+        $this->assertFalse($session->isPoisoned());
     }
 }
