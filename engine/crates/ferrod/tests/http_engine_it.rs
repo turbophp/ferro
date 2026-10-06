@@ -2694,19 +2694,21 @@ async fn lifetime_idle_limit_and_the_keep_alive_clamp_each_retire_a_connection()
     let e = engine_for(vars(&[
         ("FERRO_UPSTREAMS", "life,idle,ka".into()),
         ("FERRO_UPSTREAM_LIFE_ORIGIN", origin(addr)),
-        ("FERRO_UPSTREAM_LIFE_MAX_LIFETIME_MS", "250".into()),
+        ("FERRO_UPSTREAM_LIFE_MAX_LIFETIME_MS", "600".into()),
         ("FERRO_UPSTREAM_IDLE_ORIGIN", origin(addr)),
         ("FERRO_UPSTREAM_IDLE_IDLE_TIMEOUT_MS", "200".into()),
         ("FERRO_UPSTREAM_KA_ORIGIN", origin(ka)),
     ]));
     let get = |u: &str| idempotent_get(u);
-    // Lifetime: requests 100 ms apart (never idle long); retired once older than 250 ms.
+    // Lifetime: requests 150 ms apart (never idle long; the idle limit defaults to 15 s); reused
+    // while younger than 600 ms, retired once older. The margins are ~300 ms on each side so a
+    // loaded runner cannot push a reuse past the lifetime (review round 2).
     let l0 = conn_of(on_engine(&e, &get("life"), None).await);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(conn_of(on_engine(&e, &get("life"), None).await), l0);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(conn_of(on_engine(&e, &get("life"), None).await), l0);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
     assert_ne!(
         conn_of(on_engine(&e, &get("life"), None).await),
         l0,

@@ -262,4 +262,109 @@ mod tests {
         assert!(!s.sent(), "arming starts the exchange's counts at zero");
         assert_eq!(s.written_armed(), 0);
     }
+
+    /// Writes are HELD (pending) until `open`; reads deliver `head` only after the first write
+    /// attempt, so a head arrives while the request is still buffered inside `hyper`.
+    struct HeldWrites {
+        head: Option<&'static [u8]>,
+        open: Arc<AtomicBool>,
+        waker: Arc<Mutex<Option<std::task::Waker>>>,
+        tried: AtomicBool,
+    }
+    impl AsyncRead for HeldWrites {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.tried.load(Ordering::SeqCst)
+                && let Some(h) = self.head.take()
+            {
+                buf.put_slice(h);
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
+        }
+    }
+    impl AsyncWrite for HeldWrites {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            b: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.open.load(Ordering::SeqCst) {
+                return Poll::Ready(Ok(b.len()));
+            }
+            *self.waker.lock().unwrap() = Some(cx.waker().clone());
+            if !self.tried.swap(true, Ordering::SeqCst) {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// **Why `sent` is read only after the connection task is aborted and awaited (§23.7.1,
+    /// review round 2 on R8).** `hyper` 1.11.1 delivers a head-read error to the request's future
+    /// and then KEEPS FLUSHING the buffered request: `close()` after the error
+    /// (`proto/h1/dispatch.rs` 334–341) does not stop the same loop's `poll_flush`, and
+    /// `Buffered::poll_shutdown` (`proto/h1/io.rs` 330) flushes before shutting down. So at the
+    /// moment the error is seen `sent` can be false, and become true afterwards if the task is left
+    /// running — a read taken before the discard could report a POST that reached the upstream as
+    /// unsent (Retryable), against charter rule 3. This pins the `hyper` premise the engine's
+    /// discard-first rule rests on; if a `hyper` upgrade stops flushing, this fails and the rule's
+    /// stated reason must be re-derived (the rule itself stays).
+    #[tokio::test]
+    async fn hyper_keeps_writing_the_request_after_delivering_a_head_error() {
+        let open = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(Mutex::new(None));
+        let io = HeldWrites {
+            head: Some(b"garbage garbage\r\n\r\n"),
+            open: open.clone(),
+            waker: waker.clone(),
+            tried: AtomicBool::new(false),
+        };
+        let (t, s) = Tracker::new(io);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<
+            _,
+            crate::engine::body::OneChunk,
+        >(hyper_util::rt::TokioIo::new(t))
+        .await
+        .unwrap();
+        let task = tokio::spawn(conn);
+        s.arm();
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "x")
+            .header("content-length", "6")
+            .body(crate::engine::body::OneChunk::new(
+                bytes::Bytes::from_static(b"charge"),
+            ))
+            .unwrap();
+        let err = sender
+            .try_send_request(req)
+            .await
+            .expect_err("a malformed head is an error");
+        assert!(
+            err.message().is_none(),
+            "the request was dispatched, not handed back"
+        );
+        assert!(!s.sent(), "nothing had left when the error was delivered");
+        // Release the held writes without aborting the connection task: hyper flushes the request.
+        open.store(true, Ordering::SeqCst);
+        if let Some(w) = waker.lock().unwrap().take() {
+            w.wake();
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        assert!(
+            s.sent(),
+            "hyper wrote the request after the head error had been delivered"
+        );
+    }
 }
