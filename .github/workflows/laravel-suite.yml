@@ -1,33 +1,38 @@
 # The M2 / C2 measurement lane: run the CURATED laravel/framework database subset
-# (testkit/laravel-suite.sh) against PostgreSQL, TWICE (the two-run reproducibility rule — the
-# result line AND the ordered failure set must not differ between runs), and upload both logs.
+# (testkit/laravel-suite.sh) against every Laravel family Ferro registers — PostgreSQL, MySQL,
+# MariaDB and SQLite — each column TWICE (the two-run reproducibility rule: the same tests with the
+# same outcomes, as sets), then hold every Ferro column to SPEC D18 against its control, and upload
+# every log.
 #
-# TWO COLUMNS, because the recorded number depends on which Illuminate `driver` NAME the application
-# registers Ferro under, and both names are real product configurations:
-#   ferro-pgsql — §15's one-word config change. The default.
-#   pgsql       — the same engine under the stock name, via `FerroConnections::register()`'s opt-in
-#                 alias. Nine of upstream's own cases gate their assertions or their skip on
-#                 `$this->driver` being `pgsql`, so the alias column is higher for a reason that is
-#                 about the harness, not about the engine. Recording one column alone would hide
-#                 that either way.
-#   stock-pgsql — THE CONTROL: upstream's own pdo_pgsql against the same server, no Ferro anywhere.
-#                 It is what makes a non-pass triageable — "is this ours, or this framework/server
-#                 pair's?" — instead of guessed at, and it earned its place before it was built (two
-#                 SchemaBuilderSchemaNameTest cases looked like a Ferro schema gap and reproduce
-#                 identically through stock PDO). Its contact assertion INVERTS: it refuses to run
-#                 if the connection turns out to be a Ferro one.
+# THREE COLUMNS PER FAMILY, because the recorded number depends on which Illuminate `driver` NAME
+# the application registers Ferro under, and both names are real product configurations:
+#   ferro-<family> — §15's one-word config change. The default.
+#   <family>       — the same engine under the stock name, via `FerroConnections::register()`'s
+#                    opt-in alias. Upstream's own cases gate their assertions or their skip on
+#                    `$this->driver`, so the alias column is what shows those are name artifacts
+#                    rather than engine behaviour (§22.2 (am), (ar)).
+#   stock-<family> — THE CONTROL: upstream's own pdo_* against the same server, no Ferro anywhere.
+#                    It is what makes a non-pass triageable — "is this ours, or this framework/server
+#                    pair's?" — instead of guessed at. Its contact assertion INVERTS: it refuses to
+#                    run if the connection turns out to be a Ferro one.
 #
-# ON DEMAND ONLY (workflow_dispatch), for the same reason as the dbal-suite lane: the bar is "green
-# modulo a recorded, triaged allow-list", so a red phpunit exit here is DATA to record, not a build
-# failure. Putting it on every push would either gate merges on a bar M2 has not reached or train
-# everyone to ignore a red check. The job FAILS only when a run died before producing a phpunit
-# result line — the contact assertion, the base-class patch check, or a ferrod that never came up.
-# That is the silent-no-op class the runner exists to refuse.
+# THE D18 GATE (E9, SPEC §22.2 (da)). SPEC D18 calls a suite column green when it has PARITY with a
+# stock-driver control: every test the control passes passes through Ferro, the skip sets match or
+# each difference is driver-name gated, and every Ferro-only non-pass is triaged as a driver-name
+# artifact or a documented incompatibility. Each family's job runs
+# `testkit/dbal/compare-columns.php --triage testkit/laravel/triage.txt` on every Ferro column against
+# its control and FAILS on a Ferro-only non-pass the triage file does not explain. A red phpunit exit
+# is otherwise DATA, not a failure: a column whose every difference is triaged ends red in phpunit
+# and green here. The job also fails when a run died before producing a result line (the contact
+# assertion, the base-class patch check, a ferrod that never came up) or when a column's run 2
+# differs from its run 1.
 #
-# PostgreSQL (job `measure`) and the MySQL family (job `measure-mysql`, M2-C1f: MySQL 8.4 and
-# MariaDB 11.8, under `ferro-mysql` and `ferro-mariadb` respectively) run here. SQLite needs no server and is measured in the
-# dev container (docs/laravel-suite/2026-09-15-c3-6b-sqlite-results.md). Report which columns ran
-# and which could not — never restate the bar as if met.
+# ON DEMAND ONLY (workflow_dispatch), for the same reason as the dbal-suite lane: the bar is measured
+# and recorded, not gated on every push.
+#
+# SQLITE RUNS HERE TOO (E9). It needs no server — ferrod opens a file — so until E9 it was measured
+# only in the dev container (§22.3 says so). Its job mirrors the others; the control starts NO ferrod
+# at all and opens the same file through pdo_sqlite.
 name: laravel-suite
 on:
   workflow_dispatch:
@@ -35,7 +40,7 @@ on:
       family:
         description: which family's columns to measure
         type: choice
-        options: [all, pg, mysql]
+        options: [all, pg, mysql, sqlite]
         default: all
 
 jobs:
@@ -43,6 +48,9 @@ jobs:
     if: inputs.family == 'all' || inputs.family == 'pg'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      FERRO_LARAVEL_SVC: pg
+      FERRO_LARAVEL_DSN: "postgres://ferro:ferro@127.0.0.1:55432/laravel_tests?options=-csearch_path%3Dpublic,my_schema"
     steps:
       - uses: actions/checkout@v4
       - uses: shivammathur/setup-php@v2
@@ -61,9 +69,8 @@ jobs:
           set -o pipefail +e
           for drv in ferro-pgsql pgsql stock-pgsql; do
             for run in 1 2; do
-              FERRO_LARAVEL_DRIVER="$drv" FERRO_LARAVEL_SVC=pg \
-                FERRO_LARAVEL_DSN="postgres://ferro:ferro@127.0.0.1:55432/laravel_tests?options=-csearch_path%3Dpublic,my_schema" \
-                bash testkit/laravel-suite.sh 2>&1 | tee "$drv-run$run.log"
+              FERRO_LARAVEL_DRIVER="$drv" \
+                bash testkit/laravel-suite.sh --log-junit "$drv-run$run.xml" 2>&1 | tee "$drv-run$run.log"
               echo "phpunit exit: $?"
             done
           done
@@ -76,59 +83,87 @@ jobs:
           set -o pipefail +e
           for drv in pgsql stock-pgsql; do
             for run in 1 2; do
-              FERRO_LARAVEL_ALLOWLIST="$PWD/testkit/laravel/allowlist-postgres.txt" \
-                FERRO_LARAVEL_DRIVER="$drv" FERRO_LARAVEL_SVC=pg \
-                FERRO_LARAVEL_DSN="postgres://ferro:ferro@127.0.0.1:55432/laravel_tests?options=-csearch_path%3Dpublic,my_schema" \
-                bash testkit/laravel-suite.sh 2>&1 | tee "pg-specific-$drv-run$run.log"
+              FERRO_LARAVEL_ALLOWLIST="$PWD/testkit/laravel/allowlist-postgres.txt" FERRO_LARAVEL_DRIVER="$drv" \
+                bash testkit/laravel-suite.sh --log-junit "spec-$drv-run$run.xml" 2>&1 | tee "spec-$drv-run$run.log"
               echo "phpunit exit: $?"
             done
           done
       # The lane's OWN pass/fail: a run that never produced a result line did not measure anything.
-      # A red phpunit exit is data; a missing result line is a broken lane.
-      - name: assert every run actually measured
+      - name: assert every run actually measured, under the name it claims
         run: |
-          for f in ferro-pgsql-run1.log ferro-pgsql-run2.log pgsql-run1.log pgsql-run2.log \
-                   stock-pgsql-run1.log stock-pgsql-run2.log \
-                   pg-specific-pgsql-run1.log pg-specific-pgsql-run2.log \
-                   pg-specific-stock-pgsql-run1.log pg-specific-stock-pgsql-run2.log; do
-            grep -qE '^(OK|FAILURES!|ERRORS!|Tests: )' "$f" \
-              || { echo "::error:: $f has no phpunit result line — the run died before measuring"; tail -40 "$f"; exit 1; }
-            grep -q '\[ferro\] connection=' "$f" \
-              || { echo "::error:: $f is missing the contact assertion line — it may not have reached Ferro"; exit 1; }
-            grep -q '\[ferro\] reset: ' "$f" \
-              || { echo "::error:: $f has no reset line — a number from an un-reset database is not reproducible"; exit 1; }
+          rc=0
+          for f in ferro-pgsql pgsql stock-pgsql spec-pgsql spec-stock-pgsql; do
+            for run in 1 2; do
+              l="$f-run$run.log"
+              grep -qE '^(OK|FAILURES!|ERRORS!|Tests: )' "$l" \
+                || { echo "::error:: $l has no phpunit result line — the run died before measuring"; tail -40 "$l"; rc=1; }
+              grep -q "\[ferro\] connection=.* driver=${f#spec-} " "$l" \
+                || { echo "::error:: $l did not run under driver ${f#spec-}"; rc=1; }
+              grep -q '\[ferro\] reset: ' "$l" \
+                || { echo "::error:: $l has no reset line — a number from an un-reset database is not reproducible"; rc=1; }
+              [ -s "$f-run$run.xml" ] || { echo "::error:: $f-run$run.xml is missing or empty"; rc=1; }
+            done
           done
-          # And the column really ran under the name it claims: the contact assertion echoes the
-          # driver it resolved through, so a broken FERRO_LARAVEL_DRIVER cannot silently produce two
-          # copies of the same column.
-          grep -q '\[ferro\] connection=.* driver=ferro-pgsql ' ferro-pgsql-run1.log \
-            || { echo "::error:: the ferro-pgsql column did not run under that driver name"; exit 1; }
-          grep -q '\[ferro\] connection=.* driver=pgsql ' pgsql-run1.log \
-            || { echo "::error:: the pgsql column did not run under that driver name"; exit 1; }
-          # The CONTROL must have reached the STOCK connection class. This is the inverse assertion,
-          # checked again here in the lane itself: a control that silently ran through Ferro would
-          # report Ferro's behaviour as upstream's baseline, which is worse than having no baseline.
-          grep -q '\[ferro\] connection=Illuminate.Database.PostgresConnection driver=stock-pgsql ' stock-pgsql-run1.log \
-            || { echo "::error:: the control column did not resolve the STOCK PostgresConnection"; exit 1; }
+          # The CONTROL must have reached the STOCK connection class — the inverse assertion, checked
+          # again in the lane itself — and the Ferro column the Ferro one.
+          for f in stock-pgsql spec-stock-pgsql; do
+            grep -q '\[ferro\] connection=Illuminate.Database.PostgresConnection driver=stock-pgsql ' "$f-run1.log" \
+              || { echo "::error:: $f did not resolve the STOCK PostgresConnection"; rc=1; }
+          done
+          grep -q '\[ferro\] connection=Ferro.Laravel.FerroPostgresConnection driver=ferro-pgsql ' ferro-pgsql-run1.log \
+            || { echo "::error:: the ferro-pgsql column did not resolve FerroPostgresConnection"; rc=1; }
+          exit $rc
+      - name: each column's run 2 equals its run 1
+        run: |
+          set -o pipefail   # an unspecified `shell:` is `bash -e` without it, so `php | tee` would hide php's status
+          rc=0
+          for f in ferro-pgsql pgsql stock-pgsql spec-pgsql spec-stock-pgsql; do
+            echo "== $f"
+            php testkit/dbal/compare-columns.php "$f-run2.xml" "$f-run1.xml" --repro | tee "repro-$f.txt" || rc=1
+          done
+          exit $rc
+      - name: D18 — each Ferro column against its control, every Ferro-only non-pass triaged
+        if: always()
+        run: |
+          set -o pipefail
+          rc=0
+          up=.laravel-suite/laravel-v11.51.0
+          for pair in "ferro-pgsql stock-pgsql pg-ferro-pgsql" "pgsql stock-pgsql pg-pgsql" \
+                      "spec-pgsql spec-stock-pgsql pg-specific-pgsql"; do
+            set -- $pair
+            echo "== laravel-$3: $1 vs $2"
+            php testkit/dbal/compare-columns.php "$1-run1.xml" "$2-run1.xml" \
+              --triage testkit/laravel/triage.txt --column "laravel-$3" --upstream "$up" || rc=1
+          done > d18.txt 2>&1
+          # Into a file, then printed: `done | tee` would run the loop in a subshell, and `rc` —
+          # with it every column's verdict but the last — would never reach this `exit`.
+          cat d18.txt
+          exit $rc
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "## laravel-suite · PostgreSQL"
+            echo '```'
+            for l in *-run1.log *-run2.log; do echo "$l: $(grep -E '^(Tests: |OK)' "$l" | tail -1)"; done
+            grep -E '^D18 VERDICT|^  (pass|skip) parity|^  failure set' d18.txt 2>/dev/null || echo "no D18 verdict"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: laravel-suite-logs
+          name: laravel-suite-pg-logs
           # `.laravel-suite/` is a HIDDEN path, which upload-artifact@v4 skips by default — so the
           # ferrod.log listed below was silently never uploaded until this line (found at C1f, when
           # the MySQL job's artifact came back without it).
           include-hidden-files: true
           path: |
-            ferro-pgsql-run1.log
-            ferro-pgsql-run2.log
-            pgsql-run1.log
-            pgsql-run2.log
-            stock-pgsql-run1.log
-            stock-pgsql-run2.log
-            pg-specific-pgsql-run1.log
-            pg-specific-pgsql-run2.log
-            pg-specific-stock-pgsql-run1.log
-            pg-specific-stock-pgsql-run2.log
+            *-run1.log
+            *-run2.log
+            *-run1.xml
+            *-run2.xml
+            repro-*.txt
+            d18.txt
             .laravel-suite/ferrod.log
       - if: always()
         run: docker compose -f testkit/docker-compose.yml logs --no-color --tail=80 pg
@@ -152,6 +187,8 @@ jobs:
         include:
           - { svc: mysql, family: mysql, conn: MySqlConnection, ferro: FerroMySqlConnection }
           - { svc: mariadb, family: mariadb, conn: MariaDbConnection, ferro: FerroMariaDbConnection }
+    env:
+      FERRO_LARAVEL_SVC: ${{ matrix.svc }}
     steps:
       - uses: actions/checkout@v4
       - uses: shivammathur/setup-php@v2
@@ -166,7 +203,7 @@ jobs:
           set -o pipefail +e
           for drv in ferro-${{ matrix.family }} ${{ matrix.family }} stock-${{ matrix.family }}; do
             for run in 1 2; do
-              FERRO_LARAVEL_DRIVER="$drv" FERRO_LARAVEL_SVC=${{ matrix.svc }} \
+              FERRO_LARAVEL_DRIVER="$drv" \
                 bash testkit/laravel-suite.sh --log-junit "$drv-run$run.xml" 2>&1 | tee "$drv-run$run.log"
               echo "phpunit exit: $?"
             done
@@ -179,74 +216,72 @@ jobs:
           set -o pipefail +e
           for drv in ${{ matrix.family }} stock-${{ matrix.family }}; do
             for run in 1 2; do
-              FERRO_LARAVEL_ALLOWLIST="$PWD/testkit/laravel/allowlist-${{ matrix.family }}.txt" \
-                FERRO_LARAVEL_DRIVER="$drv" FERRO_LARAVEL_SVC=${{ matrix.svc }} \
+              FERRO_LARAVEL_ALLOWLIST="$PWD/testkit/laravel/allowlist-${{ matrix.family }}.txt" FERRO_LARAVEL_DRIVER="$drv" \
                 bash testkit/laravel-suite.sh --log-junit "spec-$drv-run$run.xml" 2>&1 | tee "spec-$drv-run$run.log"
               echo "phpunit exit: $?"
             done
           done
       - name: assert every run actually measured, under the name it claims
         run: |
-          for drv in ${{ matrix.family }} stock-${{ matrix.family }}; do
-            for run in 1 2; do
-              f="spec-$drv-run$run.log"
-              grep -qE '^(OK|FAILURES!|ERRORS!|Tests: )' "$f" \
-                || { echo "::error:: $f has no phpunit result line — the run died before measuring"; tail -40 "$f"; exit 1; }
-              grep -q "\[ferro\] connection=.* driver=$drv " "$f" \
-                || { echo "::error:: $f did not run under driver $drv"; exit 1; }
-              grep -q '\[ferro\] reset: ' "$f" \
-                || { echo "::error:: $f has no reset line"; exit 1; }
-            done
-          done
-          grep -q "\[ferro\] connection=Illuminate.Database.${{ matrix.conn }} driver=stock-${{ matrix.family }} " "spec-stock-${{ matrix.family }}-run1.log" \
-            || { echo "::error:: the family-specific control did not resolve the STOCK ${{ matrix.conn }}"; exit 1; }
-          for drv in ferro-${{ matrix.family }} ${{ matrix.family }} stock-${{ matrix.family }}; do
-            for run in 1 2; do
-              f="$drv-run$run.log"
-              grep -qE '^(OK|FAILURES!|ERRORS!|Tests: )' "$f" \
-                || { echo "::error:: $f has no phpunit result line — the run died before measuring"; tail -40 "$f"; exit 1; }
-              grep -q "\[ferro\] connection=.* driver=$drv " "$f" \
-                || { echo "::error:: $f did not run under driver $drv"; exit 1; }
-              grep -q '\[ferro\] reset: ' "$f" \
-                || { echo "::error:: $f has no reset line"; exit 1; }
-            done
-          done
+          rc=0
           f=${{ matrix.family }}
-          grep -q "\[ferro\] connection=Illuminate.Database.${{ matrix.conn }} driver=stock-$f " "stock-$f-run1.log" \
-            || { echo "::error:: the control column did not resolve the STOCK ${{ matrix.conn }}"; exit 1; }
+          for col in "ferro-$f" "$f" "stock-$f" "spec-$f" "spec-stock-$f"; do
+            for run in 1 2; do
+              l="$col-run$run.log"
+              grep -qE '^(OK|FAILURES!|ERRORS!|Tests: )' "$l" \
+                || { echo "::error:: $l has no phpunit result line — the run died before measuring"; tail -40 "$l"; rc=1; }
+              grep -q "\[ferro\] connection=.* driver=${col#spec-} " "$l" \
+                || { echo "::error:: $l did not run under driver ${col#spec-}"; rc=1; }
+              grep -q '\[ferro\] reset: ' "$l" \
+                || { echo "::error:: $l has no reset line"; rc=1; }
+              [ -s "$col-run$run.xml" ] || { echo "::error:: $col-run$run.xml is missing or empty"; rc=1; }
+            done
+          done
+          for col in "stock-$f" "spec-stock-$f"; do
+            grep -q "\[ferro\] connection=Illuminate.Database.${{ matrix.conn }} driver=stock-$f " "$col-run1.log" \
+              || { echo "::error:: $col did not resolve the STOCK ${{ matrix.conn }}"; rc=1; }
+          done
           grep -q "\[ferro\] connection=Ferro.Laravel.${{ matrix.ferro }} driver=ferro-$f " "ferro-$f-run1.log" \
-            || { echo "::error:: the ferro-$f column did not resolve ${{ matrix.ferro }}"; exit 1; }
-      - name: compare each Ferro column with the control, as SETS (SPEC §22.2 (bz))
-        if: always()
-        run: |
-          f=${{ matrix.family }}
-          {
-            for drv in "ferro-$f" "$f"; do
-              echo "== $drv vs stock-$f (run 1)"
-              php testkit/dbal/compare-columns.php "$drv-run1.xml" "stock-$f-run1.xml" || true
-            done
-            echo "== family-specific: $f vs stock-$f (run 1)"
-            php testkit/dbal/compare-columns.php "spec-$f-run1.xml" "spec-stock-$f-run1.xml" || true
-          } | tee compare.txt
-      # A recorded number is two runs that AGREE. Each column's run 2 against its run 1, as sets: the
-      # same skips and the same failures. This one FAILS the job — the comparison above only reports,
-      # because a Ferro column differing from its control is a finding, not a broken lane, while a
-      # column differing from ITSELF means the measurement is not reproducible.
+            || { echo "::error:: the ferro-$f column did not resolve ${{ matrix.ferro }}"; rc=1; }
+          exit $rc
+      # A recorded number is two runs that AGREE.
       - name: each column's run 2 equals its run 1
         run: |
+          set -o pipefail
           f=${{ matrix.family }}
           rc=0
-          for drv in "ferro-$f" "$f" "stock-$f" "spec-$f" "spec-stock-$f"; do
-            php testkit/dbal/compare-columns.php "$drv-run2.xml" "$drv-run1.xml" > "repro-$drv.txt" || true
-            a=$(grep -E '^skip:' "repro-$drv.txt"); b=$(grep -E '^fail:' "repro-$drv.txt")
-            echo "$drv: $a | $b"
-            # Equal sets print the same digest on both sides of each line.
-            for line in "$a" "$b"; do
-              d=$(echo "$line" | grep -oE 'sha256 [0-9a-f]+' | sort -u | wc -l)
-              [ "$d" = 1 ] || { echo "::error:: $drv: run 2 differs from run 1 ($line)"; rc=1; }
-            done
+          for col in "ferro-$f" "$f" "stock-$f" "spec-$f" "spec-stock-$f"; do
+            echo "== $col"
+            php testkit/dbal/compare-columns.php "$col-run2.xml" "$col-run1.xml" --repro | tee "repro-$col.txt" || rc=1
           done
           exit $rc
+      - name: D18 — each Ferro column against its control, every Ferro-only non-pass triaged
+        if: always()
+        run: |
+          set -o pipefail
+          f=${{ matrix.family }}
+          rc=0
+          up=.laravel-suite/laravel-v11.51.0
+          for pair in "ferro-$f stock-$f $f-ferro-$f" "$f stock-$f $f-$f" "spec-$f spec-stock-$f $f-specific-$f"; do
+            set -- $pair
+            echo "== laravel-$3: $1 vs $2"
+            php testkit/dbal/compare-columns.php "$1-run1.xml" "$2-run1.xml" \
+              --triage testkit/laravel/triage.txt --column "laravel-$3" --upstream "$up" || rc=1
+          done > d18.txt 2>&1
+          # Into a file, then printed: `done | tee` would run the loop in a subshell, and `rc` —
+          # with it every column's verdict but the last — would never reach this `exit`.
+          cat d18.txt
+          exit $rc
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "## laravel-suite · ${{ matrix.svc }}"
+            echo '```'
+            for l in *-run1.log *-run2.log; do echo "$l: $(grep -E '^(Tests: |OK)' "$l" | tail -1)"; done
+            grep -E '^D18 VERDICT|^  (pass|skip) parity|^  failure set' d18.txt 2>/dev/null || echo "no D18 verdict"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -257,5 +292,111 @@ jobs:
             *-run2.log
             *-run1.xml
             *-run2.xml
-            compare.txt
+            repro-*.txt
+            d18.txt
+            .laravel-suite/ferrod.log
+
+  # SQLite (E9; the columns themselves are C3-6b's, SPEC §22.2 (bn)). No container and no port: the
+  # runner deletes and recreates the database FILE before each run, and the Ferro columns' ferrod opens
+  # it (`sqlite://<path>`). The control starts NO ferrod at all — pdo_sqlite opens the same file — so
+  # a mis-set variable cannot route it through Ferro.
+  #
+  # The alias column (`sqlite`) is MEASURED and gated like the others, but on SQLite it is not the
+  # escape hatch it is elsewhere: upstream's own tests open throwaway SQLite connections that carry
+  # no `ferro_socket`, and the alias captures them (§22.2 (bn); the triage file explains each case).
+  # Upstream's SQLite-specific directory is not run (there is no allowlist for it).
+  measure-sqlite:
+    if: inputs.family == 'all' || inputs.family == 'sqlite'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      FERRO_LARAVEL_SVC: sqlite
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with: { php-version: "8.4", extensions: msgpack, tools: composer }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: measure every driver-name column, twice each
+        run: |
+          set -o pipefail +e
+          for drv in ferro-sqlite sqlite stock-sqlite; do
+            for run in 1 2; do
+              FERRO_LARAVEL_DRIVER="$drv" \
+                bash testkit/laravel-suite.sh --log-junit "$drv-run$run.xml" 2>&1 | tee "$drv-run$run.log"
+              echo "phpunit exit: $?"
+            done
+          done
+      - name: assert every run actually measured, under the name it claims
+        run: |
+          rc=0
+          for col in ferro-sqlite sqlite stock-sqlite; do
+            for run in 1 2; do
+              l="$col-run$run.log"
+              grep -qE '^(OK|FAILURES!|ERRORS!|Tests: )' "$l" \
+                || { echo "::error:: $l has no phpunit result line — the run died before measuring"; tail -40 "$l"; rc=1; }
+              # On SQLite the contact assertion also proves WHICH FILE answered (PRAGMA database_list),
+              # because the testbench trap it exists for is itself SQLite.
+              grep -q "\[ferro\] connection=.* driver=$col server=SQLite " "$l" \
+                || { echo "::error:: $l did not run under driver $col against SQLite"; rc=1; }
+              grep -q '\[ferro\] reset: sqlite ' "$l" \
+                || { echo "::error:: $l has no reset line"; rc=1; }
+              [ -s "$col-run$run.xml" ] || { echo "::error:: $col-run$run.xml is missing or empty"; rc=1; }
+            done
+          done
+          for run in 1 2; do
+            grep -q '^\[control\] no ferrod started' "stock-sqlite-run$run.log" \
+              || { echo "::error:: control run $run does not say it started no ferrod"; rc=1; }
+            grep -q '\[ferro\] connection=Illuminate.Database.SQLiteConnection driver=stock-sqlite ' "stock-sqlite-run$run.log" \
+              || { echo "::error:: control run $run did not resolve the STOCK SQLiteConnection"; rc=1; }
+          done
+          grep -q '\[ferro\] connection=Ferro.Laravel.FerroSQLiteConnection driver=ferro-sqlite ' ferro-sqlite-run1.log \
+            || { echo "::error:: the ferro-sqlite column did not resolve FerroSQLiteConnection"; rc=1; }
+          exit $rc
+      - name: each column's run 2 equals its run 1
+        run: |
+          set -o pipefail
+          rc=0
+          for col in ferro-sqlite sqlite stock-sqlite; do
+            echo "== $col"
+            php testkit/dbal/compare-columns.php "$col-run2.xml" "$col-run1.xml" --repro | tee "repro-$col.txt" || rc=1
+          done
+          exit $rc
+      - name: D18 — each Ferro column against its control, every Ferro-only non-pass triaged
+        if: always()
+        run: |
+          set -o pipefail
+          rc=0
+          up=.laravel-suite/laravel-v11.51.0
+          for pair in "ferro-sqlite stock-sqlite sqlite-ferro-sqlite" "sqlite stock-sqlite sqlite-sqlite"; do
+            set -- $pair
+            echo "== laravel-$3: $1 vs $2"
+            php testkit/dbal/compare-columns.php "$1-run1.xml" "$2-run1.xml" \
+              --triage testkit/laravel/triage.txt --column "laravel-$3" --upstream "$up" || rc=1
+          done > d18.txt 2>&1
+          # Into a file, then printed: `done | tee` would run the loop in a subshell, and `rc` —
+          # with it every column's verdict but the last — would never reach this `exit`.
+          cat d18.txt
+          exit $rc
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "## laravel-suite · SQLite"
+            echo '```'
+            for l in *-run1.log *-run2.log; do echo "$l: $(grep -E '^(Tests: |OK)' "$l" | tail -1)"; done
+            grep -E '^D18 VERDICT|^  (pass|skip) parity|^  failure set' d18.txt 2>/dev/null || echo "no D18 verdict"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: laravel-suite-sqlite-logs
+          include-hidden-files: true   # for .laravel-suite/ferrod.log — see the PG job
+          path: |
+            *-run1.log
+            *-run2.log
+            *-run1.xml
+            *-run2.xml
+            repro-*.txt
+            d18.txt
             .laravel-suite/ferrod.log

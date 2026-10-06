@@ -173,9 +173,10 @@ if [ "$svc" = sqlite ] && [ "$driver" = stock-sqlite ]; then
 else
   cargo build -p ferrod --manifest-path "$root/Cargo.toml"
   sock="$(mktemp -u /tmp/ferro-laravel-XXXXXX.sock)"
+  # `CARGO_TARGET_DIR` is honoured (E9) — see testkit/dbal-suite.sh: otherwise a STALE binary runs.
   env FERRO_SOCK="$sock" FERRO_POOLS="$pool" \
       "FERRO_POOL_$(echo "$pool" | tr '[:lower:]-' '[:upper:]_')_DSN=$dsn" \
-      "$root/target/debug/ferrod" >"$work/ferrod.log" 2>&1 &
+      "${CARGO_TARGET_DIR:-$root/target}/debug/ferrod" >"$work/ferrod.log" 2>&1 &
   ferrod_pid=$!
   trap 'kill "$ferrod_pid" 2>/dev/null || true; rm -f "$sock"' EXIT   # ONLY our own daemon.
   for _ in $(seq 1 100); do [ -S "$sock" ] && break; sleep 0.1; done
