@@ -1298,13 +1298,13 @@ async fn an_mtls_upstream_is_not_served_until_f5c() {
     assert_eq!(rec.tcp(), 0);
 }
 
-/// **SPEC §21 open item O-F5c, pinned as it stands.** An upstream that REQUIRES a client
+/// **SPEC D23 (formerly §21 open item O-F5c).** An upstream that REQUIRES a client
 /// certificate, configured without one: under TLS 1.2 the refusal fails the handshake (before
 /// dispatch, `tls_verify`, never Indeterminate); under TLS 1.3 the client's handshake completes
 /// first (premise P-M), the request's records reach the socket, and the server's
 /// `certificate_required` alert arrives after dispatch — so by the measured `sent` rule the POST is
 /// "sent, no head" (`Indeterminate`), although the server's HTTP layer received nothing. Never
-/// re-sent. F5c decides this row; this test is expected to change with it.
+/// re-sent. Decided by D23 (option a); F5c renames this test; its assertions stay.
 #[tokio::test]
 async fn mtls_required_but_absent_tls12_is_tls_verify_and_tls13_is_the_open_item() {
     let pki = Pki::new();

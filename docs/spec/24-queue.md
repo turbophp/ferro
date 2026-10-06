@@ -11,7 +11,7 @@ and are listed in §24.17. **D22 was RATIFIED by the owner on 2026-10-06, with t
 (G1 onward) could start before ratification; **G1 may now start.** The amendments are applied in
 place below: (a) a store's table defaults to `ferro_jobs`, so mixed mode becomes an explicit
 opt-in (§24.3); (b) a store declares a `KIND`, `sql` being the only v1 kind, and the token is opaque
-bytes on the wire, at most 1 KiB (§24.3, §24.4, §24.5). **`job_id` is opaque bytes too** (SPEC
+bytes on the wire, 1 to 1 024 bytes (§24.3, §24.4, §24.5). **`job_id` is opaque bytes too** (SPEC
 **D24**, owner decision 2026-10-06, settling open item O-G1), so every QUEUE shape is kind-neutral
 before G1 freezes it (§24.3, §24.4).
 
@@ -83,8 +83,9 @@ No PHP-native host-level job transport exists. PgBouncer sees statements, not jo
 
 **C — a drop-in seam exists. Holds for Laravel, which is v1's drop-in tier.**
 
-- **Laravel:** `QueueManager::addConnector`. Adoption is one config value, `driver = 'ferro'`, and
-  the auto-discovered `FerroServiceProvider` registers it (§22.2 (ch)).
+- **Laravel:** `QueueManager::addConnector`. Adoption is one driver value, `driver = 'ferro'`, plus the shipped `ferro_jobs`
+  migration or `TABLE=jobs` on the store (§24.3). The auto-discovered `FerroServiceProvider`
+  registers the driver (§22.2 (ch)).
 - **Symfony (post-v1):** `TransportFactoryInterface` with a `ferro://` DSN, plus a bundle line
   (UNVERIFIED that nothing else is needed). The Messenger transport is demoted out of v1 (§24.17 Q4).
 
@@ -255,7 +256,7 @@ Reasons for the stock layout, by weight:
     kind (a Redis stream entry id, an SQS receipt handle of about 1 KB), mints differently without a
     wire change.
   - **A token the store cannot decode** (for the `sql` kind, any length other than 8) is refused
-    before any statement. G1 decides and pins its terminal. `LeaseLost` would be literally true, since
+    before any statement. G1 decides and pins its terminal, under prerequisite (c) below. `LeaseLost` would be literally true, since
     the token names no current reservation, but only a client defect produces such a token, and the
     Laravel tier treats an autocommit `LeaseLost` as done (§24.11), which would hide the defect. A
     token over 1 024 bytes is an out-of-bounds field, refused like any other, and G1 pins where.
@@ -277,6 +278,20 @@ does not fit an `i64`. The client never interprets it.
   wire carries **no numeric order**. A client may not compare or sort job ids, and must not infer
   enqueue order from them.
 - **Cost:** a few bytes per job on the wire, and no numeric ordering for the client.
+
+**G1 prerequisites for the opaque fields (normative; review round of (de)).**
+
+- **(a) A canonical `sql` `job_id` encoding with a strict decode.** Each `bigint` id has exactly one
+  encoding. The decoder refuses every non-canonical form (for a decimal-text encoding: leading zeros,
+  a sign, surrounding spaces). Otherwise two byte strings would name one row. A dedup replay
+  (§24.6) returns a `job_id` byte-identical to the first send's, and G1 pins this with a test.
+- **(b) Refusal vectors at both bounds.** Each opaque field gets a 0-byte refusal vector beside the
+  1 025-byte one, refused by both codecs.
+- **(c) The terminal for an undecodable token or `job_id` is neither `Protocol` nor `LeaseLost`.** It
+  is not `Protocol`, because the frame is well-formed: that code means a wire fault. It is not
+  `LeaseLost`, because that would hide a client defect behind "did nothing" (§24.11). G1 may allocate
+  a new NonRetryable code for it, after `0x3010`. If it does, the code lands in `/proto` with
+  vectors and both codecs, and G1 records its choice either way.
 - **Precondition, stated rather than enforced: an `(id, created_at)` pair is never reissued while a
   token for it is outstanding.**
   - `TRUNCATE … RESTART IDENTITY`, MySQL `TRUNCATE`, sequence resets, restores and async-replica
@@ -371,7 +386,7 @@ G1 (PROTOCOL.md §13; §12 is HTTP's, §23). `common` is `[tx_id|nil, timeout_ms
 parsed as on EXEC (§22.2 (cd)). Every success terminal carries `stats {queue_us, exec_us}`.
 `token` and `job_id` (with `new_job_id`) are opaque bytes, 1 to 1 024 of them, everywhere they
 appear (§24.3; D22 amendment (b) for the token, D24 for the id). The golden vectors carry each at its
-`sql`-kind size and at 1 024 bytes, and both codecs refuse 1 025. The PHP side holds each as an
+`sql`-kind size and at 1 024 bytes, and both codecs refuse 0 and 1 025 (§24.3's G1 prerequisites). The PHP side holds each as an
 opaque string and must send it back as `bin`. Encoding it as `str` would change the wire type and
 could fail the codec's UTF-8 check.
 
@@ -422,8 +437,9 @@ could fail the codec's UTF-8 check.
     those ids binding that `now`, then a SELECT of the reserved rows, then COMMIT.
   - **Frame clamp.** `max_jobs` is clamped so the reply fits one frame:
     `floor((max_frame_payload − envelope) / (MAX_PAYLOAD_BYTES + per-job overhead))`, where the
-    per-job overhead counts the store kind's largest token (8 bytes for the `sql` kind; never
-    more than 1 024). **Cost:** at the
+    per-job overhead counts the store kind's largest `job_id` **plus** its largest token. For the
+    `sql` kind that is the maximum length of G1's `job_id` encoding plus 8; for any kind it is never
+    more than 2 048 (1 024 + 1 024, D22 (b) and D24). **Cost:** at the
     4 MiB default that is 3, so batch RESERVE is nearly inert. An operator who wants batches lowers
     `MAX_PAYLOAD_BYTES`. Laravel always asks for 1.
   - **Over-size rows.** Rows over `MAX_PAYLOAD_BYTES` (from stock producers) are never reserved and
@@ -863,7 +879,7 @@ $q->transactionalAck($r, fn ($tx) => …);                  // rolls back on Lea
 - **Errors.** `LeaseLostException` and `PoolMismatchException` sit inside the `FerroException`
   contract.
 
-**Laravel driver (`ferro/laravel`, config only).**
+**Laravel driver (`ferro/laravel`): one driver value, plus the shipped `ferro_jobs` migration or `TABLE=jobs` on the store (§24.3).**
 
 ```php
 'connections' => ['database' => [
@@ -1063,11 +1079,11 @@ every duplicate and every phantom attempt is attributable to a counted or docume
 | slice | delivers | proves |
 |---|---|---|
 | **G0** *(DONE, §22.2 (cn))* | this section; `QUEUE = 7`, `LeaseLost`, `PoolMismatch` and `queue_wait_grace_ms` allocated in the spec (their `/proto` entries land at G1); §21 D21/D22; the §24.16 amendments | review attacked §24.5–§24.8 before any code |
-| **G1** *(D22 ratified 2026-10-06; may start)* | `/proto`: `[services] QUEUE = 7`, the method table, the two codes and `queue_wait_grace_ms` G0 allocated, PROTOCOL.md §1 and a new §13, golden vectors (an 8-byte and a 1 024-byte token, §24.4), both codecs, **all shapes frozen**, with `job_id` as opaque bytes (D24; vectors at the `sql` size and at 1 024 bytes); store config (`KIND=sql` and the refusal of any other kind, `TABLE` defaulting to `ferro_jobs`), version gate, shape verification; ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
+| **G1** *(D22 ratified 2026-10-06; may start)* | `/proto`: `[services] QUEUE = 7`, the method table, the two codes and `queue_wait_grace_ms` G0 allocated, PROTOCOL.md §1 and a new §13, golden vectors (an 8-byte and a 1 024-byte token, §24.4), both codecs, **all shapes frozen**, with `job_id` as opaque bytes (D24; vectors at the `sql` size and at 1 024 bytes, refusals at 0 and 1 025), after §24.3's G1 prerequisites: a canonical `sql` id encoding with a strict decode, and a terminal for an undecodable token or id that is neither `Protocol` nor `LeaseLost` (a new code if needed); store config (`KIND=sql` and the refusal of any other kind, `TABLE` defaulting to `ferro_jobs`), version gate, shape verification; ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
 | **G2** | tx path: `resolve_active` made `pub(crate)`, `PoolMismatch`, `TxCommand::Queue` + `after_commit`, in-tx `LeaseLost` semantics (R1), refused tx-scoped RESERVE | atomicity both ways; mismatch leaves the transaction usable; chaos rows 2 and 7 |
 | **G3** | the waker (per queue, `LIMIT k`, statement deadlines, register-then-sweep), long-poll, the wait bound, **unreserve**, wake hints, coalesced polls, drain; queue metrics and spans | cost bound (row 11); one END under every CANCEL/deadline race and the deliver-xor-unreserve rule (row 12); idle-polling bench vs stock (A's number); R4 reproduced on the real transport |
 | **G4** | native PHP API, `queueWorker()`, wait clamp, client fate and licensed re-sends; dedup table and purge **after** the dedup spike reproduces §24.6's three paths | chaos rows 1, 3–6, 8, 9 and 15 through the client |
-| **G5** | Laravel driver: `FerroQueue` (dedicated reserve session), `FerroJob` (`delete`/`release` rules, the `fail()` override); the `ferro_jobs` migration and the rule for a stock `'table'` key (§24.11); demo engine column; the three-column upstream run on PG | D18 on PostgreSQL; chaos rows 13, 14 and 16; the SIGALRM reentrancy premise |
+| **G5** | Laravel driver: `FerroQueue` (dedicated reserve session), `FerroJob` (`delete`/`release` rules, the `fail()` override); the `ferro_jobs` migration and the rule for a stock `'table'` key (§24.11); pin what `push()`/`FerroJob::getJobId()` return for an opaque `job_id` (D24); demo engine column; the three-column upstream run on PG | D18 on PostgreSQL; chaos rows 13, 14 and 16; the SIGALRM reentrancy premise |
 | **G6** | MySQL/MariaDB stores (engine-owned RC transactions, actor-command steps, MySQL dedup spike) and their D18 columns | D18 and chaos on MySQL 8.4 and MariaDB 11.8; rows 17 and 19 |
 
 **Removed from the v1 plan, kept as post-v1 labels** (§24.15): **G7**, the Symfony Messenger
