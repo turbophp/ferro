@@ -884,8 +884,12 @@ async fn abandoning_a_copy_out_with_cancel_leaves_the_session_usable() {
     let server = small_windows(url);
     let mut c = server.connect().await;
     c.hello(1).await;
+    // An ENDLESS export (10^12 rows; a set-returning function in the select list is evaluated per
+    // row, never spooled to a temp file): only the backend cancel can end it. Without that cancel
+    // the engine's bounded drain would still end the request — after the pool's `checkout_timeout`
+    // (5 s), discarding the connection — so the time bound below is what pins the cancel itself.
     let req = copy_req(
-        "COPY (SELECT g, repeat('x', 200) FROM generate_series(1, 200000) g) TO STDOUT",
+        "COPY (SELECT generate_series(1, 1000000000000), repeat('x', 200)) TO STDOUT",
         true,
         None,
     );
@@ -893,6 +897,7 @@ async fn abandoning_a_copy_out_with_cancel_leaves_the_session_usable() {
         .await;
     let first = recv_for(&mut c, 3).await;
     assert_eq!(first.header.method, method_stream::COPY_DATA);
+    let cancelled_at = std::time::Instant::now();
     c.cancel(3).await;
     let t = loop {
         let f = recv_for(&mut c, 3).await;
@@ -906,6 +911,58 @@ async fn abandoning_a_copy_out_with_cancel_leaves_the_session_usable() {
         e.code,
         errc::CANCELLED,
         "a declared-readonly COPY_OUT that was cancelled: {e:?}"
+    );
+    assert!(
+        cancelled_at.elapsed() < Duration::from_millis(2500),
+        "the terminal must come from the BACKEND cancel, not the 5 s drain bound ({:?})",
+        cancelled_at.elapsed()
+    );
+    let ok = exec_ok(&mut c, 4, "SELECT 1").await;
+    assert_eq!(ok.rows[0][0], Value::I64(1));
+}
+
+/// A SLOW export (an endless query emitting a 2 KB row every 20 ms — PostgreSQL itself flushes its
+/// output buffer every ~8 KB, i.e. every ~80 ms here): the producer coalesces only what the backend
+/// has already produced, so the first rows reach the client promptly rather than after a frame's
+/// worth (256 KiB — about 2.6 s at this rate) has accumulated; and a CANCEL that lands while the
+/// producer waits on the BACKEND (not on the client's credit, as in the test above) still ends it
+/// through the backend cancel, well inside the pool's 5 s drain bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_export_streams_promptly_and_a_cancel_mid_wait_ends_it() {
+    let Some(url) = pg_url() else { return };
+    let server = small_windows(url);
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    let req = copy_req(
+        "COPY (SELECT generate_series(1, 1000000000000), repeat('x', 2000), pg_sleep(0.02)) TO STDOUT",
+        true,
+        None,
+    );
+    let sent_at = std::time::Instant::now();
+    c.send_request(3, service::SQL, method_sql::COPY_OUT, req.encode())
+        .await;
+    let first = recv_for(&mut c, 3).await;
+    assert_eq!(first.header.method, method_stream::COPY_DATA);
+    assert!(
+        sent_at.elapsed() < Duration::from_secs(1),
+        "the first rows must not wait for a full frame ({:?})",
+        sent_at.elapsed()
+    );
+    c.window_update(3, 1, first.payload.len() as u32).await;
+    let cancelled_at = std::time::Instant::now();
+    c.cancel(3).await;
+    let t = loop {
+        let f = recv_for(&mut c, 3).await;
+        if f.header.flags & flags::END != 0 {
+            break Outcome::decode(&f.payload).unwrap();
+        }
+        c.window_update(3, 1, f.payload.len() as u32).await;
+    };
+    assert_eq!(err_body(t).code, errc::CANCELLED);
+    assert!(
+        cancelled_at.elapsed() < Duration::from_millis(2500),
+        "ended by the backend cancel, not the drain bound ({:?})",
+        cancelled_at.elapsed()
     );
     let ok = exec_ok(&mut c, 4, "SELECT 1").await;
     assert_eq!(ok.rows[0][0], Value::I64(1));

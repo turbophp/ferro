@@ -36,6 +36,7 @@ use ferro_pool::error::PoolError;
 use ferro_pool::pool::{Checkout, Pool};
 use ferro_proto::consts::errc;
 use ferro_proto::messages::CopyRequest;
+use futures::FutureExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -52,8 +53,9 @@ use crate::session::responder::{InboundRx, OpenInboundError, Responder, StreamSe
 use crate::tx::{TxCommand, TxRegistry};
 
 /// The most COPY bytes one engine-to-client `COPY_DATA` frame carries. PostgreSQL sends one
-/// `CopyData` message per ROW, so the producer coalesces rows up to this size (cutting per-frame
-/// overhead) and splits a row larger than it (COPY bytes are divisible, so — unlike a row stream —
+/// `CopyData` message per ROW, so the producer coalesces the rows the backend has already produced
+/// up to this size (cutting per-frame overhead without ever waiting to fill a frame) and splits a row
+/// larger than it (COPY bytes are divisible, so — unlike a row stream —
 /// no row is ever too large for the frame ceiling).
 pub const COPY_OUT_FRAME_BYTES: usize = 256 * 1024;
 
@@ -613,24 +615,40 @@ async fn run_copy_out<B: PoolBackend>(
                 return StreamEnded::Broken;
             }
         };
-        let last = match item {
-            Some(Ok(b)) => {
-                buf.extend_from_slice(&b);
-                false
+        // Coalesce what the backend has ALREADY produced — never wait for more: under load the
+        // frames fill up, and a slow export (rows trickling out of a long query) still reaches the
+        // client row by row instead of after `COPY_OUT_FRAME_BYTES` have accumulated. Polling
+        // `next()` once and dropping it is safe: the driver's stream loses nothing it has not
+        // yielded.
+        let mut item = item;
+        let mut last = false;
+        loop {
+            match item {
+                Some(Ok(b)) => buf.extend_from_slice(&b),
+                Some(Err(e)) => {
+                    let broken = ends_tx(&e);
+                    let _ = handle.finish().await;
+                    responder.end_error(fate::classify_fate(e, ctx));
+                    return if broken {
+                        StreamEnded::Broken
+                    } else {
+                        StreamEnded::Intact
+                    };
+                }
+                None => {
+                    last = true;
+                    break;
+                }
             }
-            Some(Err(e)) => {
-                let broken = ends_tx(&e);
-                let _ = handle.finish().await;
-                responder.end_error(fate::classify_fate(e, ctx));
-                return if broken {
-                    StreamEnded::Broken
-                } else {
-                    StreamEnded::Intact
-                };
+            if buf.len() >= COPY_OUT_FRAME_BYTES {
+                break;
             }
-            None => true,
-        };
-        while buf.len() >= COPY_OUT_FRAME_BYTES || (last && !buf.is_empty()) {
+            match handle.next().now_or_never() {
+                Some(next) => item = next,
+                None => break,
+            }
+        }
+        while !buf.is_empty() {
             let take = buf.len().min(COPY_OUT_FRAME_BYTES);
             let chunk = buf.split_to(take);
             match responder.send_copy_data(&chunk, cancel, deadline).await {
