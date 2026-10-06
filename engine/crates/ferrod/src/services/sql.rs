@@ -477,7 +477,31 @@ async fn run_exec_on_pool<B: PoolBackend>(
     //     C3-4: the client's DECLARED `readonly` rides through to the backend here, so a backend
     //     able to enforce it (SQLite's `PRAGMA query_only`) does, rather than the flag being trusted
     //     by `fate.rs` alone. One of THREE call sites that must pass it — see `checkout_declared`.
-    let mut co = match pool.checkout_declared(req.readonly).await {
+    //
+    //     M3-D1c review F1: `timeout_ms` and the per-request CANCEL bound the WHOLE request, the
+    //     wait for a pooled connection included. Before, only the statement was raced, so a request
+    //     queued behind an exhausted pool waited the pool's `checkout_timeout` whatever the client
+    //     asked for, and ignored its CANCEL — the client's backstop then fired, went unanswered, and
+    //     the client closed the session, turning a never-dispatched write into `Indeterminate`.
+    //     ONE deadline, fixed here, is shared by the checkout and the statement, so the engine
+    //     answers by `timeout_ms` — ahead of the client's backstop (`timeout_ms` + 2 s) — however
+    //     the time was split. Dropping the checkout future is the cancellation path `Pool::checkout`
+    //     is written for (its queue-depth guard, permit and any half-recycled conn all release on
+    //     drop), and a request that never got a connection was never sent: a known did-not-apply.
+    let deadline = req
+        .timeout_ms
+        .map(|ms| tokio::time::Instant::now() + Duration::from_millis(u64::from(ms)));
+    let checkout = pool.checkout_declared(req.readonly);
+    tokio::pin!(checkout);
+    let checked_out = tokio::select! {
+        biased;
+        // Polled FIRST: a connection that is ready is never refused for a timer that fired in the
+        // same round — the statement's own race below then decides.
+        r = &mut checkout => r,
+        () = sleep_until_opt(deadline) => Err(PoolError::Timeout),
+        () = cancel.cancelled() => Err(cancelled_before_dispatch()),
+    };
+    let mut co = match checked_out {
         Ok(co) => co,
         Err(e) => {
             // A checkout failure means NO connection was established, so the user statement was
@@ -495,6 +519,31 @@ async fn run_exec_on_pool<B: PoolBackend>(
         }
     };
     let queue_us = co.stats().queue_us;
+    // What is left of the deadline for the statement itself. A deadline the checkout used up
+    // entirely is answered as a checkout timeout WITHOUT dispatching: a statement sent with no time
+    // left would be cancelled at once, and a write would then be `Indeterminate` for nothing.
+    let timeout_ms = match deadline {
+        None => None,
+        Some(d) => {
+            let left = d
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis();
+            if left == 0 {
+                drop(co);
+                responder.end_error(fate::classify_fate(
+                    PoolError::Timeout,
+                    OpContext {
+                        readonly: req.readonly,
+                        sent: false,
+                        in_tx: false,
+                    },
+                ));
+                return;
+            }
+            // `left` <= the original `timeout_ms`, itself a u32.
+            Some(u32::try_from(left).unwrap_or(u32::MAX))
+        }
+    };
 
     // (4) run the GUARDED, INTERRUPTIBLE row-returning entry: enforces `timeout_ms` + the
     // per-request CANCEL via a biased select that polls the query FIRST, so `sent` is honest for
@@ -502,7 +551,7 @@ async fn run_exec_on_pool<B: PoolBackend>(
     // the conn is released (below) before framing, so a slow client cannot inflate it (D-S5-1).
     // NEVER conn_mut()/the raw client here (that bypasses the tx-control guard → cross-tenant leak).
     let (result, exec_us) =
-        run_autocommit_exec(&mut co, sql, &req.params, req.timeout_ms, &cancel).await;
+        run_autocommit_exec(&mut co, sql, &req.params, timeout_ms, &cancel).await;
 
     // Release the pooled connection BEFORE framing/sending (RAII): held only for the query. A
     // cancelled/timed-out statement returns Err(57014) here, which `Checkout::query`'s S1
@@ -626,6 +675,21 @@ async fn sleep_opt(ms: Option<u32>) {
     match ms {
         Some(ms) => tokio::time::sleep(Duration::from_millis(u64::from(ms))).await,
         None => std::future::pending().await,
+    }
+}
+
+/// The error for a request CANCELled while it still waited for a pooled connection (M3-D1c review
+/// F1). It is a cancel, so it takes [`fate::classify_fate`]'s 57014 override — the `sent: false`
+/// arm that override documents for exactly this pre-dispatch race: a write is a known did-not-apply
+/// (`ConnectionLost{Retryable}`), a read `Cancelled`. No SQLSTATE is invented: the cancel came from
+/// the client, not from a backend, and the override keys on the code.
+fn cancelled_before_dispatch() -> PoolError {
+    PoolError::Sql {
+        code: errc::CANCELLED,
+        branch: errc::CANCELLED_BRANCH,
+        sqlstate: None,
+        errno: None,
+        message: "cancelled while waiting for a pooled connection".to_string(),
     }
 }
 

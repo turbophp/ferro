@@ -27,6 +27,13 @@ use Ferro\Client\Value\ValuePolicy;
 final class Ferro
 {
     /**
+     * Seconds the client waits past a statement timeout for the engine's own answer (M3-D1c): the
+     * margin of `docs/spec/23-http.md` §23.11.0. It covers the engine's out-of-band cancel, whose
+     * side connection alone may take up to 2 s to dial (SPEC §22.2 (aj)).
+     */
+    private const DEADLINE_MARGIN = 2.0;
+
+    /**
      * Connect to a `ferrod` over its Unix domain socket, complete the handshake, and return a
      * ready, resilient {@see Connection}.
      *
@@ -50,15 +57,18 @@ final class Ferro
         ?RetryPolicy $policy = null,
         ?TypePolicyOptions $types = null,
         ?ValuePolicy $values = null,
+        ?float $statementTimeout = null,
         ?Manifest $manifest = null,
     ): Connection {
+        $requestTimeout = self::requestTimeout($statementTimeout);
         $hash = $manifest?->hash();
-        $factory = static function () use ($socketPath, $connectTimeout, $ioTimeout, $hash): SessionInterface {
+        $factory = static function () use ($socketPath, $connectTimeout, $ioTimeout, $requestTimeout, $hash): SessionInterface {
             $session = new Session(Transport::connectUnix($socketPath, $connectTimeout, $ioTimeout));
+            $session->setRequestTimeout($requestTimeout);
             $session->hello($hash);
             return $session;
         };
-        return self::assemble($factory, $pool, $policy, $types, $values, $manifest);
+        return self::assemble($factory, $pool, $policy, $types, $values, $statementTimeout, $manifest);
     }
 
     /**
@@ -76,15 +86,18 @@ final class Ferro
         ?RetryPolicy $policy = null,
         ?TypePolicyOptions $types = null,
         ?ValuePolicy $values = null,
+        ?float $statementTimeout = null,
         ?Manifest $manifest = null,
     ): Connection {
+        $requestTimeout = self::requestTimeout($statementTimeout);
         $hash = $manifest?->hash();
-        $factory = static function () use ($host, $port, $connectTimeout, $ioTimeout, $hash): SessionInterface {
+        $factory = static function () use ($host, $port, $connectTimeout, $ioTimeout, $requestTimeout, $hash): SessionInterface {
             $session = new Session(Transport::connectTcp($host, $port, $connectTimeout, $ioTimeout));
+            $session->setRequestTimeout($requestTimeout);
             $session->hello($hash);
             return $session;
         };
-        return self::assemble($factory, $pool, $policy, $types, $values, $manifest);
+        return self::assemble($factory, $pool, $policy, $types, $values, $statementTimeout, $manifest);
     }
 
     /**
@@ -112,6 +125,7 @@ final class Ferro
         ?RetryPolicy $policy,
         ?TypePolicyOptions $types,
         ?ValuePolicy $values,
+        ?float $statementTimeout,
         ?Manifest $manifest,
     ): Connection {
         $policy ??= RetryPolicy::default();
@@ -130,7 +144,22 @@ final class Ferro
             fate: new FateClassifier($policy->retryReads),
             values: $values,
             types: $types,
+            statementTimeout: $statementTimeout,
             manifest: $manifest,
         );
+    }
+
+    /**
+     * The client's backstop deadline for a statement timeout (M3-D1c): the timeout plus a margin,
+     * so the ENGINE — which enforces the timeout itself and knows the statement's fate — answers
+     * first, and the client CANCELs only an engine that did not.
+     */
+    private static function requestTimeout(?float $statementTimeout): ?float
+    {
+        if ($statementTimeout === null) {
+            return null;
+        }
+        Connection::statementTimeoutMs($statementTimeout); // validates, before anything is dialled
+        return $statementTimeout + self::DEADLINE_MARGIN;
     }
 }
