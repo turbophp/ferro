@@ -54,7 +54,7 @@ pub async fn supervise(
 
 /// [`supervise`], with the session's out-of-band threshold (M3-D3): `Some(t)` when the client
 /// advertised `MEMFD_RX` and the engine's OOB path is enabled, in which case a SUCCESS terminal whose
-/// inline payload would be at least `t` bytes is sent as an `OOB_FD` terminal instead
+/// inline payload would be at least `t` bytes is marked for the writer to send as an `OOB_FD` terminal
 /// ([`ok_terminal`]). Error and cancelled terminals are always small and always inline. Either way it
 /// is still exactly ONE terminal frame on the one reserved permit.
 #[allow(clippy::too_many_arguments)]

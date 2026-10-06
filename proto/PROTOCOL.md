@@ -120,6 +120,14 @@ fds it receives in arrival order, and gives the n-th `OOB_FD` frame the n-th fd.
 with no fd queued, a memfd whose size is not `len`, or an `OOB_FD` frame on a session that never set
 `MEMFD_RX` means the two ends disagree about the byte stream: a desync.
 
+**What a receiver must not lose.** A receiver whose process has no free fd-table slot gets no fd: the
+kernel closes it and reports a truncated control message (`MSG_CTRUNC`), and the result is gone. A
+receiver therefore keeps a slot free for the read of an `OOB_FD` frame's FIRST byte (the only read an
+fd can arrive with when every read is exact-length) — the PHP client holds one slot in reserve and
+frees it for that read. A `MSG_PEEK` of the header into no control buffer reads the flags without
+taking the fd. Engine side, the memfd is made immediately before its frame is sent and the engine's
+copy closed right after, so a terminal waiting behind a slow reader holds no fd in the engine.
+
 Vector: `oob_ref` (§7).
 
 ## 2. Canonical MessagePack profile
