@@ -18,11 +18,16 @@
 //! - **CPU is bounded by the deadline.** The engine checks its cancel token and total deadline
 //!   between steps, so a bomb that is never short of credit still ends at the request's deadline.
 //!   That needs every step to be short in CPU as well as in output, so a step is bounded by its
-//!   INPUT too: it ends after [`STEP_MAX_INPUT`] bytes of input or [`STEP_MAX_MEMBERS`] gzip member
-//!   headers, returning [`Next::Yield`] if it produced nothing. Without that, a stream of EMPTY gzip
-//!   members (20 bytes each, inflating to nothing) was consumed a whole network read per step with
-//!   no output — so no credit parking, no check and no yield — and burned a core until the
-//!   deadline (review round, §22.2 (db)). The inflater is reset per member, never reallocated.
+//!   INPUT and its TIME too: it ends after [`STEP_MAX_INPUT`] bytes of input, [`STEP_MAX_MEMBERS`]
+//!   gzip member headers or [`STEP_MAX_TIME`], whichever is first, returning [`Next::Yield`] if it
+//!   produced nothing; inflate is handed its input [`INFLATE_SLICE`] bytes at a time so the time is
+//!   checked often. A byte bound alone is not a CPU bound: empty gzip members (20 bytes, nothing
+//!   out) were consumed a whole network read per step (review round 1), and EMPTY fixed-Huffman
+//!   deflate blocks (about 10 bits each, ~2.5 µs of inflate per input byte) made even 64 KiB a
+//!   ~160 ms step (review round 2) — no output, so no credit parking, no check and no yield, a core
+//!   burned until the deadline (§22.2 (db)). The inflater is reset per member, never reallocated,
+//!   and a gzip header is parsed incrementally, each byte examined once however it is split across
+//!   reads.
 //! - **A corrupt stream is `ResponseIncomplete` (`decode`)**: a bad gzip header, a CRC32 or length
 //!   mismatch, an inflate error, a stream truncated at the end of the body, or bytes after the end
 //!   of the compressed stream that do not begin another gzip member.
@@ -41,6 +46,15 @@ pub const MAX_GZIP_HEADER: usize = 64 * 1024;
 /// short) chunk or [`Next::Yield`]. A step over input that inflates to MORE than `max_chunk` is
 /// bounded by its output instead, as before.
 pub const STEP_MAX_INPUT: usize = 64 * 1024;
+
+/// The most time one step spends before it ends with what it has (checked between inflate slices
+/// and member boundaries, once the step has made progress). Bounds a step over input that costs
+/// much more CPU per byte than it produces, which no byte bound can.
+pub const STEP_MAX_TIME: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The most input one inflate call is handed, so [`STEP_MAX_TIME`] is checked at least every this
+/// many bytes.
+pub const INFLATE_SLICE: usize = 256;
 
 /// The most gzip member headers one step starts. Each costs a header parse and an inflater reset
 /// whatever its size, so this bounds a step of tiny members that the input bound would not.
@@ -123,8 +137,13 @@ pub struct Decoder {
     state: State,
     inflate: Decompress,
     crc: Crc,
-    /// Unconsumed input. Only a short tail (a partial header, trailer or sniff) is ever carried into
-    /// the next `feed`; inflate consumes what it is given.
+    /// The gzip member header being parsed.
+    hdr: GzHeader,
+    /// [`STEP_MAX_TIME`]; tests lift it to reach the byte and member bounds deterministically.
+    max_step_time: std::time::Duration,
+    /// Unconsumed input. Only a short tail (a partial trailer or sniff, at most 8 bytes) is ever
+    /// carried into the next `feed`: a header is consumed as it is parsed and inflate consumes what
+    /// it is given.
     pending: Bytes,
     pos: usize,
     seen_input: bool,
@@ -142,6 +161,8 @@ impl Decoder {
             },
             inflate: Decompress::new(false),
             crc: Crc::new(),
+            hdr: GzHeader::new(),
+            max_step_time: STEP_MAX_TIME,
             pending: Bytes::new(),
             pos: 0,
             seen_input: false,
@@ -165,6 +186,13 @@ impl Decoder {
             self.pending = Bytes::from(joined);
         }
         self.pos = 0;
+    }
+
+    /// Without the time bound: only the byte and member bounds end a step (tests).
+    #[cfg(test)]
+    fn without_time_bound(mut self) -> Self {
+        self.max_step_time = std::time::Duration::MAX;
+        self
     }
 
     fn rest(&self) -> &[u8] {
@@ -195,8 +223,13 @@ impl Decoder {
         // called during one), so the difference is exact.
         let start = self.pos;
         let mut members = 0usize;
+        let began = std::time::Instant::now();
         loop {
             if self.pos - start >= STEP_MAX_INPUT {
+                return Ok(StepEnd::Bound);
+            }
+            // The time bound, once the step has done something (so every step makes progress).
+            if (self.pos > start || *filled > 0) && began.elapsed() >= self.max_step_time {
                 return Ok(StepEnd::Bound);
             }
             match self.state {
@@ -204,24 +237,21 @@ impl Decoder {
                     if self.rest().is_empty() {
                         return Ok(StepEnd::NeedInput);
                     }
-                    if members == STEP_MAX_MEMBERS {
+                    if members == STEP_MAX_MEMBERS && !self.hdr.started() {
                         return Ok(StepEnd::Bound);
                     }
-                    match parse_gzip_header(self.rest())? {
-                        Some(len) => {
-                            members += 1;
-                            self.pos += len;
-                            // Reset, never reallocate: the inflater's state is ~43 KB, and a member
-                            // can be 20 bytes.
-                            self.inflate.reset(false);
-                            self.crc = Crc::new();
-                            self.state = State::Inflate;
-                        }
-                        None if self.rest().len() >= MAX_GZIP_HEADER => {
-                            return Err(DecodeError::Header);
-                        }
-                        None => return Ok(StepEnd::NeedInput),
+                    let (used, done) = self.hdr.advance(&self.pending[self.pos..])?;
+                    self.pos += used;
+                    if !done {
+                        return Ok(StepEnd::NeedInput);
                     }
+                    members += 1;
+                    self.hdr = GzHeader::new();
+                    // Reset, never reallocate: the inflater's state is ~43 KB, and a member can be
+                    // 20 bytes.
+                    self.inflate.reset(false);
+                    self.crc = Crc::new();
+                    self.state = State::Inflate;
                 }
                 State::Sniff => {
                     if self.rest().len() < 2 {
@@ -242,10 +272,11 @@ impl Decoder {
                     if *filled == out.len() {
                         return Ok(StepEnd::Bound);
                     }
-                    // Hand inflate no more input than the step has left, so ONE call cannot consume
-                    // a whole network read either (a run of empty deflate blocks inflates to
-                    // nothing, like a run of empty members).
-                    let budget = STEP_MAX_INPUT - (self.pos - start);
+                    // Hand inflate a slice of at most `INFLATE_SLICE` within the step's budget, so ONE
+                    // call can neither consume a whole network read nor run long between two time
+                    // checks (a run of empty deflate blocks inflates to nothing, like a run of
+                    // empty members, and costs far more CPU per byte).
+                    let budget = (STEP_MAX_INPUT - (self.pos - start)).min(INFLATE_SLICE);
                     let avail = self.pending.len() - self.pos;
                     let end = self.pos + avail.min(budget);
                     let in_before = self.inflate.total_in();
@@ -277,8 +308,8 @@ impl Decoder {
                         Status::Ok | Status::BufError => {
                             if produced == 0 && consumed == 0 {
                                 // No progress: inflate wants input (room is handled above). If the
-                                // step's budget cut the slice short, more input IS here: end the
-                                // step, and the next one (with a fresh budget) continues.
+                                // slice was cut short, more input IS here: end the step, and the next
+                                // one continues.
                                 return Ok(if avail > budget {
                                     StepEnd::Bound
                                 } else {
@@ -319,7 +350,9 @@ impl Decoder {
             return Ok(());
         }
         match self.state {
-            State::GzHeader { first: false } if self.rest().is_empty() => Ok(()),
+            State::GzHeader { first: false } if self.rest().is_empty() && !self.hdr.started() => {
+                Ok(())
+            }
             State::Done if self.rest().is_empty() => Ok(()),
             State::GzHeader { first: false } | State::Done => Err(DecodeError::TrailingData),
             _ => Err(DecodeError::Truncated),
@@ -327,60 +360,174 @@ impl Decoder {
     }
 }
 
-/// RFC 1952 §2.3 member header. `Ok(Some(len))`: complete, `len` bytes long. `Ok(None)`: incomplete.
-fn parse_gzip_header(b: &[u8]) -> Result<Option<usize>, DecodeError> {
-    const FHCRC: u8 = 0x02;
-    const FEXTRA: u8 = 0x04;
-    const FNAME: u8 = 0x08;
-    const FCOMMENT: u8 = 0x10;
-    const RESERVED: u8 = 0xe0;
-    // Check the magic as soon as it is visible, so a non-gzip body fails at its first bytes.
-    for (i, want) in [0x1f, 0x8b, 8].into_iter().enumerate() {
-        match b.get(i) {
-            None => return Ok(None),
-            Some(&v) if v != want => return Err(DecodeError::Header),
-            Some(_) => {}
+const FHCRC: u8 = 0x02;
+const FEXTRA: u8 = 0x04;
+const FNAME: u8 = 0x08;
+const FCOMMENT: u8 = 0x10;
+const RESERVED: u8 = 0xe0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HdrStage {
+    /// ID1 ID2 CM FLG MTIME(4) XFL OS.
+    Fixed,
+    XLen,
+    Extra,
+    Name,
+    Comment,
+    Hcrc,
+    Done,
+}
+
+/// An RFC 1952 §2.3 member header, parsed INCREMENTALLY: every byte is examined once and consumed,
+/// however the header is split across reads. (Re-joining and re-scanning a partial header on every
+/// `feed` was quadratic in its length — 1-byte chunks of a header with a ~64 KiB `FNAME` cost
+/// seconds; review round 2, §22.2 (db).)
+#[derive(Debug)]
+struct GzHeader {
+    stage: HdrStage,
+    flg: u8,
+    /// Header bytes consumed so far; bounded by [`MAX_GZIP_HEADER`].
+    len: usize,
+    /// Bytes of a fixed-size stage seen so far.
+    got: usize,
+    two: [u8; 2],
+    extra_left: usize,
+    /// CRC32 of the header bytes before `FHCRC` (its low 16 bits are the `FHCRC` value).
+    crc: Crc,
+}
+
+impl GzHeader {
+    fn new() -> Self {
+        GzHeader {
+            stage: HdrStage::Fixed,
+            flg: 0,
+            len: 0,
+            got: 0,
+            two: [0; 2],
+            extra_left: 0,
+            crc: Crc::new(),
         }
     }
-    let Some(&flg) = b.get(3) else {
-        return Ok(None);
-    };
-    if flg & RESERVED != 0 {
-        return Err(DecodeError::Header);
+
+    fn started(&self) -> bool {
+        self.len > 0
     }
-    let mut i = 10; // ID1 ID2 CM FLG MTIME(4) XFL OS
-    if b.len() < i {
-        return Ok(None);
-    }
-    if flg & FEXTRA != 0 {
-        let Some(x) = b.get(i..i + 2) else {
-            return Ok(None);
+
+    /// The stage after `from`, by the header's flags.
+    fn after(&self, from: HdrStage) -> HdrStage {
+        let order = [
+            (HdrStage::XLen, FEXTRA),
+            (HdrStage::Name, FNAME),
+            (HdrStage::Comment, FCOMMENT),
+            (HdrStage::Hcrc, FHCRC),
+        ];
+        let from_ix = match from {
+            HdrStage::Fixed => 0,
+            HdrStage::Extra => 1,
+            HdrStage::Name => 2,
+            HdrStage::Comment => 3,
+            _ => 4,
         };
-        i += 2 + usize::from(u16::from_le_bytes([x[0], x[1]]));
-        if b.len() < i {
-            return Ok(None);
-        }
+        order[from_ix..]
+            .iter()
+            .find(|(_, flag)| self.flg & flag != 0)
+            .map_or(HdrStage::Done, |(stage, _)| *stage)
     }
-    for flag in [FNAME, FCOMMENT] {
-        if flg & flag != 0 {
-            match b[i..].iter().position(|&c| c == 0) {
-                Some(z) => i += z + 1,
-                None => return Ok(None),
+
+    fn eat(&mut self, b: &[u8]) {
+        self.crc.update(b);
+        self.len += b.len();
+    }
+
+    /// Consume header bytes from `b`: `(used, true)` when the header completed after `used` bytes,
+    /// `(b.len(), false)` when all of `b` was consumed and more is needed.
+    fn advance(&mut self, b: &[u8]) -> Result<(usize, bool), DecodeError> {
+        let mut i = 0;
+        while i < b.len() && self.stage != HdrStage::Done {
+            match self.stage {
+                HdrStage::Fixed => {
+                    let c = b[i];
+                    // The magic is checked as soon as it is visible, so a non-gzip body fails at
+                    // its first bytes.
+                    let bad = match self.got {
+                        0 => c != 0x1f,
+                        1 => c != 0x8b,
+                        2 => c != 8,
+                        3 => c & RESERVED != 0,
+                        _ => false,
+                    };
+                    if bad {
+                        return Err(DecodeError::Header);
+                    }
+                    if self.got == 3 {
+                        self.flg = c;
+                    }
+                    self.eat(&b[i..=i]);
+                    i += 1;
+                    self.got += 1;
+                    if self.got == 10 {
+                        self.got = 0;
+                        self.stage = self.after(HdrStage::Fixed);
+                    }
+                }
+                HdrStage::XLen => {
+                    self.two[self.got] = b[i];
+                    self.eat(&b[i..=i]);
+                    i += 1;
+                    self.got += 1;
+                    if self.got == 2 {
+                        self.got = 0;
+                        self.extra_left = usize::from(u16::from_le_bytes(self.two));
+                        self.stage = if self.extra_left == 0 {
+                            self.after(HdrStage::Extra)
+                        } else {
+                            HdrStage::Extra
+                        };
+                    }
+                }
+                HdrStage::Extra => {
+                    let n = self.extra_left.min(b.len() - i);
+                    self.eat(&b[i..i + n]);
+                    i += n;
+                    self.extra_left -= n;
+                    if self.extra_left == 0 {
+                        self.stage = self.after(HdrStage::Extra);
+                    }
+                }
+                HdrStage::Name | HdrStage::Comment => {
+                    let field = self.stage;
+                    match b[i..].iter().position(|&c| c == 0) {
+                        Some(z) => {
+                            self.eat(&b[i..=i + z]);
+                            i += z + 1;
+                            self.stage = self.after(field);
+                        }
+                        None => {
+                            self.eat(&b[i..]);
+                            i = b.len();
+                        }
+                    }
+                }
+                HdrStage::Hcrc => {
+                    self.two[self.got] = b[i];
+                    i += 1;
+                    self.len += 1;
+                    self.got += 1;
+                    if self.got == 2 {
+                        if (self.crc.sum() & 0xffff) as u16 != u16::from_le_bytes(self.two) {
+                            return Err(DecodeError::Header);
+                        }
+                        self.stage = HdrStage::Done;
+                    }
+                }
+                HdrStage::Done => unreachable!("the loop stops at Done"),
+            }
+            if self.stage != HdrStage::Done && self.len >= MAX_GZIP_HEADER {
+                return Err(DecodeError::Header);
             }
         }
+        Ok((i, self.stage == HdrStage::Done))
     }
-    if flg & FHCRC != 0 {
-        if b.len() < i + 2 {
-            return Ok(None);
-        }
-        let mut crc = Crc::new();
-        crc.update(&b[..i]);
-        if (crc.sum() & 0xffff) as u16 != u16::from_le_bytes([b[i], b[i + 1]]) {
-            return Err(DecodeError::Header);
-        }
-        i += 2;
-    }
-    Ok(Some(i))
 }
 
 #[cfg(test)]
@@ -491,12 +638,13 @@ mod tests {
     /// [`STEP_MAX_MEMBERS`] members and consumes at most [`STEP_MAX_INPUT`] bytes, returning
     /// [`Next::Yield`]; the stream still decodes to its (empty) whole and finishes cleanly. Counted,
     /// not timed. The same for a deflate stream of empty stored blocks, which one inflate call
-    /// would otherwise consume whole.
+    /// would otherwise consume whole. Run with the time bound lifted, so these two bounds — not
+    /// [`STEP_MAX_TIME`], which in a debug build ends such a step first — are what is tested.
     #[test]
     fn a_step_is_bounded_by_its_input_when_nothing_is_decoded() {
         let member = gzip(b"");
         let wire = member.repeat((256 * 1024) / member.len());
-        let mut d = Decoder::new(Coding::Gzip, 256 * 1024);
+        let mut d = Decoder::new(Coding::Gzip, 256 * 1024).without_time_bound();
         d.feed(Bytes::from(wire.clone()));
         let before = d.rest().len();
         assert_eq!(d.next_chunk().unwrap(), Next::Yield);
@@ -523,7 +671,7 @@ mod tests {
         // NLEN=0xffff), then one final empty block.
         let mut raw = [0u8, 0, 0, 0xff, 0xff].repeat(64 * 1024);
         raw.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
-        let mut d = Decoder::new(Coding::Deflate, 256 * 1024);
+        let mut d = Decoder::new(Coding::Deflate, 256 * 1024).without_time_bound();
         d.feed(Bytes::from(raw.clone()));
         let before = d.rest().len();
         assert_eq!(d.next_chunk().unwrap(), Next::Yield);
@@ -540,6 +688,83 @@ mod tests {
             }
         }
         d.finish().unwrap();
+    }
+
+    /// A deflate stream of EMPTY fixed-Huffman blocks (what `FlushCompress::Partial` on no input
+    /// emits: about 10 bits each), zlib-wrapped or raw.
+    fn empty_static_blocks(zlib: bool, at_least: usize) -> Vec<u8> {
+        let mut c = flate2::Compress::new(Compression::default(), zlib);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 64];
+        while out.len() < at_least {
+            let before = c.total_out();
+            c.compress(&[], &mut buf, flate2::FlushCompress::Partial)
+                .unwrap();
+            let n = usize::try_from(c.total_out() - before).unwrap();
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    /// The TIME bound (review round 2): empty fixed-Huffman blocks cost ~2.5 µs of inflate per
+    /// input byte (release) and decode to nothing, so the 64 KiB input bound alone allowed a
+    /// ~160 ms step. Now a step ends after [`STEP_MAX_TIME`], with inflate handed at most
+    /// [`INFLATE_SLICE`] bytes per call. Expressed as a COUNT, not a clock: the first step consumes
+    /// at most a quarter of the input bound — at the measured cost a step that ran to the byte
+    /// bound would take ~40× the time bound — and returns `Yield`. Both under the zlib sniff and
+    /// the raw-deflate fallback.
+    #[test]
+    fn a_step_is_bounded_by_time_over_empty_fixed_huffman_blocks() {
+        for zlib in [true, false] {
+            let wire = empty_static_blocks(zlib, STEP_MAX_INPUT + 16 * 1024);
+            let mut d = Decoder::new(Coding::Deflate, 256 * 1024);
+            d.feed(Bytes::from(wire));
+            let before = d.rest().len();
+            assert_eq!(d.next_chunk().unwrap(), Next::Yield, "zlib={zlib}");
+            let used = before - d.rest().len();
+            assert!(
+                used > 0 && used <= STEP_MAX_INPUT / 4,
+                "zlib={zlib}: one step consumed {used} bytes of empty fixed-Huffman blocks"
+            );
+        }
+    }
+
+    /// A partial gzip header is consumed as it is parsed, never re-joined and re-scanned (review
+    /// round 2: four members with a ~60 KiB `FNAME` each, fed one byte at a time, cost 3.24 s —
+    /// quadratic). Counted, not timed: the input the decoder still holds after each feed, summed
+    /// over every feed, stays linear in the body's length (it was ~n²/2), and the body decodes.
+    #[test]
+    fn a_partial_gzip_header_is_not_rescanned_per_feed() {
+        let mut wire = Vec::new();
+        for i in 0..4 {
+            let mut e = flate2::GzBuilder::new()
+                .filename(vec![b'a' + i; 60_000])
+                .comment("c")
+                .write(Vec::new(), Compression::fast());
+            e.write_all(b"x").unwrap();
+            wire.extend(e.finish().unwrap());
+        }
+        let mut d = Decoder::new(Coding::Gzip, 64 * 1024);
+        let mut held = 0usize;
+        let mut out = Vec::new();
+        for b in wire.chunks(1) {
+            d.feed(Bytes::copy_from_slice(b));
+            loop {
+                match d.next_chunk().unwrap() {
+                    Next::Chunk(c) => out.extend(c),
+                    Next::Yield => {}
+                    Next::NeedInput => break,
+                }
+            }
+            held += d.rest().len();
+        }
+        d.finish().unwrap();
+        assert_eq!(out, b"xxxx");
+        assert!(
+            held <= 16 * wire.len(),
+            "{held} bytes held across {} one-byte feeds",
+            wire.len()
+        );
     }
 
     #[test]

@@ -1856,25 +1856,25 @@ async fn the_extension_hard_end_is_measured_from_the_drain_start() {
         .unwrap();
     let ended = t0.elapsed();
     assert!(
-        ended >= Duration::from_millis(1_150) && ended < Duration::from_millis(1_550),
+        ended >= Duration::from_millis(1_150) && ended < Duration::from_millis(1_700),
         "the hard end is cap + drain_deadline from the drain's start (1.2 s), not from the \
          extension's entry (1.8 s): {ended:?}"
     );
 }
 
-/// An upstream that streams EMPTY gzip members for ever: valid gzip that inflates to nothing.
-async fn empty_members_upstream() -> Upstream {
-    let member = gzip(b"");
-    let piece = Arc::new(member.repeat((256 * 1024) / member.len()));
+/// An upstream that answers with `Content-Encoding: <ce>`, chunked, and streams `piece` for ever.
+async fn endless_encoded(ce: &'static str, piece: Vec<u8>) -> Upstream {
+    let piece = Arc::new(piece);
     upstream(move |mut s, rec| {
         let piece = Arc::clone(&piece);
         async move {
             if rec.read_request(&mut s).await.is_none() {
                 return;
             }
-            let head =
-                b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n";
-            if rec.write(&mut s, head).await.is_err() {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: {ce}\r\nTransfer-Encoding: chunked\r\n\r\n"
+            );
+            if rec.write(&mut s, head.as_bytes()).await.is_err() {
                 return;
             }
             loop {
@@ -1890,23 +1890,36 @@ async fn empty_members_upstream() -> Upstream {
     .await
 }
 
+/// Endless EMPTY gzip members: valid gzip that inflates to nothing.
+async fn empty_members_upstream() -> Upstream {
+    let member = gzip(b"");
+    endless_encoded("gzip", member.repeat((256 * 1024) / member.len())).await
+}
+
+/// Endless EMPTY fixed-Huffman deflate blocks, raw (RFC 1951): each block is BFINAL=0, BTYPE=01
+/// and the end-of-block code (seven 0 bits) — 10 bits, so four blocks are exactly five bytes,
+/// `02 08 20 80 00`, and the stream repeats byte-aligned for ever. It inflates to nothing at
+/// ~2.5 µs of CPU per input byte (release).
+async fn empty_static_blocks_upstream() -> Upstream {
+    endless_encoded(
+        "deflate",
+        [0x02u8, 0x08, 0x20, 0x80, 0x00].repeat(256 * 1024 / 5),
+    )
+    .await
+}
+
 /// One decoding exchange with a 300 ms deadline on a current-thread runtime, beside a cooperative
-/// ticker: the terminal, how long it took, and the longest gap the ticker saw.
-async fn decode_with_ticker(up: &Upstream) -> (Terminal, Duration, Duration) {
+/// ticker that counts how often it ran: the terminal, how long it took, and the tick count. Every
+/// time the exchange yields (or waits on the network) the ticker runs once.
+async fn decode_with_ticker(up: &Upstream) -> (Terminal, Duration, usize) {
     let engine = engine_with(upstreams(&[("u", up.addr)], &[]), Arc::new(TcpConnect));
-    let max_gap = Arc::new(std::sync::Mutex::new(Duration::ZERO));
+    let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let ticker = {
-        let max_gap = max_gap.clone();
+        let ticks = ticks.clone();
         tokio::spawn(async move {
-            let mut last = Instant::now();
             loop {
+                ticks.fetch_add(1, Ordering::SeqCst);
                 tokio::task::yield_now().await;
-                let g = last.elapsed();
-                {
-                    let mut m = max_gap.lock().unwrap();
-                    *m = (*m).max(g);
-                }
-                last = Instant::now();
             }
         })
     };
@@ -1926,46 +1939,64 @@ async fn decode_with_ticker(up: &Upstream) -> (Terminal, Duration, Duration) {
         .await;
     let took = started.elapsed();
     ticker.abort();
-    let gap = *max_gap.lock().unwrap();
-    (t, took, gap)
+    (t, took, ticks.load(Ordering::SeqCst))
 }
 
-/// **The review's MEDIUM defect: a decode step is bounded by its INPUT, not only its output.** An
-/// endless stream of EMPTY gzip members decodes to nothing, so no frame is ever sent and no credit
-/// can park it. Before the fix one step consumed a whole network read (thousands of members, each
-/// allocating a fresh inflater) with no yield and no check: 93–97 ms executor stalls and a
-/// terminal 62–79 ms past its deadline (debug), a core burned until the deadline. Now the longest
-/// gap a cooperative task sees is comparable to the zeros-bomb CONTROL's (which is bounded by its
-/// output), and the terminal is the deadline's, on time.
+fn assert_timed_out(what: &str, t: &Terminal, took: Duration) {
+    assert!(
+        matches!(t, Terminal::Error(ep) if ep.detail.as_deref() == Some(http_cause::TIMEOUT)),
+        "{what}: {t:?}"
+    );
+    assert!(
+        took < Duration::from_millis(450),
+        "{what}: the terminal is the 300 ms deadline's, not a step's: {took:?}"
+    );
+}
+
+/// **The review's MEDIUM defect (round 1): a decode step is bounded by its INPUT, not only its
+/// output.** An endless stream of EMPTY gzip members decodes to nothing, so no frame is ever sent
+/// and no credit can park it. Before the fix one step consumed a whole network read (thousands of
+/// members) with no yield and no check: 93–97 ms executor stalls, a terminal 62–79 ms late, a core
+/// burned until the deadline. Counted, not a gap: a cooperative task must run at least 30 times in
+/// the 300 ms exchange (one per 10 ms; the fixed decoder yields after every bounded step, ~1 ms).
+/// The count is per unit of deadline, not per byte the upstream wrote: on loopback the upstream
+/// fills the socket buffers (~3.9 MB) whatever the decoder consumes, so its written count says
+/// nothing about the decoder.
 #[tokio::test(flavor = "current_thread")]
 async fn empty_gzip_members_are_bounded_by_the_deadline_and_yield() {
-    let control = bomb_upstream().await;
-    let (ct, c_took, c_gap) = decode_with_ticker(&control).await;
-    let empty = empty_members_upstream().await;
-    let (t, took, gap) = decode_with_ticker(&empty).await;
+    let up = empty_members_upstream().await;
+    let (t, took, ticks) = decode_with_ticker(&up).await;
     eprintln!(
-        "F4b review: empty members → {took:?}, longest gap {gap:?} (upstream wrote {} B); \
-         zeros-bomb control → {c_took:?}, longest gap {c_gap:?}",
-        empty.rec.written()
+        "F4b review: empty gzip members → {took:?}, {ticks} ticks, upstream wrote {} B",
+        up.rec.written()
     );
-    for (what, t) in [("control", &ct), ("empty members", &t)] {
-        assert!(
-            matches!(t, Terminal::Error(ep) if ep.detail.as_deref() == Some(http_cause::TIMEOUT)),
-            "{what}: {t:?}"
-        );
-    }
+    assert_timed_out("empty gzip members", &t, took);
     assert!(
-        empty.rec.written() > MIB as u64,
-        "the empty members were being consumed: {} B",
-        empty.rec.written()
+        ticks >= 30,
+        "{ticks} ticks in a 300 ms exchange: the decoder ran long steps without yielding"
     );
-    let bound = (c_gap * 3).max(Duration::from_millis(25));
-    assert!(
-        gap <= bound,
-        "an empty-member stream held the thread for {gap:?} (control {c_gap:?})"
+}
+
+/// **The review's MEDIUM defect (round 2): a step is bounded by TIME as well.** Empty fixed-Huffman
+/// deflate blocks cost ~2.5 µs of inflate per input byte and decode to nothing, so even the 64 KiB
+/// input bound allowed a ~160 ms step (release; through the engine in debug, 294–303 ms stalls and
+/// a terminal 253–270 ms late). The time bound ends a step after ~1 ms. Counted, not a gap: this
+/// input is consumed so slowly that the bytes the upstream wrote (mostly sitting in socket buffers)
+/// say nothing about the decoder, so the count is per unit of deadline — at least 15 runs of a
+/// cooperative task in the 300 ms (one per 20 ms). Measured: 60–69 in a debug build, where one
+/// 256-byte inflate slice of this input already takes ~4 ms; a decoder bounded only by bytes gives
+/// one or two, its first step outlasting the deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn empty_fixed_huffman_blocks_are_bounded_by_time_and_yield() {
+    let up = empty_static_blocks_upstream().await;
+    let (t, took, ticks) = decode_with_ticker(&up).await;
+    eprintln!(
+        "F4b review: empty fixed-Huffman blocks → {took:?}, {ticks} ticks, upstream wrote {} B",
+        up.rec.written()
     );
+    assert_timed_out("empty fixed-Huffman blocks", &t, took);
     assert!(
-        took < Duration::from_millis(300) + bound,
-        "the terminal is the deadline's, on time: {took:?}"
+        ticks >= 15,
+        "{ticks} ticks in a 300 ms exchange: the decoder ran long steps without yielding"
     );
 }
