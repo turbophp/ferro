@@ -54,8 +54,9 @@ pub struct Overhead {
     pub p99_ns: i64,
 }
 
-/// The M3-fibers fan-out scenario is not implemented in M0 — recorded as an explicit placeholder so
-/// the result shape is stable across milestones.
+/// The fan-out scenario is not part of THIS record: since M3-D1e it is measured by
+/// `--scenario fanout` and written to its own `*-fanout.json` (`crate::fanout`). The field stays a
+/// placeholder so the trivial-call record's shape is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fanout {
     pub placeholder: bool,
@@ -66,7 +67,7 @@ impl Default for Fanout {
     fn default() -> Self {
         Fanout {
             placeholder: true,
-            blocked_on: "M3-fibers".to_string(),
+            blocked_on: "recorded separately: --scenario fanout".to_string(),
         }
     }
 }

@@ -35,6 +35,7 @@ require $autoload;
 
 use Ferro\Ferro;
 use Ferro\Loop;
+use Ferro\Protocol\Msgpack\PackerFactory;
 
 $conn = null;
 $deadline = microtime(true) + 15.0;
@@ -104,11 +105,22 @@ for ($i = 0; $i < $measured; ++$i) {
     $a[$i] = $await();
 }
 
-$jit = function_exists('opcache_get_status') ? (@opcache_get_status(false)['jit'] ?? null) : null;
+$jitRaw = null;
+if (function_exists('opcache_get_status')) {
+    $status = @opcache_get_status(false);
+    if (is_array($status) && isset($status['jit']) && is_array($status['jit'])) {
+        $jitRaw = $status['jit'];
+    }
+}
+$jitOn = is_array($jitRaw) && !empty($jitRaw['enabled']) && !empty($jitRaw['on']);
 echo json_encode([
     'header' => [
         'php_version' => PHP_VERSION,
-        'jit_effective' => is_array($jit) && !empty($jit['enabled']) && !empty($jit['on']) ? 'on' : 'off',
+        'ext_msgpack' => extension_loaded('msgpack'),
+        'gc_enabled' => gc_enabled(),
+        'jit_effective' => $jitOn ? 'on' : 'off',
+        'jit_status' => $jitRaw,
+        'packer_class' => get_class(PackerFactory::forEncode()),
         'k' => $k,
         'sleep_ms' => $sleep * 1000.0,
         'warmup_n' => $warmup,

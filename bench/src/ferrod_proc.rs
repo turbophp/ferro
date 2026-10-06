@@ -32,9 +32,22 @@ impl FerrodProc {
     /// `FERRO_POOL_DEFAULT_DSN=<dsn>`. stdout+stderr are redirected to `log_path`. The current
     /// environment is inherited so a `RUST_LOG` set by the operator still applies.
     pub fn spawn(bin: &Path, socket_path: &Path, dsn: &str, log_path: &Path) -> io::Result<Self> {
+        Self::spawn_with_env(bin, socket_path, dsn, log_path, &[])
+    }
+
+    /// [`spawn`](Self::spawn) plus extra environment (the fan-out scenario enables the metrics
+    /// endpoint, to read the pool size the daemon ACTUALLY ran with rather than a copied constant).
+    pub fn spawn_with_env(
+        bin: &Path,
+        socket_path: &Path,
+        dsn: &str,
+        log_path: &Path,
+        extra: &[(&str, &str)],
+    ) -> io::Result<Self> {
         let log = std::fs::File::create(log_path)?;
         let log_err = log.try_clone()?;
         let child = Command::new(bin)
+            .envs(extra.iter().copied())
             .env("FERRO_SOCK", socket_path)
             .env("FERRO_POOLS", "default")
             .env("FERRO_POOL_DEFAULT_DSN", dsn)
