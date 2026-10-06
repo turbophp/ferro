@@ -251,14 +251,21 @@ pub fn upstreams(
 pub struct StallConnect {
     pub stall_after: usize,
     pub stall_conns: usize,
+    /// Connection attempts from this index on never complete (a connect that hangs).
+    pub hang_from: usize,
     pub opened: AtomicUsize,
 }
 
 impl StallConnect {
     pub fn new(stall_after: usize, stall_conns: usize) -> Arc<Self> {
+        Self::hanging(stall_after, stall_conns, usize::MAX)
+    }
+
+    pub fn hanging(stall_after: usize, stall_conns: usize, hang_from: usize) -> Arc<Self> {
         Arc::new(StallConnect {
             stall_after,
             stall_conns,
+            hang_from,
             opened: AtomicUsize::new(0),
         })
     }
@@ -314,9 +321,12 @@ impl Connect for StallConnect {
         peer: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = io::Result<BoxIo>> + Send + 'a>> {
         Box::pin(async move {
+            let n = self.opened.fetch_add(1, Ordering::SeqCst);
+            if n >= self.hang_from {
+                std::future::pending::<()>().await;
+            }
             let inner = TcpStream::connect(peer).await?;
             inner.set_nodelay(true)?;
-            let n = self.opened.fetch_add(1, Ordering::SeqCst);
             let budget = (n < self.stall_conns).then_some(self.stall_after);
             Ok(Box::new(StallIo { inner, budget }) as BoxIo)
         })
@@ -405,7 +415,15 @@ pub struct Served {
 }
 
 pub fn served(env: Vec<(String, String)>, drain_deadline: Duration) -> Served {
-    let engine = engine_with(env, Arc::new(TcpConnect));
+    served_with(env, drain_deadline, Arc::new(TcpConnect))
+}
+
+pub fn served_with(
+    env: Vec<(String, String)>,
+    drain_deadline: Duration,
+    connector: Arc<dyn Connect>,
+) -> Served {
+    let engine = engine_with(env, connector);
     let mut socket = std::env::temp_dir();
     socket.push(format!(
         "ferrod-f4b-{}-{}.sock",

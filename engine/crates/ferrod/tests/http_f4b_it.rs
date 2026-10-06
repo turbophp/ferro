@@ -1091,6 +1091,54 @@ async fn chaos15_the_drain_refuses_new_requests_finishes_short_ones_and_caps_the
     wait_for("no connection left", || s.engine.live_connections() == 0).await;
 }
 
+/// **The drain cap before a byte left is Retryable and unsent**, in both pre-send phases: a POST
+/// dispatched to a connection that accepts no byte ("dispatched, not sent"), and a POST still
+/// waiting for its connect ("before dispatch") are both `UpstreamUnavailable` (`draining`) at the
+/// cap — the same answer a request refused at admission gets — and the upstream received nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_drain_cap_before_any_byte_is_sent_is_retryable() {
+    let up = answering().await;
+    // Connection 0 accepts no request byte; connection 1's connect never completes.
+    let s = served_with(
+        upstreams(
+            &[("u", up.addr)],
+            &[
+                ("", "DRAIN_MS", "500"),
+                ("u", "CONNECT_TIMEOUT_MS", "30000"),
+            ],
+        ),
+        Duration::from_millis(300),
+        StallConnect::hanging(0, 1, 1),
+    );
+    let mut c = s.client().await;
+    send(&mut c, 2, &post("u", b"never-leaves")).await;
+    wait_for("the first connection open", || up.rec.conns() == 1).await;
+    send(&mut c, 3, &post("u", b"never-dialled")).await;
+    wait_for("both in flight", || s.engine.in_flight() == 2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let t0 = Instant::now();
+    s.drain.trigger();
+    let r = collect_many(&mut c, &[2, 3], t0, Duration::from_secs(3)).await;
+    for rid in [2, 3] {
+        r[&rid].reply.assert_error(
+            errc::UPSTREAM_UNAVAILABLE,
+            branch::RETRYABLE,
+            http_cause::DRAINING,
+        );
+        assert!(
+            r[&rid].at >= Duration::from_millis(450),
+            "at the cap: {:?}",
+            r[&rid].at
+        );
+    }
+    assert_eq!(
+        up.rec.bytes_in.load(Ordering::SeqCst),
+        0,
+        "nothing was sent"
+    );
+    assert_eq!(up.rec.conns(), 1, "the second POST never connected");
+}
+
 /// **The extension ends early, and only when HTTP is in flight.** An idle session drains in
 /// `drain_deadline` exactly as before F4b; one 400 ms exchange in flight at a 5 s cap ends `serve`
 /// `drain_deadline` after its terminal, not at the 5.3 s sum.
