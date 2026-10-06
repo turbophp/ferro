@@ -94,6 +94,12 @@ abstract class LiveTestCase extends TestCase
 
     protected function tearDown(): void
     {
+        // Close every session the test left open BEFORE stopping ferrod. A drop-in tier's connection
+        // object sits in a reference cycle (Illuminate's connection <-> its PDO resolver closure), so
+        // its socket outlives the test until the cycle collector runs; ferrod's SIGTERM drain then
+        // waits its full `drain_deadline` (5 s) for that idle session. Measured: one Laravel live
+        // test 10.4 s -> 0.6 s, i.e. ~12 minutes per Laravel CI step.
+        gc_collect_cycles();
         $this->stopFerrod();
         if ($this->socketPath !== '' && file_exists($this->socketPath)) { @unlink($this->socketPath); }
         if ($this->stderrPath !== '' && file_exists($this->stderrPath)) { @unlink($this->stderrPath); }
