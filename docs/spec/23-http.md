@@ -1,8 +1,8 @@
 # SPEC §23 — Ferro HTTP: the outbound HTTP transport engine
 
-**Status:** normative, adopted 2026-10-06 (M6-F0, SPEC §22.2 (cn)). This file is §23 of `ferro-spec-v0.2.md`, which carries a stub pointing here; it has the same authority as the rest of the spec, and the charter's definition of done applies to it unchanged. Its decisions are recorded in SPEC §21 as **D19** (the HTTP contract), **D20** (the dependency set) and **D21** (retry licences per service, shared with §24). The choices the draft left open were decided under the owner's full-freedom grant, 2026-10-06, and are listed in §23.18.
+**Status:** normative, adopted 2026-10-06 (M6-F0, SPEC §22.2 (cn)). This file is §23 of `ferro-spec-v0.2.md`, which carries a stub pointing here; it has the same authority as the rest of the spec, and the charter's definition of done applies to it unchanged. Its decisions are recorded in SPEC §21 as **D19** (the HTTP contract), **D20** (the dependency set) and **D21** (retry licences per service, shared with §24). The choices the draft left open were decided under the owner's full-freedom grant as applied 2026-10-06 (ledger, "Owner directives and grants"), and are listed in §23.18.
 
-**Allocations.** This section allocates service id `HTTP = 6`, the engine feature bit `HTTP = 0x08`, the error codes `UpstreamUnavailable = 0x1007`, `RateLimited = 0x1008` (Retryable), `TlsRefused = 0x300D` and `ResponseIncomplete = 0x300E` (NonRetryable), and the `[http.causes]` vocabulary (§23.5). They are allocated **in the spec only**. The `/proto` registry entries, golden vectors and both codecs land with slice F2, the engine's first code slice (§23.15); until then nothing in `/proto` names them, and no other change may take these numbers. §24 (Ferro Queue) allocates from the numbers after these.
+**Allocations.** This section allocates service id `HTTP = 6`, the engine feature bit `HTTP = 0x08`, the error codes `UpstreamUnavailable = 0x1007`, `RateLimited = 0x1008` (Retryable), `TlsRefused = 0x300D` and `ResponseIncomplete = 0x300E` (NonRetryable), and the `[http.causes]` vocabulary (§23.5). They are allocated here and **reserved in `/proto` as comments only** — beside `[services]` in `methods.toml` and in a reserved-codes block at the end of `errors.toml` — with no keys, so no generated constant and no registry-hash change follows, and no other change may take these numbers. The `/proto` keys, golden vectors and both codecs land with slice F2, the engine's first code slice (§23.15). §24 (Ferro Queue) allocates from the numbers after these.
 
 **Read first:** §23.16 (how each conflict with existing text was resolved), §23.18 (the decisions) and §23.19 (the premises not yet measured, owed by spikes F1a and F1b). A premise that turns out false changes the plan, not the evidence (the C3-1 precedent). Review-finding ids such as "review F13" are provenance; the appendix lists them.
 
@@ -430,9 +430,14 @@ On `SIGTERM`:
 - **New HTTP requests** are refused at once with Retryable `UpstreamUnavailable` (`draining`), not sent.
 - **In-flight exchanges** keep running until their own terminal or `FERRO_HTTP_DRAIN_MS` (default 30 s), whichever comes first. Then they are cancelled and classified by §23.7.1. A sent non-idempotent request with no head is Indeterminate; a delivery in progress is `ResponseIncomplete`.
 
-**Chassis change, listed in §23.17 and recorded in §5:** `serve`'s session-drain wait becomes `max(drain_deadline, http drain)` *while HTTP exchanges are in flight*. SQL draining is unchanged, and the queue engine's drain is §24.8's (parked `RESERVE`s are answered at once with no jobs).
+**Chassis changes, listed in §23.17 and recorded in §5** (review of the adoption, R13):
 
-**§18 (amended):** the systemd unit's `TimeoutStopSec` must exceed the HTTP drain.
+1. **A drain signal reaches the sessions.** Today `serve` stops accepting and then hard-aborts every session task when its wait ends (`serve.rs`); sessions are never told the daemon is draining. The refusal of new HTTP requests above, and §24.8's immediate answer to parked `RESERVE`s, both need that signal plumbed into the session layer, the HTTP service and the queue waker. P17 covers only that frames are still read.
+2. **`serve` outlasts the HTTP cap.** While HTTP exchanges are in flight, `serve`'s wait becomes `FERRO_HTTP_DRAIN_MS + drain_deadline`, not their maximum, so an exchange cancelled at the cap still has `drain_deadline` to emit its engine-classified `END` before the hard abort. Otherwise the client classifies by §23.7.3, which cannot see an operator's `IDEMPOTENT_METHODS` and reports a declared-idempotent request without a head as `Indeterminate` where the engine would have said `Retryable`.
+
+SQL draining is unchanged.
+
+**§18 (amended):** the systemd unit's `TimeoutStopSec` must exceed `FERRO_HTTP_DRAIN_MS + drain_deadline`.
 
 **Cost, stated (C17; accepted, §23.18 Q9):**
 
@@ -450,7 +455,7 @@ Operators bound the damage by scheduling restarts and by keeping the drain above
 **`sent` is a measured fact.**
 
 - **HTTP/1.1** (every non-idempotent request in v1). The connection carries one exchange at a time. A tracker wraps the connection's *plaintext* I/O, below `hyper` and above TLS, and is armed at dispatch. The first `poll_write` that accepts one or more bytes sets `sent = true`. TLS handshake bytes precede arming. Bytes buffered into rustls count as sent, which is conservative (P1). `hyper`'s `try_send_request`, which returns an unserialised message, is a cross-check (P19).
-- **HTTP/2** (effectively-idempotent requests only in v1). A request is `sent` once it is handed to a ready `SendRequest`. Every post-send failure of an idempotent request is Retryable, so v1 needs no HTTP/2 not-processed licence (§23.8.3).
+- **HTTP/2** (effectively-idempotent requests only in v1). A request is `sent` once it is handed to a ready `SendRequest`. No post-send failure of an idempotent request is `Indeterminate` — a link-level one is `Retryable`, and a timeout or cancel follows §9.2's read rule (the table below) — so v1 needs no HTTP/2 not-processed licence (§23.8.3).
 - **No partial-write refinement.** The first byte is the line.
 
 **"Head received"** means `hyper` returned a complete final head (2xx–5xx).
@@ -766,7 +771,7 @@ Labels come from closed vocabularies:
 | `ferro_http_draining` | gauge | 0 or 1 |
 | `ferro_traceparent_invalid_total` | counter | existing; HTTP feeds it |
 
-`ferro_errors_total` stays SQL-only (C12).
+`ferro_errors_total{code,branch}` keeps counting every service's error terminals at the one terminal builder, as it does today for SQL, TX, STREAM and ADMIN (§22.2 (bu)); `ferro_http_errors_total` adds the `upstream` and `cause` labels for HTTP (C12).
 
 #### 23.10.3 Slow log and error text
 
@@ -806,7 +811,12 @@ Every assertion is mutation-proven (§22.2 (br)).
 
 **The change, which applies to SQL and HTTP alike:**
 
-1. **A per-request client deadline.** Each request records `deadline = now + (its timeout_ms ?? the service default) + margin`, with a default margin of 2 s.
+1. **A per-request client deadline.** A request whose bound the client knows records `deadline = now + bound + margin`, with a default margin of 2 s. The bound is (review of the adoption, R9):
+   - a SQL request or a queue verb other than a parked `RESERVE`: its `timeout_ms`;
+   - an HTTP request: its `timeout_ms` when it carries one;
+   - a queue `RESERVE` that waits: `wait_ms + queue_wait_grace_ms`, the engine's bound on its terminal (§24.8), plus its own `timeout_ms` if any.
+
+   **A request that carries no bound gets no client deadline** and is bounded on the client side by liveness only (item 2). That is the rule for an HTTP request with `timeout_ms = nil`: the engine bounds it by the upstream's `TIMEOUT_MS`, which the client cannot see (§23.7.3), and a client-chosen default shorter than that would `CANCEL` a sent POST early and make it `Indeterminate` by the client's own hand.
    - The engine enforces `timeout_ms` itself, so in normal operation its terminal arrives first.
    - **When the client deadline expires,** the client sends `CANCEL` for that `request_id` and fails **only that request**, using §23.7.3's table (HTTP) or §19.3's (SQL) with the §9.2 cause `timeout`.
    - **The session stays alive.** A late `END` for that id is drained and discarded.
@@ -1124,7 +1134,7 @@ Every slice runs the adversarial review before push (D15's process note). Every 
 | **D1c** *(M3, prerequisite)* | Per-request client deadlines and PING liveness (§23.11.0). | A slow request no longer poisons a session (SQL and HTTP). Must land before F8. |
 | **F1a** | Spike `engine/crates/ferro-http-spike` (ships no library code), **v1 critical path:** P1, P14, P15, P19, P7 (h1), P3, P16, P17 (P18 is measured with D1c). | `sent` is exact on HTTP/1.1; causes are distinguishable; head limits are settable; backpressure is bounded; deps pass cargo-deny. **A false premise here changes §23.7 before F2.** |
 | **F1b** | Spike, off the critical path: P2 (with the library-GOAWAY negative control), P5, P7 (h2), P4, P6, P20. | Evidence for F5b and for the post-v1 HTTP/2-writes slice; incompatibility entries measured. |
-| **F2** | `/proto`: the registry entries for what F0 allocated in the spec — `HTTP = 6`, three methods, the four codes, `[http.causes]`, the feature bit — plus vectors, both codecs, and PROTOCOL.md §1, §5 (the `detail` sentence) and a new §12. `ferrod` routes `HTTP/REQUEST` and answers `Unsupported`; the other HTTP methods route `Unsupported` (tested). | The wire is pinned before behaviour. |
+| **F2** | `/proto`: the registry entries for what F0 allocated in the spec — `HTTP = 6`, three methods, the four codes, `[http.causes]`, the feature bit — plus vectors, both codecs, and PROTOCOL.md §1, §5 (the `detail` sentence) and a new §12 (Queue's messages take §13). `ferrod` routes `HTTP/REQUEST` and answers `Unsupported`; the other HTTP methods route `Unsupported` (tested). | The wire is pinned before behaviour. |
 | **F3** | `ferro-http` configuration and the validator (§23.4), with the fuzz target, property gate and refusal corpus. No network. | The SSRF rule in isolation. |
 | **F4** | The HTTP/1.1 plaintext engine: DNS, the address guard with pinning, the pool, the write tracker, `ferro_http::fate`, head limits, `HEAD`/`BODY`/`END` through the generalised `Responder`, `CANCEL`, deadlines, budgets, the HTTP drain. Chaos 1, 2, 4, 5, 6, 11, 12, 14, 15, 16, 17. | Rules 3 and 4 hold; memory is bounded; restarts behave as stated. |
 | **F5** | TLS: rustls, roots, `CA_FILE`, mTLS, resumption. Chaos 3. | Real `https`. |
@@ -1157,7 +1167,7 @@ Every row is resolved in this change; the amendments it names are applied in `fe
 | C9 | D18 drop-in parity | **Drop-in differences, each a cited incompatibility entry:** (1) proxy env and `proxy` not honoured; (2) no re-send on a stale reused connection (P4); (3) 600 s default ceiling instead of none; (4) title-cased HTTP/1.1 request names; (5) **response header names lowercase** (`getHeaders()` keys; P6); (6) `verify=false`/`cert`/`ssl_key`/`force_ip_resolve` refused; (7) bodies > 16 MiB refused; (8) no brotli; (9) unmapped origins refused with `UnmappedOriginException` (a `RequestException`, so it escapes Laravel unwrapped); (10) `TRACE`/`TRACK`/`CONNECT` refused case-insensitively; (11) override and forwarding headers refused by default; (12) request-header limits (100 lines / 64 KiB) and response-head limits (256 KiB / 256 fields; P20); (13) PSR-7 `version` does not select the version, and a `1.0` request is sent as 1.1; (14) query-string routing not confined; (15) **`new GuzzleHttp\Client()` without the handler uses curl** (no global seam); (16) restarts cancel exchanges that outlive the HTTP drain; (17) `curl` options ignored, so no `CURLOPT_RESOLVE` equivalent; (18) a body-level `_method` override is not confined. | `docs/known-incompatibilities.md`, checked by `ci/check-incompatibilities-doc.sh`. |
 | C10 | §12: credentials in the secret store; DSNs in the environment | attached HTTP credentials are file-only | Not extending the debt. |
 | C11 | `ErrorPayload` `sqlstate`/`errno`/`detail` are backend fields | on HTTP: `sqlstate`/`errno` are `nil`, and **`detail` is exactly one `[http.causes]` registry token** | PROTOCOL.md §5 gains one sentence at F2. No shape change. Charter rule 2 holds because the tokens are generated. |
-| C12 | §13 `ferro_errors_total`, one span per EXEC | the `ferro_http_*` family, one span per `REQUEST` | §13 amended. |
+| C12 | §13 `ferro_errors_total`, one span per EXEC | the `ferro_http_*` family, one span per `REQUEST`; `ferro_errors_total` still counts HTTP's error terminals at the one terminal builder | §13 amended. |
 | C13 | (cj): an open stream is exclusive on its session | lifted for HTTP streams | Slice F8, with the guard; the per-stream memory bound is stated (§23.9.1). |
 | C14 | §18 `ferro.toml`; the tree is env-only | `FERRO_UPSTREAM_<NAME>_*` | The environment convention is kept; `ferro.toml` is not built first (§23.18 Q1). |
 | C15 | §17 M6 | matches; PSR-18 is synchronous; the Symfony client is not built | §17 M6 amended; no Symfony client in v1 (§23.18 Q6). |
@@ -1190,11 +1200,11 @@ Revisit triggers: an unpatchable advisory in this tree, or a measured reason to 
 
 > Manifest `idempotent: true` (§11) is the sole licence to auto-retry an `Indeterminate` **SQL statement**. Every other service defines its licences in its own section — §23.7.2 for Ferro HTTP, §24.6 for Ferro Queue — and each licence is either a **declaration** (by the caller or by the operator) or a property the **protocol** defines for an operation whose statements the engine itself composes. None is ever inferred from an HTTP method or from user statement text. A licence permits only the caller's policy layer to retry; the engine never re-sends anything (charter rule 3).
 
-For HTTP the licence works through classification: a request the caller or the operator declared idempotent is classified `Retryable` after a post-send failure, never `Indeterminate` (§23.7.1, §23.7.2). For Queue the licences are the autocommit fenced verbs re-sent with the same token, a dedup-keyed single-job `ENQUEUE`, and `RESERVE` (§24.6). Rationale: §22.2 (ac), §23.7.2, §24.6. Both drafts had numbered their licence decision D21; it is one §21 entry, not two.
+For HTTP the licence works through classification, and nothing licenses re-sending an `Indeterminate` HTTP request: a request the caller or the operator declared idempotent is never `Indeterminate` — a link-level failure after sending is `Retryable`, and a timeout or cancel follows §9.2's read rule (`QueryTimeout`, `Cancelled`) (§23.7.1, §23.7.2). For Queue the licences are the autocommit fenced verbs re-sent with the same token, a dedup-keyed single-job `ENQUEUE`, and `RESERVE` (§24.6). Rationale: §22.2 (ac), §23.7.2, §24.6. Both drafts had numbered their licence decision D21; it is one §21 entry, not two.
 
 **Amendments made in the same change** (each an *[Amended …]* note in the existing text):
 
-- **§5:** the service table (`06 http`, `07 queue`), the `HTTP` engine feature bit, and the drain note (`serve` waits `max(drain_deadline, http drain)` while HTTP exchanges are in flight).
+- **§5:** the service table (`06 http`, `07 queue`), the `HTTP` engine feature bit, and the drain note (a drain signal plumbed into the sessions; `serve` waits `FERRO_HTTP_DRAIN_MS + drain_deadline` while HTTP exchanges are in flight; §23.6.1).
 - **§9.2:** the four HTTP codes (and §24's two), `Forbidden` widened, and D21's licence sentence.
 - **§11, §19.3:** D21's wording; §19.3 gains §23.7.3's table by reference.
 - **§12:** the uid-split statement, the reflection limit, the address guard, file-only attached credentials, and the per-pool allow-list gap.
@@ -1204,11 +1214,12 @@ For HTTP the licence works through classification: a request the caller or the o
 - **§20.1:** `ferro-http`, `php/guzzle`, `php/psr18`. **§20.3:** HTTP chaos (§23.14) and lanes B and C.
 - **product-vision §4.2:** C1, C2, C22 and the §23.18 Q8 rewording of D.
 - **ledger:** Phase F follows §23.15; D1c is marked as the prerequisite of M6-F8.
-- **Deferred to slice F2, because they touch `/proto`:** `methods.toml`, `errors.toml`, golden vectors, both codecs, and PROTOCOL.md §1, §5 and a new §12.
+- **`/proto`, comments only:** `HTTP = 6` and the four codes are reserved as comments in `methods.toml` and `errors.toml` (no keys, no registry-hash change).
+- **Deferred to slice F2, because they change `/proto`'s keys:** `methods.toml`, `errors.toml`, golden vectors, both codecs, and PROTOCOL.md §1, §5 and a new §12.
 
 ### 23.18 Decisions taken at adoption
 
-The F0 draft left ten choices open. Each was **decided under the owner's full-freedom grant, 2026-10-06**; the labels Q1–Q10 are kept because the text above cites them.
+The F0 draft left ten choices open. Each was **decided under the owner's full-freedom grant as applied 2026-10-06 (ledger, "Owner directives and grants")**; the labels Q1–Q10 are kept because the text above cites them.
 
 1. **Q1: configuration format — the environment convention.** `FERRO_UPSTREAMS` plus `FERRO_UPSTREAM_<NAME>_<KEY>`, as `config.rs` already does for pools (§23.3.1). §18's `ferro.toml` is not built first as a chassis slice; when it is built, it maps onto these keys.
 2. **Q2: process isolation — in-process.** Ferro HTTP lives in the crate `ferro-http`, behind the default-on cargo feature `http`, inside `ferrod`, with the full `cargo deny check` (advisories included) as its gate on both feature configurations (§23.13, D20). A separate process behind the socket was declined as a chassis change with no measured need.
@@ -1235,7 +1246,10 @@ Every premise below is owed by the slice that names it, and none may be relied o
 - **P3.** The dependency set passes `deny.toml` unchanged and builds with no CMake and no toolchain beyond the existing C compiler. `ring` is `Apache-2.0 AND ISC`; `rustls-native-certs` is `Apache-2.0 OR ISC OR MIT`.
 - **P16.** `unicode-normalization`'s licence is on the allow-list. If it is not, `PATH_ENCODING=utf8` ships with a fixed code-point refusal table instead, generated from Unicode data at build time.
 - **P17.** During `ferrod`'s drain, an existing session keeps reading frames, so a new HTTP `REQUEST` can be refused with `draining` rather than lost. Measured against `serve.rs`/`session`.
-- **P18.** The session reader answers `PING` while request handlers are busy or parked on credit (D1c's liveness design).
+
+**Owned by D1c (M3), not by F1a:**
+
+- **P18.** The session reader answers `PING` while request handlers are busy or parked on credit. §23.11.0's liveness design rests on it, so D1c measures it before it relies on it.
 
 **F1b: off the critical path, before F5b and for the incompatibility page.**
 

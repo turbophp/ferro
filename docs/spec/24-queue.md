@@ -5,15 +5,18 @@
 the spec, and the charter's definition of done applies to it unchanged. Its decisions are recorded in
 SPEC §21 as **D21** (retry licences per service, one entry shared with §23; this section's licences
 are §24.6) and **D22** (the §3 / charter-rule-6 scope exception for the engine's closed statement
-set). The choices the draft left open were decided under the owner's full-freedom grant, 2026-10-06,
-and are listed in §24.17.
+set). The choices the draft left open were decided under the owner's full-freedom grant as applied 2026-10-06 (ledger, "Owner directives and grants"),
+and are listed in §24.17. **D22 is PENDING OWNER RATIFICATION:** it amends binding scope text (§3,
+charter rule 6), so no G-slice code (G1 onward) starts before the owner ratifies it.
 
 **Allocations.** This section allocates service id `QUEUE = 7`, the error codes `LeaseLost = 0x300F`
 and `PoolMismatch = 0x3010` (both NonRetryable), and the registry constant
-`queue_wait_grace_ms = 1000`. They are allocated **in the spec only**, after §23's (`HTTP = 6`,
-`0x1007`, `0x1008`, `0x300D`, `0x300E`). The `/proto` registry entries, golden vectors and both
-codecs land with slice G1, the engine's first code slice (§24.14); until then nothing in `/proto`
-names them, and no other change may take these numbers. Ferro Queue is not behind a cargo feature and
+`queue_wait_grace_ms = 1000`, after §23's (`HTTP = 6`, `0x1007`, `0x1008`, `0x300D`, `0x300E`).
+The service id and both codes are **reserved in `/proto` as comments only** (beside `[services]` in
+`methods.toml`, and in the reserved-codes block of `errors.toml`), with no keys, so no generated
+constant and no registry-hash change follows, and no other change may take these numbers. The keys,
+the constant, golden vectors and both codecs land with slice G1, the engine's first code slice
+(§24.14). Ferro Queue is not behind a cargo feature and
 takes no engine feature bit.
 
 **Read first:** §24.16 (how each conflict with existing text was resolved), §24.17 (the decisions
@@ -118,8 +121,9 @@ No PHP-native host-level job transport exists. PgBouncer sees statements, not jo
   - Inside a client transaction, every statement goes through the TX actor (§24.5).
   - No user statement is ever read, changed or inferred from. The scope exception this needs is
     D22 (C8).
-- **I4 — No engine retries (charter rule 3).** The engine executes each request at most once and ends
-  it with a classified terminal. **Redelivery after a lease expires is a property of stored state:** a
+- **I4 — No engine retries (charter rule 3).** The engine never re-executes a statement after it
+  failed or its fate is unconfirmed, and ends each request with one classified terminal. A parked
+  RESERVE's repeated sweeps are polls after an empty success, not retries (§24.8). **Redelivery after a lease expires is a property of stored state:** a
   row past its deadline satisfies the predicate, and the next RESERVE (a new request) selects it.
   There is no reaper and no timer that moves rows. In v1 the engine initiates exactly two kinds of
   write. Neither re-executes anything, and neither is retried if it fails:
@@ -301,7 +305,7 @@ G3 bench question (charter rule 5). The engine never creates an index.
   (§24.15) then needs no version bump.
 
 Shapes are positional msgpack arrays with strict arity. Field order lands with the golden vectors at
-G1 (PROTOCOL.md §12). `common` is `[tx_id|nil, timeout_ms|nil, traceparent|nil]`, and `traceparent` is
+G1 (PROTOCOL.md §13; §12 is HTTP's, §23). `common` is `[tx_id|nil, timeout_ms|nil, traceparent|nil]`, and `traceparent` is
 parsed as on EXEC (§22.2 (cd)). Every success terminal carries `stats {queue_us, exec_us}`.
 
 | method | request | success terminal | `tx_id` |
@@ -688,7 +692,8 @@ The review established what any future design must satisfy, recorded here so it 
 - it needs its own §21 decision, because D22 covers only the writes I4 lists.
 
 **Drain (§7.7).** On `ferrod` SIGTERM, parked RESERVEs get `Ok{jobs: []}` and **nothing** is
-released. Workers finish their fenced verbs on the successor, because tokens live in rows.
+released. This needs the drain signal §23.6.1 plumbs into the sessions and the waker; today sessions
+are never told the daemon is draining. Workers finish their fenced verbs on the successor, because tokens live in rows.
 
 **PostgreSQL LISTEN/NOTIFY is not the v1 wake mechanism.** It needs an app-installed trigger
 (no engine DDL) and a dedicated listening connection per pool (M5 machinery, built after M7). It is a
@@ -744,6 +749,11 @@ post-v1 option, triggered by measured cross-host latency.
   pool an admitted peer can already EXEC raw SQL against the same table, so the store adds no
   boundary there.
 - **Manifest-only pools accept QUEUE verbs.** They are a closed, engine-authored operation set (C4).
+  **Cost, stated:** a store declared on a manifest-only pool widens that pool's surface by all seven
+  verbs, none of which the manifest declares — RESERVE reads any job payload, which routinely carries
+  personal data or serialized models, and CLEAR deletes a whole queue. Declaring the store there is
+  the operator's choice; the engine states it rather than prevents it. Manifest-only mode itself is
+  M4 (ledger E2), after M7, so until M4 no pool is manifest-only.
 - **No admin verbs.** CLEAR is data-plane. D15 is untouched.
 
 ### 24.11 PHP side
@@ -958,7 +968,7 @@ every duplicate and every phantom attempt is attributable to a counted or docume
 | slice | delivers | proves |
 |---|---|---|
 | **G0** *(DONE, §22.2 (cn))* | this section; `QUEUE = 7`, `LeaseLost`, `PoolMismatch` and `queue_wait_grace_ms` allocated in the spec (their `/proto` entries land at G1); §21 D21/D22; the §24.16 amendments | review attacked §24.5–§24.8 before any code |
-| **G1** | `/proto`: `[services] QUEUE = 7`, the method table, the two codes and `queue_wait_grace_ms` G0 allocated, PROTOCOL.md §1 and §12, golden vectors, both codecs, **all shapes frozen**; store config, version gate, shape verification; ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
+| **G1** *(waits on D22's owner ratification)* | `/proto`: `[services] QUEUE = 7`, the method table, the two codes and `queue_wait_grace_ms` G0 allocated, PROTOCOL.md §1 and a new §13, golden vectors, both codecs, **all shapes frozen**; store config, version gate, shape verification; ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
 | **G2** | tx path: `resolve_active` made `pub(crate)`, `PoolMismatch`, `TxCommand::Queue` + `after_commit`, in-tx `LeaseLost` semantics (R1), refused tx-scoped RESERVE | atomicity both ways; mismatch leaves the transaction usable; chaos rows 2 and 7 |
 | **G3** | the waker (per queue, `LIMIT k`, statement deadlines, register-then-sweep), long-poll, the wait bound, **unreserve**, wake hints, coalesced polls, drain; queue metrics and spans | cost bound (row 11); one END under every CANCEL/deadline race and the deliver-xor-unreserve rule (row 12); idle-polling bench vs stock (A's number); R4 reproduced on the real transport |
 | **G4** | native PHP API, `queueWorker()`, wait clamp, client fate and licensed re-sends; dedup table and purge **after** the dedup spike reproduces §24.6's three paths | chaos rows 1, 3–6, 8, 9 and 15 through the client |
@@ -1030,9 +1040,14 @@ land with slice G1.
 - **C7 — §9.2 (the RESERVE classification; F15).** The first draft classified a lost RESERVE
   `Retryable`, which contradicts §9.2's definition: RESERVE is a dispatched side-effecting statement.
   It is **`Indeterminate`, so §9.2's tree and its definition stand unchanged.** What changes is the
-  licence sentence, amended per D21 ("…unless the query's manifest entry declares `idempotent: true`
-  (§11), or the request's re-send is licensed by its service's own section under D21 — §23.7.2 for
-  HTTP, §24.6 for a Queue verb…"). §19.3 gains a pointer. The client's `retry_reads` does **not**
+  licence sentence, amended per D21. The adopted §9.2 sentence reads, verbatim: "clients MUST NOT
+  auto-retry `Indeterminate` unless the query's manifest entry declares `idempotent: true` (§11), or,
+  for a Ferro Queue verb, §24.6 licenses the re-send (an autocommit fenced verb, a dedup-keyed
+  `ENQUEUE`, a `RESERVE`). Ferro HTTP licenses through classification instead, and nothing licenses
+  re-sending an `Indeterminate` HTTP request: a request declared idempotent, by its caller or by the
+  operator for its upstream, is never `Indeterminate` — a link-level failure after sending is
+  `Retryable`, and a timeout or cancel follows the read rule above (§23.7.1, §23.7.2); the method
+  alone licenses nothing. Raw-SQL writes are never auto-retried." §19.3 gains a pointer. The client's `retry_reads` does **not**
   apply to RESERVE: its re-send runs under the queue licence, not as a read.
 - **C8 — §3 and charter rule 6 (F18).** §3 says "not a storage engine, not a SQL rewriter". Charter
   rule 6 says "no SQL rewriting … no read/write inference". The precedents the first draft cited
@@ -1043,8 +1058,9 @@ land with slice G1.
   - it defines an application table's semantics (fencing, the dedup table);
   - it reads application data shapes (`information_schema`).
 
-  **Resolved by D22**, signed under the owner's full-freedom grant (§24.17 Q6). §3 gains, after its
-  first bullet:
+  **Resolved by D22**, decided under the owner's full-freedom grant (§24.17 Q6) and **PENDING OWNER
+  RATIFICATION**, because it amends binding scope text: no G-slice code (G1 onward) starts before the
+  owner ratifies it. §3 gains an amendment note to this effect:
 
   > "**Exception (D22):** the job transport engine (§24) composes a closed set of statements against
   > an operator-declared table whose layout the application owns, and may write its rows on its own
@@ -1052,7 +1068,10 @@ land with slice G1.
   > storage owned by the engine; no user statement is read, rewritten or inferred from."
 
   Charter rule 6 reads with the sentence "Engine-authored statements of the §24 queue verbs are not
-  SQL rewriting." D22 records it; `CLAUDE.md`'s copy of the charter was not edited in this change
+  SQL rewriting, and the `ferro` queue driver is not a drop-in database tier under the rule's 'change
+  execution, never SQL generation': it is a new driver name whose transport replaces
+  `DatabaseQueue`'s builder-generated SQL by design, while the drop-in database tiers keep stock SQL
+  generation." D22 records it; `CLAUDE.md`'s copy of the charter was not edited in this change
   and gains the sentence when that file is next updated.
 
   Stated honestly: this widens what the engine may do to application data. The cost is that a defect
@@ -1061,8 +1080,7 @@ land with slice G1.
 
 ### 24.17 Decisions taken at adoption, and the premises still owed
 
-The G0 draft left eight choices for confirmation. Each was **decided under the owner's full-freedom
-grant, 2026-10-06**; the labels Q1–Q8 are kept because the text above cites them.
+The G0 draft left eight choices for confirmation. Each was **decided under the owner's full-freedom grant as applied 2026-10-06 (ledger, "Owner directives and grants")**; the labels Q1–Q8 are kept because the text above cites them. Q6 (D22) is decided only provisionally and is pending owner ratification.
 
 - **Q1 — layout: Laravel's stock `jobs` table is v1's only layout** (§24.3), with its costs stated
   there: one-second resolution, a per-store lease, a 255-attempt ceiling on MySQL (32 767 on PG),
@@ -1080,8 +1098,10 @@ grant, 2026-10-06**; the labels Q1–Q8 are kept because the text above cites th
   application gets the native API only in v1, and D16's and product-vision §4.3's naming of the
   Messenger seam is amended accordingly.
 - **Q5 — `at_most_once`: cut, confirmed** (§24.15).
-- **Q6 — the §3 / charter-rule-6 scope exception: signed as D22.** v1 as redefined by D16 includes a
-  queue engine, which cannot exist without it (C8).
+- **Q6 — the §3 / charter-rule-6 scope exception: decided as D22, PENDING OWNER RATIFICATION.** v1
+  as redefined by D16 includes a queue engine, which cannot exist without it (C8). Because it amends
+  binding scope text, the grant decides it only provisionally: no G-slice code (G1 onward) starts
+  before the owner ratifies it.
 - **Q7 — the `FerroJob::fail()` divergence: accepted.** On `LeaseLost` the stale holder skips
   `failed()` and `JobFailed`. That is safer than stock (no `failed_jobs` row for a job someone else
   runs), at the stated cost that a `failed()` callback with side effects (a notification) no longer
