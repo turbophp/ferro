@@ -226,12 +226,6 @@ async fn handle_exec(
     }));
 
     // (2) reject not-yet-supported request shapes (each: one END, session survives).
-    if req.query_id.is_some() {
-        responder.end_error(unsupported(
-            "query_id (manifest execution) is post-M0 (M3); send inline sql",
-        ));
-        return;
-    }
     match req.fetch {
         // FETCH_STREAM is honored on BOTH paths: the autocommit producer (below) and, since Task 5,
         // the tx-scoped producer forwarded to the owning actor (the `Some(tx_id)` arm).
@@ -241,14 +235,27 @@ async fn handle_exec(
             return;
         }
     }
-    let sql = match &req.sql {
-        Some(s) => s.as_str(),
-        None => {
-            responder.end_error(unsupported(
-                "EXEC requires an inline sql statement in M0 (query_id manifests are M3)",
-            ));
-            return;
-        }
+
+    // (2b) the statement: inline SQL, or a manifest `query_id` (M3-D2d). Resolved per path below,
+    // because a `query_id` must agree with the pool it would RUN on — the request's `pool` for
+    // autocommit, the transaction's pinned pool for a tx-scoped request.
+    let resolve_sql = |run_pool: &str| -> Result<&str, ferro_proto::messages::ErrorPayload> {
+        crate::manifest::resolve(
+            req.sql.as_deref(),
+            req.query_id.as_deref(),
+            req.readonly,
+            run_pool,
+            registry.manifest(),
+        )
+        .map_err(|e| match e {
+            crate::manifest::ResolveError::BothSqlAndQueryId => protocol(
+                "malformed ExecRequest: sql and query_id are both set (sql is nil iff a query_id is used)",
+            ),
+            crate::manifest::ResolveError::NoStatement => {
+                unsupported("EXEC requires an inline sql statement or a manifest query_id")
+            }
+            crate::manifest::ResolveError::Refused(m) => unsupported(m),
+        })
     };
 
     match req.tx_id {
@@ -257,6 +264,13 @@ async fn handle_exec(
             // `req.pool` is ignored here — the transaction is already pinned to its pool's conn.
             let handle = match resolve_active(tx_registry, tx_id, session_id) {
                 Ok(h) => h,
+                Err(ep) => {
+                    responder.end_error(ep);
+                    return;
+                }
+            };
+            let sql = match resolve_sql(&handle.pool) {
+                Ok(sql) => sql,
                 Err(ep) => {
                     responder.end_error(ep);
                     return;
@@ -368,6 +382,13 @@ async fn handle_exec(
             let Some(pool) = registry.get(&req.pool) else {
                 responder.end_error(unsupported(format!("unknown pool {:?}", req.pool)));
                 return;
+            };
+            let sql = match resolve_sql(&req.pool) {
+                Ok(sql) => sql,
+                Err(ep) => {
+                    responder.end_error(ep);
+                    return;
+                }
             };
 
             // ONE authority for the streaming capability (M1-S8a): the backend's own
@@ -694,7 +715,16 @@ fn exec_span_attrs(
         };
         attrs.push(("db.system.name", Str(system.to_string())));
         attrs.push(("ferro.pool", Str(pool)));
-        if let Some(sql) = req.sql.as_deref() {
+        // A `query_id` (M3-D2d) is named, and its manifest SQL fingerprinted, only when it IS a
+        // manifest id: a client-supplied string that is not one is never exported.
+        let declared = req
+            .query_id
+            .as_deref()
+            .and_then(|id| registry.manifest()?.get(id).map(|q| (id, q.sql.as_str())));
+        if let Some((id, _)) = declared {
+            attrs.push(("ferro.query_id", Str(id.to_string())));
+        }
+        if let Some(sql) = req.sql.as_deref().or(declared.map(|(_, sql)| sql)) {
             attrs.push((
                 "db.query.text",
                 Str(crate::slow_log::fingerprint_of(sql, dialect).to_string()),

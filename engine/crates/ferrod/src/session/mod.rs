@@ -357,17 +357,18 @@ impl Session {
             return;
         }
 
-        let _hello = match handshake::validate_hello(&first) {
-            Ok(hello) => hello,
-            Err(err) => {
-                let _ = control_tx
-                    .send(ControlMsg::bare(err.into_out_frame()))
-                    .await;
-                drop(control_tx);
-                let _ = writer_handle.await;
-                return;
-            }
-        };
+        let _hello =
+            match handshake::validate_hello(&first, pool_registry.manifest().map(|m| m.hash())) {
+                Ok(hello) => hello,
+                Err(err) => {
+                    let _ = control_tx
+                        .send(ControlMsg::bare(err.into_out_frame()))
+                        .await;
+                    drop(control_tx);
+                    let _ = writer_handle.await;
+                    return;
+                }
+            };
 
         // The per-pool metadata, with `server_version` learned lazily per pool, CONCURRENTLY, and
         // bounded AS A WHOLE by `PoolRegistry::VERSION_PROBE_BUDGET` — never fatal: a pool whose
@@ -385,6 +386,7 @@ impl Session {
             first.header.request_id,
             epoch,
             pool_registry.pool_info().await,
+            pool_registry.manifest().is_some(),
         );
         if control_tx.send(ControlMsg::bare(ack)).await.is_err() {
             // Writer already gone; nothing left to do.

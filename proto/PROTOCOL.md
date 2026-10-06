@@ -242,7 +242,7 @@ service's terminal frame carries.
 |---|---|---|---|
 | 1 | `client_version` | `u32` | |
 | 2 | `type_registry_hash` | `str` | |
-| 3 | `manifest_hash` | `str \| nil` | present only in manifest-only mode (M3+) |
+| 3 | `manifest_hash` | `str \| nil` | the checked-SQL manifest the client was built against (§11 of the SPEC, M3-D2d), or `nil` for none. When set it must equal the engine's loaded manifest hash, or the handshake is refused session-fatal `Unsupported` (also when the engine has no manifest). `nil` makes no claim and is always admitted. `HELLO_ACK` sets the `MANIFEST` engine feature when a manifest is loaded |
 | 4 | `pid` | `u32` | client OS pid, diagnostic |
 | 5 | `features` | `u32` | client feature bitfield: `MEMFD_RX 0x01`, `FIBERS 0x02` |
 
@@ -469,7 +469,7 @@ A positional fixarray of 9 fields in declaration order (payload of a non-`END` `
 |---|---|---|---|
 | 1 | `pool` | `str` | target pool name |
 | 2 | `sql` | `str \| nil` | literal SQL; `nil` iff a `query_id` is used (manifest mode, M3) |
-| 3 | `query_id` | `str \| nil` | manifest query id; `nil` in M0 (rejected `Unsupported` if set) |
+| 3 | `query_id` | `str \| nil` | manifest query id (M3-D2d): the engine runs the manifest's SQL for it. The request's `readonly`, and the pool it runs on (`pool` for autocommit, the transaction's pinned pool when `tx_id` is set), must equal the manifest's declaration, else `Unsupported`; so are an unknown id and an engine with no manifest. Setting both `sql` and `query_id` is `Protocol` |
 | 4 | `params` | `array<Value>` | positional bind params, each a `[tag, payload]` `Value` (§3) |
 | 5 | `timeout_ms` | `u32 \| nil` | per-statement deadline hint |
 | 6 | `readonly` | `bool` | client-declared; drives the write-loss → `Indeterminate` split (no engine inference) |

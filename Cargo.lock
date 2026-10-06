@@ -416,6 +416,7 @@ dependencies = [
  "ferro-backend-pg",
  "ferro-backend-sqlite",
  "ferro-classify",
+ "ferro-manifest",
  "ferro-pool",
  "ferro-proto",
  "futures",
