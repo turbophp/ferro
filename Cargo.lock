@@ -346,6 +346,13 @@ name = "ferro-classify"
 version = "0.0.0"
 
 [[package]]
+name = "ferro-cli"
+version = "0.0.0"
+dependencies = [
+ "ferro-manifest",
+]
+
+[[package]]
 name = "ferro-e2e"
 version = "0.0.0"
 dependencies = [
@@ -354,6 +361,15 @@ dependencies = [
  "futures",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "ferro-manifest"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

@@ -1,0 +1,17 @@
+[package]
+name = "ferro-cli"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The `ferro` CLI (SPEC §11, D10): manifest building, schema checking and code generation."
+
+[[bin]]
+name = "ferro"
+path = "src/main.rs"
+
+[dependencies]
+ferro-manifest = { path = "../ferro-manifest" }
+
+[lints]
+workspace = true

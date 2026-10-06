@@ -328,10 +328,16 @@ Fan-out of k queries costs ≈ max(query) + boundary overhead, not the sum. Tran
 sqlx's trick, ported: verify every query against a real schema at build time, and generate the types. The CLI is a Rust binary in the engine workspace (D10), sharing the proto and backend crates.
 
 - `ferro schema sync` — applies the project's migrations to a disposable shadow database (or loads a committed schema snapshot).
-- `ferro check` — collects queries from: `.sql` files with front-matter and `#[FerroQuery('…')]` attributes (v1); inline `Ferro::sql('…')` literals via a PHPStan extension (phase 2, D3). Each is `PREPARE`d against the shadow schema; syntax errors, unknown columns, and param-count/type mismatches fail CI.
+- `ferro check` — collects queries from: `.sql` files with front-matter and `#[FerroQuery(id: …, sql: …)]` attributes (v1; named, literal arguments — see the amendment below); inline `Ferro::sql('…')` literals via a PHPStan extension (phase 2, D3). Each is `PREPARE`d against the shadow schema; syntax errors, unknown columns, and param-count/type mismatches fail CI.
 - `ferro gen` — emits `gen/`: readonly DTO classes with native property types, PHPStan stubs, and `manifest.json`.
 
-**Manifest schema:** `query_id → {normalized_sql, param_types, result_shape, pool, readonly: bool, idempotent: bool}`. `idempotent` defaults to `false`; it is declared in the query's front-matter/attribute and is the sole license for auto-retrying an `Indeterminate` write (§9.2, §19.3) — a natural-key upsert can declare it, a balance increment cannot.
+**Manifest schema:** `query_id → {sql, param_types, result_shape, pool, readonly: bool, idempotent: bool}`. `idempotent` defaults to `false`; it is declared in the query's front-matter/attribute and is the sole license for auto-retrying an `Indeterminate` write (§9.2, §19.3) — a natural-key upsert can declare it, a balance increment cannot.
+
+*[Amended M3-D2a (§22.2 (cl)): the formats are fixed.]*
+- **A `.sql` file** declares exactly ONE query. It starts with a `-- ferro:` block of INDENTED `--   key: value` lines (`--` then two spaces or a tab — `-- note: x` on the first SQL line is a comment, not a key): `id` (required, `[a-z][a-z0-9_.-]*`, up to 128 characters — never all digits, which PHP would turn into an integer key), `pool` (default `default`), `readonly` and `idempotent` (default `false`; exactly `true` or `false`, so a typo cannot license or forbid a retry), and `dto`. Anything that could make the file mean something other than it looks is refused: a front-matter-looking line after a blank line, a second `-- ferro:` block. The SQL is kept byte for byte, line endings included.
+- **An attribute** is `#[Ferro\Attribute\FerroQuery(id: …, sql: …, …)]` with NAMED, LITERAL arguments. `vendor/bin/ferro-queries` reads these with PHP's tokenizer, never running the code, resolves the attribute's name against the file's `namespace` and `use` imports as PHP does, and refuses anything it cannot read exactly.
+- **`ferro manifest`** collects both into `manifest.json`. The SQL is stored as written, minus front-matter and trimmed, and never rewritten.
+- **The hash** is SHA-256 over `{"v":1,"q":{id:{sql,pool,readonly,idempotent}}}` (ids sorted, no whitespace). `dto` and the source location are not part of it, because they do not change what runs. A loader recomputes it and never trusts the copy recorded in the file. A manifest with a repeated query id, an unknown field, or no queries is refused whole.
 
 The manifest hash participates in the handshake (§5). **Manifest-only mode** (`pools.<name>.manifest_only = true`): the engine executes only registered `query_id`s and rejects raw SQL — the injection surface collapses to zero for that pool, and compromised PHP cannot exfiltrate beyond the declared query set. Ships as a hardening option, off by default.
 
@@ -1255,6 +1261,25 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
     - **a known limit both D1 slices inherit: the client's socket read timeout doubles as every request's deadline.** `Ferro::connect`'s default is 5 s, so a query slower than that poisons the session and fails every request in flight on it, not just the slow one.
 
     All three are D1c. The remedy for the third is a per-request deadline that CANCELs only its own request, with the socket timeout reduced to a liveness bound.
+
+  **(cl) M3-D2a — the manifest is built: `ferro-manifest` + the `ferro` CLI + `ferro-queries` (2026-10-06).**
+  - **`ferro-manifest`** is a library shared by the CLI and (from D2d) `ferrod`, so both compute one hash from one canonical form. The canonical bytes are pinned by a test, because a change to them would move every deployed pair's hash at once.
+  - **The CLI binary is `ferro` (crate `ferro-cli`, D10).**
+    - `ferro manifest --sql <dir> [--php-queries <json>] --out <file>` collects queries from `.sql` front-matter and from the JSON `vendor/bin/ferro-queries` prints for `#[FerroQuery]` attributes, then validates and writes them.
+    - `ferro manifest-hash <file>` recomputes the hash.
+    - Exit codes: 1 on any invalid input (every problem listed, nothing written), 2 on misuse.
+    - Arguments are parsed by hand rather than adding a CLI dependency.
+  - **Attributes are read by PHP, not Rust.** PHP's own tokenizer (`PhpToken`) is the only robust PHP parser available without a dependency. The extractor accepts only NAMED, LITERAL arguments: single-quoted strings, double-quoted strings and heredocs with no backslash or interpolation, nowdocs (dedented as PHP does), and `true`/`false`/`null`. A concatenation, constant or expression is refused with its location, because a query the manifest gets wrong runs the wrong SQL under a trusted id.
+  - **Not established (D2b–D2e):**
+    - checking queries against a real schema (`ferro check`, `ferro schema sync`);
+    - code generation (`ferro gen`);
+    - the engine loading the manifest, comparing the hash at HELLO and running `query_id`;
+    - the client's idempotent retry licence.
+  - **The adversarial review confirmed 20 findings, three HIGH, all reproduced and fixed** — and all three were the extractor recording something other than what PHP runs, which is exactly the failure this slice exists to prevent:
+    - a `b'…'` binary-string prefix was read as part of the string (`'SELECT 1` recorded for `SELECT 1`);
+    - the attribute's name was compared as text, so `#[ferroquery(…)]`, an alias, a group import or `#[Attribute\FerroQuery(…)]` after `use Ferro\Attribute` were silently MISSED, while a short `FerroQuery` that PHP resolves to another class was taken. Names are now resolved against `namespace` and `use` as PHP does, case-insensitively, and only a top-level attribute counts (`#[CoversClass(FerroQuery::class)]` no longer breaks a tests-directory scan). The stated "aliases are not resolved" limit is gone;
+    - a nowdoc's dedent rewrote line terminators (CRLF → LF, `\f` → newline, and byte 0x85 inside a UTF-8 character split the string).
+    Also fixed: a blank line inside the front-matter silently ended it (the query then ran on the DEFAULT pool); a second `-- ferro:` block was swallowed into the first query's SQL (a `DELETE` inside a query declared `readonly`); a manifest's repeated query id kept the LAST entry without a word, and a misspelt field was ignored; `fs::write` truncated a good manifest before failing; a symlink cycle hung the `.sql` walk; a non-UTF-8 argument panicked. **The extractor is now tested against PHP itself:** each case is `eval`-compiled and its attributes instantiated through Reflection, so the expected value is PHP's, not the author's belief about PHP; 17 of those cases fail against the reviewed version. The hash is now pinned as a known answer computed outside the crate, including a vector with non-ASCII and control characters, since a PHP client recomputing it (D2e) must reproduce serde_json's escaping exactly. **Remaining leniency, stated:** an attribute's TARGET is not checked, so a declaration on a function or parameter, which PHP refuses at instantiation, is still extracted.
 
 ### 22.3 M2 exit record (2026-10-02)
 
