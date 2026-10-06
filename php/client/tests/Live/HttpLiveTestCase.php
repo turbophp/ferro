@@ -80,7 +80,8 @@ abstract class HttpLiveTestCase extends LiveTestCase
 
     /**
      * Besides `up` and `ops`: `dead`, a loopback port nothing listens on (a dial failure), and
-     * `tls`, an `https` origin — configured, but not served until slice F5 (`Unsupported`).
+     * `tls`, an `https` origin on the plain-HTTP upstream's port with a 300 ms connect bound: the
+     * upstream never answers the ClientHello, so the dial (DNS + TCP + TLS) times out.
      *
      * @return array<string, string>
      */
@@ -98,6 +99,7 @@ abstract class HttpLiveTestCase extends LiveTestCase
             'FERRO_UPSTREAM_DEAD_ADDRESS_CLASSES' => 'loopback',
             'FERRO_UPSTREAM_TLS_ORIGIN' => 'https://127.0.0.1:' . $this->upstreamPort,
             'FERRO_UPSTREAM_TLS_ADDRESS_CLASSES' => 'loopback',
+            'FERRO_UPSTREAM_TLS_CONNECT_TIMEOUT_MS' => '300',
         ];
     }
 

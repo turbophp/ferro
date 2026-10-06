@@ -1,6 +1,6 @@
 //! The SPEC §23.7.1 write tracker: what decides `sent`.
 //!
-//! It wraps the connection's PLAINTEXT I/O, below `hyper` (and, from slice F5, above TLS). Built on
+//! It wraps the connection's PLAINTEXT I/O, below `hyper` (and, on `https`, above TLS). Built on
 //! spike F1a's measured tracker (`ferro-http-spike/tests/common`), with the four rules that spike
 //! proved load-bearing kept as they were, each pinned by a test here:
 //!
@@ -12,9 +12,20 @@
 //!    keep-alive connection the previous exchange's bytes, reads and first error never leak into
 //!    this one — the read count that separates `eof_empty` from `eof_partial_head` is dispatch-
 //!    relative.
-//! 4. **`sent` is the OR of a plaintext half and a ciphertext half** (review F-1). F4a is plaintext,
-//!    so nothing writes the ciphertext half yet; it exists so F5's `CipherTap` below TLS only has
-//!    to feed it, and the `sent` rule does not change shape when TLS arrives.
+//! 4. **`sent` is measured where the bytes meet the SOCKET** (review F-1, M6-F5a). On `http` the
+//!    plaintext layer IS the socket, so `sent` is the plaintext count. On `https` it is the
+//!    [`CipherTap`]'s count below TLS ALONE: `tokio-rustls` 0.26.6 can fail a plaintext write after
+//!    earlier encrypted records of that same write reached the socket (F-1, so the plaintext count
+//!    can read zero while the upstream decrypted the head), AND it can ACCEPT a plaintext write into
+//!    `rustls`'s buffer while the socket took nothing (`poll_write` returns `Ok(n)` once `n > 0`
+//!    plaintext bytes are buffered and the socket write is `Pending`). Those buffered bytes never
+//!    reach the wire once the connection is discarded, so they are UNSENT; F1a's "plaintext OR
+//!    ciphertext" counted them as sent (§23.7.1 as amended by M6-F5a, SPEC §22.2 (dc)).
+//! 5. **Ferro never sends `close_notify`** (M6-F5a). On `https` the plaintext [`Tracker`] does not
+//!    forward `poll_shutdown` to TLS: `hyper` shuts its I/O down on its own after delivering some
+//!    errors (rule above), and the alert `rustls` would then write is a ciphertext byte after
+//!    dispatch carrying no request byte — it would turn a request that never left into "sent". The
+//!    socket closes when the connection is dropped, as every discard does.
 //!
 //! The engine reads `sent` only AFTER it has aborted `hyper`'s connection task and dropped the I/O
 //! (§23.7.1 as amended by F1a): that task writes independently of the response future, so before
@@ -39,13 +50,18 @@ pub enum Dir {
 /// What the tracker has observed, shared (`Arc`) between the tracker inside `hyper` and the engine.
 #[derive(Debug, Default)]
 pub struct TrackState {
+    /// The connection runs TLS: `sent` is the ciphertext count (rule 4), and the plaintext
+    /// tracker never forwards a shutdown (rule 5). Fixed at construction.
+    tls: bool,
     armed: AtomicBool,
     plain_sent: AtomicBool,
     written_armed: AtomicU64,
     written_unarmed: AtomicU64,
-    /// Ciphertext bytes the socket accepted below TLS since dispatch (review F-1). Fed by F5's
-    /// `CipherTap`; zero on plaintext.
+    /// Ciphertext bytes the socket accepted below TLS since dispatch (review F-1). Fed by the
+    /// [`CipherTap`]; zero on plaintext.
     cipher_armed: AtomicU64,
+    /// Ciphertext bytes the socket accepted while unarmed (the handshake; diagnostic).
+    cipher_unarmed: AtomicU64,
     read_armed: AtomicU64,
     read_total: AtomicU64,
     first_error: Mutex<Option<(Dir, io::ErrorKind)>>,
@@ -62,10 +78,35 @@ impl TrackState {
         self.armed.store(true, Ordering::SeqCst);
     }
 
-    /// §23.7.1: sent ⇔ the plaintext layer accepted a byte since dispatch OR the socket accepted a
-    /// ciphertext byte since dispatch.
+    /// §23.7.1 (as amended by M6-F5a): sent ⇔ the SOCKET accepted a byte since dispatch — the
+    /// plaintext count on `http`, the ciphertext count below TLS on `https` (module docs, rule 4).
     pub fn sent(&self) -> bool {
-        self.plain_sent.load(Ordering::SeqCst) || self.cipher_armed.load(Ordering::SeqCst) > 0
+        if self.tls {
+            self.cipher_armed.load(Ordering::SeqCst) > 0
+        } else {
+            self.plain_sent.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Whether the connection runs TLS.
+    pub fn is_tls(&self) -> bool {
+        self.tls
+    }
+
+    /// Ciphertext bytes the socket accepted since dispatch.
+    pub fn cipher_armed(&self) -> u64 {
+        self.cipher_armed.load(Ordering::SeqCst)
+    }
+
+    /// Ciphertext bytes the socket accepted while unarmed (the handshake, before dispatch).
+    pub fn cipher_unarmed(&self) -> u64 {
+        self.cipher_unarmed.load(Ordering::SeqCst)
+    }
+
+    /// Whether the plaintext layer accepted a byte since dispatch (on `https`: into `rustls`'s
+    /// buffer, which is not the wire — diagnostics and tests only).
+    pub fn plaintext_sent(&self) -> bool {
+        self.plain_sent.load(Ordering::SeqCst)
     }
 
     /// Plaintext request bytes accepted since dispatch (`HttpStats.bytes_sent`, §23.5.4).
@@ -107,6 +148,17 @@ impl TrackState {
         }
     }
 
+    fn note_cipher(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if self.armed.load(Ordering::SeqCst) {
+            self.cipher_armed.fetch_add(n as u64, Ordering::SeqCst);
+        } else {
+            self.cipher_unarmed.fetch_add(n as u64, Ordering::SeqCst);
+        }
+    }
+
     fn note_written(&self, n: usize) {
         if n == 0 {
             return;
@@ -127,6 +179,7 @@ pub struct Tracker<T> {
 }
 
 impl<T> Tracker<T> {
+    /// The plaintext tracker of an `http` connection: it sits directly on the socket.
     pub fn new(inner: T) -> (Self, Arc<TrackState>) {
         let state = Arc::new(TrackState::default());
         (
@@ -136,6 +189,94 @@ impl<T> Tracker<T> {
             },
             state,
         )
+    }
+
+    /// The plaintext tracker of an `https` connection, above TLS, sharing the state its
+    /// [`CipherTap`] below TLS feeds.
+    pub fn over_tls(inner: T, state: Arc<TrackState>) -> Self {
+        debug_assert!(state.tls, "a TLS tracker shares a CipherTap's state");
+        Tracker { inner, state }
+    }
+
+    /// The wrapped I/O (tests: the controls that bypass the tracker's rules).
+    #[cfg(test)]
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+/// The ciphertext half (review F-1): wraps the TRANSPORT below TLS and counts the encrypted bytes
+/// the socket accepts into the same [`TrackState`] the plaintext [`Tracker`] above TLS uses. On
+/// `https` this count alone decides `sent` (module docs, rule 4). Reads pass through uncounted;
+/// write errors are left to the plaintext layer, which sees `rustls`'s report of them.
+#[derive(Debug)]
+pub struct CipherTap<T> {
+    inner: T,
+    state: Arc<TrackState>,
+}
+
+impl<T> CipherTap<T> {
+    /// Below TLS, with a fresh TLS-mode state for [`Tracker::over_tls`].
+    pub fn new(inner: T) -> (Self, Arc<TrackState>) {
+        let state = Arc::new(TrackState {
+            tls: true,
+            ..TrackState::default()
+        });
+        (
+            CipherTap {
+                inner,
+                state: state.clone(),
+            },
+            state,
+        )
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for CipherTap<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for CipherTap<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &res {
+            self.state.note_cipher(*n);
+        }
+        res
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let res = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = &res {
+            self.state.note_cipher(*n);
+        }
+        res
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -201,6 +342,12 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Tracker<T> {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.state.tls {
+            // Rule 5: no `close_notify`. Forwarding would make `rustls` write an alert record —
+            // a ciphertext byte after dispatch that carries no request byte. The socket closes when
+            // the connection is dropped.
+            return Poll::Ready(Ok(()));
+        }
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -261,6 +408,33 @@ mod tests {
         s.arm();
         assert!(!s.sent(), "arming starts the exchange's counts at zero");
         assert_eq!(s.written_armed(), 0);
+    }
+
+    /// Both of the [`CipherTap`]'s write paths count (rule 4). `tokio-rustls` 0.26.6 writes only
+    /// vectored, so the non-vectored `poll_write` is unexercised by every TLS test — and a
+    /// version that routes through it would, uncounted, report a delivered request as unsent (the
+    /// HIGH direction). This drives each path directly (review L4).
+    #[tokio::test]
+    async fn the_cipher_tap_counts_plain_and_vectored_socket_writes() {
+        let (mut tap, s) = CipherTap::new(tokio::io::sink());
+        // `write` is `poll_write`; `write_vectored` is `poll_write_vectored`.
+        let n = tap.write(b"handshake").await.unwrap();
+        assert_eq!(
+            (s.cipher_unarmed(), s.cipher_armed(), s.sent()),
+            (n as u64, 0, false)
+        );
+        s.arm();
+        let n = tap.write(b"record").await.unwrap();
+        assert!(n > 0);
+        assert_eq!(s.cipher_armed(), n as u64, "poll_write counts");
+        assert!(s.sent());
+        s.arm();
+        assert!(!s.sent());
+        let bufs = [io::IoSlice::new(b"ab"), io::IoSlice::new(b"cd")];
+        let n = tap.write_vectored(&bufs).await.unwrap();
+        assert!(n > 0);
+        assert_eq!(s.cipher_armed(), n as u64, "poll_write_vectored counts");
+        assert!(s.sent());
     }
 
     /// Writes are HELD (pending) until `open`; reads deliver `head` only after the first write

@@ -29,9 +29,7 @@ ferro-proto = { path = "../ferro-proto" }
 # default build of this crate stays tokio-free ON PURPOSE — its three `cargo-fuzz` targets build
 # under coverage instrumentation, which tokio ICEs on current nightly (ci.yml's fuzz-smoke NOTE), so
 # pulling tokio into the default feature set would silently cost the SSRF rule its fuzz job.
-# `rustls`/`tokio-rustls`/`rustls-native-certs` are NOT here yet: F4a is plaintext only; F5 adds
-# them with the `default-features = false, features = ["ring", "tls12"]` selection P3 proved
-# load-bearing. `http2` likewise waits for F5b. Every crate below was already in the lock (F1a).
+# `http2` waits for F5b. Every crate below was already in the lock (F1a).
 hyper = { version = "1", default-features = false, features = ["client", "http1"], optional = true }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
 http = { version = "1", optional = true }
@@ -46,6 +44,19 @@ tracing = { version = "0.1", optional = true }
 # "`flate2` is already locked" — so this adds no crate. `default-features = false` plus
 # `rust_backend` keeps the C zlib backends out.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
+# §23.8.8 TLS (M6-F5a): D20's TLS half, with EXACTLY the selections spike F1a measured (§23.13, P3).
+# `tokio-rustls`'s DEFAULT features select `aws_lc_rs` (CMake + the OpenSSL licence: the backend D20
+# rejects), so `default-features = false` is load-bearing, not tidiness. All four were already in the
+# lock (the F1a spike), so this adds no crate.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+rustls-pki-types = { version = "1", optional = true }
+# TEST-ONLY certificate generation (`testcert`, behind the non-default `test-certs` feature, which only
+# `ferrod`'s dev-dependency enables). `rcgen` is not in the lock and D20 does not list it, so the
+# suites build their certificates IN-TEST with a small DER writer signed by `ring` — the crypto
+# backend D20 already adopts (in the lock through `rustls`). Never linked into a daemon build.
+ring = { version = "0.17", optional = true }
 
 [features]
 default = []
@@ -59,7 +70,14 @@ engine = [
     "dep:tokio-util",
     "dep:tracing",
     "dep:flate2",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rustls-pki-types",
 ]
+# Test scaffolding only (see `ring` above): `ferro_http::testcert`.
+test-certs = ["dep:ring", "dep:rustls-pki-types"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+ring = "0.17"

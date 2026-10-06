@@ -138,23 +138,28 @@ final class HttpLiveTest extends HttpLiveTestCase
         $this->assertSame(200, $conn->upstream('up')->request('GET', '/echo')->status, 'the session goes on');
     }
 
-    public function testADialFailureIsRetryableAndAnHttpsUpstreamIsNotServedYet(): void
+    /**
+     * Dial failures never send anything, so even a POST is Retryable: a refused port, and an
+     * `https` origin whose port speaks plain HTTP — the TLS handshake never completes, so the dial
+     * times out before any request byte exists (§23.7.1's dial rows; `https` is served since F5a).
+     */
+    public function testADialFailureIsRetryableAndNeverSent(): void
     {
         $conn = $this->conn();
-        try {
-            $conn->upstream('dead')->request('POST', '/x', body: 'x');
-            $this->fail('expected the dial failure');
-        } catch (HttpRetryableException $e) {
-            $this->assertSame(C::ERR_UPSTREAM_UNAVAILABLE, $e->errorCode());
-            $this->assertSame(C::HTTP_CAUSE_CONNECT_REFUSED, $e->cause());
-            $this->assertSame(FateClass::Retryable, $e->fate(), 'never sent, so Retryable even for a POST');
-        }
-        try {
-            $conn->upstream('tls')->request('GET', '/echo');
-            $this->fail('expected Unsupported');
-        } catch (NonRetryableException $e) {
-            $this->assertSame(C::ERR_UNSUPPORTED, $e->errorCode());
-            $this->assertNotInstanceOf(HttpException::class, $e, 'Unsupported is not an exchange fate (no cause)');
+        $cases = [
+            'dead' => C::HTTP_CAUSE_CONNECT_REFUSED,
+            'tls' => C::HTTP_CAUSE_CONNECT_TIMEOUT,
+        ];
+        foreach ($cases as $upstream => $cause) {
+            try {
+                $conn->upstream($upstream)->request('POST', '/echo', body: 'x');
+                $this->fail("{$upstream}: expected the dial failure");
+            } catch (HttpRetryableException $e) {
+                $this->assertSame(C::ERR_UPSTREAM_UNAVAILABLE, $e->errorCode(), $upstream);
+                $this->assertSame($cause, $e->cause(), $upstream);
+                $this->assertFalse($e->clientSynthesised());
+                $this->assertSame(FateClass::Retryable, $e->fate(), 'never sent, so Retryable even for a POST');
+            }
         }
         $this->assertSame(0, $this->received('/'));
     }

@@ -1897,10 +1897,11 @@ async fn a_disabled_service_is_not_advertised_and_refuses() {
     assert_eq!(up.rec.conns(), 0);
 }
 
-/// An `https` upstream is configured but not SERVED until TLS lands (slice F5): `Unsupported`, with
-/// no cause token (§22.2 (cy)), and nothing dialled.
+/// An `https` upstream was `Unsupported` until TLS landed (F4a); from slice M6-F5a it is SERVED, so
+/// it is dialled like any other: nothing listens on port 1, so `connect_refused`, never
+/// `Unsupported`. TLS itself is `http_tls_it.rs`'s.
 #[tokio::test]
-async fn an_https_upstream_is_unsupported_until_f5() {
+async fn an_https_upstream_is_served_from_f5a() {
     let d = daemon(vars(&[
         ("FERRO_UPSTREAMS", "tls".into()),
         ("FERRO_UPSTREAM_TLS_ORIGIN", "https://127.0.0.1:1".into()),
@@ -1908,7 +1909,14 @@ async fn an_https_upstream_is_unsupported_until_f5() {
     let mut c = d.client().await;
     let r = exchange(&mut c, 1, &request("tls", "GET", "/")).await;
     let ep = r.error();
-    assert_eq!((ep.code, ep.detail.as_deref()), (errc::UNSUPPORTED, None));
+    assert_eq!(
+        (ep.code, ep.detail.as_deref()),
+        (
+            errc::UPSTREAM_UNAVAILABLE,
+            Some(http_cause::CONNECT_REFUSED)
+        ),
+        "{ep:?}"
+    );
 }
 
 // =================================================================================================
