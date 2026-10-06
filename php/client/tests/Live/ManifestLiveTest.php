@@ -28,6 +28,34 @@ final class ManifestLiveTest extends LiveTestCase
 {
     private string $manifestPath = '';
 
+    /**
+     * This run's names for the fixture's tables and sequences. The live tiers of several checkouts
+     * share one PostgreSQL database, and fixed names let one run's DROP/CREATE land in the middle of
+     * another's statement (`relation "d2e_kv" does not exist`, reproduced in every one of 16 rounds
+     * of two concurrent runs). The manifest is generated per run from these, so its SQL — and its
+     * hash — are this run's too.
+     */
+    private static function t(string $sql): string
+    {
+        $suffix = '_' . getmypid();
+        return strtr($sql, [
+            'd2e_kv' => 'd2e_kv' . $suffix,
+            'd2e_log' => 'd2e_log' . $suffix,
+            'd2e_put_attempts' => 'd2e_put_attempts' . $suffix,
+            'd2e_add_attempts' => 'd2e_add_attempts' . $suffix,
+        ]);
+    }
+
+    /** @return array<string, array{sql: string, pool: string, readonly: bool, idempotent: bool}> */
+    private static function queries(): array
+    {
+        $q = self::QUERIES;
+        foreach ($q as $id => $entry) {
+            $q[$id]['sql'] = self::t($entry['sql']);
+        }
+        return $q;
+    }
+
     private const QUERIES = [
         'kv.put' => [
             // `hits` counts APPLICATIONS (review F5: `SET v = EXCLUDED.v` alone passes whether the
@@ -48,13 +76,25 @@ final class ManifestLiveTest extends LiveTestCase
     protected function extraEnv(): array
     {
         $this->manifestPath = sys_get_temp_dir() . '/ferro-d2e-manifest-' . getmypid() . '.json';
-        file_put_contents($this->manifestPath, json_encode(['version' => 1, 'queries' => self::QUERIES], JSON_THROW_ON_ERROR));
+        file_put_contents($this->manifestPath, json_encode(['version' => 1, 'queries' => self::queries()], JSON_THROW_ON_ERROR));
         return ['FERRO_MANIFEST' => $this->manifestPath];
     }
 
     protected function tearDown(): void
     {
-        parent::tearDown();
+        try {
+            if ($this->socketPath !== '' && file_exists($this->socketPath)) {
+                $c = $this->connectConnection();
+                foreach (['DROP TABLE IF EXISTS d2e_kv', 'DROP TABLE IF EXISTS d2e_log', 'DROP SEQUENCE IF EXISTS d2e_put_attempts', 'DROP SEQUENCE IF EXISTS d2e_add_attempts'] as $sql) {
+                    $c->exec(self::t($sql));
+                }
+                $c->session()->close();
+            }
+        } catch (\Throwable) {
+            // best effort: a leftover fixture is this run's alone
+        } finally {
+            parent::tearDown();
+        }
         if ($this->manifestPath !== '' && file_exists($this->manifestPath)) {
             @unlink($this->manifestPath);
         }
@@ -70,7 +110,7 @@ final class ManifestLiveTest extends LiveTestCase
             'CREATE TABLE d2e_log (id serial PRIMARY KEY, v text NOT NULL)',
             'CREATE SEQUENCE d2e_put_attempts', 'CREATE SEQUENCE d2e_add_attempts',
         ] as $sql) {
-            $c->exec($sql);
+            $c->exec(self::t($sql));
         }
     }
 
@@ -82,7 +122,7 @@ final class ManifestLiveTest extends LiveTestCase
     /** @return int how many times the engine was asked to run the statement */
     private function attempts(string $sequence): int
     {
-        return (int) $this->connectConnection()->scalar("SELECT last_value FROM {$sequence}", []);
+        return (int) $this->connectConnection()->scalar(self::t("SELECT last_value FROM {$sequence}"), []);
     }
 
     public function testQueriesRunByIdOnTheEnginesSql(): void
@@ -106,13 +146,13 @@ final class ManifestLiveTest extends LiveTestCase
 
         $this->assertSame(2, $this->attempts('d2e_put_attempts'), 'sent twice: the loss, then the licensed re-send');
         $check = $this->connectConnection();
-        $this->assertSame(1, (int) $check->scalar('SELECT count(*) FROM d2e_kv WHERE k = 7', []));
-        $this->assertSame('seven', $check->scalar('SELECT v FROM d2e_kv WHERE k = 7', []));
+        $this->assertSame(1, (int) $check->scalar(self::t('SELECT count(*) FROM d2e_kv WHERE k = 7'), []));
+        $this->assertSame('seven', $check->scalar(self::t('SELECT v FROM d2e_kv WHERE k = 7'), []));
         // Two sends, ONE application: the first send's statement was cancelled by `ferrod` at its
         // statement timeout mid-sleep, so the licensed re-send is the only one that applied. (Had
         // it applied too, the declared-idempotent upsert would still leave one row — which is why
         // the licence is safe — but `hits` would read 2.)
-        $this->assertSame(1, (int) $check->scalar('SELECT hits FROM d2e_kv WHERE k = 7', []));
+        $this->assertSame(1, (int) $check->scalar(self::t('SELECT hits FROM d2e_kv WHERE k = 7'), []));
     }
 
     /** Review F3: inside a closure transaction a query by id runs IN it, and its rollback undoes it. */
@@ -127,7 +167,7 @@ final class ManifestLiveTest extends LiveTestCase
             }, RetryPolicy::none());
         } catch (\LogicException) {
         }
-        $this->assertSame(0, (int) $this->connectConnection()->scalar('SELECT count(*) FROM d2e_kv WHERE k = 4', []));
+        $this->assertSame(0, (int) $this->connectConnection()->scalar(self::t('SELECT count(*) FROM d2e_kv WHERE k = 4'), []));
     }
 
     /** **The control.** The identical loss on a write NOT declared idempotent surfaces; one send. */
@@ -159,7 +199,7 @@ final class ManifestLiveTest extends LiveTestCase
     /** A client built against another manifest is refused at connect (M3-D2d). */
     public function testAClientWithAnotherManifestIsRefusedAtConnect(): void
     {
-        $other = self::QUERIES;
+        $other = self::queries();
         $other['log.add']['idempotent'] = true; // the edit that would license a double write
         $this->expectException(HandshakeException::class);
         $this->expectExceptionMessage('manifest_hash mismatch');

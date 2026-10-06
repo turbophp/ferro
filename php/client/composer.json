@@ -5,12 +5,14 @@
     "license": "Apache-2.0",
     "require": { "php": ">=8.2" },
     "require-dev": {
+        "phpstan/phpstan": "^2.0",
         "phpunit/phpunit": "^11.0",
-        "phpstan/phpstan": "^2.0"
+        "revolt/event-loop": "^1.0"
     },
     "suggest": {
         "ext-msgpack": "Faster MessagePack codec hot path",
-        "ext-sockets": "Enables the MEMFD_RX out-of-band receive path (M3)"
+        "ext-sockets": "Enables the MEMFD_RX out-of-band receive path (M3)",
+        "revolt/event-loop": "Lets Ferro\\Revolt::install() suspend awaits into the Revolt event loop (AMPHP v3)"
     },
     "bin": ["bin/ferro-queries"],
     "autoload": { "psr-4": { "Ferro\\": "src/" }, "files": ["src/functions.php"] },
