@@ -215,12 +215,18 @@ being merely *slow* cannot also pass it.
   only on the 4 ms throttle.
   - **The fix:** after the stall, the probe **holds for 3 s** and requires the upstream's written
     count not to move at all.
-  - **The slowest read-ahead it catches** is one frame per ~3.3 s, the 300 ms window plus the hold.
-    Measured: caught at 2.9 s and 3.2 s per frame, missed at 4 s.
+  - **What the hold catches** is a reader whose reads reach the socket inside the hold. The
+    guaranteed bound is the review's mutation, one frame per 350 ms (`held = false` locally with
+    1.6 MB excess, and on a GitHub runner with 3.9 MB).
+    - Slower readers are caught only sometimes. Locally the probe caught 2 s, 2.9 s and 3.2 s per
+      frame and missed 4 s. On a GitHub runner it MISSED 2 s per frame (`held = true`, excess
+      585 KB): at that rate the reader may only drain hyper's own buffer during the hold, and the
+      upstream genuinely does not move. The first version of this control asserted the 2 s case
+      and failed CI on PR #92; that case was removed and the claimed bound corrected.
   - **A slower reader** still leaks one 64 KiB frame per period past the credit. It is not
     detectable in a bounded test, and its harm is bounded by its rate.
   - `p7_control_a_slow_read_ahead_client_fails_the_probe` keeps the review's mutation as a permanent
-    control at 350 ms (measured excess 1.6 MB, `held = false`) and at 2 s.
+    control at 350 ms.
   - The review's mutation applied inside the positive test (M-P7d) and a probe without the hold
     (M-P7c) are both killed.
   - The positive runs hold for the full 3 s, with the excess unchanged (~0.65 / ~0.59 MB).
