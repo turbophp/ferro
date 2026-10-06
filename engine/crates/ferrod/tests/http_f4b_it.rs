@@ -13,16 +13,21 @@ mod http_support;
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::io::Write as _;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use ferro_http::engine::{ResponseSink, SinkError, SinkFrame, TcpConnect};
+use ferro_http::engine::{
+    BoxIo, Connect, DrainView, ResponseSink, SinkError, SinkFrame, TcpConnect, Terminal,
+};
 use ferro_proto::consts::{branch, errc, flags, http_cause, method_http, service};
 use ferro_proto::messages::{HttpDecoded, HttpHeaderField, HttpRequest, Outcome};
 use http_support::*;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
 const MIB: usize = 1024 * 1024;
@@ -564,6 +569,15 @@ fn encoded_response(target: &str) -> Vec<u8> {
     let (ce, body): (&str, Vec<u8>) = match target.split('/').nth(1).unwrap_or("") {
         "gzip" => ("gzip", gzip(&data)),
         "xgzip" => ("x-gzip", gzip(&data)),
+        "mixedgzip" => ("GZip", gzip(&data)),
+        // 5000 EMPTY members, then the data: far more members than one bounded decode step
+        // starts, so the decoder must be stepped until it asks for input, never left holding
+        // undecoded input at the end of a read (review round).
+        "manyempty" => {
+            let mut body = gzip(b"").repeat(5000);
+            body.extend(gzip(&data));
+            ("gzip", body)
+        }
         "zlib" => ("deflate", zlib(&data)),
         "raw" => ("Deflate", raw_deflate(&data)),
         "br" => ("br", b"not really brotli".to_vec()),
@@ -637,6 +651,8 @@ async fn gzip_and_deflate_are_decoded_and_everything_else_passes_through() {
     for (enc, received) in [
         ("gzip", "gzip"),
         ("xgzip", "x-gzip"),
+        ("mixedgzip", "GZip"),
+        ("manyempty", "gzip"),
         ("zlib", "deflate"),
         ("raw", "Deflate"),
     ] {
@@ -1342,8 +1358,9 @@ async fn the_drain_cap_before_any_byte_is_sent_is_retryable() {
 }
 
 /// **The extension ends early, and only when HTTP is in flight.** An idle session drains in
-/// `drain_deadline` exactly as before F4b; one 400 ms exchange in flight at a 5 s cap ends `serve`
-/// `drain_deadline` after its terminal, not at the 5.3 s sum.
+/// `drain_deadline` exactly as before F4b (1 s here: under 1.6 s, so an extension entered with
+/// nothing in flight — another `drain_deadline` — fails it); one 400 ms exchange in flight at a 5 s
+/// cap ends `serve` `drain_deadline` after its terminal, not at the 5.3 s sum.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_drain_extension_is_bounded_by_the_last_http_terminal() {
     let slow = upstream(|mut s, rec| async move {
@@ -1356,15 +1373,15 @@ async fn the_drain_extension_is_bounded_by_the_last_http_terminal() {
     let env = upstreams(&[("slow", slow.addr)], &[("", "DRAIN_MS", "5000")]);
 
     // An idle session: unchanged.
-    let s = served(env.clone(), Duration::from_millis(300));
+    let s = served(env.clone(), Duration::from_secs(1));
     let _c = s.client().await;
     let t0 = Instant::now();
     s.drain.trigger();
     s.served.await.unwrap();
     let idle = t0.elapsed();
     assert!(
-        idle >= Duration::from_millis(280) && idle < Duration::from_millis(1_000),
-        "{idle:?}"
+        idle >= Duration::from_millis(980) && idle < Duration::from_millis(1_600),
+        "an idle session drains in drain_deadline, with no extension: {idle:?}"
     );
 
     // One short exchange in flight.
@@ -1548,4 +1565,407 @@ async fn chaos4_the_stale_keep_alive_residual_at_the_default_and_at_zero() {
             );
         }
     }
+}
+
+// =================================================================================================
+// Review round (§22.2 (db)): the adversarial review's probes, adopted
+// =================================================================================================
+
+/// A connector whose connection's FIRST write blocks its worker thread for `block` before it
+/// reaches the socket — so the request's bytes leave while the engine is already tearing the
+/// connection down — and whose `connect` itself can block its thread for `connect_block` (an
+/// exchange the cap cannot stop on time). `entered` is set as either begins.
+struct BlockConnect {
+    entered: Arc<AtomicBool>,
+    block: Duration,
+    connect_block: Duration,
+}
+struct BlockIo {
+    inner: tokio::net::TcpStream,
+    first: bool,
+    entered: Arc<AtomicBool>,
+    block: Duration,
+}
+impl BlockIo {
+    fn block_once(&mut self) {
+        if self.first {
+            self.first = false;
+            self.entered.store(true, Ordering::SeqCst);
+            std::thread::sleep(self.block);
+        }
+    }
+}
+impl AsyncRead for BlockIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        b: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, b)
+    }
+}
+impl AsyncWrite for BlockIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        b: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.block_once();
+        Pin::new(&mut self.inner).poll_write(cx, b)
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        b: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.block_once();
+        Pin::new(&mut self.inner).poll_write_vectored(cx, b)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+impl Connect for BlockConnect {
+    fn connect<'a>(
+        &'a self,
+        peer: std::net::SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<BoxIo>> + Send + 'a>> {
+        Box::pin(async move {
+            if !self.connect_block.is_zero() {
+                self.entered.store(true, Ordering::SeqCst);
+                std::thread::sleep(self.connect_block);
+            }
+            let inner = tokio::net::TcpStream::connect(peer).await?;
+            Ok(Box::new(BlockIo {
+                inner,
+                first: true,
+                entered: self.entered.clone(),
+                block: self.block,
+            }) as BoxIo)
+        })
+    }
+}
+
+/// An upstream that reads one request and then holds the connection open without answering.
+async fn reads_and_holds() -> Upstream {
+    upstream(|mut s, rec| async move {
+        if rec.read_request(&mut s).await.is_some() {
+            rec.hold_until_closed(&mut s, Duration::from_secs(10)).await;
+        }
+    })
+    .await
+}
+
+/// **R1: `sent` is read AFTER the teardown, for the drain cap and for a `CANCEL`.** The stop fires
+/// while `hyper`'s first write of a POST is in progress on another worker (the connector blocks
+/// that write for 400 ms, then lets it through). The upstream RECEIVES the request, so the answer
+/// must be Indeterminate — never the "stopped before any byte was sent" (Retryable for the drain,
+/// `Cancelled` for a `CANCEL`) that reading `sent` before `discard` completes would give.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_during_the_first_write_is_indeterminate_for_the_drain_and_a_cancel() {
+    for drained in [true, false] {
+        let up = reads_and_holds().await;
+        let in_write = Arc::new(AtomicBool::new(false));
+        let engine = engine_with(
+            upstreams(&[("u", up.addr)], &[("", "DRAIN_MS", "0")]),
+            Arc::new(BlockConnect {
+                entered: in_write.clone(),
+                block: Duration::from_millis(400),
+                connect_block: Duration::ZERO,
+            }),
+        );
+        let drain_token = CancellationToken::new();
+        let at: Arc<OnceLock<tokio::time::Instant>> = Arc::new(OnceLock::new());
+        let drain = DrainView::new(drain_token.clone(), at.clone());
+        let cancel = CancellationToken::new();
+        let task = {
+            let (e, cancel) = (engine.clone(), cancel.clone());
+            tokio::spawn(async move {
+                e.serve_request(
+                    post("u", b"probe-body"),
+                    None,
+                    Instant::now(),
+                    &cancel,
+                    &drain,
+                    &BlackHole,
+                )
+                .await
+            })
+        };
+        wait_for("hyper inside its first write", || {
+            in_write.load(Ordering::SeqCst)
+        })
+        .await;
+        if drained {
+            at.get_or_init(tokio::time::Instant::now);
+            drain_token.cancel();
+        } else {
+            cancel.cancel();
+        }
+        let t = task.await.unwrap();
+        wait_for("the upstream received the request", || {
+            up.rec.requests().len() == 1
+        })
+        .await;
+        let want = if drained {
+            http_cause::DRAINING
+        } else {
+            http_cause::CANCELLED
+        };
+        match &t {
+            Terminal::Error(ep) => {
+                assert_eq!(ep.detail.as_deref(), Some(want), "{t:?}");
+                assert_eq!(
+                    ep.branch,
+                    branch::INDETERMINATE,
+                    "drained={drained}: a RECEIVED POST reported {t:?}"
+                );
+            }
+            other => panic!("drained={drained}: a RECEIVED POST reported {other:?}"),
+        }
+    }
+}
+
+/// **R3: the drain cap reaching a BODY frame parked on credit is the drain row.** The client stops
+/// replenishing credit; the exchange parks; the drain cap fires. The client never cancelled, so the
+/// terminal is `ResponseIncomplete` (`draining`) — not `Cancelled`, which mapping the sink's
+/// cancellation to a `CANCEL` regardless of the drain would give.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_drain_cap_while_parked_on_credit_is_the_drain_row() {
+    let up = upstream(|mut s, rec| async move {
+        if rec.read_request(&mut s).await.is_none() {
+            return;
+        }
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\n\r\n";
+        if rec.write(&mut s, head).await.is_err() {
+            return;
+        }
+        let piece = vec![b'z'; 16 * 1024];
+        while rec.write(&mut s, &piece).await.is_ok() {}
+    })
+    .await;
+    let s = served(
+        upstreams(&[("u", up.addr)], &[("", "DRAIN_MS", "300")]),
+        Duration::from_millis(300),
+    );
+    let mut c = s.client().await;
+    send(&mut c, 2, &request("u", "GET", "/feed")).await;
+    let mut frames = 0;
+    while let Some(f) = c.recv_or_none(Duration::from_millis(500)).await {
+        assert_eq!(
+            f.header.flags & flags::END,
+            0,
+            "no terminal before the drain"
+        );
+        frames += 1;
+    }
+    assert!(
+        frames >= 2,
+        "head + a body parked on credit: {frames} frames"
+    );
+    s.drain.trigger();
+    let end = loop {
+        let f = c
+            .recv_or_none(Duration::from_secs(3))
+            .await
+            .expect("a terminal");
+        if f.header.flags & flags::END != 0 {
+            break Outcome::decode(&f.payload).unwrap();
+        }
+    };
+    match &end {
+        Outcome::Error(ep) => {
+            assert_eq!(ep.code, errc::RESPONSE_INCOMPLETE, "{end:?}");
+            assert_eq!(ep.detail.as_deref(), Some(http_cause::DRAINING), "{end:?}");
+        }
+        other => panic!("a request the client never cancelled ended {other:?}"),
+    }
+}
+
+/// **R4: validation comes before the drain check (§23.6's order).** A request the validator
+/// refuses gets its `forbidden_*` answer during the drain too, not `draining`; the control, a
+/// valid request in the same drain, is refused `draining`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forbidden_request_during_the_drain_is_refused_forbidden() {
+    let up = responder(OK_EMPTY).await;
+    let s = served(
+        upstreams(&[("u", up.addr)], &[("", "DRAIN_MS", "1000")]),
+        Duration::from_millis(300),
+    );
+    let mut c = s.client().await;
+    s.drain.trigger();
+    exchange(&mut c, 2, &request("nope", "GET", "/"))
+        .await
+        .assert_error(
+            errc::FORBIDDEN,
+            errc::FORBIDDEN_BRANCH,
+            http_cause::FORBIDDEN_UPSTREAM,
+        );
+    exchange(&mut c, 3, &request("u", "TRACE", "/"))
+        .await
+        .assert_error(
+            errc::FORBIDDEN,
+            errc::FORBIDDEN_BRANCH,
+            http_cause::FORBIDDEN_METHOD,
+        );
+    exchange(&mut c, 4, &request("u", "GET", "/"))
+        .await
+        .assert_error(
+            errc::UPSTREAM_UNAVAILABLE,
+            branch::RETRYABLE,
+            http_cause::DRAINING,
+        );
+    assert_eq!(up.rec.conns(), 0);
+}
+
+/// **R10: the extension's hard end is measured from the DRAIN's start**, not from when `serve`
+/// entered the extension. An exchange the cap cannot stop on time (its connector blocks its
+/// thread for 4 s, past the cap) keeps the in-flight count up; `serve` must still end at
+/// `FERRO_HTTP_DRAIN_MS + drain_deadline` = 1.2 s after the drain began — measured from the
+/// extension's entry it would be 1.8 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_extension_hard_end_is_measured_from_the_drain_start() {
+    let up = reads_and_holds().await;
+    let in_connect = Arc::new(AtomicBool::new(false));
+    let s = served_with(
+        upstreams(&[("u", up.addr)], &[("", "DRAIN_MS", "600")]),
+        Duration::from_millis(600),
+        Arc::new(BlockConnect {
+            entered: in_connect.clone(),
+            block: Duration::ZERO,
+            connect_block: Duration::from_secs(4),
+        }),
+    );
+    let mut c = s.client().await;
+    send(&mut c, 2, &post("u", b"stuck-in-connect")).await;
+    wait_for("the connector blocking its thread", || {
+        in_connect.load(Ordering::SeqCst)
+    })
+    .await;
+    let t0 = Instant::now();
+    s.drain.trigger();
+    tokio::time::timeout(Duration::from_secs(3), s.served)
+        .await
+        .expect("serve returned")
+        .unwrap();
+    let ended = t0.elapsed();
+    assert!(
+        ended >= Duration::from_millis(1_150) && ended < Duration::from_millis(1_550),
+        "the hard end is cap + drain_deadline from the drain's start (1.2 s), not from the \
+         extension's entry (1.8 s): {ended:?}"
+    );
+}
+
+/// An upstream that streams EMPTY gzip members for ever: valid gzip that inflates to nothing.
+async fn empty_members_upstream() -> Upstream {
+    let member = gzip(b"");
+    let piece = Arc::new(member.repeat((256 * 1024) / member.len()));
+    upstream(move |mut s, rec| {
+        let piece = Arc::clone(&piece);
+        async move {
+            if rec.read_request(&mut s).await.is_none() {
+                return;
+            }
+            let head =
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n";
+            if rec.write(&mut s, head).await.is_err() {
+                return;
+            }
+            loop {
+                let mut out = format!("{:x}\r\n", piece.len()).into_bytes();
+                out.extend_from_slice(&piece);
+                out.extend_from_slice(b"\r\n");
+                if rec.write(&mut s, &out).await.is_err() {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+}
+
+/// One decoding exchange with a 300 ms deadline on a current-thread runtime, beside a cooperative
+/// ticker: the terminal, how long it took, and the longest gap the ticker saw.
+async fn decode_with_ticker(up: &Upstream) -> (Terminal, Duration, Duration) {
+    let engine = engine_with(upstreams(&[("u", up.addr)], &[]), Arc::new(TcpConnect));
+    let max_gap = Arc::new(std::sync::Mutex::new(Duration::ZERO));
+    let ticker = {
+        let max_gap = max_gap.clone();
+        tokio::spawn(async move {
+            let mut last = Instant::now();
+            loop {
+                tokio::task::yield_now().await;
+                let g = last.elapsed();
+                {
+                    let mut m = max_gap.lock().unwrap();
+                    *m = (*m).max(g);
+                }
+                last = Instant::now();
+            }
+        })
+    };
+    let rec = Recorder::new(None, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+    let started = Instant::now();
+    let t = engine
+        .exchange(
+            &HttpRequest {
+                timeout_ms: Some(300),
+                ..decode_get("/decode")
+            },
+            None,
+            started,
+            &CancellationToken::new(),
+            &rec,
+        )
+        .await;
+    let took = started.elapsed();
+    ticker.abort();
+    let gap = *max_gap.lock().unwrap();
+    (t, took, gap)
+}
+
+/// **The review's MEDIUM defect: a decode step is bounded by its INPUT, not only its output.** An
+/// endless stream of EMPTY gzip members decodes to nothing, so no frame is ever sent and no credit
+/// can park it. Before the fix one step consumed a whole network read (thousands of members, each
+/// allocating a fresh inflater) with no yield and no check: 93–97 ms executor stalls and a
+/// terminal 62–79 ms past its deadline (debug), a core burned until the deadline. Now the longest
+/// gap a cooperative task sees is comparable to the zeros-bomb CONTROL's (which is bounded by its
+/// output), and the terminal is the deadline's, on time.
+#[tokio::test(flavor = "current_thread")]
+async fn empty_gzip_members_are_bounded_by_the_deadline_and_yield() {
+    let control = bomb_upstream().await;
+    let (ct, c_took, c_gap) = decode_with_ticker(&control).await;
+    let empty = empty_members_upstream().await;
+    let (t, took, gap) = decode_with_ticker(&empty).await;
+    eprintln!(
+        "F4b review: empty members → {took:?}, longest gap {gap:?} (upstream wrote {} B); \
+         zeros-bomb control → {c_took:?}, longest gap {c_gap:?}",
+        empty.rec.written()
+    );
+    for (what, t) in [("control", &ct), ("empty members", &t)] {
+        assert!(
+            matches!(t, Terminal::Error(ep) if ep.detail.as_deref() == Some(http_cause::TIMEOUT)),
+            "{what}: {t:?}"
+        );
+    }
+    assert!(
+        empty.rec.written() > MIB as u64,
+        "the empty members were being consumed: {} B",
+        empty.rec.written()
+    );
+    let bound = (c_gap * 3).max(Duration::from_millis(25));
+    assert!(
+        gap <= bound,
+        "an empty-member stream held the thread for {gap:?} (control {c_gap:?})"
+    );
+    assert!(
+        took < Duration::from_millis(300) + bound,
+        "the terminal is the deadline's, on time: {took:?}"
+    );
 }

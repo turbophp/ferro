@@ -17,6 +17,12 @@
 //!   256 MiB out).
 //! - **CPU is bounded by the deadline.** The engine checks its cancel token and total deadline
 //!   between steps, so a bomb that is never short of credit still ends at the request's deadline.
+//!   That needs every step to be short in CPU as well as in output, so a step is bounded by its
+//!   INPUT too: it ends after [`STEP_MAX_INPUT`] bytes of input or [`STEP_MAX_MEMBERS`] gzip member
+//!   headers, returning [`Next::Yield`] if it produced nothing. Without that, a stream of EMPTY gzip
+//!   members (20 bytes each, inflating to nothing) was consumed a whole network read per step with
+//!   no output — so no credit parking, no check and no yield — and burned a core until the
+//!   deadline (review round, §22.2 (db)). The inflater is reset per member, never reallocated.
 //! - **A corrupt stream is `ResponseIncomplete` (`decode`)**: a bad gzip header, a CRC32 or length
 //!   mismatch, an inflate error, a stream truncated at the end of the body, or bytes after the end
 //!   of the compressed stream that do not begin another gzip member.
@@ -30,6 +36,33 @@ use flate2::{Crc, Decompress, FlushDecompress, Status};
 /// The longest gzip header the decoder buffers (the optional `FEXTRA`, `FNAME` and `FCOMMENT`
 /// fields make its length unbounded on the wire). A header that has not ended by here is refused.
 pub const MAX_GZIP_HEADER: usize = 64 * 1024;
+
+/// The most input one step consumes: a step that has consumed this much ends, with a (possibly
+/// short) chunk or [`Next::Yield`]. A step over input that inflates to MORE than `max_chunk` is
+/// bounded by its output instead, as before.
+pub const STEP_MAX_INPUT: usize = 64 * 1024;
+
+/// The most gzip member headers one step starts. Each costs a header parse and an inflater reset
+/// whatever its size, so this bounds a step of tiny members that the input bound would not.
+pub const STEP_MAX_MEMBERS: usize = 64;
+
+/// What one decode step produced.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Next {
+    /// Decoded bytes: non-empty, at most `max_chunk`.
+    Chunk(Vec<u8>),
+    /// Work was done but nothing was decoded, and the step's input or member bound was reached:
+    /// call again (after checking the deadline and the stop, and yielding).
+    Yield,
+    /// The decoder needs more input.
+    NeedInput,
+}
+
+/// How one step ended, before the output is copied out.
+enum StepEnd {
+    NeedInput,
+    Bound,
+}
 
 /// Which decoding a response gets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,8 +116,8 @@ enum State {
 }
 
 /// An incremental, bounded decoder. Feed it each body chunk with [`Decoder::feed`], then drain it
-/// with [`Decoder::next_chunk`] until that returns `Ok(None)` (more input needed); at the end of the
-/// body, [`Decoder::finish`].
+/// with [`Decoder::next_chunk`] until that returns [`Next::NeedInput`]; at the end of the body,
+/// [`Decoder::finish`].
 pub struct Decoder {
     coding: Coding,
     state: State,
@@ -138,9 +171,10 @@ impl Decoder {
         &self.pending[self.pos..]
     }
 
-    /// The next decoded chunk (non-empty, at most `max_chunk` bytes), or `Ok(None)` when the decoder
-    /// needs more input.
-    pub fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, DecodeError> {
+    /// One bounded step: the next decoded chunk (non-empty, at most `max_chunk` bytes), a
+    /// [`Next::Yield`] when the step's input or member bound was reached with nothing decoded, or
+    /// [`Next::NeedInput`].
+    pub fn next_chunk(&mut self) -> Result<Next, DecodeError> {
         // A fixed-size buffer, allocated once: one step can never emit more than `max_chunk`,
         // whatever the ratio, and only the filled part is copied out.
         let mut out = std::mem::take(&mut self.buf);
@@ -148,32 +182,50 @@ impl Decoder {
         let r = self.step(&mut out, &mut filled);
         let chunk = (filled > 0).then(|| out[..filled].to_vec());
         self.buf = out;
-        r.map(|()| chunk)
+        let end = r?;
+        Ok(match (chunk, end) {
+            (Some(c), _) => Next::Chunk(c),
+            (None, StepEnd::Bound) => Next::Yield,
+            (None, StepEnd::NeedInput) => Next::NeedInput,
+        })
     }
 
-    fn step(&mut self, out: &mut [u8], filled: &mut usize) -> Result<(), DecodeError> {
+    fn step(&mut self, out: &mut [u8], filled: &mut usize) -> Result<StepEnd, DecodeError> {
+        // Input consumed by THIS step: `pos` only moves forward within a step (`feed` is not
+        // called during one), so the difference is exact.
+        let start = self.pos;
+        let mut members = 0usize;
         loop {
+            if self.pos - start >= STEP_MAX_INPUT {
+                return Ok(StepEnd::Bound);
+            }
             match self.state {
                 State::GzHeader { .. } => {
                     if self.rest().is_empty() {
-                        return Ok(());
+                        return Ok(StepEnd::NeedInput);
+                    }
+                    if members == STEP_MAX_MEMBERS {
+                        return Ok(StepEnd::Bound);
                     }
                     match parse_gzip_header(self.rest())? {
                         Some(len) => {
+                            members += 1;
                             self.pos += len;
-                            self.inflate = Decompress::new(false);
+                            // Reset, never reallocate: the inflater's state is ~43 KB, and a member
+                            // can be 20 bytes.
+                            self.inflate.reset(false);
                             self.crc = Crc::new();
                             self.state = State::Inflate;
                         }
                         None if self.rest().len() >= MAX_GZIP_HEADER => {
                             return Err(DecodeError::Header);
                         }
-                        None => return Ok(()),
+                        None => return Ok(StepEnd::NeedInput),
                     }
                 }
                 State::Sniff => {
                     if self.rest().len() < 2 {
-                        return Ok(());
+                        return Ok(StepEnd::NeedInput);
                     }
                     // RFC 1950: CM = 8, CINFO <= 7, FCHECK makes the pair a multiple of 31, and no
                     // preset dictionary. Anything else is taken as raw deflate (the fallback servers
@@ -183,19 +235,25 @@ impl Decoder {
                         && cmf >> 4 <= 7
                         && ((u16::from(cmf) << 8) | u16::from(flg)) % 31 == 0
                         && flg & 0x20 == 0;
-                    self.inflate = Decompress::new(zlib);
+                    self.inflate.reset(zlib);
                     self.state = State::Inflate;
                 }
                 State::Inflate => {
                     if *filled == out.len() {
-                        return Ok(());
+                        return Ok(StepEnd::Bound);
                     }
+                    // Hand inflate no more input than the step has left, so ONE call cannot consume
+                    // a whole network read either (a run of empty deflate blocks inflates to
+                    // nothing, like a run of empty members).
+                    let budget = STEP_MAX_INPUT - (self.pos - start);
+                    let avail = self.pending.len() - self.pos;
+                    let end = self.pos + avail.min(budget);
                     let in_before = self.inflate.total_in();
                     let out_before = self.inflate.total_out();
                     let status = self
                         .inflate
                         .decompress(
-                            &self.pending[self.pos..],
+                            &self.pending[self.pos..end],
                             &mut out[*filled..],
                             FlushDecompress::None,
                         )
@@ -218,15 +276,21 @@ impl Decoder {
                         }
                         Status::Ok | Status::BufError => {
                             if produced == 0 && consumed == 0 {
-                                // No progress: inflate wants input (room is handled above).
-                                return Ok(());
+                                // No progress: inflate wants input (room is handled above). If the
+                                // step's budget cut the slice short, more input IS here: end the
+                                // step, and the next one (with a fresh budget) continues.
+                                return Ok(if avail > budget {
+                                    StepEnd::Bound
+                                } else {
+                                    StepEnd::NeedInput
+                                });
                             }
                         }
                     }
                 }
                 State::GzTrailer => {
                     if self.rest().len() < 8 {
-                        return Ok(());
+                        return Ok(StepEnd::NeedInput);
                     }
                     let t = &self.rest()[..8];
                     let crc = u32::from_le_bytes([t[0], t[1], t[2], t[3]]);
@@ -242,7 +306,7 @@ impl Decoder {
                     if !self.rest().is_empty() {
                         return Err(DecodeError::TrailingData);
                     }
-                    return Ok(());
+                    return Ok(StepEnd::NeedInput);
                 }
             }
         }
@@ -353,10 +417,16 @@ mod tests {
         let mut biggest = 0;
         for c in wire.chunks(piece.max(1)) {
             d.feed(Bytes::copy_from_slice(c));
-            while let Some(chunk) = d.next_chunk()? {
-                assert!(!chunk.is_empty() && chunk.len() <= max);
-                biggest = biggest.max(chunk.len());
-                out.extend_from_slice(&chunk);
+            loop {
+                match d.next_chunk()? {
+                    Next::Chunk(chunk) => {
+                        assert!(!chunk.is_empty() && chunk.len() <= max);
+                        biggest = biggest.max(chunk.len());
+                        out.extend_from_slice(&chunk);
+                    }
+                    Next::Yield => {}
+                    Next::NeedInput => break,
+                }
             }
         }
         d.finish()?;
@@ -398,14 +468,78 @@ mod tests {
         d.feed(Bytes::from(wire));
         let mut total = 0usize;
         let mut steps = 0usize;
-        while let Some(c) = d.next_chunk().unwrap() {
-            assert!(c.len() <= 256 * 1024);
-            total += c.len();
-            steps += 1;
+        loop {
+            match d.next_chunk().unwrap() {
+                Next::Chunk(c) => {
+                    assert!(c.len() <= 256 * 1024);
+                    total += c.len();
+                    steps += 1;
+                }
+                Next::Yield => {}
+                Next::NeedInput => break,
+            }
         }
         d.finish().unwrap();
         assert_eq!(total, zeros.len());
         assert!(steps >= 256, "{steps} steps");
+    }
+
+    /// The CPU bound (review round): a step is bounded by its INPUT, not only its output. A network
+    /// read made of EMPTY gzip members (each a valid member that inflates to nothing) used to be
+    /// consumed whole in one step — thousands of members, no output, so no credit parking and no
+    /// check of the deadline or the stop in between. Now one step starts at most
+    /// [`STEP_MAX_MEMBERS`] members and consumes at most [`STEP_MAX_INPUT`] bytes, returning
+    /// [`Next::Yield`]; the stream still decodes to its (empty) whole and finishes cleanly. Counted,
+    /// not timed. The same for a deflate stream of empty stored blocks, which one inflate call
+    /// would otherwise consume whole.
+    #[test]
+    fn a_step_is_bounded_by_its_input_when_nothing_is_decoded() {
+        let member = gzip(b"");
+        let wire = member.repeat((256 * 1024) / member.len());
+        let mut d = Decoder::new(Coding::Gzip, 256 * 1024);
+        d.feed(Bytes::from(wire.clone()));
+        let before = d.rest().len();
+        assert_eq!(d.next_chunk().unwrap(), Next::Yield);
+        let used = before - d.rest().len();
+        assert!(
+            used <= STEP_MAX_MEMBERS * member.len() && used <= STEP_MAX_INPUT,
+            "one step consumed {used} of {before} bytes"
+        );
+        let mut steps = 1;
+        loop {
+            match d.next_chunk().unwrap() {
+                Next::Chunk(c) => panic!("decoded {} bytes from empty members", c.len()),
+                Next::Yield => steps += 1,
+                Next::NeedInput => break,
+            }
+        }
+        d.finish().unwrap();
+        assert!(
+            steps >= wire.len() / member.len() / STEP_MAX_MEMBERS,
+            "{steps}"
+        );
+
+        // Raw deflate: 64 Ki non-final EMPTY stored blocks (5 bytes each: BFINAL=0 BTYPE=00, LEN=0,
+        // NLEN=0xffff), then one final empty block.
+        let mut raw = [0u8, 0, 0, 0xff, 0xff].repeat(64 * 1024);
+        raw.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+        let mut d = Decoder::new(Coding::Deflate, 256 * 1024);
+        d.feed(Bytes::from(raw.clone()));
+        let before = d.rest().len();
+        assert_eq!(d.next_chunk().unwrap(), Next::Yield);
+        let used = before - d.rest().len();
+        assert!(
+            used <= STEP_MAX_INPUT,
+            "one step consumed {used} of {before} bytes"
+        );
+        loop {
+            match d.next_chunk().unwrap() {
+                Next::Chunk(c) => panic!("decoded {} bytes from empty blocks", c.len()),
+                Next::Yield => {}
+                Next::NeedInput => break,
+            }
+        }
+        d.finish().unwrap();
     }
 
     #[test]
@@ -506,6 +640,7 @@ mod tests {
         };
         assert_eq!(h(&["gzip"]), Some((Coding::Gzip, "gzip".into())));
         assert_eq!(h(&["X-Gzip"]), Some((Coding::Gzip, "X-Gzip".into())));
+        assert_eq!(h(&["GZip"]), Some((Coding::Gzip, "GZip".into())));
         assert_eq!(h(&["Deflate"]), Some((Coding::Deflate, "Deflate".into())));
         for none in [
             &[][..],

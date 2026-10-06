@@ -878,14 +878,20 @@ async fn send_decoded(
         if tokio::time::Instant::now() >= bounds.deadline {
             return Err(HeadReceived::Timeout);
         }
-        let Some(chunk) = d.next_chunk().map_err(|_| HeadReceived::Decode)? else {
-            return Ok(());
-        };
-        let payload = HttpBody { chunk }.encode();
-        sink.send(SinkFrame::Body, payload, bounds.deadline, &stop.token)
-            .await
-            .map_err(|e| sink_failure(e, stop))?;
-        // A step that never waits (credit to spare) must still let other tasks run.
+        match d.next_chunk().map_err(|_| HeadReceived::Decode)? {
+            decode::Next::NeedInput => return Ok(()),
+            // A bounded step that decoded nothing (empty gzip members, empty deflate blocks): no
+            // frame, so no credit can park it — the checks above and this yield are its only bound.
+            decode::Next::Yield => {}
+            decode::Next::Chunk(chunk) => {
+                let payload = HttpBody { chunk }.encode();
+                sink.send(SinkFrame::Body, payload, bounds.deadline, &stop.token)
+                    .await
+                    .map_err(|e| sink_failure(e, stop))?;
+            }
+        }
+        // A step that never waits (credit to spare, or nothing to send) must still let other tasks
+        // run.
         tokio::task::yield_now().await;
     }
 }
