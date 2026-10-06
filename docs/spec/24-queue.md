@@ -6,8 +6,14 @@ the spec, and the charter's definition of done applies to it unchanged. Its deci
 SPEC §21 as **D21** (retry licences per service, one entry shared with §23; this section's licences
 are §24.6) and **D22** (the §3 / charter-rule-6 scope exception for the engine's closed statement
 set). The choices the draft left open were decided under the owner's full-freedom grant as applied 2026-10-06 (ledger, "Owner directives and grants"),
-and are listed in §24.17. **D22 is PENDING OWNER RATIFICATION:** it amends binding scope text (§3,
-charter rule 6), so no G-slice code (G1 onward) starts before the owner ratifies it.
+and are listed in §24.17. **D22 was RATIFIED by the owner on 2026-10-06, with two amendments**
+(SPEC §22.2 (de)). Because it amends binding scope text (§3, charter rule 6), no G-slice code
+(G1 onward) could start before ratification; **G1 may now start.** The amendments are applied in
+place below: (a) a store's table defaults to `ferro_jobs`, so mixed mode becomes an explicit
+opt-in (§24.3); (b) a store declares a `KIND`, `sql` being the only v1 kind, and the token is opaque
+bytes on the wire, 1 to 1 024 bytes (§24.3, §24.4, §24.5). **`job_id` is opaque bytes too** (SPEC
+**D24**, owner decision 2026-10-06, settling open item O-G1), so every QUEUE shape is kind-neutral
+before G1 freezes it (§24.3, §24.4).
 
 **Allocations.** This section allocates service id `QUEUE = 7`, the error codes `LeaseLost = 0x300F`
 and `PoolMismatch = 0x3010` (both NonRetryable), and the registry constant
@@ -77,8 +83,9 @@ No PHP-native host-level job transport exists. PgBouncer sees statements, not jo
 
 **C — a drop-in seam exists. Holds for Laravel, which is v1's drop-in tier.**
 
-- **Laravel:** `QueueManager::addConnector`. Adoption is one config value, `driver = 'ferro'`, and
-  the auto-discovered `FerroServiceProvider` registers it (§22.2 (ch)).
+- **Laravel:** `QueueManager::addConnector`. Adoption is one driver value, `driver = 'ferro'`, plus the shipped `ferro_jobs`
+  migration or `TABLE=jobs` on the store (§24.3). The auto-discovered `FerroServiceProvider`
+  registers the driver (§22.2 (ch)).
 - **Symfony (post-v1):** `TransportFactoryInterface` with a `ferro://` DSN, plus a bundle line
   (UNVERIFIED that nothing else is needed). The Messenger transport is demoted out of v1 (§24.17 Q4).
 
@@ -147,8 +154,10 @@ engine, and PHP names it.
 
 ```
 FERRO_QUEUE_STORES=jobs
-FERRO_QUEUE_JOBS_POOL=main               # required
-FERRO_QUEUE_JOBS_TABLE=jobs              # [schema.]identifier, validated at load
+FERRO_QUEUE_JOBS_KIND=sql                # the default and the only v1 kind; anything else is refused
+FERRO_QUEUE_JOBS_POOL=main               # required (sql kind)
+FERRO_QUEUE_JOBS_TABLE=ferro_jobs        # the default; [schema.]identifier, validated at load;
+                                         # `jobs` = stock's table, i.e. mixed mode (below)
 FERRO_QUEUE_JOBS_LEASE_S=90              # = Laravel's retry_after default; minimum 2
 FERRO_QUEUE_JOBS_POLL_MS=1000            # coalesced poll interval (§24.8)
 FERRO_QUEUE_JOBS_MAX_WAIT_MS=30000       # ceiling on a RESERVE's wait
@@ -164,6 +173,10 @@ FERRO_QUEUE_JOBS_DEPTH_SAMPLE_MS=30000   # 0 = off
 **Config-load refusals.** Each is fatal for that store only, and is logged by store name, never with
 a DSN:
 
+- a `KIND` other than `sql`. Store kinds exist so that Redis Streams or SQS can be added after v1
+  without a shape change (D22 amendment (b)). Each such kind needs its own §21 decision, and v1 builds
+  none, so any other value is refused as unsupported in v1, never ignored. That way no operator
+  believes a broker-backed store is running;
 - an unknown pool;
 - a pool whose family is unsupported, or below the version gate;
 - a table identifier that is not `[A-Za-z_][A-Za-z0-9_]*`, optionally schema-qualified;
@@ -181,7 +194,8 @@ pool's existing version probe (§22.2 (u)). **Cost:** on PostgreSQL this is stri
 9.5 gate. PG 9.5–11 are out of support; PG 11 reached end of life in 2023. Accepted (§24.17 Q8).
 
 **The layout is Laravel's stock `jobs` table, unchanged, and it is v1's only layout** (decided,
-§24.17 Q1). `jobs.stub` defines:
+§24.17 Q1). **Its default name is `ferro_jobs`** (owner decision 2026-10-06, D22 amendment (a)).
+`jobs.stub` defines:
 
 - `id` bigIncrements;
 - `queue` string, indexed;
@@ -192,13 +206,29 @@ pool's existing version probe (§22.2 (u)). **Cost:** on PostgreSQL this is stri
 
 All times are Unix seconds.
 
-Reasons, by weight:
+Reasons for the stock layout, by weight:
 
-1. **Gradual, reversible adoption.** Switching between `database` and `ferro` with jobs in flight
-   works, and stock workers can drain the same table, with conditions (mixed mode, below).
-2. **D18 parity is reachable at all.** Upstream asserts `DB::table('jobs')->count()`.
-3. **No new schema** for the commonest adopter.
+1. **Gradual, reversible adoption, when the operator asks for it.** With the table set to `jobs`,
+   switching between `database` and `ferro` with jobs in flight works, and stock workers can drain
+   the same table, with conditions (mixed mode, below).
+2. **D18 parity is reachable at all.** Upstream asserts `DB::table('jobs')->count()`, so the D18
+   engine column sets the table to `jobs` (§24.12).
+3. **No new layout.** Under the default name an adopter creates one table of a layout Laravel already
+   defines. Under `jobs` the adopter creates nothing.
 4. **The fence needs no new column.**
+
+**Why the default name is `ferro_jobs`, not `jobs`** (D22 amendment (a)):
+
+- **No silent sharing.** With `jobs` as the default, a `ferro` store and a stock `database` queue on
+  the same database would share one table without anyone choosing it. Stock workers would then take
+  and delete Ferro's jobs with PHP-clock leases and unfenced deletes. That is mixed mode, which is
+  supported only under a condition (`retry_after == LEASE_S`) nobody would have checked.
+- **Not `_ferro_jobs`.** A leading underscore is unusual in Laravel schemas, and some tools treat
+  such a name as hidden.
+- **Cost:** zero-configuration gradual adoption is lost. Moving from `database` to `ferro` takes one
+  migration (`ferro_jobs`, which `ferro/laravel` ships) or one setting (`TABLE=jobs`, which is mixed
+  mode). Jobs already queued in `jobs` are not seen by a store on `ferro_jobs`, so the operator either
+  drains `jobs` with stock workers first or sets `TABLE=jobs`.
 
 **Cost, stated:**
 
@@ -217,9 +247,51 @@ Reasons, by weight:
   - It therefore survives lease expiry until someone else reserves the job, so a late ACK is honoured
     when nobody else took the job.
   - Unreserve does not invalidate a delivered token: it touches only tokens nobody holds.
-- **On the wire** the token is an opaque `u64`. This layout packs `created_at` (low 32 bits of the
-  stored value) above `attempts` (16 bits). A future layout may mint it differently without a wire
-  change.
+- **On the wire** the token is **opaque bytes, 1 to 1 024 of them** (msgpack `bin`). It was an opaque
+  `u64` until D22 amendment (b), and was changed before G1 froze the shapes. The client never
+  interprets a token: it receives it in a `RESERVE` reply and sends it back unchanged.
+  - **Minting is the store kind's.** The `sql` kind mints **8 bytes**, packing `created_at` (the low
+    32 bits of the stored value) above `attempts` (16 bits), as the `u64` did. The byte layout is
+    internal to the `sql` kind and is fixed at G1 by its builders' tests. A future layout, or a future
+    kind (a Redis stream entry id, an SQS receipt handle of about 1 KB), mints differently without a
+    wire change.
+  - **A token the store cannot decode** (for the `sql` kind, any length other than 8) is refused
+    before any statement. G1 decides and pins its terminal, under prerequisite (c) below. `LeaseLost` would be literally true, since
+    the token names no current reservation, but only a client defect produces such a token, and the
+    Laravel tier treats an autocommit `LeaseLost` as done (§24.11), which would hide the defect. A
+    token over 1 024 bytes is an out-of-bounds field, refused like any other, and G1 pins where.
+
+**The job id on the wire is opaque bytes too** (SPEC D24, owner decision 2026-10-06). `job_id`
+(and `RELEASE`'s `new_job_id`) is **1 to 1 024 bytes** (msgpack `bin`) in all six wire positions
+(§24.4), because a Redis stream entry id (two 64-bit integers) or an SQS message id (a UUID string)
+does not fit an `i64`. The client never interprets it.
+
+- **The `sql` kind encodes the row's `bigint` `id` internally**, and decodes it back before any
+  statement. Its byte encoding is fixed at G1 by the builders' tests. A decimal-text encoding would
+  let the Laravel tier hand Laravel the same digits stock does (§24.11), and G1 weighs that when it
+  chooses the encoding.
+- **The fence is unchanged.** It is still `(id, attempts, created_at)` over the row's columns
+  (above), and the engine decodes `job_id` and the token into those columns. A `job_id` the store
+  cannot decode is refused before any statement, under the same rule as an undecodable token, and G1
+  pins its terminal.
+- **Ordering:** rows are still served best-effort FIFO by `id` inside the database (§24.7), but the
+  wire carries **no numeric order**. A client may not compare or sort job ids, and must not infer
+  enqueue order from them.
+- **Cost:** a few bytes per job on the wire, and no numeric ordering for the client.
+
+**G1 prerequisites for the opaque fields (normative; review round of (de)).**
+
+- **(a) A canonical `sql` `job_id` encoding with a strict decode.** Each `bigint` id has exactly one
+  encoding. The decoder refuses every non-canonical form (for a decimal-text encoding: leading zeros,
+  a sign, surrounding spaces). Otherwise two byte strings would name one row. A dedup replay
+  (§24.6) returns a `job_id` byte-identical to the first send's, and G1 pins this with a test.
+- **(b) Refusal vectors at both bounds.** Each opaque field gets a 0-byte refusal vector beside the
+  1 025-byte one, refused by both codecs.
+- **(c) The terminal for an undecodable token or `job_id` is neither `Protocol` nor `LeaseLost`.** It
+  is not `Protocol`, because the frame is well-formed: that code means a wire fault. It is not
+  `LeaseLost`, because that would hide a client defect behind "did nothing" (§24.11). G1 may allocate
+  a new NonRetryable code for it, after `0x3010`. If it does, the code lands in `/proto` with
+  vectors and both codecs, and G1 records its choice either way.
 - **Precondition, stated rather than enforced: an `(id, created_at)` pair is never reissued while a
   token for it is outstanding.**
   - `TRUNCATE … RESTART IDENTITY`, MySQL `TRUNCATE`, sequence resets, restores and async-replica
@@ -250,8 +322,10 @@ Rounding rules (normative):
 - **`lease_deadline`** in replies is `reserved_at + lease_s + 1`, the first DB second at which another
   RESERVE may take the job.
 
-**Mixed mode** means stock `DatabaseQueue` workers and Ferro workers on one table. It is supported
-and tested (chaos row 10) only when the stock connections' `retry_after` equals `LEASE_S`.
+**Mixed mode** means stock `DatabaseQueue` workers and Ferro workers on one table. **It is an
+explicit opt-in:** the store's `TABLE` is set to the stock connections' table, normally `jobs`,
+because the default `ferro_jobs` is never a stock table (D22 amendment (a)). It is supported and
+tested (chaos row 10) only when the stock connections' `retry_after` equals `LEASE_S`.
 
 - Stock workers stamp and compare with the **PHP** clock, so a stock worker may take a Ferro-held job
   up to (PHP-to-DB skew + 1 s) early.
@@ -261,10 +335,13 @@ and tested (chaos row 10) only when the stock connections' `retry_after` equals 
 **Who creates the table: the application's migrations, never the engine.**
 
 - Engine DDL would make `ferrod` a schema owner, needing DDL privileges and racing migrations.
-- Laravel apps already have the table. `ferro/laravel` publishes one optional migration, for the
-  dedup table.
-- Everyone else gets the DDL from `ferro queue schema --store <name> --dialect <pg|mysql>`. The CLI
-  prints it and never runs it.
+- Laravel apps already have a stock `jobs` table, but the default store table is `ferro_jobs`
+  (D22 amendment (a)). `ferro/laravel` therefore publishes a **`ferro_jobs` migration**: stock
+  `jobs.stub`'s layout, unchanged, under the Ferro name. It also publishes one optional migration
+  for the dedup table. An app that sets `TABLE=jobs` (mixed mode) needs neither table migration.
+- Everyone else gets the DDL from `ferro queue schema --store <name> --dialect <pg|mysql>`, for the
+  store's configured table (`ferro_jobs` unless `TABLE` says otherwise). The CLI prints it and never
+  runs it.
 
 **Shape verification.** At a store's first use in each `boot_epoch` the engine reads
 `information_schema.columns` once and checks names and types. `ferrod` has no configuration reload
@@ -307,13 +384,18 @@ G3 bench question (charter rule 5). The engine never creates an index.
 Shapes are positional msgpack arrays with strict arity. Field order lands with the golden vectors at
 G1 (PROTOCOL.md §13; §12 is HTTP's, §23). `common` is `[tx_id|nil, timeout_ms|nil, traceparent|nil]`, and `traceparent` is
 parsed as on EXEC (§22.2 (cd)). Every success terminal carries `stats {queue_us, exec_us}`.
+`token` and `job_id` (with `new_job_id`) are opaque bytes, 1 to 1 024 of them, everywhere they
+appear (§24.3; D22 amendment (b) for the token, D24 for the id). The golden vectors carry each at its
+`sql`-kind size and at 1 024 bytes, and both codecs refuse 0 and 1 025 (§24.3's G1 prerequisites). The PHP side holds each as an
+opaque string and must send it back as `bin`. Encoding it as `str` would change the wire type and
+could fail the codec's UTF-8 check.
 
 | method | request | success terminal | `tx_id` |
 |---|---|---|---|
-| `ENQUEUE = 1` | `[store, jobs: [[queue, payload: str, delay_s: u32]] (1..=1000), dedup_key: str\|nil, common]` | `[job_id: i64\|nil, inserted: u32, deduplicated: bool, stats]`. `job_id` is non-nil iff exactly one job | yes |
-| `RESERVE = 2` | `[store, queues: [str] (1..=16, priority order), max_jobs: u16, wait_ms: u32, liveness: bool, common]` | `[jobs: [[job_id, token: u64, attempts, queue, payload, created_at, lease_deadline]], stats]`, possibly empty | **refused** (`Unsupported`) |
-| `ACK = 3` | `[store, job_id, token, common]` | `[outcome: u8 (1 acked, 2 gone), stats]`. `gone` is never returned in a transaction | yes |
-| `RELEASE = 4` | `[store, job_id, token, delay_s, common]` | `[new_job_id: i64\|nil, stats]`. `nil` = `gone` (autocommit only) | yes |
+| `ENQUEUE = 1` | `[store, jobs: [[queue, payload: str, delay_s: u32]] (1..=1000), dedup_key: str\|nil, common]` | `[job_id: bin (1..=1024)\|nil, inserted: u32, deduplicated: bool, stats]`. `job_id` is non-nil iff exactly one job | yes |
+| `RESERVE = 2` | `[store, queues: [str] (1..=16, priority order), max_jobs: u16, wait_ms: u32, liveness: bool, common]` | `[jobs: [[job_id: bin (1..=1024), token: bin (1..=1024), attempts, queue, payload, created_at, lease_deadline]], stats]`, possibly empty | **refused** (`Unsupported`) |
+| `ACK = 3` | `[store, job_id: bin (1..=1024), token: bin (1..=1024), common]` | `[outcome: u8 (1 acked, 2 gone), stats]`. `gone` is never returned in a transaction | yes |
+| `RELEASE = 4` | `[store, job_id, token, delay_s, common]` | `[new_job_id: bin (1..=1024)\|nil, stats]`. `nil` = `gone` (autocommit only) | yes |
 | `EXTEND = 5` | `[store, job_id, token, common]` | `[lease_deadline, stats]` | yes |
 | `SIZE = 6` | `[store, queue, common]` | `[pending, delayed, reserved, stats]` | yes |
 | `CLEAR = 7` | `[store, queue, common]` | `[deleted: u64, stats]` | yes |
@@ -354,7 +436,10 @@ parsed as on EXEC (§22.2 (cd)). Every success terminal carries `stats {queue_us
     `SELECT id, UNIX_TIMESTAMP() … ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED`, then an UPDATE of
     those ids binding that `now`, then a SELECT of the reserved rows, then COMMIT.
   - **Frame clamp.** `max_jobs` is clamped so the reply fits one frame:
-    `floor((max_frame_payload − envelope) / (MAX_PAYLOAD_BYTES + per-job overhead))`. **Cost:** at the
+    `floor((max_frame_payload − envelope) / (MAX_PAYLOAD_BYTES + per-job overhead))`, where the
+    per-job overhead counts the store kind's largest `job_id` **plus** its largest token. For the
+    `sql` kind that is the maximum length of G1's `job_id` encoding plus 8; for any kind it is never
+    more than 2 048 (1 024 + 1 024, D22 (b) and D24). **Cost:** at the
     4 MiB default that is 3, so batch RESERVE is nearly inert. An operator who wants batches lowers
     `MAX_PAYLOAD_BYTES`. Laravel always asks for 1.
   - **Over-size rows.** Rows over `MAX_PAYLOAD_BYTES` (from stock producers) are never reserved and
@@ -418,6 +503,15 @@ consumption, and the leases would run down in a client buffer.
 **Rule.** ENQUEUE, ACK, RELEASE, EXTEND, SIZE and CLEAR accept a `tx_id`. With one, the verb runs on
 the transaction's pinned connection through the TX actor, and its outcome is the transaction's
 outcome. In-transaction ENQUEUE plus a business write is the outbox pattern, made structural.
+
+**Only a `sql` store in the transaction's pool** (D22 amendment (b)). Transactional composition
+exists because the store's rows live in the same database as the business write, on the same
+pinned connection. So it is available only for a store of kind `sql` whose pool is the
+transaction's pool (step 2 below refuses any other pool with `PoolMismatch`). A future non-SQL kind
+(Redis Streams, SQS) has no transaction to join: it refuses every tx-scoped verb before any
+statement, as a tx-scoped RESERVE is refused today (`Unsupported`). That holds unless a later §21
+decision adds an outbox, which would stage the job in the transaction's database and forward it
+after COMMIT. v1 builds only the `sql` kind, so in v1 this rule refuses nothing new.
 
 **Mechanism.**
 
@@ -559,7 +653,8 @@ itself composes, or (the dedup key) a caller's declaration; none is inferred fro
     - incrementing at first ACK/EXTEND would let two reservations share a token, which breaks the
       fence, and Laravel reads `attempts()` before running;
     - decrementing on a *delivered* job would reuse a token someone holds.
-- **Ordering.** Best-effort FIFO by `id` within a queue. There is no guarantee.
+- **Ordering.** Best-effort FIFO by `id` within a queue. There is no guarantee. Job ids are opaque on
+  the wire (D24), so a client can neither observe nor rely on this order through them.
 - **Priorities.** Laravel's model: queue order (`--queue=high,default`), up to 16 queues per RESERVE.
 - **Leases.** `lease_s` per store, renewed only by EXTEND. **No automatic renewal while a session
   lives:** a hung worker would hold its job forever. A job's `timeout` must stay below `lease_s`, as
@@ -784,7 +879,7 @@ $q->transactionalAck($r, fn ($tx) => …);                  // rolls back on Lea
 - **Errors.** `LeaseLostException` and `PoolMismatchException` sit inside the `FerroException`
   contract.
 
-**Laravel driver (`ferro/laravel`, config only).**
+**Laravel driver (`ferro/laravel`): one driver value, plus the shipped `ferro_jobs` migration or `TABLE=jobs` on the store (§24.3).**
 
 ```php
 'connections' => ['database' => [
@@ -800,7 +895,11 @@ $q->transactionalAck($r, fn ($tx) => …);                  // rolls back on Lea
 - **`FerroQueue extends Illuminate\Queue\Queue implements Queue, ClearableQueue`.**
   - **Producers** (`push`/`later`/`pushRaw`/`bulk`) use the DB connection's session, through
     `getPdo()->ferro()` (§22.2 (bw)), with `tx_id` iff that connection is in a transaction.
-  - `push` returns the job id. `bulk` returns `true`, as stock does.
+  - `push` returns the job id. `bulk` returns `true`, as stock does. *[D24: the id is opaque bytes
+    on the wire, where stock returns an integer. What `push()` and `FerroJob::getJobId()` hand Laravel
+    is G5's to decide and pin: the raw bytes, or a printable form. Binary strings are unsafe in JSON
+    and logs, and the choice depends on G1's `sql` encoding (§24.3). Either way it is a drop-in
+    difference for code that treats a queued job's id as a number.]*
   - **`pop()`** reserves on a **dedicated, lazily dialled queue session** with the DB connection's
     socket options.
     - It never shares a session with the DB tier, so `DB::reconnect()`, `purge()` and C1e-3
@@ -813,6 +912,15 @@ $q->transactionalAck($r, fn ($tx) => …);                  // rolls back on Lea
       if leased, reappears after its lease.
   - `size()` is SIZE summed, and `clear()` is CLEAR.
   - Retry-after is the store's `LEASE_S`. A `retry_after` key in the config is refused at connect.
+  - **The table is the engine's, not the config's.** The store's `TABLE` is declared in `ferrod`
+    (default `ferro_jobs`, §24.3). `ferro/laravel` ships the `ferro_jobs` migration (stock
+    `jobs.stub`'s layout under the Ferro name). An app that keeps its stock `jobs` table sets
+    `TABLE=jobs` on the store instead, which is mixed mode (§24.3). **A trap the default creates,
+    for G5 to close:** stock `config/queue.php` carries `'table' => env('DB_QUEUE_TABLE', 'jobs')`,
+    so a config edited from `database` would still say `jobs` while the store uses `ferro_jobs`. The
+    tier cannot honour the key, because the table is not on the wire, and must not ignore it
+    silently. G5 decides between refusing it at connect (the `retry_after` precedent above) and
+    another explicit rule, and pins the choice with a test.
 - **`FerroJob extends Illuminate\Queue\Jobs\Job`.** `attempts()` comes from the reservation.
   - **`delete()`** sends ACK.
     - **Inside a transaction** on the DB connection it is an in-transaction ACK, and **`LeaseLost`
@@ -872,7 +980,10 @@ Columns per family (PostgreSQL first, then MySQL and MariaDB at G6):
 
 1. **control:** stock `database` driver over stock `pdo_*`;
 2. **DB tier:** stock `database` driver over `ferro-*`;
-3. **engine:** the `ferro` driver over `ferro-*`.
+3. **engine:** the `ferro` driver over `ferro-*`, with the store's **`TABLE=jobs` set explicitly**.
+   Upstream asserts `DB::table('jobs')`, and the default `ferro_jobs` (D22 amendment (a)) would
+   leave those assertions counting an empty table. The column therefore uses the opt-in `jobs` table,
+   with no stock workers on it. The §15 demo's engine column picks either table in G5 and states which.
 
 Scope:
 
@@ -935,7 +1046,7 @@ every duplicate and every phantom attempt is attributable to a counted or docume
    1, 3 and 4.
 9. **`ferrod` SIGTERM drain with leases outstanding.** Nothing is released; ACKs succeed on the
    successor.
-10. **Mixed mode with `retry_after == LEASE_S`.** No loss; Ferro's fencing holds; duplicates are
+10. **Mixed mode with `retry_after == LEASE_S`** (the store's `TABLE=jobs`, the explicit opt-in, §24.3). No loss; Ferro's fencing holds; duplicates are
     attributed to stock workers.
 11. **Parked-waiter cost.** 200 parked RESERVEs hold zero pool connections, asserted on the pin and
     idle gauges.
@@ -968,11 +1079,11 @@ every duplicate and every phantom attempt is attributable to a counted or docume
 | slice | delivers | proves |
 |---|---|---|
 | **G0** *(DONE, §22.2 (cn))* | this section; `QUEUE = 7`, `LeaseLost`, `PoolMismatch` and `queue_wait_grace_ms` allocated in the spec (their `/proto` entries land at G1); §21 D21/D22; the §24.16 amendments | review attacked §24.5–§24.8 before any code |
-| **G1** *(waits on D22's owner ratification)* | `/proto`: `[services] QUEUE = 7`, the method table, the two codes and `queue_wait_grace_ms` G0 allocated, PROTOCOL.md §1 and a new §13, golden vectors, both codecs, **all shapes frozen**; store config, version gate, shape verification; ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
+| **G1** *(D22 ratified 2026-10-06; may start)* | `/proto`: `[services] QUEUE = 7`, the method table, the two codes and `queue_wait_grace_ms` G0 allocated, PROTOCOL.md §1 and a new §13, golden vectors (an 8-byte and a 1 024-byte token, §24.4), both codecs, **all shapes frozen**, with `job_id` as opaque bytes (D24; vectors at the `sql` size and at 1 024 bytes, refusals at 0 and 1 025), after §24.3's G1 prerequisites: a canonical `sql` id encoding with a strict decode, and a terminal for an undecodable token or id that is neither `Protocol` nor `LeaseLost` (a new code if needed); store config (`KIND=sql` and the refusal of any other kind, `TABLE` defaulting to `ferro_jobs`), version gate, shape verification; ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
 | **G2** | tx path: `resolve_active` made `pub(crate)`, `PoolMismatch`, `TxCommand::Queue` + `after_commit`, in-tx `LeaseLost` semantics (R1), refused tx-scoped RESERVE | atomicity both ways; mismatch leaves the transaction usable; chaos rows 2 and 7 |
 | **G3** | the waker (per queue, `LIMIT k`, statement deadlines, register-then-sweep), long-poll, the wait bound, **unreserve**, wake hints, coalesced polls, drain; queue metrics and spans | cost bound (row 11); one END under every CANCEL/deadline race and the deliver-xor-unreserve rule (row 12); idle-polling bench vs stock (A's number); R4 reproduced on the real transport |
 | **G4** | native PHP API, `queueWorker()`, wait clamp, client fate and licensed re-sends; dedup table and purge **after** the dedup spike reproduces §24.6's three paths | chaos rows 1, 3–6, 8, 9 and 15 through the client |
-| **G5** | Laravel driver: `FerroQueue` (dedicated reserve session), `FerroJob` (`delete`/`release` rules, the `fail()` override); demo engine column; the three-column upstream run on PG | D18 on PostgreSQL; chaos rows 13, 14 and 16; the SIGALRM reentrancy premise |
+| **G5** | Laravel driver: `FerroQueue` (dedicated reserve session), `FerroJob` (`delete`/`release` rules, the `fail()` override); the `ferro_jobs` migration and the rule for a stock `'table'` key (§24.11); pin what `push()`/`FerroJob::getJobId()` return for an opaque `job_id` (D24); demo engine column; the three-column upstream run on PG | D18 on PostgreSQL; chaos rows 13, 14 and 16; the SIGALRM reentrancy premise |
 | **G6** | MySQL/MariaDB stores (engine-owned RC transactions, actor-command steps, MySQL dedup spike) and their D18 columns | D18 and chaos on MySQL 8.4 and MariaDB 11.8; rows 17 and 19 |
 
 **Removed from the v1 plan, kept as post-v1 labels** (§24.15): **G7**, the Symfony Messenger
@@ -993,6 +1104,10 @@ G1–G6: the `liveness` field is already in the frozen G1 shape, and a v1 engine
   tier is Laravel. The transport sketch in §24.11 is non-normative and UNVERIFIED.
 - **Backends.** Redis Streams and Kafka (P8), SQS, Beanstalk, and a **SQLite store**: under D13 every
   RESERVE takes the writer lock, and SQLite apps keep the stock driver through `ferro-sqlite`.
+  **Prepared, not built** (D22 amendment (b)): the store `KIND` key and the opaque-bytes token let
+  Redis Streams or SQS be added later without a shape change (`job_id` is opaque bytes as well,
+  SPEC D24). Each such kind needs its own §21 decision, because D22 covers SQL stores only, and
+  none offers transactional composition without an outbox (§24.5).
 - **The scheduler and `onOneServer`** (P9).
 - **Job-level features:** unique jobs (`ShouldBeUnique` stays Laravel's), numeric priorities, FIFO
   groups, payload encryption or inspection, a FAIL verb, rate limiting, engine tries limits, and
@@ -1058,9 +1173,11 @@ land with slice G1.
   - it defines an application table's semantics (fencing, the dedup table);
   - it reads application data shapes (`information_schema`).
 
-  **Resolved by D22**, decided under the owner's full-freedom grant (§24.17 Q6) and **PENDING OWNER
-  RATIFICATION**, because it amends binding scope text: no G-slice code (G1 onward) starts before the
-  owner ratifies it. §3 gains an amendment note to this effect:
+  **Resolved by D22**, decided under the owner's full-freedom grant (§24.17 Q6). Because it amends
+  binding scope text, no G-slice code (G1 onward) could start before the owner ratified it. **The
+  owner ratified it on 2026-10-06, with two amendments** (the `ferro_jobs` default table and store
+  kinds with an opaque-bytes token, SPEC §21 D22, §22.2 (de)), so G1 may start. §3 gains an amendment
+  note to this effect:
 
   > "**Exception (D22):** the job transport engine (§24) composes a closed set of statements against
   > an operator-declared table whose layout the application owns, and may write its rows on its own
@@ -1071,8 +1188,9 @@ land with slice G1.
   SQL rewriting, and the `ferro` queue driver is not a drop-in database tier under the rule's 'change
   execution, never SQL generation': it is a new driver name whose transport replaces
   `DatabaseQueue`'s builder-generated SQL by design, while the drop-in database tiers keep stock SQL
-  generation." D22 records it; `CLAUDE.md`'s copy of the charter was not edited in this change
-  and gains the sentence when that file is next updated.
+  generation." D22 records it. `CLAUDE.md`'s copy of the charter was not edited in this change
+  and gains the sentence when that file is next updated. At ratification (§22.2 (de)) the edit was
+  prepared, and it was applied on the owner's direct approval the same day.
 
   Stated honestly: this widens what the engine may do to application data. The cost is that a defect
   in an engine statement builder can now damage application rows. The mitigations are the shape
@@ -1080,12 +1198,14 @@ land with slice G1.
 
 ### 24.17 Decisions taken at adoption, and the premises still owed
 
-The G0 draft left eight choices for confirmation. Each was **decided under the owner's full-freedom grant as applied 2026-10-06 (ledger, "Owner directives and grants")**; the labels Q1–Q8 are kept because the text above cites them. Q6 (D22) is decided only provisionally and is pending owner ratification.
+The G0 draft left eight choices for confirmation. Each was **decided under the owner's full-freedom grant as applied 2026-10-06 (ledger, "Owner directives and grants")**; the labels Q1–Q8 are kept because the text above cites them. Q6 (D22) was decided only provisionally, and the owner ratified it on 2026-10-06 with two amendments, one of which refines Q1 (SPEC §22.2 (de)).
 
 - **Q1 — layout: Laravel's stock `jobs` table is v1's only layout** (§24.3), with its costs stated
   there: one-second resolution, a per-store lease, a 255-attempt ceiling on MySQL (32 767 on PG),
   time columns that overflow in 2038 on PG and 2106 on MySQL/MariaDB, and the `(id, created_at)`
-  reuse precondition.
+  reuse precondition. *[Refined at D22's ratification (owner, 2026-10-06): the layout is unchanged,
+  but its default NAME is `ferro_jobs`, so sharing a table with stock workers (mixed mode) is an
+  explicit opt-in, `TABLE=jobs` (§24.3).]*
 - **Q2 — liveness release: dropped from v1.** It is the one engine write that can enable a second
   execution, and v1 does not need it: without it a dead worker's job waits for its lease, exactly as
   with stock Laravel. Listed in §24.15; its constraints are kept in §24.8. The `liveness` field stays
@@ -1098,10 +1218,12 @@ The G0 draft left eight choices for confirmation. Each was **decided under the o
   application gets the native API only in v1, and D16's and product-vision §4.3's naming of the
   Messenger seam is amended accordingly.
 - **Q5 — `at_most_once`: cut, confirmed** (§24.15).
-- **Q6 — the §3 / charter-rule-6 scope exception: decided as D22, PENDING OWNER RATIFICATION.** v1
-  as redefined by D16 includes a queue engine, which cannot exist without it (C8). Because it amends
-  binding scope text, the grant decides it only provisionally: no G-slice code (G1 onward) starts
-  before the owner ratifies it.
+- **Q6 — the §3 / charter-rule-6 scope exception: decided as D22, RATIFIED by the owner on
+  2026-10-06 with two amendments.** v1 as redefined by D16 includes a queue engine, which cannot
+  exist without it (C8). Because it amends binding scope text, the grant could decide it only
+  provisionally, and no G-slice code (G1 onward) could start before ratification. The owner ratified
+  it with (a) the `ferro_jobs` default table and (b) store kinds with an opaque-bytes token (SPEC §21
+  D22, §22.2 (de)). G1 may start.
 - **Q7 — the `FerroJob::fail()` divergence: accepted.** On `LeaseLost` the stale holder skips
   `failed()` and `JobFailed`. That is safer than stock (no `failed_jobs` row for a job someone else
   runs), at the stated cost that a `failed()` callback with side effects (a notification) no longer
