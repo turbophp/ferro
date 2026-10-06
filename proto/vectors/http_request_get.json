@@ -1,0 +1,47 @@
+{
+  "frame_hex": "f7040000060001003c000000460000009da6676974687562a3474554b52f7265706f732f747572626f7068702f666572726fc09192a6616363657074c4106170706c69636174696f6e2f6a736f6ec0c0c0c0c0c3c0c0",
+  "header": {
+    "flags": 0,
+    "method": 1,
+    "request_id": 60,
+    "service": 6
+  },
+  "message": {
+    "body": null,
+    "connect_timeout_ms": null,
+    "decode": true,
+    "headers": [
+      [
+        "accept",
+        [
+          97,
+          112,
+          112,
+          108,
+          105,
+          99,
+          97,
+          116,
+          105,
+          111,
+          110,
+          47,
+          106,
+          115,
+          111,
+          110
+        ]
+      ]
+    ],
+    "idempotent": null,
+    "method": "GET",
+    "origin": null,
+    "read_timeout_ms": null,
+    "route": null,
+    "target": "/repos/turbophp/ferro",
+    "timeout_ms": null,
+    "traceparent": null,
+    "upstream": "github"
+  },
+  "name": "http_request_get"
+}

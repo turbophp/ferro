@@ -1,0 +1,18 @@
+{
+  "about": "Shared fixture for the [http.causes] shape rule (M6-F2, SPEC §22.2 (cy)). Each case is a whole causes table and whether the rule accepts it. Run against the Rust rule (ferro-proto tests/registry_sync.rs, which build.rs and the registry parser share via include!) AND against proto/tools/gen-php.php (php/client tests/Conformance/HttpCausesShapeRuleTest.php), so the implementations cannot disagree.",
+  "cases": [
+    { "why": "an ordinary token", "causes": { "EOF_EMPTY": "eof_empty" }, "valid": true },
+    { "why": "digits after the first letter", "causes": { "H2_STREAM_ERROR": "h2_stream_error", "INFORMATIONAL_101": "informational_101" }, "valid": true },
+    { "why": "the empty table", "causes": {}, "valid": false },
+    { "why": "a leading digit (not a Rust identifier; PHP json_decode would also turn the key into an int)", "causes": { "123": "123" }, "valid": false },
+    { "why": "a leading underscore", "causes": { "_X": "_x" }, "valid": false },
+    { "why": "a trailing newline (PHP's $ matches before one without the D modifier)", "causes": { "A\n": "a\n" }, "valid": false },
+    { "why": "the key is not the token upper-cased", "causes": { "EOFEMPTY": "eof_empty" }, "valid": false },
+    { "why": "an upper-case token", "causes": { "EOF_EMPTY": "EOF_EMPTY" }, "valid": false },
+    { "why": "an empty token", "causes": { "": "" }, "valid": false },
+    { "why": "a hyphen", "causes": { "EOF-EMPTY": "eof-empty" }, "valid": false },
+    { "why": "a space", "causes": { "EOF EMPTY": "eof empty" }, "valid": false },
+    { "why": "a non-ASCII letter", "causes": { "É": "é" }, "valid": false },
+    { "why": "one bad entry among good ones", "causes": { "EOF_EMPTY": "eof_empty", "RESET": "Reset" }, "valid": false }
+  ]
+}

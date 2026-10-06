@@ -22,6 +22,7 @@ final class Constants
 
     public const SERVICE_ADMIN = 5;
     public const SERVICE_CORE = 1;
+    public const SERVICE_HTTP = 6;
     public const SERVICE_SQL = 2;
     public const SERVICE_STREAM = 4;
     public const SERVICE_TX = 3;
@@ -33,6 +34,9 @@ final class Constants
     public const METHOD_CORE_PING = 3;
     public const METHOD_CORE_PONG = 4;
     public const METHOD_CORE_WINDOW_UPDATE = 6;
+    public const METHOD_HTTP_BODY = 3;
+    public const METHOD_HTTP_HEAD = 2;
+    public const METHOD_HTTP_REQUEST = 1;
     public const METHOD_SQL_EXEC = 1;
     public const METHOD_STREAM_DATA = 2;
     public const METHOD_STREAM_HEAD = 1;
@@ -74,6 +78,7 @@ final class Constants
 
     public const FEATURE_CLIENT_FIBERS = 2;
     public const FEATURE_CLIENT_MEMFD_RX = 1;
+    public const FEATURE_ENGINE_HTTP = 8;
     public const FEATURE_ENGINE_LISTEN_STREAMS = 2;
     public const FEATURE_ENGINE_MANIFEST = 4;
     public const FEATURE_ENGINE_MEMFD = 1;
@@ -100,12 +105,18 @@ final class Constants
     public const ERR_PROTOCOL_BRANCH = 3;
     public const ERR_QUERY_TIMEOUT = 12295;
     public const ERR_QUERY_TIMEOUT_BRANCH = 3;
+    public const ERR_RATE_LIMITED = 4104;
+    public const ERR_RATE_LIMITED_BRANCH = 1;
     public const ERR_REPLICA_UNAVAILABLE = 4102;
     public const ERR_REPLICA_UNAVAILABLE_BRANCH = 1;
+    public const ERR_RESPONSE_INCOMPLETE = 12302;
+    public const ERR_RESPONSE_INCOMPLETE_BRANCH = 3;
     public const ERR_SERIALIZATION_FAILURE = 4101;
     public const ERR_SERIALIZATION_FAILURE_BRANCH = 1;
     public const ERR_SYNTAX = 12289;
     public const ERR_SYNTAX_BRANCH = 3;
+    public const ERR_TLS_REFUSED = 12301;
+    public const ERR_TLS_REFUSED_BRANCH = 3;
     public const ERR_TX_DEADLINE = 4099;
     public const ERR_TX_DEADLINE_BRANCH = 1;
     public const ERR_TX_NOT_FOUND = 12299;
@@ -114,8 +125,103 @@ final class Constants
     public const ERR_UNIQUE_BRANCH = 3;
     public const ERR_UNSUPPORTED = 12298;
     public const ERR_UNSUPPORTED_BRANCH = 3;
+    public const ERR_UPSTREAM_UNAVAILABLE = 4103;
+    public const ERR_UPSTREAM_UNAVAILABLE_BRANCH = 1;
     public const ERR_WRITE_UNCONFIRMED = 8193;
     public const ERR_WRITE_UNCONFIRMED_BRANCH = 2;
 
-    public const TYPE_REGISTRY_HASH = 'b1d69ba2485a43aa';
+    public const HTTP_CAUSE_BODY_BUDGET = 'body_budget';
+    public const HTTP_CAUSE_BODY_EOF = 'body_eof';
+    public const HTTP_CAUSE_BODY_FRAMING = 'body_framing';
+    public const HTTP_CAUSE_BODY_RESET = 'body_reset';
+    public const HTTP_CAUSE_BREAKER_OPEN = 'breaker_open';
+    public const HTTP_CAUSE_BREAKER_PROBE_BUSY = 'breaker_probe_busy';
+    public const HTTP_CAUSE_CANCELLED = 'cancelled';
+    public const HTTP_CAUSE_CONNECT_REFUSED = 'connect_refused';
+    public const HTTP_CAUSE_CONNECT_TIMEOUT = 'connect_timeout';
+    public const HTTP_CAUSE_CONNECT_UNREACHABLE = 'connect_unreachable';
+    public const HTTP_CAUSE_DEADLINE = 'deadline';
+    public const HTTP_CAUSE_DECODE = 'decode';
+    public const HTTP_CAUSE_DNS = 'dns';
+    public const HTTP_CAUSE_DRAINING = 'draining';
+    public const HTTP_CAUSE_EOF_EMPTY = 'eof_empty';
+    public const HTTP_CAUSE_EOF_PARTIAL_HEAD = 'eof_partial_head';
+    public const HTTP_CAUSE_FORBIDDEN_ADDRESS = 'forbidden_address';
+    public const HTTP_CAUSE_FORBIDDEN_BODY = 'forbidden_body';
+    public const HTTP_CAUSE_FORBIDDEN_HEADER = 'forbidden_header';
+    public const HTTP_CAUSE_FORBIDDEN_METHOD = 'forbidden_method';
+    public const HTTP_CAUSE_FORBIDDEN_ORIGIN = 'forbidden_origin';
+    public const HTTP_CAUSE_FORBIDDEN_TARGET = 'forbidden_target';
+    public const HTTP_CAUSE_FORBIDDEN_UPSTREAM = 'forbidden_upstream';
+    public const HTTP_CAUSE_H2_CONNECTION_ERROR = 'h2_connection_error';
+    public const HTTP_CAUSE_H2_GOAWAY_ABOVE_LAST = 'h2_goaway_above_last';
+    public const HTTP_CAUSE_H2_REFUSED_STREAM = 'h2_refused_stream';
+    public const HTTP_CAUSE_H2_STREAM_ERROR = 'h2_stream_error';
+    public const HTTP_CAUSE_INFORMATIONAL_101 = 'informational_101';
+    public const HTTP_CAUSE_MALFORMED_HEAD = 'malformed_head';
+    public const HTTP_CAUSE_MAX_RESPONSE_BYTES = 'max_response_bytes';
+    public const HTTP_CAUSE_OVERSIZE_HEAD = 'oversize_head';
+    public const HTTP_CAUSE_QUEUE_FULL = 'queue_full';
+    public const HTTP_CAUSE_QUEUE_TIMEOUT = 'queue_timeout';
+    public const HTTP_CAUSE_RATE_LIMITED = 'rate_limited';
+    public const HTTP_CAUSE_READ_IDLE = 'read_idle';
+    public const HTTP_CAUSE_RESET = 'reset';
+    public const HTTP_CAUSE_RETRY_AFTER_HOLD = 'retry_after_hold';
+    public const HTTP_CAUSE_TIMEOUT = 'timeout';
+    public const HTTP_CAUSE_TLS_ALPN = 'tls_alpn';
+    public const HTTP_CAUSE_TLS_HANDSHAKE = 'tls_handshake';
+    public const HTTP_CAUSE_TLS_VERIFY = 'tls_verify';
+    public const HTTP_CAUSE_TLS_VERSION = 'tls_version';
+    public const HTTP_CAUSE_UNSENT_CLOSED = 'unsent_closed';
+    public const HTTP_CAUSE_UNSENT_WRITE = 'unsent_write';
+    public const HTTP_CAUSE_WRITE = 'write';
+    public const HTTP_CAUSES = [
+        'body_budget',
+        'body_eof',
+        'body_framing',
+        'body_reset',
+        'breaker_open',
+        'breaker_probe_busy',
+        'cancelled',
+        'connect_refused',
+        'connect_timeout',
+        'connect_unreachable',
+        'deadline',
+        'decode',
+        'dns',
+        'draining',
+        'eof_empty',
+        'eof_partial_head',
+        'forbidden_address',
+        'forbidden_body',
+        'forbidden_header',
+        'forbidden_method',
+        'forbidden_origin',
+        'forbidden_target',
+        'forbidden_upstream',
+        'h2_connection_error',
+        'h2_goaway_above_last',
+        'h2_refused_stream',
+        'h2_stream_error',
+        'informational_101',
+        'malformed_head',
+        'max_response_bytes',
+        'oversize_head',
+        'queue_full',
+        'queue_timeout',
+        'rate_limited',
+        'read_idle',
+        'reset',
+        'retry_after_hold',
+        'timeout',
+        'tls_alpn',
+        'tls_handshake',
+        'tls_verify',
+        'tls_version',
+        'unsent_closed',
+        'unsent_write',
+        'write',
+    ];
+
+    public const TYPE_REGISTRY_HASH = '8a862520dcdf7e38';
 }

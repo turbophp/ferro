@@ -27,7 +27,21 @@ pub struct Registry {
     pub tags: BTreeMap<String, u8>,
     pub branches: BTreeMap<String, u8>,
     pub codes: BTreeMap<String, ErrCode>,
+    /// Ferro HTTP's closed vocabularies (M6-F2, SPEC §23.5.6), from `errors.toml`'s `[http.*]`.
+    pub http: HttpVocab,
 }
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpVocab {
+    /// `[http.causes]`: constant NAME → wire TOKEN. On service `HTTP`, `ErrorPayload.detail` is
+    /// exactly one of these tokens. Every key is its token upper-cased ([`check_http_causes`]).
+    pub causes: BTreeMap<String, String>,
+}
+
+// `check_http_causes` — the one Rust implementation of the `[http.causes]` shape rule, shared
+// with `build.rs` by `include!` (see the file for why).
+include!("http_causes_rule.rs");
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrCode {
@@ -61,6 +75,9 @@ struct TypesToml {
 struct ErrorsToml {
     branches: BTreeMap<String, u8>,
     codes: BTreeMap<String, ErrCode>,
+    // Unlike the tables above, `deny_unknown_fields` (on `HttpVocab`): a misspelled `[http.cause]`
+    // must fail the parse, not vanish from the lock the way an unknown top-level key would.
+    http: HttpVocab,
 }
 
 impl Registry {
@@ -75,6 +92,9 @@ impl Registry {
         // cosmetic reorder of the TOML list, or a no-op edit mints a spurious handshake failure.
         let mut implemented = t.implemented;
         implemented.sort();
+        if let Err(why) = check_http_causes(&e.http.causes) {
+            panic!("errors.toml: {why}");
+        }
         Registry {
             protocol_version: m.protocol_version,
             magic: m.magic,
@@ -91,6 +111,7 @@ impl Registry {
             tags: t.tags,
             branches: e.branches,
             codes: e.codes,
+            http: e.http,
         }
     }
 

@@ -29,7 +29,17 @@ struct Registry {
     tags: BTreeMap<String, u8>,
     branches: BTreeMap<String, u8>,
     codes: BTreeMap<String, ErrCode>,
+    http: HttpVocab,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpVocab {
+    causes: BTreeMap<String, String>,
+}
+
+// The shape rule `registry.rs` also uses — one implementation, so the two readers cannot drift.
+include!("src/http_causes_rule.rs");
 
 fn lock_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../proto/registry.lock.json")
@@ -38,6 +48,7 @@ fn lock_path() -> PathBuf {
 fn main() {
     let lock = lock_path();
     println!("cargo:rerun-if-changed={}", lock.display());
+    println!("cargo:rerun-if-changed=src/http_causes_rule.rs");
     let lock_bytes = fs::read(&lock).unwrap();
     let reg: Registry = serde_json::from_slice(&lock_bytes).unwrap();
 
@@ -122,6 +133,25 @@ fn main() {
     writeln!(o, "    pub const ALL: &[(&str, u16, u8)] = &[").unwrap();
     for (name, ec) in &reg.codes {
         writeln!(o, "        (\"{name}\", 0x{:04X}, {}),", ec.code, ec.branch).unwrap();
+    }
+    writeln!(o, "    ];").unwrap();
+    writeln!(o, "}}").unwrap();
+
+    // Ferro HTTP's cause vocabulary (M6-F2, SPEC §23.5.6): `NAME: &str = "token"` per cause, plus
+    // `ALL`, every token in the table's (alphabetical-by-name) order, so a consumer can test a
+    // `detail` for membership instead of keeping its own list. The shape rule is re-checked here,
+    // against the LOCK, because the lock is what this build reads: a hand-edited lock that slipped a
+    // second spelling past `Registry::from_toml_dir` must not compile into a constant.
+    writeln!(o, "pub mod http_cause {{").unwrap();
+    if let Err(why) = check_http_causes(&reg.http.causes) {
+        panic!("registry.lock.json: {why}");
+    }
+    for (name, token) in &reg.http.causes {
+        writeln!(o, "    pub const {name}: &str = \"{token}\";").unwrap();
+    }
+    writeln!(o, "    pub const ALL: &[&str] = &[").unwrap();
+    for token in reg.http.causes.values() {
+        writeln!(o, "        \"{token}\",").unwrap();
     }
     writeln!(o, "    ];").unwrap();
     writeln!(o, "}}").unwrap();

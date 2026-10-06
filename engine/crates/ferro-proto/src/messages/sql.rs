@@ -386,7 +386,7 @@ impl StreamData {
 
 // --- shared Option/peek helpers (one rule, mirrored byte-for-byte in the PHP codec) ---
 
-fn write_opt_str(out: &mut Vec<u8>, v: &Option<String>) {
+pub(crate) fn write_opt_str(out: &mut Vec<u8>, v: &Option<String>) {
     match v {
         None => enc::write_nil(out).unwrap(),
         Some(s) => {
@@ -395,7 +395,7 @@ fn write_opt_str(out: &mut Vec<u8>, v: &Option<String>) {
     }
 }
 
-fn write_opt_u32(out: &mut Vec<u8>, v: &Option<u32>) {
+pub(crate) fn write_opt_u32(out: &mut Vec<u8>, v: &Option<u32>) {
     match v {
         None => enc::write_nil(out).unwrap(),
         Some(n) => {
@@ -422,14 +422,14 @@ fn write_opt_value(out: &mut Vec<u8>, v: &Option<Value>) {
     }
 }
 
-fn read_opt_str(rd: &mut &[u8]) -> Result<Option<String>, CodecError> {
+pub(crate) fn read_opt_str(rd: &mut &[u8]) -> Result<Option<String>, CodecError> {
     if peek_nil(rd)? {
         return Ok(None);
     }
     Ok(Some(read_str(rd)?))
 }
 
-fn read_opt_u32(rd: &mut &[u8]) -> Result<Option<u32>, CodecError> {
+pub(crate) fn read_opt_u32(rd: &mut &[u8]) -> Result<Option<u32>, CodecError> {
     if peek_nil(rd)? {
         return Ok(None);
     }
@@ -458,7 +458,7 @@ fn read_opt_value(rd: &mut &[u8]) -> Result<Option<Value>, CodecError> {
 
 /// Peek the next marker; if it is bare `nil` (`0xc0`) consume it and return `true`, else leave the
 /// cursor untouched. An empty cursor is truncation, not `None`.
-fn peek_nil(rd: &mut &[u8]) -> Result<bool, CodecError> {
+pub(crate) fn peek_nil(rd: &mut &[u8]) -> Result<bool, CodecError> {
     match rd.first() {
         None => Err(CodecError::Truncated { need: 1, have: 0 }),
         Some(&0xc0) => {

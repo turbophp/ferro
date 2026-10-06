@@ -10,6 +10,11 @@ use Ferro\Protocol\ExecOk;
 use Ferro\Protocol\ExecRequest;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Header;
+use Ferro\Protocol\HttpBody;
+use Ferro\Protocol\HttpDone;
+use Ferro\Protocol\HttpHead;
+use Ferro\Protocol\HttpRequest;
+use Ferro\Protocol\HttpWire;
 use Ferro\Protocol\Message;
 use Ferro\Protocol\Msgpack\{PurePacker, ExtPacker};
 use Ferro\Protocol\OobRef;
@@ -159,7 +164,33 @@ final class VectorConformanceTest extends TestCase
         }
         $off = 0;
         $ext = (new ExtPacker())->unpack($payload, $off);
-        $this->assertEquals(json_encode($pure), json_encode($ext), "ext vs pure decode for {$v['name']}");
+        // `serialize()`, not `json_encode()`: json_encode returns FALSE for any value holding a
+        // non-UTF-8 string, so every vector carrying a `bin` such as 0xc0/0x80/0xff (HTTP's, and
+        // `sql_exec_response_typedvalue`/`stream_data_rows` before them) compared false == false
+        // and passed whatever ext-msgpack decoded (M6-F2 review F-a). serialize() is exact on
+        // bytes, int-vs-float and key order.
+        $this->assertSame(self::canonical($pure), self::canonical($ext), "ext vs pure decode for {$v['name']}");
+    }
+
+    /**
+     * The comparator {@see testExtPackerDecodeMatchesPureWhenLoaded} uses, pinned to be NON-VACUOUS on
+     * exactly the values the old one was blind to — so this holds even where ext-msgpack is absent
+     * (it is in this container; CI provisions it).
+     */
+    public function testTheExtVsPureComparatorSeesNonUtf8Bytes(): void
+    {
+        $a = ['x', "\xc0\x00", 1];
+        $b = ['x', "\xc0\x01", 1];
+        $this->assertFalse(json_encode($a), 'the old comparator: json_encode gives up on these');
+        $this->assertSame(json_encode($a), json_encode($b), 'the old comparator called these equal');
+        $this->assertNotSame(self::canonical($a), self::canonical($b));
+        $this->assertNotSame(self::canonical([1]), self::canonical([1.0]), 'int vs float is a difference');
+        $this->assertSame(self::canonical($a), self::canonical(['x', "\xc0\x00", 1]));
+    }
+
+    private static function canonical(mixed $v): string
+    {
+        return serialize($v);
     }
 
     /** @return iterable<string, array{0:array<string,mixed>}> only the SQL EXEC vectors (Task S5). */
@@ -576,6 +607,173 @@ final class VectorConformanceTest extends TestCase
     }
 
     /**
+     * The HTTP vectors (M6-F2, SPEC §23.5.5): every `http_*` vector. The `http_` prefix is the byte-lock
+     * key (/proto/PROTOCOL.md §7), exactly as `sql_exec_`/`stream_` are.
+     * @return iterable<string, array{0:array<string,mixed>}>
+     */
+    public static function httpVectors(): iterable
+    {
+        foreach (self::vectors() as $name => [$v]) {
+            if (str_starts_with((string) ($v['name'] ?? ''), 'http_')) {
+                yield $name => [$v];
+            }
+        }
+    }
+
+    /**
+     * THE HTTP cross-language byte lock. For every `http_*` vector PHP must (a) encode the vector's
+     * NAMED message fields to the exact Rust-produced payload, (b) decode those bytes back to the same
+     * fields with full consumption, and (c) re-encode the decoded value to the same bytes. Which codec
+     * applies is read from the frame HEADER's method (and the `END` flag for the terminal), never from
+     * the name, so a vector filed under the wrong method fails here rather than being checked as
+     * something it is not. `bin` fields ride the JSON as byte-int arrays; {@see self::httpFromJson}
+     * turns them into the binary strings the codec takes.
+     * @param array<string,mixed> $v
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('httpVectors')]
+    public function testHttpVectorByteMatchesBothDirections(array $v): void
+    {
+        $name = (string) $v['name'];
+        $header = is_array($v['header'] ?? null) ? $v['header'] : [];
+        $this->assertSame(C::SERVICE_HTTP, $header['service'] ?? null, "{$name} rides service HTTP");
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $message = self::httpFromJson(is_array($v['message']) ? $v['message'] : []);
+        $p = new PurePacker();
+        $method = $header['method'] ?? null;
+        $flags = (int) ($header['flags'] ?? 0);
+
+        if ($method === C::METHOD_HTTP_REQUEST && ($flags & C::FLAG_END) === 0) {
+            $this->assertSame(bin2hex($payload), bin2hex(HttpRequest::encode($message, $p)), "HttpRequest encode for {$name}");
+            $wire = HttpWire::unpackArray($payload, $p, HttpRequest::ARITY, $name);
+            $decoded = HttpRequest::mapFromWire($wire);
+            $this->assertSame($message, $decoded, "HttpRequest decode==value for {$name}");
+            $this->assertSame(bin2hex($payload), bin2hex(HttpRequest::encode($decoded, $p)), "{$name} fixpoint");
+        } elseif ($method === C::METHOD_HTTP_REQUEST) {
+            // The completed exchange's terminal: Outcome::Ok(HttpDone).
+            $this->assertSame(C::FLAG_END, $flags);
+            $this->assertSame(bin2hex($payload), bin2hex(Outcome::ok(HttpDone::encode($message, $p))->encode($p)),
+                "Outcome::Ok(HttpDone) encode for {$name}");
+            $outcome = Outcome::decode($payload, $p);
+            $this->assertTrue($outcome->isOk());
+            $decoded = HttpDone::decode($outcome->body(), $p);
+            $this->assertSame($message, $decoded, "HttpDone decode==value for {$name}");
+            $this->assertGreaterThan(0xFFFFFFFF, $decoded['stats']['total_us'], 'the vector locks a u64 past u32');
+            $this->assertSame(bin2hex($payload), bin2hex(Outcome::ok(HttpDone::encode($decoded, $p))->encode($p)), "{$name} fixpoint");
+        } elseif ($method === C::METHOD_HTTP_HEAD) {
+            $this->assertSame(0, $flags, 'HEAD is neither terminal nor STREAM-flagged');
+            $this->assertSame(bin2hex($payload), bin2hex(HttpHead::encode($message, $p)), "HttpHead encode for {$name}");
+            $decoded = HttpHead::decode($payload, $p);
+            $this->assertSame($message, $decoded, "HttpHead decode==value for {$name}");
+            $this->assertSame(bin2hex($payload), bin2hex(HttpHead::encode($decoded, $p)), "{$name} fixpoint");
+        } elseif ($method === C::METHOD_HTTP_BODY) {
+            $this->assertSame(C::FLAG_STREAM, $flags, 'BODY carries the STREAM flag');
+            $this->assertSame(bin2hex($payload), bin2hex(HttpBody::encode($message, $p)), "HttpBody encode for {$name}");
+            $chunk = HttpBody::decode($payload, $p);
+            $this->assertSame($message['chunk'], $chunk, "HttpBody decode==value for {$name}");
+            $this->assertSame(bin2hex($payload), bin2hex(HttpBody::encode(['chunk' => $chunk], $p)), "{$name} fixpoint");
+        } else {
+            $this->fail("{$name}: no HTTP codec for method " . var_export($method, true));
+        }
+    }
+
+    /**
+     * The five HTTP error terminals (SPEC §23.5.5): each byte-matches through `ErrorPayload` in both
+     * directions, carries the generated code and branch, has `sqlstate`/`errno` nil (C11), and has a
+     * `detail` that is EXACTLY one generated `[http.causes]` token (§23.5.6) — the client keys
+     * exception classes on it, so a free-text detail would be a defect the vector catches.
+     */
+    public function testHttpErrorVectorsCarryOneCauseTokenEach(): void
+    {
+        $upstream = self::loadVector('error_upstream_unavailable.json');
+        $rate = self::loadVector('error_rate_limited.json');
+        $tls = self::loadVector('error_tls_refused.json');
+        $incomplete = self::loadVector('error_response_incomplete.json');
+        $forbidden = self::loadVector('error_forbidden_http.json');
+        $p = new PurePacker();
+        foreach ([
+            [$upstream, C::ERR_UPSTREAM_UNAVAILABLE, C::ERR_UPSTREAM_UNAVAILABLE_BRANCH, C::HTTP_CAUSE_BREAKER_OPEN, true],
+            [$rate, C::ERR_RATE_LIMITED, C::ERR_RATE_LIMITED_BRANCH, C::HTTP_CAUSE_RATE_LIMITED, true],
+            [$tls, C::ERR_TLS_REFUSED, C::ERR_TLS_REFUSED_BRANCH, C::HTTP_CAUSE_TLS_VERIFY, false],
+            [$incomplete, C::ERR_RESPONSE_INCOMPLETE, C::ERR_RESPONSE_INCOMPLETE_BRANCH, C::HTTP_CAUSE_BODY_EOF, false],
+            [$forbidden, C::ERR_FORBIDDEN, C::ERR_FORBIDDEN_BRANCH, C::HTTP_CAUSE_FORBIDDEN_TARGET, false],
+        ] as [$v, $code, $branch, $cause, $retryAfter]) {
+            $name = (string) $v['name'];
+            $header = is_array($v['header'] ?? null) ? $v['header'] : [];
+            $this->assertSame([C::FLAG_END, C::SERVICE_HTTP, C::METHOD_HTTP_REQUEST],
+                [$header['flags'] ?? null, $header['service'] ?? null, $header['method'] ?? null],
+                "{$name}: a handler-built terminal on the request's own HTTP/REQUEST header");
+            $message = is_array($v['message']) ? $v['message'] : [];
+            $fields = is_array($message['error'] ?? null) ? $message['error'] : [];
+            $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+
+            $this->assertSame(bin2hex($payload), bin2hex(Outcome::error(ErrorPayload::fromArray($fields))->encode($p)),
+                "PHP Outcome::Error encode must byte-match {$name}");
+            $err = Outcome::decode($payload, $p)->errorPayload();
+            $this->assertSame([$code, $branch], [$err->code, $err->branch], "{$name}: generated code and branch");
+            $this->assertSame([null, null], [$err->sqlstate, $err->errno], "{$name}: sqlstate/errno are nil on HTTP (C11)");
+            $this->assertSame($cause, $err->detail, "{$name}: detail is the cause token");
+            $this->assertContains($err->detail, C::HTTP_CAUSES, "{$name}: detail is in [http.causes]");
+            $this->assertSame($retryAfter, $err->retryAfterMs !== null, "{$name}: retry_after_ms presence");
+            $this->assertEquals($fields, $err->toArray());
+            $this->assertSame(bin2hex($payload), bin2hex(Outcome::error($err)->encode($p)), "{$name} fixpoint");
+        }
+    }
+
+    /**
+     * Turn an HTTP vector's JSON message into the codec's logical shape: every `bin` field arrives as
+     * a byte-int array and becomes a binary string; `headers`/`trailers` become `[name, value]` pairs;
+     * `decoded` stays a positional pair; `http_done`'s positional `stats` array becomes the keyed one.
+     * @param array<array-key,mixed> $m
+     * @return array<string,mixed>
+     */
+    private static function httpFromJson(array $m): array
+    {
+        $bytes = static function (mixed $v): string {
+            if (!is_array($v)) { throw new \LogicException('expected a byte array'); }
+            return implode('', array_map(static fn (mixed $b): string => chr(is_int($b) ? $b : throw new \LogicException("bad byte")), $v));
+        };
+        $headers = static function (mixed $v) use ($bytes): array {
+            $out = [];
+            foreach (is_array($v) ? $v : [] as $pair) {
+                if (!is_array($pair) || !is_string($pair[0] ?? null)) { throw new \LogicException('bad header'); }
+                $out[] = [$pair[0], $bytes($pair[1] ?? null)];
+            }
+            return $out;
+        };
+        $out = [];
+        foreach ($m as $k => $val) {
+            $key = (string) $k;
+            $out[$key] = match ($key) {
+                'headers', 'trailers' => $headers($val),
+                'body', 'reason', 'chunk' => $val === null ? null : $bytes($val),
+                default => $val,
+            };
+        }
+        if (isset($out['stats']) && is_array($out['stats']) && array_is_list($out['stats'])) {
+            $stats = [];
+            foreach (HttpDone::STATS as $i => $field) { $stats[$field] = $out['stats'][$i] ?? null; }
+            $stats['reused'] = $out['stats'][count(HttpDone::STATS)] ?? null;
+            $out['stats'] = $stats;
+        }
+        unset($out['status']); // http_done's Outcome status, not an HttpDone field
+        if (array_key_exists('trailers', $out)) {
+            return ['trailers' => $out['trailers'], 'stats' => $out['stats'] ?? []];
+        }
+        if (array_key_exists('upstream', $m)) {
+            // Restore HttpRequest's wire order so the decoded array compares with assertSame.
+            $order = ['upstream', 'method', 'target', 'origin', 'headers', 'body', 'timeout_ms',
+                'connect_timeout_ms', 'read_timeout_ms', 'idempotent', 'decode', 'route', 'traceparent'];
+            return array_merge(array_fill_keys($order, null), array_intersect_key($out, array_flip($order)));
+        }
+        if (array_key_exists('version', $m)) {
+            $order = ['status', 'version', 'reason', 'headers', 'decoded', 'idempotent'];
+            $out['status'] = $m['status'] ?? null;
+            return array_merge(array_fill_keys($order, null), array_intersect_key($out, array_flip($order)));
+        }
+        return $out;
+    }
+
+    /**
      * @param array<string,mixed> $message
      */
     private function encodeTxRequest(string $name, array $message, PurePacker $p): string
@@ -616,6 +814,7 @@ final class VectorConformanceTest extends TestCase
         $prefixLocked = [];
         foreach (self::sqlVectors() as [$v]) { $prefixLocked[] = (string) $v['name']; }
         foreach (self::streamVectors() as [$v]) { $prefixLocked[] = (string) $v['name']; }
+        foreach (self::httpVectors() as [$v]) { $prefixLocked[] = (string) $v['name']; }
 
         // The four vectors this task added — each must be inside a PREFIX-keyed provider.
         foreach ([

@@ -14,6 +14,7 @@
   "services": {
     "ADMIN": 5,
     "CORE": 1,
+    "HTTP": 6,
     "SQL": 2,
     "STREAM": 4,
     "TX": 3
@@ -29,6 +30,11 @@
       "PING": 3,
       "PONG": 4,
       "WINDOW_UPDATE": 6
+    },
+    "http": {
+      "BODY": 3,
+      "HEAD": 2,
+      "REQUEST": 1
     },
     "sql": {
       "EXEC": 1
@@ -52,6 +58,7 @@
       "MEMFD_RX": 1
     },
     "engine": {
+      "HTTP": 8,
       "LISTEN_STREAMS": 2,
       "MANIFEST": 4,
       "MEMFD": 1
@@ -151,9 +158,17 @@
       "code": 12295,
       "branch": 3
     },
+    "RateLimited": {
+      "code": 4104,
+      "branch": 1
+    },
     "ReplicaUnavailable": {
       "code": 4102,
       "branch": 1
+    },
+    "ResponseIncomplete": {
+      "code": 12302,
+      "branch": 3
     },
     "SerializationFailure": {
       "code": 4101,
@@ -161,6 +176,10 @@
     },
     "Syntax": {
       "code": 12289,
+      "branch": 3
+    },
+    "TlsRefused": {
+      "code": 12301,
       "branch": 3
     },
     "TxDeadline": {
@@ -179,9 +198,62 @@
       "code": 12298,
       "branch": 3
     },
+    "UpstreamUnavailable": {
+      "code": 4103,
+      "branch": 1
+    },
     "WriteUnconfirmed": {
       "code": 8193,
       "branch": 2
+    }
+  },
+  "http": {
+    "causes": {
+      "BODY_BUDGET": "body_budget",
+      "BODY_EOF": "body_eof",
+      "BODY_FRAMING": "body_framing",
+      "BODY_RESET": "body_reset",
+      "BREAKER_OPEN": "breaker_open",
+      "BREAKER_PROBE_BUSY": "breaker_probe_busy",
+      "CANCELLED": "cancelled",
+      "CONNECT_REFUSED": "connect_refused",
+      "CONNECT_TIMEOUT": "connect_timeout",
+      "CONNECT_UNREACHABLE": "connect_unreachable",
+      "DEADLINE": "deadline",
+      "DECODE": "decode",
+      "DNS": "dns",
+      "DRAINING": "draining",
+      "EOF_EMPTY": "eof_empty",
+      "EOF_PARTIAL_HEAD": "eof_partial_head",
+      "FORBIDDEN_ADDRESS": "forbidden_address",
+      "FORBIDDEN_BODY": "forbidden_body",
+      "FORBIDDEN_HEADER": "forbidden_header",
+      "FORBIDDEN_METHOD": "forbidden_method",
+      "FORBIDDEN_ORIGIN": "forbidden_origin",
+      "FORBIDDEN_TARGET": "forbidden_target",
+      "FORBIDDEN_UPSTREAM": "forbidden_upstream",
+      "H2_CONNECTION_ERROR": "h2_connection_error",
+      "H2_GOAWAY_ABOVE_LAST": "h2_goaway_above_last",
+      "H2_REFUSED_STREAM": "h2_refused_stream",
+      "H2_STREAM_ERROR": "h2_stream_error",
+      "INFORMATIONAL_101": "informational_101",
+      "MALFORMED_HEAD": "malformed_head",
+      "MAX_RESPONSE_BYTES": "max_response_bytes",
+      "OVERSIZE_HEAD": "oversize_head",
+      "QUEUE_FULL": "queue_full",
+      "QUEUE_TIMEOUT": "queue_timeout",
+      "RATE_LIMITED": "rate_limited",
+      "READ_IDLE": "read_idle",
+      "RESET": "reset",
+      "RETRY_AFTER_HOLD": "retry_after_hold",
+      "TIMEOUT": "timeout",
+      "TLS_ALPN": "tls_alpn",
+      "TLS_HANDSHAKE": "tls_handshake",
+      "TLS_VERIFY": "tls_verify",
+      "TLS_VERSION": "tls_version",
+      "UNSENT_CLOSED": "unsent_closed",
+      "UNSENT_WRITE": "unsent_write",
+      "WRITE": "write"
     }
   }
 }

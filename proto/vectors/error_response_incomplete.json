@@ -1,0 +1,22 @@
+{
+  "frame_hex": "f704020006000100420000004e000000920197cd300e03c0c0d939757073747265616d2062696c6c696e673a20636f6e6e656374696f6e20636c6f736564206265666f72652074686520626f647920656e646564a8626f64795f656f66c0",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 66,
+    "service": 6
+  },
+  "message": {
+    "error": {
+      "branch": 3,
+      "code": 12302,
+      "detail": "body_eof",
+      "errno": null,
+      "message": "upstream billing: connection closed before the body ended",
+      "retry_after_ms": null,
+      "sqlstate": null
+    },
+    "status": 1
+  },
+  "name": "error_response_incomplete"
+}
