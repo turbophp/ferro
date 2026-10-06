@@ -184,6 +184,13 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     private ?float $requestTimeout = null;
 
     /**
+     * The scheduler watching this session, if any ({@see observe}, M3-D1d).
+     *
+     * @var (\Closure(?int): void)|null
+     */
+    private ?\Closure $observer = null;
+
+    /**
      * @param int $maxInFlight the most requests this session keeps in flight at once. At the limit,
      *                         {@see submit} reads frames until a terminal frees a slot before it
      *                         writes. It must stay below the engine's own per-session limit
@@ -450,6 +457,60 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         }
     }
 
+    /**
+     * Let ONE scheduler hear about everything that can make a {@see Waiter} on this session ready
+     * (M3-D1d, {@see \Ferro\Revolt}), or stop it hearing (`null`). `$observer($rid)` runs after every
+     * frame read off the wire, whoever read it — a frame read by another Fiber's blocking call can be
+     * the one a suspended Fiber waits for — with that frame's `request_id`; `$observer(null)` runs
+     * when the session fails, an open stream closes, or a deadline is set, any of which can change
+     * what is ready or when the scheduler must next wake.
+     *
+     * The observer must not read or write the session; what it throws is ignored.
+     *
+     * @internal
+     * @param (\Closure(?int): void)|null $observer
+     */
+    public function observe(?\Closure $observer): void
+    {
+        $this->observer = $observer;
+    }
+
+    private function notify(?int $requestId): void
+    {
+        if ($this->observer === null) {
+            return;
+        }
+        try {
+            ($this->observer)($requestId);
+        } catch (\Throwable) {
+            // The scheduler routes its own failures to its waiters; a frame is never lost to it.
+        }
+    }
+
+    /**
+     * Bytes already read off the socket into PHP's stream buffer and not yet consumed. A scheduler
+     * watching the descriptor for readability must drain these first: the descriptor does not
+     * report them (M3-D1d).
+     */
+    public function bufferedBytes(): int
+    {
+        $stream = $this->selectableStream();
+        if (!is_resource($stream)) {
+            return 0;
+        }
+        $meta = stream_get_meta_data($stream);
+        return $meta['unread_bytes'];
+    }
+
+    /**
+     * Whether any request's final frame is still to be read off the wire. When none is,
+     * {@see pollOnce} reads nothing, so a scheduler must not keep asking it to (M3-D1d review F3).
+     */
+    public function hasRequestsInFlight(): bool
+    {
+        return $this->inFlight !== [];
+    }
+
     /** Whether `$requestId` was submitted and its terminal has not been consumed yet. */
     public function isPending(int $requestId): bool
     {
@@ -579,6 +640,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             if ($this->streamRequestId === $requestId) {
                 $this->streamOpen = false;
                 $this->streamRequestId = null;
+                $this->notify(null);
             }
             throw $e;
         }
@@ -587,6 +649,8 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         if ($isEnd) {
             $this->streamOpen = false;
             $this->streamRequestId = null;
+            // A Fiber waiting for this stream to close ({@see assertNoOpenStream}) can go on.
+            $this->notify(null);
             return ['type' => 'end', 'outcome' => Outcome::decode($body, $this->decodePacker)];
         }
 
@@ -856,6 +920,17 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     private function pump(?float $until = null): void
     {
         [$header, $body] = $this->readFrame($until);
+        try {
+            $this->route($header, $body);
+        } finally {
+            // After filing, so an observer that looks finds the frame where its awaiter will.
+            $this->notify($header->requestId);
+        }
+    }
+
+    /** File one frame read by {@see pump}. */
+    private function route(Header $header, string $body): void
+    {
         $rid = $header->requestId;
         $isEnd = ($header->flags & C::FLAG_END) !== 0;
 
@@ -1082,6 +1157,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     {
         if (isset($this->inFlight[$requestId])) {
             $this->deadlines[$requestId] = $at;
+            $this->notify(null); // a scheduler sleeping past `$at` must wake for it
         }
     }
 
@@ -1207,6 +1283,9 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         } catch (\Throwable) {
             // Best-effort: the point is that nothing more is WRITTEN, which the flag guarantees.
         }
+        // Every pending request is ready now (it fails at its own await), and the socket a
+        // scheduler may be watching is closed: it must stop watching it before it selects again.
+        $this->notify(null);
     }
 
     /** Whether the open stream has ended, or the session has failed (either ends a wait for it). */
