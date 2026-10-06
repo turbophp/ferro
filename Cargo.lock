@@ -400,6 +400,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "ferro-proto",
+ "flate2",
  "http",
  "http-body",
  "hyper",
@@ -490,6 +491,7 @@ dependencies = [
  "ferro-manifest",
  "ferro-pool",
  "ferro-proto",
+ "flate2",
  "futures",
  "getrandom 0.2.17",
  "mysql_async",
