@@ -32,8 +32,10 @@ use const JSON_THROW_ON_ERROR;
  *  - `initializeDatabase()` is a no-op: upstream drops and recreates the database through a
  *    privileged connection, which Ferro cannot serve (PHP holds no credentials, SPEC §12 / D8). The
  *    RUNNER's container-side (or file-delete) reset is where idempotence lives.
- *  - `isDriverOneOf()` answers FALSE for every name, in the Ferro column AND the control, so both
- *    run the same gating and differ in exactly one variable — the driver.
+ *  - `isDriverOneOf()` answers the column's PDO driver name — the control's real one, and for the
+ *    Ferro column the PDO driver of the family the pool serves — so both columns take upstream's
+ *    vendor gates exactly as a stock `pdo_*` run would (E9, SPEC §22.2 (da); it answered FALSE for
+ *    every name until then, which made every positive vendor gate skip in BOTH columns).
  *
  * **Where 3.10.6's surface differs from 4.4.4's, this file follows 3.10.6** — measured from the
  * pinned clone, not assumed: `generateResultSetQuery(array $rows, AbstractPlatform $platform)` takes
@@ -125,7 +127,15 @@ class TestUtil
 
     public static function isDriverOneOf(string ...$names): bool
     {
-        return false;
+        // The control names its real driver (`db_driver`); the Ferro column names the PDO driver of
+        // the family its pool serves (`db_vendor_driver`, from the runner). Neither is a guess this
+        // file may make, so a run with neither refuses rather than silently taking every "other" branch.
+        $driver = $GLOBALS['db_driver'] ?? $GLOBALS['db_vendor_driver'] ?? null;
+        if (! is_string($driver) || $driver === '') {
+            throw new RuntimeException('isDriverOneOf(): neither db_driver (the control) nor db_vendor_driver (the Ferro column) is set');
+        }
+
+        return in_array($driver, $names, true);
     }
 
     /**

@@ -14,8 +14,11 @@ tests/Functional/Types
 #
 # EXCLUDED, with reasons:
 #   tests/Functional/Driver/{PDO,PgSQL,Mysqli,SQLite3,OCI8,SQLSrv,IBMDB2}
-#       vendor-extension sub-trees; they markTestSkipped unless isDriverOneOf names them, and ours
-#       names nothing (see TestUtil.ferro.php).
+#       vendor-extension sub-trees: they test upstream's own driver CLASSES (each builds e.g. a
+#       `PDO\PgSQL\Driver` itself through `createDriver()`), not the connection under test, so they
+#       would measure upstream's PDO driver in BOTH columns. (Until E9 they also skipped everywhere,
+#       because isDriverOneOf named nothing; since E9 it names the family's PDO driver, so this
+#       exclusion is now the only thing keeping them out — SPEC §22.2 (da).)
 #   tests/Functional/Driver/AbstractDriverTestCase.php
 #       testConnectsWithoutDatabaseNameParameter / testReturnsDatabaseNameWithoutDatabaseNameParameter
 #       assume the driver can connect to a SERVER with no database. Ferro's DSN lives in the engine

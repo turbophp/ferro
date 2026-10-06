@@ -92,7 +92,7 @@ echo "[ferro] reset: $svc/$db dropped and recreated"
 sock=""
 if [ "$control" != 1 ]; then
   bin="${FERRO_ORM_FERROD:-}"
-  if [ -z "$bin" ]; then cargo build -q -p ferrod --manifest-path "$root/Cargo.toml"; bin="$root/target/debug/ferrod"; fi
+  if [ -z "$bin" ]; then cargo build -q -p ferrod --manifest-path "$root/Cargo.toml"; bin="${CARGO_TARGET_DIR:-$root/target}/debug/ferrod"; fi
   sock="$(mktemp -u /tmp/ferro-orm-XXXXXX.sock)"
   env FERRO_SOCK="$sock" FERRO_POOLS=orm FERRO_POOL_ORM_DSN="$dsn" "$bin" >"$work/ferrod.log" 2>&1 &
   ferrod_pid=$!
