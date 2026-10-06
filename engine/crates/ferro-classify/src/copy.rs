@@ -12,7 +12,10 @@
 //! - a `COPY … FROM STDIN` on the COPY_OUT path puts the server into copy-in mode, where it ignores
 //!   `Sync` and waits for data that never comes — a wedged pooled connection;
 //! - a `COPY … FROM 'file'` / `FROM PROGRAM` reads a server-side file or runs a program instead of
-//!   the client's bytes.
+//!   the client's bytes — the method would not speak the sub-protocol it declares. That refusal is
+//!   protocol INTEGRITY, not a security control: `EXEC` passes the same statement to the server
+//!   unchanged, and the server's privileges (`pg_read_server_files`, `pg_execute_server_program`)
+//!   are the boundary.
 //!
 //! So a method whose wire contract IS the COPY sub-protocol in one direction refuses a statement
 //! that cannot speak it. This is the same kind of check as `ferro-pool`'s bare-tx-control guard: it
@@ -21,7 +24,8 @@
 //! byte for byte. Everything else about the COPY (table, columns, options, `WHERE`) is the server's
 //! to accept or refuse.
 //!
-//! **Fails closed.** Anything this does not positively recognise — an unterminated literal, a
+//! **Fails closed.** Anything this does not positively recognise — an unterminated literal, comment
+//! or dollar-quoted body (probed for: the region pass itself masks one to the end of the input), a
 //! second statement, a target that is not exactly `STDIN`/`STDOUT` — is "not a COPY of that
 //! direction", and the request is refused before anything reaches the backend.
 

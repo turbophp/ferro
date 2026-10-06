@@ -950,7 +950,8 @@ PostgreSQL's COPY sub-protocol (M3-D4; SPEC §6.1). Methods: `methods.sql` `COPY
 `COPY_OUT = 3`; `methods.stream` `COPY_DATA = 3`, `COPY_DONE = 4`. The client's statement reaches the
 server unmodified; the engine refuses, before anything reaches the server, a statement that is not
 exactly one `COPY … FROM STDIN` (for `COPY_IN`) or `COPY … TO STDOUT` (for `COPY_OUT`) — a refusal of
-the request's SHAPE, `Unsupported`, never an inference about what it does. A `COPY … STDIN/STDOUT`
+the request's SHAPE, `Unsupported`, never an inference about what it does. It sends nothing and
+involves no connection, so with a `tx_id` it leaves the transaction open, as an `EXEC` refusal does. A `COPY … STDIN/STDOUT`
 sent as an `EXEC` is refused the same way. Non-PostgreSQL pools refuse both methods (`Unsupported`).
 No `protocol_version` bump: no existing message changed shape (the ADMIN precedent, §11.3); the
 registry hash moved.
