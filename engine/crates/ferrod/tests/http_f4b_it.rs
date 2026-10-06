@@ -461,13 +461,12 @@ async fn the_decode_loop_checks_the_deadline_and_the_stop_between_steps() {
         )
         .await;
     let deadline = started + Duration::from_millis(400);
-    let frames = rec.frames.lock().unwrap();
-    let late = frames.iter().filter(|(_, at, _)| *at > deadline).count();
-    assert!(
-        frames.len() > 10,
-        "the bomb was decoding: {} frames",
-        frames.len()
-    );
+    let (sent, late) = {
+        let frames = rec.frames.lock().unwrap();
+        let late = frames.iter().filter(|(_, at, _)| *at > deadline).count();
+        (frames.len(), late)
+    };
+    assert!(sent > 10, "the bomb was decoding: {sent} frames");
     assert!(
         matches!(&t, ferro_http::engine::Terminal::Error(ep) if ep.detail.as_deref() == Some(http_cause::TIMEOUT)),
         "{t:?}"
@@ -476,7 +475,6 @@ async fn the_decode_loop_checks_the_deadline_and_the_stop_between_steps() {
         late <= 1,
         "{late} frames decoded and sent after the deadline"
     );
-    drop(frames);
 
     // The stop token (a CANCEL — and the drain cap, which fires the same token).
     let cancel = CancellationToken::new();
