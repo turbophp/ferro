@@ -80,7 +80,30 @@ if (is_callable([$conn, 'getServerVersion'])) {
 } else {
     $version = $native instanceof PDO ? (string) $native->getAttribute(PDO::ATTR_SERVER_VERSION) : '?';
 }
-$platform = get_class($conn->getDatabasePlatform());
+$platformObj = $conn->getDatabasePlatform();
+$platform = get_class($platformObj);
+
+// The driver NAME this column's vendor gates answer (TestUtil::isDriverOneOf()) must be the family
+// the connection really is (E9 review round 2, LOW). The runner derives both from one variable, but
+// a misconfigured name would otherwise fail OPEN: a `pdo_mysql` column on a PostgreSQL server runs
+// upstream's MySQL-only tests and skips the PostgreSQL ones, in BOTH columns, and nothing differs.
+$gateName = (string) ($GLOBALS['db_driver'] ?? $GLOBALS['db_vendor_driver'] ?? '');
+$family = [
+    'pdo_pgsql'  => Doctrine\DBAL\Platforms\PostgreSQLPlatform::class,
+    'pdo_mysql'  => Doctrine\DBAL\Platforms\AbstractMySQLPlatform::class,
+    // DBAL 3 spells it SqlitePlatform, DBAL 4 SQLitePlatform; class names are case-insensitive, and
+    // instanceof on an already-loaded class needs no autoload.
+    'pdo_sqlite' => 'Doctrine\DBAL\Platforms\SQLitePlatform',
+][$gateName] ?? null;
+if ($family === null || ! $platformObj instanceof $family) {
+    fwrite(STDERR, sprintf(
+        "VENDOR-GATE ASSERTION FAILED: TestUtil::isDriverOneOf() would answer '%s', but the connection's platform is %s.\n"
+        . "Refusing to run: upstream's vendor-gated tests would run for the wrong family in both columns.\n",
+        $gateName === '' ? '(unset)' : $gateName,
+        $platform,
+    ));
+    exit(1);
+}
 
 // A real round trip, so "connected" cannot mean "constructed an object".
 if ((int) $conn->fetchOne('SELECT 1') !== 1) {

@@ -22,7 +22,8 @@ declare(strict_types=1);
  *     whose expectation matches what Ferro actually did. A difference is any of:
  *       - Ferro FAILS a test the control passes, skips or did not collect;
  *       - both FAIL, with a different exception type, or — for PHPUnit's own assertion types, which
- *         every assertion failure shares — a different normalised first message line (E9 review F3);
+ *         every assertion failure shares — a different normalised WHOLE message, the expected/actual
+ *         diff included (E9 review F3);
  *       - Ferro SKIPS, or never collects, a test the control RAN (C5b's rule);
  *       - Ferro RUNS AND PASSES a test the control skipped or did not collect (E9 review F6 — D18's
  *         skip clause is about the two skip SETS, so a difference in either direction counts).
@@ -57,17 +58,31 @@ declare(strict_types=1);
  *   expect        what Ferro did, which the entry excuses and nothing else (E9 review F2):
  *                   `skip`                      skipped, or did not collect, a test the control ran
  *                   `pass`                      ran and passed a test the control skipped
- *                   `fail <Type>`               failed with exactly this JUnit exception type
- *                   `fail <Type> /<regex>/`     … and a first message line matching the regex
+ *                   `fail <Type> /^<regex>/`    failed with exactly this JUnit exception type, and a
+ *                                               message matching the regex — matched against the
+ *                                               WHOLE message (every line before the trace, the
+ *                                               assertion diff included), with JUnit's echo of the
+ *                                               type stripped. The regex is REQUIRED, anchored with
+ *                                               `^`, flags s/i/u only, and must match none of the
+ *                                               neutral probes in EXPECT_PROBES (E9 review R2-1).
  *                 `skip` and `pass` are skip-SET differences, and D18 admits only a driver-name
  *                 gate for those, so they require kind `driver-name`.
  *   citations     `;`-separated, each one of
  *                   §22.2 (xx)                              a SPEC changelog entry that exists
  *                   docs/<path>                             a file that exists
  *                   known:"<text>"                          text in docs/known-incompatibilities.md
- *                   upstream:<path>:<line>:"<text>"         that clone line contains <text>
+ *                   upstream:<path>:<line>:"<text>"         that clone line contains <text>, is
+ *                                                           code (not a comment), and sits in the
+ *                                                           entry's own class — immediately above
+ *                                                           or inside the entry's own method
  *                   upstream-class:<path>:<line>:"<text>"   … and it is a CLASS-level gate: the next
- *                                                           code line declares the class
+ *                                                           code line declares the entry's own
+ *                                                           class, in the entry's namespace
+ *                   upstream-via:<path>:<line>:"<text>"     a line in a HELPER method of the entry's
+ *                                                           class that one of the entry's own
+ *                                                           upstream: lines names (e.g. a
+ *                                                           DefineEnvironment attribute's target)
+ *                 (the binding to the entry's class/method is E9 review R2-2; citation_binding())
  *   reason        free text, required
  *
  * ci/check-suite-triage.sh checks the same format and every citation it can without the clone, per
@@ -76,7 +91,7 @@ declare(strict_types=1);
 
 $repo = dirname(__DIR__, 2);
 
-/** @var array<string,array<string,array{0:string,1:string}>> column => test id => [type, first message line] */
+/** @var array<string,array<string,array{0:string,1:string,2:string}>> column => test id => [type, first message line, whole message] */
 $causes = [];
 
 /** @return array<string,string> test id => pass|fail|skip */
@@ -167,20 +182,93 @@ function triage_die(string $file, int $line, string $why): never
     exit(2);
 }
 
+/**
+ * Strings no expectation regex may match (E9 review R2-1). A regex that matches one of them excuses
+ * failures that share nothing with the one the entry was written for: the empty string and a
+ * one-letter message match a regex that constrains nothing (`^` plus a dot-star, `/^\w/`), and the rest are the
+ * framing EVERY failure of a common type starts with — the DBAL wrapper's prefix, PHPUnit's
+ * assertion headlines without their diff — so a regex that stops there names no cause at all.
+ */
+const EXPECT_PROBES = [
+    '',
+    'x',
+    "x\nx",
+    'An exception occurred while executing a query: x',
+    'SQLSTATE[HY000]: General error: x',
+    'Ferro: x',
+];
+
+/**
+ * PHPUnit's assertion headlines. A regex may match one of these only by pinning the WHOLE message
+ * to it (`/^Failed asserting that false is true\.$/`): an unlabelled `assertTrue()` reports nothing
+ * else, so that exact message is the most an entry can say, while a regex that also matches the
+ * headline followed by anything (a diff, another line) says nothing about which assertion failed.
+ */
+const EXPECT_HEADLINES = [
+    'Failed asserting that two strings are identical.',
+    'Failed asserting that two arrays are identical.',
+    'Failed asserting that two values are equal.',
+    'Failed asserting that false is true.',
+    'Failed asserting that true is false.',
+];
+
+/**
+ * Why an `expect` field is unusable, or null. Shared by the gate and ci/check-suite-triage.sh (which
+ * calls `--check-expects`), so the two cannot disagree about what a usable regex is.
+ *
+ * A `fail` entry needs a regex (R2-1: `fail <Type>` alone excused every failure of that type — for
+ * `PHPUnit\Framework\ExpectationFailedException`, every assertion failure there is), anchored with
+ * `^` at the start of the message (an unanchored `/e/` matches almost anything), without the `m`
+ * flag (which lets `^` anchor at any line of the diff), and matching none of EXPECT_PROBES.
+ */
+function expect_problem(string $x): ?string
+{
+    if ($x === 'skip' || $x === 'pass') {
+        return null;
+    }
+    if (preg_match('~^fail ([A-Za-z_\\\\][A-Za-z0-9_\\\\]*)(?: (/.+/[a-z]*))?$~', $x, $m) !== 1) {
+        return "expect must be `skip`, `pass` or `fail <Type> /^<regex>/`, got '$x'";
+    }
+    $re = $m[2] ?? null;
+    if ($re === null) {
+        return "a `fail` expectation needs a message regex — `fail <Type>` alone excuses every failure of that type: '$x'";
+    }
+    if (! str_starts_with($re, '/^')) {
+        return "the expect regex must be anchored at the start of the message (`/^…/`): $re";
+    }
+    $flags = substr($re, strrpos($re, '/') + 1);
+    if (preg_match('/^[siu]*$/', $flags) !== 1) {
+        return "the expect regex may carry only the s, i and u flags (`m` would let `^` anchor at any line): $re";
+    }
+    if (@preg_match($re, '') === false) {
+        return "expect regex does not compile: $re";
+    }
+    foreach (EXPECT_PROBES as $p) {
+        if (preg_match($re, $p) === 1) {
+            return sprintf('the expect regex %s is too loose: it matches the probe %s, which names no cause', $re, json_encode($p));
+        }
+    }
+    foreach (EXPECT_HEADLINES as $h) {
+        if (preg_match($re, "$h\nx") === 1) {
+            return sprintf('the expect regex %s is too loose: it matches the bare assertion headline %s followed by anything — '
+                . 'match the diff beneath it, or pin the whole message with `$` when there is none', $re, json_encode($h));
+        }
+    }
+    return null;
+}
+
 /** @return array{outcome:string,type:?string,re:?string} */
 function parse_expect(string $file, int $n, string $x): array
 {
+    $why = expect_problem($x);
+    if ($why !== null) {
+        triage_die($file, $n, $why);
+    }
     if ($x === 'skip' || $x === 'pass') {
         return ['outcome' => $x, 'type' => null, 're' => null];
     }
-    if (preg_match('~^fail ([A-Za-z_\\\\][A-Za-z0-9_\\\\]*)(?: (/.+/[a-z]*))?$~', $x, $m) !== 1) {
-        triage_die($file, $n, "expect must be `skip`, `pass`, `fail <Type>` or `fail <Type> /<regex>/`, got '$x'");
-    }
-    $re = $m[2] ?? null;
-    if ($re !== null && @preg_match($re, '') === false) {
-        triage_die($file, $n, "expect regex does not compile: $re");
-    }
-    return ['outcome' => 'fail', 'type' => $m[1], 're' => $re];
+    preg_match('~^fail (\S+) (/.+/[a-z]*)$~', $x, $m);
+    return ['outcome' => 'fail', 'type' => $m[1], 're' => $m[2]];
 }
 
 /**
@@ -228,7 +316,7 @@ function load_triage(string $file): array
         // silently dropped — an unparsed citation is one nobody checks.
         $cites = [];
         foreach (array_map('trim', explode(';', $citeField)) as $c) {
-            if (preg_match('/^(§22\.2 \([a-z]+\)|docs\/\S+|known:"[^"]+"|upstream(-class)?:[^:\s]+:[0-9]+:"[^"]+")$/u', $c) !== 1) {
+            if (preg_match('/^(§22\.2 \([a-z]+\)|docs\/\S+|known:"[^"]+"|upstream(-class|-via)?:[^:\s]+:[0-9]+:"[^"]+")$/u', $c) !== 1) {
                 triage_die($file, $n, "unrecognised citation '$c'");
             }
             $cites[] = $c;
@@ -243,6 +331,9 @@ function load_triage(string $file): array
         if ($kind === 'defect' && ! $has('docs/followups/')) {
             triage_die($file, $n, 'a defect entry must cite its OPEN follow-up under docs/followups/');
         }
+        if ($has('upstream-via:') && ! $has('upstream:')) {
+            triage_die($file, $n, 'an upstream-via: citation needs the upstream: line on the entry\'s own method that names its helper');
+        }
         if (str_ends_with($test, '::*') && ! $has('upstream-class:')) {
             triage_die($file, $n, 'a whole-class entry (`Class::*`) needs an upstream-class: citation — a gate on the CLASS, not on one method');
         }
@@ -255,12 +346,20 @@ function load_triage(string $file): array
     return $entries;
 }
 
-/** Resolve one entry's citations. `upstream:`/`upstream-class:` only when a clone root is given. */
+/** Resolve one entry's citations. `upstream…:` ones only when a clone root is given. */
 function check_citations(string $file, array $e, string $repo, ?string $upstream): void
 {
     static $spec = null, $known = null;
     $spec ??= (string) @file_get_contents("$repo/ferro-spec-v0.2.md");
     $known ??= (string) @file_get_contents("$repo/docs/known-incompatibilities.md");
+    // The texts of the entry's own `upstream:` citations: an `upstream-via:` line must sit in a
+    // helper one of them names.
+    $named = [];
+    foreach ($e['cites'] as $c) {
+        if (preg_match('/^upstream:[^:]+:[0-9]+:"(.+)"$/su', $c, $m) === 1) {
+            $named[] = $m[1];
+        }
+    }
     foreach ($e['cites'] as $c) {
         if (preg_match('/^§22\.2 (\([a-z]+\))$/', $c, $m) === 1) {
             // The changelog spells an entry `**(ae) <title>**` (ci/check-incompatibilities-doc.sh).
@@ -273,28 +372,152 @@ function check_citations(string $file, array $e, string $repo, ?string $upstream
             }
         } elseif (preg_match('/^known:"(.+)"$/su', $c, $m) === 1) {
             str_contains($known, $m[1]) || triage_die($file, $e['line'], "docs/known-incompatibilities.md does not contain: {$m[1]}");
-        } elseif ($upstream !== null && preg_match('/^upstream(-class)?:([^:]+):([0-9]+):"(.+)"$/su', $c, $m) === 1) {
+        } elseif ($upstream !== null && preg_match('/^upstream(-class|-via)?:([^:]+):([0-9]+):"(.+)"$/su', $c, $m) === 1) {
             $lines = @file("$upstream/{$m[2]}", FILE_IGNORE_NEW_LINES);
             $lines !== false || triage_die($file, $e['line'], "upstream file does not exist in $upstream: {$m[2]}");
             $idx = (int) $m[3] - 1;
             $at = $lines[$idx] ?? null;
             ($at !== null && str_contains($at, $m[4]))
                 || triage_die($file, $e['line'], "upstream {$m[2]}:{$m[3]} does not contain: {$m[4]}");
-            if ($m[1] === '-class') {
-                // The next line that is code — not another attribute, a comment or blank — must
-                // declare the class: then the cited gate is on the class, not on one method.
-                for ($i = $idx + 1; $i < count($lines); $i++) {
-                    $t = trim($lines[$i]);
-                    if ($t === '' || str_starts_with($t, '#[') || str_starts_with($t, '//') || str_starts_with($t, '*') || str_starts_with($t, '/*')) {
-                        continue;
-                    }
-                    preg_match('/^(final |abstract |readonly )*class \w+/', $t) === 1
-                        || triage_die($file, $e['line'], "upstream-class {$m[2]}:{$m[3]} is not a class-level gate (next code line: $t)");
-                    break;
-                }
-            }
+            $why = citation_binding($lines, $idx, $m[1], $e['test'], $named);
+            $why === null || triage_die($file, $e['line'], "upstream{$m[1]} {$m[2]}:{$m[3]}: $why");
         }
     }
+}
+
+/** Is this (trimmed) line a comment — a docblock line, `//` or a `#` that is not an attribute? */
+function is_comment_line(string $t): bool
+{
+    return str_starts_with($t, '*') || str_starts_with($t, '/*') || str_starts_with($t, '//')
+        || (str_starts_with($t, '#') && ! str_starts_with($t, '#['));
+}
+
+/** The namespace in force at line $idx (0-based): the last `namespace X;` at or before it. */
+function namespace_at(array $lines, int $idx): string
+{
+    for ($i = min($idx, count($lines) - 1); $i >= 0; $i--) {
+        if (preg_match('/^\s*namespace\s+([\w\\\\]+)\s*;/', $lines[$i], $m) === 1) {
+            return $m[1];
+        }
+    }
+    return '';
+}
+
+/** The class declared on this line, or null. */
+function declared_class(string $line): ?string
+{
+    return preg_match('/^\s*(?:(?:final|abstract|readonly)\s+)*class\s+(\w+)/', $line, $m) === 1 ? $m[1] : null;
+}
+
+/**
+ * Does the cited upstream line belong to the entry's OWN test (E9 review R2-2)? Without this, a
+ * citation proved only that SOME gate exists in the clone: `SchemaBuilderTest::*` citing
+ * `SchemaBuilderSchemaNameTest`'s class gate excused an injected skip of `testDropAllTables`, and a
+ * method entry citing another method's gate passed the same way. Null when it does; else why not.
+ *
+ *   - the cited line is code, never a comment: a docblock that quotes a gate gates nothing;
+ *   - `upstream-class:` — the next code line after it (attributes, comments and blanks skipped)
+ *     declares the class, that class is the entry's own short name, and the namespace in force
+ *     there is the entry's namespace;
+ *   - `upstream:` — the line sits in the entry's class and namespace and, for a method entry,
+ *     either immediately above the entry's method (an attribute run ending at its declaration) or
+ *     inside its body (the nearest named method before it is the entry's, and its braces are open);
+ *   - `upstream-via:` — the line sits in the entry's class and namespace, inside a HELPER method
+ *     whose name appears in the quoted text of one of the entry's own `upstream:` citations (which
+ *     are themselves bound to the entry's method). Upstream gates some tests through a helper the
+ *     test names — `#[DefineEnvironment('defineEnvironmentWouldThrowsPDOException')]` on the test,
+ *     the `$this->driver` branch in the helper — and this is that chain, checked link by link.
+ *
+ * @param list<string> $named the quoted texts of the entry's `upstream:` citations
+ */
+function citation_binding(array $lines, int $idx, string $mode, string $test, array $named = []): ?string
+{
+    $classLevel = $mode === '-class';
+    [$fqcn, $method] = explode('::', $test, 2);
+    $method = preg_replace('/ with data set \*$/', '', $method) ?? $method;
+    $pos = strrpos($fqcn, '\\');
+    $short = $pos === false ? $fqcn : substr($fqcn, $pos + 1);
+    $ns = $pos === false ? '' : substr($fqcn, 0, $pos);
+    $t = trim($lines[$idx]);
+    if (is_comment_line($t)) {
+        return "the cited line is a comment, which gates nothing: $t";
+    }
+    if ($classLevel) {
+        for ($i = $idx + 1; $i < count($lines); $i++) {
+            $u = trim($lines[$i]);
+            if ($u === '' || str_starts_with($u, '#[') || is_comment_line($u)) {
+                continue;
+            }
+            $cls = declared_class($u);
+            if ($cls === null) {
+                return "not a class-level gate (next code line: $u)";
+            }
+            if ($cls !== $short || namespace_at($lines, $i) !== $ns) {
+                return sprintf('the gate is on %s\\%s, not on the entry\'s class %s', namespace_at($lines, $i), $cls, $fqcn);
+            }
+            return null;
+        }
+        return 'not a class-level gate (no class follows it)';
+    }
+    // The class the line sits in.
+    $cls = null;
+    for ($i = $idx; $i >= 0; $i--) {
+        if (($cls = declared_class($lines[$i])) !== null) {
+            break;
+        }
+    }
+    if ($cls !== $short || namespace_at($lines, $idx) !== $ns) {
+        return sprintf('the line is in %s\\%s, not in the entry\'s class %s', namespace_at($lines, $idx), $cls ?? '(no class)', $fqcn);
+    }
+    $fn = '/\bfunction\s+(\w+)\s*\(/';
+    if ($mode === '-via') {
+        $helper = enclosing_method($lines, $idx);
+        if ($helper === null) {
+            return 'the line is in no method body';
+        }
+        foreach ($named as $text) {
+            if (preg_match('/\b' . preg_quote($helper, '/') . '\b/', $text) === 1) {
+                return null;
+            }
+        }
+        return "the line is in $helper(), which none of the entry's own upstream: lines names";
+    }
+    if ($method === '*') {
+        return null;
+    }
+    // Immediately above: the cited line opens an attribute run that ends at a method declaration.
+    if (str_starts_with($t, '#[') || preg_match($fn, $t) === 1) {
+        for ($i = $idx; $i < count($lines); $i++) {
+            if (preg_match($fn, $lines[$i], $m) === 1) {
+                return $m[1] === $method ? null : "the gate is on {$m[1]}(), not on the entry's method $method()";
+            }
+            if ($i > $idx && preg_match('/[{};]/', $lines[$i]) === 1) {
+                break;
+            }
+        }
+        return 'an attribute that is not on a method declaration';
+    }
+    // Inside: the nearest named method before the line, with its body still open at the line.
+    $in = enclosing_method($lines, $idx);
+    if ($in === null) {
+        return 'the line is in no method body';
+    }
+    return $in === $method ? null : "the line is in $in(), not in the entry's method $method()";
+}
+
+/** The named method whose body contains line $idx: the nearest declaration before it, braces open. */
+function enclosing_method(array $lines, int $idx): ?string
+{
+    for ($i = $idx - 1; $i >= 0; $i--) {
+        if (preg_match('/\bfunction\s+(\w+)\s*\(/', $lines[$i], $m) === 1) {
+            $depth = 0;
+            for ($k = $i; $k < $idx; $k++) {
+                $depth += substr_count($lines[$k], '{') - substr_count($lines[$k], '}');
+            }
+            return $depth > 0 ? $m[1] : null;
+        }
+    }
+    return null;
 }
 
 /** Does entry $e excuse what Ferro did? */
@@ -311,7 +534,8 @@ function expect_matches(array $e, string $what, ?array $cause): bool
     if ($x['outcome'] !== 'fail' || $cause === null || $cause[0] !== $x['type']) {
         return false;
     }
-    return $x['re'] === null || preg_match($x['re'], strip_type_echo($cause[0], $cause[2])) === 1;
+    // Every `fail` expectation carries a regex (expect_problem); there is no type-only arm.
+    return $x['re'] !== null && preg_match($x['re'], strip_type_echo($cause[0], $cause[2])) === 1;
 }
 
 /**
@@ -328,6 +552,18 @@ function strip_type_echo(string $type, string $m): string
 }
 
 // ---- arguments ---------------------------------------------------------------------------------
+if (($argv[1] ?? null) === '--check-expects') {
+    // For ci/check-suite-triage.sh: stdin is `<where>\t<expect>` lines; one line out per unusable one.
+    $bad = 0;
+    while (($l = fgets(STDIN)) !== false) {
+        [$where, $x] = array_pad(explode("\t", rtrim($l, "\n"), 2), 2, '');
+        if (($why = expect_problem($x)) !== null) {
+            echo "$where: $why\n";
+            $bad++;
+        }
+    }
+    exit($bad === 0 ? 0 : 1);
+}
 $pos = [];
 $opt = ['triage' => null, 'column' => null, 'upstream' => null, 'repro' => false];
 for ($i = 1; $i < $argc; $i++) {

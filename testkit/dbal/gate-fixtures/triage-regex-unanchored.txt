@@ -1,7 +1,8 @@
-# A gate fixture for ci/test-suite-gate.sh (E9 review F7). Column key: fx-col; the upstream tree is
-# testkit/dbal/gate-fixtures/upstream. The file's name says what it breaks, if anything.
-fx-col | Fx\SuiteTest::testRefused | incompatibility | fail Fx\Refusal /^refused: no credentials in PHP/ | known:"acceptance gate, where upstream"; docs/no-such-file.md | fixture: a documented incompatibility, with its type and message
+# A gate fixture for ci/test-suite-gate.sh (E9 review rounds 2–3). Column key: fx-col; the upstream tree is
+# testkit/dbal/gate-fixtures/upstream. Breaks: R2-1: an unanchored regex.
+fx-col | Fx\SuiteTest::testRefused | incompatibility | fail Fx\Refusal /e/ | known:"acceptance gate, where upstream"; §22.2 (z) | fixture: a documented incompatibility, with its type and message
 fx-col | Fx\SuiteTest::testNameGated | driver-name | skip | upstream:tests/SuiteTest.php:7:"#[RequiresDatabase('stock')]" | fixture: a method-level name gate that SKIPS
 fx-col | Fx\SuiteTest::testControlSkips | driver-name | pass | upstream:tests/SuiteTest.php:14:"$driver instanceof StockDriver" | fixture: the control skips, Ferro runs and passes
 fx-col | Fx\SuiteTest::testTemp with data set * | incompatibility | fail Fx\Gone /^no such table: __temp__/ | known:"On SQLite, a non-simple `ALTER TABLE` must run inside a transaction." | fixture: every data set of one method
 fx-col | Fx\GatedTest::* | driver-name | skip | upstream-class:tests/SuiteTest.php:20:"#[RequiresDatabase('stock')]" | fixture: a CLASS-level gate
+fx-col | Fx\HelperGatedTest::testViaHelper | driver-name | fail Fx\Refusal /^refused by the helper's gate/ | upstream:tests/SuiteTest.php:44:"#[DefineEnvironment('stockEnvironment')]"; upstream-via:tests/SuiteTest.php:57:"$this->driver === 'stock'" | fixture: a gate through a helper the test names

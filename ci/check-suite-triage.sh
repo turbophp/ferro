@@ -14,27 +14,36 @@
 #   2. the test is Class::method, with `*` ONLY as a trailing ` with data set *` or as the whole
 #      method (`Class::*`), and `Class::*` only with an `upstream-class:` citation — a method glob
 #      once excused four ungated SQL-injection tests along with the six gated ones it meant
-#   3. the expectation is `skip`, `pass`, `fail <Type>` or `fail <Type> /<regex>/`, and `skip`/`pass`
-#      (skip-SET differences) only on a driver-name entry — D18 admits no other explanation for one
+#   3. the expectation is `skip`, `pass` or `fail <Type> /^<regex>/`, and `skip`/`pass` (skip-SET
+#      differences) only on a driver-name entry — D18 admits no other explanation for one. A `fail`
+#      regex is REQUIRED, `^`-anchored, flags s/i/u only, and matches none of the gate's neutral
+#      probes (E9 review R2-1: `/.*/`, `/e/` or no regex at all excused a different message). That
+#      rule is compare-columns.php's own expect_problem(), called through `--check-expects`, so the
+#      two cannot disagree — which makes PHP the one tool this check needs.
 #   4. every `§22.2 (xx)` exists in the spec's changelog (spelled `**(xx) <title>**`)
 #   5. every `docs/…` path exists; a `defect` entry cites a follow-up under docs/followups/ whose
 #      status is OPEN (a defect whose follow-up is resolved is not a defect any more)
 #   6. every `known:"…"` text appears verbatim in docs/known-incompatibilities.md — D18 admits an
 #      incompatibility only when that page documents it — and an incompatibility entry has one
-#   7. every `upstream:`/`upstream-class:` citation is well-formed, and a driver-name entry has one
+#   7. every `upstream:`/`upstream-class:`/`upstream-via:` citation is well-formed, a driver-name
+#      entry has an `upstream:` or `upstream-class:` one, and an `upstream-via:` (a line in a helper
+#      the test names) comes with the `upstream:` line on the test's own method that names it
 #
-# What it does NOT check, stated: whether an upstream line really contains the quoted text, or is
-# really a class-level gate. That needs the pinned upstream clone, which this lane does not have;
-# compare-columns.php checks both on every suite run, against the clone the run just measured.
+# What it does NOT check, stated: whether an upstream line really contains the quoted text, is code,
+# and is a gate on the entry's OWN class or method (E9 review R2-2). That needs the pinned upstream
+# clone, which this lane does not have; compare-columns.php checks all of it on every suite run,
+# against the clone the run just measured.
 #
-# It needs no toolchain and no backend — a file check, like ci/check-d12-recorded.sh — and it is
-# written to the same conventions as ci/check-incompatibilities-doc.sh.
+# It needs PHP (for the regex rule above) and no backend — a file check, like
+# ci/check-d12-recorded.sh — and it is written to the same conventions as
+# ci/check-incompatibilities-doc.sh.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 spec="$root/ferro-spec-v0.2.md"
 known="$root/docs/known-incompatibilities.md"
 fail=0
 n_entries=0
+expects=""   # `<where>\t<expect>` lines, judged by compare-columns.php --check-expects below
 
 bad() { printf 'FAIL  %s\n' "$*" >&2; fail=1; }
 
@@ -74,10 +83,10 @@ for file in "${files[@]}"; do
     esac
     if [[ "$expect" == skip || "$expect" == pass ]]; then
       [ "$kind" = driver-name ] || bad "$where: '$expect' is a skip-set difference, and D18 admits only a driver-name gate for one"
-    elif ! [[ "$expect" =~ ^fail\ [A-Za-z_\\][A-Za-z0-9_\\]*(\ /.+/[a-z]*)?$ ]]; then
-      bad "$where: expect must be 'skip', 'pass', 'fail <Type>' or 'fail <Type> /<regex>/', got '$expect'"
+    else
+      expects+="$where"$'\t'"$expect"$'\n'
     fi
-    has_known=0 has_upstream=0 has_class=0 has_followup=0
+    has_known=0 has_upstream=0 has_class=0 has_method=0 has_via=0 has_followup=0
     IFS=';' read -r -a cl <<< "$cites"
     for c in "${cl[@]}"; do
       c="${c#"${c%%[![:space:]]*}"}"; c="${c%"${c##*[![:space:]]}"}"
@@ -99,7 +108,9 @@ for file in "${files[@]}"; do
       elif [[ "$c" =~ ^upstream-class:[^:[:space:]]+:[0-9]+:\"[^\"]+\"$ ]]; then
         has_upstream=1 has_class=1
       elif [[ "$c" =~ ^upstream:[^:[:space:]]+:[0-9]+:\"[^\"]+\"$ ]]; then
-        has_upstream=1
+        has_upstream=1 has_method=1
+      elif [[ "$c" =~ ^upstream-via:[^:[:space:]]+:[0-9]+:\"[^\"]+\"$ ]]; then
+        has_via=1
       else
         bad "$where: unrecognised citation '$c'"
       fi
@@ -110,12 +121,21 @@ for file in "${files[@]}"; do
       && bad "$where: an incompatibility entry must cite docs/known-incompatibilities.md (known:\"…\") — D18"
     [ "$kind" = defect ] && [ "$has_followup" = 0 ] \
       && bad "$where: a defect entry must cite its OPEN follow-up under docs/followups/"
+    [ "$has_via" = 1 ] && [ "$has_method" = 0 ] \
+      && bad "$where: an upstream-via: citation needs the upstream: line on the entry's own method that names its helper"
     [[ "$test" == *::\* ]] && [ "$has_class" = 0 ] \
       && bad "$where: a whole-class entry (Class::*) needs an upstream-class: citation"
   done < "$file"
   [ "$entries" -gt 0 ] || bad "$rel has no entries"
   n_entries=$((n_entries + entries))
 done
+
+command -v php >/dev/null || { bad "php is required: the expect regex rule is compare-columns.php's own"; expects=""; }
+if [ -n "$expects" ]; then
+  while IFS= read -r why; do
+    bad "$why"
+  done < <(printf '%s' "$expects" | php "$root/testkit/dbal/compare-columns.php" --check-expects)
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "" >&2

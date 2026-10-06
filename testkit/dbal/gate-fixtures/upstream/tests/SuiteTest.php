@@ -28,3 +28,39 @@ final class GatedTest
     {
     }
 }
+
+/**
+ * #[RequiresDatabase('stock')] — quoted in a comment, which gates nothing.
+ */
+final class CommentedTest
+{
+    public function testOne(): void
+    {
+    }
+}
+
+final class HelperGatedTest
+{
+    #[DefineEnvironment('stockEnvironment')]
+    public function testViaHelper(): void
+    {
+    }
+
+    #[DefineEnvironment('otherEnvironment')]
+    public function testOtherHelper(): void
+    {
+    }
+
+    protected function stockEnvironment($app)
+    {
+        $this->afterApplicationCreated(function () {
+            if ($this->driver === 'stock') {
+                $this->expectException(Refusal::class);
+            }
+        });
+    }
+
+    protected function otherEnvironment($app)
+    {
+    }
+}
