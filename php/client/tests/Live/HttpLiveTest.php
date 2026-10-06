@@ -360,8 +360,11 @@ final class HttpLiveTest extends HttpLiveTestCase
         $s = $conn->upstream('up')->stream('GET', "/big?bytes={$total}", timeoutMs: 60_000);
         $it = $s->getIterator();
         $read = strlen($it->current());
-        usleep(1_500_000); // stalled: no credit returned
-        $written = max([0, ...array_map(static fn (array $l): int => (int) ($l['written'] ?? 0), $this->upstreamLog())]);
+        // Stalled: no credit returned. Measure at the PLATEAU, not after a fixed sleep — a slow
+        // runner (CI measured 7.08 MB after 1.5 s) is still filling the window when a fixed sleep
+        // ends, which fails the control below while proving nothing about the bound. The plateau
+        // is the state the bound is about: the upstream has written all it ever will without credit.
+        $written = $this->writtenPlateau(minSeconds: 1.5, quietSeconds: 0.75, maxSeconds: 20.0);
         $this->assertLessThan(28 * 1024 * 1024, $written, sprintf('the upstream wrote %d bytes against one 16 MiB window', $written));
         $this->assertGreaterThan(8 * 1024 * 1024, $written, 'control: it did write ahead into the window');
         for ($it->next(); $it->valid(); $it->next()) {
@@ -551,5 +554,31 @@ final class HttpLiveTest extends HttpLiveTestCase
         }
         $this->assertFalse($conn->session()->isPoisoned());
         $this->assertSame(3, $this->received('/status/200?big='));
+    }
+
+    /**
+     * The largest `written` the `/big` upstream has logged, once it has stopped growing for
+     * `$quietSeconds` (and at least `$minSeconds` have passed). Fails after `$maxSeconds` if it never
+     * stops — which is itself the backpressure failure this helper exists to measure.
+     */
+    private function writtenPlateau(float $minSeconds, float $quietSeconds, float $maxSeconds): int
+    {
+        $t0 = microtime(true);
+        $last = -1;
+        $since = $t0;
+        while (true) {
+            $now = microtime(true);
+            $w = max([0, ...array_map(static fn (array $l): int => (int) ($l['written'] ?? 0), $this->upstreamLog())]);
+            if ($w !== $last) {
+                $last = $w;
+                $since = $now;
+            } elseif ($now - $t0 >= $minSeconds && $now - $since >= $quietSeconds) {
+                return $w;
+            }
+            if ($now - $t0 >= $maxSeconds) {
+                $this->fail(sprintf('the upstream never stopped writing without credit (%d bytes after %.1f s)', $w, $maxSeconds));
+            }
+            usleep(50_000);
+        }
     }
 }
