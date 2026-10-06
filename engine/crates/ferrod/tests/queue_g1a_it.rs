@@ -403,8 +403,16 @@ async fn wait_absent_recheck() {
     .await;
 }
 
-/// The verbs are G1b's, so a fully verified store answers `Unsupported` with this marker.
-const VERIFIED: &str = "is verified";
+/// A verified store SERVES its verbs (M7-G1b): SIZE answers its counts. (Under G1a a verified store
+/// answered `Unsupported` "is verified"; the verbs exist now, so success is the marker.)
+async fn assert_verified(c: &mut TestClient, rid: u32) {
+    match queue(c, rid, method_queue::SIZE, size("jobs")).await {
+        Outcome::Ok(body) => {
+            ferro_proto::messages::SizeResponse::decode(&body).expect("a SIZE terminal");
+        }
+        other => panic!("expected the verified store to serve SIZE, got {other:?}"),
+    }
+}
 
 #[tokio::test]
 async fn a_stock_table_passes_the_gate_and_verification_which_is_then_cached() {
@@ -419,7 +427,7 @@ async fn a_stock_table_passes_the_gate_and_verification_which_is_then_cached() {
     sql_ok(&mut c, 2, &format!("CREATE SCHEMA {schema}")).await;
     sql_ok(&mut c, 3, &stock_table(&table)).await;
 
-    // Every verb reaches the end of G1a's path: verified, then not yet served.
+    // Every verb passes verification and is SERVED (M7-G1b): none answers `Unsupported`.
     let token = Token::from_pg(1, 1).encode();
     for (rid, method, payload) in [
         (10u32, method_queue::SIZE, size("jobs")),
@@ -430,19 +438,27 @@ async fn a_stock_table_passes_the_gate_and_verification_which_is_then_cached() {
             enqueue("{}", "default", None, None),
         ),
         (13, method_queue::RESERVE, reserve(false, 0, None)),
-        (14, method_queue::ACK, ack(b"1", &token)),
-        (15, method_queue::EXTEND, ack(b"1", &token)),
+        (14, method_queue::ACK, ack(b"999", &token)), // no such row: `gone`
     ] {
-        let ep = queue_err(&mut c, rid, method, payload).await;
-        assert_code(&ep, errc::UNSUPPORTED, VERIFIED);
-        assert!(ep.message.contains("G1b"), "{}", ep.message);
+        match queue(&mut c, rid, method, payload).await {
+            Outcome::Ok(_) => {}
+            other => panic!("method {method}: {other:?}"),
+        }
     }
+    // EXTEND of a token naming no row is a known-fate LeaseLost — served, not refused.
+    let ep = queue_err(&mut c, 15, method_queue::EXTEND, ack(b"1", &token)).await;
+    assert_code(&ep, errc::LEASE_LOST, "did nothing");
 
-    // CACHED for the process: dropping the table does not change the verdict (a real re-check
-    // would now find no table).
+    // CACHED for the process: dropping the table does not bring back verification's "does not
+    // exist" — the verb is SENT and the statement itself fails (42P01, undefined table).
     sql_ok(&mut c, 20, &format!("DROP SCHEMA {schema} CASCADE")).await;
     let ep = queue_err(&mut c, 21, method_queue::SIZE, size("jobs")).await;
-    assert_code(&ep, errc::UNSUPPORTED, VERIFIED);
+    assert_eq!(ep.sqlstate.as_deref(), Some("42P01"), "{ep:?}");
+    assert!(
+        !ep.message.contains("on the pool's search_path"),
+        "{}",
+        ep.message
+    );
     assert_session_alive(&mut c, 48).await;
 }
 
@@ -466,8 +482,7 @@ async fn an_absent_table_is_named_and_re_checked_at_the_next_use() {
     let ep = queue_err(&mut c, 7, method_queue::SIZE, size("jobs")).await;
     assert_code(&ep, errc::UNSUPPORTED, "does not exist");
     wait_absent_recheck().await;
-    let ep = queue_err(&mut c, 5, method_queue::SIZE, size("jobs")).await;
-    assert_code(&ep, errc::UNSUPPORTED, VERIFIED);
+    assert_verified(&mut c, 5).await;
     sql_ok(&mut c, 6, &format!("DROP SCHEMA {schema} CASCADE")).await;
 }
 
@@ -555,8 +570,7 @@ async fn a_mixed_case_table_is_the_quoted_one_not_the_folded_one() {
     assert_code(&ep, errc::UNSUPPORTED, "does not exist");
     sql_ok(&mut c, 5, &stock_table(&format!("{schema}.\"Jobs\""))).await;
     wait_absent_recheck().await;
-    let ep = queue_err(&mut c, 6, method_queue::SIZE, size("jobs")).await;
-    assert_code(&ep, errc::UNSUPPORTED, VERIFIED);
+    assert_verified(&mut c, 6).await;
     sql_ok(&mut c, 7, &format!("DROP SCHEMA {schema} CASCADE")).await;
 }
 
@@ -574,8 +588,7 @@ async fn an_unqualified_table_is_looked_up_in_current_schema() {
     let mut c = connected(&server).await;
     sql_ok(&mut c, 2, &format!("DROP TABLE IF EXISTS {name}")).await;
     sql_ok(&mut c, 3, &stock_table(&name)).await;
-    let ep = queue_err(&mut c, 4, method_queue::SIZE, size("jobs")).await;
-    assert_code(&ep, errc::UNSUPPORTED, VERIFIED);
+    assert_verified(&mut c, 4).await;
     sql_ok(&mut c, 5, &format!("DROP TABLE {name}")).await;
 }
 
@@ -610,8 +623,7 @@ async fn an_unqualified_table_follows_the_pools_search_path() {
         }
         other => panic!("{other:?}"),
     }
-    let ep = queue_err(&mut c, 6, method_queue::SIZE, size("jobs")).await;
-    assert_code(&ep, errc::UNSUPPORTED, VERIFIED);
+    assert_verified(&mut c, 6).await;
     sql_ok(&mut c, 7, &format!("DROP SCHEMA {first} CASCADE")).await;
     sql_ok(&mut c, 8, &format!("DROP SCHEMA {second} CASCADE")).await;
 }
@@ -658,7 +670,6 @@ async fn a_view_is_refused_and_a_partitioned_table_passes() {
         &(stock_table(&format!("{schema}.ferro_jobs")) + " PARTITION BY RANGE (id)"),
     )
     .await;
-    let ep = queue_err(&mut c, 4, method_queue::SIZE, size("jobs")).await;
-    assert_code(&ep, errc::UNSUPPORTED, VERIFIED);
+    assert_verified(&mut c, 4).await;
     sql_ok(&mut c, 5, &format!("DROP SCHEMA {schema} CASCADE")).await;
 }

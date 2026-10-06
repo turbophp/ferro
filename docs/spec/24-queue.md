@@ -353,6 +353,15 @@ for their own reason; (c) `InvalidHandle`.]*
 - MySQL/MariaDB: `UNIX_TIMESTAMP()`, which is statement-start time truncated to seconds.
 
 A multi-statement verb binds the first statement's `now` into the rest.
+*[Amended at the M7-G1b review (SPEC §22.2 (dg), F3): **on PostgreSQL the only multi-statement
+autocommit verb is a RESERVE naming several queues, and it is not one unit.** Its queues are tried in
+order, one statement each, and the FIRST that reserves anything answers alone (§24.4) — so each queue's
+statement is its own unit with its own `now`, and every job in a reply was reserved by ONE statement
+under ONE `now` (one `reserved_at`, one `lease_deadline`; pinned live). A later queue's statement reads
+a later clock, which can only make more jobs available and is never early. No `now` is bound across
+them, because an empty statement would have to report its `now`, restructuring the statement this
+section's rescan premise was measured on. The binding rule stands for MySQL's multi-statement
+transaction (G6), where one unit really is several statements.]*
 
 Rounding rules (normative):
 
@@ -363,6 +372,17 @@ Rounding rules (normative):
   matures in (d−1, d], so Ferro is up to 1 s later.
 - **Lease expiry:** a reservation is expired iff `reserved_at < now - lease_s`. The effective lease is
   therefore in (L, L+1] s and **never shorter than declared**. Stock's `<=` gives (L−1, L].
+- *[Amended M7-G1b (SPEC §22.2 (dg)): **a `delay_s` whose `available_at` would overflow the time
+  column is refused before sending** (carried from the G1a review; measured: PostgreSQL otherwise
+  answers `22003` AFTER the statement was sent). The check cannot read the database's `now` before
+  anything is sent, so it reads the ENGINE's wall clock and keeps a one-day margin
+  (`DELAY_CLOCK_MARGIN_S`): `delay_s` is refused (`Unsupported`, "nothing was sent") iff
+  `engine_now + 1 + delay_s + 86 400` exceeds the column's ceiling (`integer` on PostgreSQL). ENQUEUE
+  checks every job, RELEASE its one; `delay_s = 0` is never refused. **Residual, stated:** a database
+  clock more than a day ahead of `ferrod`'s lets a delay within a day of the ceiling through, and
+  PostgreSQL refuses it with `22003` — a known non-execution (the INSERT is atomic), never a wrong or
+  partial write. **Cost:** a delay landing within a day of 2038-01-19 is refused although it would
+  have fit.]*
 - **`lease_deadline`** in replies is `reserved_at + lease_s + 1`, the first DB second at which another
   RESERVE may take the job.
 
@@ -412,6 +432,25 @@ restart; until then a verb that fails against the changed table is classified li
   cast to `text`, so the decode does not depend on catalog domain types.]*
 - The engine also resolves the identity default (PG `pg_get_serial_sequence`) for diagnostics only.
 - It never repairs the table.
+- *[Amended M7-G1b (SPEC §22.2 (dg)): **`id` must be UNIQUE** (carried from the G1a review): a fence
+  `WHERE id = $1 AND attempts = $2 AND created_at = $3` over duplicate ids would match several rows, so
+  one ACK could delete two jobs. The same catalog statement now also reports whether some index on the
+  relation is unique, VALID (a failed `CREATE UNIQUE INDEX CONCURRENTLY` leaves an invalid one),
+  IMMEDIATE (a `DEFERRABLE` constraint admits duplicates until commit), not partial, not on an
+  expression, and has exactly one key column, `id` (`INCLUDE` columns allowed). Without one the store is
+  refused (`Unsupported`, "column id is not unique"), cached like any wrong shape. Measured on
+  PostgreSQL 16 for each of those cases and for a partitioned table's primary key (which passes).
+  **An ordinary table with INHERITANCE children is refused too** (review F1): a unique index does not
+  reach a child created `INHERITS (jobs)`, every statement (no `ONLY`) reaches the child's rows, and
+  measured, one ACK deleted the same `(id, attempts, created_at)` from parent and child, then reported
+  `Indeterminate`. A PARTITIONED table stays accepted: PostgreSQL requires a unique index on it to
+  include every partition-key column, so a unique index on `id` alone means it is partitioned by `id`
+  and uniqueness holds across its partitions (measured: a duplicate across hash sub-partitions is
+  refused, `PRIMARY KEY (id)` on a table partitioned by `queue` is refused, an index built `ON ONLY`
+  the parent is invalid, and neither a partitioned table nor a partition can be an inheritance
+  parent). Residual, as for every check here: a child added AFTER verification is not seen until the
+  next `boot_epoch`; a fence matching two rows is then refused as an unreadable result
+  (`Indeterminate`), never reported as one job.]*
 
 **Indexes.** Laravel's `(queue)` index is the minimum. Whether a composite or partial index pays is a
 G3 bench question (charter rule 5). The engine never creates an index.
@@ -523,6 +562,20 @@ checkout, as the "queue name" refusal below says. Until the slices that build th
   - **Over-size rows.** Rows over `MAX_PAYLOAD_BYTES` (from stock producers) are never reserved and
     are counted as stuck (§24.9).
   - **Waiting.** A non-zero `wait_ms` parks the request (§24.8).
+  - *[Amended M7-G1b (SPEC §22.2 (dg)): **one queue answers.** The queues are tried in the given
+    order, one statement each on one checkout, and the FIRST queue that yields any job answers the
+    request; later queues are not tried. Every job in a reply therefore comes from one queue, and a
+    failure while serving queue *i* is that one statement's fate, because the queues before it
+    reserved nothing. **Cost:** a `max_jobs = 5` request may receive two jobs from `high` while
+    `default` has more; the client asks again (Laravel asks for one). **The clamp is applied before
+    the statement, as its `LIMIT`,** and is itemised exactly (`checks::reserve_limit`: a fixed part of
+    27 bytes and 1 084 per job at worst, the `sql` kind's 20-byte `job_id` plus 8-byte token
+    included), pinned against the real encoder as TIGHT — the clamped count of maximum-size jobs fits
+    one frame and one more does not. **The statement is §24.4's exactly**, with `$ceiling` =
+    `smallint`'s 32 767 (`attempts < 32 767`, so the reservation's `+ 1` fits; a row AT the ceiling is
+    never reserved again); its `RETURNING` rows are sorted by id before they are delivered (the
+    statement promises no order), and more rows than the `LIMIT` is refused as an unreadable result
+    rather than delivered.]*
 - **ACK.** `DELETE … WHERE id = ? AND attempts = ? AND created_at = ?`.
   - **Autocommit:** affected = 1 is `acked`. Affected = 0 runs an unlocked probe of the id:
     - absent → `gone`, which is success-equivalent;
@@ -544,10 +597,22 @@ checkout, as the "queue name" refusal below says. Until the slices that build th
     engine-owned READ COMMITTED transaction. Inside one it runs as one actor command (§24.5).
   - **No match:** `nil` (`gone`) in autocommit and `LeaseLost` in a transaction.
   - A new id sends a hot-failing job to the back of the queue, as stock does.
+  - *[Amended M7-G1b (SPEC §22.2 (dg)): **"no match" runs ACK's probe.** This section says a RELEASE
+    with no match answers `nil` in autocommit, and §24.6's table says a stale token's autocommit RELEASE
+    answers `LeaseLost`; both hold, because the PostgreSQL statement probes the old id exactly as ACK's
+    does: absent, or present with the SAME token (a concurrent delete) → `nil`; present with another
+    token → `LeaseLost`. One statement: the fenced DELETE feeds the INSERT, and the probe reads the
+    statement's snapshot.]*
 - **EXTEND.** `UPDATE … SET reserved_at = now`, fenced. It renews by one full `lease_s`. It also
   retakes a job whose lease expired when nobody else took it, because the holder is evidently
   alive. No match → `LeaseLost`.
 - **SIZE** counts by state. Laravel's `size()` returns the sum.
+  *[Amended M7-G1b (SPEC §22.2 (dg)): the states are Laravel 12's exactly (illuminate/queue v12.69.3,
+  read from source): `pending` = `reserved_at IS NULL AND available_at <= now`, `delayed` =
+  `reserved_at IS NULL AND available_at > now`, `reserved` = `reserved_at IS NOT NULL` — **an expired
+  lease still counts as reserved**, as stock counts it, although RESERVE would take it — and
+  `oldest_pending_at` = the smallest pending `available_at`. One statement, one row even for an empty
+  queue. CLEAR deletes every row of the queue, reserved ones included, as stock's `clear()` does.]*
 - **CLEAR** deletes the queue's rows. It is data-plane and has no admin gate.
 - **Isolation (normative).**
   - Engine-owned transactions are READ COMMITTED, composed and pinned as above.
@@ -572,6 +637,15 @@ checkout, as the "queue name" refusal below says. Until the slices that build th
   statement has completed for the request. Otherwise it is the raced result, and the client must
   accept the jobs it carries.
 - No path both unreserves a job and delivers it. G3 pins this with a mutation-tested race test.
+- *[Amended M7-G1b (SPEC §22.2 (dg)): **until G3 builds unreserve, an autocommit RESERVE whose terminal
+  is raced by session teardown leaves its reservation to expire** — a stock-equivalent phantom attempt
+  of the kind §24.7 lists — rather than restoring it. G1b's RESERVE never waits, so the window is one
+  statement long. A CANCEL observed before a RESERVE statement is SENT (while the verb waits for its
+  connection, or between two queues) is classified by the shared fate matrix as an unsent write:
+  `Retryable{ConnectionLost}`, nothing reserved (the connection-wait case is pinned live; the
+  case of a CANCEL that has arrived before a later statement is sent — between two queues — is pinned
+  by a unit test on a fake backend, which a review showed was possible where this text first said it
+  was not); the `Cancelled` terminal above is the parked case, G3's.]*
 
 **No push or STREAM delivery in v1.** The seam pulls. Streaming would lease jobs ahead of
 consumption, and the leases would run down in a client buffer.
@@ -681,6 +755,17 @@ This is **two additions** to the actor: the `Queue` command and the after-commit
 | `ferrod` dies or restarts | in-memory state lost; leases expire by their stored deadlines; tokens stay valid | in-flight requests per the rows above |
 | SIZE lost | `Retryable` (a read) | retry |
 | CLEAR lost | `Indeterminate`, **not** licensed: a re-send would delete jobs enqueued after the first CLEAR | surface it |
+
+*[Amended M7-G1b (SPEC §22.2 (dg)): **built for every autocommit verb on PostgreSQL**, through the
+shared `fate::classify_fate` with the `OpContext` above (`readonly` for SIZE only; `sent` honest per
+statement; `in_tx: false`), and pinned live: a write verb sent and then timed out or CANCELled is
+`Indeterminate{WriteUnconfirmed}` (the §19.3 `57014` override) with a read-back proving it applied
+nothing and was not re-sent; SIZE is `Cancelled`; a verb that never got its connection is `PoolTimeout`
+or `Retryable{ConnectionLost}`, never `Indeterminate`. **One row the table did not have:** a statement
+that RAN but whose rows do not have the shape its builder produces (only a table altered after
+verification, or a defect, does that) is `Indeterminate{WriteUnconfirmed}` for a write — its effect is
+real and cannot be reported, so no known-fate code may claim it did nothing — and `Unsupported` for
+SIZE.]*
 
 **The new retry licences (D21).** All three are client-policy licences in §9.2's sense, and the
 engine never re-sends. Each is a protocol-defined property of a verb whose statements the engine
@@ -1162,7 +1247,7 @@ one reviewable slice (the HTTP precedent: `/proto` alone was F2). `/proto` is co
 |---|---|---|
 | **G0** *(DONE, §22.2 (cn))* | this section; `QUEUE = 7`, `LeaseLost`, `PoolMismatch` and `queue_wait_grace_ms` allocated in the spec (their `/proto` entries land at G1); §21 D21/D22; the §24.16 amendments | review attacked §24.5–§24.8 before any code |
 | **G1a** *(BUILT M7-G1a, SPEC §22.2 (df); DONE when merged)* | `/proto`: `[services] QUEUE = 7`, `[methods.queue]`, `LeaseLost`/`PoolMismatch` and the new `InvalidHandle` (`0x3011`), `queue_wait_grace_ms`, the `[ack_outcome]` table and three shape bounds; PROTOCOL.md §1 and a new **§14**; golden vectors (every handle position at its `sql` size and at 1 024 bytes) and refusal vectors (0 and 1 025 bytes for every handle position; 0 and max + 1 jobs and queues) in both codecs; **all shapes frozen**; §24.3's G1 prerequisites (the canonical decimal `job_id`, the 8-byte token, both with strict decodes; `InvalidHandle`); store config with every refusal; the version gate and shape verification at first use (PostgreSQL; cached per process, an absent table excepted); `ferrod` routing and a QUEUE handler that makes every pre-checkout refusal and the first-use verification, then answers `Unsupported` for every verb | an undecodable handle is `InvalidHandle` before any statement; a wrong shape names its column; a view is refused and a partitioned table passes; an unqualified table follows `search_path`; the gate and the verdict caching (including the absent-table TTL, counted) are wired; mutation-proven |
-| **G1b** | ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules; the statement builders in `ferro-queue`. *Carried from the G1a review:* shape verification must also require `id` to be UNIQUE (the primary key or a unique index) — a fence `WHERE id = $1 AND …` over duplicate ids would match several rows; and `now + 1 + delay_s` must be pre-checked against PG `integer` before send, since a `delay_s` near `u32::MAX` otherwise overflows `available_at` as a post-send `22003` (refuse it `Unsupported`, nothing sent); SIZE fills `oldest_pending_at` | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
+| **G1b** *(BUILT M7-G1b, SPEC §22.2 (dg); DONE when merged)* | ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules; the statement builders in `ferro-queue`. *Carried from the G1a review:* shape verification must also require `id` to be UNIQUE (the primary key or a unique index) — a fence `WHERE id = $1 AND …` over duplicate ids would match several rows; and `now + 1 + delay_s` must be pre-checked against PG `integer` before send, since a `delay_s` near `u32::MAX` otherwise overflows `available_at` as a post-send `22003` (refuse it `Unsupported`, nothing sent); SIZE fills `oldest_pending_at` | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
 | **G2** | tx path: `resolve_active` made `pub(crate)`, `PoolMismatch`, `TxCommand::Queue` + `after_commit`, in-tx `LeaseLost` semantics (R1), refused tx-scoped RESERVE | atomicity both ways; mismatch leaves the transaction usable; chaos rows 2 and 7 |
 | **G3** | the waker (per queue, `LIMIT k`, statement deadlines, register-then-sweep), long-poll, the wait bound, **unreserve**, wake hints, coalesced polls, drain; queue metrics and spans | cost bound (row 11); one END under every CANCEL/deadline race and the deliver-xor-unreserve rule (row 12); idle-polling bench vs stock (A's number); R4 reproduced on the real transport |
 | **G4** | native PHP API, `queueWorker()`, wait clamp, client fate and licensed re-sends; dedup table and purge **after** the dedup spike reproduces §24.6's three paths | chaos rows 1, 3–6, 8, 9 and 15 through the client |
@@ -1317,7 +1402,12 @@ The G0 draft left eight choices for confirmation. Each was **decided under the o
 **Premises not yet measured, each owned by the slice named.** None may be relied on before its slice
 measures it; a false one changes the plan, not the evidence.
 
-- PG `MATERIALIZED` locking CTE: affected ≤ LIMIT and no double return under concurrency (G1).
+- ~~PG `MATERIALIZED` locking CTE: affected ≤ LIMIT and no double return under concurrency (G1).~~
+  **ASSERTED at G1b** (SPEC §22.2 (dg)): 16 sessions with a measured peak of 16 RESERVEs in flight,
+  no reply over `k`, every job delivered once, `sum(attempts)` equal to the job count; re-confirmed by
+  the review's chaos probe (40 sessions plus stock workers, three runs). Measured beside it: dropping
+  `MATERIALIZED` changes nothing on PostgreSQL 16 (a `FOR UPDATE` CTE is never inlined), while the
+  `WHERE id IN (… LIMIT k FOR UPDATE SKIP LOCKED)` form over-reserves even in one session.
 - Dedup statement sequence on PG (G4) and its MySQL counterpart (G6).
 - R4 on the real `Transport`, and the SIGTERM-while-parked exit bound (G3/G5).
 - Sync and async client reentrancy when Laravel's SIGALRM handler runs `FerroJob::fail()` while a
