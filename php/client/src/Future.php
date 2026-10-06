@@ -7,7 +7,7 @@ namespace Ferro;
  *
  * The request behind a pending Future has already been WRITTEN to the engine; {@see await} reads
  * its terminal and turns it into a value or an exception. Under plain FPM `await` blocks on the
- * socket. Several Futures created before any is awaited run concurrently in the engine, so awaiting
+ * socket; under {@see Loop}, or Revolt with {@see Revolt::install()}, it suspends the Fiber. Several Futures created before any is awaited run concurrently in the engine, so awaiting
  * all of them costs about the slowest one, not the sum.
  *
  * A Future settles exactly once. A second `await` returns the same value, or rethrows the same
@@ -82,7 +82,8 @@ final class Future
     {
         if (!$this->settled && $this->waiter !== null) {
             // Inside a Fiber that {@see Loop} runs, suspend until the terminal has arrived; the loop
-            // reads the socket for every waiting Fiber meanwhile. Anywhere else, resolving blocks.
+            // reads the socket for every waiting Fiber meanwhile. Anywhere else, the installed
+            // {@see Revolt} adapter may suspend it into the Revolt loop; failing that, resolving blocks.
             Loop::waitFor($this->waiter);
         }
         $this->settle();
