@@ -11,11 +11,13 @@
 //! reports the highest-precedence trigger found, so `Checkout::exec`'s `batch_execute` path is
 //! covered, not just the leading statement).
 
+mod copy;
 mod fingerprint;
 mod redact;
 mod rules;
 mod scan;
 
+pub use copy::{CopyDirection, copy_direction};
 pub use fingerprint::{Fingerprint, INPUT_LIMIT, TRUNCATED_MARKER, fingerprint};
 
 /// The upstream SQL dialect being classified against. [`Dialect::Postgres`] is wired to a live

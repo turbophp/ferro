@@ -24,6 +24,9 @@ use crate::pin::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+mod copy;
+pub use copy::{CopyEnd, CopyInHandle, CopyOutHandle};
+
 /// A connection sitting idle in the pool, plus the bookkeeping needed to recycle it safely on
 /// the next checkout.
 ///

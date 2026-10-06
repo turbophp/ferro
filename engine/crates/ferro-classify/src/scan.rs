@@ -440,6 +440,13 @@ pub(crate) fn next_token_after_keyword(sql: &str) -> Option<String> {
     }
 }
 
+/// The same-length masked copy of `sql` — every string literal, comment and dollar-quoted body
+/// blanked to spaces, `"..."` quoted identifiers left visible — for a consumer that must tokenize
+/// CODE only (`crate::copy`'s COPY shape check, M3-D4).
+pub(crate) fn masked_code(sql: &str) -> String {
+    scan(sql).masked
+}
+
 /// True iff `ident` (ASCII, case-insensitive) appears as a WHOLE identifier — neighboring bytes
 /// (if any) are not `[A-Za-z0-9_]` — inside a CODE region (everything except `'...'`/`E'...'`
 /// strings, `--`/`/* */` (nested) comments, and `$tag$...$tag$` bodies; `"..."` quoted identifiers

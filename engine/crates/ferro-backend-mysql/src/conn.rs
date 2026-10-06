@@ -243,6 +243,10 @@ impl Cancel for MysqlCancel {
 impl PoolBackend for MysqlBackend {
     type Conn = MysqlConn;
     type RowStream = crate::stream::MysqlRowStream;
+    // M3-D4: MySQL has no COPY sub-protocol (`LOAD DATA LOCAL INFILE` is a different shape and out
+    // of scope), so `supports_copy` keeps its `false` default.
+    type CopyIn = ferro_pool::backend::NoCopy;
+    type CopyOut = ferro_pool::backend::NoCopy;
     type CancelHandle = MysqlCancel;
 
     /// Owned, borrow-free cancel handle (S6): captures the server-side connection id + the connect

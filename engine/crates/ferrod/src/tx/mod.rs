@@ -122,6 +122,23 @@ pub enum TxCommand {
         responder: Responder,
         done: oneshot::Sender<()>,
     },
+    /// A tx-scoped SQL/`COPY_IN` or SQL/`COPY_OUT` (M3-D4). Shaped like [`TxCommand::ExecStreamed`]
+    /// and for the same reason: the COPY borrows the actor's pinned `co`, so the producer runs IN the
+    /// actor and declares the ONE terminal through the moved `Responder`; `done` lets the forwarding
+    /// handler return after it. `inbound` is the COPY_IN's client data channel, opened (and its
+    /// window reserved) by the forwarding handler; `None` for COPY_OUT. A COPY stopped by the client
+    /// or a deadline ends the transaction (rollback + tombstone, `TxDeadline{Retryable}`), exactly
+    /// as a streamed statement does.
+    Copy {
+        direction: ferro_classify::CopyDirection,
+        sql: String,
+        timeout_ms: Option<u32>,
+        readonly: bool,
+        cancel: CancellationToken,
+        responder: Responder,
+        inbound: Option<crate::session::responder::InboundRx>,
+        done: oneshot::Sender<()>,
+    },
     /// Establish a savepoint. `name` is an optional client alias; the engine composes the ACTUAL
     /// savepoint name (`sp_N`) it runs on the wire (never a client string — no injection surface).
     Savepoint {
@@ -208,6 +225,10 @@ pub struct TxHandle {
     /// only be refused INSIDE the actor — i.e. after checkout + BEGIN, force-tainting the pinned
     /// connection.
     pub streaming: bool,
+    /// Whether that backend has the COPY sub-protocol (`PoolBackend::supports_copy`, M3-D4),
+    /// captured at BEGIN for the same reason as `streaming`: a tx-scoped COPY on a backend without
+    /// one is refused by the forwarding handler, before the actor and its pinned connection.
+    pub copy: bool,
     /// The pool this transaction is pinned to, and that pool's SQL dialect — captured at BEGIN.
     /// The tx-scoped EXEC IGNORES its request's `pool` field, so anything that describes the
     /// statement (the OTLP span's pool and family, the dialect its fingerprint is read in) must
@@ -423,6 +444,7 @@ mod tests {
             done: done_rx,
             // Registry/lookup fixtures only; `true` is the trait default (PG's real value).
             streaming: true,
+            copy: true,
             pool: "default".into(),
             dialect: ferro_classify::Dialect::Postgres,
         }

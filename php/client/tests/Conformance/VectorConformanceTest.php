@@ -5,6 +5,9 @@ use Ferro\Protocol\BackupRequest;
 use Ferro\Protocol\BackupResponse;
 use Ferro\Protocol\BeginRequest;
 use Ferro\Protocol\BeginResponse;
+use Ferro\Protocol\CodecException;
+use Ferro\Protocol\CopyData;
+use Ferro\Protocol\CopyRequest;
 use Ferro\Protocol\ErrorPayload;
 use Ferro\Protocol\ExecOk;
 use Ferro\Protocol\ExecRequest;
@@ -519,6 +522,83 @@ final class VectorConformanceTest extends TestCase
         $this->assertSame(C::OOB_ENCODING_FRAME_PAYLOAD, $decoded['encoding']);
         $this->assertSame(bin2hex($payload), bin2hex(OobRef::encode($decoded, $p)),
             'oob_ref decode->encode fixpoint');
+    }
+
+    /**
+     * `copy_in_request` / `copy_out_request` (M3-D4): the COPY request body, a Value-free fixarray(5).
+     * The two vectors lock both arms of both nullables (`timeout_ms`, `tx_id`) between them, and the
+     * COPY_OUT one carries `readonly = true` — the CLIENT's declaration, which the engine trusts.
+     */
+    public function testCopyRequestVectorsByteMatchBothDirections(): void
+    {
+        $in = self::loadVector('copy_in_request.json');
+        $out = self::loadVector('copy_out_request.json');
+        $this->assertSame(C::METHOD_SQL_COPY_IN, $in['header']['method'] ?? null);
+        $this->assertSame(C::METHOD_SQL_COPY_OUT, $out['header']['method'] ?? null);
+        $p = new PurePacker();
+        foreach ([$in, $out] as $v) {
+            $message = is_array($v['message']) ? $v['message'] : [];
+            $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+            $this->assertSame(C::SERVICE_SQL, $v['header']['service'] ?? null);
+            $this->assertSame(bin2hex($payload), bin2hex(CopyRequest::encode($message, $p)),
+                "PHP CopyRequest encode must byte-match {$v['name']}");
+            $off = 0;
+            $wire = $p->unpack($payload, $off);
+            $this->assertSame(strlen($payload), $off);
+            $this->assertIsArray($wire);
+            $decoded = CopyRequest::mapFromWire($wire);
+            $this->assertEquals($message, $decoded);
+            $this->assertSame(bin2hex($payload), bin2hex(CopyRequest::encode($decoded, $p)),
+                "{$v['name']} decode->encode fixpoint");
+        }
+    }
+
+    /**
+     * `copy_data` (M3-D4): a 300-byte chunk, so `bin16` is the width locked, carrying COPY text-format
+     * specials and a 0xc0 byte. `copy_done`: the empty fixarray. The client both sends and receives
+     * `COPY_DATA`, so both directions are locked through the STRICT decoder the session uses.
+     */
+    public function testCopyDataAndDoneVectorsByteMatchBothDirections(): void
+    {
+        $v = self::loadVector('copy_data.json');
+        $p = new PurePacker();
+        $this->assertSame(C::SERVICE_STREAM, $v['header']['service'] ?? null);
+        $this->assertSame(C::METHOD_STREAM_COPY_DATA, $v['header']['method'] ?? null);
+        $this->assertSame(C::FLAG_STREAM, $v['header']['flags'] ?? null, 'a COPY_DATA frame carries STREAM');
+        $message = is_array($v['message']) ? $v['message'] : [];
+        $chunk = (string) hex2bin((string) ($message['data_hex'] ?? ''));
+        $this->assertSame(300, strlen($chunk));
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $this->assertSame("\x91\xc5", substr($payload, 0, 2), 'a 300-byte chunk is a bin16');
+        $this->assertSame(bin2hex($payload), bin2hex(CopyData::encode($chunk, $p)), 'PHP CopyData encode');
+        $this->assertSame(bin2hex($chunk), bin2hex(CopyData::decode($payload)), 'PHP CopyData decode');
+
+        $d = self::loadVector('copy_done.json');
+        $this->assertSame(C::METHOD_STREAM_COPY_DONE, $d['header']['method'] ?? null);
+        $this->assertSame(0, $d['header']['flags'] ?? null);
+        $this->assertSame(bin2hex(CopyData::DONE), bin2hex(substr((string) hex2bin((string) $d['frame_hex']), 16)));
+    }
+
+    public function testCopyDataDecodeIsStrict(): void
+    {
+        $p = new PurePacker();
+        $ok = CopyData::encode('abc', $p);
+        foreach ([
+            'trailing byte' => $ok . "\x00",
+            'short' => "\x91\xc4\x05ab",
+            'a str, not a bin' => "\x91\xa3abc",
+            'wrong arity' => "\x92\xc4\x00\xc0",
+            'empty' => '',
+        ] as $why => $bad) {
+            try {
+                CopyData::decode($bad);
+                $this->fail("CopyData::decode accepted: {$why}");
+            } catch (CodecException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+        $big = str_repeat('z', 70000);
+        $this->assertSame($big, CopyData::decode(CopyData::encode($big, $p)), 'bin32 round trip');
     }
 
     /**

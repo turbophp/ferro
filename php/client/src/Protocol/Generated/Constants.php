@@ -33,7 +33,11 @@ final class Constants
     public const METHOD_CORE_PING = 3;
     public const METHOD_CORE_PONG = 4;
     public const METHOD_CORE_WINDOW_UPDATE = 6;
+    public const METHOD_SQL_COPY_IN = 2;
+    public const METHOD_SQL_COPY_OUT = 3;
     public const METHOD_SQL_EXEC = 1;
+    public const METHOD_STREAM_COPY_DATA = 3;
+    public const METHOD_STREAM_COPY_DONE = 4;
     public const METHOD_STREAM_DATA = 2;
     public const METHOD_STREAM_HEAD = 1;
     public const METHOD_TX_BEGIN = 1;
@@ -117,5 +121,5 @@ final class Constants
     public const ERR_WRITE_UNCONFIRMED = 8193;
     public const ERR_WRITE_UNCONFIRMED_BRANCH = 2;
 
-    public const TYPE_REGISTRY_HASH = 'b1d69ba2485a43aa';
+    public const TYPE_REGISTRY_HASH = 'da203b0763236f67';
 }

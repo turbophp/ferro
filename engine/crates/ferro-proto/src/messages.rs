@@ -129,6 +129,9 @@ pub use tx::{BeginRequest, BeginResponse, Isolation, SavepointRequest, TxControl
 pub mod admin;
 pub use admin::{BackupRequest, BackupResponse};
 
+pub mod copy;
+pub use copy::{CopyData, CopyDone, CopyRequest};
+
 /// Terminal outcome envelope `[status, body]` (decision W-4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
