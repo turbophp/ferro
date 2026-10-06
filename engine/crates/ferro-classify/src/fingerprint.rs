@@ -262,6 +262,20 @@ mod tests {
 
     const ALL: [Dialect; 3] = [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite];
 
+    /// A non-ASCII dollar-quote tag is a tag to PostgreSQL, so its body is a literal and never
+    /// reaches the slow log or a span (review round 2, L2 — it did, verbatim).
+    #[test]
+    fn a_non_ascii_dollar_tag_hides_its_body() {
+        for sql in [
+            "SELECT $é$hunter2-secret$é$",
+            "SELECT $tagé$hunter2-secret$tagé$",
+            "SELECT $é$hunter2-secret",
+        ] {
+            let f = pg(sql);
+            assert!(!f.as_str().contains("hunter2"), "{sql:?} -> {f}");
+        }
+    }
+
     /// The cases that named this module's behaviour, measured against real statement shapes from
     /// this repository's own suites before the implementation was trusted.
     #[test]

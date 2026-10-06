@@ -1280,3 +1280,61 @@ async fn a_backend_killed_before_copy_done_is_retryable_and_during_commit_indete
     assert_eq!(e.branch, errc::WRITE_UNCONFIRMED_BRANCH);
     assert_session_alive(&mut c, 77).await;
 }
+
+/// Review round 2, L1, reproduced live before the fix: the shape check read `$` differently from
+/// PostgreSQL, so these statements — COPY … TO STDOUT to the server — were sent down the COPY_IN
+/// path, where the server ran the DELETE and COMMITTED while the request reported `Retryable`. Now
+/// COPY_IN refuses them before anything reaches the server, and COPY_OUT runs them as what they are.
+#[tokio::test(flavor = "multi_thread")]
+async fn statements_the_lexer_used_to_misroute_are_refused_on_copy_in_and_run_on_copy_out() {
+    let Some(url) = pg_url() else { return };
+    let server = small_windows(url);
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    exec_ok(
+        &mut c,
+        2,
+        "DROP TABLE IF EXISTS d4_e2e_lex; CREATE TABLE d4_e2e_lex (id int);
+         INSERT INTO d4_e2e_lex VALUES (1), (2), (3)",
+    )
+    .await;
+    let cases = [
+        "COPY (DELETE FROM d4_e2e_lex WHERE id = 1 RETURNING $é$ ) FROM STDIN $é$) TO STDOUT",
+        "COPY (DELETE FROM d4_e2e_lex WHERE id = 2 RETURNING 1 AS x$b$) TO STDOUT NULL $b$) FROM STDIN $b$ -- $b$",
+    ];
+    let mut rid = 10;
+    for (i, sql) in cases.iter().enumerate() {
+        c.send_request(
+            rid,
+            service::SQL,
+            method_sql::COPY_IN,
+            copy_req(sql, false, None).encode(),
+        )
+        .await;
+        let e = err_body(Outcome::decode(&recv_for(&mut c, rid).await.payload).unwrap());
+        assert_eq!(e.code, errc::UNSUPPORTED, "{sql}: {e:?}");
+        assert_eq!(
+            count(&mut c, rid + 1, "d4_e2e_lex").await,
+            3 - i as i64,
+            "COPY_IN ran nothing"
+        );
+        // On COPY_OUT it is what the server reads: a DELETE … RETURNING exported to the client.
+        c.send_request(
+            rid + 2,
+            service::SQL,
+            method_sql::COPY_OUT,
+            copy_req(sql, false, None).encode(),
+        )
+        .await;
+        let t = loop {
+            let f = recv_for(&mut c, rid + 2).await;
+            if f.header.flags & flags::END != 0 {
+                break Outcome::decode(&f.payload).unwrap();
+            }
+            c.window_update(rid + 2, 1, f.payload.len() as u32).await;
+        };
+        assert_eq!(ok_body(t).affected, 1, "{sql}");
+        assert_eq!(count(&mut c, rid + 3, "d4_e2e_lex").await, 2 - i as i64);
+        rid += 10;
+    }
+}

@@ -235,3 +235,39 @@ async fn a_copy_rejected_before_copy_mode_does_not_kill_the_connection() {
     assert_eq!(one, 1);
     assert!(!client.is_closed());
 }
+
+/// The premise behind the engine's open-error rule (M3-D4 review round 2, L1): a statement handed to
+/// `copy_in` that turns out NOT to be a `COPY … FROM STDIN` runs — and, in autocommit, COMMITS at the
+/// `Sync` — before the driver reports anything, and what it then reports is NOT a server error. So a
+/// non-server failure while opening a COPY_IN cannot be read as "nothing was applied".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_copy_statement_on_the_copy_in_path_applies_before_the_driver_objects() {
+    let Some(url) = test_url() else {
+        return;
+    };
+    let client = connect(&url).await;
+    client
+        .batch_execute(
+            "DROP TABLE IF EXISTS d4_fork_misroute;
+             CREATE TABLE d4_fork_misroute (id int); INSERT INTO d4_fork_misroute VALUES (1), (2), (3)",
+        )
+        .await
+        .unwrap();
+    let err = match client
+        .copy_in::<_, Bytes>("DELETE FROM d4_fork_misroute WHERE id = 1")
+        .await
+    {
+        Ok(_) => panic!("a DELETE is not a COPY"),
+        Err(e) => e,
+    };
+    assert!(
+        err.as_db_error().is_none(),
+        "the driver's objection is not the server's answer: {err:?}"
+    );
+    let other = connect(&url).await;
+    assert_eq!(
+        count(&other, "d4_fork_misroute").await,
+        2,
+        "the DELETE committed"
+    );
+}

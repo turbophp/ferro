@@ -255,6 +255,12 @@ mod tests {
         assert!(!speaks_copy_stdio("-- COPY t FROM STDIN\nSELECT 1"));
         assert!(!speaks_copy_stdio("COPY t FROM '/x.csv'"));
         assert!(!speaks_copy_stdio("SELECT 1"));
+        // A non-ASCII dollar-quote tag hides what it encloses (review round 2, L1/L2).
+        assert!(!speaks_copy_stdio("SELECT $é$ ; COPY t FROM STDIN $é$"));
+        // `a$b$` is one identifier, so this IS a COPY FROM STDIN to the server.
+        assert!(speaks_copy_stdio(
+            "COPY a$b$ FROM STDIN NULL $b$ TO STDOUT $b$ -- $b$"
+        ));
     }
 
     /// Tokenization edge cases, each with the verdict the server's own grammar implies. The
@@ -331,6 +337,25 @@ mod tests {
             // The server's grammar refuses a query as a FROM source (42601, before copy mode, known
             // fate); the shape is still a COPY FROM STDIN, and the server decides the rest.
             ("COPY (SELECT 1 FROM t) FROM STDIN", Some(In)),
+            // `$` as PostgreSQL's lexer reads it (review round 2, L1, each reproduced live as an
+            // applied DELETE reported Retryable): a dollar-quote tag may hold bytes 0x80-0xFF, and
+            // a `$` right after an identifier character continues the identifier (`x$b$` is one
+            // name). Each of these is, to the server, the OTHER direction from what it looks like.
+            (
+                "COPY (DELETE FROM t WHERE id = 1 RETURNING $é$ ) FROM STDIN $é$) TO STDOUT",
+                Some(Out),
+            ),
+            (
+                "COPY (DELETE FROM t RETURNING 1 AS x$b$) TO STDOUT NULL $b$) FROM STDIN $b$ -- $b$",
+                Some(Out),
+            ),
+            (
+                "COPY a$b$ FROM STDIN NULL $b$ TO STDOUT $b$ -- $b$",
+                Some(In),
+            ),
+            ("COPY t FROM STDIN $é$ ; DROP TABLE t $é$", Some(In)),
+            ("COPY t FROM $é$STDIN$é$", None),
+            ("COPY x1$ FROM STDIN", Some(In)),
         ];
         for (sql, want) in cases {
             assert_eq!(copy_direction(sql), *want, "{sql:?}");

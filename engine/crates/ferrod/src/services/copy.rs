@@ -387,6 +387,31 @@ pub(crate) async fn run_copy<B: PoolBackend>(
     }
 }
 
+/// The terminal of a COPY_IN whose OPEN failed. "Nothing of a COPY FROM STDIN can apply before its
+/// end-of-data" rests on the statement BEING one, and only the server's own answer (`Sql`) or a
+/// refusal that sent nothing (`Unsupported`) is a known fate here. Anything else — a lost link, or a
+/// reply the driver did not expect — means the statement may have reached the server and run as
+/// something else: measured (M3-D4 review round 2, L1), a statement the shape check misread
+/// executed a `DELETE` and COMMITTED at the `Sync` before the driver reported an unexpected message.
+/// So it is classified as SENT — `Indeterminate` in autocommit, the transaction ended inside one —
+/// whatever stopped the request, never the "cannot have applied" of `not_applied`.
+fn copy_in_open_failed(
+    e: PoolError,
+    why: Option<&str>,
+    in_tx: bool,
+) -> ferro_proto::messages::ErrorPayload {
+    let known = matches!(e, PoolError::Sql { .. } | PoolError::Unsupported(_));
+    let ctx = OpContext {
+        readonly: false,
+        sent: !known,
+        in_tx,
+    };
+    match why {
+        Some(w) if known => fate::classify_fate(copy_stopped_before_done(w), ctx),
+        _ => fate::classify_fate(e, ctx),
+    }
+}
+
 /// Did this error end the transaction it ran in? A server's own rejection (a malformed row, a
 /// constraint) leaves the transaction open — failed, for the client to roll back, exactly as a
 /// failed EXEC does — and so does a refusal that sent nothing (`Unsupported`). A cancel/timeout
@@ -460,10 +485,7 @@ async fn run_copy_in<B: PoolBackend>(
         }
         (Err(e), why) => {
             let broken = why.is_some() || ends_tx(&e);
-            responder.end_error(match why {
-                Some(w) => not_applied(w),
-                None => before_done(e),
-            });
+            responder.end_error(copy_in_open_failed(e, why, in_tx));
             return if broken {
                 StreamEnded::Broken
             } else {
@@ -749,6 +771,52 @@ async fn run_copy_out<B: PoolBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed COPY_IN open that is not the server's own answer may have applied (review round 2,
+    /// L1): `Indeterminate` in autocommit, never the known "cannot have applied".
+    #[test]
+    fn an_open_failure_that_is_not_the_servers_answer_is_never_claimed_unapplied() {
+        for why in [None, Some("cancelled")] {
+            let e = copy_in_open_failed(PoolError::ConnectionLost, why, false);
+            assert_eq!(e.code, errc::WRITE_UNCONFIRMED, "{why:?}: {e:?}");
+            assert_eq!(e.branch, errc::WRITE_UNCONFIRMED_BRANCH);
+            // An engine-internal failure is never claimed to have not applied either.
+            let e =
+                copy_in_open_failed(PoolError::Backend("unexpected message".into()), why, false);
+            assert_ne!(e.branch, errc::CONNECTION_LOST_BRANCH, "{why:?}: {e:?}");
+        }
+        // Known fates stay known.
+        let e = copy_in_open_failed(PoolError::Unsupported("shape".into()), None, false);
+        assert_eq!(e.code, errc::UNSUPPORTED);
+        let sql = PoolError::Sql {
+            code: errc::PROTOCOL,
+            branch: errc::PROTOCOL_BRANCH,
+            sqlstate: Some("42P01".into()),
+            errno: None,
+            message: "no such table".into(),
+        };
+        assert_eq!(
+            copy_in_open_failed(sql, None, false).sqlstate.as_deref(),
+            Some("42P01")
+        );
+        let cancelled = PoolError::Sql {
+            code: errc::CANCELLED,
+            branch: errc::CANCELLED_BRANCH,
+            sqlstate: Some("57014".into()),
+            errno: None,
+            message: "canceling statement".into(),
+        };
+        let e = copy_in_open_failed(cancelled, Some("cancelled"), false);
+        assert_eq!(
+            e.code,
+            errc::CONNECTION_LOST,
+            "a stop the server confirmed: {e:?}"
+        );
+        assert_eq!(e.branch, errc::CONNECTION_LOST_BRANCH);
+        // Inside a transaction the transaction is what is lost: Retryable, not Indeterminate.
+        let e = copy_in_open_failed(PoolError::ConnectionLost, None, true);
+        assert_ne!(e.branch, errc::WRITE_UNCONFIRMED_BRANCH);
+    }
 
     #[test]
     fn a_refusal_or_a_server_error_keeps_the_transaction_and_a_stop_ends_it() {
