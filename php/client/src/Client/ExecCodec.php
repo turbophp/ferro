@@ -60,16 +60,17 @@ final class ExecCodec
 
     /**
      * Build one EXEC payload. `$txId = null` is the autocommit path; a non-null `$txId` scopes the
-     * statement to that transaction's actor on the engine.
+     * statement to that transaction's actor on the engine. With a `$queryId` (M3-D2e) the engine
+     * runs its manifest's SQL for that id and `sql` is sent as nil (PROTOCOL.md §6: exactly one).
      *
      * @param list<mixed> $params
      */
-    public function encode(string $pool, string $sql, array $params, bool $readonly, int $fetch, ?int $txId): string
+    public function encode(string $pool, string $sql, array $params, bool $readonly, int $fetch, ?int $txId, ?string $queryId = null): string
     {
         $request = [
             'pool' => $pool,
-            'sql' => $sql,
-            'query_id' => null,
+            'sql' => $queryId === null ? $sql : null,
+            'query_id' => $queryId,
             'params' => $this->bindParams($params),
             'timeout_ms' => null,
             'readonly' => $readonly,

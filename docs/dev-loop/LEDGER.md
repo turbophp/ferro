@@ -199,7 +199,7 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 | D2b | `ferro check` + `ferro schema sync`: PREPARE every query against a shadow schema, record param/result types | OPEN | PG, MySQL, SQLite through the backend crates. |
 | D2c | `ferro gen`: DTOs, a `Queries` id-constant class, PHPStan stubs | OPEN | |
 | D2d | Engine: load `FERRO_MANIFEST`, advertise `MANIFEST`, refuse a HELLO with a different `manifest_hash`, run EXEC by `query_id` | DONE — SPEC §22.2 (cm) | No `/proto` shape change. The request must AGREE with the manifest's pool and `readonly`, and the session must have sent the matching hash. |
-| D2e | Client: `…ById` methods + the `idempotent` retry licence + a chaos test (idempotent upsert retried across a `ferrod` kill, applied once) | OPEN | The only licensed auto-retry (§9.2). |
+| D2e | Client: `…ById` methods + the `idempotent` retry licence + a chaos test | DONE — SPEC §22.2 (co) | The only licensed auto-retry (§9.2). Live: a lost declared-idempotent upsert succeeds after exactly two sends, applied once; the undeclared control surfaces Indeterminate after one. The loss is a client link cut, not a daemon kill. Async/stream by id not built. |
 | D3 | memfd large-payload path behind `MEMFD_RX` (§5.1) | OPEN | |
 | D4 | COPY API | OPEN | |
 
