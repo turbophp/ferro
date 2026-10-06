@@ -13,7 +13,7 @@
         "ext-sockets": "Enables the MEMFD_RX out-of-band receive path (M3)"
     },
     "bin": ["bin/ferro-queries"],
-    "autoload": { "psr-4": { "Ferro\\": "src/" } },
+    "autoload": { "psr-4": { "Ferro\\": "src/" }, "files": ["src/functions.php"] },
     "autoload-dev": { "psr-4": { "Ferro\\Tests\\": "tests/" } },
     "scripts": {
         "test": "phpunit",

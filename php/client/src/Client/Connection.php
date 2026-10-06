@@ -5,6 +5,7 @@ namespace Ferro\Client;
 use Ferro\Client\Error\ConnectionLostException;
 use Ferro\Client\Error\EpochChangedException;
 use Ferro\Client\Error\ErrorMapper;
+use Ferro\Client\Error\FerroException;
 use Ferro\Client\Error\IndeterminateException;
 use Ferro\Client\Error\InvalidTransactionStateException;
 use Ferro\Client\Error\NonRetryableException;
@@ -369,6 +370,90 @@ final class Connection
         return $this->codec->assocRows($this->dispatch($sql, $params, true, ExecCodec::FETCH_ROWS));
     }
 
+    // ---- asynchronous calls (M3-D1, SPEC §10.1) ---------------------------------------------------
+
+    /**
+     * {@see query}, asynchronously: the request is written now and its rows are read at
+     * {@see \Ferro\Future::await}. Futures created before any is awaited run concurrently in the
+     * engine over this one socket, so `Ferro\await([...])` over k of them costs about the slowest.
+     *
+     * @template T of object
+     * @param list<mixed> $params
+     * @param class-string<T>|null $dto
+     * @return \Ferro\Future<($dto is null ? list<array<string,mixed>> : list<T>)>
+     */
+    public function queryAsync(string $sql, array $params = [], ?string $dto = null): \Ferro\Future
+    {
+        return $this->dispatchAsync($sql, $params, true, ExecCodec::FETCH_ROWS, function (array $res) use ($dto): array {
+            if ($dto === null) {
+                return $this->codec->assocRows($res);
+            }
+            $out = [];
+            foreach ($res['rows'] as $row) {
+                $out[] = $this->codec->hydrateDto($dto, $res['cols'], $row);
+            }
+            return $out;
+        });
+    }
+
+    /**
+     * {@see queryOne}, asynchronously.
+     *
+     * @template T of object
+     * @param list<mixed> $params
+     * @param class-string<T>|null $dto
+     * @return \Ferro\Future<($dto is null ? array<string,mixed>|null : T|null)>
+     */
+    public function queryOneAsync(string $sql, array $params = [], ?string $dto = null): \Ferro\Future
+    {
+        return $this->dispatchAsync($sql, $params, true, ExecCodec::FETCH_ROWS, function (array $res) use ($dto): array|object|null {
+            $firstRow = $res['rows'][0] ?? null;
+            if ($firstRow === null) {
+                return null;
+            }
+            return $dto === null
+                ? $this->codec->assocRow($res['cols'], $firstRow)
+                : $this->codec->hydrateDto($dto, $res['cols'], $firstRow);
+        });
+    }
+
+    /**
+     * {@see scalar}, asynchronously.
+     *
+     * @param list<mixed> $params
+     * @return \Ferro\Future<mixed>
+     */
+    public function scalarAsync(string $sql, array $params = []): \Ferro\Future
+    {
+        return $this->dispatchAsync($sql, $params, true, ExecCodec::FETCH_ROWS, static function (array $res): mixed {
+            $firstRow = $res['rows'][0] ?? null;
+            return $firstRow === null ? null : ($firstRow[0] ?? null);
+        });
+    }
+
+    /**
+     * {@see rows}, asynchronously.
+     *
+     * @param list<mixed> $params
+     * @return \Ferro\Future<list<array<string,mixed>>>
+     */
+    public function rowsAsync(string $sql, array $params = []): \Ferro\Future
+    {
+        return $this->dispatchAsync($sql, $params, true, ExecCodec::FETCH_ROWS, fn (array $res): array => $this->codec->assocRows($res));
+    }
+
+    /**
+     * {@see exec}, asynchronously: the affected-row count. The fate declaration is the caller's, as
+     * for {@see exec} — an undeclared statement is a WRITE, and a lost write is `Indeterminate`.
+     *
+     * @param list<mixed> $params
+     * @return \Ferro\Future<int>
+     */
+    public function execAsync(string $sql, array $params = [], bool $readonly = false): \Ferro\Future
+    {
+        return $this->dispatchAsync($sql, $params, $readonly, ExecCodec::FETCH_NONE, static fn (array $res): int => $res['affected']);
+    }
+
     /**
      * The RAW statement entry point: positional rows, the terminal's own `affected` count, the
      * generated key — and, uniquely on this class, a `readonly` fate flag the CALLER chooses.
@@ -457,7 +542,7 @@ final class Connection
         // `session()` (the reconnect loop's CURRENT one). They are the same object today because
         // nothing reconnects while a transaction is open — but "today" is not an invariant, and the
         // failure if they ever diverge is the engine refusing a tx_id it does not own.
-        $session = $this->tx?->session() ?? $this->requestSession(OpKind::Read, true);
+        $session = $this->ownTx()?->session() ?? $this->requestSession(OpKind::Read, true);
         if (!$session instanceof StreamingSessionInterface) {
             throw new ProtocolException(
                 'stream() requires a session implementing StreamingSessionInterface (the concrete Session)',
@@ -469,7 +554,7 @@ final class Connection
             $params,
             true,
             ExecCodec::FETCH_STREAM,
-            $this->tx?->txId(),
+            $this->ownTx()?->txId(),
         );
         // A streamed read reports no generated key, and — like every other statement — it CLEARS the
         // previous one rather than letting it linger (the `lastInsertId()` contract is "the last
@@ -562,7 +647,7 @@ final class Connection
      */
     public function streamRaw(string $sql, array $params = [], bool $readonly = false): RawStream
     {
-        $session = $this->tx?->session() ?? $this->requestSession($readonly ? OpKind::Read : OpKind::Write, $readonly);
+        $session = $this->ownTx()?->session() ?? $this->requestSession($readonly ? OpKind::Read : OpKind::Write, $readonly);
         if (!$session instanceof StreamingSessionInterface) {
             throw new ProtocolException(
                 'streamRaw() requires a session implementing StreamingSessionInterface (the concrete Session)',
@@ -574,7 +659,7 @@ final class Connection
             $params,
             $readonly,
             ExecCodec::FETCH_STREAM,
-            $this->tx?->txId(),
+            $this->ownTx()?->txId(),
         );
         // CLEAR on the way in — the "never a stale key" half of the `lastInsertId()` contract, and
         // the honest answer while the statement is in flight. It is REPOPULATED when the terminal
@@ -788,6 +873,13 @@ final class Connection
     }
 
     /**
+     * The Fiber that called {@see begin} for the open transaction; null is the main program.
+     *
+     * @var \Fiber<mixed, mixed, mixed, mixed>|null
+     */
+    private ?\Fiber $txFiber = null;
+
+    /**
      * Open a transaction IMPERATIVELY and leave it open until {@see commit} or {@see rollBack}.
      *
      * This is the shape a Doctrine DBAL driver needs: DBAL's `Connection::beginTransaction()`,
@@ -822,7 +914,7 @@ final class Connection
      */
     public function begin(bool $readonly = false, ?Isolation $isolation = null): void
     {
-        if ($this->tx !== null) {
+        if ($this->ownTx() !== null) {
             throw new InvalidTransactionStateException(
                 'a transaction is already open on this connection; Ferro does not nest transactions '
                     . '(use SAVEPOINT SQL, which passes through inside an open transaction)',
@@ -873,6 +965,7 @@ final class Connection
             $this->decodeTxId($outcome),
             $this->encodePacker,
         );
+        $this->txFiber = \Fiber::getCurrent();
     }
 
     /**
@@ -889,6 +982,7 @@ final class Connection
     {
         $tx = $this->requireTx('commit');
         $this->tx = null;
+        $this->txFiber = null;
         try {
             $tx->commit();
         } catch (ConnectionLostException | TransportException $e) {
@@ -952,8 +1046,9 @@ final class Connection
      */
     public function rollBack(): void
     {
-        $tx = $this->requireTx('rollBack');
+        $tx = $this->requireTx('rollBack', allowAbandoned: true);
         $this->tx = null;
+        $this->txFiber = null;
         try {
             $tx->rollback();
         } catch (ConnectionLostException | TransportException) {
@@ -978,11 +1073,43 @@ final class Connection
      * error the caller was already carrying — the exact failure {@see rollBack}'s swallowing arm
      * exists to prevent.
      */
-    private function requireTx(string $method): TxHandle
+    private function requireTx(string $method, bool $allowAbandoned = false): TxHandle
     {
-        return $this->tx ?? throw new InvalidTransactionStateException(
-            $method . '() with no open transaction (call begin() first)',
-        );
+        if ($this->tx === null) {
+            throw new InvalidTransactionStateException($method . '() with no open transaction (call begin() first)');
+        }
+        // An owner Fiber that has already ended can never finish its own transaction, so a rollback
+        // from anywhere is the only way to release it. Nothing else may continue it.
+        if ($allowAbandoned && $this->txFiber !== null && $this->txFiber->isTerminated()) {
+            return $this->tx;
+        }
+        return $this->ownTx() ?? throw new InvalidTransactionStateException($method . '() with no open transaction');
+    }
+
+    /**
+     * The open imperative transaction, if this Fiber owns it (M3-D1b review F1).
+     *
+     * The imperative transaction lives on the Connection, but under {@see \Ferro\Loop} several
+     * Fibers share a Connection. Without this check, a second Fiber's statement ran INSIDE the first
+     * Fiber's transaction and reported success, and the first Fiber's rollback then undid it
+     * (measured live). So the transaction belongs to the Fiber that called {@see begin} (the main
+     * program counts as one), and any other Fiber's statement, `begin`, `commit` or `rollBack` is
+     * refused rather than routed. The closure form {@see transaction} is unaffected: its statements
+     * go through its own {@see TxHandle}.
+     */
+    private function ownTx(): ?TxHandle
+    {
+        if ($this->tx === null) {
+            return null;
+        }
+        if (\Fiber::getCurrent() !== $this->txFiber) {
+            throw new InvalidTransactionStateException(
+                'this Connection\'s open transaction belongs to another Fiber; a transaction belongs to '
+                    . 'the Fiber that began it (use a Connection per concurrent transaction, or the '
+                    . 'closure form transaction())',
+            );
+        }
+        return $this->tx;
     }
 
     // ---- transaction ----------------------------------------------------------------------------
@@ -1011,7 +1138,7 @@ final class Connection
         // still points at the first — and, worse, its §19.1 re-run loop could reconnect underneath
         // the open imperative tx and silently void its `tx_id`. Everything below this guard is
         // unchanged.
-        if ($this->tx !== null) {
+        if ($this->ownTx() !== null) {
             throw new InvalidTransactionStateException(
                 'transaction() cannot be called while an imperative transaction is open '
                     . '(commit() or rollBack() first); Ferro does not nest transactions',
@@ -1168,15 +1295,141 @@ final class Connection
         // a statement that errored, was cancelled, or whose fate is Indeterminate.
         $this->lastInsertId = null;
 
-        if ($this->tx === null) {
+        $tx = $this->ownTx();
+        if ($tx === null) {
             return $this->dispatchAutocommit($sql, $params, $readonly, $fetch);
         }
-        $res = $this->tx->runForConnection($sql, $params, $readonly, $fetch);
+        $res = $tx->runForConnection($sql, $params, $readonly, $fetch);
         // Propagate the generated key to the connection level (M1-S8a Task 9): a driver's
         // `lastInsertId()` is read off the Connection, and nearly every real INSERT happens inside a
         // transaction. The closure form deliberately does NOT propagate — see {@see lastInsertId}.
         $this->lastInsertId = $res['last_insert_id'];
         return $res;
+    }
+
+    /**
+     * The asynchronous statement path (M3-D1): write the EXEC now, read and classify its terminal
+     * at `await`, then shape it with `$shape`.
+     *
+     * It runs the SAME fate rules as {@see dispatchAutocommit}, and reuses that method for every
+     * case that needs a second attempt, so there is one retry policy, not two:
+     *  - a lost request is classified with {@see FateClassifier::classifyLoss} (a lost write is
+     *    `Indeterminate`; only a read the policy allows is re-issued, synchronously, at `await`);
+     *  - a server-declared Retryable read is re-issued the same way.
+     *
+     * Two cases settle at once instead of going asynchronous:
+     *  - **inside a transaction.** A statement is part of the transaction's order. Leaving it in
+     *    flight would let the caller's next statement overtake it in the client's view while the
+     *    engine runs them in order.
+     *  - **a session that cannot multiplex**, or a submit that fails (for example while reconnecting a
+     *    closed session). The synchronous path already classifies and recovers from those.
+     *
+     * **`lastInsertId()` is NOT touched by an asynchronous statement, on ANY of these paths.** "The
+     * most recent statement" has no meaning when several are in flight at once, so every path below,
+     * including the ones that settle at once and the read re-issue, runs inside
+     * {@see preservingLastInsertId} (M3-D1a review F4: they used to set or clear it).
+     *
+     * **Every error surfaces at `await`, never at the call** (review F7): a failure to submit is held
+     * by a settled Future like any other.
+     *
+     * @template R
+     * @param list<mixed> $params
+     * @param \Closure(array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}): R $shape
+     * @return \Ferro\Future<R>
+     */
+    private function dispatchAsync(string $sql, array $params, bool $readonly, int $fetch, \Closure $shape): \Ferro\Future
+    {
+        try {
+            $inTx = $this->ownTx() !== null;
+        } catch (InvalidTransactionStateException $e) {
+            return \Ferro\Future::settleNow(static fn () => throw $e);
+        }
+        if ($inTx) {
+            return \Ferro\Future::settleNow(fn () => $shape($this->preservingLastInsertId(
+                fn () => $this->dispatch($sql, $params, $readonly, $fetch),
+            )));
+        }
+        $sync = fn () => $shape($this->preservingLastInsertId(
+            fn () => $this->dispatchAutocommit($sql, $params, $readonly, $fetch),
+        ));
+        $opKind = $readonly ? OpKind::Read : OpKind::Write;
+        try {
+            $session = $this->requestSession($opKind, $readonly);
+            if (!$session instanceof MultiplexingSessionInterface) {
+                return \Ferro\Future::settleNow($sync);
+            }
+            $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, null);
+            try {
+                $rid = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
+            } catch (ConnectionLostException | TransportException $e) {
+                if (!self::wasSent($e)) {
+                    // Nothing was sent: the synchronous path reconnects, re-sends and classifies
+                    // exactly as it would for a synchronous call.
+                    return \Ferro\Future::settleNow($sync);
+                }
+                throw $e;
+            }
+        } catch (\Throwable $e) {
+            return \Ferro\Future::settleNow(static fn () => throw $e);
+        }
+
+        return new \Ferro\Future(fn (): mixed => $this->preservingLastInsertId(function () use ($session, $rid, $opKind, $readonly, $sql, $params, $fetch, $shape): mixed {
+            try {
+                $outcome = $session->awaitTerminal($rid);
+            } catch (ConnectionLostException | TransportException $e) {
+                $fate = $this->fate->classifyLoss(
+                    $opKind,
+                    $readonly,
+                    $e->getMessage(),
+                    $e instanceof ConnectionLostException ? $e->errorPayload() : null,
+                    $this->reconnect?->lastEpochChanged() ?? false,
+                    sent: self::wasSent($e),
+                );
+                if ($this->reconnect !== null
+                    && 1 < $this->policy->maxAttempts
+                    && $this->fate->mayRetryException($fate, $readonly, $opKind)
+                ) {
+                    // The same re-issue the synchronous path performs, counted as its second attempt.
+                    // {@see requestSession} replaces the session if this loss closed it.
+                    return $shape($this->dispatchAutocommit($sql, $params, $readonly, $fetch, 1));
+                }
+                throw $fate;
+            } catch (CodecException $e) {
+                throw new ProtocolException('failed to decode SQL terminal: ' . $e->getMessage(), 0, $e);
+            }
+            if ($outcome->isOk()) {
+                return $shape($this->codec->decode($outcome));
+            }
+            $ex = ErrorMapper::fromOutcome($outcome);
+            if ($this->reconnect !== null
+                && 1 < $this->policy->maxAttempts
+                && $this->fate->mayRetryException($ex, $readonly, $opKind)
+            ) {
+                return $shape($this->dispatchAutocommit($sql, $params, $readonly, $fetch, 1));
+            }
+            throw $ex;
+        }),
+            static fn () => $session instanceof Session ? $session->discard($rid) : null,
+            $session instanceof Session ? new Waiter($session, $rid) : null,
+        );
+    }
+
+    /**
+     * Run `$work` and put {@see $lastInsertId} back as it was, whatever `$work` did to it — the
+     * asynchronous paths' "never touches it" rule (M3-D1a review F4).
+     *
+     * @template R
+     * @param \Closure(): R $work
+     * @return R
+     */
+    private function preservingLastInsertId(\Closure $work): mixed
+    {
+        $saved = $this->lastInsertId;
+        try {
+            return $work();
+        } finally {
+            $this->lastInsertId = $saved;
+        }
     }
 
     /**
@@ -1186,11 +1439,16 @@ final class Connection
      * @param list<mixed> $params
      * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
      */
-    private function dispatchAutocommit(string $sql, array $params, bool $readonly, int $fetch): array
-    {
+    private function dispatchAutocommit(
+        string $sql,
+        array $params,
+        bool $readonly,
+        int $fetch,
+        int $startAttempt = 0,
+    ): array {
         $opKind = $readonly ? OpKind::Read : OpKind::Write;
         $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, null);
-        $attempt = 0;
+        $attempt = $startAttempt;
 
         while (true) {
             try {
@@ -1264,7 +1522,7 @@ final class Connection
             return $session->openStream(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
         } catch (ConnectionLostException | TransportException $e) {
             throw $this->fate->classifyLoss(
-                $this->tx !== null ? OpKind::TxStatement : ($readonly ? OpKind::Read : OpKind::Write),
+                $this->ownTx() !== null ? OpKind::TxStatement : ($readonly ? OpKind::Read : OpKind::Write),
                 $readonly,
                 'stream open lost: ' . $e->getMessage(),
                 $e instanceof ConnectionLostException ? $e->errorPayload() : null,

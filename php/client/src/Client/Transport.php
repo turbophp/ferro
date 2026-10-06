@@ -7,15 +7,15 @@ use Ferro\Client\Error\TransportException;
 /**
  * Dependency-free stream transport (charter rule 7): `stream_socket_client` over `unix://`
  * (primary, `/run/ferro/{schema_hash}.sock`) or `tcp://` (the `FERRO_ADDR` fallback) — NOT
- * `ext-sockets`. Blocking, single-in-flight: the S7 M0 client writes one framed request and
- * block-reads exactly its one terminal.
+ * `ext-sockets`. Blocking reads and writes; {@see Session} routes several in-flight requests over it
+ * (M3-D1a).
  *
  * The stream is held as `/** @var resource *​/ private $sock` (a stream resource has no native
  * property type, so this class is deliberately NOT `readonly`); both
  * `stream_socket_client`'s `resource|false` and `fread`'s `string|false` are handled explicitly so
  * the type stays a bare `resource` for PHPStan level 9.
  */
-final class Transport implements TransportInterface
+final class Transport implements SelectableTransportInterface
 {
     private const DEFAULT_CONNECT_TIMEOUT = 5.0;
     private const DEFAULT_READ_TIMEOUT = 30.0;
@@ -26,9 +26,14 @@ final class Transport implements TransportInterface
     /**
      * @param resource $sock an already-connected, blocking stream
      */
-    private function __construct($sock)
+    private function __construct($sock, private readonly float $readTimeout = self::DEFAULT_READ_TIMEOUT)
     {
         $this->sock = $sock;
+    }
+
+    public function readTimeout(): float
+    {
+        return $this->readTimeout;
     }
 
     /** Connect over a Unix domain socket at `$socketPath` (the primary transport). */
@@ -75,13 +80,14 @@ final class Transport implements TransportInterface
         $sec = (int) $readTimeout;
         $usec = (int) round(($readTimeout - $sec) * 1_000_000);
         stream_set_timeout($sock, $sec, $usec);
-        return new self($sock);
+        return new self($sock, $readTimeout);
     }
 
     public function readExact(int $n): string
     {
         if ($n < 0) { throw new TransportException("readExact: negative length {$n}"); }
         if ($n === 0) { return ''; }
+        $this->assertOpen('read');
 
         $buf = '';
         $remaining = $n;
@@ -107,6 +113,7 @@ final class Transport implements TransportInterface
 
     public function writeAll(string $bytes): void
     {
+        $this->assertOpen('write');
         $len = strlen($bytes);
         $written = 0;
         while ($written < $len) {
@@ -123,6 +130,23 @@ final class Transport implements TransportInterface
             }
             $written += $n;
         }
+    }
+
+    /**
+     * A read or write on a closed stream is a {@see TransportException}, never PHP's `TypeError`,
+     * which `@` cannot suppress and which would escape every caller's typed handling (M3-D1a
+     * review F2/F3).
+     */
+    private function assertOpen(string $op): void
+    {
+        if (!is_resource($this->sock)) {
+            throw new TransportException("{$op} on a closed transport");
+        }
+    }
+
+    public function stream(): mixed
+    {
+        return is_resource($this->sock) ? $this->sock : null;
     }
 
     public function close(): void
