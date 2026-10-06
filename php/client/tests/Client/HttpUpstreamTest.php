@@ -35,6 +35,7 @@ use Ferro\Protocol\StreamData;
 use Ferro\Protocol\StreamHead;
 use Ferro\Tests\Support\DuplexDouble;
 use Ferro\Tests\Support\FakeTransport;
+use Ferro\Tests\Support\SignalDouble;
 use Ferro\Tests\Support\ForkedFakeEngine as Fake;
 use Ferro\Tests\Support\HttpFrames as F;
 use PHPUnit\Framework\TestCase;
@@ -1103,6 +1104,79 @@ final class HttpUpstreamTest extends TestCase
         $this->assertSame(31, strlen($b2->await()->body));
         $this->assertSame(31, strlen($b3->await()->body));
         $this->assertFalse($session->hasRequestsInFlight(), 'the stream\'s END was read and dropped');
+    }
+
+    /**
+     * R2-2, in process (the reviewer's probe, review round 3): both slots are streams with full
+     * windows, but the END that frees one is waiting and the socket says so. The request is sent.
+     */
+    public function testTheSlotRefusalReadsFirstWhenSomethingIsReadable(): void
+    {
+        $t = new FakeTransport();
+        $d = new SignalDouble($t);
+        $t->feed(F::helloAck());
+        $session = new Session($d, new RequestIdAllocator(0), maxInFlight: 2);
+        $session->hello();
+        $http = (new Connection($session, 'default'))->upstream('up');
+        $t->feed(F::head(1));
+        $a = $http->stream('GET', '/a');
+        $t->feed(F::head(2));
+        $b = $http->stream('GET', '/b');
+        for ($i = 0; $i < 64; ++$i) {
+            $t->feed(F::body(1, 'a') . F::body(2, 'b'));
+        }
+        $t->feed(F::done(1));
+        $d->signal(); // the socket is readable: the END is waiting
+        $out = 'sent';
+        try {
+            $session->submitHttp('x');
+        } catch (InFlightLimitException) {
+            $out = 'refused';
+        }
+        $this->assertSame('sent', $out, 'a slot was about to free: its END was already readable');
+        unset($a, $b);
+    }
+
+    /**
+     * R2-5's re-ask (mutation R5b; the reviewer's pin, review round 3): rid 2 was CANCELled and its
+     * grace has run out, but its answer arrives while rid 1's CANCEL is being written. The pass must
+     * ask again whether anything is readable before judging rid 2's grace — a stale "nothing is
+     * readable" from before that write closed the session under an engine that had answered.
+     */
+    public function testR5bReadabilityIsReAskedAfterACancel(): void
+    {
+        $t = new FakeTransport();
+        $d = new SignalDouble($t, 0.1);
+        $t->feed(F::helloAck());
+        $session = new Session($d, new RequestIdAllocator(0));
+        $session->hello();
+        $conn = new Connection($session, 'default');
+        $x = $conn->scalarAsync('SELECT 1'); // rid 1
+        $y = $conn->scalarAsync('SELECT 2'); // rid 2
+        $session->setDeadline(1, microtime(true) + 0.3);
+        $session->setDeadline(2, microtime(true) + 0.01);
+        usleep(20_000);
+        $session->enforceDeadlines(); // CANCEL rid 2; its grace (0.1 s) starts
+        $this->assertSame([2], F::cancels($t->written));
+        usleep(350_000); // rid 1 has expired, and so has rid 2's grace
+        $d->onWrite = static function (Header $h, \Closure $onReadable) use ($t, $d): void {
+            if (($h->flags & C::FLAG_CANCEL) !== 0 && $h->requestId === 1) {
+                // rid 2's terminal arrives while rid 1's CANCEL is written (the write did not block)
+                $t->feed(Fake::cancelled(2));
+                $d->signal();
+            }
+        };
+        $session->enforceDeadlines();
+        $this->assertFalse($session->isPoisoned(), "rid 2's answer was readable; its grace must not be judged silent");
+        $d->unsignal();
+        $t->feed(Fake::cancelled(1));
+        foreach ([$y, $x] as $f) {
+            try {
+                $f->await();
+            } catch (FerroException) {
+            }
+        }
+        $this->assertFalse($session->hasRequestsInFlight());
     }
 
     /** @return array{0:FakeTransport,1:DuplexDouble,2:Session,3:Connection} */
