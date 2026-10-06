@@ -188,7 +188,8 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 
 | # | Item | State | Notes |
 |---|------|-------|-------|
-| D1 | Fibers multiplexing in `ferro/client` (§10.1) | OPEN | |
+| D1a | Multiplexed session + `Future`/`Ferro\await()` + async `Connection` methods (§10.1) | DONE — SPEC §22.2 (cj) | Fan-out ≈ max(query) under plain FPM (measured live with a sequential control). Limits recorded: in-tx statements settle at once, async does not update `lastInsertId()`, an open stream stays exclusive. |
+| D1b | Fiber suspension: `Ferro\Loop` + Revolt adapter, `FIBERS` feature bit, §16 fan-out bench | OPEN | An `await` inside a Fiber suspends instead of blocking. |
 | D2 | `ferro check`/`gen` + `idempotent` manifest + manifest handshake (§11) | OPEN | The only licensed auto-retry lives here. |
 | D3 | memfd large-payload path behind `MEMFD_RX` (§5.1) | OPEN | |
 | D4 | COPY API | OPEN | |

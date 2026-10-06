@@ -5,6 +5,7 @@ namespace Ferro\Client;
 use Ferro\Client\Error\ConnectionLostException;
 use Ferro\Client\Error\EpochChangedException;
 use Ferro\Client\Error\ErrorMapper;
+use Ferro\Client\Error\FerroException;
 use Ferro\Client\Error\IndeterminateException;
 use Ferro\Client\Error\InvalidTransactionStateException;
 use Ferro\Client\Error\NonRetryableException;
@@ -367,6 +368,90 @@ final class Connection
     public function rows(string $sql, array $params = []): array
     {
         return $this->codec->assocRows($this->dispatch($sql, $params, true, ExecCodec::FETCH_ROWS));
+    }
+
+    // ---- asynchronous calls (M3-D1, SPEC §10.1) ---------------------------------------------------
+
+    /**
+     * {@see query}, asynchronously: the request is written now and its rows are read at
+     * {@see \Ferro\Future::await}. Futures created before any is awaited run concurrently in the
+     * engine over this one socket, so `Ferro\await([...])` over k of them costs about the slowest.
+     *
+     * @template T of object
+     * @param list<mixed> $params
+     * @param class-string<T>|null $dto
+     * @return \Ferro\Future<($dto is null ? list<array<string,mixed>> : list<T>)>
+     */
+    public function queryAsync(string $sql, array $params = [], ?string $dto = null): \Ferro\Future
+    {
+        return $this->dispatchAsync($sql, $params, true, ExecCodec::FETCH_ROWS, function (array $res) use ($dto): array {
+            if ($dto === null) {
+                return $this->codec->assocRows($res);
+            }
+            $out = [];
+            foreach ($res['rows'] as $row) {
+                $out[] = $this->codec->hydrateDto($dto, $res['cols'], $row);
+            }
+            return $out;
+        });
+    }
+
+    /**
+     * {@see queryOne}, asynchronously.
+     *
+     * @template T of object
+     * @param list<mixed> $params
+     * @param class-string<T>|null $dto
+     * @return \Ferro\Future<($dto is null ? array<string,mixed>|null : T|null)>
+     */
+    public function queryOneAsync(string $sql, array $params = [], ?string $dto = null): \Ferro\Future
+    {
+        return $this->dispatchAsync($sql, $params, true, ExecCodec::FETCH_ROWS, function (array $res) use ($dto): array|object|null {
+            $firstRow = $res['rows'][0] ?? null;
+            if ($firstRow === null) {
+                return null;
+            }
+            return $dto === null
+                ? $this->codec->assocRow($res['cols'], $firstRow)
+                : $this->codec->hydrateDto($dto, $res['cols'], $firstRow);
+        });
+    }
+
+    /**
+     * {@see scalar}, asynchronously.
+     *
+     * @param list<mixed> $params
+     * @return \Ferro\Future<mixed>
+     */
+    public function scalarAsync(string $sql, array $params = []): \Ferro\Future
+    {
+        return $this->dispatchAsync($sql, $params, true, ExecCodec::FETCH_ROWS, static function (array $res): mixed {
+            $firstRow = $res['rows'][0] ?? null;
+            return $firstRow === null ? null : ($firstRow[0] ?? null);
+        });
+    }
+
+    /**
+     * {@see rows}, asynchronously.
+     *
+     * @param list<mixed> $params
+     * @return \Ferro\Future<list<array<string,mixed>>>
+     */
+    public function rowsAsync(string $sql, array $params = []): \Ferro\Future
+    {
+        return $this->dispatchAsync($sql, $params, true, ExecCodec::FETCH_ROWS, fn (array $res): array => $this->codec->assocRows($res));
+    }
+
+    /**
+     * {@see exec}, asynchronously: the affected-row count. The fate declaration is the caller's, as
+     * for {@see exec} — an undeclared statement is a WRITE, and a lost write is `Indeterminate`.
+     *
+     * @param list<mixed> $params
+     * @return \Ferro\Future<int>
+     */
+    public function execAsync(string $sql, array $params = [], bool $readonly = false): \Ferro\Future
+    {
+        return $this->dispatchAsync($sql, $params, $readonly, ExecCodec::FETCH_NONE, static fn (array $res): int => $res['affected']);
     }
 
     /**
@@ -1180,17 +1265,109 @@ final class Connection
     }
 
     /**
+     * The asynchronous statement path (M3-D1): write the EXEC now, read and classify its terminal
+     * at `await`, then shape it with `$shape`.
+     *
+     * It runs the SAME fate rules as {@see dispatchAutocommit}, and reuses that method for every
+     * case that needs a second attempt, so there is one retry policy, not two:
+     *  - a lost request is classified with {@see FateClassifier::classifyLoss} (a lost write is
+     *    `Indeterminate`; only a read the policy allows is re-issued, synchronously, at `await`);
+     *  - a server-declared Retryable read is re-issued the same way.
+     *
+     * Two cases settle at once instead of going asynchronous:
+     *  - **inside a transaction.** A statement is part of the transaction's order. Leaving it in
+     *    flight would let the caller's next statement overtake it in the client's view while the
+     *    engine runs them in order.
+     *  - **a session that cannot multiplex**, or a submit that fails (for example while reconnecting a
+     *    closed session). The synchronous path already classifies and recovers from those.
+     *
+     * **`lastInsertId()` is NOT updated by an asynchronous statement.** "The most recent statement"
+     * has no meaning when several are in flight at once. The key is on the raw result shape
+     * ({@see fetchRaw}).
+     *
+     * @template R
+     * @param list<mixed> $params
+     * @param \Closure(array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}): R $shape
+     * @return \Ferro\Future<R>
+     */
+    private function dispatchAsync(string $sql, array $params, bool $readonly, int $fetch, \Closure $shape): \Ferro\Future
+    {
+        if ($this->tx !== null) {
+            return \Ferro\Future::settleNow(fn () => $shape($this->dispatch($sql, $params, $readonly, $fetch)));
+        }
+        $opKind = $readonly ? OpKind::Read : OpKind::Write;
+        try {
+            $session = $this->requestSession($opKind, $readonly);
+        } catch (FerroException $e) {
+            return \Ferro\Future::settleNow(static fn () => throw $e);
+        }
+        if (!$session instanceof MultiplexingSessionInterface) {
+            return \Ferro\Future::settleNow(fn () => $shape($this->dispatchAutocommit($sql, $params, $readonly, $fetch)));
+        }
+        $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, null);
+        try {
+            $rid = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
+        } catch (ConnectionLostException | TransportException) {
+            // Nothing was sent, or the session is gone: the synchronous path reconnects, re-sends
+            // and classifies exactly as it would for a synchronous call.
+            return \Ferro\Future::settleNow(fn () => $shape($this->dispatchAutocommit($sql, $params, $readonly, $fetch)));
+        }
+
+        return new \Ferro\Future(function () use ($session, $rid, $opKind, $readonly, $sql, $params, $fetch, $shape): mixed {
+            try {
+                $outcome = $session->awaitTerminal($rid);
+            } catch (ConnectionLostException | TransportException $e) {
+                $fate = $this->fate->classifyLoss(
+                    $opKind,
+                    $readonly,
+                    $e->getMessage(),
+                    $e instanceof ConnectionLostException ? $e->errorPayload() : null,
+                    $this->reconnect?->lastEpochChanged() ?? false,
+                    sent: self::wasSent($e),
+                );
+                if ($this->reconnect !== null
+                    && 1 < $this->policy->maxAttempts
+                    && $this->fate->mayRetryException($fate, $readonly, $opKind)
+                ) {
+                    // The same re-issue the synchronous path performs, counted as its second attempt.
+                    // {@see requestSession} replaces the session if this loss closed it.
+                    return $shape($this->dispatchAutocommit($sql, $params, $readonly, $fetch, 1));
+                }
+                throw $fate;
+            } catch (CodecException $e) {
+                throw new ProtocolException('failed to decode SQL terminal: ' . $e->getMessage(), 0, $e);
+            }
+            if ($outcome->isOk()) {
+                return $shape($this->codec->decode($outcome));
+            }
+            $ex = ErrorMapper::fromOutcome($outcome);
+            if ($this->reconnect !== null
+                && 1 < $this->policy->maxAttempts
+                && $this->fate->mayRetryException($ex, $readonly, $opKind)
+            ) {
+                return $shape($this->dispatchAutocommit($sql, $params, $readonly, $fetch, 1));
+            }
+            throw $ex;
+        });
+    }
+
+    /**
      * Send one autocommit EXEC and decode it, transparently reconnecting + re-issuing a Retryable
      * READ (bounded by the policy). A lost WRITE / Indeterminate / exhausted read propagates.
      *
      * @param list<mixed> $params
      * @return array{cols: list<string>, rows: list<list<mixed>>, affected: int, last_insert_id: int|string|null}
      */
-    private function dispatchAutocommit(string $sql, array $params, bool $readonly, int $fetch): array
-    {
+    private function dispatchAutocommit(
+        string $sql,
+        array $params,
+        bool $readonly,
+        int $fetch,
+        int $startAttempt = 0,
+    ): array {
         $opKind = $readonly ? OpKind::Read : OpKind::Write;
         $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, null);
-        $attempt = 0;
+        $attempt = $startAttempt;
 
         while (true) {
             try {
