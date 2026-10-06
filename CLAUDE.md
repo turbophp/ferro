@@ -24,7 +24,7 @@ Now **M2 / Phase C (Eloquent, SQLite backend, observability, DBAL ^3.8 bridge)**
 
 **M3 is complete (2026-10-06)** — every Phase D row is merged; see `docs/dev-loop/LEDGER.md` (Phase D) for the record.
 
-**Owner decisions of 2026-10-06 (SPEC §21, §22.2 (de)):** D22 ratified with two amendments (default store table `ferro_jobs`; store kinds with opaque-bytes tokens and job ids), so G1 may start; O-F5c settled as D23 (F5c unblocked); D18 clarified to its clause 3; HTTP/2 (F5b, F1b's HTTP/2 premises) and the MSSQL backend (E1) deferred past v1, with `HTTP=auto` refused in v1.
+**Owner decisions of 2026-10-06 (SPEC §21, §22.2 (de)):** D22 ratified with two amendments (default store table `ferro_jobs`; store kinds with opaque-bytes tokens), job ids opaque bytes by D24, so G1 may start; O-F5c settled as D23 (F5c unblocked); D18 clarified to its clause 3; HTTP/2 (F5b, F1b's HTTP/2 premises) and the MSSQL backend (E1) deferred past v1, with `HTTP=auto` refused in v1.
 
 ## What Ferro is
 
