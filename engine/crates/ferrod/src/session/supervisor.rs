@@ -114,10 +114,10 @@ pub async fn supervise_with(
     registry.remove(id);
 }
 
-/// The success terminal for `body`: inline, or — when `oob_threshold` is `Some(t)` and the inline
-/// payload (`Outcome::Ok` envelope + `body`) would be at least `t` bytes — an `OOB_FD` terminal
-/// whose payload is moved into a sealed memfd (`session::oob`). A memfd that cannot be made falls
-/// back to the inline terminal: the payload is still in hand, so the client sees the same outcome.
+/// The success terminal for `body`, always built INLINE here. When `oob_threshold` is `Some(t)` and
+/// the inline payload (`Outcome::Ok` envelope + `body`) is at least `t` bytes, it is marked `oob`:
+/// the writer moves its payload into a sealed memfd just before sending it (`session::oob`), so the
+/// engine never holds a memfd for a terminal that is merely queued (review F2).
 fn ok_terminal(
     service: u16,
     method: u16,
@@ -125,35 +125,13 @@ fn ok_terminal(
     body: &[u8],
     oob_threshold: Option<usize>,
 ) -> ControlMsg {
-    if let Some(threshold) = oob_threshold
-        && body.len() + super::oob::ENVELOPE_LEN >= threshold
-    {
-        match super::oob::seal_payload(body) {
-            Ok((fd, len)) => {
-                let frame = build_terminal_frame(
-                    service,
-                    method,
-                    id,
-                    TerminalPayload::Oob(super::oob::oob_ref(len)),
-                );
-                return ControlMsg {
-                    frame,
-                    cap: None,
-                    fd: Some(fd),
-                };
-            }
-            Err(e) => {
-                super::oob::COUNTERS.record_fallback();
-                tracing::warn!(error = %e, "could not build an OOB memfd; sending the terminal inline");
-            }
-        }
+    let frame = build_terminal_frame(service, method, id, Outcome::Ok(body.to_vec()));
+    let oob = oob_threshold.is_some_and(|threshold| frame.payload.len() >= threshold);
+    ControlMsg {
+        frame,
+        cap: None,
+        oob,
     }
-    ControlMsg::bare(build_terminal_frame(
-        service,
-        method,
-        id,
-        Outcome::Ok(body.to_vec()),
-    ))
 }
 
 /// What a terminal frame carries: its `Outcome` inline (every terminal before M3-D3, and every
@@ -224,35 +202,29 @@ pub(crate) fn build_terminal_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::oob;
 
-    /// The threshold is on the INLINE PAYLOAD (envelope + body), inclusive: a body exactly
-    /// `threshold - ENVELOPE_LEN` bytes long goes out of band, one byte shorter stays inline, and no
-    /// threshold at all (a session without `MEMFD_RX`) never does.
+    /// The threshold is on the INLINE PAYLOAD (envelope + body), inclusive: a body whose inline
+    /// payload is exactly `threshold` bytes is marked out of band, one byte shorter is not, and no
+    /// threshold at all (a session without `MEMFD_RX`) never is. The frame itself is ALWAYS the
+    /// inline terminal — the writer makes the memfd, not the supervisor (review F2).
     #[test]
     fn the_oob_threshold_is_the_inline_payload_size_inclusive() {
         let threshold = 4096;
-        let at = vec![0xc0; threshold - oob::ENVELOPE_LEN];
-        let below = vec![0xc0; threshold - oob::ENVELOPE_LEN - 1];
+        let envelope = Outcome::Ok(Vec::new()).encode().len();
+        let at = vec![0xc0; threshold - envelope];
+        let below = vec![0xc0; threshold - envelope - 1];
 
         let msg = ok_terminal(2, 1, 9, &at, Some(threshold));
-        assert_eq!(msg.frame.header.flags, flags::END | flags::OOB_FD);
-        let fd = msg.fd.expect("an OOB terminal carries its fd");
-        let r = OobRef::decode(&msg.frame.payload).expect("an OobRef payload");
-        assert_eq!(r.len as usize, threshold);
-        assert_eq!(
-            oob::read_back(fd, r.len).unwrap(),
-            Outcome::Ok(at.clone()).encode(),
-            "the memfd holds exactly the inline payload"
-        );
+        assert!(msg.oob, "at the threshold: out of band");
+        assert_eq!(msg.frame.header.flags, flags::END, "built inline");
+        assert_eq!(msg.frame.payload.len(), threshold);
+        assert_eq!(msg.frame.payload.to_vec(), Outcome::Ok(at.clone()).encode());
 
         let msg = ok_terminal(2, 1, 9, &below, Some(threshold));
-        assert_eq!(msg.frame.header.flags, flags::END);
-        assert!(msg.fd.is_none());
+        assert!(!msg.oob, "one byte below: inline");
         assert_eq!(msg.frame.payload.to_vec(), Outcome::Ok(below).encode());
 
         let msg = ok_terminal(2, 1, 9, &at, None);
-        assert_eq!(msg.frame.header.flags, flags::END, "no MEMFD_RX, never OOB");
-        assert!(msg.fd.is_none());
+        assert!(!msg.oob, "no MEMFD_RX, never OOB");
     }
 }

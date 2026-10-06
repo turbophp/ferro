@@ -1,5 +1,3 @@
-use std::os::fd::OwnedFd;
-
 use bytes::{Buf, Bytes, BytesMut};
 use ferro_proto::consts::MAX_FRAME_PAYLOAD;
 use ferro_proto::header::{HEADER_LEN, Header};
@@ -42,15 +40,18 @@ pub struct OutFrame {
 /// `Some(guard)`; because the guard travels IN the message, a cancelled/failed enqueue drops the
 /// message and releases the reservation (no leak), and there is exactly one release, on the drop.
 ///
-/// `fd` (M3-D3) is the sealed memfd an `OOB_FD` terminal names (`session::oob`). It is `Some` on
-/// exactly the frames whose header sets `OOB_FD`, and the writer sends it with `SCM_RIGHTS` attached
-/// to that frame's first byte, then drops it — closing the engine's copy once the kernel holds the
-/// in-flight reference.
+/// `oob` (M3-D3) marks a SUCCESS terminal the writer may send out of band (`session::oob`): the
+/// frame is the ordinary inline terminal, and the WRITER — immediately before sending it — copies its
+/// payload into a sealed memfd and sends an `OOB_FD` frame instead, falling back to this very frame
+/// if the memfd cannot be made or the kernel refuses the fd. A queued terminal is therefore heap,
+/// exactly as an inline one is, and the engine holds at most one OOB memfd per session at a time
+/// (review F2: a memfd made when the HANDLER finished sat in the engine's fd table for as long as
+/// the client took to read, so one non-reading session could exhaust `RLIMIT_NOFILE`).
 #[derive(Debug)]
 pub struct ControlMsg {
     pub frame: OutFrame,
     pub cap: Option<CapReserve>,
-    pub fd: Option<OwnedFd>,
+    pub oob: bool,
 }
 
 impl ControlMsg {
@@ -60,7 +61,7 @@ impl ControlMsg {
         ControlMsg {
             frame,
             cap: None,
-            fd: None,
+            oob: false,
         }
     }
 }

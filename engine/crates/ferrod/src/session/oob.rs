@@ -6,17 +6,22 @@
 //! **sealed** memfd instead, and the terminal frame (`END | OOB_FD`) carries an [`OobRef`] naming it.
 //! The fd rides `SCM_RIGHTS` on the session's own Unix socket.
 //!
-//! **What moves and what does not.** The handler still builds the encoded `ExecOk` body in the heap,
-//! exactly as the inline path does; [`seal_payload`] then writes the 2-byte `Outcome` envelope and
-//! that body straight into the memfd. That replaces the inline path's later copies — the
-//! supervisor's `Outcome::Ok(body.to_vec())`, `Outcome::encode`'s splice, and the writer's frame
-//! buffer — with one copy into shared memory, and the heap body is freed when the supervisor
-//! returns, without waiting for the client to read anything. The memfd's pages are kernel shmem,
-//! still CHARGED to `ferrod`'s memory cgroup until the client closes its fd; what the engine gets
-//! back is its heap and its writer: a multi-megabyte terminal no longer occupies the single ordered
-//! writer for as long as the client takes to drain it, so the other requests multiplexed on the
-//! session are not queued behind it. The result ceiling is unchanged (a buffered result still has
-//! to fit one frame's `MAX_FRAME_PAYLOAD`), because §5.1 permits no difference but throughput.
+//! **What moves and what does not, and WHEN.** The handler still builds the encoded `ExecOk` body
+//! in the heap, and the supervisor still builds the ordinary inline terminal from it, merely marking
+//! it `oob` (`ControlMsg::oob`). The memfd is made by the WRITER, immediately before the terminal is
+//! sent: [`seal_payload`] copies the frame's payload into it, the frame goes out with the fd, and
+//! the engine's copy of the fd is closed. So a terminal waiting in the control channel is heap,
+//! exactly as an inline one is, and the engine holds at most ONE memfd per session at any moment —
+//! a memfd made when the handler finished would sit in the engine's fd table for as long as the
+//! client took to read, and one non-reading session could then exhaust `RLIMIT_NOFILE` and lock
+//! every other tenant out of `accept` (review F2, reproduced). What the engine gets back is its
+//! writer: a multi-megabyte terminal leaves the socket as one short frame, so the other requests
+//! multiplexed on the session are not queued behind the client draining it. The memfd's pages are
+//! kernel shmem, not `ferrod` RSS, and they live as long as SOME process holds the fd: once sent,
+//! that is the client's socket receive queue, then the client — so they survive the session's
+//! teardown and even `ferrod`'s exit until the client reads or closes its socket (review F3). The
+//! result ceiling is unchanged (a buffered result still has to fit one frame's
+//! `MAX_FRAME_PAYLOAD`), because §5.1 permits no difference but throughput.
 //!
 //! **Associating the fd with its frame is the classic bug, and the rule here makes it impossible to
 //! get wrong on either side.** On a `SOCK_STREAM` Unix socket ancillary data is attached to the
@@ -32,7 +37,7 @@
 //! (closes) any fd attached to bytes read that way.
 
 use std::fs::File;
-use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
+use std::io::{self, IoSlice, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,7 +48,7 @@ use tokio::io::Interest;
 use tokio::net::UnixStream;
 
 use ferro_proto::consts::oob_encoding;
-use ferro_proto::messages::{OobRef, Outcome};
+use ferro_proto::messages::OobRef;
 
 /// The seals every OOB memfd carries before its fd leaves the engine: its size can neither shrink
 /// nor grow, its bytes cannot be written, and no seal can be removed or added. A receiver can
@@ -58,35 +63,26 @@ pub const SEALS: SealFlag = SealFlag::F_SEAL_SHRINK
 /// of `n` bytes an inline payload of `n + ENVELOPE_LEN`. Pinned against the codec by a test.
 pub const ENVELOPE_LEN: usize = 2;
 
-/// The 2 bytes `Outcome::Ok(body).encode()` puts in front of `body` (`0x92` fixarray(2), then the
-/// status `outcome::OK`). Derived from the codec rather than restated, and pinned by a test.
-fn outcome_ok_envelope() -> Vec<u8> {
-    // `Outcome::Ok` splices its body after the envelope, so with an EMPTY body what it encodes IS
-    // the envelope.
-    Outcome::Ok(Vec::new()).encode()
-}
-
-/// Write `Outcome::Ok(body)`'s exact encoding into a fresh memfd, seal it, and rewind it.
+/// Copy `payload` — a terminal frame's exact inline payload — into a fresh memfd, seal it, and
+/// rewind it. Returns the sealed fd. The fd is positioned at offset 0, because an `SCM_RIGHTS` fd
+/// shares its OPEN FILE DESCRIPTION — and therefore its file offset — with the engine's copy: a
+/// receiver that reads "from the current position" would otherwise read nothing.
 ///
-/// Returns the sealed fd and the payload length. The fd is positioned at offset 0, because an
-/// `SCM_RIGHTS` fd shares its OPEN FILE DESCRIPTION — and therefore its file offset — with the
-/// engine's copy: a receiver that reads "from the current position" would otherwise read nothing.
-pub fn seal_payload(body: &[u8]) -> io::Result<(OwnedFd, u64)> {
+/// Synchronous: it runs in the writer task right before the send, the same order of work as the
+/// inline path's copy of the payload into the writer's frame buffer, which it replaces.
+pub fn seal_payload(payload: &[u8]) -> io::Result<OwnedFd> {
     let fd = memfd_create(
         c"ferro-oob",
         MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING,
     )
     .map_err(io::Error::from)?;
     let mut file = File::from(fd);
-    let envelope = outcome_ok_envelope();
-    let len = (envelope.len() + body.len()) as u64;
     // `set_len` first so the kernel allocates the size once, instead of growing it write by write.
-    file.set_len(len)?;
-    file.write_all(&envelope)?;
-    file.write_all(body)?;
+    file.set_len(payload.len() as u64)?;
+    file.write_all(payload)?;
     fcntl(file.as_raw_fd(), FcntlArg::F_ADD_SEALS(SEALS)).map_err(io::Error::from)?;
     file.seek(SeekFrom::Start(0))?;
-    Ok((OwnedFd::from(file), len))
+    Ok(OwnedFd::from(file))
 }
 
 /// The `OobRef` an `OOB_FD` terminal carries for a payload of `len` bytes.
@@ -139,22 +135,6 @@ pub fn is_fd_refusal(e: &io::Error) -> bool {
     e.raw_os_error() == Some(nix::errno::Errno::ETOOMANYREFS as i32)
 }
 
-/// Read a sealed OOB payload back into memory — the writer's fallback when the kernel refuses to
-/// pass the fd. Reads from offset 0 whatever the shared offset is.
-pub fn read_back(fd: OwnedFd, len: u64) -> io::Result<Vec<u8>> {
-    let mut file = File::from(fd);
-    file.seek(SeekFrom::Start(0))?;
-    let mut out = Vec::with_capacity(len as usize);
-    file.take(len).read_to_end(&mut out)?;
-    if out.len() as u64 != len {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "oob payload shorter than recorded",
-        ));
-    }
-    Ok(out)
-}
-
 /// The seals an fd carries (`F_GET_SEALS`). For tests and diagnostics.
 pub fn seals_of(fd: impl AsFd) -> io::Result<SealFlag> {
     let bits = fcntl(fd.as_fd().as_raw_fd(), FcntlArg::F_GET_SEALS).map_err(io::Error::from)?;
@@ -202,16 +182,8 @@ pub static COUNTERS: OobCounters = OobCounters::new();
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_envelope_is_the_two_bytes_outcome_ok_puts_in_front_of_a_body() {
-        assert_eq!(outcome_ok_envelope(), vec![0x92, 0x00]);
-        assert_eq!(outcome_ok_envelope().len(), ENVELOPE_LEN);
-        let body = [0x91, 0x2a];
-        let mut spliced = outcome_ok_envelope();
-        spliced.extend_from_slice(&body);
-        assert_eq!(spliced, Outcome::Ok(body.to_vec()).encode());
-    }
+    use ferro_proto::messages::Outcome;
+    use std::io::Read;
 
     /// The memfd holds EXACTLY the inline payload, is rewound, and carries all four seals — and
     /// the seals are real: a write, a grow and a shrink through the very fd that wrote it all fail.
@@ -222,8 +194,9 @@ mod tests {
             b.extend((0..4096u32).map(|i| (i % 251) as u8));
             b
         };
-        let (fd, len) = seal_payload(&body).expect("seal");
-        assert_eq!(len as usize, body.len() + 2);
+        let payload = Outcome::Ok(body).encode();
+        let fd = seal_payload(&payload).expect("seal");
+        let len = payload.len() as u64;
         let seals = seals_of(&fd).expect("F_GET_SEALS");
         // Against the four seals spelled out, not against `SEALS` — comparing a constant with
         // itself would pass whatever it held.
@@ -244,7 +217,7 @@ mod tests {
         );
         let mut got = Vec::new();
         file.read_to_end(&mut got).unwrap();
-        assert_eq!(got, Outcome::Ok(body.clone()).encode());
+        assert_eq!(got, payload);
 
         // An OVERWRITE inside the current size, so only F_SEAL_WRITE can refuse it — a write at
         // EOF would also be refused by F_SEAL_GROW and prove nothing about the write seal (a
@@ -263,15 +236,6 @@ mod tests {
             fcntl(file.as_raw_fd(), FcntlArg::F_ADD_SEALS(SealFlag::empty())).is_err(),
             "F_SEAL_SEAL refuses any further seal change"
         );
-    }
-
-    #[test]
-    fn read_back_returns_the_payload_whatever_the_shared_offset() {
-        let (fd, len) = seal_payload(&[0xa1, b'z']).unwrap();
-        let mut file = File::from(fd);
-        file.seek(SeekFrom::End(0)).unwrap();
-        let got = read_back(OwnedFd::from(file), len).unwrap();
-        assert_eq!(got, vec![0x92, 0x00, 0xa1, b'z']);
     }
 
     #[test]
