@@ -4,6 +4,7 @@ namespace Ferro\Http\Error;
 
 use Ferro\Client\Error\CancelledException;
 use Ferro\Http\FateClass;
+use Ferro\Http\ResponseHead;
 use Ferro\Protocol\Generated\Constants as C;
 
 /**
@@ -18,9 +19,18 @@ use Ferro\Protocol\Generated\Constants as C;
  */
 final class HttpCancelledException extends CancelledException implements HttpException
 {
-    public function __construct()
+    public function __construct(private readonly ?ResponseHead $head = null)
     {
         parent::__construct('HTTP request was cancelled by the engine (Outcome::Cancelled)');
+    }
+
+    /** The head that arrived before the cancel, if one did. */
+    public function head(): ?ResponseHead { return $this->head; }
+
+    /** `true` after a 2xx head (the request was applied), `null` otherwise — never `false`. */
+    public function wasApplied(): ?bool
+    {
+        return $this->head !== null && $this->head->status >= 200 && $this->head->status < 300 ? true : null;
     }
 
     public function cause(): string { return C::HTTP_CAUSE_CANCELLED; }

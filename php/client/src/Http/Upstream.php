@@ -123,6 +123,7 @@ final class Upstream
         try {
             [$session, $exchange] = $this->send(
                 $method, $target, $headers, $body, $timeoutMs, $connectTimeoutMs, $readTimeoutMs, $idempotent, $decode, $route,
+                buffered: true,
             );
         } catch (\Throwable $e) {
             return Future::settleNow(static fn () => throw $e);
@@ -197,6 +198,7 @@ final class Upstream
         ?bool $idempotent,
         bool $decode,
         ?string $route,
+        bool $buffered = false,
     ): array {
         $declaredIdempotent = $idempotent === true;
         $request = [
@@ -243,10 +245,16 @@ final class Upstream
         } catch (TransportException $e) {
             throw HttpFates::linkLost(!$e->requestUnsent(), $declaredIdempotent, null, $e->getMessage());
         }
+        if ($buffered) {
+            // Its body is held whole anyway: its credit goes back as frames are filed, so an
+            // unawaited Future still runs to its terminal and frees its slot (review F2).
+            $session->creditOnReceipt($rid);
+        }
         if ($timeoutMs !== null) {
+            // Until its HEAD: from then on the engine bounds the exchange (review F1).
             $session->setDeadline($rid, microtime(true) + $timeoutMs / 1000 + Ferro::DEADLINE_MARGIN);
         }
-        return [$session, new HttpExchange($session, $rid, $declaredIdempotent, $this->decodePacker)];
+        return [$session, new HttpExchange($session, $rid, $declaredIdempotent, $this->decodePacker, $buffered)];
     }
 
     /**

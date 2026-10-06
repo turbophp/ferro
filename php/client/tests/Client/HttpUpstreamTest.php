@@ -3,6 +3,7 @@ declare(strict_types=1);
 namespace Ferro\Tests\Client;
 
 use Ferro\Client\Connection;
+use Ferro\Client\Error\InFlightLimitException;
 use Ferro\Client\Error\NonRetryableException;
 use Ferro\Client\Error\ProtocolException;
 use Ferro\Client\Error\TransportException;
@@ -12,6 +13,7 @@ use Ferro\Client\RequestIdAllocator;
 use Ferro\Client\RetryPolicy;
 use Ferro\Client\Session;
 use Ferro\Client\TraceContext;
+use Ferro\Client\TransportInterface;
 use Ferro\Http\Error\HttpCancelledException;
 use Ferro\Http\Error\HttpException;
 use Ferro\Http\Error\HttpIndeterminateException;
@@ -155,12 +157,12 @@ final class HttpUpstreamTest extends TestCase
         }
     }
 
-    public function testCreditIsReturnedFrameForFrameByWhatWasDebited(): void
+    public function testAStreamReturnsCreditFrameForFrameByWhatWasDebited(): void
     {
         $t = new FakeTransport();
         $conn = $this->conn($t);
         $t->feed(F::head(1) . F::body(1, 'abc') . F::body(1, str_repeat('z', 300)) . F::done(1));
-        $conn->upstream('up')->request('GET', '/');
+        $conn->upstream('up')->stream('GET', '/')->body(); // a buffered request batches instead
         $this->assertSame([
             [1, strlen(F::headPayload())],
             [1, strlen(F::bodyPayload('abc'))],
@@ -530,9 +532,6 @@ final class HttpUpstreamTest extends TestCase
         yield 'HEAD flagged STREAM' => [F::frame(C::FLAG_STREAM, C::SERVICE_HTTP, C::METHOD_HTTP_HEAD, 1, F::headPayload())];
         yield 'BODY not flagged STREAM' => [F::head(1) . F::frame(0, C::SERVICE_HTTP, C::METHOD_HTTP_BODY, 1, F::bodyPayload('x'))];
         yield 'a SQL stream frame' => [F::frame(0, C::SERVICE_STREAM, C::METHOD_STREAM_HEAD, 1, F::headPayload())];
-        yield 'status 199' => [F::head(1, 199)];
-        yield 'status 600' => [F::head(1, 600)];
-        yield 'version 12' => [F::head(1, 200, [], false, 12)];
         yield 'a malformed BODY' => [F::head(1) . F::frame(C::FLAG_STREAM, C::SERVICE_HTTP, C::METHOD_HTTP_BODY, 1, "\x91\x01")];
     }
 
@@ -587,5 +586,196 @@ final class HttpUpstreamTest extends TestCase
             $this->assertSame(C::HTTP_CAUSE_FORBIDDEN_UPSTREAM, $e->cause());
         }
         $this->assertSame('nope', F::requests($t->written)[1]['upstream']);
+    }
+
+    // ---- review round (M6-F8): HEAD values, credit and the slot wait, re-entrancy ------------------
+
+    /**
+     * A HEAD whose VALUES the client cannot use is that exchange's failure, never the session's: the
+     * frames are intact, so poisoning would fail every unrelated request on the socket (review LOW).
+     * A 1xx status and an unknown version pass through; the codec, not the client, bounds them.
+     */
+    public function testAHeadStatusThatIsNotAnHttpStatusFailsOnlyItsExchange(): void
+    {
+        $t = new FakeTransport();
+        $conn = $this->conn($t);
+        $http = $conn->upstream('up');
+        $other = $http->requestAsync('GET', '/other');               // rid 1, answered later
+        $t->feed(F::head(2, 600) . F::cancelled(2));                  // rid 2: not an HTTP status
+        try {
+            $http->request('GET', '/bad');
+            $this->fail('expected the exchange to fail');
+        } catch (ProtocolException $e) {
+            $this->assertStringContainsString('600', $e->getMessage());
+        }
+        $this->assertFalse($conn->session()->isPoisoned(), 'only that exchange failed');
+        $this->assertSame([2], F::cancels($t->written), 'it was stopped');
+        $t->feed(F::head(1) . F::body(1, 'fine') . F::done(1));
+        $this->assertSame('fine', $other->await()->body);
+
+        $t->feed(F::head(3, 199, [], false, 12) . F::done(3));
+        $odd = $http->request('GET', '/odd');
+        $this->assertSame([199, 12], [$odd->status, $odd->version]);
+    }
+
+    /**
+     * Review F2(a): a buffered exchange returns its credit as its frames are FILED — here by the
+     * slot wait of a later request, long before its own await — half a window at a time and never
+     * twice, so an unawaited Future runs to its terminal and frees its slot.
+     */
+    public function testABufferedExchangeReturnsCreditAsItsFramesAreFiled(): void
+    {
+        $t = new FakeTransport();
+        $t->feed(F::helloAck());
+        $session = new Session($t, new RequestIdAllocator(0), maxInFlight: 1);
+        $session->hello();
+        $http = (new Connection($session, 'default'))->upstream('up');
+        $first = $http->requestAsync('GET', '/big');                  // rid 1 holds the only slot
+        $half = intdiv(C::DEFAULT_CREDIT_FRAMES, 2);
+        $t->feed(F::head(1));
+        $owedBytes = strlen(F::headPayload());
+        for ($i = 1; $i < C::DEFAULT_CREDIT_FRAMES; ++$i) {           // HEAD + 63 BODY: a whole window
+            $t->feed(F::body(1, 'x'));
+            if ($i < $half) {
+                $owedBytes += strlen(F::bodyPayload('x'));
+            }
+        }
+        $t->feed(F::done(1) . F::head(2) . F::done(2));
+        $second = $http->requestAsync('GET', '/next');                // waits for the slot
+        $updates = F::windowUpdates($t->written, 1);
+        $this->assertSame([$half, $owedBytes], $updates[0] ?? null, 'half a window returned in one update, on receipt');
+        $requestAt = null;
+        $firstUpdateAt = null;
+        foreach (F::written($t->written) as $i => [$h]) {
+            if ($firstUpdateAt === null && $h->service === C::SERVICE_CORE && $h->method === C::METHOD_CORE_WINDOW_UPDATE && $h->requestId === 1) {
+                $firstUpdateAt = $i;
+            }
+            if ($h->service === C::SERVICE_HTTP && $h->method === C::METHOD_HTTP_REQUEST && $h->requestId === 2) {
+                $requestAt = $i;
+            }
+        }
+        $this->assertNotNull($requestAt);
+        $this->assertLessThan($requestAt, $firstUpdateAt, 'credited during the slot wait, before the next REQUEST');
+        $this->assertCount(2, $updates, 'two halves for a whole window');
+        $this->assertSame(C::DEFAULT_CREDIT_FRAMES - 1, strlen($first->await()->body));
+        $this->assertSame(200, $second->await()->status);
+        $this->assertCount(2, F::windowUpdates($t->written, 1), 'never credited again by the awaiter');
+    }
+
+    /**
+     * Review F2(b): when every in-flight slot holds an HTTP stream parked on credit, no slot can
+     * free, so the next request is refused unsent — Retryable — instead of blocking until the
+     * engine's own timeouts. It is NOT a transport failure: a SQL read refused this way does not
+     * reconnect (which would close the session and both streams).
+     */
+    public function testWhenEverySlotIsAStreamParkedOnCreditTheNextRequestIsRefusedNotBlocked(): void
+    {
+        $t = new FakeTransport();
+        $t->feed(F::helloAck());
+        $session = new Session($t, new RequestIdAllocator(0), maxInFlight: 2);
+        $session->hello();
+        $dials = 0;
+        $loop = new ReconnectLoop($session, static function () use (&$dials): Session {
+            ++$dials;
+            throw new TransportException('no dial expected');
+        }, new Backoff(0, 0), 1);
+        $conn = new Connection($session, 'default', reconnect: $loop, policy: RetryPolicy::default());
+        $http = $conn->upstream('up');
+        $t->feed(F::head(1));
+        $a = $http->stream('GET', '/a');
+        $t->feed(F::head(2));
+        $b = $http->stream('GET', '/b');
+        // Each stream's window fills: 64 BODY frames each, unconsumed.
+        for ($i = 0; $i < C::DEFAULT_CREDIT_FRAMES; ++$i) {
+            $t->feed(F::body(1, 'a') . F::body(2, 'b'));
+        }
+        $before = count(F::requests($t->written));
+        $f = $http->requestAsync('GET', '/third');
+        try {
+            $f->await();
+            $this->fail('expected the refusal');
+        } catch (InFlightLimitException $e) {
+            $this->assertStringContainsString('not sent', $e->getMessage());
+            $this->assertSame(C::BRANCH_RETRYABLE, $e->branch());
+        }
+        $this->assertSame($before, count(F::requests($t->written)), 'the REQUEST was never written');
+        try {
+            $conn->scalar('SELECT 1');
+            $this->fail('expected the refusal');
+        } catch (InFlightLimitException) {
+        }
+        $this->assertSame(0, $dials, 'a refused read does not reconnect');
+        $this->assertFalse($session->isPoisoned());
+        // Consuming a stream returns its credit; the streams were never harmed.
+        $it = $a->getIterator();
+        $this->assertSame('a', $it->current());
+        $t->feed(F::done(1) . F::done(2));
+        $n = 1;
+        for ($it->next(); $it->valid(); $it->next()) {
+            ++$n;
+        }
+        $this->assertSame(C::DEFAULT_CREDIT_FRAMES, $n);
+        $this->assertSame(C::DEFAULT_CREDIT_FRAMES, strlen($b->body()));
+    }
+
+    /**
+     * Review LOW (speculation, CONFIRMED): the cycle collector can destroy a partly read stream
+     * while the session is in the middle of reading a frame. Its abandonment must not read — that
+     * would consume the outer read's payload — nor write mid-frame: it discards, and its CANCEL is
+     * written once the read is over.
+     */
+    public function testAStreamCollectedMidReadOnlyDiscardsAndCancelsAfterTheRead(): void
+    {
+        $inner = new FakeTransport();
+        $hooked = new class ($inner) implements TransportInterface {
+            public ?\Closure $onPayloadRead = null;
+
+            public function __construct(public readonly FakeTransport $inner) {}
+
+            public function readExact(int $n): string
+            {
+                $bytes = $this->inner->readExact($n);
+                if ($n !== 16 && $this->onPayloadRead !== null) {
+                    $hook = $this->onPayloadRead;
+                    $this->onPayloadRead = null;
+                    $hook(); // between this frame's header and the rest of the session's handling
+                }
+                return $bytes;
+            }
+
+            public function writeAll(string $bytes): void { $this->inner->writeAll($bytes); }
+
+            public function close(): void { $this->inner->close(); }
+        };
+        $inner->feed(F::helloAck());
+        $session = new Session($hooked, new RequestIdAllocator(0));
+        $session->hello();
+        $conn = new Connection($session, 'default');
+        $inner->feed(F::head(1) . F::body(1, 'one'));
+        $s = $conn->upstream('up')->stream('GET', '/s');
+        $it = $s->getIterator();
+        $this->assertSame('one', $it->current());
+        $cycle = new \stdClass();
+        $cycle->self = $cycle;
+        $cycle->stream = $s;
+        $cycle->it = $it;
+        unset($s, $it, $cycle);
+
+        $inner->feed(self::sqlOk(2, 5));
+        $writesBefore = $inner->writeCalls;
+        $hooked->onPayloadRead = static function () use ($inner, &$writesDuringRead, &$writesBefore): void {
+            gc_collect_cycles(); // destroys the stream mid-read
+            $writesDuringRead = $inner->writeCalls - $writesBefore;
+        };
+        $writesDuringRead = null;
+        $f = $conn->scalarAsync('SELECT 5');
+        $writesBefore = $inner->writeCalls;
+        $this->assertSame(5, $f->await(), 'the outer read was not disturbed');
+        $this->assertSame(0, $writesDuringRead, 'nothing was written in the middle of the read');
+        $this->assertSame([1], F::cancels($inner->written), 'the CANCEL followed the read');
+        $this->assertFalse($session->isPoisoned());
+        $this->assertFalse($session->isPending(1), 'discarded');
+        $inner->feed(F::body(1, 'late') . F::cancelled(1) . self::sqlOk(3, 6));
+        $this->assertSame(6, $conn->scalar('SELECT 6'), 'its late frames were thrown away');
     }
 }

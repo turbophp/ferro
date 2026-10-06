@@ -4,6 +4,7 @@ namespace Ferro\Client;
 
 use Ferro\Client\Error\ConnectionLostException;
 use Ferro\Client\Error\HandshakeException;
+use Ferro\Client\Error\InFlightLimitException;
 use Ferro\Client\Error\ProtocolException;
 use Ferro\Client\Error\TransportException;
 use Ferro\Protocol\Codec;
@@ -88,6 +89,48 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
      * @var array<int, true>
      */
     private array $httpHeadSeen = [];
+
+    /**
+     * Buffered Ferro HTTP exchanges ({@see creditOnReceipt}, M6-F8 review F2): their credit is
+     * returned as each frame is FILED, not when an awaiter consumes it, so an unawaited buffered
+     * Future can never park its exchange on credit and hold an in-flight slot forever.
+     *
+     * @var array<int, true>
+     */
+    private array $creditOnReceipt = [];
+
+    /**
+     * For every other HTTP exchange: the frames and bytes filed for it whose credit has not been
+     * returned yet ({@see sendWindowUpdate}). The engine's window per request is exactly
+     * `DEFAULT_CREDIT_FRAMES` / `DEFAULT_CREDIT_BYTES` (`ferrod` does not configure it), so this
+     * tells the slot wait which exchanges are parked on credit ({@see allInFlightParkedOnCredit}).
+     *
+     * @var array<int, array{0:int,1:int}>
+     */
+    private array $unreturnedCredit = [];
+
+    /**
+     * How many transport operations are in progress (M6-F8 review). A destructor can run in the
+     * middle of one — PHP's cycle collector runs on allocation, anywhere — and an HTTP stream's
+     * abandonment writes a CANCEL and drains. Mid-read, a nested read would consume the bytes the
+     * outer read is waiting for (its {@see $partialHeader}); mid-write, a nested frame would be
+     * spliced into the outer one. So while this is non-zero, abandonment only discards, and its
+     * CANCEL waits in {@see $deferredCancels} until the operation is over.
+     */
+    private int $busy = 0;
+
+    /** @var array<int, true> CANCELs owed once {@see $busy} drops to zero */
+    private array $deferredCancels = [];
+
+    /** @var array<int, array{0:int,1:int}> credit owed to buffered exchanges, written once {@see $busy} drops to zero */
+    private array $deferredCredit = [];
+
+    /** Whether a frame is being read / written right now (a read nested in a write is allowed). */
+    private bool $reading = false;
+
+    private bool $writing = false;
+
+    private bool $flushing = false;
     private bool $handshakeDone = false;
 
     /**
@@ -371,6 +414,18 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     {
         $this->refuseIfDead(true);
         while (count($this->inFlight) >= $this->maxInFlight) {
+            if ($this->allInFlightParkedOnCredit()) {
+                // No slot can ever free: each is an HTTP stream whose window is used up and whose
+                // credit only its holder returns (M6-F8 review F2). Waiting would block until the
+                // engine's own timeouts — 600 s by default — so refuse, unsent. NOT a transport
+                // failure: a lost-link classification would make a read path reconnect, closing a
+                // healthy session and every stream on it.
+                throw new InFlightLimitException(sprintf(
+                    'not sent: all %d in-flight slots on this session are held by HTTP streams parked on '
+                        . 'their credit windows; consume or close one, or use another connection',
+                    count($this->inFlight),
+                ));
+            }
             // This request has not been written: whatever goes wrong while waiting for a slot, it
             // cannot have executed, so every failure here is `requestNotSent` (the C1e-3 rule).
             try {
@@ -433,7 +488,8 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     public function discard(int $requestId): void
     {
         unset($this->inbox[$requestId], $this->deadlines[$requestId], $this->deadlineCancelled[$requestId]);
-        unset($this->httpHeadSeen[$requestId]);
+        unset($this->httpHeadSeen[$requestId], $this->creditOnReceipt[$requestId], $this->unreturnedCredit[$requestId]);
+        unset($this->deferredCredit[$requestId]);
         if (isset($this->inFlight[$requestId])) {
             $this->discarded[$requestId] = true;
         }
@@ -717,6 +773,10 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
 
     public function sendWindowUpdate(int $requestId, int $frames, int $bytes): void
     {
+        if (isset($this->unreturnedCredit[$requestId])) {
+            [$f, $b] = $this->unreturnedCredit[$requestId];
+            $this->unreturnedCredit[$requestId] = [max(0, $f - $frames), max(0, $b - $bytes)];
+        }
         $payload = Message::encode('window_update', ['frames' => $frames, 'bytes' => $bytes], $this->encodePacker);
         $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_WINDOW_UPDATE, $payload, $requestId);
     }
@@ -876,10 +936,11 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
      * `BODY` chunks, then its ONE terminal (`end`, which clears the exchange).
      *
      * Order is checked, not assumed (§23.5): a `BODY` before the `HEAD`, a second `HEAD`, a `HEAD`
-     * flagged `STREAM` or a `BODY` not flagged, a frame of another service, a malformed payload, or a
-     * `HEAD` the engine's own contract forbids (a status outside 200..=599, a version outside
-     * {10, 11, 20}) means the two ends disagree about this exchange. That is a desync like any other
-     * ({@see awaitTerminal}): the session is poisoned and a {@see ProtocolException} thrown. A
+     * flagged `STREAM` or a `BODY` not flagged, a frame of another service, or a payload the codec
+     * refuses means the two ends disagree about the frames themselves. That is a desync like any
+     * other ({@see awaitTerminal}): the session is poisoned and a {@see ProtocolException} thrown.
+     * The HEAD's VALUES are not checked here: a status the client cannot use is that one exchange's
+     * failure, not the session's ({@see \Ferro\Http\HttpExchange::awaitHead}, review LOW). A
      * transport failure or a session-fatal terminal surfaces exactly as {@see awaitTerminal}'s do,
      * for the caller to classify (§23.7.3).
      *
@@ -908,13 +969,6 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         try {
             if ($isHttp && $header->method === C::METHOD_HTTP_HEAD && !$seen && !$streamFlag) {
                 $head = HttpHead::decode($body, $this->decodePacker);
-                if ($head['status'] < 200 || $head['status'] > 599 || !in_array($head['version'], [10, 11, 20], true)) {
-                    throw new CodecException(sprintf(
-                        'HEAD carries status %d / version %d, outside the engine\'s contract (§23.5.2)',
-                        $head['status'],
-                        $head['version'],
-                    ));
-                }
                 $this->httpHeadSeen[$requestId] = true;
                 return ['type' => 'head', 'head' => $head, 'bytes' => strlen($body)];
             }
@@ -948,6 +1002,12 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         if ($this->poisoned !== null || !$this->isPending($requestId)) {
             return;
         }
+        if ($this->busy > 0) {
+            // Re-entered from inside a transport operation (a destructor run by the cycle
+            // collector): a blocking drain here would read the outer read's bytes. Discard only.
+            $this->cancelAndDiscard($requestId);
+            return;
+        }
         if (isset($this->inFlight[$requestId]) && $this->fatal === null) {
             // The terminal has not been read off the wire yet, so the engine may still be running it.
             $this->sendCancel($requestId);
@@ -970,14 +1030,115 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             return;
         }
         if (isset($this->inFlight[$requestId]) && $this->fatal === null) {
-            try {
-                $this->sendCancel($requestId);
-            } catch (TransportException) {
-                // The write failure closed the session; there is nothing left to discard from.
-                return;
+            if ($this->busy > 0) {
+                $this->deferredCancels[$requestId] = true; // written once the operation is over
+            } else {
+                try {
+                    $this->sendCancel($requestId);
+                } catch (TransportException) {
+                    // The write failure closed the session; there is nothing left to discard from.
+                    return;
+                }
             }
         }
         $this->discard($requestId);
+    }
+
+    /**
+     * Return a buffered HTTP exchange's credit as its frames are FILED (M6-F8 review F2) — whoever
+     * reads them off the socket, half a window at a time ({@see fileHttpFrame}) — instead of when
+     * its awaiter consumes them. A buffered
+     * response is held whole anyway, so this costs no memory bound it had, and it means an
+     * unawaited Future always runs to its terminal and frees its in-flight slot. Call it right after
+     * {@see submitHttp}, before anything can read the exchange's frames.
+     */
+    public function creditOnReceipt(int $requestId): void
+    {
+        if (isset($this->inFlight[$requestId])) {
+            $this->creditOnReceipt[$requestId] = true;
+        }
+    }
+
+    /**
+     * Whether every in-flight request is an HTTP exchange parked on credit: its window has no frame
+     * left, or less than one maximal `BODY` frame of bytes. `BODY` chunks are at most one window
+     * over its frame count (`DEFAULT_CREDIT_BYTES / DEFAULT_CREDIT_FRAMES`, §23.9.1), plus the
+     * msgpack envelope. Conservative in one direction only: an exchange the engine could still fill
+     * with a SHORT chunk may be counted as parked — which matters only when it and every other slot
+     * hold unconsumed HTTP streams, and then refusing is the useful answer.
+     */
+    private function allInFlightParkedOnCredit(): bool
+    {
+        if ($this->inFlight === []) {
+            return false;
+        }
+        $maxBodyFrame = intdiv(C::DEFAULT_CREDIT_BYTES, C::DEFAULT_CREDIT_FRAMES) + 16;
+        foreach ($this->inFlight as $rid => $_) {
+            $owed = $this->unreturnedCredit[$rid] ?? null;
+            if ($owed === null || isset($this->creditOnReceipt[$rid]) || isset($this->discarded[$rid])
+                || isset($this->deadlineCancelled[$rid])) {
+                return false; // not credit-gated by its holder, or already told to stop
+            }
+            if ($owed[0] < C::DEFAULT_CREDIT_FRAMES && C::DEFAULT_CREDIT_BYTES - $owed[1] >= $maxBodyFrame) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Write what had to wait for the transport to be idle: CANCELs a destructor asked for, and the
+     * credit owed to buffered exchanges. Never throws; a write that fails closes the session, and
+     * every pending request meets that at its own await.
+     */
+    private function flushDeferred(): void
+    {
+        if ($this->busy > 0 || $this->flushing || ($this->deferredCancels === [] && $this->deferredCredit === [])) {
+            return;
+        }
+        $this->flushing = true;
+        try {
+            while ($this->deferredCancels !== [] || $this->deferredCredit !== []) {
+                if ($this->poisoned !== null || $this->fatal !== null) {
+                    $this->deferredCancels = $this->deferredCredit = [];
+                    return;
+                }
+                foreach (array_keys($this->deferredCancels) as $rid) {
+                    unset($this->deferredCancels[$rid]);
+                    if (isset($this->inFlight[$rid])) { // else its terminal arrived meanwhile
+                        $this->sendCancel($rid);
+                    }
+                }
+                foreach ($this->deferredCredit as $rid => [$f, $b]) {
+                    unset($this->deferredCredit[$rid]);
+                    if (isset($this->inFlight[$rid])) {
+                        $payload = Message::encode('window_update', ['frames' => $f, 'bytes' => $b], $this->encodePacker);
+                        $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_WINDOW_UPDATE, $payload, $rid);
+                    }
+                }
+            }
+        } catch (TransportException) {
+            $this->deferredCancels = $this->deferredCredit = [];
+        } finally {
+            $this->flushing = false;
+        }
+    }
+
+    /**
+     * While a write cannot progress and the engine has bytes for us: read (and file) at most ONE
+     * frame, waiting no longer than 50 ms for the rest of it, so the engine's writer drains and its
+     * reader comes back to our bytes ({@see DuplexTransportInterface}). A frame cut short by the 50 ms
+     * is kept and finished by the next read. A read failure fails the write; a desync is one.
+     */
+    private function readDuringWrite(): void
+    {
+        try {
+            $this->pump(microtime(true) + 0.05);
+        } catch (DeadlineSignal) {
+            // the rest of a frame is not here yet: back to writing
+        } catch (ProtocolException $e) {
+            throw new TransportException('the session desynchronised while a frame was being written: ' . $e->getMessage());
+        }
     }
 
     /**
@@ -1003,12 +1164,28 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     ): void {
         $this->refuseIfDead($isRequest);
         $header = new Header($flags, $service, $method, $requestId, strlen($payload));
+        $frame = $this->codec->encodeFrame($header, $payload);
+        // Keep reading while the write cannot progress — unless this write is itself happening
+        // inside a read (a liveness PING), where a nested read would take that read's bytes.
+        $duplex = !$this->reading && !$this->writing;
+        ++$this->busy;
+        $wasWriting = $this->writing;
+        $this->writing = true;
         try {
-            $this->transport->writeAll($this->codec->encodeFrame($header, $payload));
+            if ($duplex && $this->transport instanceof DuplexTransportInterface) {
+                $this->transport->writeAllReading($frame, $this->readDuringWrite(...));
+            } else {
+                $this->transport->writeAll($frame);
+            }
         } catch (TransportException $e) {
+            $this->writing = $wasWriting;
+            --$this->busy;
             $this->poison($e);
             throw $isRequest ? TransportException::requestNotSent($e->getMessage(), $e) : $e;
         }
+        $this->writing = $wasWriting;
+        --$this->busy;
+        $this->flushDeferred();
     }
 
     /**
@@ -1083,6 +1260,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         } finally {
             // After filing, so an observer that looks finds the frame where its awaiter will.
             $this->notify($header->requestId);
+            $this->flushDeferred(); // the credit this frame may have made owed
         }
     }
 
@@ -1129,8 +1307,47 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         }
         if ($isEnd) {
             unset($this->inFlight[$rid], $this->deadlines[$rid], $this->deadlineCancelled[$rid]);
+            unset($this->creditOnReceipt[$rid], $this->unreturnedCredit[$rid]);
         }
         $this->inbox[$rid][] = [$header, $body];
+        if (!$isEnd && $header->service === C::SERVICE_HTTP
+            && ($header->method === C::METHOD_HTTP_HEAD || $header->method === C::METHOD_HTTP_BODY)) {
+            $this->fileHttpFrame($rid, $header->method, strlen($body));
+        }
+    }
+
+    /**
+     * Bookkeeping for a Ferro HTTP `HEAD`/`BODY` just filed (M6-F8 review F1, F2).
+     *
+     * **A `HEAD` ends the request's client deadline.** From the head on, the ENGINE bounds the
+     * exchange (`timeout_ms` covers the body, and its terminal is not credit-gated), and a dead
+     * engine is caught by PING liveness — which is how D1c already treats a SQL stream. Kept, the
+     * backstop would measure the CONSUMER's wall time: a caller reading a completed response
+     * slowly would CANCEL it and close the session under every other request on it.
+     *
+     * Credit: every frame is recorded as owed. A buffered exchange's owed credit is returned as soon
+     * as half its window is owed — in ONE `WINDOW_UPDATE`, not one per frame. Per frame, 256
+     * unawaited exchanges made the client write ~16 k updates while `ferrod`'s session reader was
+     * parked behind their queued frames (it reserves a control-channel permit inline for each new
+     * request), filling the socket's send buffer: the client blocked in a write, stopped reading,
+     * and the engine's writer could never drain — a deadlock (found by this round's own live test).
+     * Half a window at a time bounds those writes to about two per exchange per window, and the
+     * engine always has the other half to keep sending.
+     */
+    private function fileHttpFrame(int $rid, int $method, int $bytes): void
+    {
+        if ($method === C::METHOD_HTTP_HEAD) {
+            unset($this->deadlines[$rid], $this->deadlineCancelled[$rid]);
+        }
+        [$f, $b] = $this->unreturnedCredit[$rid] ?? [0, 0];
+        $this->unreturnedCredit[$rid] = [$f + 1, $b + $bytes];
+        if (isset($this->creditOnReceipt[$rid])
+            && ($f + 1 >= intdiv(C::DEFAULT_CREDIT_FRAMES, 2) || $b + $bytes >= intdiv(C::DEFAULT_CREDIT_BYTES, 2))) {
+            // Written after this read is over ({@see flushDeferred}), never from inside it.
+            $this->unreturnedCredit[$rid] = [0, 0];
+            [$df, $db] = $this->deferredCredit[$rid] ?? [0, 0];
+            $this->deferredCredit[$rid] = [$df + $f + 1, $db + $b + $bytes];
+        }
     }
 
     /**
@@ -1203,9 +1420,15 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
      */
     private function readFrame(?float $until = null): array
     {
+        ++$this->busy;
+        $wasReading = $this->reading;
+        $this->reading = true;
         try {
             return $this->readFrameWithin($until);
         } finally {
+            $this->reading = $wasReading;
+            --$this->busy;
+            $this->flushDeferred();
             // A deadline-shortened wait never outlives this read (M3-D1c review F2): the transport
             // re-applies its full timeout before every write as well, because PHP's socket stream
             // bounds writes with the same timeout.
@@ -1274,6 +1497,9 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
      */
     private function onSilence(): void
     {
+        if ($this->writing) {
+            return; // a read nested in a write: the write's own bound applies, and nothing may be written mid-frame
+        }
         $timeout = $this->transport instanceof SelectableTransportInterface ? $this->transport->readTimeout() : 0.0;
         if ($this->fatal !== null) {
             // The engine said the session is over and promised to close it; a PING cannot be sent
@@ -1337,6 +1563,24 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         }
     }
 
+    /**
+     * Whether a read now would not wait: a frame partly read, bytes in PHP's stream buffer, or the
+     * socket readable. Never throws; a transport it cannot ask says no.
+     */
+    private function readableNow(): bool
+    {
+        if ($this->partialHeader !== null || $this->bufferedBytes() > 0) {
+            return true;
+        }
+        $stream = $this->selectableStream();
+        if (!is_resource($stream)) {
+            return false;
+        }
+        $r = [$stream];
+        $w = $e = null;
+        return @stream_select($r, $w, $e, 0, 0) > 0;
+    }
+
     /** The nearest pending request deadline, or null. */
     public function nearestDeadline(): ?float
     {
@@ -1359,9 +1603,16 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             return;
         }
         $now = microtime(true);
+        $readable = null;
         foreach ($this->deadlines as $rid => $at) {
             if ($now < $at) {
                 continue;
+            }
+            // The backstop judges the engine's SILENCE, not the caller's wall time (M6-F8 review
+            // F1): bytes already waiting may be this request's answer, so read them first.
+            $readable ??= $this->readableNow();
+            if ($readable) {
+                return;
             }
             if (!isset($this->deadlineCancelled[$rid])) {
                 $this->deadlineCancelled[$rid] = true;

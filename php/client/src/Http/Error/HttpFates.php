@@ -34,7 +34,7 @@ final class HttpFates
     public static function fromOutcome(Outcome $outcome, ?ResponseHead $head): FerroException
     {
         if ($outcome->isCancelled()) {
-            return new HttpCancelledException();
+            return new HttpCancelledException($head);
         }
         if (!$outcome->isError()) {
             return new ProtocolException('HttpFates::fromOutcome called on an Ok outcome');

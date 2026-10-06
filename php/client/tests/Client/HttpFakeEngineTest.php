@@ -255,4 +255,129 @@ final class HttpFakeEngineTest extends TestCase
             $this->assertSame([], $left, 'a Revolt callback outlived the test');
         }
     }
+
+    // ---- review F1: the backstop judges the engine's silence, never the caller's wall time ----------
+
+    /**
+     * The reviewer's reproduction: a response the engine COMPLETED (HEAD, 30 BODY, Ok END sent at
+     * once) read slowly — first after 2.3 s, then 100 ms per chunk — with `timeoutMs: 100` and a 0.5 s
+     * read timeout, beside an unrelated in-flight POST. It used to CANCEL the finished stream, close
+     * the session, and fail the stream as `ResponseIncomplete` and the POST as Indeterminate.
+     */
+    public function testASlowConsumerOfACompletedStreamDoesNotTripTheBackstop(): void
+    {
+        $f = $this->engine(10.0, static function (Header $h, string $p, \Closure $send): void {
+            if (Fake::isPing($h)) {
+                $send(0, Fake::pong($h->requestId));
+                return;
+            }
+            if (self::target($h, $p) === '/s') {
+                $frames = F::head($h->requestId);
+                for ($i = 0; $i < 30; ++$i) {
+                    $frames .= F::body($h->requestId, "c{$i};");
+                }
+                $send(0, $frames . F::done($h->requestId));
+            }
+            // '/hold' is never answered.
+        });
+        $conn = self::connect($f, 0.5);
+        $http = $conn->upstream('up');
+        $post = $http->requestAsync('POST', '/hold', body: 'x');
+        $s = $http->stream('GET', '/s', timeoutMs: 100);
+        usleep(2_300_000);
+        $n = 0;
+        foreach ($s as $chunk) {
+            $this->assertSame("c{$n};", $chunk);
+            ++$n;
+            usleep(100_000);
+        }
+        $this->assertSame(30, $n);
+        $this->assertTrue($s->isComplete());
+        $this->assertFalse($conn->session()->isPoisoned(), 'the unrelated POST is still in flight');
+        $this->assertFalse($post->isSettled());
+        unset($post);
+    }
+
+    /**
+     * After its HEAD a request has no client deadline: the engine bounds it, and PING liveness bounds
+     * a dead engine. A live engine whose body pauses past `timeoutMs` + 2 s + the read timeout still
+     * completes (the scripted engine ignores `timeout_ms`, which a real one never does).
+     */
+    public function testAfterItsHeadAStreamIsBoundedByLivenessNotByTheBackstop(): void
+    {
+        $f = $this->engine(10.0, static function (Header $h, string $p, \Closure $send): void {
+            if (Fake::isPing($h)) {
+                $send(0, Fake::pong($h->requestId));
+            } elseif (Fake::isCancel($h)) {
+                $send(0, F::cancelled($h->requestId));
+            } elseif (self::target($h, $p) === '/pause') {
+                $rid = $h->requestId;
+                $send(0.0, F::head($rid) . F::body($rid, 'a'));
+                $send(3.2, F::body($rid, 'b') . F::done($rid));
+            }
+        });
+        $conn = self::connect($f, 0.5);
+        $s = $conn->upstream('up')->stream('GET', '/pause', timeoutMs: 100);
+        $this->assertSame('ab', $s->body());
+        $this->assertFalse($conn->session()->isPoisoned());
+    }
+
+    /**
+     * A buffered request awaited LATE — after `timeoutMs` + 2 s + the read timeout — whose head is
+     * already waiting on the socket: that is an answer, so nothing is CANCELled. It used to CANCEL
+     * at the await, and an engine that honours it cut off the body the caller was about to read.
+     */
+    public function testABufferedRequestAwaitedLateIsNotCancelledWhenItsAnswerIsWaiting(): void
+    {
+        $f = $this->engine(10.0, static function (Header $h, string $p, \Closure $send): void {
+            if (Fake::isPing($h)) {
+                $send(0, Fake::pong($h->requestId));
+            } elseif (Fake::isCancel($h)) {
+                $send(0, F::cancelled($h->requestId));
+            } elseif (self::target($h, $p) === '/late') {
+                $rid = $h->requestId;
+                $send(0.0, F::head($rid));
+                $send(3.0, F::body($rid, 'whole') . F::done($rid));
+            }
+        });
+        $conn = self::connect($f, 0.5);
+        $future = $conn->upstream('up')->requestAsync('GET', '/late', timeoutMs: 100);
+        usleep(2_700_000); // past 0.1 + 2 + 0.5
+        $this->assertSame('whole', $future->await()->body);
+    }
+
+    /**
+     * Found by this review round's own live test: the client must keep READING while a write
+     * cannot progress. This engine floods 3 MiB of one stream's frames with a blocking write — so it
+     * reads nothing until the client reads them — while the client writes a 4 MiB REQUEST. A client
+     * that only writes blocks for its write timeout and closes the session (it did, against a real
+     * `ferrod`, behind 200 unconsumed responses: every request on the socket went Indeterminate).
+     */
+    public function testAWriteThatCannotProgressKeepsReadingSoBothSidesMoveOn(): void
+    {
+        $f = $this->engine(10.0, static function (Header $h, string $p, \Closure $send): void {
+            if (Fake::isPing($h)) {
+                $send(0, Fake::pong($h->requestId));
+                return;
+            }
+            $target = self::target($h, $p);
+            $rid = $h->requestId;
+            if ($target === '/flood') {
+                $flood = F::head($rid);
+                for ($i = 0; $i < 48; ++$i) {
+                    $flood .= F::body($rid, str_repeat(chr(65 + $i % 26), 65536));
+                }
+                $send(0, $flood . F::done($rid)); // one blocking write: nothing is read until it is all taken
+            } elseif ($target === '/big') {
+                $send(0, F::head($rid) . F::body($rid, (string) strlen($p)) . F::done($rid));
+            }
+        });
+        $conn = self::connect($f, 1.0);
+        $http = $conn->upstream('up');
+        $s = $http->stream('GET', '/flood');
+        $big = $http->requestAsync('POST', '/big', body: str_repeat('b', 4 * 1024 * 1024));
+        $this->assertGreaterThan(4 * 1024 * 1024, (int) $big->await()->body, 'the whole REQUEST arrived');
+        $this->assertSame(48 * 65536, strlen($s->body()), 'and the flood, read while it was written, is intact');
+        $this->assertFalse($conn->session()->isPoisoned());
+    }
 }

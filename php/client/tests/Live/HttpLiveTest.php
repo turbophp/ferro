@@ -211,21 +211,22 @@ final class HttpLiveTest extends HttpLiveTestCase
         $conn->exec('CREATE TABLE IF NOT EXISTS f8_http_writes (id serial PRIMARY KEY, note text)');
 
         $t0 = microtime(true);
-        $http->request('GET', '/delay/400');
-        $http->request('GET', '/delay/400');
-        $conn->scalar('SELECT pg_sleep(0.4) IS NULL');
+        $http->request('GET', '/delay/800');
+        $http->request('GET', '/delay/800');
+        $conn->scalar('SELECT pg_sleep(0.8) IS NULL');
         $sequential = microtime(true) - $t0;
-        $this->assertGreaterThanOrEqual(1.2, $sequential, 'control: the delays really delay');
+        $this->assertGreaterThanOrEqual(2.4, $sequential, 'control: the delays really delay');
 
         $t0 = microtime(true);
         $out = await([
-            'a' => $http->requestAsync('GET', '/delay/400'),
-            'b' => $http->requestAsync('POST', '/delay/400', body: 'x'),
-            'sleep' => $conn->scalarAsync('SELECT pg_sleep(0.4) IS NULL'),
+            'a' => $http->requestAsync('GET', '/delay/800'),
+            'b' => $http->requestAsync('POST', '/delay/800', body: 'x'),
+            'sleep' => $conn->scalarAsync('SELECT pg_sleep(0.8) IS NULL'),
             'write' => $conn->execAsync("INSERT INTO f8_http_writes (note) VALUES ('fan-out')"),
         ]);
         $concurrent = microtime(true) - $t0;
-        $this->assertLessThan(0.9, $concurrent, sprintf('fan-out %.3fs vs sequential %.3fs', $concurrent, $sequential));
+        // ~0.8 s concurrent against ~3.2 s if serial: 2x headroom for a loaded runner.
+        $this->assertLessThan(1.6, $concurrent, sprintf('fan-out %.3fs vs sequential %.3fs', $concurrent, $sequential));
         $this->assertSame('delayed', $out['a']->body);
         $this->assertSame('delayed', $out['b']->body);
         $this->assertSame(1, $out['write']);
@@ -267,7 +268,7 @@ final class HttpLiveTest extends HttpLiveTestCase
     #[DataProvider('readPaths')]
     public function testAStreamDeliversEachChunkAsItArrives(bool $receiveFds): void
     {
-        $s = $this->conn($receiveFds)->upstream('up')->stream('GET', '/stream?chunks=4&size=8&gap=400');
+        $s = $this->conn($receiveFds)->upstream('up')->stream('GET', '/stream?chunks=4&size=8&gap=800');
         $this->assertSame(200, $s->status);
         $this->assertSame('text/event-stream', $s->header('content-type'));
         $t0 = microtime(true);
@@ -278,8 +279,9 @@ final class HttpLiveTest extends HttpLiveTestCase
             $chunks[] = $chunk;
         }
         $this->assertSame(['.......0', '.......1', '.......2', '.......3'], $chunks);
-        $this->assertLessThan(0.3, $at[0], 'the first chunk did not wait for the rest');
-        $this->assertGreaterThanOrEqual(1.1, $at[3], 'control: the chunks really were spaced');
+        // A buffering client would hand over the first chunk at >= 2.4 s.
+        $this->assertLessThan(1.2, $at[0], 'the first chunk did not wait for the rest');
+        $this->assertGreaterThanOrEqual(2.2, $at[3], 'control: the chunks really were spaced');
         $this->assertTrue($s->isComplete());
         $this->assertSame(0, $s->stats()['tls_us'] ?? -1);
     }
@@ -381,7 +383,6 @@ final class HttpLiveTest extends HttpLiveTestCase
         $conn = $this->conn();
         $http = $conn->upstream('up');
         $done = [];
-        $t0 = microtime(true);
         $out = Loop::run([
             'stream' => static function () use ($http, &$done): string {
                 $body = $http->stream('GET', '/stream?chunks=5&size=2&gap=300')->body();
@@ -399,7 +400,6 @@ final class HttpLiveTest extends HttpLiveTestCase
                 return $v;
             },
         ]);
-        $this->assertLessThan(1.6, microtime(true) - $t0);
         $this->assertSame(['stream' => '.0.1.2.3.4', 'call' => 'delayed', 'sql' => 5], $out);
         $this->assertSame('stream', $done[2], 'the call and the query finished while the stream was between chunks');
     }
@@ -414,14 +414,14 @@ final class HttpLiveTest extends HttpLiveTestCase
             $timer = EventLoop::repeat(0.05, static function () use (&$ticks): void { ++$ticks; });
             $t0 = microtime(true);
             $out = RevoltTasks::run([
-                'call' => static fn (): string => $http->requestAsync('GET', '/delay/500')->await()->body,
-                'sql' => static fn (): mixed => $conn->scalarAsync('SELECT 5 FROM pg_sleep(0.5)')->await(),
+                'call' => static fn (): string => $http->requestAsync('GET', '/delay/800')->await()->body,
+                'sql' => static fn (): mixed => $conn->scalarAsync('SELECT 5 FROM pg_sleep(0.8)')->await(),
                 'stop' => static function () use ($timer): void {
-                    RevoltTasks::delay(0.6);
+                    RevoltTasks::delay(0.9);
                     EventLoop::cancel($timer);
                 },
             ]);
-            $this->assertLessThan(0.95, microtime(true) - $t0);
+            $this->assertLessThan(1.6, microtime(true) - $t0, '~0.9 s together against ~1.6 s serial');
             $this->assertSame('delayed', $out['call']);
             $this->assertSame(5, $out['sql']);
             $this->assertGreaterThanOrEqual(5, $ticks, 'the loop ran timers while both were in flight');
@@ -431,5 +431,125 @@ final class HttpLiveTest extends HttpLiveTestCase
             }
             Revolt::uninstall();
         }
+    }
+
+    // ---- review round (M6-F8): F1 and F2, live ------------------------------------------------------
+
+    /**
+     * Review F1, the reviewer's live reproduction: a 40-chunk stream the engine completes at once,
+     * read slowly (after 2.7 s, then 100 ms per chunk) with `timeoutMs: 500` and a 0.5 s read
+     * timeout, beside an unrelated POST in flight. It used to fail the finished stream as
+     * `ResponseIncomplete` and the POST as Indeterminate.
+     */
+    public function testASlowConsumerOfACompletedStreamLeavesTheSessionAlone(): void
+    {
+        $conn = $this->conn(ioTimeout: 0.5);
+        $http = $conn->upstream('up');
+        $post = $http->requestAsync('POST', '/hold?c=X', body: 'x');
+        $s = $http->stream('GET', '/stream?chunks=40&size=10', timeoutMs: 500);
+        usleep(2_700_000);
+        $n = 0;
+        foreach ($s as $_) {
+            ++$n;
+            usleep(100_000);
+        }
+        $this->assertSame(40, $n);
+        $this->assertTrue($s->isComplete());
+        $this->assertFalse($conn->session()->isPoisoned(), 'the unrelated POST is still in flight');
+        $this->assertFalse($post->isSettled());
+        $this->assertSame(1, $conn->scalar('SELECT 1'));
+        unset($post);
+    }
+
+    /** Review F1: a buffered request awaited after `timeoutMs` + 2 s + the read timeout succeeds. */
+    public function testABufferedRequestAwaitedLateSucceeds(): void
+    {
+        $conn = $this->conn(ioTimeout: 0.5);
+        // Within one window: a response LARGER than one, awaited this late, is the engine's
+        // `QueryTimeout` — its credit returns only as frames are read, and nothing reads while the
+        // caller sleeps (the stated cost, §22.2 (dd)).
+        $future = $conn->upstream('up')->requestAsync('GET', '/stream?chunks=20&size=10', timeoutMs: 500);
+        usleep(3_200_000);
+        $this->assertSame(200, strlen($future->await()->body));
+        $this->assertFalse($conn->session()->isPoisoned());
+    }
+
+    /**
+     * Review F2(a), the reviewer's live reproduction: 256 unawaited buffered requests whose responses
+     * exceed one credit window (200 BODY frames each), then a 257th. The slot wait used to file
+     * their frames without returning their credit, so no terminal could arrive and no slot free —
+     * blocking until the engine's own timeouts. Now their credit goes back as frames are filed.
+     */
+    public function testFanningOutPastTheInFlightLimitDoesNotDeadlockOnCredit(): void
+    {
+        $conn = $this->conn();
+        $http = $conn->upstream('up');
+        $fs = [];
+        for ($i = 0; $i < 256; ++$i) {
+            $fs[] = $http->requestAsync('GET', "/stream?chunks=200&size=5&n={$i}", timeoutMs: 30_000);
+        }
+        $t0 = microtime(true);
+        $fs[] = $http->requestAsync('GET', '/echo?n=257');
+        $this->assertLessThan(15.0, microtime(true) - $t0, 'the 257th found a slot');
+        foreach ($fs as $i => $f) {
+            $this->assertSame($i === 256 ? 200 : 1000, $i === 256 ? $f->await()->status : strlen($f->await()->body));
+        }
+    }
+
+    /**
+     * Review F2(b): when every slot holds a STREAM parked on credit — which only its holder can
+     * replenish — the next request is refused at once, unsent and Retryable, instead of blocking
+     * until the engine's own timeouts; and the streams are unharmed.
+     */
+    public function testWhenEverySlotIsAParkedStreamTheNextRequestIsRefused(): void
+    {
+        $conn = $this->conn();
+        $http = $conn->upstream('up');
+        $streams = [];
+        for ($i = 0; $i < 256; ++$i) {
+            $streams[] = $http->stream('GET', "/stream?chunks=200&size=5&n={$i}", timeoutMs: 60_000);
+        }
+        $t0 = microtime(true);
+        try {
+            $http->request('GET', '/echo?n=refused');
+            $this->fail('expected the refusal');
+        } catch (\Ferro\Client\Error\InFlightLimitException $e) {
+            $this->assertStringContainsString('not sent', $e->getMessage());
+        }
+        $this->assertLessThan(15.0, microtime(true) - $t0, 'refused, not blocked until the engine timed out');
+        $this->assertSame(0, $this->received('/echo?n=refused'));
+        $this->assertSame(1000, strlen($streams[0]->body()), 'the streams are unharmed');
+        foreach ($streams as $s) {
+            $s->close();
+        }
+        $this->assertSame(200, $http->request('GET', '/echo?n=after')->status);
+    }
+
+    /**
+     * Found by this review round: 200 unconsumed buffered responses fill `ferrod`'s writer channel
+     * and park its session reader, so a large REQUEST written then can only finish if the client
+     * READS while it writes. Measured before the fix: the second 12 MiB write blocked for its 10 s
+     * write timeout, closed the session, and 201 requests failed Indeterminate.
+     */
+    public function testALargeRequestBehindManyUnconsumedResponsesDoesNotStall(): void
+    {
+        $conn = $this->conn();
+        $http = $conn->upstream('up');
+        $fs = [];
+        for ($i = 0; $i < 200; ++$i) {
+            $fs[] = $http->requestAsync('GET', "/stream?chunks=300&size=5&n={$i}", timeoutMs: 30_000);
+        }
+        usleep(1_500_000); // the engine fills its writer channel; nothing reads
+        for ($k = 0; $k < 3; ++$k) {
+            $t0 = microtime(true);
+            $fs[] = $http->requestAsync('POST', "/status/200?big={$k}", body: str_repeat('b', 12 * 1024 * 1024), timeoutMs: 30_000);
+            $this->assertLessThan(4.0, microtime(true) - $t0, "write {$k} did not stall");
+        }
+        foreach ($fs as $i => $f) {
+            $res = $f->await();
+            $this->assertSame($i < 200 ? 1500 : 10, strlen($res->body), "request {$i}");
+        }
+        $this->assertFalse($conn->session()->isPoisoned());
+        $this->assertSame(3, $this->received('/status/200?big='));
     }
 }

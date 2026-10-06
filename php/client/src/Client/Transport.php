@@ -27,7 +27,7 @@ use Ferro\Protocol\Generated\Constants as C;
  * `stream_socket_client`'s `resource|false` and `fread`'s `string|false` are handled explicitly so
  * the type stays a bare `resource` for PHPStan level 9.
  */
-final class Transport implements SelectableTransportInterface, FdReceivingTransportInterface
+final class Transport implements DuplexTransportInterface, FdReceivingTransportInterface
 {
     private const DEFAULT_CONNECT_TIMEOUT = 5.0;
     private const DEFAULT_READ_TIMEOUT = 30.0;
@@ -495,6 +495,78 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
             }
             $written += $n;
         }
+    }
+
+    /**
+     * {@see DuplexTransportInterface}: write without ever blocking while the engine has bytes for
+     * us. The socket is non-blocking only around each `fwrite` and blocking again before
+     * `$onReadable` runs, because the read path (`fread`, or `recvmsg` with `SO_RCVTIMEO`) relies on
+     * blocking reads and the descriptor's `O_NONBLOCK` is shared with the imported socket.
+     */
+    public function writeAllReading(string $bytes, \Closure $onReadable): void
+    {
+        $this->assertOpen('write');
+        $len = strlen($bytes);
+        $written = 0;
+        $deadline = microtime(true) + $this->readTimeout;
+        while ($written < $len) {
+            $this->assertOpen('write');
+            if (stream_get_meta_data($this->sock)['unread_bytes'] > 0) {
+                $onReadable(); // already in PHP's buffer: select would not report it
+                continue;
+            }
+            [$readable, $writable] = $this->selectReadWrite(max(0.0, $deadline - microtime(true)));
+            if ($writable) {
+                stream_set_blocking($this->sock, false);
+                try {
+                    $k = @fwrite($this->sock, substr($bytes, $written, 1 << 18));
+                } finally {
+                    stream_set_blocking($this->sock, true);
+                }
+                if ($k === false) {
+                    throw new TransportException(sprintf('write failed after %d of %d bytes', $written, $len));
+                }
+                if ($k > 0) {
+                    $written += $k;
+                    $deadline = microtime(true) + $this->readTimeout; // progress: a fresh bound
+                }
+                continue;
+            }
+            if ($readable) {
+                $onReadable();
+                continue;
+            }
+            if (microtime(true) >= $deadline) {
+                throw new TransportException(sprintf('write timed out after %d of %d bytes', $written, $len));
+            }
+        }
+    }
+
+    /**
+     * Wait up to `$seconds` for the socket to be readable or writable.
+     *
+     * @return array{0:bool,1:bool} readable, writable
+     */
+    private function selectReadWrite(float $seconds): array
+    {
+        $r = [$this->sock];
+        $w = [$this->sock];
+        $e = null;
+        $sec = (int) $seconds;
+        $n = @stream_select($r, $w, $e, $sec, (int) (($seconds - $sec) * 1_000_000));
+        if ($n === false) {
+            throw new TransportException('select failed on the socket');
+        }
+        // Which of the two: asked one at a time, by the count each select returns.
+        return $n === 0 ? [false, false] : [$this->readyNow(false), $this->readyNow(true)];
+    }
+
+    private function readyNow(bool $forWrite): bool
+    {
+        $r = $forWrite ? null : [$this->sock];
+        $w = $forWrite ? [$this->sock] : null;
+        $e = null;
+        return @stream_select($r, $w, $e, 0, 0) > 0;
     }
 
     /**

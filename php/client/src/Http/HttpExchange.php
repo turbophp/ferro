@@ -49,6 +49,12 @@ final class HttpExchange
         /** The request's OWN `idempotent = true` — all the client may count before `HEAD` (§23.7.3). */
         private readonly bool $declaredIdempotent,
         private readonly PackerInterface $decodePacker,
+        /**
+         * The session returns this exchange's credit as its frames are filed
+         * ({@see Session::creditOnReceipt}, the buffered form), so this object must not return it
+         * again.
+         */
+        private readonly bool $sessionCredits = false,
     ) {}
 
     /** Read up to the `HEAD`, or throw the fate of an exchange that ended without one. */
@@ -72,6 +78,17 @@ final class HttpExchange
         $head = ResponseHead::fromWire($frame['head']);
         $this->head = $head;
         $this->replenish($frame['bytes']);
+        if ($head->status < 100 || $head->status > 599) {
+            // Not an HTTP status (RFC 9110 §15: three digits, 100..599). The frames are intact, so
+            // this is THIS exchange's failure, never the session's: stop it, read it to its
+            // terminal, and leave every other request on the socket alone (M6-F8 review).
+            $this->abandon();
+            throw new ProtocolException(sprintf(
+                'HTTP request %d: the engine sent status %d, which is not an HTTP status; the exchange was abandoned',
+                $this->requestId,
+                $head->status,
+            ));
+        }
         return $head;
     }
 
@@ -199,6 +216,9 @@ final class HttpExchange
 
     private function replenish(int $bytes): void
     {
+        if ($this->sessionCredits) {
+            return;
+        }
         try {
             $this->session->sendWindowUpdate($this->requestId, 1, $bytes);
         } catch (TransportException $e) {
