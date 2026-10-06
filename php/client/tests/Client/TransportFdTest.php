@@ -247,6 +247,55 @@ final class TransportFdTest extends TestCase
     }
 
     /**
+     * The header peek's UNSURE branch (round-2 review): an `OOB_FD` header whose first 2 bytes
+     * arrive in their own write, carrying the fd, and the other 14 in a second. A peek stops at the
+     * first fd-bearing chunk, so it sees 2 bytes — too few to read the flags — and must answer
+     * "may carry an fd", freeing the reserve; answering "no" would leave a full fd table with no
+     * slot, and the kernel would close the fd. Under a full table, in a child process.
+     */
+    public function testAHeaderSplitBeforeItsFlagsStillFreesTheReserve(): void
+    {
+        if (!function_exists('posix_setrlimit')) {
+            $this->markTestSkipped('needs ext-posix to lower RLIMIT_NOFILE in the child');
+        }
+        $autoload = dirname(__DIR__, 2) . '/vendor/autoload.php';
+        $code = <<<'PHP'
+            require $argv[1];
+            $path = $argv[2];
+            posix_setrlimit(POSIX_RLIMIT_NOFILE, 64, 64);
+            $server = stream_socket_server('unix://' . $path);
+            $t = \Ferro\Client\Transport::connectUnix($path, 1.0, 2.0, true);
+            $peer = stream_socket_accept($server, 1.0);
+            $sock = socket_import_stream($peer);
+            $C = \Ferro\Protocol\Generated\Constants::class;
+            $head = (new \Ferro\Protocol\Header($C::FLAG_END | $C::FLAG_OOB_FD, 2, 1, 7, 0))->encode();
+            $f = tmpfile(); fwrite($f, 'SPLIT');
+            class_exists(\Ferro\Client\Error\TransportException::class);
+            $hold = [];
+            while (($h = @fopen('/dev/null', 'r')) !== false) { $hold[] = $h; }
+            socket_sendmsg($sock, ['iov' => [substr($head, 0, 2)],
+                'control' => [['level' => SOL_SOCKET, 'type' => SCM_RIGHTS, 'data' => [$f]]]], 0);
+            fwrite($peer, substr($head, 2));
+            try {
+                $t->beginFrame();
+                $bytes = $t->readExact(16);
+                $fd = $t->takeFd();
+                $out = ($bytes === $head ? 'header' : 'WRONG BYTES') . ':' . (is_resource($fd) ? stream_get_contents($fd, -1, 0) : 'NO FD');
+            } catch (\Throwable $e) {
+                $out = 'ERROR ' . $e->getMessage();
+            }
+            echo json_encode(['frame' => $out, 'releases' => $t->fdReserveReleases()]);
+            PHP;
+        $proc = proc_open([PHP_BINARY, '-r', $code, $autoload, $this->path . '.split'], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        $this->assertIsResource($proc);
+        $stdout = (string) stream_get_contents($pipes[1]);
+        $stderr = (string) stream_get_contents($pipes[2]);
+        proc_close($proc);
+        @unlink($this->path . '.split');
+        $this->assertSame(['frame' => 'header:SPLIT', 'releases' => 1], json_decode($stdout, true), "child: {$stdout} {$stderr}");
+    }
+
+    /**
      * Review F4: a received fd is close-on-exec from the moment it exists (`MSG_CMSG_CLOEXEC`), so a
      * child process the application starts never inherits a result's memfd.
      */

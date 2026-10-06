@@ -46,6 +46,16 @@ final class ConnectionOptions
             );
         }
 
+        $receiveFds = self::nullableBool($config, 'ferro_receive_fds');
+        if ($socket === null && $receiveFds === true) {
+            // `true` insists (`Ferro::connect(receiveFds: true)` throws when it cannot), and the TCP
+            // fallback can never receive an fd: refused rather than quietly ignored.
+            throw new \InvalidArgumentException(
+                'Ferro: "ferro_receive_fds" => true needs "ferro_socket"; the TCP fallback '
+                . '("ferro_host"/"ferro_port") cannot receive fds. Leave it unset for auto.',
+            );
+        }
+
         return new self(
             $pool,
             $socket,
@@ -53,7 +63,7 @@ final class ConnectionOptions
             $port,
             self::float($config, 'ferro_connect_timeout') ?? 2.0,
             self::float($config, 'ferro_io_timeout') ?? 30.0,
-            self::nullableBool($config, 'ferro_receive_fds'),
+            $receiveFds,
         );
     }
 

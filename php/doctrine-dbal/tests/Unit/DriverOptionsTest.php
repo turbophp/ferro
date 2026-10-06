@@ -66,6 +66,21 @@ final class DriverOptionsTest extends TestCase
         DriverOptions::fromParams(['unix_socket' => '/s', 'driverOptions' => ['receive_fds' => 'no']]);
     }
 
+    /**
+     * `receive_fds = true` insists, and the TCP fallback can never receive an fd: refused, never
+     * silently ignored. `false` or unset is fine there (TCP reads inline anyway).
+     */
+    public function testReceiveFdsTrueOnTheTcpFallbackIsRefused(): void
+    {
+        foreach ([false, null] as $v) {
+            $o = DriverOptions::fromParams(['host' => '127.0.0.1', 'port' => 7777, 'driverOptions' => ['receive_fds' => $v]]);
+            self::assertSame($v, $o->receiveFds);
+        }
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessageMatches('/receive_fds.*TCP/');
+        DriverOptions::fromParams(['host' => '127.0.0.1', 'port' => 7777, 'driverOptions' => ['receive_fds' => true]]);
+    }
+
     /** A wrongly-typed option is refused, not silently coerced (level 9 narrows, but so do we). */
     public function testAWronglyTypedOptionIsRefused(): void
     {

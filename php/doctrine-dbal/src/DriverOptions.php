@@ -25,7 +25,8 @@ namespace Ferro\DBAL;
  *   `driverOptions.connect_timeout` / `driverOptions.io_timeout` — seconds, floats.
  *   `driverOptions.receive_fds` — bool or null (the default, auto): whether the connection may
  *      receive large results as a sealed memfd (SPEC §5.1, `Ferro::connect(receiveFds:)`). `false`
- *      opts this connection out of the out-of-band path.
+ *      opts this connection out of the out-of-band path. `true` on the TCP fallback is refused: TCP
+ *      cannot receive fds, and `true` insists.
  */
 final class DriverOptions
 {
@@ -71,6 +72,17 @@ final class DriverOptions
             );
         }
 
+        $receiveFds = self::optNullableBool($opts, 'receive_fds');
+        if ($socket === null && $receiveFds === true) {
+            // `true` insists (`Ferro::connect(receiveFds: true)` throws when it cannot), and the TCP
+            // fallback can never receive an fd. Ignoring it would quietly run the path the
+            // configuration asked not to.
+            throw new \InvalidArgumentException(
+                'Ferro: driverOptions.receive_fds = true needs the Unix socket transport; the TCP '
+                . 'fallback (host/port) cannot receive fds. Use `unix_socket`, or leave it unset.',
+            );
+        }
+
         return new self(
             $socket,
             $host,
@@ -79,7 +91,7 @@ final class DriverOptions
             self::optBool($opts, 'readonly'),
             self::optFloat($opts, 'connect_timeout') ?? 2.0,
             self::optFloat($opts, 'io_timeout') ?? 5.0,
-            self::optNullableBool($opts, 'receive_fds'),
+            $receiveFds,
         );
     }
 

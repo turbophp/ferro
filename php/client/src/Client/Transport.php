@@ -57,9 +57,14 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
      * reports a truncated control message, and a result the engine had already produced — a
      * committed write — is lost, where the `fread` path would have read it. The reserve is released
      * immediately before the one read an fd can arrive with ({@see beginFrame}) and retaken as soon
-     * as a slot is free again ({@see fdClosed}). PHP runs one thing at a time, so nothing can take the
-     * freed slot between the release and the `recvmsg`. An `ext-sockets` socket rather than an open
-     * file: one descriptor, and not subject to `open_basedir`.
+     * as a slot is free again ({@see fdClosed}). One PHP thread per fd table runs one thing at a
+     * time, so nothing can take the freed slot between the release and the `recvmsg` — an
+     * ASSUMPTION: on a thread-safe (ZTS) SAPI that runs several PHP threads in one process
+     * (FrankenPHP, Octane on FrankenPHP) another thread can open a file in that window. Unverified
+     * (no ZTS build was available); the cost would be F1's behaviour returning under fd exhaustion —
+     * the fd closed by the kernel, a committed large write reported `Indeterminate` — and the
+     * mitigation is `receiveFds: false`. An `ext-sockets` socket rather than an open file: one
+     * descriptor, and not subject to `open_basedir`.
      */
     private ?\Socket $reserve = null;
 

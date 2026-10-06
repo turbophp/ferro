@@ -39,6 +39,17 @@ final class ConnectionOptionsTest extends TestCase
         ConnectionOptions::fromConfig(['ferro_socket' => '/s', 'ferro_receive_fds' => 'maybe']);
     }
 
+    /** `true` insists; the TCP fallback cannot receive fds, so it is refused there, not ignored. */
+    public function testReceiveFdsTrueOnTheTcpFallbackIsRefused(): void
+    {
+        foreach ([false, null, 'auto'] as $v) {
+            ConnectionOptions::fromConfig(['ferro_host' => '127.0.0.1', 'ferro_receive_fds' => $v]);
+        }
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessageMatches('/ferro_receive_fds.*TCP/');
+        ConnectionOptions::fromConfig(['ferro_host' => '127.0.0.1', 'ferro_receive_fds' => 'true']);
+    }
+
     public function testThePoolDefaultsToDefault(): void
     {
         $o = ConnectionOptions::fromConfig(['ferro_socket' => '/s.sock']);
