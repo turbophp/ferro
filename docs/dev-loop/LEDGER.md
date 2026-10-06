@@ -195,7 +195,11 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 | D1c | Per-request client deadlines + a PING-probed liveness check (SPEC §23.11.0 specifies both, including the bound per request kind and P18) | OPEN | The socket read timeout (5 s default in `Ferro::connect`) is also every request's deadline and poisons the whole session when a single query runs long. Replace it with a per-request deadline that CANCELs only that request, and make the socket timeout a PING-probed liveness bound. **Hard prerequisite of M6-F8** (F0 review F2). |
 | D1d | Revolt/AMPHP adapter | OPEN | Split out of D1c. Revolt is not installed in the container; fetch it with `--prefer-source` as a dev dependency. Not an HTTP prerequisite. |
 | D1e | §16 fan-out bench on the D17 runner | OPEN | Split out of D1c. Not an HTTP prerequisite. |
-| D2 | `ferro check`/`gen` + `idempotent` manifest + manifest handshake (§11) | OPEN | The only licensed auto-retry lives here. |
+| D2a | `ferro-manifest` + `ferro manifest`/`manifest-hash` + `vendor/bin/ferro-queries` (§11) | DONE — SPEC §22.2 (cl) | Formats fixed, hash pinned, attributes read by PHP's tokenizer. |
+| D2b | `ferro check` + `ferro schema sync`: PREPARE every query against a shadow schema, record param/result types | OPEN | PG, MySQL, SQLite through the backend crates. |
+| D2c | `ferro gen`: DTOs, a `Queries` id-constant class, PHPStan stubs | OPEN | |
+| D2d | Engine: load `FERRO_MANIFEST`, advertise `MANIFEST`, refuse a HELLO with a different `manifest_hash`, run EXEC by `query_id` | DONE — SPEC §22.2 (cm) | No `/proto` shape change. The request must AGREE with the manifest's pool and `readonly`, and the session must have sent the matching hash. |
+| D2e | Client: `…ById` methods + the `idempotent` retry licence + a chaos test (idempotent upsert retried across a `ferrod` kill, applied once) | OPEN | The only licensed auto-retry (§9.2). |
 | D3 | memfd large-payload path behind `MEMFD_RX` (§5.1) | OPEN | |
 | D4 | COPY API | OPEN | |
 

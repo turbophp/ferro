@@ -1,0 +1,27 @@
+#!/usr/bin/env php
+<?php
+// /php/client/bin/ferro-queries — print every #[FerroQuery(...)] declaration under the given paths
+// as the JSON list `ferro manifest --php-queries` reads (SPEC §11, M3-D2a).
+//
+//   vendor/bin/ferro-queries src/ > queries.json
+//
+// It reads source with PHP's own tokenizer and never runs it. Arguments must be NAMED and LITERAL
+// (strings, true/false, null); anything else is refused with its location, because a value this
+// script cannot see is a query the manifest would silently get wrong. Exit 1 on any problem.
+declare(strict_types=1);
+
+require __DIR__ . '/../src/Tooling/QueryExtractor.php';
+
+$paths = array_slice($argv, 1);
+if ($paths === [] || in_array($paths[0], ['-h', '--help'], true)) {
+    fwrite(STDERR, "usage: ferro-queries <path>...   (prints JSON for `ferro manifest --php-queries`)\n");
+    exit($paths === [] ? 2 : 0);
+}
+[$queries, $problems] = \Ferro\Tooling\QueryExtractor::extractPaths($paths);
+foreach ($problems as $p) {
+    fwrite(STDERR, "error: {$p}\n");
+}
+if ($problems !== []) {
+    exit(1);
+}
+echo json_encode($queries, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR), "\n";

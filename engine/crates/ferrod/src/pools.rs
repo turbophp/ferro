@@ -334,6 +334,9 @@ pub struct PoolRegistry {
     /// SPEC §13's OTLP exporter (M2-C4c-2), when the operator configured one. Here for the same
     /// reason as `slow_log`: every EXEC path already holds the registry.
     tracer: Option<crate::otlp::Tracer>,
+    /// SPEC §11's checked-SQL manifest (M3-D2d), when `FERRO_MANIFEST` loaded one. Here for the
+    /// same reason as `tracer`: every EXEC path already holds the registry.
+    manifest: Option<Arc<crate::manifest::LoadedManifest>>,
 }
 
 impl PoolRegistry {
@@ -423,7 +426,13 @@ impl PoolRegistry {
             probes_issued: AtomicU64::new(0),
             tuning,
             tracer: config.otlp.clone().map(crate::otlp::Tracer::start),
+            manifest: config.manifest.clone(),
         })
+    }
+
+    /// The loaded checked-SQL manifest, if any.
+    pub fn manifest(&self) -> Option<&crate::manifest::LoadedManifest> {
+        self.manifest.as_deref()
     }
 
     /// Resolve a pool by the name a client referenced in `ExecRequest.pool`. `None` ⇒ the handler
@@ -1124,6 +1133,7 @@ mod tests {
             1,
             crate::epoch::BootEpoch(7),
             registry.pool_info().await,
+            false,
         );
         let bytes = frame.payload.to_vec();
         let as_text = String::from_utf8_lossy(&bytes).into_owned();
