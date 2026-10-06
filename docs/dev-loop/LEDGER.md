@@ -32,8 +32,12 @@ nothing in this file overrides any of them.
   the DBAL server-family columns have no recorded stock-driver control), SQLite has no ORM column,
   Octane sync mode is untested (E6, M5). The loop's routine was disabled at the exit; M3 is not
   started.
-- Not started: M3 (Fibers, manifest, memfd, COPY), M4 (MSSQL, replica routing, `ferro top`),
-  M5 (streams product, packaging).
+- **v1 was redefined by the owner on 2026-10-06** (SPEC D16–D18):
+  - v1 now also includes Ferro HTTP (M6) and Ferro Queue (M7);
+  - the §16 numbers are measured on GitHub runners;
+  - "green" means parity with a stock-driver control.
+- Build order: **M3 → M6 → M7 → M4 → M5 → v1 exit**. **M3 is IN PROGRESS** (Phase D).
+- Not started: M6, M7, M4 (MSSQL, replica routing, `ferro top`) and M5 (streams, packaging).
 
 ## Protocol (one iteration)
 
@@ -184,10 +188,36 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 
 | # | Item | State | Notes |
 |---|------|-------|-------|
-| D1 | Fibers multiplexing in `ferro/client` (§10.1) | OPEN | |
+| D1a | Multiplexed session + `Future`/`Ferro\await()` + async `Connection` methods (§10.1) | DONE — SPEC §22.2 (cj) | Fan-out ≈ max(query) under plain FPM (measured live with a sequential control). Limits recorded: in-tx statements settle at once, async does not update `lastInsertId()`, an open stream stays exclusive. |
+| D1b | Fiber suspension: `Ferro\Loop` + the `FIBERS` feature bit | DONE — SPEC §22.2 (ck) | An `await` inside a Loop-run Fiber suspends; measured live on one session and across two. |
+| D1c | Revolt/AMPHP adapter + §16 fan-out bench on the D17 runner + per-request client deadlines | OPEN | Revolt is not installed in the container; fetch it with `--prefer-source` as a dev dependency. **Deadlines:** the socket read timeout (5 s default in `Ferro::connect`) is also every request's deadline and poisons the whole session when a single query runs long. Replace it with a per-request deadline that CANCELs only that request, and keep the socket timeout as a liveness bound. Ferro HTTP needs this first (F0 review F2). |
 | D2 | `ferro check`/`gen` + `idempotent` manifest + manifest handshake (§11) | OPEN | The only licensed auto-retry lives here. |
 | D3 | memfd large-payload path behind `MEMFD_RX` (§5.1) | OPEN | |
 | D4 | COPY API | OPEN | |
+
+### Phase F — M6: Ferro HTTP (SPEC D16; product-vision §4.2)
+
+| # | Item | State | Notes |
+|---|------|-------|-------|
+| F0 | SPEC section for the HTTP engine plus its `/proto` service id, before any code. It must cover the §3 admission test in writing, the fate taxonomy mapping (connect failure / 503+Retry-After → Retryable; dispatched with no response, non-idempotent → Indeterminate; 4xx → NonRetryable), named upstreams with daemon-held credentials, the SSRF rule (no request to an undeclared upstream), and streaming bodies over the credit path | OPEN | The design slice. The adversarial reviewer attacks the fate table and the SSRF rule before anything is built. |
+| F1 | Engine: named upstreams, per-upstream connection pools with TLS (rustls), request/response, timeouts and `CANCEL` | OPEN | |
+| F2 | Fate classification + chaos suite for HTTP (a request dispatched with no response must be Indeterminate; nothing is ever retried by the engine) | OPEN | Charter rule 3 holds for HTTP too. |
+| F3 | Streaming response bodies (SSE/chunked) on the credit path | OPEN | |
+| F4 | Per-upstream circuit breakers and host-level rate limits | OPEN | |
+| F5 | PHP: a Guzzle handler and a PSR-18 client over `ferro/client` | OPEN | Seam: `HandlerStack`. |
+| F6 | Drop-in acceptance: Guzzle's own handler-level suite (or a curated subset) through the Ferro handler, with a stock-curl-handler control (D18) | OPEN | The bar for M6. |
+
+### Phase G — M7: Ferro Queue (SPEC D16; product-vision §4.3)
+
+| # | Item | State | Notes |
+|---|------|-------|-------|
+| G0 | SPEC section for the queue engine plus its service id, before any code. It must cover the §3 admission test, the "never owns a durable log" rule, lease/ack/retry/backoff/delayed semantics, transactional enqueue on `tx_id`, and the fate of a lease that dies mid-job | OPEN | The design slice. |
+| G1 | Engine over PG `SKIP LOCKED`: enqueue, reserve with lease, ack, release/retry with backoff, delayed jobs | OPEN | Reuses the pools and pin machinery. |
+| G2 | Transactional enqueue: a job enqueued inside a transaction rides that `tx_id` and commits or rolls back with it | OPEN | The headline. |
+| G3 | Laravel Queue driver (`ferro` connection) | OPEN | |
+| G4 | Symfony Messenger transport | OPEN | |
+| G5 | Drop-in acceptance: Laravel's queue integration tests and the §15 demo's queue paths through Ferro Queue, with a stock `database`-driver control (D18) | OPEN | |
+| G6 | MySQL backend for the queue engine (`SKIP LOCKED` exists from MySQL 8.0 / MariaDB 10.6) | OPEN | Redis Streams stays post-v1 unless a slice proves it cheap. |
 
 ### Phase E — M4 + M5 (SPEC §17), then the v1 gate
 
@@ -200,7 +230,8 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 | E5 | LISTEN/NOTIFY streams | OPEN | M5. |
 | E6 | Runtime guidance (Octane; widen to FrankenPHP per product-vision §9, tested config) | OPEN | M5. |
 | E7 | Packaging: deb/rpm/container sidecar, systemd socket-activated units (§18) | OPEN | M5. |
-| E8 | **v1 exit measurement** (§16) | OPEN | On the recorded reference environment: boundary p50 < 60 µs / p99 < 200 µs, ≥5× connection reduction, fan-out ≤ max+2 ms, 1 GB stream RSS bounds, >95 % statement-cache hit rate. Honor the D12 accelerator decision. Results + env manifest into `bench/results/`. |
+| E9 | **D18 control columns**: a stock-driver control for every DBAL server family (PG, MySQL, MariaDB) in the `dbal-suite` workflow, the Laravel SQLite columns moved to CI, and the remaining Ferro-only non-passes re-triaged under D18 | OPEN | §22.3 recorded these as missing. D18 makes them required. |
+| E8 | **v1 exit measurement** (§16) | OPEN | On a GitHub `ubuntu-latest` runner with a per-run manifest (D17): boundary p50 < 60 µs / p99 < 200 µs, ≥5× connection reduction, fan-out ≤ max+2 ms, 1 GB stream RSS bounds, >95 % statement-cache hit rate. Honor the D12 accelerator decision. Results + env manifest into `bench/results/`. |
 
 ### Standing (any phase, any iteration)
 
@@ -415,11 +446,14 @@ the B2b-2 row above.
 
 ## v1 definition
 
-v1 = SPEC §17 milestones M1→M5 complete in order, with the two suite bars green (DBAL per §14 as
-far as backends exist, Illuminate per §15/M2), the chaos suite green on every shipped backend,
-and the §16 performance targets **measured and recorded** in `bench/results/` on the reference
-environment. Deviations are recorded in SPEC §22, never silently absorbed. Post-v1 work (product
-vision §4) is out of the loop's scope by P-log decision.
+**Redefined 2026-10-06 by the owner (SPEC D16–D18, product-vision P13).** v1 = SPEC §17's M3, M4
+and M5 for the database engine, **plus M6 (Ferro HTTP) and M7 (Ferro Queue)**, built in the order
+**M3 → M6 → M7 → M4 → M5 → v1 exit**. Every suite bar must be green in D18's sense: parity with a
+stock-driver control column for every family the suite claims. The chaos suite must be green on
+every shipped backend and engine. The §16 targets must be **measured and recorded** in
+`bench/results/` on a GitHub `ubuntu-latest` runner with a per-run environment manifest (D17).
+Deviations are recorded in SPEC §22, never silently absorbed. Work beyond that (product-vision
+§4.4+: Streams as a product, Ferro State, request dispatch) stays post-v1.
 
 ## Iteration log
 
