@@ -62,6 +62,9 @@
     "ERROR": 1,
     "OK": 0
   },
+  "oob_encoding": {
+    "FRAME_PAYLOAD": 0
+  },
   "implemented": [
     "BOOL",
     "BYTES",

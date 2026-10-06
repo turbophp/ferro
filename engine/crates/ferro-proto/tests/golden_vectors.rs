@@ -67,6 +67,9 @@ fn tags_present_in_committed_vectors() -> BTreeSet<u8> {
         let h = Header::decode(&frame).expect("header decodes");
         let payload = &frame[16..];
         match (h.service, h.method) {
+            // An OOB_FD frame (M3-D3) carries an OobRef, never a TypedValue: the values are in the
+            // memfd, which a vector cannot hold.
+            _ if (h.flags & flags::OOB_FD) != 0 => {}
             // A SQL EXEC request (no END flag) carries its bind params.
             (s, m) if s == service::SQL && m == method_sql::EXEC && (h.flags & flags::END) == 0 => {
                 let r = ExecRequest::decode(payload).expect("ExecRequest decodes");
@@ -153,6 +156,10 @@ fn message_payloads_are_canonical_and_byte_stable() {
         let h = Header::decode(&frame).unwrap();
         let payload = &frame[16..];
         let reencoded: Vec<u8> = match (h.service, h.method) {
+            // An OOB_FD frame (M3-D3) carries an OobRef whatever its (service, method): the real
+            // payload is in the passed memfd, so it must be checked BEFORE the per-service arms,
+            // which would read it as that service's own message.
+            _ if (h.flags & flags::OOB_FD) != 0 => OobRef::decode(payload).unwrap().encode(),
             (s, m) if s == service::CORE && m == mc::HELLO => {
                 Hello::decode(payload).unwrap().encode()
             }

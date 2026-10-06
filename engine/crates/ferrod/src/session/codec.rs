@@ -39,17 +39,30 @@ pub struct OutFrame {
 /// terminal — carries `cap: None`. A streamed `Responder::send_head`/`send_data` frame carries
 /// `Some(guard)`; because the guard travels IN the message, a cancelled/failed enqueue drops the
 /// message and releases the reservation (no leak), and there is exactly one release, on the drop.
+///
+/// `oob` (M3-D3) marks a SUCCESS terminal the writer may send out of band (`session::oob`): the
+/// frame is the ordinary inline terminal, and the WRITER — immediately before sending it — copies its
+/// payload into a sealed memfd and sends an `OOB_FD` frame instead, falling back to this very frame
+/// if the memfd cannot be made or the kernel refuses the fd. A queued terminal is therefore heap,
+/// exactly as an inline one is, and the engine holds at most one OOB memfd per session at a time
+/// (review F2: a memfd made when the HANDLER finished sat in the engine's fd table for as long as
+/// the client took to read, so one non-reading session could exhaust `RLIMIT_NOFILE`).
 #[derive(Debug)]
 pub struct ControlMsg {
     pub frame: OutFrame,
     pub cap: Option<CapReserve>,
+    pub oob: bool,
 }
 
 impl ControlMsg {
     /// A control/liveness/terminal frame with no cap reservation to release (the common,
     /// non-streamed case).
     pub fn bare(frame: OutFrame) -> Self {
-        ControlMsg { frame, cap: None }
+        ControlMsg {
+            frame,
+            cap: None,
+            oob: false,
+        }
     }
 }
 

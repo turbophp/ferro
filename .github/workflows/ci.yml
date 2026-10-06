@@ -110,8 +110,12 @@ jobs:
       FERRO_TEST_MYSQL_URL: mysql://ferro:ferro@127.0.0.1:33060/ferro
     steps:
       - uses: actions/checkout@v4
+      # `sockets` (M3-D3): with ext-sockets on Linux the client reads with `recvmsg` and advertises
+      # MEMFD_RX, so the live tier below runs the out-of-band path (`Live/OobLiveTest`, which SKIPS
+      # without it — fatal under `--fail-on-skipped`). The extension stays OPTIONAL for users
+      # (charter rule 7); the `fread` path is re-run separately below.
       - uses: shivammathur/setup-php@v2
-        with: { php-version: "8.4", extensions: msgpack, tools: composer }
+        with: { php-version: "8.4", extensions: "msgpack, sockets", tools: composer }
       - uses: dtolnay/rust-toolchain@stable
       - run: docker compose -f testkit/docker-compose.yml up -d --wait pg mysql
       # PHP cannot host the daemon in-process, so LiveTestCase spawns a REAL ferrod per test and
@@ -126,6 +130,11 @@ jobs:
       # about when a file belongs to two suites), the ONLY two skip reasons are the missing
       # prerequisites this job now provides — so a skip here means the lane stopped testing.
       - run: (cd php/client && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
+      # The same live tier on the `fread` read path — what every client WITHOUT ext-sockets runs.
+      # Disabling `socket_recvmsg` makes `Transport::canReceiveFds()` false, so no session advertises
+      # MEMFD_RX. `OobLiveTest` (group `oob`) needs the memfd path, so it is EXCLUDED rather than left
+      # to skip, and the step stays `--fail-on-skipped`: a run where everything skipped cannot pass.
+      - run: (cd php/client && php -d disable_functions=socket_recvmsg ./vendor/bin/phpunit tests/Live --exclude-group oob --fail-on-skipped)
       - run: (cd php/client && ./vendor/bin/phpstan analyse src --level 9)
       # M1-S8b: the Doctrine driver package. It has its OWN vendor/ (there is no composer
       # workspace), so it needs its own install/test/stan lanes — omitting them would make the whole

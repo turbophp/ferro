@@ -48,6 +48,12 @@ final class Ferro
      *   for the M1-S8b Doctrine tier, whose whole type boundary is a custom ValuePolicy: without it
      *   the facade's resilient wiring (ReconnectLoop + FateClassifier + epoch tracking) would have
      *   to be rebuilt inside the driver package.
+     * @param ?bool $receiveFds whether the session reads with `recvmsg` and advertises `MEMFD_RX`, so
+     *   the engine may send a large result as a sealed memfd (M3-D3, SPEC §5.1). `null` (the default)
+     *   does so when this process can (Linux, `ext-sockets`) and falls back to `fread` if setting it
+     *   up fails; `false` opts this connection out (the `fread` path, every result inline); `true`
+     *   insists and throws when it cannot. Per connection, unlike the engine-wide
+     *   `FERRO_MEMFD_THRESHOLD_BYTES=off`.
      */
     public static function connect(
         string $socketPath,
@@ -59,11 +65,12 @@ final class Ferro
         ?ValuePolicy $values = null,
         ?float $statementTimeout = null,
         ?Manifest $manifest = null,
+        ?bool $receiveFds = null,
     ): Connection {
         $requestTimeout = self::requestTimeout($statementTimeout);
         $hash = $manifest?->hash();
-        $factory = static function () use ($socketPath, $connectTimeout, $ioTimeout, $requestTimeout, $hash): SessionInterface {
-            $session = new Session(Transport::connectUnix($socketPath, $connectTimeout, $ioTimeout));
+        $factory = static function () use ($socketPath, $connectTimeout, $ioTimeout, $requestTimeout, $hash, $receiveFds): SessionInterface {
+            $session = new Session(Transport::connectUnix($socketPath, $connectTimeout, $ioTimeout, $receiveFds));
             $session->setRequestTimeout($requestTimeout);
             $session->hello($hash);
             return $session;
