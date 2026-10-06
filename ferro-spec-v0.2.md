@@ -1446,7 +1446,7 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
   - **Backpressure is bounded (P7 (h1) holds).**
     - Both sockets pin 128 KiB buffers. A credit-gated reader lets the upstream write only ~0.6 MB past the credit, for both body framings, and new credit resumes it.
     - The same probe on a read-ahead client sees 511 MiB.
-    - A read-ahead throttled to ~25 MB/s is caught because it never stalls (118 MiB in 5 s). One slower than the 300 ms stall window is caught by the 3 s hold, down to one frame per ~3.3 s. That window, not the 25 MB/s one, is what (bj)'s "merely slow" rule needed.
+    - A read-ahead throttled to ~25 MB/s is caught because it never stalls (118 MiB in 5 s). One slower than the 300 ms stall window is caught by the 3 s hold when its reads reach the socket inside it: guaranteed at one frame per 350 ms (the review's mutation, a permanent control). Slower readers are caught only sometimes — 2–3.2 s per frame locally, but a GitHub runner MISSED 2 s per frame (the reader drained only hyper's buffer during the hold); that control case failed CI on PR #92 and was removed, and this bound corrected. That window, not the 25 MB/s one, is what (bj)'s "merely slow" rule needed.
   - **The dependency set (P3 holds with a caveat; §23.13 amended).**
     - **`tokio-rustls`'s default features select `aws_lc_rs`**, the backend D20 rejects, so `default-features = false, features = ["ring", "tls12"]` is load-bearing.
     - With it, the lock holds no `aws-lc-*`, `cmake`, `webpki-roots`, OpenSSL crate or `httpdate`.
