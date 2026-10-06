@@ -513,7 +513,8 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         match flag.as_str() {
             "--manifest" if manifest_path.is_none() => manifest_path = Some(PathBuf::from(v)),
             "--out" if out.is_none() => out = Some(PathBuf::from(v)),
-            "--queries-class" => queries_class = v.trim_start_matches('\\').to_string(),
+            // One leading `\` (a fully-qualified spelling) is accepted; `gen` checks the rest.
+            "--queries-class" => queries_class = v.strip_prefix('\\').unwrap_or(v).to_string(),
             "--manifest" | "--out" => return usage_error(&format!("`{flag}` given twice")),
             other => return usage_error(&format!("unknown flag `{other}`")),
         }
@@ -537,9 +538,37 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         Ok(f) => f,
         Err(problems) => return report(&problems),
     };
-    if let Err(p) = codegen::write_all(&out, &files, write_atomically) {
-        return report(&[p]);
+    match codegen::write_out(&out, &files, |a, b| std::fs::rename(a, b)) {
+        Ok(w) => {
+            eprintln!(
+                "ferro: wrote {} file(s) to {}",
+                w.written.len(),
+                out.display()
+            );
+            if !w.removed.is_empty() {
+                eprintln!(
+                    "ferro: removed {} file(s) a previous run generated and this one does not: {}",
+                    w.removed.len(),
+                    w.removed.join(", ")
+                );
+            }
+        }
+        Err(codegen::WriteError::Untouched(p)) => return report(&[p]),
+        Err(codegen::WriteError::Partial {
+            problem,
+            written,
+            not_written,
+        }) => {
+            eprintln!("error: {problem}");
+            eprintln!(
+                "ferro: {} is PARTIALLY updated — written: [{}]; NOT written: [{}]. Fix the \
+                 problem and re-run `ferro gen`.",
+                out.display(),
+                written.join(", "),
+                not_written.join(", ")
+            );
+            return ExitCode::from(1);
+        }
     }
-    eprintln!("ferro: wrote {} file(s) to {}", files.len(), out.display());
     ExitCode::SUCCESS
 }
