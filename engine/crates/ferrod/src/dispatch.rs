@@ -16,7 +16,7 @@
 //! per-request `Unsupported` error `END` directly on that frame's `request_id` and moves on; the
 //! session survives (SPEC's per-request set, not the session-fatal one).
 
-use ferro_proto::consts::{method_core, method_http, service};
+use ferro_proto::consts::{method_core, method_http, method_stream, service};
 
 use crate::admin::AdminVerb;
 
@@ -44,6 +44,10 @@ pub enum Route {
     /// An admin verb this build serves (M2-C3-7b). The session authorizes it under SPEC D15 BEFORE it
     /// enters the request lifecycle; an authorized one is then handled exactly like `Request`.
     Admin(AdminVerb),
+    /// M3-D4: a client COPY frame (STREAM/`COPY_DATA` or STREAM/`COPY_DONE`) for an ALREADY
+    /// in-flight `COPY_IN`. It is not a request: it never enters the registry as one and gets no
+    /// terminal of its own — the reader loop routes it to that request's handler, or discards it.
+    CopyData { done: bool },
     /// No route at all in this build: an ADMIN method it does not serve, an unrecognized service, or a CORE method this
     /// build doesn't recognize. Produces a per-request `Unsupported` error `END` directly —
     /// there is no request lifecycle to guard because nothing is ever spawned for it.
@@ -60,6 +64,12 @@ pub fn route(service: u16, method: u16) -> Route {
             method_core::WINDOW_UPDATE => Route::CoreControl(CoreMethod::WindowUpdate),
             _ => Route::Unsupported,
         };
+    }
+    if service == service::STREAM && method == method_stream::COPY_DATA {
+        return Route::CopyData { done: false };
+    }
+    if service == service::STREAM && method == method_stream::COPY_DONE {
+        return Route::CopyData { done: true };
     }
     if service == service::SQL || service == service::TX || service == service::STREAM {
         return Route::Request;
@@ -106,6 +116,26 @@ mod tests {
     fn unrecognized_core_method_is_unsupported() {
         assert_eq!(route(service::CORE, method_core::HELLO), Route::Unsupported);
         assert_eq!(route(service::CORE, 0xFFFF), Route::Unsupported);
+    }
+
+    #[test]
+    fn client_copy_frames_route_to_their_copy_in_and_nothing_else_does() {
+        assert_eq!(
+            route(service::STREAM, method_stream::COPY_DATA),
+            Route::CopyData { done: false }
+        );
+        assert_eq!(
+            route(service::STREAM, method_stream::COPY_DONE),
+            Route::CopyData { done: true }
+        );
+        // The engine-to-client STREAM methods are not client data.
+        assert_eq!(route(service::STREAM, method_stream::DATA), Route::Request);
+        assert_eq!(route(service::STREAM, method_stream::HEAD), Route::Request);
+        // A SQL method with the same number is a request.
+        assert_eq!(
+            route(service::SQL, method_stream::COPY_DATA),
+            Route::Request
+        );
     }
 
     #[test]

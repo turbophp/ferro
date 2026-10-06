@@ -983,6 +983,73 @@ fn main() {
         serde_json::json!({ "fd_index": oob.fd_index, "len": oob.len, "encoding": oob.encoding }),
     );
 
+    // --- COPY vectors (M3-D4; /proto/PROTOCOL.md §13). Two requests (COPY_IN autocommit with both
+    // nullables nil; COPY_OUT declared readonly, tx-scoped, with a timeout — so both arms of each
+    // nullable are locked), one CopyData chunk and the empty CopyDone. The chunk is 300 bytes, so the
+    // `bin16` width is locked rather than a `bin8` every codec would agree on, and it carries the COPY
+    // text format's own specials (tab, newline, backslash) plus a 0xc0 byte — the msgpack nil marker,
+    // which a codec that ever read the chunk as anything but opaque bytes would trip on. ---
+    let copy_in_req = CopyRequest {
+        pool: "main".into(),
+        sql: "COPY items (id, name) FROM STDIN".into(),
+        readonly: false,
+        timeout_ms: None,
+        tx_id: None,
+    };
+    write_case(
+        "copy_in_request",
+        0,
+        service::SQL,
+        method_sql::COPY_IN,
+        60,
+        copy_in_req.encode(),
+        serde_json::json!({ "pool": copy_in_req.pool, "sql": copy_in_req.sql,
+            "readonly": copy_in_req.readonly, "timeout_ms": null, "tx_id": null }),
+    );
+    let copy_out_req = CopyRequest {
+        pool: "main".into(),
+        sql: "COPY (SELECT id, name FROM items) TO STDOUT WITH (FORMAT csv)".into(),
+        readonly: true,
+        timeout_ms: Some(30_000),
+        tx_id: Some(42),
+    };
+    write_case(
+        "copy_out_request",
+        0,
+        service::SQL,
+        method_sql::COPY_OUT,
+        61,
+        copy_out_req.encode(),
+        serde_json::json!({ "pool": copy_out_req.pool, "sql": copy_out_req.sql,
+            "readonly": copy_out_req.readonly, "timeout_ms": 30000, "tx_id": 42 }),
+    );
+    let mut chunk = b"1\tfirst\\name\n2\tsecond\n".to_vec();
+    chunk.push(0xc0);
+    while chunk.len() < 300 {
+        chunk.push(b'x');
+    }
+    write_case(
+        "copy_data",
+        flags::STREAM,
+        service::STREAM,
+        method_stream::COPY_DATA,
+        60,
+        CopyData {
+            data: chunk.clone(),
+        }
+        .encode(),
+        serde_json::json!({ "data_hex": hex(&chunk) }),
+    );
+    write_case(
+        "copy_done",
+        0,
+        service::STREAM,
+        method_stream::COPY_DONE,
+        60,
+        CopyDone {}.encode(),
+        serde_json::json!({}),
+    );
+
     http_vectors();
 
     // Negative seeds (decoder must reject; also fuzz corpus).

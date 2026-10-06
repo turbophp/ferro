@@ -4,6 +4,7 @@
 
 pub mod bind;
 pub mod conn;
+pub mod copy;
 pub mod error_map;
 pub mod pgtext;
 pub mod placeholder;

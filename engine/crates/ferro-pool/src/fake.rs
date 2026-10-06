@@ -567,6 +567,8 @@ impl PoolBackend for FakeBackend {
     type Conn = FakeConn;
     type CancelHandle = FakeCancelHandle;
     type RowStream = FakeRowStream;
+    type CopyIn = crate::backend::NoCopy;
+    type CopyOut = crate::backend::NoCopy;
 
     fn cancel_handle(&self, _conn: &Self::Conn) -> Self::CancelHandle {
         // Capture a clone of the armed query gate (if any) so a later `cancel()` can release a

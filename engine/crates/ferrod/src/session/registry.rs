@@ -41,6 +41,48 @@ pub enum InsertErr {
 struct InFlight {
     cancel: CancellationToken,
     credit: Arc<CreditCell>,
+    /// M3-D4: the CLIENT-to-engine data channel of a `COPY_IN`, once its handler has opened one
+    /// ([`Registry::open_inbound`]). `None` for every other request — COPY data for such a request
+    /// is a client protocol violation.
+    inbound: Option<Arc<InboundCell>>,
+}
+
+/// One unit of client-sent COPY data, routed by the reader loop to the request's handler.
+#[derive(Debug)]
+pub enum Inbound {
+    Data(bytes::Bytes),
+    /// STREAM/`COPY_DONE`: the client sent its last chunk.
+    Done,
+}
+
+/// The engine-granted, client-to-engine credit window of one `COPY_IN` and the channel its data
+/// rides (M3-D4). The reader loop DEBITS the credit for every chunk and refuses one that does not
+/// fit, so the channel can hold at most what the handler granted — engine memory per COPY is bounded
+/// by the grant, and the reader loop never waits on a handler (a full channel is a violation, never
+/// a block). The handler REPLENISHES the credit before it tells the client, so the client can never
+/// legally send ahead of the engine's own accounting.
+#[derive(Debug)]
+pub struct InboundCell {
+    credit: std::sync::Mutex<Credit>,
+    tx: tokio::sync::mpsc::Sender<Inbound>,
+}
+
+impl InboundCell {
+    /// Add credit (frames, bytes) before telling the client about it.
+    pub fn replenish(&self, frames: u32, bytes: u32) {
+        self.credit.lock().unwrap().replenish(frames, bytes);
+    }
+}
+
+/// What the reader loop did with a client COPY frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    Delivered,
+    /// The request is not in flight, or its COPY has already ended: a chunk the client sent before
+    /// it read the terminal. Dropped silently, like a CANCEL for an unknown id.
+    Discarded,
+    /// The client broke the COPY flow-control contract: session-fatal.
+    Violation(&'static str),
 }
 
 /// The in-flight registry for one session. Holds only request-bearing (SQL/TX/STREAM) request
@@ -86,6 +128,7 @@ impl Registry {
             InFlight {
                 cancel: cancel.clone(),
                 credit: Arc::clone(&cell),
+                inbound: None,
             },
         );
         Ok((cancel, cell))
@@ -115,6 +158,64 @@ impl Registry {
     /// and hard-aborts its supervisor task. A no-op on an empty registry; cancelling an
     /// already-cancelled token is itself a documented no-op, so this is safe to call more than
     /// once too.
+    /// M3-D4: open `id`'s client-to-engine COPY channel with an initial grant of `window`. The
+    /// channel holds one item more than the grant's frames, for the `COPY_DONE` that needs no credit.
+    /// `None` if `id` is not in flight.
+    pub fn open_inbound(
+        &self,
+        id: u32,
+        window: Credit,
+    ) -> Option<(Arc<InboundCell>, tokio::sync::mpsc::Receiver<Inbound>)> {
+        self.open_inbound_with_capacity(id, window, window.frames())
+    }
+
+    /// [`Registry::open_inbound`] with the initial credit and the channel's frame capacity given
+    /// separately: a handler opens with ZERO credit (nothing may arrive before its first grant) and a
+    /// capacity of its whole window.
+    pub fn open_inbound_with_capacity(
+        &self,
+        id: u32,
+        credit: Credit,
+        frames: u32,
+    ) -> Option<(Arc<InboundCell>, tokio::sync::mpsc::Receiver<Inbound>)> {
+        let mut map = self.inner.lock().unwrap();
+        let entry = map.get_mut(&id)?;
+        let (tx, rx) = tokio::sync::mpsc::channel(frames as usize + 1);
+        let cell = Arc::new(InboundCell {
+            credit: std::sync::Mutex::new(credit),
+            tx,
+        });
+        entry.inbound = Some(Arc::clone(&cell));
+        Some((cell, rx))
+    }
+
+    /// M3-D4: route one client COPY frame to `id`'s handler. Never waits.
+    pub fn deliver(&self, id: u32, item: Inbound) -> Delivery {
+        let map = self.inner.lock().unwrap();
+        let Some(entry) = map.get(&id) else {
+            return Delivery::Discarded;
+        };
+        let Some(cell) = entry.inbound.as_ref() else {
+            return Delivery::Violation("COPY data for a request that is not an open COPY_IN");
+        };
+        if cell.tx.is_closed() {
+            return Delivery::Discarded;
+        }
+        if let Inbound::Data(b) = &item {
+            let len = u32::try_from(b.len()).unwrap_or(u32::MAX);
+            if !cell.credit.lock().unwrap().try_debit(len) {
+                return Delivery::Violation("COPY data beyond the engine's grant");
+            }
+        }
+        match cell.tx.try_send(item) {
+            Ok(()) => Delivery::Delivered,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Delivery::Discarded,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Delivery::Violation("COPY frames beyond the engine's grant")
+            }
+        }
+    }
+
     pub fn cancel_all(&self) {
         for inflight in self.inner.lock().unwrap().values() {
             inflight.cancel.cancel();

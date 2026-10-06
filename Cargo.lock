@@ -437,6 +437,7 @@ name = "ferro-pool"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "fastrand",
  "ferro-classify",
  "ferro-proto",

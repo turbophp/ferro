@@ -128,6 +128,8 @@ impl PoolBackend for PgBackend {
     type Conn = PgConn;
     type CancelHandle = PgCancel;
     type RowStream = crate::query::PgRowStream;
+    type CopyIn = crate::copy::PgCopyIn;
+    type CopyOut = crate::copy::PgCopyOut;
 
     /// The out-of-band cancel handle (S6): `tokio_postgres::Client::cancel_token` captures this
     /// connection's backend key data into a `Send + 'static` `CancelToken`. Cancelling it runs
@@ -270,6 +272,19 @@ impl PoolBackend for PgBackend {
     /// tracker might.
     fn clean_reset_profile(&self) -> Option<ResetProfile> {
         Some(ResetProfile::Targeted)
+    }
+
+    /// PostgreSQL has the COPY sub-protocol (M3-D4) — the only backend here that does.
+    fn supports_copy(&self) -> bool {
+        true
+    }
+
+    async fn copy_in(&self, conn: &mut Self::Conn, sql: &str) -> Result<Self::CopyIn, PoolError> {
+        crate::copy::copy_in(&conn.client, sql).await
+    }
+
+    async fn copy_out(&self, conn: &mut Self::Conn, sql: &str) -> Result<Self::CopyOut, PoolError> {
+        crate::copy::copy_out(&conn.client, sql).await
     }
 
     /// M1-S4 fix (M4b, whole-branch final review): routed through the SAME `is_session_fatal`-first

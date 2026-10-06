@@ -163,6 +163,23 @@ final class FateClassifier
         ));
     }
 
+    /**
+     * A COPY_IN lost before its end-of-data (`COPY_DONE`) was completely written (M3-D4): a KNOWN
+     * did-not-apply, whatever was sent before it — PostgreSQL completes a `COPY FROM STDIN` only on
+     * its end-of-data, and the engine aborts a COPY whose session ends without one. `Retryable`, with
+     * or without a transaction (in one, the transaction is dead too). It licenses the CALLER only:
+     * this client never re-sends a COPY.
+     */
+    public function copyStoppedBeforeDone(string $reason): RetryableException
+    {
+        return new RetryableException(self::payload(
+            C::ERR_CONNECTION_LOST,
+            C::BRANCH_RETRYABLE,
+            'COPY lost before its end-of-data was sent — PostgreSQL completes a COPY only on its '
+                . 'end-of-data, so it cannot have applied (Retryable): ' . $reason,
+        ));
+    }
+
     private static function payload(int $code, int $branch, string $message): ErrorPayload
     {
         return new ErrorPayload($code, $branch, null, null, $message, null, null);

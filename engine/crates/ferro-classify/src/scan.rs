@@ -133,8 +133,29 @@ fn scan(sql: &str) -> ScanResult {
     // Code, and flushed after the loop so an unterminated region still reports a span.
     let mut hidden: Vec<(usize, usize, Hidden)> = Vec::new();
     let mut open_hidden: Option<(usize, Hidden)> = None;
+    // Is the Code byte just consumed part of an IDENTIFIER token? PostgreSQL's lexer continues an
+    // identifier with `$` (`ident_cont` includes it), so `x$b$` is ONE name and opens no
+    // dollar-quote; only a `$` that does not continue an identifier can open one (M3-D4 review L1).
+    let mut in_ident = false;
 
     while i < bytes.len() {
+        if region == Region::Code {
+            let c = bytes[i];
+            let continues = if in_ident {
+                is_pg_ident_cont(c)
+            } else {
+                is_pg_ident_start(c)
+            };
+            if c == b'$' && in_ident {
+                // `$` inside an identifier: ordinary identifier text, never a dollar-quote open.
+                push_visible_char(&mut masked, sql, &mut i);
+                continue;
+            }
+            // Set for the byte about to be consumed; any arm that leaves Code resets it below.
+            in_ident = continues;
+        } else {
+            in_ident = false;
+        }
         match region {
             Region::Code => match bytes[i] {
                 b'\'' => {
@@ -325,9 +346,12 @@ fn is_e_string_prefix(sql: &str, quote_pos: usize) -> bool {
 /// If a `$tag$` dollar-quote OPENS at `sql.as_bytes()[start]` (`== b'$'`), returns `(delimiter,
 /// end)`: `delimiter` is the full opening text (e.g. `"$foo$"`, or `"$$"` for an empty tag) —
 /// textually identical to its matching close — and `end` is the byte index just past it. A tag is
-/// `[A-Za-z_][A-Za-z0-9_]*` or empty; a digit immediately after `$` (e.g. `$1`) is a positional
-/// param, NOT a dollar-quote, so this returns `None` and the `$` is ordinary Code. Ported from
-/// `placeholder.rs`'s `dollar_quote_tag_end` (`placeholder.rs:173-189`).
+/// PostgreSQL's `dolq_start dolq_cont*` — `[A-Za-z\x80-\xFF_][A-Za-z\x80-\xFF_0-9]*` — or empty; the
+/// high bytes matter (M3-D4 review L1: `$é$` is a tag to the server, and reading it as code put a
+/// literal's text in front of the COPY shape check and the fingerprint). A digit immediately after
+/// `$` (e.g. `$1`) is a positional param, NOT a dollar-quote, so this returns `None` and the `$` is
+/// ordinary Code. Whether a `$` can open one at all (not after an identifier character) is the
+/// caller's question: see `scan`.
 pub(crate) fn dollar_quote_tag(sql: &str, start: usize) -> Option<(&str, usize)> {
     let bytes = sql.as_bytes();
     debug_assert_eq!(bytes[start], b'$');
@@ -335,7 +359,7 @@ pub(crate) fn dollar_quote_tag(sql: &str, start: usize) -> Option<(&str, usize)>
     if j < bytes.len() && bytes[j].is_ascii_digit() {
         return None;
     }
-    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+    while j < bytes.len() && is_dolq_cont(bytes[j]) {
         j += 1;
     }
     if j < bytes.len() && bytes[j] == b'$' {
@@ -343,6 +367,21 @@ pub(crate) fn dollar_quote_tag(sql: &str, start: usize) -> Option<(&str, usize)>
     } else {
         None
     }
+}
+
+/// PostgreSQL's `dolq_cont`: `[A-Za-z\x80-\xFF_0-9]`.
+fn is_dolq_cont(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// PostgreSQL's `ident_start`: `[A-Za-z\x80-\xFF_]`.
+fn is_pg_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
+}
+
+/// PostgreSQL's `ident_cont`: `[A-Za-z\x80-\xFF_0-9$]`.
+fn is_pg_ident_cont(b: u8) -> bool {
+    is_dolq_cont(b) || b == b'$'
 }
 
 fn is_ident_char_byte(b: u8) -> bool {
@@ -440,6 +479,13 @@ pub(crate) fn next_token_after_keyword(sql: &str) -> Option<String> {
     }
 }
 
+/// The same-length masked copy of `sql` — every string literal, comment and dollar-quoted body
+/// blanked to spaces, `"..."` quoted identifiers left visible — for a consumer that must tokenize
+/// CODE only (`crate::copy`'s COPY shape check, M3-D4).
+pub(crate) fn masked_code(sql: &str) -> String {
+    scan(sql).masked
+}
+
 /// True iff `ident` (ASCII, case-insensitive) appears as a WHOLE identifier — neighboring bytes
 /// (if any) are not `[A-Za-z0-9_]` — inside a CODE region (everything except `'...'`/`E'...'`
 /// strings, `--`/`/* */` (nested) comments, and `$tag$...$tag$` bodies; `"..."` quoted identifiers
@@ -489,6 +535,48 @@ pub(crate) fn split_top_level_statements(sql: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `$` as PostgreSQL's lexer reads it (M3-D4 review round 2, L1): a tag may hold bytes
+    /// 0x80-0xFF, and a `$` that continues an identifier opens nothing.
+    #[test]
+    fn dollar_quotes_open_where_postgresql_opens_them() {
+        // Non-ASCII tag: the body is hidden.
+        assert_eq!(
+            masked_code("SELECT $é$ x $é$ y"),
+            format!("SELECT {} y", " ".repeat(11))
+        );
+        // `x$b$` is one identifier: nothing is hidden.
+        assert_eq!(
+            masked_code("SELECT x$b$, y FROM t"),
+            "SELECT x$b$, y FROM t"
+        );
+        // ... and after it, a `$` preceded by a space opens one as usual.
+        assert_eq!(
+            masked_code("SELECT x$b$ FROM t $b$"),
+            format!("SELECT x$b$ FROM t {}", " ".repeat(3))
+        );
+        assert_eq!(masked_code("SELECT x1$$, y"), "SELECT x1$$, y");
+        // A `$` after a NON-identifier token still opens one.
+        assert_eq!(
+            masked_code("SELECT 1$$ y $$"),
+            format!("SELECT 1{}", " ".repeat(7))
+        );
+        assert_eq!(
+            masked_code("SELECT \"x\"$$ y $$"),
+            format!("SELECT \"x\"{}", " ".repeat(7))
+        );
+        assert_eq!(
+            masked_code("SELECT x /**/$$ y $$"),
+            format!("SELECT x {}", " ".repeat(11))
+        );
+        assert_eq!(masked_code("SELECT é$$, y"), "SELECT é$$, y");
+        // A positional parameter is not an identifier, nor a dollar-quote.
+        assert_eq!(
+            masked_code("SELECT $1, $$ y $$"),
+            format!("SELECT $1, {}", " ".repeat(7))
+        );
+    }
+
     use super::*;
 
     // ---- contains_identifier_ci: TRUE cases ---------------------------------------------------

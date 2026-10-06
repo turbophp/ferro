@@ -90,6 +90,101 @@ pub struct Responder {
     /// once — so one `END` is one span by construction. A `Responder` dropped without an `end_*`
     /// drops its span too, which exports it as `NoTerminal` (see `otlp::ExecSpan`).
     span: Option<crate::otlp::ExecSpan>,
+    /// M3-D4: what a `COPY_IN` handler needs to open its client-to-engine data channel — set for
+    /// every request by `session::handle_request_frame`, used only by a COPY_IN. `None` on the
+    /// inert test constructors.
+    inbound: Option<InboundCtx>,
+}
+
+struct InboundCtx {
+    registry: Arc<super::registry::Registry>,
+    cap: Arc<SessionCap>,
+    window: super::flow::Credit,
+}
+
+impl std::fmt::Debug for InboundCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundCtx")
+            .field("window", &self.window)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A `COPY_IN`'s open client-to-engine channel (M3-D4), from [`Responder::open_inbound`]. Holds
+/// the request's reservation against the session's INBOUND cap for as long as it lives, so the
+/// session's total buffered COPY data is bounded however many COPYs are open.
+#[derive(Debug)]
+pub struct InboundRx {
+    rx: mpsc::Receiver<super::registry::Inbound>,
+    cell: Arc<super::registry::InboundCell>,
+    window: super::flow::Credit,
+    regrant: Regrant,
+    _reserve: super::flow::CapReserve,
+}
+
+/// The re-grant accounting of one `COPY_IN` (M3-D4): what has left the channel since the last grant.
+/// A pure value so the one property the memory bound rests on — every grant returns EXACTLY what was
+/// consumed, never more, in frames and in bytes — is unit-tested on its own.
+#[derive(Debug, Clone, Copy)]
+struct Regrant {
+    window: super::flow::Credit,
+    frames: u32,
+    bytes: u32,
+}
+
+impl Regrant {
+    fn new(window: super::flow::Credit) -> Self {
+        Regrant {
+            window,
+            frames: 0,
+            bytes: 0,
+        }
+    }
+
+    fn consumed(&mut self, len: usize) -> Option<(u32, u32)> {
+        self.frames += 1;
+        self.bytes = self
+            .bytes
+            .saturating_add(u32::try_from(len).unwrap_or(u32::MAX));
+        if self.frames >= self.window.frames().div_ceil(2)
+            || self.bytes >= self.window.bytes().div_ceil(2)
+        {
+            let g = (self.frames, self.bytes);
+            self.frames = 0;
+            self.bytes = 0;
+            Some(g)
+        } else {
+            None
+        }
+    }
+}
+
+impl InboundRx {
+    /// The next client COPY frame. `None` only if the registry entry is gone.
+    pub async fn recv(&mut self) -> Option<super::registry::Inbound> {
+        self.rx.recv().await
+    }
+
+    /// The whole window, for the initial grant.
+    pub fn window(&self) -> super::flow::Credit {
+        self.window
+    }
+
+    /// Record that a chunk of `len` bytes left the channel. Returns the grant to send once half the
+    /// window (in frames OR bytes) has been consumed — batching the client's `WINDOW_UPDATE`s. A
+    /// client with any credit left can always send (COPY data is divisible: it splits a chunk to fit),
+    /// and one with none has sent at least half the window, so the grant always comes: no deadlock.
+    pub fn consumed(&mut self, len: usize) -> Option<(u32, u32)> {
+        self.regrant.consumed(len)
+    }
+}
+
+/// Why [`Responder::open_inbound`] could not open the channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenInboundError {
+    /// No inbound context (an inert test responder) or the request is no longer registered.
+    Unavailable,
+    Aborted(WaitAborted),
 }
 
 impl Responder {
@@ -143,9 +238,102 @@ impl Responder {
                 cell: cell.clone(),
                 sink,
                 span: None,
+                inbound: None,
             },
             cell,
         )
+    }
+
+    /// M3-D4: give this request what a `COPY_IN` needs — the session registry (to open the data
+    /// channel the reader loop routes into), the session's INBOUND cap, and the per-COPY window.
+    pub fn with_inbound(
+        mut self,
+        registry: Arc<super::registry::Registry>,
+        cap: Arc<SessionCap>,
+        window: super::flow::Credit,
+    ) -> Self {
+        self.inbound = Some(InboundCtx {
+            registry,
+            cap,
+            window,
+        });
+        self
+    }
+
+    /// M3-D4: reserve this COPY's window against the session's inbound cap (waiting, cancellably,
+    /// while other COPYs hold it) and open the data channel with ZERO credit — the client may send
+    /// nothing until [`Responder::grant`] says so.
+    pub async fn open_inbound(
+        &self,
+        cancel: &CancellationToken,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<InboundRx, OpenInboundError> {
+        let ctx = self.inbound.as_ref().ok_or(OpenInboundError::Unavailable)?;
+        let reserve = ctx
+            .cap
+            .reserve_or_wait(u64::from(ctx.window.bytes()), cancel, deadline)
+            .await
+            .map_err(OpenInboundError::Aborted)?;
+        let zero = super::flow::Credit::new(0, 0);
+        let (cell, rx) = ctx
+            .registry
+            .open_inbound_with_capacity(self.sink.request_id, zero, ctx.window.frames())
+            .ok_or(OpenInboundError::Unavailable)?;
+        Ok(InboundRx {
+            rx,
+            cell,
+            window: ctx.window,
+            regrant: Regrant::new(ctx.window),
+            _reserve: reserve,
+        })
+    }
+
+    /// M3-D4: grant the client (frames, bytes) more COPY credit — the engine's own accounting FIRST,
+    /// then a `CORE/WINDOW_UPDATE` on this request's id (the first one also says "the COPY has
+    /// started"). Not debited from any window: it is a control frame.
+    pub async fn grant(
+        &self,
+        inbound: &InboundRx,
+        frames: u32,
+        bytes: u32,
+    ) -> Result<(), StreamSendError> {
+        inbound.cell.replenish(frames, bytes);
+        let payload = ferro_proto::messages::WindowUpdate { frames, bytes }.encode();
+        let frame = OutFrame {
+            header: Header {
+                flags: 0,
+                service: service::CORE,
+                method: ferro_proto::consts::method_core::WINDOW_UPDATE,
+                request_id: self.sink.request_id,
+                payload_len: payload.len() as u32,
+            },
+            payload: Bytes::from(payload),
+        };
+        self.sink
+            .control_tx
+            .send(ControlMsg::bare(frame))
+            .await
+            .map_err(|_| StreamSendError::LinkLost)
+    }
+
+    /// M3-D4: send one chunk of raw COPY bytes as a STREAM/`COPY_DATA` frame, under this request's
+    /// credit window and the session cap exactly like a DATA frame (a COPY_OUT's flow control IS the
+    /// stream's).
+    pub async fn send_copy_data(
+        &self,
+        data: &[u8],
+        cancel: &CancellationToken,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<usize, StreamSendError> {
+        let payload = ferro_proto::messages::CopyData::encode_slice(data);
+        self.send_stream_frame(
+            method_stream::COPY_DATA,
+            flags::STREAM,
+            payload,
+            cancel,
+            deadline,
+        )
+        .await
     }
 
     /// Attach the request's OTLP span (M2-C4c-2). `None` — the statement is not traced — is a
@@ -319,6 +507,42 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every re-grant returns EXACTLY the frames and bytes consumed since the previous one — an
+    /// over-grant (review M2: `frames + 1`) lets a conforming client overrun the channel (session-
+    /// fatal under load) or, in bytes, the session's memory bound — and one always comes by half the
+    /// window, so a client with no credit is never left waiting.
+    #[test]
+    fn a_regrant_returns_exactly_what_was_consumed_and_comes_by_half_the_window() {
+        for (wf, wb) in [(8u32, 64 * 1024u32), (32, 2 * 1024 * 1024), (1, 1), (3, 10)] {
+            let mut r = Regrant::new(Credit::new(wf, wb));
+            let (mut since_f, mut since_b) = (0u32, 0u32);
+            let (mut total_f, mut total_b, mut granted_f, mut granted_b) = (0u64, 0u64, 0u64, 0u64);
+            for i in 0..5000usize {
+                let len = (i * 7919) % (wb as usize).max(1) + 1;
+                let len = len.min(wb as usize);
+                since_f += 1;
+                since_b += len as u32;
+                total_f += 1;
+                total_b += len as u64;
+                match r.consumed(len) {
+                    Some((f, b)) => {
+                        assert_eq!((f, b), (since_f, since_b), "window ({wf}, {wb}) step {i}");
+                        granted_f += u64::from(f);
+                        granted_b += u64::from(b);
+                        since_f = 0;
+                        since_b = 0;
+                    }
+                    None => assert!(
+                        since_f < wf.div_ceil(2) && since_b < wb.div_ceil(2),
+                        "a grant was owed by half the window"
+                    ),
+                }
+            }
+            assert_eq!(granted_f + u64::from(since_f), total_f);
+            assert_eq!(granted_b + u64::from(since_b), total_b);
+        }
+    }
 
     use std::sync::Arc;
     use std::time::Duration;

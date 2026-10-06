@@ -373,7 +373,7 @@ The DSN is **never** on the wire (SPEC §12 — it is a server-side secret), and
 Empty message — a zero-field array (`[]`). Announces graceful client close so the engine can
 distinguish drain from death (§5.2).
 
-### `WINDOW_UPDATE` (service `CORE`, method `WINDOW_UPDATE` = 6) — client → server
+### `WINDOW_UPDATE` (service `CORE`, method `WINDOW_UPDATE` = 6) — either direction
 
 | # | field | type | notes |
 |---|---|---|---|
@@ -382,6 +382,11 @@ distinguish drain from death (§5.2).
 
 Note: `WINDOW_UPDATE` is itself carried in a frame whose header `request_id` names the stream
 being credited (§5.2) — the message body does not repeat `request_id`.
+
+**Client → server** (since M1-S5) it replenishes the credit of a server → client stream. **Server →
+client** (since M3-D4, and only on an open `COPY_IN`'s `request_id`) it grants the CLIENT credit to
+send COPY data; the first one also means "the COPY has started" (§13). Same shape both ways — locked
+by the one `window_update` vector. Neither direction is ever answered.
 
 ## 5. `ERROR` payload
 
@@ -445,7 +450,7 @@ NOT NULL violation (`1048`), so a consumer keyed on the SQLSTATE alone cannot te
 `errno` rides the §2 signed/unsigned narrowing ladder like any other integer field (`1062` ⇒
 `cd 04 26`, a `uint16`), NOT a fixed width.
 
-**Per-service indexes:** SQL `EXEC` → §8.3 · TX → §9.6 · STREAM `HEAD`/`DATA` → §10.3 · ADMIN → §11.3 · HTTP → §12.5.
+**Per-service indexes:** SQL `EXEC` → §8.3 · TX → §9.6 · STREAM `HEAD`/`DATA` → §10.3 · ADMIN → §11.3 · HTTP → §12.5 · COPY (`COPY_IN`/`COPY_OUT`, `COPY_DATA`/`COPY_DONE`) → §13.4.
 
 **M3-D3:** `oob_ref` — an `END | OOB_FD` SQL/`EXEC` terminal whose payload is the §1.1 `OobRef`
 (`len = 1048578`, past u16, so the width is locked), NOT an `Outcome`: the `Outcome` is what the memfd
@@ -938,3 +943,76 @@ so a skewed engine/client pair fails at the first frame, and an older decoder cl
 correctly by its explicit `branch` (§5).
 
 *(§13 is reserved for Ferro Queue's messages, SPEC §24.)*
+
+## 13. COPY (`SQL`/`COPY_IN`, `SQL`/`COPY_OUT`, `STREAM`/`COPY_DATA`, `STREAM`/`COPY_DONE`)
+
+PostgreSQL's COPY sub-protocol (M3-D4; SPEC §6.1). Methods: `methods.sql` `COPY_IN = 2`,
+`COPY_OUT = 3`; `methods.stream` `COPY_DATA = 3`, `COPY_DONE = 4`. The client's statement reaches the
+server unmodified; the engine refuses, before anything reaches the server, a statement that is not
+exactly one `COPY … FROM STDIN` (for `COPY_IN`) or `COPY … TO STDOUT` (for `COPY_OUT`) — a refusal of
+the request's SHAPE, `Unsupported`, never an inference about what it does. It sends nothing and
+involves no connection, so with a `tx_id` it leaves the transaction open, as an `EXEC` refusal does. A `COPY … STDIN/STDOUT`
+sent as an `EXEC` is refused the same way. Non-PostgreSQL pools refuse both methods (`Unsupported`).
+No `protocol_version` bump: no existing message changed shape (the ADMIN precedent, §11.3); the
+registry hash moved.
+
+### 13.1 `CopyRequest` — the body of `COPY_IN` and `COPY_OUT` (client → server)
+
+A positional fixarray of 5 (Value-free, the TX layout):
+
+| # | field | type | notes |
+|---|---|---|---|
+| 1 | `pool` | `str` | the pool (ignored when `tx_id` is set — the transaction's pool is used) |
+| 2 | `sql` | `str` | the COPY statement, verbatim |
+| 3 | `readonly` | `bool` | the client's §19.3 declaration. Meaningful for `COPY_OUT` only — `COPY (DELETE … RETURNING *) TO STDOUT` writes, and the engine does not infer otherwise. A `COPY_IN` declared `readonly` is refused (`Unsupported`): the method is the write |
+| 4 | `timeout_ms` | `u32 \| nil` | bounds the WHOLE COPY — the wait for a connection, the data, and the end — as `timeout_ms` bounds a stream. The PHP client sends `nil` |
+| 5 | `tx_id` | `u64 \| nil` | run inside that transaction (§9) |
+
+### 13.2 The exchange
+
+**`COPY_IN`.** Client sends `COPY_IN`. The engine reserves the COPY's window, checks out, starts the
+COPY, and only then sends a `CORE`/`WINDOW_UPDATE {frames, bytes}` on the request's id (§4): the
+GRANT, which also means "the COPY has started". If the COPY cannot start, the terminal `END` comes
+instead and no grant is ever sent — so no byte is ever sent into a COPY that did not start. The client
+then sends `STREAM`/`COPY_DATA` frames (`STREAM` flag set) within its credit — each frame costs one
+frame and its chunk's byte length — and reads the engine's further grants as it runs low; then one
+`STREAM`/`COPY_DONE`. The terminal is an ordinary `Outcome` (§6): on success an `ExecOk` (§8.2) with
+empty `cols`/`rows`, `affected` = rows copied, `stats.rows = 0`, `stats.bytes` = COPY bytes received.
+
+- COPY data is DIVISIBLE (a byte stream; a chunk need not end on a row), so a client with ANY credit
+  left can always send — it splits a chunk to fit — and the engine re-grants after it has forwarded
+  half its window to the server: no deadlock. The engine's default window is 32 frames / 2 MiB.
+- **Session-fatal** (`request_id = 0` terminal, `Protocol`, then the in-flight requests are drained
+  and the session closes): a `COPY_DATA` beyond the granted credit, `COPY_DATA`/`COPY_DONE` for an
+  in-flight request that is not a started `COPY_IN`, or a malformed body. The request in question is
+  in flight with its own handler, so a per-request error would be a second terminal for it.
+- **Silently discarded:** `COPY_DATA`/`COPY_DONE` for a `request_id` that is not in flight, or whose
+  COPY has already ended — the chunks a client sent before it read an early terminal.
+- **Fate.** Until `COPY_DONE`, NOTHING of the COPY can apply (PostgreSQL completes a `COPY FROM STDIN`
+  only on its end-of-data): a `CANCEL`, a deadline, the session ending, a lost backend link, or a
+  violation aborts it and the terminal is a KNOWN did-not-apply — `ConnectionLost` (Retryable) in
+  autocommit, `TxDeadline` (Retryable, the transaction rolled back) inside one. A server error
+  (a malformed row, a constraint) is reported as itself, known-fate. After `COPY_DONE` the §19.3
+  write rules apply: a cancel or timeout the engine cannot confirm, or a lost link, is
+  `Indeterminate` in autocommit.
+
+**`COPY_OUT`.** Exactly a stream (§10) without a `HEAD`: `STREAM`/`COPY_DATA` frames (`STREAM` flag)
+under the request's credit window and the session cap, replenished by the client's `WINDOW_UPDATE`,
+then the terminal: an `ExecOk` with `affected` = rows exported, `stats.rows = affected`,
+`stats.bytes` = COPY bytes sent. The engine coalesces the per-row messages the server has ALREADY sent
+into frames of up to 256 KiB — it never waits to fill one — and splits a larger row across frames. Abandon with `CANCEL` and read to the terminal.
+Fate as a streamed `EXEC` of the same `readonly`.
+
+### 13.3 `CopyData` / `CopyDone`
+
+`CopyData` is a fixarray(1) `[data: bin]` — a MessagePack `bin` (smallest width), never a `str`; a
+receiver refuses anything else, trailing bytes, or a declared length the payload does not carry. The
+bytes are opaque: the COPY format (text, CSV, binary) is the statement's. `CopyDone` is the empty
+fixarray `[]`. Neither is an `Outcome`, and neither carries `END`.
+
+### 13.4 COPY vector index
+
+`copy_in_request` (autocommit; both nullables `nil`), `copy_out_request` (`readonly = true`,
+`timeout_ms = 30000`, `tx_id = 42` — the populated arms), `copy_data` (300 bytes, so `bin16` is
+locked rather than a `bin8` every codec agrees on, carrying COPY text-format specials and a `0xc0`
+byte), and `copy_done`. The grant is a `window_update` (§4); the terminals are `ExecOk`s (§8.3).

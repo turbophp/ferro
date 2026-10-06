@@ -965,6 +965,9 @@ impl Cancel for SqliteCancel {
 impl PoolBackend for SqliteBackend {
     type Conn = SqliteConn;
     type RowStream = SqliteRowStream;
+    // M3-D4: SQLite has no COPY sub-protocol; `supports_copy` keeps its `false` default.
+    type CopyIn = ferro_pool::backend::NoCopy;
+    type CopyOut = ferro_pool::backend::NoCopy;
     type CancelHandle = SqliteCancel;
 
     /// **True as of C3-5 — flipped in the SAME change as `query_stream`, which is the whole point
