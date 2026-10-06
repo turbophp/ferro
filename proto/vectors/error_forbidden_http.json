@@ -1,0 +1,22 @@
+{
+  "frame_hex": "f7040200060001004300000055000000920197cd300c03c0c0d9387265717565737420726566757365642062792074686520656e67696e65277320706f6c69637920666f72207468697320757073747265616db0666f7262696464656e5f746172676574c0",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 67,
+    "service": 6
+  },
+  "message": {
+    "error": {
+      "branch": 3,
+      "code": 12300,
+      "detail": "forbidden_target",
+      "errno": null,
+      "message": "request refused by the engine's policy for this upstream",
+      "retry_after_ms": null,
+      "sqlstate": null
+    },
+    "status": 1
+  },
+  "name": "error_forbidden_http"
+}

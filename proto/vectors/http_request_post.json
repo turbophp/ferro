@@ -1,0 +1,68 @@
+{
+  "frame_hex": "f7040000060001003d000000d90000009da762696c6c696e67a4504f5354b72f76312f636861726765733f616d6f756e743d32303030b768747470733a2f2f6170692e6578616d706c652e636f6d9392ac636f6e74656e742d74797065c4106170706c69636174696f6e2f6a736f6e92a5782d726177c402804192af6964656d706f74656e63792d6b6579c4056b2d313233c403c07b7dcd7530cd07d0ce00011170c3c2ab2f76312f63686172676573d93730302d30616637363531393136636434336464383434386562323131633830333139632d623761643662373136393230333333312d3031",
+  "header": {
+    "flags": 0,
+    "method": 1,
+    "request_id": 61,
+    "service": 6
+  },
+  "message": {
+    "body": [
+      192,
+      123,
+      125
+    ],
+    "connect_timeout_ms": 2000,
+    "decode": false,
+    "headers": [
+      [
+        "content-type",
+        [
+          97,
+          112,
+          112,
+          108,
+          105,
+          99,
+          97,
+          116,
+          105,
+          111,
+          110,
+          47,
+          106,
+          115,
+          111,
+          110
+        ]
+      ],
+      [
+        "x-raw",
+        [
+          128,
+          65
+        ]
+      ],
+      [
+        "idempotency-key",
+        [
+          107,
+          45,
+          49,
+          50,
+          51
+        ]
+      ]
+    ],
+    "idempotent": true,
+    "method": "POST",
+    "origin": "https://api.example.com",
+    "read_timeout_ms": 70000,
+    "route": "/v1/charges",
+    "target": "/v1/charges?amount=2000",
+    "timeout_ms": 30000,
+    "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+    "upstream": "billing"
+  },
+  "name": "http_request_post"
+}

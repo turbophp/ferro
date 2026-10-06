@@ -16,7 +16,7 @@
 //! per-request `Unsupported` error `END` directly on that frame's `request_id` and moves on; the
 //! session survives (SPEC's per-request set, not the session-fatal one).
 
-use ferro_proto::consts::{method_core, service};
+use ferro_proto::consts::{method_core, method_http, service};
 
 use crate::admin::AdminVerb;
 
@@ -66,6 +66,18 @@ pub fn route(service: u16, method: u16) -> Route {
     }
     if service == service::ADMIN {
         return AdminVerb::from_method(method).map_or(Route::Unsupported, Route::Admin);
+    }
+    // Ferro HTTP (M6-F2, SPEC §23.5, review F26): only `REQUEST` travels client → engine, so only it
+    // enters the request lifecycle. `HEAD` and `BODY` are engine → client messages; a client frame
+    // carrying either — like any other HTTP method id — has no route, and is answered `Unsupported`
+    // without spawning anything. Per METHOD, unlike SQL/TX/STREAM's whole-service routing, because
+    // here a method id's direction is part of the contract.
+    if service == service::HTTP {
+        return if method == method_http::REQUEST {
+            Route::Request
+        } else {
+            Route::Unsupported
+        };
     }
     Route::Unsupported
 }
@@ -118,6 +130,33 @@ mod tests {
         // An ADMIN method id this build does not serve never reaches a handler (or the D15 gate).
         assert_eq!(route(service::ADMIN, 0), Route::Unsupported);
         assert_eq!(route(service::ADMIN, 0xFFFF), Route::Unsupported);
+    }
+
+    #[test]
+    fn http_request_routes_to_the_request_lifecycle_and_every_other_http_method_is_unsupported() {
+        assert_eq!(route(service::HTTP, method_http::REQUEST), Route::Request);
+        // HEAD and BODY are engine → client only (SPEC §23.5), so a client sending one is answered
+        // `Unsupported`, never handled. And `route` stays total over the whole method space.
+        assert_eq!(route(service::HTTP, method_http::HEAD), Route::Unsupported);
+        assert_eq!(route(service::HTTP, method_http::BODY), Route::Unsupported);
+        for m in [0, 4, 0x7FFF, 0xFFFF] {
+            assert_eq!(route(service::HTTP, m), Route::Unsupported, "method {m}");
+        }
+        // Every registered HTTP method is decided here, from the registry rather than a list: a
+        // method added to `[methods.http]` without a routing decision fails this test.
+        for &(name, id) in method_http::ALL {
+            let expected = if name == "REQUEST" {
+                Route::Request
+            } else {
+                Route::Unsupported
+            };
+            assert_eq!(route(service::HTTP, id), expected, "HTTP method {name}");
+        }
+        assert_eq!(
+            method_http::ALL.len(),
+            3,
+            "a new HTTP method needs a routing decision"
+        );
     }
 
     #[test]

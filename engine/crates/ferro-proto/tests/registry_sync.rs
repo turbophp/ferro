@@ -139,3 +139,169 @@ fn php_generated_constant_matches_the_rust_hash() {
         "php/client Constants.php is stale — run `php proto/tools/gen-php.php` and commit"
     );
 }
+
+/// The `[http.causes]` registry IS SPEC §23.5.6's table — parsed out of the spec file, not copied
+/// into this test (the §13 pin-cause precedent: a vocabulary kept by hand in two places rots in one
+/// of them). Every backticked token in the table's Tokens column, across every group, must be a
+/// registry token, and every registry token must appear in the table. A token the spec names in two
+/// groups (`deadline`, `timeout`, `cancelled`) is one registry entry.
+#[test]
+fn http_causes_are_exactly_the_spec_table() {
+    use std::collections::BTreeSet;
+
+    let spec = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../docs/spec/23-http.md"),
+    )
+    .unwrap();
+    let start = spec
+        .find("#### 23.5.6 The HTTP cause vocabulary")
+        .expect("§23.5.6 heading");
+    let section = &spec[start..];
+    let table_at = section
+        .find("| Group | Tokens |")
+        .expect("§23.5.6 has its Group | Tokens table");
+    let mut from_spec = BTreeSet::new();
+    let mut rows = 0;
+    for line in section[table_at..].lines().skip(2) {
+        if !line.starts_with('|') {
+            break; // the table ends at its first non-row line
+        }
+        rows += 1;
+        let tokens_col = line.rsplit('|').nth(1).expect("a Tokens column");
+        for (i, part) in tokens_col.split('`').enumerate() {
+            if i % 2 == 1 {
+                from_spec.insert(part.to_string());
+            }
+        }
+    }
+    assert!(rows >= 7, "parsed only {rows} rows of §23.5.6's table");
+
+    let from_registry: BTreeSet<String> = ferro_proto::consts::http_cause::ALL
+        .iter()
+        .map(|t| (*t).to_string())
+        .collect();
+    assert_eq!(
+        from_registry.len(),
+        ferro_proto::consts::http_cause::ALL.len(),
+        "a token appears twice in http_cause::ALL"
+    );
+    let missing: Vec<_> = from_spec.difference(&from_registry).collect();
+    let extra: Vec<_> = from_registry.difference(&from_spec).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "[http.causes] drifted from SPEC §23.5.6 — in the spec, not the registry: {missing:?}; \
+         in the registry, not the spec: {extra:?}"
+    );
+    // Spot-check the generated NAME → token mapping, and F3's seven policy groups (F4 maps
+    // `ferro_http::validate::PolicyCause` onto exactly these constants).
+    use ferro_proto::consts::http_cause as c;
+    assert_eq!(c::UNSENT_WRITE, "unsent_write");
+    assert_eq!(c::INFORMATIONAL_101, "informational_101");
+    for (konst, token) in [
+        (c::FORBIDDEN_UPSTREAM, "forbidden_upstream"),
+        (c::FORBIDDEN_ORIGIN, "forbidden_origin"),
+        (c::FORBIDDEN_TARGET, "forbidden_target"),
+        (c::FORBIDDEN_METHOD, "forbidden_method"),
+        (c::FORBIDDEN_HEADER, "forbidden_header"),
+        (c::FORBIDDEN_BODY, "forbidden_body"),
+        (c::FORBIDDEN_ADDRESS, "forbidden_address"),
+    ] {
+        assert_eq!(konst, token);
+    }
+}
+
+/// The shape rule refuses each way a cause could acquire a second spelling, and accepts the shipped
+/// table (which `from_toml_dir` already applied, or the lock test above could not have parsed it).
+#[test]
+fn the_http_cause_shape_rule_refuses_every_bad_entry() {
+    use ferro_proto::registry::check_http_causes;
+    use std::collections::BTreeMap;
+
+    let one = |k: &str, v: &str| BTreeMap::from([(k.to_string(), v.to_string())]);
+    assert!(check_http_causes(&one("EOF_EMPTY", "eof_empty")).is_ok());
+    for (k, v, why) in [
+        ("EOFEMPTY", "eof_empty", "key is not the token upper-cased"),
+        ("EOF_EMPTY", "EOF_EMPTY", "token is not lowercase"),
+        (
+            "EOF-EMPTY",
+            "eof-empty",
+            "a `-` is not in the token alphabet",
+        ),
+        ("", "", "an empty token"),
+        (
+            "EOF EMPTY",
+            "eof empty",
+            "a space is not in the token alphabet",
+        ),
+    ] {
+        assert!(check_http_causes(&one(k, v)).is_err(), "accepted: {why}");
+    }
+    let reg = Registry::from_toml_dir(&proto_dir());
+    assert!(check_http_causes(&reg.http.causes).is_ok());
+    assert_eq!(
+        reg.http.causes.len(),
+        45,
+        "§23.5.6 names 45 distinct tokens"
+    );
+}
+
+/// A misspelled table name must fail the PARSE rather than silently drop the vocabulary from the
+/// lock (serde ignores unknown TOP-level keys, which is how `m0_scalar` once went dead).
+#[test]
+fn a_misspelled_http_causes_table_fails_the_parse() {
+    let proto = proto_dir();
+    let tmp = std::env::temp_dir().join(format!("ferro_http_causes_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    for f in ["methods.toml", "types.toml"] {
+        std::fs::copy(proto.join(f), tmp.join(f)).unwrap();
+    }
+    let errors = std::fs::read_to_string(proto.join("errors.toml")).unwrap();
+    assert!(errors.contains("\n[http.causes]\n"));
+    std::fs::write(
+        tmp.join("errors.toml"),
+        errors.replace("\n[http.causes]\n", "\n[http.cause]\n"),
+    )
+    .unwrap();
+    let res = std::panic::catch_unwind(|| Registry::from_toml_dir(&tmp));
+    std::fs::remove_dir_all(&tmp).ok();
+    assert!(res.is_err(), "a `[http.cause]` table must not parse");
+}
+
+/// The Rust half of the shape-rule AGREEMENT test: every case in the shared fixture
+/// `proto/tools/http-causes-shape-cases.json` gets the verdict the fixture states. `build.rs` and
+/// `Registry::from_toml_dir` share this one function (`include!`), and `php/client`'s
+/// `HttpCausesShapeRuleTest` runs `gen-php.php` over the SAME cases — so the three readers of
+/// `[http.causes]` cannot disagree about a token.
+#[test]
+fn the_shared_shape_rule_fixture_gets_its_stated_verdicts() {
+    use ferro_proto::registry::check_http_causes;
+    use std::collections::BTreeMap;
+
+    let fixture: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proto_dir().join("tools/http-causes-shape-cases.json")).unwrap(),
+    )
+    .unwrap();
+    let cases = fixture["cases"].as_array().expect("cases");
+    assert!(cases.len() >= 10, "the fixture lost its cases");
+    let (mut valid, mut invalid) = (0, 0);
+    for case in cases {
+        let why = case["why"].as_str().unwrap();
+        let causes: BTreeMap<String, String> = case["causes"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+            .collect();
+        let want = case["valid"].as_bool().unwrap();
+        assert_eq!(
+            check_http_causes(&causes).is_ok(),
+            want,
+            "{why}: {causes:?}"
+        );
+        if want { valid += 1 } else { invalid += 1 }
+    }
+    assert!(
+        valid >= 1 && invalid >= 1,
+        "the fixture must exercise both verdicts"
+    );
+}

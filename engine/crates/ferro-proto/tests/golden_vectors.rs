@@ -143,7 +143,8 @@ fn message_payloads_are_canonical_and_byte_stable() {
     // level), and that decode->encode is a fixpoint. This is the Rust half of the cross-language
     // byte lock; the PHP half asserts PurePacker re-encodes to these same bytes (Task 9).
     use ferro_proto::consts::{
-        flags, method_admin, method_core as mc, method_sql, method_stream, method_tx, service,
+        flags, method_admin, method_core as mc, method_http, method_sql, method_stream, method_tx,
+        service,
     };
     use ferro_proto::messages::*;
     for entry in fs::read_dir(vectors_dir()).unwrap() {
@@ -261,6 +262,34 @@ fn message_payloads_are_canonical_and_byte_stable() {
             // StreamData message payload.
             (s, m) if s == service::STREAM && m == method_stream::DATA => {
                 StreamData::decode(payload).unwrap().encode()
+            }
+            // HTTP (M6-F2, /proto/PROTOCOL.md §12). A REQUEST without END is the client's request;
+            // with END it is the exchange's terminal — CRACK an Ok body so Rust independently
+            // arbitrates the HttpDone layout (the error vectors re-encode whole, below).
+            (s, m)
+                if s == service::HTTP
+                    && m == method_http::REQUEST
+                    && (h.flags & flags::END) == 0 =>
+            {
+                HttpRequest::decode(payload).unwrap().encode()
+            }
+            (s, m) if s == service::HTTP && m == method_http::REQUEST => {
+                let outcome = Outcome::decode(payload).unwrap();
+                if let Outcome::Ok(body) = &outcome {
+                    assert_eq!(
+                        HttpDone::decode(body).unwrap().encode(),
+                        *body,
+                        "HttpDone body for {:?} is not canonical / byte-stable",
+                        p.file_name().unwrap()
+                    );
+                }
+                outcome.encode()
+            }
+            (s, m) if s == service::HTTP && m == method_http::HEAD => {
+                HttpHead::decode(payload).unwrap().encode()
+            }
+            (s, m) if s == service::HTTP && m == method_http::BODY => {
+                HttpBody::decode(payload).unwrap().encode()
             }
             // error_protocol vectors: an Outcome terminal payload (END flag).
             _ => Outcome::decode(payload).unwrap().encode(),
@@ -393,4 +422,248 @@ fn negative_vectors_are_rejected_for_their_own_reason() {
             "missing required negative vector: {required}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// HTTP (M6-F2; SPEC §23.5.5, /proto/PROTOCOL.md §12)
+// ---------------------------------------------------------------------------------------------
+
+fn load(name: &str) -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(vectors_dir().join(format!("{name}.json"))).unwrap())
+        .unwrap()
+}
+fn payload_of(v: &serde_json::Value) -> Vec<u8> {
+    unhex(v["frame_hex"].as_str().unwrap())[16..].to_vec()
+}
+fn json_bytes(v: &serde_json::Value) -> Vec<u8> {
+    v.as_array()
+        .unwrap_or_else(|| panic!("expected a byte array, got {v}"))
+        .iter()
+        .map(|b| u8::try_from(b.as_u64().unwrap()).unwrap())
+        .collect()
+}
+fn json_opt_bytes(v: &serde_json::Value) -> Option<Vec<u8>> {
+    (!v.is_null()).then(|| json_bytes(v))
+}
+fn json_headers(v: &serde_json::Value) -> Vec<ferro_proto::messages::HttpHeaderField> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|pair| ferro_proto::messages::HttpHeaderField {
+            name: pair[0].as_str().unwrap().to_string(),
+            value: json_bytes(&pair[1]),
+        })
+        .collect()
+}
+fn json_opt_str(v: &serde_json::Value) -> Option<String> {
+    v.as_str().map(str::to_string)
+}
+fn json_opt_u32(v: &serde_json::Value) -> Option<u32> {
+    v.as_u64().map(|n| u32::try_from(n).unwrap())
+}
+
+/// The Rust half of the HTTP byte lock compares each DECODED message against its vector's NAMED
+/// `message` fields. `message_payloads_are_canonical_and_byte_stable` alone cannot do this: it is a
+/// decode→encode fixpoint, which a SYMMETRIC field swap (the same two same-typed fields exchanged in
+/// both `encode` and `decode`) passes untouched. The JSON names each field, so a swap fails here.
+#[test]
+fn http_vectors_decode_to_their_named_message_fields() {
+    use ferro_proto::messages::*;
+
+    for name in ["http_request_get", "http_request_post"] {
+        let v = load(name);
+        let m = &v["message"];
+        let got = HttpRequest::decode(&payload_of(&v)).unwrap();
+        let want = HttpRequest {
+            upstream: m["upstream"].as_str().unwrap().into(),
+            method: m["method"].as_str().unwrap().into(),
+            target: m["target"].as_str().unwrap().into(),
+            origin: json_opt_str(&m["origin"]),
+            headers: json_headers(&m["headers"]),
+            body: json_opt_bytes(&m["body"]),
+            timeout_ms: json_opt_u32(&m["timeout_ms"]),
+            connect_timeout_ms: json_opt_u32(&m["connect_timeout_ms"]),
+            read_timeout_ms: json_opt_u32(&m["read_timeout_ms"]),
+            idempotent: m["idempotent"].as_bool(),
+            decode: m["decode"].as_bool().unwrap(),
+            route: json_opt_str(&m["route"]),
+            traceparent: json_opt_str(&m["traceparent"]),
+        };
+        assert_eq!(got, want, "{name}");
+    }
+    // The POST vector sets every field to a DISTINCT value, so no swap of two same-typed fields
+    // can leave the decoded struct equal to the message.
+    let post = HttpRequest::decode(&payload_of(&load("http_request_post"))).unwrap();
+    let timeouts = [
+        post.timeout_ms,
+        post.connect_timeout_ms,
+        post.read_timeout_ms,
+    ];
+    assert!(timeouts.iter().all(Option::is_some));
+    assert_ne!(timeouts[0], timeouts[1]);
+    assert_ne!(timeouts[1], timeouts[2]);
+    assert_ne!(timeouts[0], timeouts[2]);
+    // ...and the two bools differ, so swapping `idempotent` and `decode` moves the message too.
+    assert_eq!((post.idempotent, post.decode), (Some(true), false));
+    assert_eq!(
+        post.body.as_deref().map(|b| b[0]),
+        Some(0xc0),
+        "a bin that starts with the nil marker"
+    );
+
+    for name in ["http_head", "http_head_h2"] {
+        let v = load(name);
+        let m = &v["message"];
+        let got = HttpHead::decode(&payload_of(&v)).unwrap();
+        let want = HttpHead {
+            status: u16::try_from(m["status"].as_u64().unwrap()).unwrap(),
+            version: u8::try_from(m["version"].as_u64().unwrap()).unwrap(),
+            reason: json_opt_bytes(&m["reason"]),
+            headers: json_headers(&m["headers"]),
+            decoded: (!m["decoded"].is_null()).then(|| HttpDecoded {
+                content_encoding: m["decoded"][0].as_str().unwrap().into(),
+                content_length: m["decoded"][1].as_u64(),
+            }),
+            idempotent: m["idempotent"].as_bool().unwrap(),
+        };
+        assert_eq!(got, want, "{name}");
+    }
+
+    let v = load("http_body");
+    assert_eq!(
+        HttpBody::decode(&payload_of(&v)).unwrap().chunk,
+        json_bytes(&v["message"]["chunk"])
+    );
+
+    let v = load("http_done");
+    let m = &v["message"];
+    let Outcome::Ok(body) = Outcome::decode(&payload_of(&v)).unwrap() else {
+        panic!("http_done is an Outcome::Ok");
+    };
+    let got = HttpDone::decode(&body).unwrap();
+    let s: Vec<u64> = m["stats"].as_array().unwrap()[..7]
+        .iter()
+        .map(|n| n.as_u64().unwrap())
+        .collect();
+    let want = HttpDone {
+        trailers: json_headers(&m["trailers"]),
+        stats: HttpStats {
+            queue_us: s[0],
+            connect_us: s[1],
+            tls_us: s[2],
+            ttfb_us: s[3],
+            total_us: s[4],
+            bytes_sent: s[5],
+            bytes_received: s[6],
+            reused: m["stats"][7].as_bool().unwrap(),
+        },
+    };
+    assert_eq!(got, want);
+    let mut distinct = s.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        7,
+        "every stat distinct, so a swap cannot hide"
+    );
+}
+
+/// SPEC §23.5.5 lists the HTTP golden vectors by name. Parsed out of the spec — each listed name
+/// must be committed, and every committed vector on service `HTTP` must be listed, so neither side
+/// can grow alone.
+#[test]
+fn the_http_vectors_are_exactly_the_spec_list() {
+    use ferro_proto::consts::service;
+    use std::collections::BTreeSet;
+
+    let spec = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../docs/spec/23-http.md"),
+    )
+    .unwrap();
+    let start = spec
+        .find("#### 23.5.5 Golden vectors")
+        .expect("§23.5.5 heading");
+    let end = start + spec[start..].find("#### 23.5.6").expect("§23.5.6 follows");
+    let mut listed = BTreeSet::new();
+    for line in spec[start..end].lines().filter(|l| l.starts_with("- ")) {
+        // A bullet names its vectors BEFORE any parenthesis; what follows describes them (and
+        // backticks field names such as `stats` or `retry_after_ms`, which are not vectors).
+        let names = line.split('(').next().unwrap();
+        for (i, part) in names.split('`').enumerate() {
+            if i % 2 == 1 {
+                listed.insert(part.to_string());
+            }
+        }
+    }
+    assert_eq!(
+        listed.len(),
+        11,
+        "§23.5.5 lists eleven vectors, parsed {listed:?}"
+    );
+
+    let mut on_http = BTreeSet::new();
+    for entry in fs::read_dir(vectors_dir()).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        if v["header"]["service"].as_u64() == Some(u64::from(service::HTTP)) {
+            on_http.insert(v["name"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(
+        listed, on_http,
+        "SPEC §23.5.5's list and the committed HTTP vectors differ"
+    );
+}
+
+/// SPEC §23.5.6 / C11: on service `HTTP`, an error terminal's `detail` is EXACTLY one registry cause
+/// token, and `sqlstate`/`errno` are nil. Every committed HTTP error vector is held to it, and the
+/// two codes §23.5.5 says carry `retry_after_ms` do.
+#[test]
+fn every_http_error_vector_carries_exactly_one_cause_token() {
+    use ferro_proto::consts::{errc, flags, http_cause, service};
+    use ferro_proto::messages::Outcome;
+
+    let mut seen = 0;
+    for entry in fs::read_dir(vectors_dir()).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let frame = unhex(v["frame_hex"].as_str().unwrap());
+        let h = Header::decode(&frame).unwrap();
+        if h.service != service::HTTP || h.flags & flags::END == 0 {
+            continue;
+        }
+        let Outcome::Error(ep) = Outcome::decode(&frame[16..]).unwrap() else {
+            continue;
+        };
+        seen += 1;
+        let detail = ep.detail.as_deref().expect("an HTTP error carries a cause");
+        assert!(
+            http_cause::ALL.contains(&detail),
+            "{p:?}: detail {detail:?} is not an [http.causes] token"
+        );
+        assert_eq!(
+            (ep.sqlstate.as_deref(), ep.errno),
+            (None, None),
+            "{p:?} (C11)"
+        );
+        let registered = errc::ALL
+            .iter()
+            .find(|&&(_, c, _)| c == ep.code)
+            .unwrap_or_else(|| panic!("{p:?}: code {:#06x} is not registered", ep.code));
+        assert_eq!(ep.branch, registered.2, "{p:?}: branch is the registry's");
+        if ep.code == errc::RATE_LIMITED || ep.code == errc::UPSTREAM_UNAVAILABLE {
+            assert!(
+                ep.retry_after_ms.is_some(),
+                "{p:?}: §23.5.5 says it carries retry_after_ms"
+            );
+        }
+    }
+    assert_eq!(seen, 5, "five HTTP error vectors (§23.5.5)");
 }
