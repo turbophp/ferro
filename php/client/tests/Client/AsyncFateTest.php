@@ -178,6 +178,30 @@ final class AsyncFateTest extends TestCase
         unset($first);
     }
 
+    /**
+     * Review F7, the other at-call fault: submitting while a stream is open is refused by the
+     * session, and that refusal reaches the caller at await, not at the call.
+     */
+    public function testARefusalWhileAStreamIsOpenSurfacesAtAwait(): void
+    {
+        $t = new FakeTransport();
+        $conn = new Connection(new Session($t, new RequestIdAllocator(0)), 'default');
+        $packer = PackerFactory::forEncode();
+        $head = \Ferro\Protocol\StreamHead::encode(['cols' => [['name' => 'n', 'tag' => C::TAG_I64]]], $packer);
+        $t->feed(self::frame(0, C::SERVICE_STREAM, C::METHOD_STREAM_HEAD, 1, $head));
+        $stream = $conn->streamRaw('SELECT 1', [], true);
+
+        $future = $conn->execAsync('INSERT INTO t VALUES (1)'); // must not throw here
+        $this->assertTrue($future->isSettled());
+        try {
+            $future->await();
+            $this->fail('a request cannot be submitted while a stream is open');
+        } catch (ProtocolException $e) {
+            $this->assertStringContainsString('stream', $e->getMessage());
+        }
+        unset($stream);
+    }
+
     /** Review F6, end to end: a Future dropped unawaited lets its terminal be thrown away. */
     public function testADroppedFutureDoesNotLeaveItsTerminalBehind(): void
     {
