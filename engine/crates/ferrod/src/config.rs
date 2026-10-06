@@ -298,6 +298,13 @@ pub struct Config {
     /// handler then answers every request with `Unsupported: unknown pool`). From `FERRO_POOLS`
     /// (comma-separated names) + per-pool `FERRO_POOL_<NAME>_DSN`.
     pub pools: Vec<PoolSpec>,
+    /// SPEC §11 (M3-D2d): the checked-SQL manifest file, from `FERRO_MANIFEST` (a blank value reads
+    /// as unset). Loaded by `main` into [`Config::manifest`], where a load failure stops startup.
+    pub manifest_path: Option<PathBuf>,
+    /// The loaded manifest, or `None` when no `FERRO_MANIFEST` is configured. Set by `main` (or a
+    /// test harness) after [`crate::manifest::LoadedManifest::load`] succeeds; never by `from_env`,
+    /// because loading can fail and `from_env` falls back to defaults instead of failing.
+    pub manifest: Option<std::sync::Arc<crate::manifest::LoadedManifest>>,
 }
 
 impl Default for Config {
@@ -320,6 +327,8 @@ impl Default for Config {
             metrics_addr: None,
             otlp: None,
             pools: Vec::new(),
+            manifest_path: None,
+            manifest: None,
         }
     }
 }
@@ -345,6 +354,13 @@ impl Config {
             cfg.pools = parse_pools(&names, &|k| std::env::var(k).ok());
         }
 
+        // SPEC §11 (M3-D2d). A blank value reads as unset. Only the PATH is read here: loading can
+        // fail, and `main` must refuse to start when it does rather than fall back to a default.
+        if let Ok(raw) = std::env::var("FERRO_MANIFEST")
+            && !raw.trim().is_empty()
+        {
+            cfg.manifest_path = Some(PathBuf::from(raw));
+        }
         // SPEC §13 slow log. A value that does not parse leaves it OFF rather than guessing a
         // threshold: a mistyped `FERRO_SLOW_LOG_MS` should not quietly start logging every
         // statement, and `0` is a legitimate "log everything" the operator may actually want.

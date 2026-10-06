@@ -14,6 +14,7 @@ workspace = true
 ferro-proto = { path = "../ferro-proto" }
 ferro-pool = { path = "../ferro-pool" }
 ferro-classify = { path = "../ferro-classify" }
+ferro-manifest = { path = "../ferro-manifest" }
 ferro-backend-pg = { path = "../ferro-backend-pg" }
 ferro-backend-mysql = { path = "../ferro-backend-mysql" }
 ferro-backend-sqlite = { path = "../ferro-backend-sqlite" }

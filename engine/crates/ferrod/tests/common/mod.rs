@@ -116,7 +116,7 @@ impl TestServer {
         // These scripted-handler tests configure no pools and none of them reads `HelloAck.pools`,
         // so an EMPTY registry built from their own `Config` is the faithful shape (M1-S8a Task 12).
         let pool_registry = PoolRegistry::build(&config);
-        let factory: HandlerFactory = Arc::new(move |_sid| handler.clone());
+        let factory: HandlerFactory = Arc::new(move |_sid, _info| handler.clone());
 
         tokio::spawn(async move {
             loop {
@@ -261,7 +261,7 @@ pub fn spawn_one_session_with_config(
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
     // Pool-less by construction (these `Config`s declare none), so an empty registry (M1-S8a).
     let pool_registry = PoolRegistry::build(&config);
-    let factory: HandlerFactory = Arc::new(move |_sid| handler.clone());
+    let factory: HandlerFactory = Arc::new(move |_sid, _info| handler.clone());
     let handle = tokio::spawn(async move {
         let (stream, _addr) = listener
             .accept()
@@ -303,7 +303,7 @@ pub fn spawn_serve_with_config(
     let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
     // Pool-less by construction (these `Config`s declare none), so an empty registry (M1-S8a).
     let pool_registry = PoolRegistry::build(&config);
-    let factory: HandlerFactory = Arc::new(move |_sid| handler.clone());
+    let factory: HandlerFactory = Arc::new(move |_sid, _info| handler.clone());
     let handle = tokio::spawn(serve(
         listener,
         config,

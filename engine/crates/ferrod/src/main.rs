@@ -33,8 +33,16 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 
-    let config = Config::from_env();
+    let mut config = Config::from_env();
     config.validate()?;
+    // SPEC §11 (M3-D2d): a configured manifest that does not load — unreadable, invalid, or naming
+    // a pool this daemon lacks — stops startup rather than failing on the first query for it.
+    if let Some(path) = config.manifest_path.clone() {
+        let loaded = ferrod::manifest::LoadedManifest::load(&path, &config.pools)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        tracing::info!(queries = loaded.len(), hash = %loaded.hash(), "ferrod: manifest loaded");
+        config.manifest = Some(loaded);
+    }
     let listener = bind_uds(&config)?;
     tracing::info!(socket = %config.socket_path.display(), "ferrod listening");
 

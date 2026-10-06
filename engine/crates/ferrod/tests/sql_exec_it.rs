@@ -247,7 +247,7 @@ async fn exec_checkout_connect_failure_is_retryable_not_indeterminate() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// query_id / unknown pool / fetch=stream → Unsupported; session survives each.
+// query_id without a manifest / unknown pool / fetch=stream → Unsupported; session survives each.
 // -------------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -259,13 +259,18 @@ async fn unsupported_query_id_pool_stream() {
     let mut client = server.connect().await;
     client.hello(1).await;
 
-    // query_id set (manifest is M3).
+    // A query_id on an engine with no manifest loaded (M3-D2d): Unsupported.
     let mut with_qid = req("SELECT 1");
+    with_qid.sql = None;
     with_qid.query_id = Some("q1".to_string());
     assert_eq!(
         exec_err(&mut client, 50, &with_qid).await.code,
         errc::UNSUPPORTED
     );
+    // Both sql and query_id: a malformed request (PROTOCOL.md §6), not an unsupported one.
+    let mut both = req("SELECT 1");
+    both.query_id = Some("q1".to_string());
+    assert_eq!(exec_err(&mut client, 49, &both).await.code, errc::PROTOCOL);
 
     // unknown pool name.
     let mut bad_pool = req("SELECT 1");

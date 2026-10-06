@@ -3,8 +3,9 @@
 //!
 //! Control flow (D-S5-1 — buffered into the single terminal, no DATA channel in M0):
 //!  1. decode `ExecRequest` (per-request payload); a decode failure → per-request `Protocol` error.
-//!  2. reject the not-yet-supported shapes as `Unsupported`: `query_id` (manifest is M3),
-//!     `fetch=stream` (D-S5-1), an unknown pool name, a missing inline `sql`.
+//!  2. reject an unknown fetch mode or pool name as `Unsupported`, and resolve the statement: the
+//!     inline `sql`, or since M3-D2d a manifest `query_id` (`crate::manifest::resolve`; neither is
+//!     `Unsupported`, both is `Protocol`). `fetch=stream` has been served since M1-S5.
 //!  3. `checkout()` the named pool → capture `queue_us` from `CheckoutStats`.
 //!  4. run the GUARDED, row-returning [`ferro_pool::pool::Checkout::query`] — measuring `exec_us`
 //!     around ONLY the DB call. We MUST use `Checkout::query` and MUST NOT touch `conn_mut()`/the
@@ -61,7 +62,7 @@ use crate::pools::{AnyPool, PoolRegistry};
 use crate::services::fate::{self, OpContext};
 use crate::session::codec::InFrame;
 use crate::session::responder::{Responder, StreamSendError};
-use crate::session::{HandlerFactory, HandlerFn, SessionId};
+use crate::session::{HandlerFactory, HandlerFn, SessionId, SessionInfo};
 use crate::tx::{
     CtlReply, ExecReply, TxCommand, TxHandle, TxLookupErr, TxRegistry, actor, next_tx_id,
 };
@@ -106,7 +107,7 @@ pub fn make_handler(
     max_tx: Duration,
     teardown_timeout: Duration,
 ) -> HandlerFactory {
-    Arc::new(move |session_id| -> HandlerFn {
+    Arc::new(move |session_id, info: SessionInfo| -> HandlerFn {
         let registry = registry.clone();
         let tx_registry = tx_registry.clone();
         Arc::new(move |frame, responder, cancel| {
@@ -119,6 +120,7 @@ pub fn make_handler(
                     &registry,
                     &tx_registry,
                     session_id,
+                    info,
                     idle_in_tx,
                     max_tx,
                     teardown_timeout,
@@ -138,6 +140,7 @@ async fn handle(
     registry: &PoolRegistry,
     tx_registry: &TxRegistry,
     session_id: SessionId,
+    info: SessionInfo,
     idle_in_tx: Duration,
     max_tx: Duration,
     teardown_timeout: Duration,
@@ -145,7 +148,16 @@ async fn handle(
 ) {
     match (frame.header.service, frame.header.method) {
         (service::SQL, method_sql::EXEC) => {
-            handle_exec(frame, responder, registry, tx_registry, session_id, cancel).await
+            handle_exec(
+                frame,
+                responder,
+                registry,
+                tx_registry,
+                session_id,
+                info,
+                cancel,
+            )
+            .await
         }
         (service::TX, method_tx::BEGIN) => {
             handle_begin(
@@ -199,6 +211,7 @@ async fn handle_exec(
     registry: &PoolRegistry,
     tx_registry: &TxRegistry,
     session_id: SessionId,
+    info: SessionInfo,
     cancel: CancellationToken,
 ) {
     // (1) decode the per-request payload.
@@ -226,12 +239,6 @@ async fn handle_exec(
     }));
 
     // (2) reject not-yet-supported request shapes (each: one END, session survives).
-    if req.query_id.is_some() {
-        responder.end_error(unsupported(
-            "query_id (manifest execution) is post-M0 (M3); send inline sql",
-        ));
-        return;
-    }
     match req.fetch {
         // FETCH_STREAM is honored on BOTH paths: the autocommit producer (below) and, since Task 5,
         // the tx-scoped producer forwarded to the owning actor (the `Some(tx_id)` arm).
@@ -241,14 +248,28 @@ async fn handle_exec(
             return;
         }
     }
-    let sql = match &req.sql {
-        Some(s) => s.as_str(),
-        None => {
-            responder.end_error(unsupported(
-                "EXEC requires an inline sql statement in M0 (query_id manifests are M3)",
-            ));
-            return;
-        }
+
+    // (2b) the statement: inline SQL, or a manifest `query_id` (M3-D2d). Resolved per path below,
+    // because a `query_id` must agree with the pool it would RUN on — the request's `pool` for
+    // autocommit, the transaction's pinned pool for a tx-scoped request.
+    let resolve_sql = |run_pool: &str| -> Result<&str, ferro_proto::messages::ErrorPayload> {
+        crate::manifest::resolve(
+            req.sql.as_deref(),
+            req.query_id.as_deref(),
+            req.readonly,
+            run_pool,
+            registry.manifest(),
+            info.manifest_agreed,
+        )
+        .map_err(|e| match e {
+            crate::manifest::ResolveError::BothSqlAndQueryId => protocol(
+                "malformed ExecRequest: sql and query_id are both set (sql is nil iff a query_id is used)",
+            ),
+            crate::manifest::ResolveError::NoStatement => {
+                unsupported("EXEC requires an inline sql statement or a manifest query_id")
+            }
+            crate::manifest::ResolveError::Refused(m) => unsupported(m),
+        })
     };
 
     match req.tx_id {
@@ -257,6 +278,13 @@ async fn handle_exec(
             // `req.pool` is ignored here — the transaction is already pinned to its pool's conn.
             let handle = match resolve_active(tx_registry, tx_id, session_id) {
                 Ok(h) => h,
+                Err(ep) => {
+                    responder.end_error(ep);
+                    return;
+                }
+            };
+            let sql = match resolve_sql(&handle.pool) {
+                Ok(sql) => sql,
                 Err(ep) => {
                     responder.end_error(ep);
                     return;
@@ -368,6 +396,13 @@ async fn handle_exec(
             let Some(pool) = registry.get(&req.pool) else {
                 responder.end_error(unsupported(format!("unknown pool {:?}", req.pool)));
                 return;
+            };
+            let sql = match resolve_sql(&req.pool) {
+                Ok(sql) => sql,
+                Err(ep) => {
+                    responder.end_error(ep);
+                    return;
+                }
             };
 
             // ONE authority for the streaming capability (M1-S8a): the backend's own
@@ -693,8 +728,24 @@ fn exec_span_attrs(
             Dialect::Sqlite => "sqlite",
         };
         attrs.push(("db.system.name", Str(system.to_string())));
-        attrs.push(("ferro.pool", Str(pool)));
-        if let Some(sql) = req.sql.as_deref() {
+        attrs.push(("ferro.pool", Str(pool.clone())));
+        // A `query_id` (M3-D2d) is named, and its manifest SQL fingerprinted, only when it IS a
+        // manifest id: a client-supplied string that is not one is never exported.
+        // Its text is fingerprinted only when the query is declared for THIS pool: the dialect
+        // decides where a literal ends, and a query declared for a MySQL pool read with a
+        // PostgreSQL pool's rules exported its `"…"` literal verbatim (review F7). A query run on
+        // another pool is refused anyway.
+        let declared = req
+            .query_id
+            .as_deref()
+            .and_then(|id| registry.manifest()?.get(id).map(|q| (id, q)));
+        if let Some((id, _)) = declared {
+            attrs.push(("ferro.query_id", Str(id.to_string())));
+        }
+        let declared = declared
+            .filter(|(_, q)| q.pool == pool)
+            .map(|(id, q)| (id, q.sql.as_str()));
+        if let Some(sql) = req.sql.as_deref().or(declared.map(|(_, sql)| sql)) {
             attrs.push((
                 "db.query.text",
                 Str(crate::slow_log::fingerprint_of(sql, dialect).to_string()),
@@ -1865,6 +1916,95 @@ mod tests {
     use ferro_proto::consts::{branch, tag};
     use ferro_proto::messages::Outcome;
     use ferro_proto::messages::sql::ColMeta;
+
+    /// M3-D2d review F3: the span's query-id rules, which no test reached. A query id is exported
+    /// only when it IS a manifest id, and its SQL is fingerprinted only when it is declared for the
+    /// pool the request runs on (F7: a MySQL-declared query read with PostgreSQL's literal rules
+    /// exported its `"…"` literal verbatim).
+    #[tokio::test]
+    async fn the_span_names_only_manifest_ids_and_fingerprints_only_on_the_declared_pool() {
+        use crate::config::{Config, PoolKind, PoolSpec};
+        use crate::otlp::AttrValue;
+        let spec = |name: &str, dsn: &str, kind| PoolSpec {
+            name: name.into(),
+            dsn: dsn.into(),
+            kind,
+            pin_functions: Vec::new(),
+            pin_on_unknown: true,
+            allow_dir: None,
+        };
+        let mut config = Config {
+            pools: vec![
+                spec(
+                    "default",
+                    "postgres://u:p@127.0.0.1:1/db",
+                    PoolKind::Postgres,
+                ),
+                spec("m", "mysql://u:p@127.0.0.1:1/db", PoolKind::Mysql),
+            ],
+            ..Config::default()
+        };
+        let mut m = ferro_manifest::Manifest::new();
+        let q = |sql: &str, pool: &str| ferro_manifest::Query {
+            sql: sql.into(),
+            pool: pool.into(),
+            readonly: true,
+            idempotent: false,
+            dto: None,
+            source: None,
+        };
+        m.insert(
+            "x.q".into(),
+            q(r#"SELECT 1 WHERE token = "s3cr3t-literal""#, "m"),
+        )
+        .unwrap();
+        m.insert(
+            "y.q".into(),
+            q("SELECT 1 WHERE token = 'pg-secret'", "default"),
+        )
+        .unwrap();
+        config.manifest =
+            Some(crate::manifest::LoadedManifest::from_manifest(m, &config.pools).unwrap());
+        let registry = PoolRegistry::build(&config);
+        let tx_registry = TxRegistry::new(config.drain_deadline);
+        let sid = tx_registry.next_session_id();
+        let attrs = |id: &str| {
+            let req = ExecRequest {
+                pool: "default".into(),
+                sql: None,
+                query_id: Some(id.into()),
+                params: Vec::new(),
+                timeout_ms: None,
+                readonly: true,
+                fetch: 0,
+                tx_id: None,
+                traceparent: None,
+            };
+            exec_span_attrs(&registry, &tx_registry, sid, &req)
+        };
+        let get = |a: &[crate::otlp::Attr], k: &str| {
+            a.iter().find(|(n, _)| *n == k).map(|(_, v)| match v {
+                AttrValue::Str(s) => s.clone(),
+                other => format!("{other:?}"),
+            })
+        };
+
+        // Declared on THIS pool: named, and fingerprinted (the literal hidden).
+        let a = attrs("y.q");
+        assert_eq!(get(&a, "ferro.query_id").as_deref(), Some("y.q"));
+        let text = get(&a, "db.query.text").expect("fingerprinted");
+        assert!(!text.contains("pg-secret"), "{text}");
+
+        // Declared for ANOTHER pool: named, but no text at all.
+        let a = attrs("x.q");
+        assert_eq!(get(&a, "ferro.query_id").as_deref(), Some("x.q"));
+        assert_eq!(get(&a, "db.query.text"), None);
+
+        // Not a manifest id: never exported.
+        let a = attrs("not.declared");
+        assert_eq!(get(&a, "ferro.query_id"), None);
+        assert_eq!(get(&a, "db.query.text"), None);
+    }
 
     /// Locks `OUTCOME_OK_OVERHEAD` against `Outcome::Ok`'s ACTUAL envelope, so the size-cap can
     /// never silently drift out of sync with the codec (which would re-open the BLOCKER-v2 teardown).
