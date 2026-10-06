@@ -189,7 +189,11 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 | # | Item | State | Notes |
 |---|------|-------|-------|
 | D1 | Fibers multiplexing in `ferro/client` (§10.1) | OPEN | |
-| D2 | `ferro check`/`gen` + `idempotent` manifest + manifest handshake (§11) | OPEN | The only licensed auto-retry lives here. |
+| D2a | `ferro-manifest` + `ferro manifest`/`manifest-hash` + `vendor/bin/ferro-queries` (§11) | DONE — SPEC §22.2 (cl) | Formats fixed, hash pinned, attributes read by PHP's tokenizer. |
+| D2b | `ferro check` + `ferro schema sync`: PREPARE every query against a shadow schema, record param/result types | OPEN | PG, MySQL, SQLite through the backend crates. |
+| D2c | `ferro gen`: DTOs, a `Queries` id-constant class, PHPStan stubs | OPEN | |
+| D2d | Engine: load `FERRO_MANIFEST`, advertise `MANIFEST`, refuse a HELLO with a different `manifest_hash`, run EXEC by `query_id` (manifest pool/readonly win) | OPEN | No `/proto` shape change: HELLO field 3 and EXEC field 3 already exist. |
+| D2e | Client: `…ById` methods + the `idempotent` retry licence + a chaos test (idempotent upsert retried across a `ferrod` kill, applied once) | OPEN | The only licensed auto-retry (§9.2). |
 | D3 | memfd large-payload path behind `MEMFD_RX` (§5.1) | OPEN | |
 | D4 | COPY API | OPEN | |
 

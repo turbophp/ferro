@@ -12,6 +12,7 @@
         "ext-msgpack": "Faster MessagePack codec hot path",
         "ext-sockets": "Enables the MEMFD_RX out-of-band receive path (M3)"
     },
+    "bin": ["bin/ferro-queries"],
     "autoload": { "psr-4": { "Ferro\\": "src/" } },
     "autoload-dev": { "psr-4": { "Ferro\\Tests\\": "tests/" } },
     "scripts": {
