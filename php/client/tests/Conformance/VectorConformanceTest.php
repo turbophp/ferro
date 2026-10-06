@@ -23,6 +23,7 @@ use Ferro\Protocol\Msgpack\{PurePacker, ExtPacker};
 use Ferro\Protocol\OobRef;
 use Ferro\Protocol\Outcome;
 use Ferro\Protocol\PoolInfo;
+use Ferro\Protocol\QueueCodec;
 use Ferro\Protocol\SavepointRequest;
 use Ferro\Protocol\StreamData;
 use Ferro\Protocol\StreamHead;
@@ -854,6 +855,175 @@ final class VectorConformanceTest extends TestCase
     }
 
     /**
+     * The QUEUE vectors (M7-G1a, SPEC §24.4, /proto/PROTOCOL.md §14): every `queue_*` vector. The
+     * `queue_` prefix is the byte-lock key, exactly as `http_` is; the three QUEUE error terminals are
+     * locked by name in {@see testQueueErrorVectorsCarryTheirRegisteredCodes}.
+     * @return iterable<string, array{0:array<string,mixed>}>
+     */
+    public static function queueVectors(): iterable
+    {
+        foreach (self::vectors() as $name => [$v]) {
+            if (str_starts_with((string) ($v['name'] ?? ''), 'queue_')) {
+                yield $name => [$v];
+            }
+        }
+    }
+
+    /**
+     * THE QUEUE cross-language byte lock. For every `queue_*` vector PHP must (a) encode the vector's
+     * NAMED fields to the exact Rust-produced payload, (b) decode those bytes back to the same fields,
+     * and (c) re-encode the decoded value to the same bytes. The codec is chosen from the frame HEADER
+     * (method + `END`), never from the name. Handles arrive in the JSON as `*_hex` and become binary
+     * strings; a 1 024-byte handle that is not UTF-8 and starts with `0xc0`-range bytes is among them,
+     * so a `str` write or a `nil` peek would move the bytes.
+     * @param array<string,mixed> $v
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('queueVectors')]
+    public function testQueueVectorByteMatchesBothDirections(array $v): void
+    {
+        $name = (string) $v['name'];
+        $header = is_array($v['header'] ?? null) ? $v['header'] : [];
+        $this->assertSame(C::SERVICE_QUEUE, $header['service'] ?? null, "{$name} rides service QUEUE");
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $message = self::queueFromJson(is_array($v['message']) ? $v['message'] : []);
+        $p = new PurePacker();
+        $method = $header['method'] ?? null;
+        $flags = (int) ($header['flags'] ?? 0);
+
+        if (($flags & C::FLAG_END) === 0) {
+            $this->assertSame(0, $flags, "{$name}: a request carries no flags");
+            [$enc, $dec] = match ($method) {
+                C::METHOD_QUEUE_ENQUEUE => [QueueCodec::encodeEnqueueRequest(...), QueueCodec::decodeEnqueueRequest(...)],
+                C::METHOD_QUEUE_RESERVE => [QueueCodec::encodeReserveRequest(...), QueueCodec::decodeReserveRequest(...)],
+                C::METHOD_QUEUE_ACK, C::METHOD_QUEUE_EXTEND => [QueueCodec::encodeFencedRequest(...), QueueCodec::decodeFencedRequest(...)],
+                C::METHOD_QUEUE_RELEASE => [QueueCodec::encodeReleaseRequest(...), QueueCodec::decodeReleaseRequest(...)],
+                C::METHOD_QUEUE_SIZE, C::METHOD_QUEUE_CLEAR => [QueueCodec::encodeScopeRequest(...), QueueCodec::decodeScopeRequest(...)],
+                default => $this->fail("{$name}: no QUEUE request codec for method " . var_export($method, true)),
+            };
+            $this->assertSame(bin2hex($payload), bin2hex($enc($message, $p)), "encode for {$name}");
+            $decoded = $dec($payload, $p);
+            $this->assertSame($message, $decoded, "decode==value for {$name}");
+            $this->assertSame(bin2hex($payload), bin2hex($enc($decoded, $p)), "{$name} fixpoint");
+            return;
+        }
+        $this->assertSame(C::FLAG_END, $flags, "{$name}: a terminal carries END only");
+        [$enc, $dec] = match ($method) {
+            C::METHOD_QUEUE_ENQUEUE => [QueueCodec::encodeEnqueueResponse(...), QueueCodec::decodeEnqueueResponse(...)],
+            C::METHOD_QUEUE_RESERVE => [QueueCodec::encodeReserveResponse(...), QueueCodec::decodeReserveResponse(...)],
+            C::METHOD_QUEUE_ACK => [QueueCodec::encodeAckResponse(...), QueueCodec::decodeAckResponse(...)],
+            C::METHOD_QUEUE_RELEASE => [QueueCodec::encodeReleaseResponse(...), QueueCodec::decodeReleaseResponse(...)],
+            C::METHOD_QUEUE_EXTEND => [QueueCodec::encodeExtendResponse(...), QueueCodec::decodeExtendResponse(...)],
+            C::METHOD_QUEUE_SIZE => [QueueCodec::encodeSizeResponse(...), QueueCodec::decodeSizeResponse(...)],
+            C::METHOD_QUEUE_CLEAR => [QueueCodec::encodeClearResponse(...), QueueCodec::decodeClearResponse(...)],
+            default => $this->fail("{$name}: no QUEUE response codec for method " . var_export($method, true)),
+        };
+        $this->assertSame(bin2hex($payload), bin2hex(Outcome::ok($enc($message, $p))->encode($p)), "Outcome::Ok encode for {$name}");
+        $outcome = Outcome::decode($payload, $p);
+        $this->assertTrue($outcome->isOk(), "{$name} is an Outcome::Ok");
+        $decoded = $dec($outcome->body(), $p);
+        $this->assertSame($message, $decoded, "decode==value for {$name}");
+        $this->assertSame(bin2hex($payload), bin2hex(Outcome::ok($enc($decoded, $p))->encode($p)), "{$name} fixpoint");
+    }
+
+    /**
+     * The three QUEUE codes (SPEC §24.4; `InvalidHandle` allocated at M7-G1a for §24.3 prerequisite
+     * (c)): each byte-matches through `ErrorPayload` both ways, on the request's own QUEUE/method
+     * header, with the generated code and NonRetryable branch, and `sqlstate`/`errno`/`detail` nil.
+     */
+    public function testQueueErrorVectorsCarryTheirRegisteredCodes(): void
+    {
+        $lost = self::loadVector('error_lease_lost.json');
+        $mismatch = self::loadVector('error_pool_mismatch.json');
+        $invalid = self::loadVector('error_invalid_handle.json');
+        $p = new PurePacker();
+        foreach ([
+            [$lost, C::ERR_LEASE_LOST, C::ERR_LEASE_LOST_BRANCH, C::METHOD_QUEUE_ACK],
+            [$mismatch, C::ERR_POOL_MISMATCH, C::ERR_POOL_MISMATCH_BRANCH, C::METHOD_QUEUE_ENQUEUE],
+            [$invalid, C::ERR_INVALID_HANDLE, C::ERR_INVALID_HANDLE_BRANCH, C::METHOD_QUEUE_ACK],
+        ] as [$v, $code, $branch, $method]) {
+            $name = (string) $v['name'];
+            $header = is_array($v['header'] ?? null) ? $v['header'] : [];
+            $this->assertSame([C::FLAG_END, C::SERVICE_QUEUE, $method],
+                [$header['flags'] ?? null, $header['service'] ?? null, $header['method'] ?? null], $name);
+            $message = is_array($v['message']) ? $v['message'] : [];
+            $fields = is_array($message['error'] ?? null) ? $message['error'] : [];
+            $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+            $this->assertSame(bin2hex($payload), bin2hex(Outcome::error(ErrorPayload::fromArray($fields))->encode($p)), $name);
+            $err = Outcome::decode($payload, $p)->errorPayload();
+            $this->assertSame([$code, $branch, C::BRANCH_NON_RETRYABLE], [$err->code, $err->branch, $branch], $name);
+            $this->assertSame([null, null, null], [$err->sqlstate, $err->errno, $err->detail], $name);
+            $this->assertEquals($fields, $err->toArray());
+            $this->assertSame(bin2hex($payload), bin2hex(Outcome::error($err)->encode($p)), "{$name} fixpoint");
+        }
+        $this->assertNotSame(C::ERR_INVALID_HANDLE, C::ERR_PROTOCOL, 'an undecodable handle is not a wire fault');
+        $this->assertNotSame(C::ERR_INVALID_HANDLE, C::ERR_LEASE_LOST, 'an undecodable handle is not a lost lease');
+    }
+
+    /**
+     * Turn a QUEUE vector's JSON message into the codec's logical shape: `*_hex` → binary string,
+     * `common`/`stats` positional → keyed, job tuples → keyed, `status` dropped. Key order follows the
+     * decoders' output so the comparison can be `assertSame`.
+     * @param array<array-key,mixed> $m
+     * @return array<string,mixed>
+     */
+    private static function queueFromJson(array $m): array
+    {
+        $bin = static fn (mixed $h): string => is_string($h) ? (string) hex2bin($h) : throw new \LogicException('expected hex');
+        $common = static fn (mixed $c): array => is_array($c)
+            ? ['tx_id' => $c[0] ?? null, 'timeout_ms' => $c[1] ?? null, 'traceparent' => $c[2] ?? null]
+            : throw new \LogicException('bad common');
+        $stats = static fn (mixed $s): array => is_array($s)
+            ? ['queue_us' => $s[0] ?? null, 'exec_us' => $s[1] ?? null]
+            : throw new \LogicException('bad stats');
+        $out = [];
+        foreach ($m as $k => $val) {
+            $key = (string) $k;
+            if ($key === 'status') { continue; }
+            if (str_ends_with($key, '_hex')) {
+                $out[substr($key, 0, -4)] = $val === null ? null : $bin($val);
+            } elseif ($key === 'common') {
+                $out[$key] = $common($val);
+            } elseif ($key === 'stats') {
+                $out[$key] = $stats($val);
+            } elseif ($key === 'jobs' && is_array($val)) {
+                $out[$key] = array_map(static fn (mixed $j): array => is_array($j) && count($j) === 3
+                    ? ['queue' => $j[0], 'payload' => $j[1], 'delay_s' => $j[2]]
+                    : (is_array($j) ? ['job_id' => $bin($j[0] ?? null), 'token' => $bin($j[1] ?? null), 'attempts' => $j[2] ?? null,
+                        'queue' => $j[3] ?? null, 'payload' => $j[4] ?? null, 'created_at' => $j[5] ?? null,
+                        'lease_deadline' => $j[6] ?? null] : throw new \LogicException('bad job')), $val);
+            } else {
+                $out[$key] = $val;
+            }
+        }
+        // Each decoder's key order: the request shapes start with `store`, the responses do not.
+        $orders = [
+            ['store', 'jobs', 'dedup_key', 'common'],
+            ['store', 'queues', 'max_jobs', 'wait_ms', 'liveness', 'common'],
+            ['store', 'job_id', 'token', 'delay_s', 'common'],
+            ['store', 'job_id', 'token', 'common'],
+            ['store', 'queue', 'common'],
+            ['job_id', 'inserted', 'deduplicated', 'stats'],
+            ['jobs', 'stats'],
+            ['outcome', 'stats'],
+            ['new_job_id', 'stats'],
+            ['lease_deadline', 'stats'],
+            ['pending', 'delayed', 'reserved', 'oldest_pending_at', 'stats'],
+            ['deleted', 'stats'],
+        ];
+        $keys = array_keys($out);
+        foreach ($orders as $order) {
+            $sortedOrder = $order;
+            sort($sortedOrder);
+            $sortedKeys = $keys;
+            sort($sortedKeys);
+            if ($sortedOrder === $sortedKeys) {
+                return array_merge(array_flip($order), $out);
+            }
+        }
+        throw new \LogicException('a QUEUE vector message matches no shape: ' . implode(',', $keys));
+    }
+
+    /**
      * @param array<string,mixed> $message
      */
     private function encodeTxRequest(string $name, array $message, PurePacker $p): string
@@ -895,6 +1065,7 @@ final class VectorConformanceTest extends TestCase
         foreach (self::sqlVectors() as [$v]) { $prefixLocked[] = (string) $v['name']; }
         foreach (self::streamVectors() as [$v]) { $prefixLocked[] = (string) $v['name']; }
         foreach (self::httpVectors() as [$v]) { $prefixLocked[] = (string) $v['name']; }
+        foreach (self::queueVectors() as [$v]) { $prefixLocked[] = (string) $v['name']; }
 
         // The four vectors this task added — each must be inside a PREFIX-keyed provider.
         foreach ([

@@ -38,7 +38,12 @@ $out .= "    public const PROTOCOL_VERSION = {$lock['protocol_version']};\n";
 $out .= "    public const MAGIC = {$lock['magic']};\n";
 $out .= "    public const MAX_FRAME_PAYLOAD = {$lock['max_frame_payload']};\n";
 $out .= "    public const DEFAULT_CREDIT_FRAMES = {$lock['default_credit_frames']};\n";
-$out .= "    public const DEFAULT_CREDIT_BYTES = {$lock['default_credit_bytes']};\n\n";
+$out .= "    public const DEFAULT_CREDIT_BYTES = {$lock['default_credit_bytes']};\n";
+// Ferro Queue (SPEC §24.4, M7-G1a): the wait grace and the three shape bounds both codecs enforce.
+$out .= "    public const QUEUE_WAIT_GRACE_MS = {$lock['queue_wait_grace_ms']};\n";
+$out .= "    public const QUEUE_HANDLE_MAX_BYTES = {$lock['queue_handle_max_bytes']};\n";
+$out .= "    public const QUEUE_ENQUEUE_MAX_JOBS = {$lock['queue_enqueue_max_jobs']};\n";
+$out .= "    public const QUEUE_RESERVE_MAX_QUEUES = {$lock['queue_reserve_max_queues']};\n\n";
 $emit = function (string $prefix, array $kv) {
     $s = '';
     foreach ($kv as $k => $v) { $s .= "    public const {$prefix}_{$k} = {$v};\n"; }
@@ -55,6 +60,8 @@ $out .= "\n";
 foreach ($lock['outcome'] as $k => $v) { $out .= "    public const OUTCOME_{$k} = {$v};\n"; }
 $out .= "\n";
 foreach ($lock['oob_encoding'] as $k => $v) { $out .= "    public const OOB_ENCODING_{$k} = {$v};\n"; }
+$out .= "\n";
+foreach ($lock['ack_outcome'] as $k => $v) { $out .= "    public const ACK_OUTCOME_{$k} = {$v};\n"; }
 $out .= "\n";
 foreach ($lock['tags'] as $k => $v) { $out .= "    public const TAG_{$k} = {$v};\n"; }
 $out .= "\n";

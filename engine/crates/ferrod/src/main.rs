@@ -43,6 +43,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(queries = loaded.len(), hash = %loaded.hash(), "ferrod: manifest loaded");
         config.manifest = Some(loaded);
     }
+    // SPEC §24.3 (M7-G1a): Ferro Queue's stores. Loaded after the pools because a store names one;
+    // a refused store is logged by name and disabled, never fatal to the daemon.
+    config.queue = ferrod::queue_config::load_and_log(&config);
     // SPEC §23.3.1 (M6-F4a): Ferro HTTP's configuration, read once. A refused configuration never
     // stops the daemon — it disables an upstream, or the whole HTTP service — so this cannot fail.
     #[cfg(feature = "http")]

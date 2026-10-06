@@ -4,6 +4,10 @@
   "max_frame_payload": 16777216,
   "default_credit_frames": 64,
   "default_credit_bytes": 16777216,
+  "queue_wait_grace_ms": 1000,
+  "queue_handle_max_bytes": 1024,
+  "queue_enqueue_max_jobs": 1000,
+  "queue_reserve_max_queues": 16,
   "flags": {
     "CANCEL": 4,
     "COMPRESSED": 16,
@@ -15,6 +19,7 @@
     "ADMIN": 5,
     "CORE": 1,
     "HTTP": 6,
+    "QUEUE": 7,
     "SQL": 2,
     "STREAM": 4,
     "TX": 3
@@ -35,6 +40,15 @@
       "BODY": 3,
       "HEAD": 2,
       "REQUEST": 1
+    },
+    "queue": {
+      "ACK": 3,
+      "CLEAR": 7,
+      "ENQUEUE": 1,
+      "EXTEND": 5,
+      "RELEASE": 4,
+      "RESERVE": 2,
+      "SIZE": 6
     },
     "sql": {
       "COPY_IN": 2,
@@ -75,6 +89,10 @@
   },
   "oob_encoding": {
     "FRAME_PAYLOAD": 0
+  },
+  "ack_outcome": {
+    "ACKED": 1,
+    "GONE": 2
   },
   "implemented": [
     "BOOL",
@@ -146,8 +164,20 @@
       "code": 12291,
       "branch": 3
     },
+    "InvalidHandle": {
+      "code": 12305,
+      "branch": 3
+    },
+    "LeaseLost": {
+      "code": 12303,
+      "branch": 3
+    },
     "NotNull": {
       "code": 12292,
+      "branch": 3
+    },
+    "PoolMismatch": {
+      "code": 12304,
       "branch": 3
     },
     "PoolTimeout": {

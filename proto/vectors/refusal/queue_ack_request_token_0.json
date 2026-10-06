@@ -1,0 +1,12 @@
+{
+  "field": "token",
+  "frame_hex": "f7040000070003005a0000001000000094a46a6f6273c4023432c40093c0c0c0",
+  "header": {
+    "flags": 0,
+    "method": 3,
+    "request_id": 90,
+    "service": 7
+  },
+  "len": 0,
+  "name": "queue_ack_request_token_0"
+}

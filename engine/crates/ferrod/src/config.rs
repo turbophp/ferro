@@ -341,6 +341,9 @@ pub struct Config {
     /// Here, beside `manifest`, for the same reason: the registry builds the engine from it.
     #[cfg(feature = "http")]
     pub http: Option<std::sync::Arc<ferro_http::HttpConfig>>,
+    /// SPEC §24.3 (M7-G1a): Ferro Queue's stores, when `FERRO_QUEUE_STORES` is set. Loaded in `main`
+    /// after the pools (a store names a pool), beside `http`, and handed to the registry the same way.
+    pub queue: Option<std::sync::Arc<ferro_queue::config::QueueConfig>>,
     /// M3-D4: the per-`COPY_IN` client-to-engine credit window (see
     /// [`DEFAULT_COPY_IN_WINDOW_BYTES`]). Not an environment knob: injectable for tests.
     pub copy_in_window_frames: u32,
@@ -372,6 +375,7 @@ impl Default for Config {
             memfd_threshold: Some(DEFAULT_MEMFD_THRESHOLD_BYTES),
             #[cfg(feature = "http")]
             http: None,
+            queue: None,
             copy_in_window_frames: DEFAULT_COPY_IN_WINDOW_FRAMES,
             copy_in_window_bytes: DEFAULT_COPY_IN_WINDOW_BYTES,
         }

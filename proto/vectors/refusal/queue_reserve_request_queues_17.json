@@ -1,0 +1,12 @@
+{
+  "field": "queues",
+  "frame_hex": "f7040000070002005a0000004a00000096a46a6f6273dc0011a27130a27131a27132a27133a27134a27135a27136a27137a27138a27139a3713130a3713131a3713132a3713133a3713134a3713135a37131360100c293c0c0c0",
+  "header": {
+    "flags": 0,
+    "method": 2,
+    "request_id": 90,
+    "service": 7
+  },
+  "len": 17,
+  "name": "queue_reserve_request_queues_17"
+}

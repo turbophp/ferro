@@ -422,6 +422,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferro-queue"
+version = "0.0.0"
+dependencies = [
+ "ferro-proto",
+]
+
+[[package]]
 name = "ferrod"
 version = "0.0.0"
 dependencies = [
@@ -435,6 +442,7 @@ dependencies = [
  "ferro-manifest",
  "ferro-pool",
  "ferro-proto",
+ "ferro-queue",
  "futures",
  "getrandom 0.2.17",
  "nix",

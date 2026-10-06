@@ -14,6 +14,16 @@ magic               = 0xF7
 max_frame_payload   = 16777216   # 16 MiB hard codec ceiling (W-5)
 default_credit_frames = 64
 default_credit_bytes  = 16777216  # 16 MiB -- deliberately == MAX_FRAME_PAYLOAD so any single valid DATA frame always fits the per-request credit window (M1-S5 large-row rule, user-confirmed Option B)
+# Ferro Queue (SPEC §24.4, keyed at M7-G1a). `queue_wait_grace_ms`: the engine's bound past a parked
+# RESERVE's `wait_ms` on handing its terminal to the writer (§24.8). The other three are SHAPE BOUNDS
+# that both decoders enforce (/proto/PROTOCOL.md §14), so they are registry keys rather than numbers
+# written twice (M6-F2's rule for `HttpBody`: a bound a RECEIVER enforces becomes a /proto key):
+# every `job_id`/`new_job_id`/`token` is a `bin` of 1..=queue_handle_max_bytes (SPEC D22 (b), D24);
+# an ENQUEUE carries 1..=queue_enqueue_max_jobs jobs; a RESERVE names 1..=queue_reserve_max_queues.
+queue_wait_grace_ms      = 1000
+queue_handle_max_bytes   = 1024
+queue_enqueue_max_jobs   = 1000
+queue_reserve_max_queues = 16
 
 [flags]
 STREAM     = 0x01
@@ -31,10 +41,9 @@ ADMIN  = 5
 # Ferro HTTP — SPEC §23 (docs/spec/23-http.md), allocated there at M6-F0; keyed at M6-F2. Its
 # methods are `[methods.http]` below; its messages are /proto/PROTOCOL.md §12.
 HTTP   = 6
-# RESERVED, comment only (no key, so no generated constant and no registry-hash change):
-#   QUEUE = 7   Ferro Queue — SPEC §24 (docs/spec/24-queue.md), allocated by §24; the key lands
-#                with its first code slice, M7-G1.
-# Do not reuse 7 for anything else.
+# Ferro Queue — SPEC §24 (docs/spec/24-queue.md), allocated there at M7-G0; keyed at M7-G1a. Its
+# methods are `[methods.queue]` below; its messages are /proto/PROTOCOL.md §14.
+QUEUE  = 7
 
 [methods.core]
 HELLO         = 1
@@ -100,6 +109,20 @@ REQUEST = 1
 HEAD    = 2
 BODY    = 3
 
+# QUEUE service (M7-G1a; SPEC §24.4, /proto/PROTOCOL.md §14). Every method is client → engine and
+# request-bearing, ending in exactly one `END` whose `Outcome::Ok` body is the method's own response
+# shape. ACK, RELEASE and EXTEND are the FENCED verbs (they carry a `job_id` and a `token`). Every
+# QUEUE shape is frozen from here on: a later shape change bumps `protocol_version` (§24.4).
+# (Service `QUEUE = 7` above.)
+[methods.queue]
+ENQUEUE = 1
+RESERVE = 2
+ACK     = 3
+RELEASE = 4
+EXTEND  = 5
+SIZE    = 6
+CLEAR   = 7
+
 # Terminal outcome-envelope status discriminant (decision W-4). In /proto so both codecs
 # generate it rather than hand-writing 0/1/2 (charter rule 2).
 [outcome]
@@ -116,6 +139,14 @@ CANCELLED = 2
 # it would an inline payload. `COMPRESSED` (D11) would be a second value; none exists.
 [oob_encoding]
 FRAME_PAYLOAD = 0
+
+# Ferro Queue ACK's `outcome` (M7-G1a, SPEC §24.4, /proto/PROTOCOL.md §14): the success terminal of an
+# ACK carries one of these. `GONE` (the job no longer exists) is success-equivalent and is never
+# returned inside a transaction. In /proto for the reason `[outcome]` is: both codecs generate it
+# rather than hand-write the byte (charter rule 2), and both decoders refuse any other value.
+[ack_outcome]
+ACKED = 1
+GONE  = 2
 
 [features.engine]
 MEMFD          = 0x01

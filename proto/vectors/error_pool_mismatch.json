@@ -1,0 +1,22 @@
+{
+  "frame_hex": "f704020007000100550000004a000000920197cd301003c0c0d93d73746f7265206a6f6273206973206e6f74206f6e20746865207472616e73616374696f6e277320706f6f6c3b206e6f7468696e67207761732073656e74c0c0",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 85,
+    "service": 7
+  },
+  "message": {
+    "error": {
+      "branch": 3,
+      "code": 12304,
+      "detail": null,
+      "errno": null,
+      "message": "store jobs is not on the transaction's pool; nothing was sent",
+      "retry_after_ms": null,
+      "sqlstate": null
+    },
+    "status": 1
+  },
+  "name": "error_pool_mismatch"
+}

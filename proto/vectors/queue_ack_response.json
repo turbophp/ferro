@@ -1,0 +1,18 @@
+{
+  "frame_hex": "f7040200070003004b0000000c0000009200920192cc96ce000111eb",
+  "header": {
+    "flags": 2,
+    "method": 3,
+    "request_id": 75,
+    "service": 7
+  },
+  "message": {
+    "outcome": 1,
+    "stats": [
+      150,
+      70123
+    ],
+    "status": 0
+  },
+  "name": "queue_ack_response"
+}

@@ -1,0 +1,12 @@
+{
+  "field": "new_job_id",
+  "frame_hex": "f7040200070004005a00000008000000920092c400920000",
+  "header": {
+    "flags": 2,
+    "method": 4,
+    "request_id": 90,
+    "service": 7
+  },
+  "len": 0,
+  "name": "queue_release_response_new_job_id_0"
+}

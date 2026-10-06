@@ -106,11 +106,26 @@ branch = 3
 code = 0x300E
 branch = 3
 
-# RESERVED codes, comments only (no keys, so no generated constant and no registry-hash change).
-# Allocated by SPEC §24; each key lands with Ferro Queue's first code slice (G1). Do not reuse.
-# (SPEC §23's four HTTP codes, reserved here at M6-F0, were keyed above at M6-F2.)
-#   0x300F  LeaseLost            NonRetryable  Ferro Queue (SPEC §24, docs/spec/24-queue.md)
-#   0x3010  PoolMismatch         NonRetryable  Ferro Queue (SPEC §24)
+# Ferro Queue (SPEC §24.4, keyed at M7-G1a). A fenced verb's (ACK/RELEASE/EXTEND) token names no
+# current reservation, so the verb did NOTHING. Known fate; outside a transaction the Laravel tier
+# treats it as done, inside one it must roll back (§24.6, §24.11).
+[codes.LeaseLost]
+code = 0x300F
+branch = 3
+# Ferro Queue (SPEC §24.5): a tx-scoped queue verb named a store whose pool is not the transaction's.
+# Refused before any statement, so the transaction is untouched.
+[codes.PoolMismatch]
+code = 0x3010
+branch = 3
+# Ferro Queue (SPEC §24.3 G1 prerequisite (c), allocated at M7-G1a): a `job_id` or `token` that is
+# well-formed on the wire (a `bin` within its bounds) but that the store's KIND cannot decode — for
+# the `sql` kind, a `job_id` that is not the canonical decimal text of an `i64`, or a token that is
+# not its 8-byte layout. Refused before any statement. Deliberately NOT `Protocol` (the frame is
+# well-formed; that code means a wire fault) and NOT `LeaseLost` (which a tier treats as "did
+# nothing, done" — it would hide what is always a CLIENT defect: no engine ever minted such bytes).
+[codes.InvalidHandle]
+code = 0x3011
+branch = 3
 
 # The Ferro HTTP CAUSE vocabulary (SPEC §23.5.6, M6-F2). On service `HTTP`, an `ErrorPayload.detail`
 # is EXACTLY one of these tokens — never free text and never a PHP-supplied value — because a Guzzle

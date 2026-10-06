@@ -305,3 +305,88 @@ fn the_shared_shape_rule_fixture_gets_its_stated_verdicts() {
         "the fixture must exercise both verdicts"
     );
 }
+
+/// SPEC §24 allocates Ferro Queue's numbers in prose ("**Allocations.**"), and M7-G1a keyed them.
+/// Every `` `Name = value` `` pair that paragraph states is checked against the registry, so the spec
+/// and `/proto` cannot drift apart in either direction (a renumbered key, or a spec edit that moved a
+/// number without the registry).
+#[test]
+fn the_queue_allocations_in_spec_24_are_the_registry_s() {
+    let reg = Registry::from_toml_dir(&proto_dir());
+    let spec = std::fs::read_to_string(proto_dir().join("../docs/spec/24-queue.md")).unwrap();
+    let start = spec
+        .find("**Allocations.**")
+        .expect("§24's Allocations paragraph");
+    let para = &spec[start..start + spec[start..].find("\n\n").unwrap()];
+    let mut seen = std::collections::BTreeMap::new();
+    for (i, part) in para.split('`').enumerate() {
+        let Some((name, value)) = part.split_once(" = ") else {
+            continue;
+        };
+        if i % 2 == 0 {
+            continue; // outside backticks
+        }
+        let value = match value.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16).unwrap(),
+            None => value.parse::<u64>().unwrap(),
+        };
+        let registered = match name {
+            "queue_wait_grace_ms" => u64::from(reg.queue_wait_grace_ms),
+            "queue_handle_max_bytes" => u64::from(reg.queue_handle_max_bytes),
+            "queue_enqueue_max_jobs" => u64::from(reg.queue_enqueue_max_jobs),
+            "queue_reserve_max_queues" => u64::from(reg.queue_reserve_max_queues),
+            _ => reg
+                .services
+                .get(name)
+                .map(|&v| u64::from(v))
+                .or_else(|| reg.codes.get(name).map(|c| u64::from(c.code)))
+                .or_else(|| reg.methods["queue"].get(name).map(|&v| u64::from(v)))
+                .or_else(|| reg.ack_outcome.get(name).map(|&v| u64::from(v)))
+                .unwrap_or_else(|| panic!("§24 allocates {name}, which the registry lacks")),
+        };
+        assert_eq!(
+            value, registered,
+            "{name}: §24 says {value}, the registry {registered}"
+        );
+        seen.insert(name.to_string(), value);
+    }
+    for name in [
+        "QUEUE",
+        "LeaseLost",
+        "PoolMismatch",
+        "InvalidHandle",
+        "queue_wait_grace_ms",
+    ] {
+        assert!(
+            seen.contains_key(name),
+            "§24's Allocations paragraph no longer states {name}"
+        );
+    }
+    for code in ["LeaseLost", "PoolMismatch", "InvalidHandle"] {
+        assert_eq!(
+            reg.codes[code].branch, reg.branches["NonRetryable"],
+            "{code}"
+        );
+    }
+    // §24.4's shape bounds are the registry's (M7-G1a made them keys: both decoders enforce them).
+    let bounds = [
+        (
+            format!("bin (1..={})", reg.queue_handle_max_bytes),
+            "handles",
+        ),
+        (
+            format!("(1..={})", reg.queue_enqueue_max_jobs),
+            "ENQUEUE jobs",
+        ),
+        (
+            format!("(1..={}, priority order)", reg.queue_reserve_max_queues),
+            "RESERVE queues",
+        ),
+    ];
+    for (text, what) in bounds {
+        assert!(
+            spec.contains(&text),
+            "§24.4 no longer states {what} as {text:?}"
+        );
+    }
+}

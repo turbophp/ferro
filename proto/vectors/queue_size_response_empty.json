@@ -1,0 +1,21 @@
+{
+  "frame_hex": "f704020007000600570000001100000092009500cd012c00c092cc96ce000111eb",
+  "header": {
+    "flags": 2,
+    "method": 6,
+    "request_id": 87,
+    "service": 7
+  },
+  "message": {
+    "delayed": 300,
+    "oldest_pending_at": null,
+    "pending": 0,
+    "reserved": 0,
+    "stats": [
+      150,
+      70123
+    ],
+    "status": 0
+  },
+  "name": "queue_size_response_empty"
+}
