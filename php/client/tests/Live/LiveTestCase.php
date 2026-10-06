@@ -268,6 +268,26 @@ abstract class LiveTestCase extends TestCase
         $this->waitUntilReady();
     }
 
+    /**
+     * SIGKILL the running ferrod and reap it — no drain, no terminal for anything in flight (the
+     * M6-F8 chaos 8 shape, SPEC §23.14). {@see restartFerrod} relaunches it afterwards.
+     */
+    protected function killFerrod(): void
+    {
+        if ($this->proc === null || !is_resource($this->proc)) {
+            return;
+        }
+        @proc_terminate($this->proc, self::SIGKILL);
+        $deadline = microtime(true) + self::STOP_TIMEOUT_SEC;
+        while (microtime(true) < $deadline) {
+            $s = $this->procStatus();
+            if ($s === null || $s['running'] === false) { break; }
+            usleep(10_000);
+        }
+        proc_close($this->proc);
+        $this->proc = null;
+    }
+
     /** The repo-relative candidate binary paths, plus `FERRO_FERROD_BIN`. */
     private static function locateFerrod(): ?string
     {

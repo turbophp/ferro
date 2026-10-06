@@ -13,6 +13,8 @@ use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Header;
 use Ferro\Protocol\Hello;
 use Ferro\Protocol\HelloAck;
+use Ferro\Protocol\HttpBody;
+use Ferro\Protocol\HttpHead;
 use Ferro\Protocol\Message;
 use Ferro\Protocol\Outcome;
 use Ferro\Protocol\PoolInfo;
@@ -49,8 +51,9 @@ use Ferro\Protocol\StreamHead;
  *    {@see TransportException::requestNotSent}, including one refused because the session had
  *    already failed while it waited for an in-flight slot.
  *
- * Open streams are still exclusive: no request may be submitted while a stream is open on this
- * session (see {@see $streamOpen}).
+ * Open SQL streams are still exclusive: no SQL request may be submitted while one is open on this
+ * session (see {@see $streamOpen}). Ferro HTTP exchanges are not, in either direction
+ * ({@see submitHttp}, M6-F8): any number may be open at once, beside SQL requests and a SQL stream.
  *
  * Handshake branching (SPEC §5): after sending HELLO the session reads ONE reply frame and routes
  * it by shape, NEVER by comparing hashes client-side (the registry check is SERVER-side and can
@@ -74,6 +77,17 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     private int|string|null $bootEpoch = null;
     /** @var list<PoolInfo> cached pool metadata from HELLO_ACK (M1-S8a: name + family + version) */
     private array $poolInfo = [];
+    /** The engine feature bits from HELLO_ACK (`Constants::FEATURE_ENGINE_*`); 0 before HELLO. */
+    private int $engineFeatures = 0;
+
+    /**
+     * Ferro HTTP requests whose `HEAD` has been read (M6-F8). A request's frames must arrive as
+     * exactly one `HEAD`, then `BODY` frames, then one terminal; a frame out of that order means the
+     * two ends disagree about the exchange, which {@see readHttpFrame} treats as a desync.
+     *
+     * @var array<int, true>
+     */
+    private array $httpHeadSeen = [];
     private bool $handshakeDone = false;
 
     /**
@@ -249,6 +263,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             $ack = HelloAck::decode($body, $this->decodePacker);
             $this->bootEpoch = $ack->bootEpoch;
             $this->poolInfo = $ack->pools;
+            $this->engineFeatures = $ack->features;
             $this->handshakeDone = true;
             return $ack;
         }
@@ -333,6 +348,27 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     public function submit(int $service, int $method, string $payload): int
     {
         $this->assertNoOpenStream();
+        return $this->submitFrame($service, $method, $payload);
+    }
+
+    /**
+     * Write a Ferro HTTP `REQUEST` frame and return its `request_id` (M6-F8, SPEC §23.11.1).
+     *
+     * Exactly {@see submit}, minus the open-stream guard, in BOTH directions: an HTTP request may be
+     * sent while a SQL stream is open, and an open HTTP exchange never sets the guard, so SQL
+     * requests and other HTTP requests go on beside it. The guard exists because a buffered
+     * statement on the same `tx_id` would queue in the engine behind a stream stalled on its credit
+     * window (§22.2 (cj)); an HTTP exchange has no transaction relation, so it neither queues behind
+     * a SQL stream nor makes anything queue behind it. Each exchange is bounded by its own credit
+     * window (64 frames / 16 MiB), which is its client-side memory bound (§23.9.1).
+     */
+    public function submitHttp(string $payload): int
+    {
+        return $this->submitFrame(C::SERVICE_HTTP, C::METHOD_HTTP_REQUEST, $payload);
+    }
+
+    private function submitFrame(int $service, int $method, string $payload): int
+    {
         $this->refuseIfDead(true);
         while (count($this->inFlight) >= $this->maxInFlight) {
             // This request has not been written: whatever goes wrong while waiting for a slot, it
@@ -397,6 +433,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     public function discard(int $requestId): void
     {
         unset($this->inbox[$requestId], $this->deadlines[$requestId], $this->deadlineCancelled[$requestId]);
+        unset($this->httpHeadSeen[$requestId]);
         if (isset($this->inFlight[$requestId])) {
             $this->discarded[$requestId] = true;
         }
@@ -593,6 +630,16 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     }
 
     public function handshakeComplete(): bool { return $this->handshakeDone; }
+
+    /**
+     * The engine feature bits the last HELLO_ACK advertised (`Constants::FEATURE_ENGINE_*`). Ferro
+     * HTTP checks `FEATURE_ENGINE_HTTP` before sending: an engine built without the `http` feature
+     * has the same registry hash, so the bit is the only way to know it serves HTTP (§23.5).
+     */
+    public function engineFeatures(): int
+    {
+        return $this->engineFeatures;
+    }
 
     // ---- streamed read (M1-S5 Task 6, {@see StreamingSessionInterface}) --------------------------
 
@@ -820,6 +867,117 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         while ($this->streamOpen && $this->streamRequestId === $requestId) {
             $this->readCopyEvent($requestId);
         }
+    }
+
+    // ---- Ferro HTTP (M6-F8, SPEC §23.5, §23.11.1) --------------------------------------------------
+
+    /**
+     * The next frame of the HTTP exchange `$requestId` ({@see submitHttp}): its one `HEAD`, then its
+     * `BODY` chunks, then its ONE terminal (`end`, which clears the exchange).
+     *
+     * Order is checked, not assumed (§23.5): a `BODY` before the `HEAD`, a second `HEAD`, a `HEAD`
+     * flagged `STREAM` or a `BODY` not flagged, a frame of another service, a malformed payload, or a
+     * `HEAD` the engine's own contract forbids (a status outside 200..=599, a version outside
+     * {10, 11, 20}) means the two ends disagree about this exchange. That is a desync like any other
+     * ({@see awaitTerminal}): the session is poisoned and a {@see ProtocolException} thrown. A
+     * transport failure or a session-fatal terminal surfaces exactly as {@see awaitTerminal}'s do,
+     * for the caller to classify (§23.7.3).
+     *
+     * Sends no `WINDOW_UPDATE`: the caller replenishes once it has consumed the frame.
+     *
+     * @return array{type:'head', head:array{status:int,version:int,reason:?string,headers:list<array{0:string,1:string}>,decoded:?array{0:string,1:?int},idempotent:bool}, bytes:int}
+     *       | array{type:'body', chunk:string, bytes:int}
+     *       | array{type:'end', outcome:Outcome}
+     */
+    public function readHttpFrame(int $requestId): array
+    {
+        [$header, $body] = $this->nextFrameFor($requestId);
+        if (($header->flags & C::FLAG_END) !== 0) {
+            unset($this->httpHeadSeen[$requestId]);
+            try {
+                return ['type' => 'end', 'outcome' => Outcome::decode($body, $this->decodePacker)];
+            } catch (CodecException $e) {
+                // The frame was read whole, so the stream is still in step; only this terminal is
+                // unreadable. The exchange is over either way.
+                throw new ProtocolException("undecodable terminal for HTTP request {$requestId}: " . $e->getMessage(), 0, $e);
+            }
+        }
+        $seen = isset($this->httpHeadSeen[$requestId]);
+        $isHttp = $header->service === C::SERVICE_HTTP;
+        $streamFlag = ($header->flags & C::FLAG_STREAM) !== 0;
+        try {
+            if ($isHttp && $header->method === C::METHOD_HTTP_HEAD && !$seen && !$streamFlag) {
+                $head = HttpHead::decode($body, $this->decodePacker);
+                if ($head['status'] < 200 || $head['status'] > 599 || !in_array($head['version'], [10, 11, 20], true)) {
+                    throw new CodecException(sprintf(
+                        'HEAD carries status %d / version %d, outside the engine\'s contract (§23.5.2)',
+                        $head['status'],
+                        $head['version'],
+                    ));
+                }
+                $this->httpHeadSeen[$requestId] = true;
+                return ['type' => 'head', 'head' => $head, 'bytes' => strlen($body)];
+            }
+            if ($isHttp && $header->method === C::METHOD_HTTP_BODY && $seen && $streamFlag) {
+                $chunk = HttpBody::decode($body, $this->decodePacker);
+                return ['type' => 'body', 'chunk' => $chunk, 'bytes' => strlen($body)];
+            }
+            throw new CodecException(sprintf(
+                'unexpected frame for HTTP request %d: service=%d method=%d flags=%d (HEAD %s)',
+                $requestId,
+                $header->service,
+                $header->method,
+                $header->flags,
+                $seen ? 'already read' : 'not yet read',
+            ));
+        } catch (CodecException $e) {
+            $this->poison(new TransportException('HTTP exchange desynchronised: ' . $e->getMessage()));
+            throw new ProtocolException('HTTP exchange desynchronised: ' . $e->getMessage(), 0, $e);
+        }
+    }
+
+    /**
+     * Abandon an HTTP exchange: `CANCEL`, then read and discard its frames up to and including its
+     * ONE terminal (the {@see abandonStream} contract), so the engine stops the exchange and frees
+     * its upstream connection instead of leaving it parked on credit until its own timeout. A no-op
+     * for an exchange that already ended, was discarded, or is on a closed session — this runs from
+     * `finally` blocks carrying the real error.
+     */
+    public function abandonHttp(int $requestId): void
+    {
+        if ($this->poisoned !== null || !$this->isPending($requestId)) {
+            return;
+        }
+        if (isset($this->inFlight[$requestId]) && $this->fatal === null) {
+            // The terminal has not been read off the wire yet, so the engine may still be running it.
+            $this->sendCancel($requestId);
+        }
+        while (true) {
+            if ($this->readHttpFrame($requestId)['type'] === 'end') {
+                return;
+            }
+        }
+    }
+
+    /**
+     * Abandon an HTTP exchange WITHOUT waiting: `CANCEL` it (best effort) and throw its frames away
+     * as they arrive ({@see discard}). For a destructor or a dropped Future, which must neither block
+     * nor throw. Never throws.
+     */
+    public function cancelAndDiscard(int $requestId): void
+    {
+        if ($this->poisoned !== null || !$this->isPending($requestId)) {
+            return;
+        }
+        if (isset($this->inFlight[$requestId]) && $this->fatal === null) {
+            try {
+                $this->sendCancel($requestId);
+            } catch (TransportException) {
+                // The write failure closed the session; there is nothing left to discard from.
+                return;
+            }
+        }
+        $this->discard($requestId);
     }
 
     /**

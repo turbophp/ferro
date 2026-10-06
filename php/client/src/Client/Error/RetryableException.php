@@ -8,8 +8,12 @@ namespace Ferro\Client\Error;
  * failure, a pool timeout, a deadlock/serialization abort, a lost READ). The Task-4 resilience loop
  * MAY transparently re-issue a Retryable READ (`retry_reads`) — it MUST NOT retry a Retryable write
  * unless a manifest declares it idempotent (M3). Carries the decoded `ErrorPayload`.
+ *
+ * Not `final` since M6-F8: Ferro HTTP's Retryable failure ({@see \Ferro\Http\Error\HttpRetryableException})
+ * extends it, so a `catch` on this class catches it too (SPEC §23.11.1). Nothing in this client
+ * re-sends an HTTP request, Retryable or not (§23.7.3).
  */
-final class RetryableException extends FerroException
+class RetryableException extends FerroException
 {
     use CarriesErrorPayload;
 }
