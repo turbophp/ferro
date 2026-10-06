@@ -225,16 +225,34 @@ async fn handle(
         (service::ADMIN, method_admin::BACKUP) => {
             crate::services::admin::handle_backup(frame, responder, registry, cancel).await
         }
-        // Ferro HTTP (M6-F2, SPEC §23.15): the wire is pinned before the behaviour, so a REQUEST is
-        // routed, DECODED — a malformed one is `Protocol`, exactly as §23.6 step 1 will keep it — and
-        // then answered `Unsupported`, because nothing in this build serves HTTP (and it does not
-        // advertise `feature_engine::HTTP`). Slice F4 replaces this arm with the engine.
+        // Ferro HTTP (SPEC §23.6; M6-F2 routed it, M6-F4a serves it). Step 1 is HERE: the frame is
+        // DECODED first — a malformed one is `Protocol`, with no cause token (§22.2 (cy)) — and the
+        // total deadline runs from this instant. A daemon that does not serve HTTP (built without
+        // the `http` feature, or with no `FERRO_UPSTREAMS`) answers `Unsupported` and does not
+        // advertise `feature_engine::HTTP`.
         (service::HTTP, method_http::REQUEST) => {
+            let started = std::time::Instant::now();
             match ferro_proto::messages::HttpRequest::decode(&frame.payload) {
                 Err(e) => responder.end_error(protocol(format!("malformed HttpRequest: {e}"))),
-                Ok(_) => responder.end_error(unsupported(
-                    "Ferro HTTP is not served by this build (feature HTTP is not advertised)",
-                )),
+                Ok(req) => {
+                    #[cfg(feature = "http")]
+                    if let Some(engine) = registry.http() {
+                        crate::services::http::handle_request(
+                            engine,
+                            req,
+                            info.peer_uid,
+                            started,
+                            responder,
+                            cancel,
+                        )
+                        .await;
+                        return;
+                    }
+                    let _ = (req, started);
+                    responder.end_error(unsupported(
+                        "Ferro HTTP is not served by this daemon (feature HTTP is not advertised)",
+                    ))
+                }
             }
         }
         // Any other routed frame (an unrecognized SQL/TX method, or STREAM) → one END, session lives.

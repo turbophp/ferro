@@ -22,6 +22,8 @@ Now **M2 / Phase C (Eloquent, SQLite backend, observability, DBAL ^3.8 bridge)**
 
 **v1 was REDEFINED by the owner on 2026-10-06 (SPEC D16–D18, product-vision P13), and the loop is running again to deliver it.** v1 = the database engine's M3, M4 and M5 **plus Ferro HTTP (M6) and Ferro Queue (M7)**, built **M3 → M6 → M7 → M4 → M5 → v1 exit** (§17 amended). Each engine gets its own SPEC section and service id before any code. The §16 numbers are measured on a GitHub `ubuntu-latest` runner with a per-run environment manifest (D17). An upstream suite is "green" when it has **parity with a stock-driver control** (D18), which makes the missing DBAL server-family controls required work (ledger E9). Read the ledger's v1 definition and Phases D, F, G and E before starting a slice.
 
+**M3 is complete (2026-10-06)** — every Phase D row is merged; see `docs/dev-loop/LEDGER.md` (Phase D) for the record.
+
 ## What Ferro is
 
 A **per-host database access engine for PHP**. One Rust daemon (`ferrod`, tokio) owns all upstream DB connections, pools them in transaction mode, and multiplexes many PHP-FPM workers over a local Unix socket — while remaining a **drop-in** replacement for Doctrine DBAL and Laravel Eloquent (config-only adoption).

@@ -337,6 +337,11 @@ pub struct PoolRegistry {
     /// SPEC §11's checked-SQL manifest (M3-D2d), when `FERRO_MANIFEST` loaded one. Here for the
     /// same reason as `tracer`: every EXEC path already holds the registry.
     manifest: Option<Arc<crate::manifest::LoadedManifest>>,
+    /// SPEC §23's Ferro HTTP engine (M6-F4a), when `FERRO_UPSTREAMS` configured one. Here for the
+    /// same reason as `manifest`: the session builds `HELLO_ACK` from the registry, and every
+    /// request handler already holds it. Upstream names share no namespace with pool names (§23.3).
+    #[cfg(feature = "http")]
+    http: Option<Arc<ferro_http::engine::HttpEngine>>,
 }
 
 impl PoolRegistry {
@@ -371,7 +376,37 @@ impl PoolRegistry {
         Self::build_with(config, tuning)
     }
 
+    /// [`PoolRegistry::build`] with an explicitly constructed HTTP engine instead of the one
+    /// `config.http` would produce — the e2e seam that injects a resolver (§23.8.5's address guard
+    /// can only be tested against a name that resolves to `fd00:ec2::254` if the test decides what
+    /// it resolves to). `None` builds a registry that serves no HTTP.
+    #[cfg(feature = "http")]
+    pub fn build_with_http(
+        config: &Config,
+        http: Option<Arc<ferro_http::engine::HttpEngine>>,
+    ) -> Arc<Self> {
+        Self::assemble(config, ProbeTuning::default(), http)
+    }
+
     fn build_with(config: &Config, tuning: ProbeTuning) -> Arc<Self> {
+        #[cfg(feature = "http")]
+        let http = config
+            .http
+            .clone()
+            .map(|c| Arc::new(ferro_http::engine::HttpEngine::new(c)));
+        Self::assemble(
+            config,
+            tuning,
+            #[cfg(feature = "http")]
+            http,
+        )
+    }
+
+    fn assemble(
+        config: &Config,
+        tuning: ProbeTuning,
+        #[cfg(feature = "http")] http: Option<Arc<ferro_http::engine::HttpEngine>>,
+    ) -> Arc<Self> {
         let slow_log = SlowLogConfig {
             threshold_ms: config.slow_log_ms,
             log_params: config.log_params,
@@ -427,7 +462,29 @@ impl PoolRegistry {
             tuning,
             tracer: config.otlp.clone().map(crate::otlp::Tracer::start),
             manifest: config.manifest.clone(),
+            #[cfg(feature = "http")]
+            http,
         })
+    }
+
+    /// The Ferro HTTP engine, when HTTP is configured (SPEC §23, M6-F4a).
+    #[cfg(feature = "http")]
+    pub fn http(&self) -> Option<&Arc<ferro_http::engine::HttpEngine>> {
+        self.http.as_ref()
+    }
+
+    /// Whether this daemon SERVES Ferro HTTP — what `HELLO_ACK`'s `HTTP` feature bit says (§23.5):
+    /// built with the `http` feature, configured, and not disabled by a daemon-wide configuration
+    /// error (§23.3.1). False on a `--no-default-features` build.
+    pub fn http_served(&self) -> bool {
+        #[cfg(feature = "http")]
+        {
+            self.http.as_ref().is_some_and(|e| e.serves())
+        }
+        #[cfg(not(feature = "http"))]
+        {
+            false
+        }
     }
 
     /// The loaded checked-SQL manifest, if any.
@@ -1133,6 +1190,7 @@ mod tests {
             1,
             crate::epoch::BootEpoch(7),
             registry.pool_info().await,
+            false,
             false,
             false,
         );
