@@ -663,21 +663,28 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// The `ETOOMANYREFS` inline fallback (review RV3), against a REAL `ferrod` process. The kernel
-/// refuses an `SCM_RIGHTS` send once the sending user has more fds in flight than the sender's
-/// `RLIMIT_NOFILE` — unless the sender is privileged, which is why a root daemon never reaches
-/// this path. So `ferrod` runs here under a lowered `RLIMIT_NOFILE` and, when the test runs as root,
-/// as uid 65534 (no capabilities). A client that does not read keeps every fd in flight until the
-/// limit refuses the next one; the writer must then send that terminal INLINE. Every result must
-/// arrive, each its own, some by memfd and — the point — some inline.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_refused_fd_sends_the_same_terminal_inline() {
-    use std::os::unix::process::CommandExt;
-    const N: u32 = 400;
-    const NOFILE: u64 = 128;
+/// A REAL `ferrod` process (not the in-process test server), for what only a process can show:
+/// its own `RLIMIT_NOFILE`, and its own privileges.
+struct Spawned {
+    _child: KillOnDrop,
+    dir: std::path::PathBuf,
+    sock: std::path::PathBuf,
+    log: std::path::PathBuf,
+}
 
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Spawn `ferrod` with `RLIMIT_NOFILE = nofile`, a SQLite pool, a 4096-byte OOB threshold, and its
+/// log in `log`. With `unprivileged`, a test running as root has it run as uid 65534 — the kernel's
+/// in-flight fd limit does not apply to a privileged sender.
+fn spawn_ferrod(tag: &str, nofile: u64, unprivileged: bool, rust_log: &str) -> Spawned {
+    use std::os::unix::process::CommandExt;
     let dir = std::path::PathBuf::from(format!(
-        "/tmp/ferro-oob-refs-{}-{}",
+        "/tmp/ferro-oob-{tag}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -685,8 +692,8 @@ async fn a_refused_fd_sends_the_same_terminal_inline() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let as_root = nix::unistd::geteuid().is_root();
-    if as_root {
+    let drop_root = unprivileged && nix::unistd::geteuid().is_root();
+    if drop_root {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         println!(
@@ -695,11 +702,12 @@ async fn a_refused_fd_sends_the_same_terminal_inline() {
         );
     }
     let sock = dir.join("ferrod.sock");
+    let log = dir.join("ferrod.log");
     // `sh -c 'ulimit -n'` lowers the limit for ferrod alone (this crate forbids the `unsafe` a
     // `pre_exec` would need); std's `uid`/`gid` drop root, clearing supplementary groups first.
     let mut cmd = std::process::Command::new("/bin/sh");
     cmd.arg("-c")
-        .arg(format!("ulimit -n {NOFILE} && exec \"$0\""))
+        .arg(format!("ulimit -n {nofile} && exec \"$0\""))
         .arg(env!("CARGO_BIN_EXE_ferrod"))
         .env("FERRO_SOCK", &sock)
         .env("FERRO_POOLS", "default")
@@ -709,30 +717,53 @@ async fn a_refused_fd_sends_the_same_terminal_inline() {
         )
         .env("FERRO_MEMFD_THRESHOLD_BYTES", "4096")
         .env("FERRO_ALLOW_UIDS", nix::unistd::geteuid().to_string())
-        .env("RUST_LOG", "error")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if as_root {
+        .env("RUST_LOG", rust_log)
+        .env("NO_COLOR", "1")
+        // `ferrod` logs to stdout; stderr joins it so a panic lands in the same file.
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::OpenOptions::new().append(true).open(&log).unwrap());
+    if drop_root {
         cmd.uid(65534).gid(65534);
     }
-    let _ferrod = KillOnDrop(cmd.spawn().expect("spawn ferrod"));
+    Spawned {
+        _child: KillOnDrop(cmd.spawn().expect("spawn ferrod")),
+        dir,
+        sock,
+        log,
+    }
+}
+
+async fn connect_when_listening(sock: &Path) -> UnixStream {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let mut c = loop {
-        if let Ok(s) = UnixStream::connect(&sock).await {
-            break FdClient {
-                stream: s,
-                buf: Vec::new(),
-                fds: VecDeque::new(),
-                chunk: 64 * 1024,
-            };
+    loop {
+        if let Ok(s) = UnixStream::connect(sock).await {
+            return s;
         }
         assert!(
             std::time::Instant::now() < deadline,
             "ferrod never listened"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The `ETOOMANYREFS` inline fallback (review RV3), against a REAL `ferrod` process. The kernel
+/// refuses an `SCM_RIGHTS` send once the sending user has more fds in flight than the sender's
+/// `RLIMIT_NOFILE` — unless the sender is privileged, which is why a root daemon never reaches
+/// this path. So `ferrod` runs here under a lowered `RLIMIT_NOFILE` and, when the test runs as root,
+/// as uid 65534 (no capabilities). A client that does not read keeps every fd in flight until the
+/// limit refuses the next one; the writer must then send that terminal INLINE. Every result must
+/// arrive, each its own, some by memfd and — the point, asserted rather than assumed — some inline.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_fd_sends_the_same_terminal_inline() {
+    const N: u32 = 400;
+    let f = spawn_ferrod("refs", 128, true, "error");
+    let mut c = FdClient {
+        stream: connect_when_listening(&f.sock).await,
+        buf: Vec::new(),
+        fds: VecDeque::new(),
+        chunk: 64 * 1024,
     };
-    // The precondition, asserted rather than assumed: the daemon really is unprivileged.
     let ack = c.hello(MEMFD_RX).await;
     assert_ne!(ack.features & u32::from(feature_engine::MEMFD), 0);
 
@@ -764,7 +795,6 @@ async fn a_refused_fd_sends_the_same_terminal_inline() {
             other => panic!("expected TEXT, got {other:?}"),
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(
         oob > 0,
         "some results went by memfd ({oob} OOB, {inline} inline)"
@@ -773,5 +803,40 @@ async fn a_refused_fd_sends_the_same_terminal_inline() {
         inline > 0,
         "the in-flight limit refused no fd, so the fallback was never exercised \
          ({oob} OOB, {inline} inline)"
+    );
+}
+
+/// Review F2's amplifier: out of fds, `accept` fails at once for as long as the connection stays
+/// queued, and the accept loop used to retry without pausing — a core spinning and a log line per
+/// spin (717 000 in 13 s in the review's reproduction). `ferrod` runs here with 40 fds and is
+/// handed more connections than that; it must back off rather than spin.
+#[tokio::test(flavor = "multi_thread")]
+async fn accept_backs_off_when_the_daemon_is_out_of_fds() {
+    let f = spawn_ferrod("accept", 40, false, "warn");
+    let mut held = vec![connect_when_listening(&f.sock).await];
+    for _ in 0..60 {
+        if let Ok(s) = UnixStream::connect(&f.sock).await {
+            held.push(s);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let failures = || {
+        std::fs::read_to_string(&f.log)
+            .unwrap_or_default()
+            .matches("accept failed")
+            .count()
+    };
+    let before = failures();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let in_two_seconds = failures() - before;
+    assert!(
+        in_two_seconds > 0,
+        "the precondition: accept is failing for lack of fds ({} connections held); log:\n{}",
+        held.len(),
+        std::fs::read_to_string(&f.log).unwrap_or_default()
+    );
+    assert!(
+        in_two_seconds < 200,
+        "{in_two_seconds} accept failures logged in 2 s: the accept loop is spinning"
     );
 }
