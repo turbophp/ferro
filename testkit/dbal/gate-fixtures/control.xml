@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="fixture" tests="13">
+    <testcase name="testPlain" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001"/>
+    <testcase name="testRefused" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001"/>
+    <testcase name="testNameGated" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001"/>
+    <testcase name="testControlSkips" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <skipped/>
+    </testcase>
+    <testcase name="testBothSkip" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <skipped/>
+    </testcase>
+    <testcase name="testSharedAssert" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <failure type="PHPUnit\Framework\ExpectationFailedException">Fx\SuiteTest::testSharedAssert
+Failed asserting that two strings are identical.
+--- Expected
++++ Actual
+@@ @@
+-'a'
++'b'
+
+/fixture/tests/SuiteTest.php:42</failure>
+    </testcase>
+    <testcase name="testSharedPath" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <failure type="PHPUnit\Framework\ExpectationFailedException">Fx\SuiteTest::testSharedPath
+Failed asserting that file "/run/control-1/x.db" exists.
+
+/fixture/tests/SuiteTest.php:42</failure>
+    </testcase>
+    <testcase name="testSharedError" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <error type="Fx\Boom">Fx\SuiteTest::testSharedError
+Fx\Boom: boom
+
+/fixture/tests/SuiteTest.php:42</error>
+    </testcase>
+    <testcase name="testCollected" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001"/>
+    <testcase name="testTemp with data set #0" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001"/>
+    <testcase name="testTemp with data set #1" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001"/>
+    <testcase name="testOne" class="Fx\GatedTest" classname="Fx.GatedTest" assertions="1" time="0.001"/>
+    <testcase name="testTwo" class="Fx\GatedTest" classname="Fx.GatedTest" assertions="1" time="0.001"/>
+  </testsuite>
+</testsuites>

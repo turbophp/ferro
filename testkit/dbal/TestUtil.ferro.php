@@ -45,18 +45,17 @@ use const JSON_THROW_ON_ERROR;
  *     method below stays a no-op, and the RUNNER is where idempotence now lives; a recorded number
  *     MUST come from a run that performed the reset (the runner prints a `[ferro] reset: …` line).
  *
- * `isDriverOneOf()` answers FALSE for every name, and that is a deliberate decision with 60 call
- * sites behind it: claiming `pdo_pgsql`/`pdo_mysql` would opt Ferro into PDO-specific expectations
- * and into whole vendor sub-trees written against those extensions. Answering nothing means every
- * vendor-gated test takes its "other" branch, which is the honest description of what Ferro is.
- *
- * **It answers FALSE under the CONTROL column too, and that is also deliberate.** The control's job
- * is to isolate ONE variable — the driver — so that a non-pass can be attributed. Letting it answer
- * `pdo_sqlite` would change the SKIP GATING as well, and the two columns would then be running
- * different test sets; the Illuminate lane measured exactly that confound when six of upstream's
- * tests turned out to branch on the driver NAME (SPEC §22.2 (am)). The cost is stated rather than
- * hidden: the control is not "upstream's own numbers", it is upstream's own DRIVER on this suite's
- * own gating, which is what makes the two columns comparable line by line.
+ * `isDriverOneOf()` answers the column's PDO DRIVER NAME (E9, SPEC §22.2 (da)): the control's real
+ * one (`db_driver`), and for the Ferro column the PDO driver of the family its pool serves
+ * (`db_vendor_driver`, set by the runner from the family). Until E9 it answered FALSE for every name
+ * in BOTH columns, on the reasoning that claiming `pdo_pgsql`/`pdo_mysql` would opt Ferro into
+ * PDO-specific expectations. The review showed what that cost: every POSITIVE vendor gate
+ * (`if (! isDriverOneOf('mysqli', 'pdo_mysql')) skip`) skipped in both columns, so a test such as
+ * `Types/BigIntTypeTest::testUnsignedBigIntOnMySQL` — squarely in Ferro's §9.1 policy area — ran in
+ * neither, and a symmetric skip is invisible to a control. Ferro claims to be a drop-in for the
+ * family, so the family's vendor tests are part of what it must pass; both columns now take
+ * upstream's gates exactly as a stock `pdo_*` run does, and every difference that produces is
+ * triaged in testkit/dbal/triage.txt like any other.
  *
  * The public surface below is the MEASURED one, read out of the pinned 4.4.4 clone rather than
  * guessed: `isDriverOneOf` (:237), `getPrivilegedConnection` (:232), `isPdoStringifyFetchesEnabled`
@@ -162,7 +161,15 @@ class TestUtil
 
     public static function isDriverOneOf(string ...$names): bool
     {
-        return false;
+        // The control names its real driver (`db_driver`); the Ferro column names the PDO driver of
+        // the family its pool serves (`db_vendor_driver`, from the runner). Neither is a guess this
+        // file may make, so a run with neither refuses rather than silently taking every "other" branch.
+        $driver = $GLOBALS['db_driver'] ?? $GLOBALS['db_vendor_driver'] ?? null;
+        if (! is_string($driver) || $driver === '') {
+            throw new RuntimeException('isDriverOneOf(): neither db_driver (the control) nor db_vendor_driver (the Ferro column) is set');
+        }
+
+        return in_array($driver, $names, true);
     }
 
     /**

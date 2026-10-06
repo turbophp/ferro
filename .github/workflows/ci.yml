@@ -37,6 +37,12 @@ jobs:
       # incompatibilities-page entry. Checked per push, so a stale explanation fails here rather
       # than at the next suite dispatch. Same shape: a file check, no toolchain, no backend.
       - run: ./ci/check-suite-triage.sh
+      # …and the D18 gate's own tests (E9 review F7): synthetic columns under
+      # testkit/dbal/gate-fixtures/, each with the exit status AND the reason the gate must give.
+      # Plain PHP, no extension beyond the defaults, no backend.
+      - uses: shivammathur/setup-php@v2
+        with: { php-version: "8.4", tools: none }
+      - run: ./ci/test-suite-gate.sh
 
   # The LIVE acceptance lane. It must be able to FAIL: every live suite in this repo is
   # `skip`-if-unconfigured by design, so a DSN this lane forgets to export turns its whole tier

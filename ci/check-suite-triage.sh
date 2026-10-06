@@ -2,23 +2,30 @@
 # ci/check-suite-triage.sh — the gate for the D18 triage files (SPEC D18; E9, SPEC §22.2 (da)).
 #
 # The sibling of ci/check-incompatibilities-doc.sh, and it exists for the same reason. A triage entry
-# is what lets a Ferro-only non-pass stand in a suite column that SPEC D18 still calls green, so an
-# entry whose explanation has gone stale is worse than no entry: the gate keeps passing on a reason
-# that is no longer true. Prose cannot be checked; citations can, and the format makes every entry
-# carry one. This script fails the build when an entry is malformed or a citation stops resolving:
+# is what lets a difference from the stock-driver control stand in a suite column that SPEC D18 still
+# calls green, so an entry whose explanation has gone stale is worse than no entry: the gate keeps
+# passing on a reason that is no longer true. Prose cannot be checked; citations can, and the format
+# makes every entry carry one. This script fails the build when an entry is malformed or a citation
+# stops resolving. It reads the format testkit/dbal/compare-columns.php documents at its top:
 #
-#   1. every entry has the five ` | `-separated fields compare-columns.php reads, a known kind, a
-#      Class::method test glob and a non-empty reason
-#   2. every `§22.2 (xx)` exists in the spec's changelog (spelled `**(xx) <title>**`)
-#   3. every `docs/…` path exists
-#   4. every `known:"…"` text appears verbatim in docs/known-incompatibilities.md — D18 admits a
-#      Ferro-only non-pass as an INCOMPATIBILITY only when that page documents it, so an
-#      `incompatibility` entry must point into the page, and editing the page out from under it fails
-#   5. every `upstream:<path>:<line>:"…"` citation is well-formed, and a `driver-name` entry has one
+#   <column globs> | <test> | <kind> | <expect> | <citations> | <reason>
 #
-# What it does NOT check, stated: whether an `upstream:` line really contains the quoted text. That
-# needs the pinned upstream clone, which this lane does not have; testkit/dbal/compare-columns.php
-# checks it on every suite run, against the clone the run just measured.
+#   1. six fields; a known kind (driver-name, incompatibility, defect); a non-empty reason
+#   2. the test is Class::method, with `*` ONLY as a trailing ` with data set *` or as the whole
+#      method (`Class::*`), and `Class::*` only with an `upstream-class:` citation — a method glob
+#      once excused four ungated SQL-injection tests along with the six gated ones it meant
+#   3. the expectation is `skip`, `pass`, `fail <Type>` or `fail <Type> /<regex>/`, and `skip`/`pass`
+#      (skip-SET differences) only on a driver-name entry — D18 admits no other explanation for one
+#   4. every `§22.2 (xx)` exists in the spec's changelog (spelled `**(xx) <title>**`)
+#   5. every `docs/…` path exists; a `defect` entry cites a follow-up under docs/followups/ whose
+#      status is OPEN (a defect whose follow-up is resolved is not a defect any more)
+#   6. every `known:"…"` text appears verbatim in docs/known-incompatibilities.md — D18 admits an
+#      incompatibility only when that page documents it — and an incompatibility entry has one
+#   7. every `upstream:`/`upstream-class:` citation is well-formed, and a driver-name entry has one
+#
+# What it does NOT check, stated: whether an upstream line really contains the quoted text, or is
+# really a class-level gate. That needs the pinned upstream clone, which this lane does not have;
+# compare-columns.php checks both on every suite run, against the clone the run just measured.
 #
 # It needs no toolchain and no backend — a file check, like ci/check-d12-recorded.sh — and it is
 # written to the same conventions as ci/check-incompatibilities-doc.sh.
@@ -49,32 +56,48 @@ for file in "${files[@]}"; do
     where="$rel:$ln"
     # Split on the exact separator compare-columns.php splits on.
     IFS=$'\x1f' read -r -a f <<< "${line// | /$'\x1f'}"
-    if [ "${#f[@]}" -ne 5 ]; then
-      bad "$where: expected 5 fields separated by ' | ', got ${#f[@]}"
+    if [ "${#f[@]}" -ne 6 ]; then
+      bad "$where: expected 6 fields separated by ' | ', got ${#f[@]}"
       continue
     fi
-    cols="${f[0]}" test="${f[1]}" kind="${f[2]}" cites="${f[3]}" reason="${f[4]}"
+    cols="${f[0]}" test="${f[1]}" kind="${f[2]}" expect="${f[3]}" cites="${f[4]}" reason="${f[5]}"
     for c in ${cols//,/ }; do
       [[ "$c" =~ ^[a-z0-9*.-]+$ ]] || bad "$where: bad column glob '$c'"
     done
-    [[ "$test" == *::* ]] || bad "$where: the test glob must be Class::method"
+    t="${test% with data set \*}"
+    [[ "$t" =~ ^[^:*[:space:]][^:*]*::([^*]+|\*)$ ]] \
+      || bad "$where: the test must be Class::method — '*' only as a trailing ' with data set *' or as the whole method: '$test'"
     [ -n "${reason// /}" ] || bad "$where: a reason is required"
     case "$kind" in
-      driver-name|incompatibility) ;;
-      *) bad "$where: kind must be driver-name or incompatibility, got '$kind'" ;;
+      driver-name|incompatibility|defect) ;;
+      *) bad "$where: kind must be driver-name, incompatibility or defect, got '$kind'" ;;
     esac
-    has_known=0 has_upstream=0
+    if [[ "$expect" == skip || "$expect" == pass ]]; then
+      [ "$kind" = driver-name ] || bad "$where: '$expect' is a skip-set difference, and D18 admits only a driver-name gate for one"
+    elif ! [[ "$expect" =~ ^fail\ [A-Za-z_\\][A-Za-z0-9_\\]*(\ /.+/[a-z]*)?$ ]]; then
+      bad "$where: expect must be 'skip', 'pass', 'fail <Type>' or 'fail <Type> /<regex>/', got '$expect'"
+    fi
+    has_known=0 has_upstream=0 has_class=0 has_followup=0
     IFS=';' read -r -a cl <<< "$cites"
     for c in "${cl[@]}"; do
       c="${c#"${c%%[![:space:]]*}"}"; c="${c%"${c##*[![:space:]]}"}"
       if [[ "$c" =~ ^§22\.2\ (\([a-z]+\))$ ]]; then
         grep -qF "**${BASH_REMATCH[1]} " "$spec" || bad "$where: §22.2 ${BASH_REMATCH[1]} is cited but not present in ferro-spec-v0.2.md"
       elif [[ "$c" =~ ^docs/[^[:space:]]+$ ]]; then
-        [ -e "$root/$c" ] || bad "$where: cited path does not exist: $c"
+        if [ ! -e "$root/$c" ]; then
+          bad "$where: cited path does not exist: $c"
+        elif [[ "$c" == docs/followups/* ]]; then
+          has_followup=1
+          if [ "$kind" = defect ] && ! grep -qE '\*\*STATUS: OPEN\b' "$root/$c"; then
+            bad "$where: a defect entry cites a follow-up that is not OPEN: $c"
+          fi
+        fi
       elif [[ "$c" =~ ^known:\"([^\"]+)\"$ ]]; then
         has_known=1
         grep -qF -- "${BASH_REMATCH[1]}" "$known" \
           || bad "$where: docs/known-incompatibilities.md does not contain: ${BASH_REMATCH[1]}"
+      elif [[ "$c" =~ ^upstream-class:[^:[:space:]]+:[0-9]+:\"[^\"]+\"$ ]]; then
+        has_upstream=1 has_class=1
       elif [[ "$c" =~ ^upstream:[^:[:space:]]+:[0-9]+:\"[^\"]+\"$ ]]; then
         has_upstream=1
       else
@@ -85,6 +108,10 @@ for file in "${files[@]}"; do
       && bad "$where: a driver-name entry must cite the upstream line that branches on the name (upstream:…)"
     [ "$kind" = incompatibility ] && [ "$has_known" = 0 ] \
       && bad "$where: an incompatibility entry must cite docs/known-incompatibilities.md (known:\"…\") — D18"
+    [ "$kind" = defect ] && [ "$has_followup" = 0 ] \
+      && bad "$where: a defect entry must cite its OPEN follow-up under docs/followups/"
+    [[ "$test" == *::\* ]] && [ "$has_class" = 0 ] \
+      && bad "$where: a whole-class entry (Class::*) needs an upstream-class: citation"
   done < "$file"
   [ "$entries" -gt 0 ] || bad "$rel has no entries"
   n_entries=$((n_entries + entries))

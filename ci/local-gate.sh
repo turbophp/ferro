@@ -79,5 +79,6 @@ echo "== d12 gate ==" ; ./ci/check-d12-recorded.sh
 echo "== incompatibilities doc gate ==" ; ./ci/check-incompatibilities-doc.sh
 # The D18 suite triage files (E9): the same kind of check, for the same reason.
 echo "== suite triage gate ==" ; ./ci/check-suite-triage.sh
+echo "== suite gate tests ==" ; ./ci/test-suite-gate.sh
 if [ "$live" = 1 ]; then echo "ALL GATES GREEN (live: pg + mysql + mariadb + php live tier)"
 else echo "ALL GATES GREEN (OFFLINE — live suites skipped; re-run with --live before pushing)"; fi

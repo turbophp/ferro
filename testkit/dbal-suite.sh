@@ -262,6 +262,14 @@ cfg="$work/phpunit.generated.xml"
     fi
   else
     echo '    <var name="db_driverClass" value="'"$driver_class"'"/>'
+    # The PDO driver of the family this pool serves, which TestUtil::isDriverOneOf() answers for the
+    # Ferro column (E9): Ferro is a drop-in for that family, so upstream's vendor gates for it apply.
+    case "$svc" in
+      pg|psql) echo '    <var name="db_vendor_driver" value="pdo_pgsql"/>' ;;
+      mysql|mariadb|mysql-local) echo '    <var name="db_vendor_driver" value="pdo_mysql"/>' ;;
+      sqlite) echo '    <var name="db_vendor_driver" value="pdo_sqlite"/>' ;;
+      *) echo "::error:: no vendor driver for FERRO_DBAL_SVC=$svc" >&2; exit 1 ;;
+    esac
     echo '    <var name="db_unix_socket" value="'"$sock"'"/>'
     echo '    <var name="db_driver_options" value="{&quot;pool&quot;:&quot;'"$pool"'&quot;}"/>'
   fi

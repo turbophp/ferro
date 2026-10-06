@@ -113,10 +113,21 @@ jobs:
             done
             # The contact assertion's own line, in its own direction: the Ferro column reached a
             # Ferro driverClass, and the control reached upstream's PDO driver with no daemon started.
+            # Each log on its own: `grep -q PATTERN a b` succeeds when EITHER file matches, so one
+            # good run would have vouched for a run that never reached Ferro (E9 review).
             if [ "$col" = ferro ]; then
-              grep -q '^\[ferro\] driver=Ferro\\DBAL\\' ferro-run1.log ferro-run2.log \
-                || { echo "::error:: the Ferro column did not report a Ferro driverClass"; rc=1; }
-            else
+              for run in 1 2; do
+                grep -q '^\[ferro\] driver=Ferro\\DBAL\\' "ferro-run$run.log" \
+                  || { echo "::error:: Ferro run $run did not report a Ferro driverClass"; rc=1; }
+              done
+            fi
+            # Both columns answer upstream's vendor gates with a PDO driver name (E9 review F5); a run
+            # that answered none would skip every positive vendor gate in silence.
+            for run in 1 2; do
+              grep -Eq '^\[(ferro|control)\] driver=.* vendor_gates=pdo_(pgsql|mysql|sqlite)$' "$col-run$run.log" \
+                || { echo "::error:: $col run $run does not answer the vendor gates with a PDO driver name"; rc=1; }
+            done
+            if [ "$col" = control ]; then
               for run in 1 2; do
                 grep -q '^\[control\] no ferrod started' "control-run$run.log" \
                   || { echo "::error:: control run $run does not say it started no ferrod"; rc=1; }

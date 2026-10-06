@@ -89,10 +89,12 @@ if ((int) $conn->fetchOne('SELECT 1') !== 1) {
 }
 
 fwrite(STDOUT, sprintf(
-    ($control ? "[control] " : "[ferro] ") . "driver=%s platform=%s server=%s\n",
+    ($control ? "[control] " : "[ferro] ") . "driver=%s platform=%s server=%s vendor_gates=%s\n",
     get_class($conn->getDriver()),
     $platform,
     $version,
+    // Which PDO driver name TestUtil::isDriverOneOf() answers for this column (E9).
+    (string) ($GLOBALS['db_driver'] ?? $GLOBALS['db_vendor_driver'] ?? 'none'),
 ));
 
 $conn->close();
