@@ -21,6 +21,7 @@ struct Registry {
     methods: BTreeMap<String, BTreeMap<String, u16>>,
     features: BTreeMap<String, BTreeMap<String, u16>>,
     outcome: BTreeMap<String, u8>,
+    oob_encoding: BTreeMap<String, u8>,
     // Not emitted as a constant; declared because `deny_unknown_fields` would otherwise reject the
     // lock and panic the build. It still feeds TYPE_REGISTRY_HASH via the raw lock bytes (M1-S7).
     #[allow(dead_code)]
@@ -81,6 +82,7 @@ fn main() {
         emit_mod_u16(&mut o, &format!("feature_{side}"), f);
     }
     emit_mod_u8(&mut o, "outcome", &reg.outcome);
+    emit_mod_u8(&mut o, "oob_encoding", &reg.oob_encoding);
     emit_mod_u8(&mut o, "tag", &reg.tags);
     // `branch` additionally carries `ALL` — `(registry name, value)` — for the same reason as
     // `errc::ALL` below: the error-taxonomy metrics label by branch NAME and must not hand-keep it.

@@ -288,6 +288,7 @@ impl Responder {
         let msg = ControlMsg {
             frame,
             cap: Some(cap),
+            oob: false,
         };
         // The FINAL channel send is cancel/deadline-aware too (carried Task-4a review fix). Steps 2-3
         // already returned, so without this a slow-but-connected client filling the channel's slack

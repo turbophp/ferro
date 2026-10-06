@@ -47,6 +47,8 @@ final class Constants
     public const OUTCOME_ERROR = 1;
     public const OUTCOME_OK = 0;
 
+    public const OOB_ENCODING_FRAME_PAYLOAD = 0;
+
     public const TAG_ARRAY = 14;
     public const TAG_BOOL = 1;
     public const TAG_BYTES = 7;
@@ -115,5 +117,5 @@ final class Constants
     public const ERR_WRITE_UNCONFIRMED = 8193;
     public const ERR_WRITE_UNCONFIRMED_BRANCH = 2;
 
-    public const TYPE_REGISTRY_HASH = 'f88f5878e3799ce4';
+    public const TYPE_REGISTRY_HASH = 'b1d69ba2485a43aa';
 }

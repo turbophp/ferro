@@ -27,7 +27,9 @@
 //! - a RESERVED bit actually set (`OOB_FD`/`COMPRESSED`) -> `Fatal`, `errc::UNSUPPORTED` — M0
 //!   recognizes these bits but implements neither (`OOB_FD` in particular implies ancillary-fd
 //!   framing this codec never prepared for), so continuing to read this connection's byte stream
-//!   at all is unsafe; the whole session ends.
+//!   at all is unsafe; the whole session ends. Still true since M3-D3: the engine SENDS `OOB_FD`
+//!   frames (`session::oob`), but reads its socket with plain `read(2)`, so a client frame carrying
+//!   one is as unreadable as before.
 //! - an unknown, non-reserved bit set -> `PerRequestErr`, `errc::PROTOCOL`, scoped to
 //!   `frame.header.request_id` — `payload_len` was already known from the header, so this one
 //!   frame is cleanly skippable and the session survives.

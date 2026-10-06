@@ -98,6 +98,23 @@ msg!(WindowUpdate {
     frames: u32,
     bytes: u32
 });
+msg!(
+    /// The payload of a frame carrying the `OOB_FD` flag (M3-D3, SPEC §5.1, `/proto/PROTOCOL.md`
+    /// §1.1): the frame's real payload was moved into a SEALED memfd passed beside the frame with
+    /// `SCM_RIGHTS`, and this positional fixarray of 3 says how to read it back.
+    ///
+    /// * `fd_index` — which of the fds that arrived with this frame's FIRST BYTE holds the payload.
+    ///   The engine attaches exactly one fd per `OOB_FD` frame, so it is always `0`, and a receiver
+    ///   refuses any other value rather than guessing.
+    /// * `len` — the payload's exact byte length; the memfd's size equals it.
+    /// * `encoding` — registry `oob_encoding::*`. `FRAME_PAYLOAD` (the only value) means the memfd
+    ///   holds exactly the bytes the frame would otherwise have carried inline.
+    OobRef {
+        fd_index: u32,
+        len: u64,
+        encoding: u8
+    }
+);
 msg!(ErrorPayload {
     code: u16, branch: u8, sqlstate: Option<String>, errno: Option<i32>,
     message: String, detail: Option<String>, retry_after_ms: Option<u32>
@@ -184,6 +201,20 @@ impl Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oob_ref_is_a_positional_fixarray_of_three_and_roundtrips() {
+        let r = OobRef {
+            fd_index: 0,
+            len: 16_777_218,
+            encoding: crate::consts::oob_encoding::FRAME_PAYLOAD,
+        };
+        let b = r.encode();
+        assert_eq!(b[0], 0x93, "OobRef is a fixarray(3)");
+        assert_eq!(OobRef::decode(&b).unwrap(), r);
+        // A map or a wrong arity is not an OobRef.
+        assert!(OobRef::decode(&[0x92, 0x00, 0x01]).is_err());
+    }
 
     #[test]
     fn trailing_bytes_rejected() {

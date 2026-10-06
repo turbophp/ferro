@@ -90,6 +90,17 @@ pub async fn serve(
                     Ok((stream, _addr)) => stream,
                     Err(err) => {
                         tracing::warn!(error = %err, "accept failed");
+                        // Out of fds or kernel memory, the pending connection stays in the backlog
+                        // and `accept` fails again at once: without a pause this loop spins a core
+                        // and writes a log line per spin (M3-D3 review F2 measured 717 000 lines in
+                        // 13 s). Back off briefly, still answering a drain.
+                        if accept_error_is_resource_exhaustion(&err) {
+                            tokio::select! {
+                                biased;
+                                _ = drain.wait() => {}
+                                _ = tokio::time::sleep(ACCEPT_BACKOFF) => {}
+                            }
+                        }
                         continue;
                     }
                 };
@@ -157,5 +168,39 @@ async fn drain_sessions(mut sessions: JoinSet<()>, deadline: Duration) {
             "drain deadline exceeded: hard-closing remaining sessions"
         );
         sessions.abort_all();
+    }
+}
+
+/// How long the accept loop pauses after an `accept` that failed for lack of fds or kernel memory.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// `EMFILE`, `ENFILE`, `ENOBUFS` and `ENOMEM`: `accept` failures that will repeat at once, because
+/// the connection stays queued until a resource frees up. Every other failure (`ECONNABORTED`, a
+/// peer that reset before it was accepted) concerns one connection and retries immediately.
+fn accept_error_is_resource_exhaustion(err: &std::io::Error) -> bool {
+    use nix::errno::Errno;
+    matches!(
+        err.raw_os_error().map(Errno::from_raw),
+        Some(Errno::EMFILE | Errno::ENFILE | Errno::ENOBUFS | Errno::ENOMEM)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_resource_exhaustion_backs_off() {
+        use nix::errno::Errno;
+        for e in [Errno::EMFILE, Errno::ENFILE, Errno::ENOBUFS, Errno::ENOMEM] {
+            assert!(accept_error_is_resource_exhaustion(
+                &std::io::Error::from_raw_os_error(e as i32)
+            ));
+        }
+        for e in [Errno::ECONNABORTED, Errno::EPROTO, Errno::EINTR] {
+            assert!(!accept_error_is_resource_exhaustion(
+                &std::io::Error::from_raw_os_error(e as i32)
+            ));
+        }
     }
 }

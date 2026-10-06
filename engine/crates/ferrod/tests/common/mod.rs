@@ -763,6 +763,44 @@ pub fn stream_server(url: String, credit_frames: u32) -> TestServer {
     TestServer::spawn_with_factory_and_config(BootEpoch(1), config, registry, tx_registry, factory)
 }
 
+/// An EXEC server whose SESSIONS run `config` as tuned by `tune` (M3-D3), with one "default" pool
+/// at `url`. Like [`stream_server`], the same config seeds both the pool and every session, so a
+/// session-level knob such as `memfd_threshold` is actually in force — `exec_server` and its
+/// variants hand the session `Config::default()` whatever the pool was built from.
+pub fn exec_server_with_session_config(url: String, tune: impl FnOnce(&mut Config)) -> TestServer {
+    let kind = ferrod::config::infer_pool_kind(&url);
+    let mut config = Config {
+        pools: vec![PoolSpec {
+            name: "default".to_string(),
+            dsn: url,
+            kind,
+            pin_functions: Vec::new(),
+            pin_on_unknown: true,
+            allow_dir: None,
+        }],
+        ..Config::default()
+    };
+    tune(&mut config);
+    let registry = PoolRegistry::build(&config);
+    let tx_registry = Arc::new(TxRegistry::new(config.drain_deadline));
+    let factory = sql::make_handler(
+        registry.clone(),
+        tx_registry.clone(),
+        config.idle_in_tx,
+        config.max_tx,
+        config.tx_teardown_timeout,
+    );
+    TestServer::spawn_with_factory_and_config(BootEpoch(1), config, registry, tx_registry, factory)
+}
+
+/// The socket path a [`TestServer`] listens on, for a test that needs its own client (M3-D3's
+/// fd-receiving client cannot use [`TestClient`], whose `Framed` reads with plain `read(2)`).
+impl TestServer {
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
 /// A base read-only `EXEC "sql"` against the "default" pool, fetch=rows, no params.
 pub fn req(sql: &str) -> ExecRequest {
     ExecRequest {

@@ -27,7 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 anyhow = "1"
 getrandom = "0.2"
-nix = { version = "0.29", features = ["socket", "user"] }
+nix = { version = "0.29", features = ["socket", "user", "fs", "uio"] }
 
 [dev-dependencies]
 # The OTLP e2e (`tests/otlp_it.rs`, M2-C4c-2) parses what a collector received and exported. Already in

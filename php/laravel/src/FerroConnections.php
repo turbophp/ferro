@@ -153,7 +153,7 @@ final class FerroConnections
             ? new MySqlValuePolicy()
             : new RawStringValuePolicy();
         return $o->socketPath !== null
-            ? Ferro::connect($o->socketPath, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $values)
+            ? Ferro::connect($o->socketPath, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $values, receiveFds: $o->receiveFds)
             : Ferro::connectTcp((string) $o->host, $o->port, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $values);
     }
 }

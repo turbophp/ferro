@@ -18,6 +18,38 @@ final class ConnectionOptionsTest extends TestCase
         self::assertSame('main', $o->pool);
     }
 
+    /**
+     * `ferro_receive_fds` (SPEC §5.1): unset is AUTO; `false` opts the connection out of the memfd
+     * path. The strings an uncast `env()` hands over are read; anything else is refused, because
+     * the key exists to switch a path OFF and a guess could leave it on.
+     */
+    public function testReceiveFdsIsAutoUnlessSet(): void
+    {
+        self::assertNull(ConnectionOptions::fromConfig(['ferro_socket' => '/s'])->receiveFds);
+        $cases = [
+            [false, false], ['false', false], ['0', false], ['off', false],
+            [true, true], ['true', true], ['1', true],
+            [null, null], ['', null], ['auto', null],
+        ];
+        foreach ($cases as [$in, $want]) {
+            $got = ConnectionOptions::fromConfig(['ferro_socket' => '/s', 'ferro_receive_fds' => $in])->receiveFds;
+            self::assertSame($want, $got, var_export($in, true));
+        }
+        $this->expectException(\InvalidArgumentException::class);
+        ConnectionOptions::fromConfig(['ferro_socket' => '/s', 'ferro_receive_fds' => 'maybe']);
+    }
+
+    /** `true` insists; the TCP fallback cannot receive fds, so it is refused there, not ignored. */
+    public function testReceiveFdsTrueOnTheTcpFallbackIsRefused(): void
+    {
+        foreach ([false, null, 'auto'] as $v) {
+            ConnectionOptions::fromConfig(['ferro_host' => '127.0.0.1', 'ferro_receive_fds' => $v]);
+        }
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessageMatches('/ferro_receive_fds.*TCP/');
+        ConnectionOptions::fromConfig(['ferro_host' => '127.0.0.1', 'ferro_receive_fds' => 'true']);
+    }
+
     public function testThePoolDefaultsToDefault(): void
     {
         $o = ConnectionOptions::fromConfig(['ferro_socket' => '/s.sock']);
