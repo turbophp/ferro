@@ -353,6 +353,15 @@ for their own reason; (c) `InvalidHandle`.]*
 - MySQL/MariaDB: `UNIX_TIMESTAMP()`, which is statement-start time truncated to seconds.
 
 A multi-statement verb binds the first statement's `now` into the rest.
+*[Amended at the M7-G1b review (SPEC §22.2 (dg), F3): **on PostgreSQL the only multi-statement
+autocommit verb is a RESERVE naming several queues, and it is not one unit.** Its queues are tried in
+order, one statement each, and the FIRST that reserves anything answers alone (§24.4) — so each queue's
+statement is its own unit with its own `now`, and every job in a reply was reserved by ONE statement
+under ONE `now` (one `reserved_at`, one `lease_deadline`; pinned live). A later queue's statement reads
+a later clock, which can only make more jobs available and is never early. No `now` is bound across
+them, because an empty statement would have to report its `now`, restructuring the statement this
+section's rescan premise was measured on. The binding rule stands for MySQL's multi-statement
+transaction (G6), where one unit really is several statements.]*
 
 Rounding rules (normative):
 
@@ -430,7 +439,18 @@ restart; until then a verb that fails against the changed table is classified li
   IMMEDIATE (a `DEFERRABLE` constraint admits duplicates until commit), not partial, not on an
   expression, and has exactly one key column, `id` (`INCLUDE` columns allowed). Without one the store is
   refused (`Unsupported`, "column id is not unique"), cached like any wrong shape. Measured on
-  PostgreSQL 16 for each of those cases and for a partitioned table's primary key (which passes).]*
+  PostgreSQL 16 for each of those cases and for a partitioned table's primary key (which passes).
+  **An ordinary table with INHERITANCE children is refused too** (review F1): a unique index does not
+  reach a child created `INHERITS (jobs)`, every statement (no `ONLY`) reaches the child's rows, and
+  measured, one ACK deleted the same `(id, attempts, created_at)` from parent and child, then reported
+  `Indeterminate`. A PARTITIONED table stays accepted: PostgreSQL requires a unique index on it to
+  include every partition-key column, so a unique index on `id` alone means it is partitioned by `id`
+  and uniqueness holds across its partitions (measured: a duplicate across hash sub-partitions is
+  refused, `PRIMARY KEY (id)` on a table partitioned by `queue` is refused, an index built `ON ONLY`
+  the parent is invalid, and neither a partitioned table nor a partition can be an inheritance
+  parent). Residual, as for every check here: a child added AFTER verification is not seen until the
+  next `boot_epoch`; a fence matching two rows is then refused as an unreadable result
+  (`Indeterminate`), never reported as one job.]*
 
 **Indexes.** Laravel's `(queue)` index is the minimum. Whether a composite or partial index pays is a
 G3 bench question (charter rule 5). The engine never creates an index.
@@ -623,8 +643,9 @@ checkout, as the "queue name" refusal below says. Until the slices that build th
   statement long. A CANCEL observed before a RESERVE statement is SENT (while the verb waits for its
   connection, or between two queues) is classified by the shared fate matrix as an unsent write:
   `Retryable{ConnectionLost}`, nothing reserved (the connection-wait case is pinned live; the
-  between-queues case is not, because no test can land a CANCEL deterministically in that window —
-  mutation T7 survives); the `Cancelled` terminal above is the parked case, G3's.]*
+  case of a CANCEL that has arrived before a later statement is sent — between two queues — is pinned
+  by a unit test on a fake backend, which a review showed was possible where this text first said it
+  was not); the `Cancelled` terminal above is the parked case, G3's.]*
 
 **No push or STREAM delivery in v1.** The seam pulls. Streaming would lease jobs ahead of
 consumption, and the leases would run down in a client buffer.
@@ -1381,7 +1402,12 @@ The G0 draft left eight choices for confirmation. Each was **decided under the o
 **Premises not yet measured, each owned by the slice named.** None may be relied on before its slice
 measures it; a false one changes the plan, not the evidence.
 
-- PG `MATERIALIZED` locking CTE: affected ≤ LIMIT and no double return under concurrency (G1).
+- ~~PG `MATERIALIZED` locking CTE: affected ≤ LIMIT and no double return under concurrency (G1).~~
+  **ASSERTED at G1b** (SPEC §22.2 (dg)): 16 sessions with a measured peak of 16 RESERVEs in flight,
+  no reply over `k`, every job delivered once, `sum(attempts)` equal to the job count; re-confirmed by
+  the review's chaos probe (40 sessions plus stock workers, three runs). Measured beside it: dropping
+  `MATERIALIZED` changes nothing on PostgreSQL 16 (a `FOR UPDATE` CTE is never inlined), while the
+  `WHERE id IN (… LIMIT k FOR UPDATE SKIP LOCKED)` form over-reserves even in one session.
 - Dedup statement sequence on PG (G4) and its MySQL counterpart (G6).
 - R4 on the real `Transport`, and the SIGTERM-while-parked exit bound (G3/G5).
 - Sync and async client reentrancy when Laravel's SIGALRM handler runs `FerroJob::fail()` while a
