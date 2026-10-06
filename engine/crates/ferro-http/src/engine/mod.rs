@@ -260,11 +260,21 @@ impl HttpEngine {
             Err(cause) => return policy(cause, None),
         };
 
+        // §23.8.1: `PARTITION=uid` gives every peer uid its own connections. A peer the transport
+        // could not attest has no uid to be partitioned by, and pooling all such peers together
+        // would be exactly the cross-tenant sharing the operator turned the key on to prevent, so it
+        // is REFUSED (fail closed, as F3 refuses an unattested peer on an `ALLOW_UIDS` upstream).
         let key: PoolKey = (
             up.name.clone(),
-            match up.partition {
-                Partition::Uid => peer_uid,
-                Partition::None => None,
+            match (up.partition, peer_uid) {
+                (Partition::Uid, Some(uid)) => Some(uid),
+                (Partition::Uid, None) => {
+                    return policy(
+                        PolicyCause::Upstream,
+                        Some("upstream not available to this peer".into()),
+                    );
+                }
+                (Partition::None, _) => None,
             },
         );
         let admitted = Instant::now();
@@ -294,7 +304,8 @@ impl HttpEngine {
             } else {
                 BeforeDispatch::Deadline
             };
-            self.pools.checkin(
+            // Unused: it keeps its `idle_since`, so the reuse rules see its true idleness.
+            self.pools.return_unused(
                 key,
                 conn,
                 usize::try_from(up.limits.max_connections).unwrap_or(usize::MAX),
@@ -353,6 +364,27 @@ impl HttpEngine {
         let ttfb_us = micros(dispatched.elapsed());
 
         // ---- head ---------------------------------------------------------------------------------
+        // A head that arrived while NO byte of the request had been sent cannot be the answer to
+        // it: the upstream spoke first (an unsolicited 101 or 200 on accept, read by `hyper` once the
+        // request was queued behind a slow write). Every head-phase arm below — the delivered head,
+        // the 101, the oversize check, `MAX_RESPONSE_BYTES` — would otherwise classify a request
+        // that never left as received (review of M6-F4a, finding 1: a POST reported Indeterminate
+        // with zero bytes at the upstream). So: tear the connection down, THEN read `sent` (§23.7.1),
+        // and an unsent request is "dispatched, not sent" (`unsent_closed`, Retryable). If bytes
+        // slipped out while the task was being stopped, the head still preceded the request, which
+        // is a malformed exchange: "sent, no head" (`malformed_head`).
+        if !conn.track.sent() {
+            let track = conn.track.clone();
+            conn.discard().await;
+            return classify(
+                if track.sent() {
+                    Situation::SentNoHead(SentNoHead::MalformedHead)
+                } else {
+                    Situation::DispatchedNotSent(DispatchedNotSent::UnsentClosed)
+                },
+                idem,
+            );
+        }
         let (parts, mut body) = resp.into_parts();
         if parts.status == http::StatusCode::SWITCHING_PROTOCOLS {
             // `hyper` returns a 101 as an ordinary head (P14); §23.5.2 calls it malformed.

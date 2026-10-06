@@ -30,7 +30,10 @@ use std::time::{Duration, Instant};
 
 use common::{TestClient, TestServer, assert_session_alive};
 use ferro_http::HttpConfig;
-use ferro_http::engine::{BoxIo, Connect, HttpEngine, Resolve, StaticResolver, TcpConnect};
+use ferro_http::engine::{
+    BoxIo, Connect, HttpEngine, Resolve, ResponseSink, SinkError, SinkFrame, StaticResolver,
+    TcpConnect, Terminal,
+};
 use ferro_proto::consts::{
     MAX_FRAME_PAYLOAD, errc, feature_engine, flags, http_cause, method_http, service,
 };
@@ -971,6 +974,9 @@ enum Fault {
     /// The first write waits this long, then every write passes through: a request that is slow
     /// to leave but WILL leave if nothing stops it.
     Delay(Duration),
+    /// The socket accepts this many bytes in total, then every write fails: a link that dies on
+    /// the WRITE side part-way through a request (P14's `write` control).
+    FailAfter(usize),
 }
 
 struct FaultConnect(Fault);
@@ -979,6 +985,7 @@ struct FaultIo {
     inner: TcpStream,
     fault: Fault,
     delay: Option<Pin<Box<tokio::time::Sleep>>>,
+    accepted: usize,
 }
 
 impl AsyncRead for FaultIo {
@@ -1009,6 +1016,19 @@ impl AsyncWrite for FaultIo {
                 }
                 Pin::new(&mut self.inner).poll_write(cx, buf)
             }
+            Fault::FailAfter(budget) => {
+                if self.accepted >= budget {
+                    return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                }
+                let n = buf.len().min(budget - self.accepted);
+                match Pin::new(&mut self.inner).poll_write(cx, &buf[..n]) {
+                    Poll::Ready(Ok(k)) => {
+                        self.accepted += k;
+                        Poll::Ready(Ok(k))
+                    }
+                    other => other,
+                }
+            }
         }
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1031,6 +1051,7 @@ impl Connect for FaultConnect {
                 inner,
                 fault,
                 delay: None,
+                accepted: 0,
             }) as BoxIo)
         })
     }
@@ -2087,4 +2108,730 @@ async fn the_wire_half_of_the_property_gate() {
         accepted >= 300 && refused >= 300,
         "{accepted} accepted / {refused} refused"
     );
+}
+
+// =================================================================================================
+// Review round (M6-F4a): the findings, each pinned by a test that failed before its fix
+// =================================================================================================
+
+/// A connector that records every peer it was asked to dial, then dials it.
+struct RecConnect(Arc<Mutex<Vec<SocketAddr>>>);
+impl Connect for RecConnect {
+    fn connect<'a>(
+        &'a self,
+        peer: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<BoxIo>> + Send + 'a>> {
+        self.0.lock().unwrap().push(peer);
+        Box::pin(async move {
+            let s = TcpStream::connect(peer).await?;
+            Ok(Box::new(s) as BoxIo)
+        })
+    }
+}
+
+/// A connector that never connects (only the connect bound can end it).
+struct NeverConnect;
+impl Connect for NeverConnect {
+    fn connect<'a>(
+        &'a self,
+        _peer: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<BoxIo>> + Send + 'a>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// A connector whose connect fails with one I/O error kind.
+struct FailConnect(io::ErrorKind);
+impl Connect for FailConnect {
+    fn connect<'a>(
+        &'a self,
+        _peer: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<BoxIo>> + Send + 'a>> {
+        let k = self.0;
+        Box::pin(async move { Err(io::Error::from(k)) })
+    }
+}
+
+/// **Review P2 (finding 2): a mixed answer never DIALS a refused address.** The earlier test could
+/// not tell: `fd00:ec2::254` simply fails to connect on a test host and the dial falls through, so
+/// "dial every resolved address, refused ones first" passed it. A recording connector sees every
+/// peer the engine dials: exactly the admitted one.
+#[tokio::test]
+async fn a_mixed_answer_never_dials_the_refused_address() {
+    let up2 = upstream_on(
+        TcpListener::bind("127.0.0.2:0").await.unwrap(),
+        |mut s, rec| async move {
+            while rec.read_request(&mut s).await.is_some() {
+                let _ = rec.write(&mut s, OK_HELLO).await;
+            }
+        },
+    )
+    .await;
+    let resolver = StaticResolver::new();
+    resolver.set(
+        "mixed.test",
+        vec![vec![
+            ip("fd00:ec2::254"),
+            ip("169.254.169.254"),
+            ip("127.0.0.2"),
+        ]],
+    );
+    let peers = Arc::new(Mutex::new(Vec::new()));
+    let d = daemon_with(
+        vars(&[
+            ("FERRO_UPSTREAMS", "mixed".into()),
+            (
+                "FERRO_UPSTREAM_MIXED_ORIGIN",
+                format!("http://mixed.test:{}", up2.addr.port()),
+            ),
+            ("FERRO_UPSTREAM_MIXED_ADDRESS_CLASSES", "loopback".into()),
+        ]),
+        resolver,
+        Arc::new(RecConnect(peers.clone())),
+        |_| {},
+    );
+    let mut c = d.client().await;
+    let r = exchange(&mut c, 1, &request("mixed", "GET", "/")).await;
+    assert_eq!(r.body, b"hello");
+    assert_eq!(
+        peers.lock().unwrap().clone(),
+        vec![SocketAddr::new(ip("127.0.0.2"), up2.addr.port())],
+        "only the checked, admitted address is ever dialled"
+    );
+}
+
+/// **Review P3 (finding 1): a head that arrives before ANY byte of the request was sent is not an
+/// answer to it.** The upstream speaks first — a 101, a 200, or (with `MAX_RESPONSE_BYTES=10`) a
+/// head already past the cap — on a socket whose first write is slow; `hyper` reads that head once
+/// the request is queued. The request never left, so a POST is Retryable `unsent_closed` — never
+/// Indeterminate, never `Ok` — and the upstream receives zero bytes.
+#[tokio::test]
+async fn a_head_before_any_byte_was_sent_is_unsent_not_indeterminate() {
+    let heads: [(&str, &'static [u8]); 2] = [
+        (
+            "101",
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\nConnection: upgrade\r\n\r\n",
+        ),
+        ("200", b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+    ];
+    for (what, head) in heads {
+        for cap in [false, true] {
+            let up = upstream(move |mut s, rec| async move {
+                let _ = rec.write(&mut s, head).await;
+                rec.hold_until_closed(&mut s, Duration::from_secs(8)).await;
+            })
+            .await;
+            let mut env = vars(&[
+                ("FERRO_UPSTREAMS", "f".into()),
+                ("FERRO_UPSTREAM_F_ORIGIN", origin(up.addr)),
+            ]);
+            if cap {
+                env.push(("FERRO_UPSTREAM_F_MAX_RESPONSE_BYTES".into(), "10".into()));
+            }
+            let d = daemon_with(
+                env,
+                StaticResolver::new(),
+                Arc::new(FaultConnect(Fault::Delay(Duration::from_millis(400)))),
+                |_| {},
+            );
+            let mut c = d.client().await;
+            let r = exchange(&mut c, 1, &post("f", b"charge")).await;
+            assert!(
+                r.head.is_none(),
+                "{what} cap={cap}: no HEAD for an unsent request"
+            );
+            r.assert_error(
+                errc::CONNECTION_LOST,
+                errc::CONNECTION_LOST_BRANCH,
+                http_cause::UNSENT_CLOSED,
+            );
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            assert_eq!(
+                up.rec.bytes_in.load(Ordering::SeqCst),
+                0,
+                "{what} cap={cap}: the request never reached the upstream"
+            );
+        }
+    }
+}
+
+/// **Review P4 (finding 6): a head of EXACTLY the limit with an empty reason and no SP**
+/// (`HTTP/1.1 200\r\n`, which `httparse` accepts) is delivered. The measure counted a space that
+/// was never sent and refused it `oversize_head` — which makes a POST Indeterminate.
+#[tokio::test]
+async fn a_head_at_the_limit_with_no_reason_phrase_is_delivered() {
+    const MAX: usize = 256 * 1024;
+    let prefix = "HTTP/1.1 200\r\ncontent-length: 0\r\nx-pad: ";
+    let mut h = prefix.as_bytes().to_vec();
+    h.resize(MAX - 4, b'a');
+    h.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(h.len(), MAX);
+    let resp: &'static [u8] = Box::leak(h.into_boxed_slice());
+    let u = upstream(move |mut s, rec| async move {
+        if rec.read_request(&mut s).await.is_some() {
+            let _ = rec.write(&mut s, resp).await;
+            rec.hold_until_closed(&mut s, Duration::from_secs(10)).await;
+        }
+    })
+    .await;
+    let d = daemon_with(
+        vars(&[
+            ("FERRO_UPSTREAMS", "h".into()),
+            ("FERRO_UPSTREAM_H_ORIGIN", origin(u.addr)),
+        ]),
+        StaticResolver::new(),
+        Arc::new(TcpConnect),
+        |c| c.credit_bytes = MAX_FRAME_PAYLOAD,
+    );
+    let mut c = d.client().await;
+    let r = exchange(&mut c, 1, &post("h", b"x")).await;
+    let head = r.head.as_ref().unwrap_or_else(|| panic!("{:?}", r.end));
+    assert_eq!((head.status, head.reason.as_deref()), (200, Some(&b""[..])));
+    assert_eq!(header(head, "x-pad")[0].len(), MAX - prefix.len() - 4);
+    r.done();
+}
+
+/// **Review P1 (finding 4): a BODY parked on credit, then `CANCEL`, discards the connection** —
+/// though the rest of the body is readable. `hyper` 1.11.1 DRAINS a dropped body when the remainder
+/// is readable and returns the connection to keep-alive, so a connection the engine failed to
+/// discard (or leaked) would stay open: one socket and one task per such cancel. The upstream must
+/// see the close.
+#[tokio::test]
+async fn a_cancel_while_a_body_frame_waits_for_credit_discards_the_connection() {
+    let up = upstream(|mut s, rec| async move {
+        if rec.read_request(&mut s).await.is_none() {
+            return;
+        }
+        let _ = rec
+            .write(&mut s, b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nAAAA")
+            .await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let _ = rec.write(&mut s, b"BBBB").await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let _ = rec.write(&mut s, b"CCCC").await;
+        rec.hold_until_closed(&mut s, Duration::from_secs(8)).await;
+    })
+    .await;
+    let d = daemon_with(
+        vars(&[
+            ("FERRO_UPSTREAMS", "s".into()),
+            ("FERRO_UPSTREAM_S_ORIGIN", origin(up.addr)),
+        ]),
+        StaticResolver::new(),
+        Arc::new(TcpConnect),
+        |c| c.credit_frames = 2,
+    );
+    let mut c = d.client().await;
+    c.send_request(
+        1,
+        service::HTTP,
+        method_http::REQUEST,
+        idempotent_get("s").encode(),
+    )
+    .await;
+    assert_eq!(c.recv().await.header.method, method_http::HEAD);
+    assert_eq!(c.recv().await.header.method, method_http::BODY);
+    // The next BODY is parked on credit (2 frames granted, 2 spent); the remainder is readable.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.cancel(1).await;
+    collect(&mut c, 1).await.assert_cancelled();
+    wait_for(|| up.rec.closed_by_peer() == 1).await;
+}
+
+/// **Review P5 (finding 4): `CANCEL` racing the last body bytes.** Whichever wins, a `Cancelled`
+/// exchange's connection is closed (left alone, `hyper` would drain the readable remainder and keep
+/// it alive). Forty iterations on a multi-threaded runtime, so both orderings occur.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_racing_the_last_body_bytes_never_leaves_a_connection_open() {
+    let mut cancelled = 0;
+    for _ in 0..40 {
+        let go = Arc::new(tokio::sync::Notify::new());
+        let g = go.clone();
+        let up = upstream(move |mut s, rec| {
+            let g = g.clone();
+            async move {
+                if rec.read_request(&mut s).await.is_none() {
+                    return;
+                }
+                let _ = rec
+                    .write(&mut s, b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nAAAA")
+                    .await;
+                g.notified().await;
+                let _ = rec.write(&mut s, b"BBBB").await;
+                rec.hold_until_closed(&mut s, Duration::from_millis(1500))
+                    .await;
+            }
+        })
+        .await;
+        let d = daemon(vars(&[
+            ("FERRO_UPSTREAMS", "s".into()),
+            ("FERRO_UPSTREAM_S_ORIGIN", origin(up.addr)),
+        ]));
+        let mut c = d.client().await;
+        c.send_request(
+            1,
+            service::HTTP,
+            method_http::REQUEST,
+            idempotent_get("s").encode(),
+        )
+        .await;
+        let _ = c.recv().await; // HEAD
+        let _ = c.recv().await; // BODY "AAAA"
+        go.notify_one();
+        c.cancel(1).await;
+        let end = loop {
+            let f = c.recv().await;
+            if f.header.flags & flags::END != 0 {
+                break Outcome::decode(&f.payload).expect("terminal");
+            }
+        };
+        if matches!(end, Outcome::Cancelled) {
+            cancelled += 1;
+            let t = Instant::now();
+            while up.rec.closed_by_peer() == 0 && t.elapsed() < Duration::from_millis(1400) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                up.rec.closed_by_peer(),
+                1,
+                "a Cancelled exchange left its connection open"
+            );
+        }
+    }
+    assert!(
+        cancelled >= 5,
+        "the race was exercised ({cancelled} cancels)"
+    );
+}
+
+fn bounded(name: &str, host: &str) -> Vec<(String, String)> {
+    let n = name.to_uppercase();
+    vec![
+        ("FERRO_UPSTREAMS".into(), name.into()),
+        (
+            format!("FERRO_UPSTREAM_{n}_ORIGIN"),
+            format!("http://{host}"),
+        ),
+        (
+            format!("FERRO_UPSTREAM_{n}_CONNECT_TIMEOUT_MS"),
+            "200".into(),
+        ),
+        (
+            format!("FERRO_UPSTREAM_{n}_ADDRESS_CLASSES"),
+            "loopback".into(),
+        ),
+    ]
+}
+
+fn assert_unavailable(r: &Reply, cause: &str) {
+    r.assert_error(
+        errc::UPSTREAM_UNAVAILABLE,
+        errc::UPSTREAM_UNAVAILABLE_BRANCH,
+        cause,
+    );
+}
+
+/// **Review P6 and finding 5: the dial cells, end to end, and the connect bound.**
+/// `connect_refused` (a dead port); `dns` (an unknown name, and a resolver that never answers —
+/// ended by `CONNECT_TIMEOUT_MS`, not by the 10 s total deadline); `connect_timeout` (a connect that
+/// never completes, ended by the same bound); `connect_unreachable`; each Retryable
+/// `UpstreamUnavailable` with its token. And a socket that accepts part of a request and then fails
+/// on the WRITE side is `write` (Indeterminate for a POST).
+#[tokio::test]
+async fn the_dial_cells_and_the_connect_bound() {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead = l.local_addr().unwrap();
+    drop(l);
+    let d = daemon(vars(&[
+        ("FERRO_UPSTREAMS", "r,n".into()),
+        ("FERRO_UPSTREAM_R_ORIGIN", origin(dead)),
+        ("FERRO_UPSTREAM_N_ORIGIN", "http://nosuch.test".into()),
+    ]));
+    let mut c = d.client().await;
+    assert_unavailable(
+        &exchange(&mut c, 1, &post("r", b"x")).await,
+        http_cause::CONNECT_REFUSED,
+    );
+    assert_unavailable(
+        &exchange(&mut c, 2, &post("n", b"x")).await,
+        http_cause::DNS,
+    );
+
+    let d = daemon_with(
+        bounded("p", "slow.test"),
+        Arc::new(PendingResolver),
+        Arc::new(TcpConnect),
+        |_| {},
+    );
+    let mut c = d.client().await;
+    let t = Instant::now();
+    assert_unavailable(
+        &exchange(&mut c, 3, &post("p", b"x")).await,
+        http_cause::DNS,
+    );
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+
+    let resolver = StaticResolver::new();
+    resolver.set("slow.test", vec![vec![ip("127.0.0.1")]]);
+    let d = daemon_with(
+        bounded("t", "slow.test"),
+        resolver.clone(),
+        Arc::new(NeverConnect),
+        |_| {},
+    );
+    let mut c = d.client().await;
+    let t = Instant::now();
+    assert_unavailable(
+        &exchange(&mut c, 4, &post("t", b"x")).await,
+        http_cause::CONNECT_TIMEOUT,
+    );
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+
+    let d = daemon_with(
+        bounded("u", "slow.test"),
+        resolver.clone(),
+        Arc::new(FailConnect(io::ErrorKind::HostUnreachable)),
+        |_| {},
+    );
+    let mut c = d.client().await;
+    assert_unavailable(
+        &exchange(&mut c, 5, &post("u", b"x")).await,
+        http_cause::CONNECT_UNREACHABLE,
+    );
+
+    // `write`: the socket accepts 100 bytes of the request, then fails on the write side.
+    let up = upstream(|mut s, rec| async move {
+        rec.hold_until_closed(&mut s, Duration::from_secs(8)).await;
+    })
+    .await;
+    let d = daemon_with(
+        vars(&[
+            ("FERRO_UPSTREAMS", "w".into()),
+            ("FERRO_UPSTREAM_W_ORIGIN", origin(up.addr)),
+        ]),
+        StaticResolver::new(),
+        Arc::new(FaultConnect(Fault::FailAfter(100))),
+        |_| {},
+    );
+    let mut c = d.client().await;
+    exchange(&mut c, 6, &post("w", &[7u8; 64 * 1024]))
+        .await
+        .assert_error(
+            errc::WRITE_UNCONFIRMED,
+            errc::WRITE_UNCONFIRMED_BRANCH,
+            http_cause::WRITE,
+        );
+}
+
+/// **Review R7 (finding 5): a failed dial forgets the cached DNS answer**, so the next dial
+/// re-resolves instead of retrying a dead answer for `DNS_TTL_MS` (60 s by default).
+#[tokio::test]
+async fn a_failed_dial_forgets_the_cached_answer() {
+    let up = responder(OK_HELLO).await;
+    let port = up.addr.port();
+    let resolver = StaticResolver::new();
+    // 127.0.0.2:port has no listener (refused); 127.0.0.1:port is the upstream.
+    resolver.set(
+        "flaky.test",
+        vec![vec![ip("127.0.0.2")], vec![ip("127.0.0.1")]],
+    );
+    let d = daemon_with(
+        vars(&[
+            ("FERRO_UPSTREAMS", "fl".into()),
+            (
+                "FERRO_UPSTREAM_FL_ORIGIN",
+                format!("http://flaky.test:{port}"),
+            ),
+            ("FERRO_UPSTREAM_FL_ADDRESS_CLASSES", "loopback".into()),
+        ]),
+        resolver.clone(),
+        Arc::new(TcpConnect),
+        |_| {},
+    );
+    let mut c = d.client().await;
+    assert_unavailable(
+        &exchange(&mut c, 1, &request("fl", "GET", "/")).await,
+        http_cause::CONNECT_REFUSED,
+    );
+    assert_eq!(
+        exchange(&mut c, 2, &request("fl", "GET", "/")).await.body,
+        b"hello"
+    );
+    assert_eq!(
+        resolver.calls(),
+        2,
+        "the failed dial's answer was not reused"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Pool rules (§23.8.1, §23.8.2), driven on the engine directly. Two ATTESTED uids are what the
+// session hands the engine, and a test process cannot connect to a Unix socket as a second uid
+// without privileges; the session-to-engine plumbing of the uid is pinned separately
+// (`refusals_are_forbidden_with_their_cause_and_dial_nothing`, through `ALLOW_UIDS`).
+// -------------------------------------------------------------------------------------------------
+
+/// A sink that keeps every frame.
+#[derive(Default)]
+struct VecSink(Mutex<Vec<(SinkFrame, Vec<u8>)>>);
+impl ResponseSink for VecSink {
+    fn send<'a>(
+        &'a self,
+        frame: SinkFrame,
+        payload: Vec<u8>,
+        _deadline: tokio::time::Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        self.0.lock().unwrap().push((frame, payload));
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn engine_for(env: Vec<(String, String)>) -> HttpEngine {
+    let cfg = HttpConfig::load(env.into_iter().map(|(k, v)| (k.into(), v.into())), &|_| {
+        Err(io::Error::from(io::ErrorKind::NotFound))
+    });
+    assert!(cfg.errors().is_empty());
+    HttpEngine::new(Arc::new(cfg))
+}
+
+/// One exchange on the engine: its terminal and the `x-conn` the upstream stamped on the head.
+async fn on_engine(e: &HttpEngine, req: &HttpRequest, uid: Option<u32>) -> (Terminal, Option<u64>) {
+    let sink = VecSink::default();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let t = e.exchange(req, uid, Instant::now(), &cancel, &sink).await;
+    let frames = sink.0.lock().unwrap();
+    let conn = frames
+        .iter()
+        .filter(|(f, _)| *f == SinkFrame::Head)
+        .find_map(|(_, p)| {
+            let h = HttpHead::decode(p).unwrap();
+            let v = header(&h, "x-conn").first()?.to_vec();
+            std::str::from_utf8(&v).ok()?.parse().ok()
+        });
+    (t, conn)
+}
+
+/// A keep-alive upstream that stamps every response with its connection's accept index, delays
+/// `/slow` by 200 ms, and adds `extra` header lines. Returns its address and its accept count.
+async fn numbered(extra: &'static str) -> (SocketAddr, Arc<AtomicU64>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicU64::new(0));
+    let c = count.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+            tokio::spawn(async move {
+                let rec = Rec::default();
+                while let Some(seen) = rec.read_request(&mut s).await {
+                    if seen.request_line().contains("/slow") {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nX-Conn: {n}\r\n{extra}Content-Length: 0\r\n\r\n"
+                    );
+                    if s.write_all(resp.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, count)
+}
+
+fn conn_of(r: (Terminal, Option<u64>)) -> u64 {
+    assert!(matches!(r.0, Terminal::Done(_)), "{:?}", r.0);
+    r.1.expect("x-conn")
+}
+
+/// **`PARTITION=uid` (§23.8.1): two attested uids never share a connection** — the cross-tenant
+/// isolation the key exists for — while each uid reuses its own; without the key they share. An
+/// UNATTESTED peer on a partitioned upstream is refused `forbidden_upstream` (fail closed).
+#[tokio::test]
+async fn partition_by_uid_never_shares_a_connection_across_uids() {
+    let (addr, _) = numbered("").await;
+    let e = engine_for(vars(&[
+        ("FERRO_UPSTREAMS", "part,shared".into()),
+        ("FERRO_UPSTREAM_PART_ORIGIN", origin(addr)),
+        ("FERRO_UPSTREAM_PART_PARTITION", "uid".into()),
+        ("FERRO_UPSTREAM_SHARED_ORIGIN", origin(addr)),
+    ]));
+    let a1 = conn_of(on_engine(&e, &idempotent_get("part"), Some(1000)).await);
+    let b1 = conn_of(on_engine(&e, &idempotent_get("part"), Some(2000)).await);
+    assert_ne!(a1, b1, "uid 2000 must not ride uid 1000's connection");
+    assert_eq!(
+        conn_of(on_engine(&e, &idempotent_get("part"), Some(1000)).await),
+        a1
+    );
+    assert_eq!(
+        conn_of(on_engine(&e, &idempotent_get("part"), Some(2000)).await),
+        b1
+    );
+    // Control: without the key, the second uid takes the first uid's idle connection.
+    let s1 = conn_of(on_engine(&e, &idempotent_get("shared"), Some(1000)).await);
+    assert_eq!(
+        conn_of(on_engine(&e, &idempotent_get("shared"), Some(2000)).await),
+        s1
+    );
+    match on_engine(&e, &idempotent_get("part"), None).await.0 {
+        Terminal::Error(ep) => assert_eq!(
+            (ep.code, ep.detail.as_deref()),
+            (errc::FORBIDDEN, Some(http_cause::FORBIDDEN_UPSTREAM))
+        ),
+        other => panic!("an unattested peer on a partitioned upstream: {other:?}"),
+    }
+}
+
+/// **`MAX_LIFETIME_MS`, `IDLE_TIMEOUT_MS` and the `Keep-Alive: timeout` clamp (§23.8.2), each
+/// alone.** A connection past its lifetime is retired although it is barely idle; one idle past
+/// `IDLE_TIMEOUT_MS` is retired although it is young; a server's `Keep-Alive: timeout=1` clamps the
+/// idle limit to 0 s, so even an immediate request dials fresh. The controls reuse.
+#[tokio::test]
+async fn lifetime_idle_limit_and_the_keep_alive_clamp_each_retire_a_connection() {
+    let (addr, _) = numbered("").await;
+    let (ka, _) = numbered("Keep-Alive: timeout=1\r\n").await;
+    let e = engine_for(vars(&[
+        ("FERRO_UPSTREAMS", "life,idle,ka".into()),
+        ("FERRO_UPSTREAM_LIFE_ORIGIN", origin(addr)),
+        ("FERRO_UPSTREAM_LIFE_MAX_LIFETIME_MS", "250".into()),
+        ("FERRO_UPSTREAM_IDLE_ORIGIN", origin(addr)),
+        ("FERRO_UPSTREAM_IDLE_IDLE_TIMEOUT_MS", "200".into()),
+        ("FERRO_UPSTREAM_KA_ORIGIN", origin(ka)),
+    ]));
+    let get = |u: &str| idempotent_get(u);
+    // Lifetime: requests 100 ms apart (never idle long); retired once older than 250 ms.
+    let l0 = conn_of(on_engine(&e, &get("life"), None).await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(conn_of(on_engine(&e, &get("life"), None).await), l0);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(conn_of(on_engine(&e, &get("life"), None).await), l0);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_ne!(
+        conn_of(on_engine(&e, &get("life"), None).await),
+        l0,
+        "past MAX_LIFETIME_MS"
+    );
+    // Idle limit: young, but idle 300 ms > 200 ms.
+    let i0 = conn_of(on_engine(&e, &get("idle"), None).await);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(conn_of(on_engine(&e, &get("idle"), None).await), i0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_ne!(
+        conn_of(on_engine(&e, &get("idle"), None).await),
+        i0,
+        "idle past IDLE_TIMEOUT_MS"
+    );
+    // The clamp: `timeout=1` → idle limit 0 → never reused.
+    let k0 = conn_of(on_engine(&e, &get("ka"), None).await);
+    assert_ne!(
+        conn_of(on_engine(&e, &get("ka"), None).await),
+        k0,
+        "Keep-Alive: timeout=1 clamps the idle limit to 0"
+    );
+}
+
+/// **Idle retention is bounded by `MAX_CONNECTIONS`, and reuse is LIFO (§23.8.2).** Two concurrent
+/// requests open two connections; with `MAX_CONNECTIONS=1` only one is kept. With room for both,
+/// the one returned LAST (the slow exchange's) is the one the next request takes.
+#[tokio::test]
+async fn idle_retention_is_bounded_and_reuse_is_lifo() {
+    let (addr, count) = numbered("").await;
+    let e = engine_for(vars(&[
+        ("FERRO_UPSTREAMS", "one,many".into()),
+        ("FERRO_UPSTREAM_ONE_ORIGIN", origin(addr)),
+        ("FERRO_UPSTREAM_ONE_MAX_CONNECTIONS", "1".into()),
+        ("FERRO_UPSTREAM_MANY_ORIGIN", origin(addr)),
+    ]));
+    let slow = |u: &str| HttpRequest {
+        idempotent: Some(true),
+        ..request(u, "GET", "/slow")
+    };
+    let (r1, r2) = (slow("one"), idempotent_get("one"));
+    let (a, b) = tokio::join!(on_engine(&e, &r1, None), on_engine(&e, &r2, None));
+    assert_ne!(conn_of(a), conn_of(b));
+    assert_eq!(
+        e.idle_connections("one"),
+        1,
+        "MAX_CONNECTIONS bounds idle retention"
+    );
+
+    let before = count.load(Ordering::SeqCst);
+    let (r1, r2) = (slow("many"), idempotent_get("many"));
+    let (s, f) = tokio::join!(on_engine(&e, &r1, None), on_engine(&e, &r2, None));
+    let (s, f) = (conn_of(s), conn_of(f));
+    assert_ne!(s, f);
+    assert_eq!(count.load(Ordering::SeqCst), before + 2);
+    assert_eq!(e.idle_connections("many"), 2);
+    assert_eq!(
+        conn_of(on_engine(&e, &idempotent_get("many"), None).await),
+        s,
+        "LIFO: the most recently returned connection (the slow one) is taken first"
+    );
+}
+
+/// **Review R11: a `HEAD` that cannot be delivered discards the connection.** With no credit at all
+/// (`credit_frames = 0`, which `Config::validate` admits), the `HEAD` parks; a `CANCEL` then ends
+/// the request `Cancelled`, and the upstream must see the connection close — the whole response is
+/// readable, so a connection the engine kept (or leaked) would be drained by `hyper` and stay open.
+#[tokio::test]
+async fn a_cancel_while_the_head_waits_for_credit_discards_the_connection() {
+    let up = upstream(|mut s, rec| async move {
+        if rec.read_request(&mut s).await.is_none() {
+            return;
+        }
+        let _ = rec
+            .write(&mut s, b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nAAAA")
+            .await;
+        rec.hold_until_closed(&mut s, Duration::from_secs(8)).await;
+    })
+    .await;
+    let d = daemon_with(
+        vars(&[
+            ("FERRO_UPSTREAMS", "s".into()),
+            ("FERRO_UPSTREAM_S_ORIGIN", origin(up.addr)),
+        ]),
+        StaticResolver::new(),
+        Arc::new(TcpConnect),
+        |c| c.credit_frames = 0,
+    );
+    let mut c = d.client().await;
+    c.send_request(
+        1,
+        service::HTTP,
+        method_http::REQUEST,
+        idempotent_get("s").encode(),
+    )
+    .await;
+    wait_for(|| up.rec.written() > 0).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    c.cancel(1).await;
+    let r = collect_with(&mut c, 1, false).await;
+    assert!(r.head.is_none(), "no credit, so no HEAD");
+    r.assert_cancelled();
+    wait_for(|| up.rec.closed_by_peer() == 1).await;
+}
+
+/// **Review R10: a connection is pooled only once `hyper` will take its next request.** Back to
+/// back, 300 exchanges on one keep-alive connection, driven on the engine with no session round
+/// trip between them (the tightest the engine can be asked): every one completes and every one
+/// after the first reuses the connection. Pooled before `hyper`'s dispatcher wants the next
+/// request, `try_send_request` hands the request back and it would fail `unsent_closed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn back_to_back_reuse_never_finds_a_connection_unready() {
+    let (addr, count) = numbered("").await;
+    let e = engine_for(vars(&[
+        ("FERRO_UPSTREAMS", "bb".into()),
+        ("FERRO_UPSTREAM_BB_ORIGIN", origin(addr)),
+    ]));
+    let first = conn_of(on_engine(&e, &idempotent_get("bb"), None).await);
+    for i in 0..300 {
+        let (t, conn) = on_engine(&e, &post("bb", b"x"), None).await;
+        match t {
+            Terminal::Done(d) => assert!(d.stats.reused, "iteration {i}: not reused"),
+            other => panic!("iteration {i}: {other:?}"),
+        }
+        assert_eq!(conn, Some(first), "iteration {i}");
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 1);
 }

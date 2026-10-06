@@ -126,6 +126,19 @@ impl Pools {
         stack.push(conn);
     }
 
+    /// Return a connection that was checked out but never used (a `CANCEL` or deadline caught
+    /// before dispatch). Unlike [`Pools::checkin`] it keeps `idle_since`, so the reuse rules —
+    /// above all `H1_UNSAFE_REUSE_MAX_IDLE_MS` — keep seeing how long it has really been idle.
+    pub fn return_unused(&self, key: PoolKey, conn: HttpConn, max_idle: usize) {
+        let mut map = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        let stack = map.entry(key).or_default();
+        if stack.len() >= max_idle {
+            conn.task.abort();
+            return;
+        }
+        stack.push(conn);
+    }
+
     /// Idle connections currently held for `key` (diagnostics and tests).
     pub fn idle_count(&self, key: &PoolKey) -> usize {
         let map = self.idle.lock().unwrap_or_else(|p| p.into_inner());
@@ -155,6 +168,63 @@ pub fn idle_limit(configured: Duration, keep_alive: Option<&[u8]>) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::track::Tracker;
+    use hyper_util::rt::TokioIo;
+
+    /// A live `HttpConn` over an in-memory pipe whose far end is kept open (returned), idle for
+    /// `idle_ago` already.
+    async fn conn(idle_ago: Duration) -> (HttpConn, tokio::io::DuplexStream) {
+        let (a, b) = tokio::io::duplex(4096);
+        let (tracked, track) = Tracker::new(a);
+        let (sender, c) = http1::handshake::<_, OneChunk>(TokioIo::new(tracked))
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let _ = c.await;
+        });
+        let now = Instant::now();
+        let conn = HttpConn {
+            sender,
+            task,
+            track,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            created: now,
+            idle_since: now.checked_sub(idle_ago).unwrap(),
+            idle_limit: Duration::from_secs(60),
+        };
+        (conn, b)
+    }
+
+    fn policy(idempotent: bool) -> ReusePolicy {
+        ReusePolicy {
+            max_lifetime: Duration::from_secs(60),
+            idempotent,
+            unsafe_reuse_max_idle: Duration::from_secs(2),
+        }
+    }
+
+    /// Review minor of M6-F4a: a connection handed back UNUSED (a `CANCEL` or deadline caught
+    /// before dispatch) keeps its true idleness, so `H1_UNSAFE_REUSE_MAX_IDLE_MS` still refuses it
+    /// to a non-idempotent request; a connection returned after an exchange is fresh again.
+    #[tokio::test]
+    async fn an_unused_return_keeps_idle_since_and_a_checkin_resets_it() {
+        let key: PoolKey = ("u".into(), None);
+        let pools = Pools::default();
+        let (c, _far) = conn(Duration::from_secs(5)).await;
+        pools.return_unused(key.clone(), c, 8);
+        assert!(
+            pools.checkout(&key, policy(false)).is_none(),
+            "5 s idle is past the 2 s unsafe-reuse bound"
+        );
+        assert!(pools.checkout(&key, policy(true)).is_some());
+
+        let (c, _far2) = conn(Duration::from_secs(5)).await;
+        pools.checkin(key.clone(), c, 8);
+        assert!(
+            pools.checkout(&key, policy(false)).is_some(),
+            "checkin resets idleness"
+        );
+    }
 
     #[test]
     fn keep_alive_timeout_clamps_the_idle_limit_minus_a_second() {

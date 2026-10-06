@@ -39,7 +39,13 @@ pub fn reason_phrase(ext: &http::Extensions, status: StatusCode) -> Vec<u8> {
 /// The engine's exact head measure (§23.9.1, F1a): the status line (`HTTP/1.1 NNN reason` + CRLF),
 /// plus each field's name, value and 4 bytes (`": "` and CRLF), plus the final CRLF.
 pub fn head_size(reason: &[u8], headers: &HeaderMap) -> usize {
-    let status_line = "HTTP/1.1 200 ".len() + reason.len() + 2;
+    // `HTTP/1.1 NNN` is 12 bytes; the SP before the reason is counted only when there IS a reason:
+    // `HTTP/1.1 200\r\n` (no SP, empty reason) is legal and `httparse` accepts it, and counting a
+    // space that was never sent refused a head exactly at the limit (review of M6-F4a, finding 6).
+    // `HTTP/1.1 200 \r\n` (SP, empty reason) is therefore under-counted by one byte — the
+    // permitted direction (§23.9.1 as amended).
+    let sp = usize::from(!reason.is_empty());
+    let status_line = "HTTP/1.1 200".len() + sp + reason.len() + 2;
     let fields: usize = headers
         .iter()
         .map(|(n, v)| n.as_str().len() + v.as_bytes().len() + 4)
@@ -182,6 +188,8 @@ mod tests {
         h.append("x-a", "bc".parse().unwrap());
         // "HTTP/1.1 200 OK\r\n" = 17; "content-length: 0\r\n" = 19; "x-a: bc\r\n" = 9; "\r\n" = 2.
         assert_eq!(head_size(b"OK", &h), 17 + 19 + 9 + 2);
+        // "HTTP/1.1 200\r\n" = 14: no reason, no SP.
+        assert_eq!(head_size(b"", &h), 14 + 19 + 9 + 2);
     }
 
     #[test]
