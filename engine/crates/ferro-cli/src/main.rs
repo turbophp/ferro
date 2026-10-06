@@ -26,6 +26,7 @@ use std::process::ExitCode;
 
 use ferro_manifest::{Column, Manifest, Problem, collect_sql_dir};
 
+mod codegen;
 mod db;
 
 const USAGE: &str = "\
@@ -45,6 +46,9 @@ usage:
       PREPARE every query against its pool's (shadow) database without running it: a syntax error,
       an unknown relation or a column type the engine cannot carry fails, every problem listed.
       --write records each query's parameter and column descriptions (not part of the hash).
+  ferro gen --manifest <checked manifest.json> --out <dir> [--queries-class <FQCN>]
+      Generate PHP: one readonly DTO per declared `dto` (from the columns `ferro check --write`
+      recorded), a class of query-id constants (default `Ferro\\Gen\\Queries`) and manifest.json.
 ";
 
 fn main() -> ExitCode {
@@ -64,6 +68,7 @@ fn main() -> ExitCode {
         Some("manifest-hash") => cmd_manifest_hash(&args[1..]),
         Some("check") => block_on(cmd_check(&args[1..])),
         Some("schema-sync") => block_on(cmd_schema_sync(&args[1..])),
+        Some("gen") => cmd_gen(&args[1..]),
         Some("-V" | "--version") => {
             println!("ferro {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -494,4 +499,47 @@ async fn reset(conn: &mut db::Db) -> Result<(), String> {
         }
         db::Db::Sqlite(..) => Ok(()),
     }
+}
+
+fn cmd_gen(args: &[String]) -> ExitCode {
+    let mut manifest_path: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut queries_class = "Ferro\\Gen\\Queries".to_string();
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let Some(v) = it.next() else {
+            return usage_error(&format!("`{flag}` needs a value"));
+        };
+        match flag.as_str() {
+            "--manifest" if manifest_path.is_none() => manifest_path = Some(PathBuf::from(v)),
+            "--out" if out.is_none() => out = Some(PathBuf::from(v)),
+            "--queries-class" => queries_class = v.trim_start_matches('\\').to_string(),
+            "--manifest" | "--out" => return usage_error(&format!("`{flag}` given twice")),
+            other => return usage_error(&format!("unknown flag `{other}`")),
+        }
+    }
+    let (Some(manifest_path), Some(out)) = (manifest_path, out) else {
+        return usage_error("`--manifest` and `--out` are required");
+    };
+    let manifest = match std::fs::read(&manifest_path)
+        .map_err(|e| {
+            vec![Problem {
+                at: manifest_path.display().to_string(),
+                message: format!("cannot read: {e}"),
+            }]
+        })
+        .and_then(|b| Manifest::from_json(&b))
+    {
+        Ok(m) => m,
+        Err(problems) => return report(&problems),
+    };
+    let files = match codegen::generate(&manifest, &queries_class) {
+        Ok(f) => f,
+        Err(problems) => return report(&problems),
+    };
+    if let Err(p) = codegen::write_all(&out, &files, write_atomically) {
+        return report(&[p]);
+    }
+    eprintln!("ferro: wrote {} file(s) to {}", files.len(), out.display());
+    ExitCode::SUCCESS
 }

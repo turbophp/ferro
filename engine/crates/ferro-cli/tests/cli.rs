@@ -484,3 +484,103 @@ fn an_unconfigured_pool_is_named_and_a_dsn_is_never_printed() {
         "the DSN's password was printed: {all}"
     );
 }
+
+// ---- M3-D2c: gen ------------------------------------------------------------------------------
+
+fn checked_manifest(dir: &Path, queries: serde_json::Value) -> PathBuf {
+    let p = dir.join("checked.json");
+    std::fs::write(
+        &p,
+        serde_json::json!({"version": 1, "queries": queries}).to_string(),
+    )
+    .unwrap();
+    p
+}
+
+fn col(name: &str, tag: Option<u8>, ty: &str) -> serde_json::Value {
+    serde_json::json!({"name": name, "tag": tag, "type": ty})
+}
+
+#[test]
+fn gen_writes_a_nullable_dto_per_class_a_queries_class_and_the_manifest() {
+    let dir = scratch("gen-ok");
+    let m = checked_manifest(
+        &dir,
+        serde_json::json!({
+            "users.find": {"sql": "SELECT 1", "pool": "default", "readonly": true, "idempotent": false,
+                "dto": "App\\Dto\\UserRow",
+                "columns": [col("id", Some(2), "int8"), col("created_at", Some(11), "timestamptz"),
+                            col("balance", Some(5), "numeric"), col("extra", None, "")]},
+            "users.touch": {"sql": "UPDATE u SET t = 1", "pool": "default", "readonly": false, "idempotent": true}
+        }),
+    );
+    let out = dir.join("gen");
+    let o = ferro(&[
+        "gen",
+        "--manifest",
+        m.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--queries-class",
+        "App\\Ferro\\Queries",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let dto = std::fs::read_to_string(out.join("UserRow.php")).unwrap();
+    assert!(dto.contains("namespace App\\Dto;"));
+    assert!(dto.contains("final readonly class UserRow"));
+    for want in [
+        "public ?int $id,",
+        "public ?\\DateTimeImmutable $createdAt,",
+        "public ?\\Ferro\\Decimal $balance,",
+        "public mixed $extra,",
+    ] {
+        assert!(dto.contains(want), "missing `{want}` in:\n{dto}");
+    }
+    let q = std::fs::read_to_string(out.join("Queries.php")).unwrap();
+    assert!(
+        q.contains("public const USERS_FIND = 'users.find';")
+            && q.contains("public const USERS_TOUCH = 'users.touch';"),
+        "{q}"
+    );
+    let hash = String::from_utf8(ferro(&["manifest-hash", m.to_str().unwrap()]).stdout).unwrap();
+    assert!(q.contains(&format!("MANIFEST_HASH = '{}'", hash.trim())));
+    assert!(out.join("manifest.json").exists());
+}
+
+#[test]
+fn gen_refuses_what_it_cannot_generate_and_writes_nothing() {
+    let dir = scratch("gen-bad");
+    let m = checked_manifest(
+        &dir,
+        serde_json::json!({
+            "a.unchecked": {"sql": "SELECT 1", "pool": "default", "readonly": true, "idempotent": false, "dto": "App\\A"},
+            "b.one": {"sql": "SELECT 1", "pool": "default", "readonly": true, "idempotent": false, "dto": "App\\B",
+                "columns": [col("id", Some(2), "int8")]},
+            "b.two": {"sql": "SELECT 2", "pool": "default", "readonly": true, "idempotent": false, "dto": "App\\B",
+                "columns": [col("name", Some(6), "text")]},
+            "c.expr": {"sql": "SELECT count(*)", "pool": "default", "readonly": true, "idempotent": false, "dto": "App\\C",
+                "columns": [col("count(*)", Some(2), "int8")]},
+            "d.camel": {"sql": "SELECT 1", "pool": "default", "readonly": true, "idempotent": false, "dto": "App\\D",
+                "columns": [col("userId", Some(2), "int8")]}
+        }),
+    );
+    let out = dir.join("gen");
+    let o = ferro(&[
+        "gen",
+        "--manifest",
+        m.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    for want in [
+        "run `ferro check --write`",
+        "with different columns",
+        "alias it in the SQL",
+        "lower snake_case",
+    ] {
+        assert!(err.contains(want), "missing `{want}` in: {err}");
+    }
+    assert!(!out.exists(), "nothing was written");
+}
