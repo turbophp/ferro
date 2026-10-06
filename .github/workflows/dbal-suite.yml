@@ -1,25 +1,36 @@
-# The M1-S9 A5 measurement lane: run the CURATED doctrine/dbal subset (testkit/dbal-suite.sh)
-# against a chosen backend family, TWICE (the two-run reproducibility rule from §22.2 (z) — the
-# result line AND the ordered failure set must not differ between runs), and upload both logs.
+# The doctrine/dbal measurement lane: run the CURATED subset (testkit/dbal-suite.sh) against a chosen
+# backend family as TWO COLUMNS — Ferro and a stock-driver CONTROL — each TWICE (the two-run
+# reproducibility rule, §22.2 (z)), then hold the pair to SPEC D18 and upload every log.
 #
-# ON DEMAND ONLY (workflow_dispatch). It is deliberately NOT part of the per-push `ci` workflow:
-# the suite's bar is "green modulo a recorded, triaged allow-list", so a red phpunit exit here is
-# DATA to record, not a build failure — putting it on every push would either gate merges on a bar
-# M1 has not reached yet or train everyone to ignore a red check. The job FAILS only when a run
-# died before producing a phpunit result line (the contact assertion, the TestUtil patch check, a
-# ferrod that never came up) — the silent-no-op class the runner script exists to refuse.
+# THE CONTROL (E9, SPEC D18 / §22.2 (da)). D18 calls a suite column green when it has PARITY with a
+# stock-driver control: every test the control passes also passes through Ferro, the skip sets match
+# (or each difference is driver-name gated), and every Ferro-only non-pass is triaged. §22.3 recorded
+# that the server-family columns had no control in this workflow — only SQLite did — so their triage
+# could not be checked against anything. Every family now runs the identical tests against the
+# identical database through upstream's own driver (`pdo_pgsql`, `pdo_mysql`, `pdo_sqlite`), with
+# NO ferrod started and the contact assertion INVERTED: testkit/dbal/bootstrap.php refuses to run a
+# control whose connection turns out to be a Ferro one, and the step below checks the inverted line
+# is in every control log.
+#
+# ON DEMAND ONLY (workflow_dispatch). It is deliberately NOT part of the per-push `ci` workflow. Two
+# things fail a job:
+#   1. a run that died before producing a phpunit result line (the contact assertion, the TestUtil
+#      patch check, a ferrod that never came up) — the silent-no-op class the runner refuses;
+#   2. THE D18 GATE: a Ferro-only non-pass that testkit/dbal/triage.txt does not explain, a column
+#      whose run 2 differs from its run 1, or a triage entry whose citation no longer resolves.
+# A red phpunit exit is still DATA, not a failure: a column with documented incompatibilities ends
+# red in phpunit and green here.
 #
 # The recording protocol (ledger item A5) lives in docs/dev-loop/LEDGER.md: numbers from THIS lane
-# on a MERGED main, two runs diffed, result + ordered failure set into docs/dbal-suite/ and
-# CLAUDE.md. Dispatch it against main after the M1-S9 engine PRs merge.
+# on a MERGED main, two runs diffed, result + ordered failure set into docs/dbal-suite/.
 name: dbal-suite
 on:
   workflow_dispatch:
     inputs:
       family:
-        description: "Backend family to measure"
+        description: "Backend family to measure (each runs its Ferro column AND its stock-driver control)"
         type: choice
-        options: [all, pg, mysql, mariadb, sqlite, sqlite-control]
+        options: [all, pg, mysql, mariadb, sqlite]
         default: all
       dbal:
         # M2-C5b: WHICH upstream suite — and therefore which driverClass and which of the driver
@@ -36,13 +47,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `sqlite-control` is not a backend, it is the CONTROL COLUMN: the identical tests against
-        # the identical file through upstream's own `pdo_sqlite`, with the contact assertion
-        # INVERTED. It rides the same matrix so the two SQLite columns are produced by one dispatch
-        # and cannot drift apart in environment.
-        family: ${{ fromJSON(inputs.family == 'all' && '["pg","mysql","mariadb","sqlite","sqlite-control"]' || format('["{0}"]', inputs.family)) }}
+        # One job per family runs BOTH columns, so the Ferro column and its control share one runner,
+        # one container and one environment — the comparison would mean less across two machines.
+        # (Until E9 the SQLite control was a separate `sqlite-control` matrix entry; it is folded in.)
+        family: ${{ fromJSON(inputs.family == 'all' && '["pg","mysql","mariadb","sqlite"]' || format('["{0}"]', inputs.family)) }}
+    env:
+      FERRO_DBAL_TAG: ${{ inputs.dbal }}
+      FERRO_DBAL_SVC: ${{ matrix.family }}
     steps:
       - uses: actions/checkout@v4
+      # pdo_pgsql, pdo_mysql and pdo_sqlite come with setup-php's default extension set; the CONTROL
+      # columns are what need them.
       - uses: shivammathur/setup-php@v2
         with: { php-version: "8.4", extensions: msgpack, tools: composer }
       - uses: dtolnay/rust-toolchain@stable
@@ -54,72 +69,103 @@ jobs:
       # ports; the retry covers the residual case of a connection that grabbed one BEFORE the
       # reservation and is still alive at bind time.
       # SQLite has no container and no host port, so neither of the next two steps applies to it.
-      # That is the whole reason this family can also run on a box with no database server at all.
-      - if: ${{ !startsWith(matrix.family, 'sqlite') }}
+      - if: ${{ matrix.family != 'sqlite' }}
         run: sudo sysctl -w net.ipv4.ip_local_reserved_ports=33060,33061,55432
       # The suite resets its database via `docker compose exec`, so the family's container must be
       # the testkit one — same digest-pinned image, credentials and healthcheck as every other lane.
-      - if: ${{ !startsWith(matrix.family, 'sqlite') }}
+      - if: ${{ matrix.family != 'sqlite' }}
         run: |
           docker compose -f testkit/docker-compose.yml up -d --wait ${{ matrix.family }} \
             || { sleep 15; docker compose -f testkit/docker-compose.yml up -d --wait ${{ matrix.family }}; }
-      - name: suite, run 1 of 2
+      - name: the Ferro column and its control, twice each
         run: |
           set -o pipefail +e
-          svc="${{ matrix.family }}"
-          control=0
-          case "${{ matrix.family }}" in
+          # The server families' control needs the DSN to build its stock-driver params; SQLite's
+          # columns both take the runner's own file path (an EMPTY FERRO_DBAL_DSN reads as unset).
+          case "$FERRO_DBAL_SVC" in
             pg)      dsn="postgres://ferro:ferro@127.0.0.1:55432/doctrine_tests" ;;
             mysql)   dsn="mysql://ferro:ferro@127.0.0.1:33060/doctrine_tests" ;;
             mariadb) dsn="mysql://ferro:ferro@127.0.0.1:33061/doctrine_tests" ;;
-            # Both SQLite columns let the runner pick its own file path; the control additionally
-            # starts no ferrod at all, so a mis-set variable cannot route it through Ferro.
-            sqlite)         svc=sqlite; dsn="" ;;
-            sqlite-control) svc=sqlite; dsn=""; control=1 ;;
+            sqlite)  dsn="" ;;
           esac
-          echo "FERRO_DBAL_DSN=$dsn" >> "$GITHUB_ENV"
-          echo "FERRO_DBAL_SVC=$svc" >> "$GITHUB_ENV"
-          echo "FERRO_DBAL_CONTROL=$control" >> "$GITHUB_ENV"
-          echo "FERRO_DBAL_TAG=${{ inputs.dbal }}" >> "$GITHUB_ENV"
-          # An EMPTY FERRO_DBAL_DSN is the same as an unset one here — the script reads it with
-          # `${FERRO_DBAL_DSN:-…}`, whose `:-` treats empty as absent — so the SQLite columns pass
-          # it empty and get the runner's own file path.
-          FERRO_DBAL_SVC="$svc" FERRO_DBAL_CONTROL="$control" FERRO_DBAL_DSN="$dsn" \
-            FERRO_DBAL_TAG="${{ inputs.dbal }}" \
-            ./testkit/dbal-suite.sh 2>&1 | tee run1.log
-          echo "exit=$?" >> "$GITHUB_OUTPUT"
-      - name: suite, run 2 of 2 (reproducibility)
+          for col in ferro control; do
+            control=0; [ "$col" = control ] && control=1
+            for run in 1 2; do
+              FERRO_DBAL_CONTROL="$control" FERRO_DBAL_DSN="$dsn" \
+                ./testkit/dbal-suite.sh --log-junit "$col-run$run.xml" 2>&1 | tee "$col-run$run.log"
+              echo "$col run $run: phpunit exit $?"
+            done
+          done
+      - name: every run measured, and under the column it claims
         run: |
-          set -o pipefail +e
-          FERRO_DBAL_SVC="$FERRO_DBAL_SVC" FERRO_DBAL_CONTROL="$FERRO_DBAL_CONTROL" \
-            FERRO_DBAL_DSN="$FERRO_DBAL_DSN" FERRO_DBAL_TAG="$FERRO_DBAL_TAG" \
-            ./testkit/dbal-suite.sh 2>&1 | tee run2.log
-          echo "exit=$?" >> "$GITHUB_OUTPUT"
-      - name: result lines + broken-run gate
-        run: |
-          for f in run1.log run2.log; do
-            # A run that produced NO phpunit result line did not measure anything — the pre-flight
-            # (contact assertion, TestUtil patch, ferrod startup) died. That, and only that, is a
-            # lane failure; a result line with failures/errors is the measurement.
-            if ! grep -Eq '^(OK |Tests: |ERRORS!|FAILURES!|OK, but)' "$f"; then
-              echo "::error:: $f contains no phpunit result line — the run died before measuring"
-              tail -40 "$f"
-              exit 1
+          rc=0
+          for col in ferro control; do
+            for run in 1 2; do
+              f="$col-run$run.log"
+              # A run that produced NO phpunit result line did not measure anything — the pre-flight
+              # (contact assertion, TestUtil patch, ferrod startup) died. A result line with failures
+              # or errors is the measurement.
+              grep -Eq '^(OK |Tests: |ERRORS!|FAILURES!|OK, but)' "$f" \
+                || { echo "::error:: $f contains no phpunit result line — the run died before measuring"; tail -40 "$f"; rc=1; }
+              grep -q '\[ferro\] reset: ' "$f" \
+                || { echo "::error:: $f has no reset line — a number from an un-reset database is not reproducible"; rc=1; }
+              [ -s "$col-run$run.xml" ] || { echo "::error:: $col-run$run.xml is missing or empty"; rc=1; }
+            done
+            # The contact assertion's own line, in its own direction: the Ferro column reached a
+            # Ferro driverClass, and the control reached upstream's PDO driver with no daemon started.
+            if [ "$col" = ferro ]; then
+              grep -q '^\[ferro\] driver=Ferro\\DBAL\\' ferro-run1.log ferro-run2.log \
+                || { echo "::error:: the Ferro column did not report a Ferro driverClass"; rc=1; }
+            else
+              for run in 1 2; do
+                grep -q '^\[control\] no ferrod started' "control-run$run.log" \
+                  || { echo "::error:: control run $run does not say it started no ferrod"; rc=1; }
+                grep -q '^\[control\] driver=Doctrine\\DBAL\\Driver\\PDO\\' "control-run$run.log" \
+                  || { echo "::error:: control run $run did not reach upstream's PDO driver"; rc=1; }
+              done
             fi
           done
+          exit $rc
+      # A recorded number is two runs that AGREE: the same tests with the same outcomes, as sets.
+      - name: each column's run 2 equals its run 1
+        run: |
+          # pipefail: an unspecified `shell:` runs `bash -e` WITHOUT it, so `php … | tee` would
+          # report tee's status and the check would pass whatever php said.
+          set -o pipefail
+          rc=0
+          for col in ferro control; do
+            echo "== $col"
+            php testkit/dbal/compare-columns.php "$col-run2.xml" "$col-run1.xml" --repro | tee "repro-$col.txt" || rc=1
+          done
+          exit $rc
+      # THE D18 GATE. The upstream clone is passed so every `upstream:` citation that applies to this
+      # column is checked against the very tree the run measured.
+      - name: D18 — the Ferro column against its control, and every Ferro-only non-pass triaged
+        if: always()
+        run: |
+          set -o pipefail   # the gate's exit status, not tee's (see the step above)
+          major="${FERRO_DBAL_TAG%%.*}"
+          php testkit/dbal/compare-columns.php ferro-run1.xml control-run1.xml \
+            --triage testkit/dbal/triage.txt --column "dbal$major-$FERRO_DBAL_SVC" \
+            --upstream ".dbal-suite/dbal-$FERRO_DBAL_TAG" | tee d18.txt
+      - name: summary
+        if: always()
+        run: |
           {
             echo "## dbal-suite · doctrine/dbal ${{ inputs.dbal }} · ${{ matrix.family }}"
             echo '```'
-            echo "run 1: $(grep -E '^(Tests: |OK)' run1.log | tail -1)"
-            echo "run 2: $(grep -E '^(Tests: |OK)' run2.log | tail -1)"
+            for f in ferro-run1.log ferro-run2.log control-run1.log control-run2.log; do
+              echo "$f: $(grep -E '^(Tests: |OK)' "$f" 2>/dev/null | tail -1)"
+            done
+            grep -E '^D18 VERDICT|^  (pass|skip) parity|^  failure set' d18.txt 2>/dev/null || echo "no D18 verdict"
             echo '```'
             echo "Reset lines (a recorded run must show them):"
             echo '```'
-            grep '\[ferro\] reset:' run1.log run2.log || echo "NONE — do not record this run"
+            grep '\[ferro\] reset:' ferro-run*.log control-run*.log || echo "NONE — do not record this run"
             echo '```'
-            echo "Contact line (Ferro columns) / inverted contact line (the control):"
+            echo "Contact line (Ferro column) / inverted contact line (the control):"
             echo '```'
-            grep -E '^\[(ferro|control)\] driver=' run1.log run2.log || echo "NONE — do not record this run"
+            grep -E '^\[(ferro|control)\] driver=' ferro-run*.log control-run*.log || echo "NONE — do not record this run"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
@@ -127,8 +173,16 @@ jobs:
         with:
           name: dbal-suite-${{ inputs.dbal }}-${{ matrix.family }}-${{ github.run_id }}
           path: |
-            run1.log
-            run2.log
+            ferro-run1.log
+            ferro-run2.log
+            control-run1.log
+            control-run2.log
+            ferro-run1.xml
+            ferro-run2.xml
+            control-run1.xml
+            control-run2.xml
+            repro-*.txt
+            d18.txt
             .dbal-suite/ferrod.log
           if-no-files-found: warn
           # A hidden path, which upload-artifact@v4 skips by default (found at M2-C1f).

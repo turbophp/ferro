@@ -137,12 +137,24 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   pool, setting `charset` also skips DoctrineBundle's default table collation
   (`utf8mb4_unicode_ci`); set `default_table_options` yourself to keep the DDL a `pdo_mysql` app
   would emit (SPEC §22.2 (by)).
+- **A version-less `getDriver()->getDatabasePlatform()` is refused AFTER a connect too (DBAL 3).**
+  Stock drivers answer that call with the family's OLDEST platform, which is not the one the
+  connection actually uses (that is chosen from the server version). Once connected the driver does
+  know the family, so here the refusal is a policy rather than a necessity: it will not hand a caller
+  a second, older SQL dialect for the same database. Measured by upstream's
+  `Doctrine\DBAL\Tests\Functional\Schema\SchemaManagerFunctionalTestCase::testDispatchEventWhenDatabasePlatformIsExplicitlyPassed`
+  on every family (DBAL 4.4.4's tree has no such test). Ask the connection, not the driver:
+  `$conn->getDatabasePlatform()` (SPEC §22.2 (bz)).
 - **No database credentials exist in PHP.** The DSN lives in the engine (SPEC §12 / D8). The DBAL
   `user`, `password`, `host`, `dbname` and `charset` parameters are therefore inert — measured at the
   acceptance gate, where upstream's `testInvalidUserName` / `testInvalidPassword` / `testInvalidHost`
   cannot fail and `testInheritCharsetFromPrimary` reports the engine's `utf8mb4` rather than the
   requested `latin1`. Tooling that shells out to `pg_dump`/`mysqldump` with the application's config
   cannot work; ops provisions separate dump credentials.
+  For the same reason a Ferro connection always HAS a database — the one in the pool's DSN — so code
+  that relies on a connection with no `dbname` cannot construct one: upstream's
+  `Doctrine\DBAL\Tests\Functional\Schema\MySQLSchemaManagerTest::testListTableColumnsThrowsDatabaseRequired`
+  expects `DatabaseRequired` and gets the pool's database instead (SPEC §22.2 (da)).
 - **DBAL 3's `SqliteSchemaManager::createDatabase($path)` creates no file.** That method (deprecated
   upstream) opens a second connection with `path` set to the argument; a Ferro connection ignores
   `path`, because the database is the engine pool's (SPEC §12 / D8, and D14 confines every file the
@@ -262,6 +274,12 @@ indeterminate write, never upgraded to retryable. The driver's own refusals
   keys are enforced anyway** — the engine sets and verifies the pragma on every SQLite connection it
   dials, so the guarantee comes from the pool rather than from your middleware. Settings the engine
   does not apply at dial cannot be made to stick from PHP; ask for them on the pool.
+  **The same is true of a session `SET` issued as an ordinary statement outside a transaction**
+  (SPEC §7.4): it configures the one checkout that ran it, which hygiene resets before the next
+  tenant. DBAL 3's upstream `Doctrine\DBAL\Tests\Functional\TransactionTest::testCommitFalse` sets a
+  session `wait_timeout` on MySQL and waits for the connection to expire; through Ferro the setting
+  lands on a different checkout from the one it means to expire, so nothing does (SPEC §22.2 (bz)).
+  Inside a transaction the connection is pinned and a `SET` holds until the transaction ends.
 - **Several statements in one `executeStatement()` are refused, on every backend.** Ferro prepares
   every statement, so `"CREATE TABLE a (…); CREATE TABLE b (…)"` in a single call fails —
   PostgreSQL with `42601` *"cannot insert multiple commands into a prepared statement"*, SQLite with
@@ -720,7 +738,10 @@ upstream's own PDO driver:
   still refused, because that pragma is a no-op inside a transaction; transaction plus the
   transaction-legal `PRAGMA defer_foreign_keys` → still refused. Inventing a fourth would mean the
   tier substituting SQL the stock grammar did not emit. Drop the constraint, alter, re-add — or use
-  PostgreSQL. SPEC §22.2 (bn).
+  PostgreSQL. SPEC §22.2 (bn). The same rebuild also fails at its COPY step, with
+  `foreign key mismatch - "__temp__posts" referencing "users"`, when the table being rebuilt is
+  itself a child: measured under the `sqlite` alias by upstream's SQLite-gated foreign-key and
+  primary-key cases, which skip under `ferro-sqlite` and so hide it there (SPEC §22.3).
 - **`selectResultSets()` returns one result set.** `ExecOk` carries exactly one `cols`+`rows`, and
   carrying N of them is a breaking wire change; it is deferred on the ground that no tier can reach a
   second result set today (DBAL 4's driver `Result` has no `nextRowset`, and the only Illuminate

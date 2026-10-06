@@ -32,6 +32,11 @@ jobs:
       # it kept telling readers a FIXED defect was still broken. Prose can't be checked, citations
       # can — see the script's header. Also a file check, no toolchain, no backend.
       - run: ./ci/check-incompatibilities-doc.sh
+      # The D18 triage files (E9): every entry that lets a Ferro-only non-pass stand in an
+      # on-demand suite column must still cite something that exists — a spec letter, an
+      # incompatibilities-page entry. Checked per push, so a stale explanation fails here rather
+      # than at the next suite dispatch. Same shape: a file check, no toolchain, no backend.
+      - run: ./ci/check-suite-triage.sh
 
   # The LIVE acceptance lane. It must be able to FAIL: every live suite in this repo is
   # `skip`-if-unconfigured by design, so a DSN this lane forgets to export turns its whole tier

@@ -64,8 +64,8 @@ ctl_driver=""
 if [ "$control" = 1 ]; then
   case "$svc" in
     sqlite) ctl_driver=pdo_sqlite ;;
-    pg) ctl_driver=pdo_pgsql ;;
-    mysql|mariadb) ctl_driver=pdo_mysql ;;
+    pg|psql) ctl_driver=pdo_pgsql ;;
+    mysql|mariadb|mysql-local) ctl_driver=pdo_mysql ;;
     *) echo "::error:: FERRO_DBAL_CONTROL=1 has no stock driver for FERRO_DBAL_SVC=$svc"; exit 1 ;;
   esac
   if [ "$svc" != sqlite ]; then
@@ -169,6 +169,26 @@ do_reset() {
         mariadb -uroot < "$root/testkit/dbal/reset-mysql.sql"
       echo "[ferro] reset: mariadb/doctrine_tests from testkit/dbal/reset-mysql.sql"
       ;;
+    # LOCAL clients (E9), for a dev box with the servers but no Docker daemon: the Laravel runner's
+    # `psql`/`mysql-local` arms — the same SQL against the same database, only the client binary's
+    # location differs. They exist so a column can be measured locally WITH its reset rather than
+    # under `--no-reset`, which is exactly how a number stops being reproducible. The credentials
+    # are the DSN the shell already holds for ferrod's own config, never PHP's (SPEC §12/D8).
+    psql)
+      psql -v ON_ERROR_STOP=1 -q -d "$dsn" -f "$root/testkit/dbal/reset-pg.sql"
+      echo "[ferro] reset: local psql against \$FERRO_DBAL_DSN from testkit/dbal/reset-pg.sql"
+      ;;
+    # The container reset runs as root because it re-GRANTs. The suite's own user cannot GRANT and
+    # does not need to: MySQL and MariaDB keep a database-level grant by NAME (`mysql.db`), so the
+    # grant testkit/mysql-init.sql made survives the DROP (testkit/laravel/reset-mysql.sql relies on
+    # the same fact). So the local arm runs the identical file minus its GRANT/FLUSH lines.
+    mysql-local)
+      re='^[a-z]+://([^:@/]+):([^@/]*)@([^:/]+):([0-9]+)/'
+      [[ "$dsn" =~ $re ]] || { echo "::error:: cannot parse FERRO_DBAL_DSN for the local reset"; exit 1; }
+      grep -vE '^(GRANT|FLUSH) ' "$root/testkit/dbal/reset-mysql.sql" \
+        | MYSQL_PWD="${BASH_REMATCH[2]}" mysql -u"${BASH_REMATCH[1]}" -h"${BASH_REMATCH[3]}" -P"${BASH_REMATCH[4]}"
+      echo "[ferro] reset: local mysql against \$FERRO_DBAL_DSN from testkit/dbal/reset-mysql.sql"
+      ;;
     sqlite)
       # Deleting the file IS the drop-and-create, and it is strictly more thorough than either SQL
       # reset: no schema, sequence, view or leftover row can survive it. The `-wal` and `-shm`
@@ -201,9 +221,12 @@ if [ "$control" = 1 ]; then
 else
   cargo build -p ferrod --manifest-path "$root/Cargo.toml"
   sock="$(mktemp -u /tmp/ferro-dbal-XXXXXX.sock)"
+  # `CARGO_TARGET_DIR` is honoured (E9): the build above writes there when it is set, and starting
+  # `$root/target/debug/ferrod` instead would run whatever STALE binary an earlier build left — a
+  # column measuring code other than the tree under test, with nothing to say so.
   env FERRO_SOCK="$sock" FERRO_POOLS="$pool" \
       "FERRO_POOL_$(echo "$pool" | tr '[:lower:]-' '[:upper:]_')_DSN=$dsn" \
-      "$root/target/debug/ferrod" >"$work/ferrod.log" 2>&1 &
+      "${CARGO_TARGET_DIR:-$root/target}/debug/ferrod" >"$work/ferrod.log" 2>&1 &
   ferrod_pid=$!
   trap 'kill "$ferrod_pid" 2>/dev/null || true; rm -f "$sock"' EXIT   # ONLY our own daemon.
   for _ in $(seq 1 100); do [ -S "$sock" ] && break; sleep 0.1; done
