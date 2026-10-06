@@ -11,9 +11,9 @@ and are listed in §24.17. **D22 was RATIFIED by the owner on 2026-10-06, with t
 (G1 onward) could start before ratification; **G1 may now start.** The amendments are applied in
 place below: (a) a store's table defaults to `ferro_jobs`, so mixed mode becomes an explicit
 opt-in (§24.3); (b) a store declares a `KIND`, `sql` being the only v1 kind, and the token is opaque
-bytes on the wire, at most 1 KiB (§24.3, §24.4, §24.5). SPEC §21 open item **O-G1** (the `job_id`
-width for a non-SQL kind) must be settled before G1's `/proto` change merges, and its interim
-default is the `i64` written here.
+bytes on the wire, at most 1 KiB (§24.3, §24.4, §24.5). **`job_id` is opaque bytes too** (SPEC
+**D24**, owner decision 2026-10-06, settling open item O-G1), so every QUEUE shape is kind-neutral
+before G1 freezes it (§24.3, §24.4).
 
 **Allocations.** This section allocates service id `QUEUE = 7`, the error codes `LeaseLost = 0x300F`
 and `PoolMismatch = 0x3010` (both NonRetryable), and the registry constant
@@ -253,13 +253,30 @@ Reasons for the stock layout, by weight:
     32 bits of the stored value) above `attempts` (16 bits), as the `u64` did. The byte layout is
     internal to the `sql` kind and is fixed at G1 by its builders' tests. A future layout, or a future
     kind (a Redis stream entry id, an SQS receipt handle of about 1 KB), mints differently without a
-    wire change. *(`job_id` stays an `i64` on the wire; whether a non-SQL kind needs it widened too is
-    SPEC §21 open item O-G1.)*
+    wire change.
   - **A token the store cannot decode** (for the `sql` kind, any length other than 8) is refused
     before any statement. G1 decides and pins its terminal. `LeaseLost` would be literally true, since
     the token names no current reservation, but only a client defect produces such a token, and the
     Laravel tier treats an autocommit `LeaseLost` as done (§24.11), which would hide the defect. A
     token over 1 024 bytes is an out-of-bounds field, refused like any other, and G1 pins where.
+
+**The job id on the wire is opaque bytes too** (SPEC D24, owner decision 2026-10-06). `job_id`
+(and `RELEASE`'s `new_job_id`) is **1 to 1 024 bytes** (msgpack `bin`) in all six wire positions
+(§24.4), because a Redis stream entry id (two 64-bit integers) or an SQS message id (a UUID string)
+does not fit an `i64`. The client never interprets it.
+
+- **The `sql` kind encodes the row's `bigint` `id` internally**, and decodes it back before any
+  statement. Its byte encoding is fixed at G1 by the builders' tests. A decimal-text encoding would
+  let the Laravel tier hand Laravel the same digits stock does (§24.11), and G1 weighs that when it
+  chooses the encoding.
+- **The fence is unchanged.** It is still `(id, attempts, created_at)` over the row's columns
+  (above), and the engine decodes `job_id` and the token into those columns. A `job_id` the store
+  cannot decode is refused before any statement, under the same rule as an undecodable token, and G1
+  pins its terminal.
+- **Ordering:** rows are still served best-effort FIFO by `id` inside the database (§24.7), but the
+  wire carries **no numeric order**. A client may not compare or sort job ids, and must not infer
+  enqueue order from them.
+- **Cost:** a few bytes per job on the wire, and no numeric ordering for the client.
 - **Precondition, stated rather than enforced: an `(id, created_at)` pair is never reissued while a
   token for it is outstanding.**
   - `TRUNCATE … RESTART IDENTITY`, MySQL `TRUNCATE`, sequence resets, restores and async-replica
@@ -352,17 +369,18 @@ G3 bench question (charter rule 5). The engine never creates an index.
 Shapes are positional msgpack arrays with strict arity. Field order lands with the golden vectors at
 G1 (PROTOCOL.md §13; §12 is HTTP's, §23). `common` is `[tx_id|nil, timeout_ms|nil, traceparent|nil]`, and `traceparent` is
 parsed as on EXEC (§22.2 (cd)). Every success terminal carries `stats {queue_us, exec_us}`.
-`token` is opaque bytes, 1 to 1 024 of them, everywhere it appears (§24.3; D22 amendment (b)). The
-golden vectors carry an 8-byte (`sql`) token and a 1 024-byte one, and both codecs refuse 1 025. The
-PHP side holds a token as an opaque string and must send it back as `bin`. Encoding it as `str`
-would change the wire type and could fail the codec's UTF-8 check.
+`token` and `job_id` (with `new_job_id`) are opaque bytes, 1 to 1 024 of them, everywhere they
+appear (§24.3; D22 amendment (b) for the token, D24 for the id). The golden vectors carry each at its
+`sql`-kind size and at 1 024 bytes, and both codecs refuse 1 025. The PHP side holds each as an
+opaque string and must send it back as `bin`. Encoding it as `str` would change the wire type and
+could fail the codec's UTF-8 check.
 
 | method | request | success terminal | `tx_id` |
 |---|---|---|---|
-| `ENQUEUE = 1` | `[store, jobs: [[queue, payload: str, delay_s: u32]] (1..=1000), dedup_key: str\|nil, common]` | `[job_id: i64\|nil, inserted: u32, deduplicated: bool, stats]`. `job_id` is non-nil iff exactly one job | yes |
-| `RESERVE = 2` | `[store, queues: [str] (1..=16, priority order), max_jobs: u16, wait_ms: u32, liveness: bool, common]` | `[jobs: [[job_id, token: bin (1..=1024), attempts, queue, payload, created_at, lease_deadline]], stats]`, possibly empty | **refused** (`Unsupported`) |
-| `ACK = 3` | `[store, job_id, token: bin (1..=1024), common]` | `[outcome: u8 (1 acked, 2 gone), stats]`. `gone` is never returned in a transaction | yes |
-| `RELEASE = 4` | `[store, job_id, token, delay_s, common]` | `[new_job_id: i64\|nil, stats]`. `nil` = `gone` (autocommit only) | yes |
+| `ENQUEUE = 1` | `[store, jobs: [[queue, payload: str, delay_s: u32]] (1..=1000), dedup_key: str\|nil, common]` | `[job_id: bin (1..=1024)\|nil, inserted: u32, deduplicated: bool, stats]`. `job_id` is non-nil iff exactly one job | yes |
+| `RESERVE = 2` | `[store, queues: [str] (1..=16, priority order), max_jobs: u16, wait_ms: u32, liveness: bool, common]` | `[jobs: [[job_id: bin (1..=1024), token: bin (1..=1024), attempts, queue, payload, created_at, lease_deadline]], stats]`, possibly empty | **refused** (`Unsupported`) |
+| `ACK = 3` | `[store, job_id: bin (1..=1024), token: bin (1..=1024), common]` | `[outcome: u8 (1 acked, 2 gone), stats]`. `gone` is never returned in a transaction | yes |
+| `RELEASE = 4` | `[store, job_id, token, delay_s, common]` | `[new_job_id: bin (1..=1024)\|nil, stats]`. `nil` = `gone` (autocommit only) | yes |
 | `EXTEND = 5` | `[store, job_id, token, common]` | `[lease_deadline, stats]` | yes |
 | `SIZE = 6` | `[store, queue, common]` | `[pending, delayed, reserved, stats]` | yes |
 | `CLEAR = 7` | `[store, queue, common]` | `[deleted: u64, stats]` | yes |
@@ -619,7 +637,8 @@ itself composes, or (the dedup key) a caller's declaration; none is inferred fro
     - incrementing at first ACK/EXTEND would let two reservations share a token, which breaks the
       fence, and Laravel reads `attempts()` before running;
     - decrementing on a *delivered* job would reuse a token someone holds.
-- **Ordering.** Best-effort FIFO by `id` within a queue. There is no guarantee.
+- **Ordering.** Best-effort FIFO by `id` within a queue. There is no guarantee. Job ids are opaque on
+  the wire (D24), so a client can neither observe nor rely on this order through them.
 - **Priorities.** Laravel's model: queue order (`--queue=high,default`), up to 16 queues per RESERVE.
 - **Leases.** `lease_s` per store, renewed only by EXTEND. **No automatic renewal while a session
   lives:** a hung worker would hold its job forever. A job's `timeout` must stay below `lease_s`, as
@@ -860,7 +879,11 @@ $q->transactionalAck($r, fn ($tx) => …);                  // rolls back on Lea
 - **`FerroQueue extends Illuminate\Queue\Queue implements Queue, ClearableQueue`.**
   - **Producers** (`push`/`later`/`pushRaw`/`bulk`) use the DB connection's session, through
     `getPdo()->ferro()` (§22.2 (bw)), with `tx_id` iff that connection is in a transaction.
-  - `push` returns the job id. `bulk` returns `true`, as stock does.
+  - `push` returns the job id. `bulk` returns `true`, as stock does. *[D24: the id is opaque bytes
+    on the wire, where stock returns an integer. What `push()` and `FerroJob::getJobId()` hand Laravel
+    is G5's to decide and pin: the raw bytes, or a printable form. Binary strings are unsafe in JSON
+    and logs, and the choice depends on G1's `sql` encoding (§24.3). Either way it is a drop-in
+    difference for code that treats a queued job's id as a number.]*
   - **`pop()`** reserves on a **dedicated, lazily dialled queue session** with the DB connection's
     socket options.
     - It never shares a session with the DB tier, so `DB::reconnect()`, `purge()` and C1e-3
@@ -1040,7 +1063,7 @@ every duplicate and every phantom attempt is attributable to a counted or docume
 | slice | delivers | proves |
 |---|---|---|
 | **G0** *(DONE, §22.2 (cn))* | this section; `QUEUE = 7`, `LeaseLost`, `PoolMismatch` and `queue_wait_grace_ms` allocated in the spec (their `/proto` entries land at G1); §21 D21/D22; the §24.16 amendments | review attacked §24.5–§24.8 before any code |
-| **G1** *(D22 ratified 2026-10-06; may start)* | `/proto`: `[services] QUEUE = 7`, the method table, the two codes and `queue_wait_grace_ms` G0 allocated, PROTOCOL.md §1 and a new §13, golden vectors (an 8-byte and a 1 024-byte token, §24.4), both codecs, **all shapes frozen**, after SPEC §21 O-G1 is settled or its interim default taken; store config (`KIND=sql` and the refusal of any other kind, `TABLE` defaulting to `ferro_jobs`), version gate, shape verification; ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
+| **G1** *(D22 ratified 2026-10-06; may start)* | `/proto`: `[services] QUEUE = 7`, the method table, the two codes and `queue_wait_grace_ms` G0 allocated, PROTOCOL.md §1 and a new §13, golden vectors (an 8-byte and a 1 024-byte token, §24.4), both codecs, **all shapes frozen**, with `job_id` as opaque bytes (D24; vectors at the `sql` size and at 1 024 bytes); store config (`KIND=sql` and the refusal of any other kind, `TABLE` defaulting to `ferro_jobs`), version gate, shape verification; ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
 | **G2** | tx path: `resolve_active` made `pub(crate)`, `PoolMismatch`, `TxCommand::Queue` + `after_commit`, in-tx `LeaseLost` semantics (R1), refused tx-scoped RESERVE | atomicity both ways; mismatch leaves the transaction usable; chaos rows 2 and 7 |
 | **G3** | the waker (per queue, `LIMIT k`, statement deadlines, register-then-sweep), long-poll, the wait bound, **unreserve**, wake hints, coalesced polls, drain; queue metrics and spans | cost bound (row 11); one END under every CANCEL/deadline race and the deliver-xor-unreserve rule (row 12); idle-polling bench vs stock (A's number); R4 reproduced on the real transport |
 | **G4** | native PHP API, `queueWorker()`, wait clamp, client fate and licensed re-sends; dedup table and purge **after** the dedup spike reproduces §24.6's three paths | chaos rows 1, 3–6, 8, 9 and 15 through the client |
@@ -1066,8 +1089,8 @@ G1–G6: the `liveness` field is already in the frozen G1 shape, and a v1 engine
 - **Backends.** Redis Streams and Kafka (P8), SQS, Beanstalk, and a **SQLite store**: under D13 every
   RESERVE takes the writer lock, and SQLite apps keep the stock driver through `ferro-sqlite`.
   **Prepared, not built** (D22 amendment (b)): the store `KIND` key and the opaque-bytes token let
-  Redis Streams or SQS be added later without a token shape change (`job_id`'s width is SPEC §21
-  open item O-G1). Each such kind needs its own §21 decision, because D22 covers SQL stores only, and
+  Redis Streams or SQS be added later without a shape change (`job_id` is opaque bytes as well,
+  SPEC D24). Each such kind needs its own §21 decision, because D22 covers SQL stores only, and
   none offers transactional composition without an outbox (§24.5).
 - **The scheduler and `onOneServer`** (P9).
 - **Job-level features:** unique jobs (`ShouldBeUnique` stays Laravel's), numeric priorities, FIFO
@@ -1151,7 +1174,7 @@ land with slice G1.
   `DatabaseQueue`'s builder-generated SQL by design, while the drop-in database tiers keep stock SQL
   generation." D22 records it. `CLAUDE.md`'s copy of the charter was not edited in this change
   and gains the sentence when that file is next updated. At ratification (§22.2 (de)) the edit was
-  prepared but not applied.
+  prepared, and it was applied on the owner's direct approval the same day.
 
   Stated honestly: this widens what the engine may do to application data. The cost is that a defect
   in an engine statement builder can now damage application rows. The mitigations are the shape
