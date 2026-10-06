@@ -52,7 +52,9 @@ use tokio_util::sync::CancellationToken;
 use ferro_pool::backend::{Cancel, PoolBackend, QueryResult};
 use ferro_pool::error::PoolError;
 use ferro_pool::pool::{Checkout, Pool, RowStreamHandle};
-use ferro_proto::consts::{MAX_FRAME_PAYLOAD, errc, method_admin, method_sql, method_tx, service};
+use ferro_proto::consts::{
+    MAX_FRAME_PAYLOAD, errc, method_admin, method_http, method_sql, method_tx, service,
+};
 use ferro_proto::messages::ErrorPayload;
 use ferro_proto::messages::sql::{ExecOk, ExecRequest, Stats};
 use ferro_proto::messages::tx::{BeginRequest, BeginResponse, SavepointRequest, TxControl};
@@ -222,6 +224,18 @@ async fn handle(
         // ADMIN (M2-C3-7b): reached only for a verb the session's D15 gate already admitted.
         (service::ADMIN, method_admin::BACKUP) => {
             crate::services::admin::handle_backup(frame, responder, registry, cancel).await
+        }
+        // Ferro HTTP (M6-F2, SPEC §23.15): the wire is pinned before the behaviour, so a REQUEST is
+        // routed, DECODED — a malformed one is `Protocol`, exactly as §23.6 step 1 will keep it — and
+        // then answered `Unsupported`, because nothing in this build serves HTTP (and it does not
+        // advertise `feature_engine::HTTP`). Slice F4 replaces this arm with the engine.
+        (service::HTTP, method_http::REQUEST) => {
+            match ferro_proto::messages::HttpRequest::decode(&frame.payload) {
+                Err(e) => responder.end_error(protocol(format!("malformed HttpRequest: {e}"))),
+                Ok(_) => responder.end_error(unsupported(
+                    "Ferro HTTP is not served by this build (feature HTTP is not advertised)",
+                )),
+            }
         }
         // Any other routed frame (an unrecognized SQL/TX method, or STREAM) → one END, session lives.
         _ => responder.end_error(unsupported("service/method not yet implemented")),

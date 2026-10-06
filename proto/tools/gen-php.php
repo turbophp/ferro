@@ -1,7 +1,11 @@
 <?php // /proto/tools/gen-php.php — reads registry.lock.json, emits Generated/Constants.php
 declare(strict_types=1);
 $root = dirname(__DIR__, 2);
-$raw = (string) file_get_contents("$root/proto/registry.lock.json");
+// Optional arguments `[lock path] [output dir]` exist for ONE caller: the shape-rule agreement test
+// (php/client HttpCausesShapeRuleTest), which runs this generator against fixture locks. With no
+// arguments it reads the committed lock and writes the committed Constants.php, as it always has.
+$lockPath = $argv[1] ?? "$root/proto/registry.lock.json";
+$raw = (string) file_get_contents($lockPath);
 $lock = json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
 
 /**
@@ -70,9 +74,36 @@ foreach ($lock['codes'] as $name => $ec) {
     $out .= "    public const ERR_{$u}_BRANCH = {$ec['branch']};\n";
 }
 $out .= "\n";
+// Ferro HTTP's cause vocabulary (M6-F2, SPEC §23.5.6): one HTTP_CAUSE_<NAME> = '<token>' per cause,
+// plus HTTP_CAUSES, every token in the lock's (alphabetical-by-name) order, so a client tests a
+// `detail` for membership instead of keeping its own list. The shape rule mirrors ferro-proto's
+// `registry::check_http_causes` and its build.rs re-check: refuse rather than emit a second spelling.
+$causes = $lock['http']['causes'] ?? null;
+if (!is_array($causes) || $causes === []) {
+    fwrite(STDERR, "registry.lock.json has no http.causes table\n");
+    exit(1);
+}
+$seen = [];
+foreach ($causes as $name => $token) {
+    // The PHP copy of ferro-proto's `src/http_causes_rule.rs`; the shared fixture
+    // proto/tools/http-causes-shape-cases.json holds both to the same verdicts. `/D` so `$` does not
+    // match before a trailing newline; `(string) $name` because json_decode turns a digit-only key
+    // into an int (such a key is refused anyway: a token starts with a letter).
+    if (!is_string($token) || preg_match('/^[a-z][a-z0-9_]*$/D', $token) !== 1
+        || (string) $name !== strtoupper($token) || isset($seen[$token])) {
+        fwrite(STDERR, "registry.lock.json http.causes: {$name} breaks the shape rule\n");
+        exit(1);
+    }
+    $seen[$token] = true;
+    $out .= "    public const HTTP_CAUSE_{$name} = '{$token}';\n";
+}
+$out .= "    public const HTTP_CAUSES = [\n";
+foreach ($causes as $token) { $out .= "        '{$token}',\n"; }
+$out .= "    ];\n";
+$out .= "\n";
 $out .= "    public const TYPE_REGISTRY_HASH = '" . $fnv1a64_hex($raw) . "';\n";
 $out .= "}\n";
-$dir = "$root/php/client/src/Protocol/Generated";
+$dir = $argv[2] ?? "$root/php/client/src/Protocol/Generated";
 @mkdir($dir, 0777, true);
 file_put_contents("$dir/Constants.php", $out);
 fwrite(STDERR, "wrote $dir/Constants.php\n");

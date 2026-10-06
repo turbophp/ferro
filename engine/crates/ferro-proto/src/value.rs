@@ -180,7 +180,7 @@ pub(crate) fn read_str_lossy(rd: &mut &[u8]) -> Result<String, CodecError> {
         .map_err(|e| CodecError::Malformed(format!("str body: {e:?}")))?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
-fn read_bin(rd: &mut &[u8]) -> Result<Vec<u8>, CodecError> {
+pub(crate) fn read_bin(rd: &mut &[u8]) -> Result<Vec<u8>, CodecError> {
     let len = dec::read_bin_len(rd).map_err(|e| CodecError::Malformed(format!("bin len: {e:?}")))?
         as usize;
     bound_len(len, rd.len())?;

@@ -11,7 +11,7 @@ use Ferro\Protocol\CodecException;
 use Ferro\Protocol\Outcome;
 
 /**
- * The client half of the COPY sub-protocol (M3-D4; SPEC §6.1, `/proto/PROTOCOL.md` §12), shared by
+ * The client half of the COPY sub-protocol (M3-D4; SPEC §6.1, `/proto/PROTOCOL.md` §13), shared by
  * {@see Connection} and {@see TxHandle} — and through them by {@see \Ferro\Pg\Copy}. Internal: the
  * public surface is `copyIn()`/`copyOut()` on those classes.
  *

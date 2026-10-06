@@ -1,0 +1,33 @@
+{
+  "frame_hex": "f7040200060001003d000000330000009200929192aa782d636865636b73756dc40361626398cc96cd04b007ce00011170cf000000012a05f200cd019cce000111ebc3",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 61,
+    "service": 6
+  },
+  "message": {
+    "stats": [
+      150,
+      1200,
+      7,
+      70000,
+      5000000000,
+      412,
+      70123,
+      true
+    ],
+    "status": 0,
+    "trailers": [
+      [
+        "x-checksum",
+        [
+          97,
+          98,
+          99
+        ]
+      ]
+    ]
+  },
+  "name": "http_done"
+}

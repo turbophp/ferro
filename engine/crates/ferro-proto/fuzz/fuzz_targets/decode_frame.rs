@@ -17,6 +17,13 @@ fuzz_target!(|data: &[u8]| {
         // shape not otherwise exercised by the fixed-size messages above.
         let _ = ferro_proto::messages::HelloAck::decode(&body[..take]);
         let _ = ferro_proto::messages::Hello::decode(&body[..take]);
+        // HTTP (M6-F2): REQUEST is the one HTTP message the ENGINE decodes from an untrusted
+        // client, and its header list is a nested length-prefixed array of `[str, bin]` pairs;
+        // the engine → client three are included because the codec is shared.
+        let _ = ferro_proto::messages::HttpRequest::decode(&body[..take]);
+        let _ = ferro_proto::messages::HttpHead::decode(&body[..take]);
+        let _ = ferro_proto::messages::HttpBody::decode(&body[..take]);
+        let _ = ferro_proto::messages::HttpDone::decode(&body[..take]);
         let mut rd = &body[..take];
         let _ = ferro_proto::value::Value::decode(&mut rd);
     }

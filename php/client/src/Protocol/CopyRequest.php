@@ -8,7 +8,7 @@ use Ferro\Protocol\Msgpack\PackerInterface;
  * `messages::copy::CopyRequest` BYTES: a fixarray of 5 — `pool` (str), `sql` (str, the caller's COPY
  * statement, unmodified), `readonly` (bool, the §19.3 declaration), `timeout_ms` (`u32 | nil`),
  * `tx_id` (`u64 | nil`). Value-free, so this is the plain positional layout the TX messages use.
- * Pinned by /proto/PROTOCOL.md §12 and the `copy_in_request`/`copy_out_request` vectors.
+ * Pinned by /proto/PROTOCOL.md §13 and the `copy_in_request`/`copy_out_request` vectors.
  */
 final class CopyRequest
 {

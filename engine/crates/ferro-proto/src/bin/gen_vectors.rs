@@ -1,7 +1,8 @@
 //! Emit deterministic golden vectors: for each case, build the full frame (header+payload),
 //! and write {name, header, message(json), frame_hex}. Also emit malformed negative .bin seeds.
 use ferro_proto::consts::{
-    self, flags, method_admin, method_core, method_sql, method_stream, method_tx, service,
+    self, flags, method_admin, method_core, method_http, method_sql, method_stream, method_tx,
+    service,
 };
 use ferro_proto::header::Header;
 use ferro_proto::messages::*;
@@ -982,7 +983,7 @@ fn main() {
         serde_json::json!({ "fd_index": oob.fd_index, "len": oob.len, "encoding": oob.encoding }),
     );
 
-    // --- COPY vectors (M3-D4; /proto/PROTOCOL.md §12). Two requests (COPY_IN autocommit with both
+    // --- COPY vectors (M3-D4; /proto/PROTOCOL.md §13). Two requests (COPY_IN autocommit with both
     // nullables nil; COPY_OUT declared readonly, tx-scoped, with a timeout — so both arms of each
     // nullable are locked), one CopyData chunk and the empty CopyDone. The chunk is 300 bytes, so the
     // `bin16` width is locked rather than a `bin8` every codec would agree on, and it carries the COPY
@@ -1049,6 +1050,8 @@ fn main() {
         serde_json::json!({}),
     );
 
+    http_vectors();
+
     // Negative seeds (decoder must reject; also fuzz corpus).
     let mut bad_magic = frame(
         0,
@@ -1095,4 +1098,307 @@ fn main() {
     std::fs::write(dir().join("negative/reserved_flag.bin"), &reserved).unwrap();
 
     eprintln!("vectors written to {}", dir().display());
+}
+
+// --- HTTP service vectors (M6-F2; SPEC §23.5.5, /proto/PROTOCOL.md §12). `bin` fields ride the
+// vector JSON as arrays of byte ints (the `BYTES` Value precedent), so a non-UTF-8 byte survives
+// JSON and re-encodes byte for byte in PHP. The `http_` name prefix is MANDATORY: PHP's byte-lock
+// provider `VectorConformanceTest::httpVectors()` keys on it. HTTP error terminals are handler-built,
+// so — unlike `error_forbidden`'s session-built CORE/0 header — they carry the request's own
+// `HTTP`/`REQUEST` header with `END`, and their `detail` is one `[http.causes]` token. ---
+
+fn bytes_json(b: &[u8]) -> serde_json::Value {
+    serde_json::Value::Array(b.iter().map(|x| serde_json::json!(*x)).collect())
+}
+fn opt_bytes_json(b: &Option<Vec<u8>>) -> serde_json::Value {
+    b.as_deref().map_or(serde_json::Value::Null, bytes_json)
+}
+fn headers_json(hs: &[HttpHeaderField]) -> serde_json::Value {
+    serde_json::Value::Array(
+        hs.iter()
+            .map(|h| serde_json::json!([h.name, bytes_json(&h.value)]))
+            .collect(),
+    )
+}
+fn hf(name: &str, value: &[u8]) -> HttpHeaderField {
+    HttpHeaderField {
+        name: name.into(),
+        value: value.to_vec(),
+    }
+}
+
+fn http_request_json(r: &HttpRequest) -> serde_json::Value {
+    serde_json::json!({
+        "upstream": r.upstream,
+        "method": r.method,
+        "target": r.target,
+        "origin": r.origin,
+        "headers": headers_json(&r.headers),
+        "body": opt_bytes_json(&r.body),
+        "timeout_ms": r.timeout_ms,
+        "connect_timeout_ms": r.connect_timeout_ms,
+        "read_timeout_ms": r.read_timeout_ms,
+        "idempotent": r.idempotent,
+        "decode": r.decode,
+        "route": r.route,
+        "traceparent": r.traceparent,
+    })
+}
+
+fn http_head_json(h: &HttpHead) -> serde_json::Value {
+    serde_json::json!({
+        "status": h.status,
+        "version": h.version,
+        "reason": opt_bytes_json(&h.reason),
+        "headers": headers_json(&h.headers),
+        "decoded": h.decoded.as_ref().map(|d| serde_json::json!([d.content_encoding, d.content_length])),
+        "idempotent": h.idempotent,
+    })
+}
+
+fn write_http_request(name: &str, req_id: u32, r: &HttpRequest) {
+    write_case(
+        name,
+        0,
+        service::HTTP,
+        method_http::REQUEST,
+        req_id,
+        r.encode(),
+        http_request_json(r),
+    );
+}
+
+fn write_http_head(name: &str, req_id: u32, h: &HttpHead) {
+    write_case(
+        name,
+        0,
+        service::HTTP,
+        method_http::HEAD,
+        req_id,
+        h.encode(),
+        http_head_json(h),
+    );
+}
+
+fn write_http_error(name: &str, req_id: u32, ep: ErrorPayload) {
+    let json = serde_json::json!({ "status": consts::outcome::ERROR, "error": {
+        "code": ep.code, "branch": ep.branch, "sqlstate": ep.sqlstate, "errno": ep.errno,
+        "message": ep.message, "detail": ep.detail, "retry_after_ms": ep.retry_after_ms } });
+    write_case(
+        name,
+        flags::END,
+        service::HTTP,
+        method_http::REQUEST,
+        req_id,
+        Outcome::Error(ep).encode(),
+        json,
+    );
+}
+
+fn http_error(
+    code: u16,
+    branch: u8,
+    message: &str,
+    cause: &str,
+    retry_after_ms: Option<u32>,
+) -> ErrorPayload {
+    ErrorPayload {
+        code,
+        branch,
+        sqlstate: None,
+        errno: None,
+        message: message.into(),
+        detail: Some(cause.into()),
+        retry_after_ms,
+    }
+}
+
+fn http_vectors() {
+    use consts::{errc, http_cause};
+
+    // The smallest real request: every optional field nil, so each nil arm is locked.
+    write_http_request(
+        "http_request_get",
+        60,
+        &HttpRequest {
+            upstream: "github".into(),
+            method: "GET".into(),
+            target: "/repos/turbophp/ferro".into(),
+            origin: None,
+            headers: vec![hf("accept", b"application/json")],
+            body: None,
+            timeout_ms: None,
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            idempotent: None,
+            decode: true,
+            route: None,
+            traceparent: None,
+        },
+    );
+    // Every field set: a body whose first byte is the 0xc0 nil marker (a `bin` that must not be
+    // read as `nil`), a header value carrying 0x80 (not UTF-8, so it must ride `bin`), a read
+    // timeout past u16 (uint32 width), and the W3C specification's own example traceparent. Every
+    // field of a given type holds a DISTINCT value — the six strings, the three timeouts, and the
+    // two bools (`idempotent` true, `decode` false) — so a swap of two same-typed fields moves the
+    // decoded message (a review finding: both bools were once false, so a swap of those two was
+    // invisible here and caught only by `http_request_get`).
+    write_http_request(
+        "http_request_post",
+        61,
+        &HttpRequest {
+            upstream: "billing".into(),
+            method: "POST".into(),
+            target: "/v1/charges?amount=2000".into(),
+            origin: Some("https://api.example.com".into()),
+            headers: vec![
+                hf("content-type", b"application/json"),
+                hf("x-raw", &[0x80, 0x41]),
+                hf("idempotency-key", b"k-123"),
+            ],
+            body: Some(vec![0xc0, 0x7b, 0x7d]),
+            timeout_ms: Some(30_000),
+            connect_timeout_ms: Some(2_000),
+            read_timeout_ms: Some(70_000),
+            idempotent: Some(true),
+            decode: false,
+            route: Some("/v1/charges".into()),
+            traceparent: Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".into()),
+        },
+    );
+    // HTTP/1.1: a reason phrase, a non-UTF-8 header value, and `decoded` with a Content-Length past
+    // u16 (uint32 width).
+    write_http_head(
+        "http_head",
+        61,
+        &HttpHead {
+            status: 201,
+            version: 11,
+            reason: Some(b"Created".to_vec()),
+            headers: vec![
+                hf("content-type", b"application/json"),
+                hf("x-raw", &[0x80, 0xff]),
+            ],
+            decoded: Some(HttpDecoded {
+                content_encoding: "gzip".into(),
+                content_length: Some(70_000),
+            }),
+            idempotent: false,
+        },
+    );
+    // HTTP/2: no reason phrase (nil), nothing decoded (nil), effective idempotency true.
+    write_http_head(
+        "http_head_h2",
+        62,
+        &HttpHead {
+            status: 503,
+            version: 20,
+            reason: None,
+            headers: vec![hf("retry-after", b"5")],
+            decoded: None,
+            idempotent: true,
+        },
+    );
+    // A chunk of 260 bytes: every byte value once (0x00, 0x80, 0xc0 among them) plus four more, so
+    // the bin16 marker is locked rather than bin8.
+    let mut chunk: Vec<u8> = (0..=255u8).collect();
+    chunk.extend_from_slice(&[0xc0, 0xc0, 0x80, 0x00]);
+    let body = HttpBody { chunk };
+    write_case(
+        "http_body",
+        flags::STREAM,
+        service::HTTP,
+        method_http::BODY,
+        61,
+        body.encode(),
+        serde_json::json!({ "chunk": bytes_json(&body.chunk) }),
+    );
+    // The completed exchange's terminal: a trailer, and stats in every uint width (fixint, uint8,
+    // uint16, uint32, uint64) so no width passes by accident.
+    let done = HttpDone {
+        trailers: vec![hf("x-checksum", b"abc")],
+        stats: HttpStats {
+            queue_us: 150,
+            connect_us: 1_200,
+            tls_us: 7,
+            ttfb_us: 70_000,
+            total_us: 5_000_000_000,
+            bytes_sent: 412,
+            bytes_received: 70_123,
+            reused: true,
+        },
+    };
+    write_case(
+        "http_done",
+        flags::END,
+        service::HTTP,
+        method_http::REQUEST,
+        61,
+        Outcome::Ok(done.encode()).encode(),
+        serde_json::json!({
+            "status": consts::outcome::OK,
+            "trailers": headers_json(&done.trailers),
+            "stats": [
+                done.stats.queue_us, done.stats.connect_us, done.stats.tls_us, done.stats.ttfb_us,
+                done.stats.total_us, done.stats.bytes_sent, done.stats.bytes_received,
+                done.stats.reused,
+            ],
+        }),
+    );
+
+    write_http_error(
+        "error_upstream_unavailable",
+        63,
+        http_error(
+            errc::UPSTREAM_UNAVAILABLE,
+            errc::UPSTREAM_UNAVAILABLE_BRANCH,
+            "upstream billing: circuit breaker open",
+            http_cause::BREAKER_OPEN,
+            Some(30_000),
+        ),
+    );
+    write_http_error(
+        "error_rate_limited",
+        64,
+        http_error(
+            errc::RATE_LIMITED,
+            errc::RATE_LIMITED_BRANCH,
+            "upstream billing: rate limit reached",
+            http_cause::RATE_LIMITED,
+            Some(1_500),
+        ),
+    );
+    write_http_error(
+        "error_tls_refused",
+        65,
+        http_error(
+            errc::TLS_REFUSED,
+            errc::TLS_REFUSED_BRANCH,
+            "upstream billing: certificate verification failed",
+            http_cause::TLS_VERIFY,
+            None,
+        ),
+    );
+    write_http_error(
+        "error_response_incomplete",
+        66,
+        http_error(
+            errc::RESPONSE_INCOMPLETE,
+            errc::RESPONSE_INCOMPLETE_BRANCH,
+            "upstream billing: connection closed before the body ended",
+            http_cause::BODY_EOF,
+            None,
+        ),
+    );
+    write_http_error(
+        "error_forbidden_http",
+        67,
+        http_error(
+            errc::FORBIDDEN,
+            errc::FORBIDDEN_BRANCH,
+            "request refused by the engine's policy for this upstream",
+            http_cause::FORBIDDEN_TARGET,
+            None,
+        ),
+    );
 }

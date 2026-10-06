@@ -28,12 +28,13 @@ SQL    = 2
 TX     = 3
 STREAM = 4
 ADMIN  = 5
-# RESERVED, comments only (no keys, so no generated constant and no registry-hash change):
-#   HTTP  = 6   Ferro HTTP  — SPEC §23 (docs/spec/23-http.md), allocated by §23; the key lands
-#                with its first code slice, M6-F2.
+# Ferro HTTP — SPEC §23 (docs/spec/23-http.md), allocated there at M6-F0; keyed at M6-F2. Its
+# methods are `[methods.http]` below; its messages are /proto/PROTOCOL.md §12.
+HTTP   = 6
+# RESERVED, comment only (no key, so no generated constant and no registry-hash change):
 #   QUEUE = 7   Ferro Queue — SPEC §24 (docs/spec/24-queue.md), allocated by §24; the key lands
 #                with its first code slice, M7-G1.
-# Do not reuse 6 or 7 for anything else.
+# Do not reuse 7 for anything else.
 
 [methods.core]
 HELLO         = 1
@@ -88,6 +89,17 @@ COPY_DONE = 4
 [methods.admin]
 BACKUP = 1
 
+# HTTP service (M6-F2; SPEC §23.5, /proto/PROTOCOL.md §12). REQUEST is the one client → engine
+# method; HEAD and BODY are engine → client only, so `ferrod` routes a client frame carrying either
+# to `Unsupported` (SPEC §23.5, review F26). A response always streams: one HEAD, zero or more BODY
+# frames (each with the `STREAM` flag), then the request's one `END`, whose `Outcome::Ok` body is
+# `HttpDone`. HTTP does NOT reuse `[methods.stream]`'s HEAD/DATA, whose payloads are SQL `ColMeta`
+# and `Value` rows. (Service `HTTP = 6` above.)
+[methods.http]
+REQUEST = 1
+HEAD    = 2
+BODY    = 3
+
 # Terminal outcome-envelope status discriminant (decision W-4). In /proto so both codecs
 # generate it rather than hand-writing 0/1/2 (charter rule 2).
 [outcome]
@@ -109,6 +121,11 @@ FRAME_PAYLOAD = 0
 MEMFD          = 0x01
 LISTEN_STREAMS = 0x02
 MANIFEST       = 0x04
+# SPEC §23.5: set when the engine build SERVES Ferro HTTP (the default-on cargo feature `http`). A
+# client must check it, because a `--no-default-features` engine has the same registry hash. Keyed
+# at M6-F2, where NOTHING serves HTTP yet, so no engine sets it — it is first set by the slice that
+# serves a REQUEST (F4).
+HTTP           = 0x08
 
 [features.client]
 MEMFD_RX = 0x01

@@ -1,0 +1,22 @@
+{
+  "frame_hex": "f7040200060001004100000048000000920197cd300d03c0c0d931757073747265616d2062696c6c696e673a20636572746966696361746520766572696669636174696f6e206661696c6564aa746c735f766572696679c0",
+  "header": {
+    "flags": 2,
+    "method": 1,
+    "request_id": 65,
+    "service": 6
+  },
+  "message": {
+    "error": {
+      "branch": 3,
+      "code": 12301,
+      "detail": "tls_verify",
+      "errno": null,
+      "message": "upstream billing: certificate verification failed",
+      "retry_after_ms": null,
+      "sqlstate": null
+    },
+    "status": 1
+  },
+  "name": "error_tls_refused"
+}

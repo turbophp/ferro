@@ -5,7 +5,7 @@ namespace Ferro\Client;
 use Ferro\Protocol\Outcome;
 
 /**
- * The COPY wire operations a session offers (M3-D4; `/proto/PROTOCOL.md` §12) — what
+ * The COPY wire operations a session offers (M3-D4; `/proto/PROTOCOL.md` §13) — what
  * {@see CopyRunner} drives. Implemented by the concrete {@see Session}.
  *
  * A COPY_IN's flow control is the reverse of a stream's: the ENGINE grants the client credit with

@@ -1,4 +1,4 @@
-//! COPY wire messages (M3-D4; SPEC §6.1, `/proto/PROTOCOL.md` §12).
+//! COPY wire messages (M3-D4; SPEC §6.1, `/proto/PROTOCOL.md` §13).
 //!
 //! `CopyRequest` is the request body of SQL/`COPY_IN` and SQL/`COPY_OUT`. It is `Value`-free, so it
 //! rides the `msg!`/rmp-serde positional layout the TX and ADMIN messages use.

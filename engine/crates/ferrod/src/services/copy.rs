@@ -1,4 +1,4 @@
-//! SQL/`COPY_IN` and SQL/`COPY_OUT` (M3-D4; SPEC §6.1, `/proto/PROTOCOL.md` §12): PostgreSQL's COPY
+//! SQL/`COPY_IN` and SQL/`COPY_OUT` (M3-D4; SPEC §6.1, `/proto/PROTOCOL.md` §13): PostgreSQL's COPY
 //! sub-protocol, with the client's statement passed through unmodified.
 //!
 //! **`COPY_IN`** (`COPY … FROM STDIN`): the handler reserves the COPY's client-to-engine window
