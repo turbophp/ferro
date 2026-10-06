@@ -888,6 +888,16 @@ async fn an_unmatched_fence_in_a_tx_is_lease_lost_never_gone_and_the_tx_stays_op
     assert_lease_lost_in_tx(w.c.ack(&stale, Some(tx)).await);
     assert_lease_lost_in_tx(w.c.release(&stale, 0, Some(tx)).await);
     assert_lease_lost_in_tx(w.c.extend(&stale, Some(tx)).await);
+    // A forged token: the CURRENT attempts, another `created_at` — every fence column counts.
+    let real = ferro_queue::sql::Token::decode(&current.token).unwrap();
+    let forged = ReservedJob {
+        token: ferro_queue::sql::Token::from_pg(real.pg_created_at() + 1, real.pg_attempts())
+            .encode()
+            .to_vec(),
+        ..current.clone()
+    };
+    assert_lease_lost_in_tx(w.c.ack(&forged, Some(tx)).await);
+    assert_lease_lost_in_tx(w.c.release(&forged, 0, Some(tx)).await);
     let o = w.c.exec_tx(tx, "SELECT 1", vec![]).await;
     assert!(
         matches!(o, Outcome::Ok(_)),
