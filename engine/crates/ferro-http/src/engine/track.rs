@@ -410,6 +410,33 @@ mod tests {
         assert_eq!(s.written_armed(), 0);
     }
 
+    /// Both of the [`CipherTap`]'s write paths count (rule 4). `tokio-rustls` 0.26.6 writes only
+    /// vectored, so the non-vectored `poll_write` is unexercised by every TLS test — and a
+    /// version that routes through it would, uncounted, report a delivered request as unsent (the
+    /// HIGH direction). This drives each path directly (review L4).
+    #[tokio::test]
+    async fn the_cipher_tap_counts_plain_and_vectored_socket_writes() {
+        let (mut tap, s) = CipherTap::new(tokio::io::sink());
+        // `write` is `poll_write`; `write_vectored` is `poll_write_vectored`.
+        let n = tap.write(b"handshake").await.unwrap();
+        assert_eq!(
+            (s.cipher_unarmed(), s.cipher_armed(), s.sent()),
+            (n as u64, 0, false)
+        );
+        s.arm();
+        let n = tap.write(b"record").await.unwrap();
+        assert!(n > 0);
+        assert_eq!(s.cipher_armed(), n as u64, "poll_write counts");
+        assert!(s.sent());
+        s.arm();
+        assert!(!s.sent());
+        let bufs = [io::IoSlice::new(b"ab"), io::IoSlice::new(b"cd")];
+        let n = tap.write_vectored(&bufs).await.unwrap();
+        assert!(n > 0);
+        assert_eq!(s.cipher_armed(), n as u64, "poll_write_vectored counts");
+        assert!(s.sent());
+    }
+
     /// Writes are HELD (pending) until `open`; reads deliver `head` only after the first write
     /// attempt, so a head arrives while the request is still buffered inside `hyper`.
     struct HeldWrites {

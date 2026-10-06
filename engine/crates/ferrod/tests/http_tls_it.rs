@@ -438,14 +438,8 @@ async fn https_round_trip_verifies_the_name_while_the_connect_goes_to_the_checke
         stats.tls_us > 0,
         "the handshake is timed (HttpStats.tls_us)"
     );
-    // `queue_us` excludes the handshake (§23.5.4 as amended): with nothing queued it is far below
-    // a handshake's duration, which it would exceed if the handshake were counted in it.
-    assert!(
-        stats.queue_us < stats.tls_us,
-        "queue_us {} counts the handshake ({} us)",
-        stats.queue_us,
-        stats.tls_us
-    );
+    // That `queue_us` excludes the handshake is pinned structurally, against a stalled handshake,
+    // by `queue_us_excludes_a_stalled_handshake` (a ratio of two fast timings flaked under load).
     let seen = rec.requests();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].body, b"charge");
@@ -786,6 +780,102 @@ async fn the_handshake_counts_against_the_connect_bound() {
     assert!(
         took >= Duration::from_millis(250) && took < Duration::from_secs(5),
         "{took:?}"
+    );
+}
+
+/// `queue_us` excludes the handshake (§23.5.4 as amended by M6-F5a). The upstream holds its
+/// ServerHello for 200 ms, so the handshake is ~200 ms by construction: `tls_us` must carry it and
+/// `queue_us` — nothing was queued — must not. Structural margins (50 ms against 150 ms), not a
+/// ratio of two fast timings, which a saturated CPU can invert (review L1: 1 failure in 40).
+#[tokio::test]
+async fn queue_us_excludes_a_stalled_handshake() {
+    let pki = Pki::new();
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg(&pki.leaf(), false, &[]));
+    let (addr, _) = raw_upstream(move |s| {
+        let acceptor = acceptor.clone();
+        async move {
+            // The ClientHello sits unread for 200 ms: the handshake cannot complete before.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let Ok(mut t) = acceptor.accept(s).await else {
+                return;
+            };
+            if read_request(&mut t).await.is_some() {
+                let _ = t.write_all(OK_HELLO).await;
+                let _ = t.flush().await;
+            }
+            let mut b = [0u8; 1024];
+            while matches!(t.read(&mut b).await, Ok(n) if n > 0) {}
+        }
+    })
+    .await;
+    let d = daemon_over(engine(env(
+        addr.port(),
+        &[("CA_FILE", pki.ca_file().display().to_string())],
+    )));
+    let r = one(&d, &post("api", b"charge")).await;
+    let stats = r.done().stats;
+    assert!(
+        stats.tls_us > 150_000,
+        "the stalled handshake is timed: tls_us {}",
+        stats.tls_us
+    );
+    assert!(
+        stats.queue_us < 50_000,
+        "queue_us {} counts the handshake ({} us)",
+        stats.queue_us,
+        stats.tls_us
+    );
+}
+
+/// A connector whose TCP connect takes `.0` before dialling (a slow SYN-ACK).
+struct SlowConnect(Duration);
+impl Connect for SlowConnect {
+    fn connect<'a>(
+        &'a self,
+        peer: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<BoxIo>> + Send + 'a>> {
+        let d = self.0;
+        Box::pin(async move {
+            tokio::time::sleep(d).await;
+            Ok(Box::new(TcpStream::connect(peer).await?) as BoxIo)
+        })
+    }
+}
+
+/// `CONNECT_TIMEOUT_MS` bounds DNS + TCP + TLS TOGETHER (§23.8.4): after a 250 ms TCP connect the
+/// handshake gets only the ~50 ms left of a 300 ms bound, never a fresh 300 ms (review L2: a fresh
+/// bound ends at ~550 ms; the shared one at ~300 ms).
+#[tokio::test]
+async fn the_handshake_gets_only_the_rest_of_the_connect_bound() {
+    let pki = Pki::new();
+    let (addr, _) = raw_upstream(|mut s| async move {
+        let mut b = [0u8; 4096];
+        while matches!(s.read(&mut b).await, Ok(n) if n > 0) {}
+    })
+    .await;
+    let d = daemon_over(engine_full(
+        env(
+            addr.port(),
+            &[
+                ("CA_FILE", pki.ca_file().display().to_string()),
+                ("CONNECT_TIMEOUT_MS", "300".into()),
+            ],
+        ),
+        resolver_to_loopback(),
+        Arc::new(SlowConnect(Duration::from_millis(250))),
+        OsRoots::Fixed(Vec::new()),
+    ));
+    let start = Instant::now();
+    let r = one(&d, &post("api", b"x")).await;
+    let took = start.elapsed();
+    r.assert_error(
+        errc::UPSTREAM_UNAVAILABLE,
+        branch::RETRYABLE,
+        http_cause::CONNECT_TIMEOUT,
+    );
+    assert!(
+        took >= Duration::from_millis(250) && took < Duration::from_millis(450),
+        "the handshake got a fresh bound: {took:?}"
     );
 }
 
@@ -1139,6 +1229,44 @@ async fn unloadable_tls_material_disables_the_upstream_indistinguishably() {
     assert_eq!(rec.tcp(), 0);
 }
 
+/// A `CA_FILE` holding one good CA and one block that is not a usable certificate DISABLES the
+/// upstream (§23.8.8 as amended: "a certificate unusable as a trust anchor"), although the good CA
+/// alone would verify the server — never a store built from whatever happened to parse (review L3).
+#[tokio::test]
+async fn one_unusable_certificate_beside_a_good_one_disables_the_upstream() {
+    let pki = Pki::new();
+    let (addr, rec) = tls_upstream(
+        server_cfg(&pki.leaf(), false, &[]),
+        Script::Respond(OK_HELLO),
+    )
+    .await;
+    let mixed = format!(
+        "{}-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        pki.ca.cert_pem()
+    );
+    let f = pki.write("mixed.pem", &mixed);
+    let e = engine(env(addr.port(), &[("CA_FILE", f.display().to_string())]));
+    let errs: Vec<String> = e.tls_errors().iter().map(|e| e.to_string()).collect();
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("certificate 2"), "{errs:?}");
+    let d = daemon_over(e);
+    let r = one(&d, &post("api", b"x")).await;
+    r.assert_error(
+        errc::FORBIDDEN,
+        errc::FORBIDDEN_BRANCH,
+        http_cause::FORBIDDEN_UPSTREAM,
+    );
+    assert_eq!(rec.tcp(), 0);
+    // The control: the good CA alone is served.
+    let good = engine(env(
+        addr.port(),
+        &[("CA_FILE", pki.ca_file().display().to_string())],
+    ));
+    assert!(good.tls_errors().is_empty());
+    let r = one(&daemon_over(good), &post("api", b"x")).await;
+    assert_eq!(r.head.expect("a head").status, 200);
+}
+
 /// mTLS is slice F5c: an upstream configured with a client certificate is `Unsupported` (no cause
 /// token) and never dialled — never a connection that silently omits the configured certificate.
 #[tokio::test]
@@ -1414,4 +1542,108 @@ async fn a_real_ferrod_trusts_the_os_store_it_reads_from_ssl_cert_file() {
         }
     }
     assert_eq!(rec.requests().len(), 1);
+}
+
+// =================================================================================================
+// A close without `close_notify` (§23.8.8 as amended by the M6-F5a review, L5)
+// =================================================================================================
+
+/// A TLS upstream on loopback that runs `f` on every connection after the handshake.
+async fn tls_script<F, Fut>(cfg: Arc<ServerConfig>, f: F) -> SocketAddr
+where
+    F: Fn(tokio_rustls::server::TlsStream<TcpStream>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+    let f = Arc::new(f);
+    let (addr, _) = raw_upstream(move |s| {
+        let acceptor = acceptor.clone();
+        let f = f.clone();
+        async move {
+            if let Ok(t) = acceptor.accept(s).await {
+                f(t).await;
+            }
+        }
+    })
+    .await;
+    addr
+}
+
+/// Closes the TLS connection: `close_notify` then FIN when `notify`, else a bare TCP FIN.
+async fn close_tls(mut t: tokio_rustls::server::TlsStream<TcpStream>, notify: bool) {
+    if notify {
+        let _ = t.shutdown().await;
+    } else {
+        let (tcp, _) = t.into_inner();
+        drop(tcp);
+    }
+}
+
+/// An upstream that reads the whole request and closes with zero response bytes is `eof_empty`
+/// only when it sends `close_notify`; a bare FIN is a truncation to `rustls` (`UnexpectedEof`), so
+/// on `https` it is `reset`. Same row (sent, no head: a POST `Indeterminate`), a different §23.11.3
+/// class — pinned, and stated in §23.8.8.
+#[tokio::test]
+async fn an_empty_close_is_eof_empty_only_with_close_notify() {
+    for (notify, cause) in [(true, http_cause::EOF_EMPTY), (false, http_cause::RESET)] {
+        let pki = Pki::new();
+        let addr = tls_script(
+            server_cfg(&pki.leaf(), false, &[]),
+            move |mut t| async move {
+                let _ = read_request(&mut t).await;
+                close_tls(t, notify).await;
+            },
+        )
+        .await;
+        let d = daemon_over(engine(env(
+            addr.port(),
+            &[("CA_FILE", pki.ca_file().display().to_string())],
+        )));
+        let r = one(&d, &post("api", b"charge")).await;
+        assert!(r.head.is_none(), "notify={notify}");
+        r.assert_error(errc::WRITE_UNCONFIRMED, branch::INDETERMINATE, cause);
+    }
+}
+
+/// A close-delimited body (no `Content-Length`, `Connection: close`) ends successfully only with
+/// `close_notify`; a bare FIN cannot be told from a truncating attacker, so on `https` it is
+/// `body_eof` after the head — where the same bytes over `http` succeed. Pinned, and stated in
+/// §23.8.8.
+#[tokio::test]
+async fn a_close_delimited_body_ends_cleanly_only_with_close_notify() {
+    for notify in [true, false] {
+        let pki = Pki::new();
+        let addr = tls_script(
+            server_cfg(&pki.leaf(), false, &[]),
+            move |mut t| async move {
+                let _ = read_request(&mut t).await;
+                let _ = t
+                    .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello")
+                    .await;
+                let _ = t.flush().await;
+                close_tls(t, notify).await;
+            },
+        )
+        .await;
+        let d = daemon_over(engine(env(
+            addr.port(),
+            &[("CA_FILE", pki.ca_file().display().to_string())],
+        )));
+        let r = one(&d, &idempotent_get("api")).await;
+        assert_eq!(
+            r.head.as_ref().expect("a head").status,
+            200,
+            "notify={notify}"
+        );
+        assert_eq!(r.body, b"hello", "notify={notify}");
+        if notify {
+            r.done();
+        } else {
+            r.assert_error(
+                errc::CONNECTION_LOST,
+                errc::CONNECTION_LOST_BRANCH,
+                http_cause::BODY_EOF,
+            );
+        }
+    }
 }
