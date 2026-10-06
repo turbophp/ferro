@@ -28,28 +28,55 @@ pub enum Dir {
     Write,
 }
 
-/// What the tracker has observed. Shared (`Arc`) between the tracker inside `hyper` and the test.
+/// What the tracker has observed. Shared (`Arc`) between the tracker inside `hyper`, the optional
+/// ciphertext tap below TLS, and the test.
 #[derive(Debug, Default)]
 pub struct TrackState {
     /// Armed at dispatch, by the engine (here: the test), immediately before handing the request to
     /// `hyper`. Bytes accepted while unarmed are counted separately so the "no byte before dispatch"
     /// half of P1 is an observation, not an assumption.
     armed: AtomicBool,
-    /// SPEC §23.7.1: "the first `poll_write` that accepts one or more bytes sets `sent = true`".
-    sent: AtomicBool,
+    /// SPEC §23.7.1: "the first `poll_write` that accepts one or more bytes sets `sent = true`" —
+    /// the PLAINTEXT half of `sent`.
+    plain_sent: AtomicBool,
     written_armed: AtomicU64,
     written_unarmed: AtomicU64,
-    /// Response bytes the plaintext layer delivered to `hyper` (HttpStats `bytes_received`).
-    read: AtomicU64,
+    /// Ciphertext bytes the socket accepted BELOW TLS since dispatch (review F-1). `tokio-rustls`
+    /// can return `Err` from a plaintext write after earlier encrypted records of that very write
+    /// already reached the socket, so the plaintext count alone can read 0 while the upstream has
+    /// decrypted the request head. Zero unless a [`CipherTap`] shares this state.
+    cipher_armed: AtomicU64,
+    /// Response bytes the plaintext layer delivered to `hyper` SINCE DISPATCH (review F-4): reset by
+    /// every `arm()`, so on a reused keep-alive connection it counts this exchange's response only.
+    read_armed: AtomicU64,
+    /// Response bytes over the connection's whole life (diagnostic; never used to classify).
+    read_total: AtomicU64,
     first_error: Mutex<Option<(Dir, io::ErrorKind)>>,
 }
 
 impl TrackState {
+    /// Dispatch. Every per-exchange count starts at zero here, so a reused connection's previous
+    /// exchange cannot leak into this one's `sent`, read count or first error.
     pub fn arm(&self) {
+        // MUTATION SITE (M-P14c): not resetting `read_armed` makes a reused connection's EOF with
+        // zero response bytes classify as `eof_partial_head`.
+        self.read_armed.store(0, Ordering::SeqCst);
+        self.plain_sent.store(false, Ordering::SeqCst);
+        self.written_armed.store(0, Ordering::SeqCst);
+        self.cipher_armed.store(0, Ordering::SeqCst);
+        *self.first_error.lock().unwrap() = None;
         self.armed.store(true, Ordering::SeqCst);
     }
+    /// SPEC §23.7.1 as amended by review F-1: sent ⇔ the plaintext layer accepted a byte since
+    /// dispatch OR the socket accepted a ciphertext byte since dispatch (conservative: a TLS record
+    /// that carries no request data still counts).
     pub fn sent(&self) -> bool {
-        self.sent.load(Ordering::SeqCst)
+        // MUTATION SITE (M-P1c): dropping the ciphertext half reopens review F-1.
+        self.plain_sent.load(Ordering::SeqCst) || self.cipher_armed.load(Ordering::SeqCst) > 0
+    }
+    /// The plaintext half alone — what the pre-review tracker called `sent`.
+    pub fn plaintext_sent(&self) -> bool {
+        self.plain_sent.load(Ordering::SeqCst)
     }
     pub fn written_armed(&self) -> u64 {
         self.written_armed.load(Ordering::SeqCst)
@@ -57,8 +84,16 @@ impl TrackState {
     pub fn written_unarmed(&self) -> u64 {
         self.written_unarmed.load(Ordering::SeqCst)
     }
+    pub fn cipher_armed(&self) -> u64 {
+        self.cipher_armed.load(Ordering::SeqCst)
+    }
+    /// Response bytes since dispatch (HttpStats `bytes_received` on HTTP/1.1, §23.5.4).
     pub fn read(&self) -> u64 {
-        self.read.load(Ordering::SeqCst)
+        self.read_armed.load(Ordering::SeqCst)
+    }
+    /// Response bytes over the connection's life (diagnostic only).
+    pub fn read_total(&self) -> u64 {
+        self.read_total.load(Ordering::SeqCst)
     }
     pub fn first_error(&self) -> Option<(Dir, io::ErrorKind)> {
         *self.first_error.lock().unwrap()
@@ -69,6 +104,12 @@ impl TrackState {
             *slot = Some((dir, kind));
         }
     }
+    fn note_read(&self, n: usize) {
+        self.read_total.fetch_add(n as u64, Ordering::SeqCst);
+        if self.armed.load(Ordering::SeqCst) {
+            self.read_armed.fetch_add(n as u64, Ordering::SeqCst);
+        }
+    }
     fn note_written(&self, n: usize) {
         if n == 0 {
             return;
@@ -76,11 +117,119 @@ impl TrackState {
         if self.armed.load(Ordering::SeqCst) {
             // MUTATION SITE (M-P1a): setting `sent` on the poll_write CALL rather than on an
             // accepted byte makes the dies-before-first-write control report `sent = true`.
-            self.sent.store(true, Ordering::SeqCst);
+            self.plain_sent.store(true, Ordering::SeqCst);
             self.written_armed.fetch_add(n as u64, Ordering::SeqCst);
         } else {
             self.written_unarmed.fetch_add(n as u64, Ordering::SeqCst);
         }
+    }
+    fn note_cipher(&self, n: usize) {
+        if n > 0 && self.armed.load(Ordering::SeqCst) {
+            self.cipher_armed.fetch_add(n as u64, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The ciphertext half of the tracker (review F-1): wraps the TRANSPORT below TLS and counts the
+/// encrypted bytes the socket accepts after dispatch into the same [`TrackState`] the plaintext
+/// [`Tracker`] above TLS uses. Reads pass through uncounted.
+pub struct CipherTap<T> {
+    inner: T,
+    state: Arc<TrackState>,
+}
+
+impl<T> CipherTap<T> {
+    /// Below TLS, with a fresh state the plaintext tracker is later given via [`h1_over_state`].
+    pub fn new(inner: T) -> (Self, Arc<TrackState>) {
+        let state = Arc::new(TrackState::default());
+        (
+            CipherTap {
+                inner,
+                state: state.clone(),
+            },
+            state,
+        )
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for CipherTap<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for CipherTap<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &res {
+            self.state.note_cipher(*n);
+        }
+        res
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let res = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = &res {
+            self.state.note_cipher(*n);
+        }
+        res
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// An I/O whose reads never complete and whose writes accept `budget` bytes in total, then FAIL:
+/// a connection that dies on the WRITE side part-way through a request (the P14 `write` control).
+pub struct FailAfter {
+    pub budget: usize,
+}
+
+impl AsyncRead for FailAfter {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for FailAfter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.budget == 0 {
+            return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
+        }
+        let n = buf.len().min(self.budget);
+        self.budget -= n;
+        Poll::Ready(Ok(n))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -94,13 +243,11 @@ pub struct Tracker<T> {
 impl<T> Tracker<T> {
     pub fn new(inner: T) -> (Self, Arc<TrackState>) {
         let state = Arc::new(TrackState::default());
-        (
-            Tracker {
-                inner,
-                state: state.clone(),
-            },
-            state,
-        )
+        (Tracker::with_state(inner, state.clone()), state)
+    }
+    /// The plaintext tracker sharing a state with a [`CipherTap`] below TLS.
+    pub fn with_state(inner: T, state: Arc<TrackState>) -> Self {
+        Tracker { inner, state }
     }
 }
 
@@ -115,7 +262,7 @@ impl<T: AsyncRead + Unpin> AsyncRead for Tracker<T> {
         match &res {
             Poll::Ready(Ok(())) => {
                 let n = buf.filled().len() - before;
-                self.state.read.fetch_add(n as u64, Ordering::SeqCst);
+                self.state.note_read(n);
             }
             Poll::Ready(Err(e)) => self.state.note_error(Dir::Read, e.kind()),
             Poll::Pending => {}
@@ -353,7 +500,19 @@ pub async fn h1_over<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (tracked, state) = Tracker::new(io);
+    h1_over_state(io, builder, Arc::new(TrackState::default())).await
+}
+
+/// [`h1_over`] with a caller-supplied state (shared with a [`CipherTap`] below TLS).
+pub async fn h1_over_state<T>(
+    io: T,
+    builder: &http1::Builder,
+    state: Arc<TrackState>,
+) -> (http1::SendRequest<OneChunk>, Arc<TrackState>, ConnTask)
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let tracked = Tracker::with_state(io, state.clone());
     let (send, conn) = builder
         .handshake(TokioIo::new(tracked))
         .await

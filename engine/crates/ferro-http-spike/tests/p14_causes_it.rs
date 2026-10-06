@@ -292,3 +292,98 @@ async fn p14_a_reset_mid_body_write_is_usually_seen_on_the_read_side() {
     eprintln!("P14 reset-mid-body-write classifications over 5 runs: {tally:?}");
     assert!(tally.keys().all(|k| *k == "write" || *k == "reset"));
 }
+
+/// **P14, the control for the test above.** The classifier CAN name `write`: on an I/O whose writes
+/// accept part of the request and then fail (reads never complete, so nothing can fail on the read
+/// side first), the error is a write-side I/O error and the cause is `write`. So "usually `reset`"
+/// above is a property of `hyper`'s read-first polling, not a classifier that cannot see writes.
+#[tokio::test]
+async fn p14_control_a_write_side_failure_is_named_write() {
+    let (mut send, track, _conn) = h1_over(FailAfter { budget: 4096 }, &h1_builder()).await;
+    track.arm();
+    let err = within("send", send.send_request(post(vec![0x42u8; 256 * 1024])))
+        .await
+        .expect_err("the write side dies part-way");
+    let o = Observed {
+        is_incomplete_message: err.is_incomplete_message(),
+        is_parse: err.is_parse(),
+        display_text: err.to_string(),
+        io_kind: io_kind(&err),
+        bytes_received: track.read(),
+        first_error: track.first_error(),
+        sent: track.sent(),
+        upstream_received: track.written_armed(),
+        debug: format!("{err:?}"),
+    };
+    assert!(o.sent && o.upstream_received == 4096, "{o:?}");
+    assert_eq!(o.first_error.map(|(d, _)| d), Some(Dir::Write), "{o:?}");
+    assert_eq!(classify(&o, true), "write", "{o:?}");
+}
+
+/// **P14 on a REUSED connection (review F-4).** F4 reuses keep-alive connections, so the read count
+/// that separates `eof_empty` from `eof_partial_head` must start AT DISPATCH: a connection whose
+/// first exchange read a whole response, and whose second exchange is closed with zero response
+/// bytes, is `eof_empty` — not `eof_partial_head`, which a connection-lifetime count would say
+/// (asserted as the control: the lifetime count is non-zero).
+#[tokio::test]
+async fn p14_eof_empty_on_a_reused_connection_counts_reads_from_dispatch() {
+    const FIRST: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let up = fake_upstream(|mut s, received| async move {
+        read_request(&mut s, &received, 64).await;
+        s.write_all(FIRST).await.unwrap();
+        // The second request on the same connection: read it, then FIN with zero response bytes.
+        read_request(&mut s, &received, 64).await;
+        drop(s);
+    })
+    .await;
+    let (mut send, track, _conn) = h1_over(dial(up.addr).await, &h1_builder()).await;
+    within("ready", send.ready()).await.unwrap();
+    track.arm();
+    let resp = within("first", send.send_request(post(vec![1u8; 64])))
+        .await
+        .expect("first exchange");
+    assert_eq!(resp.status(), 200);
+    let body = within("first body", collect_body(resp.into_body())).await;
+    assert_eq!(body, b"ok");
+    within("ready again", send.ready())
+        .await
+        .expect("the connection is reused (keep-alive)");
+
+    track.arm(); // the second dispatch
+    let err = within("second", send.send_request(post(vec![2u8; 64])))
+        .await
+        .expect_err("closed with no response");
+    let _ = up.done.await;
+    let o = Observed {
+        is_incomplete_message: err.is_incomplete_message(),
+        is_parse: err.is_parse(),
+        display_text: err.to_string(),
+        io_kind: io_kind(&err),
+        bytes_received: track.read(),
+        first_error: track.first_error(),
+        sent: track.sent(),
+        upstream_received: up.received.load(Ordering::SeqCst),
+        debug: format!("{err:?}"),
+    };
+    assert!(
+        track.read_total() >= FIRST.len() as u64,
+        "control: the connection's lifetime read count includes the first response"
+    );
+    assert!(o.sent && o.is_incomplete_message, "{o:?}");
+    assert_eq!(o.bytes_received, 0, "{o:?}");
+    assert_eq!(classify(&o, true), "eof_empty", "{o:?}");
+}
+
+/// Drain a response body (no `http-body-util` in D20's set, so by hand).
+async fn collect_body(mut body: hyper::body::Incoming) -> Vec<u8> {
+    use http_body::Body;
+    let mut out = Vec::new();
+    while let Some(frame) =
+        futures::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+    {
+        if let Ok(data) = frame.expect("body frame").into_data() {
+            out.extend_from_slice(&data);
+        }
+    }
+    out
+}

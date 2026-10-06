@@ -14,6 +14,14 @@
 //! that reads ahead regardless of credit, and must see an excess of at least 16 × the bound — so a
 //! read-ahead implementation is caught even if it were 16 times slower than this one, and the probe
 //! waits up to 5 s for it, during which a loopback reader of any speed above ~13 MB/s overshoots.
+//!
+//! **The "merely slow" half, after review F-2.** A stall is first declared after a 300 ms quiet
+//! window, so a credit-IGNORING reader that consumes one frame every 350 ms looked exactly like
+//! backpressure to the first draft (its excess stayed under the bound and the upstream "stalled").
+//! The probe now HOLDS for 3 s after the stall and requires the upstream's written count not to move
+//! at all: any reader that consumes past credit at least once every ~3.3 s (the 300 ms window plus
+//! the hold) moves it and is caught. `p7_control_a_slow_read_ahead_client_fails_the_probe` runs that
+//! mutation as a permanent control at 350 ms and at 2 s per frame.
 
 mod common;
 
@@ -44,12 +52,18 @@ enum Framing {
     Chunked,
 }
 
+/// After the stall is detected, the upstream's written count must stay unchanged for this long.
+const HOLD: Duration = Duration::from_secs(3);
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Reader {
     /// The engine model: poll the body only while credit lasts.
     CreditGated,
     /// MUTATION / negative control: a task drains the body as fast as it arrives, credit or not.
     ReadAhead,
+    /// MUTATION / negative control (review F-2): credit is honoured, then a task keeps reading past
+    /// it, one frame per period — a read-ahead that is merely SLOW.
+    SlowReadAhead(Duration),
 }
 
 struct Probe {
@@ -58,6 +72,8 @@ struct Probe {
     /// Bytes (head + body framing included) the upstream's kernel accepted, once stable.
     upstream_written: u64,
     stalled: bool,
+    /// The written count did not move for [`HOLD`] after the stall.
+    held: bool,
     resumed: bool,
 }
 
@@ -138,6 +154,20 @@ async fn settle(written: &AtomicU64) -> (u64, bool) {
     (written.load(Ordering::SeqCst), false)
 }
 
+/// Once stalled at `at`, does the upstream's written count stay at `at` for [`HOLD`]?
+async fn hold(written: &AtomicU64, at: u64) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < HOLD {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        // MUTATION SITE (M-P7c): returning `true` here (no hold) lets a 350 ms-per-frame read-ahead
+        // pass the positive test — review F-2's reproduction.
+        if written.load(Ordering::SeqCst) != at {
+            return false;
+        }
+    }
+    true
+}
+
 async fn probe(framing: Framing, reader: Reader) -> Probe {
     let (addr, written) = upstream(framing).await;
     let sock = TcpSocket::new_v4().unwrap();
@@ -157,6 +187,7 @@ async fn probe(framing: Framing, reader: Reader) -> Probe {
             }
             // Credit exhausted: the engine stops polling. Nothing else touches `body`.
             let (upstream_written, stalled) = settle(&written).await;
+            let held = stalled && hold(&written, upstream_written).await;
             // Credit replenished (WINDOW_UPDATE): the engine polls again, and the upstream must
             // resume — the stall was backpressure, not a dead connection.
             let target = delivered + CREDIT;
@@ -176,6 +207,7 @@ async fn probe(framing: Framing, reader: Reader) -> Probe {
                 delivered: target - CREDIT,
                 upstream_written,
                 stalled,
+                held,
                 resumed,
             }
         }
@@ -183,10 +215,35 @@ async fn probe(framing: Framing, reader: Reader) -> Probe {
             // MUTATION: drain ahead of credit (an "engine" that buffers the response internally).
             tokio::spawn(async move { while next_data(&mut body).await.is_some() {} });
             let (upstream_written, stalled) = settle(&written).await;
+            let held = stalled && hold(&written, upstream_written).await;
             Probe {
                 delivered: CREDIT,
                 upstream_written,
                 stalled,
+                held,
+                resumed: true,
+            }
+        }
+        Reader::SlowReadAhead(period) => {
+            while delivered < CREDIT {
+                delivered += within("credit frame", next_data(&mut body)).await.unwrap();
+            }
+            // MUTATION: keep reading past credit, slowly.
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(period).await;
+                    if next_data(&mut body).await.is_none() {
+                        break;
+                    }
+                }
+            });
+            let (upstream_written, stalled) = settle(&written).await;
+            let held = stalled && hold(&written, upstream_written).await;
+            Probe {
+                delivered,
+                upstream_written,
+                stalled,
+                held,
                 resumed: true,
             }
         }
@@ -205,14 +262,19 @@ async fn p7_h1_credit_gated_reading_backpressures_the_upstream() {
         let p = probe(framing, Reader::CreditGated).await;
         eprintln!(
             "P7 {framing:?}: delivered {} B, upstream wrote {} B, excess {} B (bound {BOUND} B), \
-             stalled={}, resumed={}",
+             stalled={}, held={}, resumed={}",
             p.delivered,
             p.upstream_written,
             excess(&p),
             p.stalled,
+            p.held,
             p.resumed
         );
         assert!(p.stalled, "{framing:?}: the upstream never stalled");
+        assert!(
+            p.held,
+            "{framing:?}: the upstream moved during the {HOLD:?} hold — something reads past credit"
+        );
         assert!(
             excess(&p) <= BOUND,
             "{framing:?}: {} B written past the credit — hyper buffers beyond the bound",
@@ -242,6 +304,28 @@ async fn p7_control_a_read_ahead_client_fails_the_probe() {
             "{framing:?}: the read-ahead control only overshot by {} B — the probe cannot tell \
              buffering from backpressure",
             excess(&p)
+        );
+    }
+}
+
+/// **P7, the "merely slow" negative control (review F-2; §22.2 (bj)'s rule).** A client that honours
+/// the credit and then keeps reading past it slowly — one frame per 350 ms (the review's mutation,
+/// slower than the 300 ms quiet window), and one per 2 s — must FAIL the probe: the upstream may look
+/// stalled for a moment, but it moves during the hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p7_control_a_slow_read_ahead_client_fails_the_probe() {
+    for period in [Duration::from_millis(350), Duration::from_secs(2)] {
+        let p = probe(Framing::ContentLength, Reader::SlowReadAhead(period)).await;
+        eprintln!(
+            "P7 slow control {period:?}: upstream wrote {} B, excess {} B, stalled={}, held={}",
+            p.upstream_written,
+            excess(&p),
+            p.stalled,
+            p.held
+        );
+        assert!(
+            !(p.stalled && p.held),
+            "a read-ahead at one frame per {period:?} passed the stall probe"
         );
     }
 }

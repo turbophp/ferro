@@ -155,15 +155,11 @@ async fn p1_control_connection_reset_before_dispatch_reports_not_sent() {
     assert_eq!(up.received.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
-/// **P1 through TLS.** The tracker wraps the `TlsStream` (plaintext above TLS, below `hyper`). The
-/// handshake completes before the tracker exists, so handshake bytes are never counted; the
-/// plaintext count after dispatch equals the bytes the upstream DECRYPTED; and a TLS connection the
-/// upstream closes before dispatch reports `sent = false`. This is also the test that makes `ring`
-/// actually compile and link (P3's "builds with no CMake" is a build, not a lock-file reading).
-#[tokio::test]
-async fn p1_through_tls_tracker_counts_plaintext_and_control_holds() {
+/// The test PKI (`tests/fixtures/`, README): a server config presenting the `localhost` leaf, and a
+/// client config trusting only the test CA.
+fn tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
     use rustls_pki_types::pem::PemObject;
-    use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let ca = CertificateDer::from_pem_slice(include_bytes!("fixtures/ca.pem")).unwrap();
@@ -187,6 +183,19 @@ async fn p1_through_tls_tracker_counts_plaintext_and_control_holds() {
             .with_root_certificates(roots)
             .with_no_client_auth(),
     );
+    (server_cfg, client_cfg)
+}
+
+/// **P1 through TLS.** The plaintext tracker wraps the `TlsStream` (above TLS, below `hyper`) and
+/// the [`CipherTap`] wraps the TCP stream below TLS; both share one state. Handshake bytes precede
+/// arming, so neither counts them; the plaintext count after dispatch equals the bytes the upstream
+/// DECRYPTED (on success); and a TLS connection the upstream closes before dispatch reports
+/// `sent = false` with NO ciphertext after arming either. This is also the test that makes `ring`
+/// actually compile and link (P3's "builds with no CMake" is a build, not a lock-file reading).
+#[tokio::test]
+async fn p1_through_tls_tracker_counts_plaintext_and_control_holds() {
+    use rustls_pki_types::ServerName;
+    let (server_cfg, client_cfg) = tls_configs();
 
     for close_before_dispatch in [false, true] {
         let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg.clone());
@@ -211,12 +220,12 @@ async fn p1_through_tls_tracker_counts_plaintext_and_control_holds() {
         });
 
         let connector = tokio_rustls::TlsConnector::from(client_cfg.clone());
-        let tcp = dial(addr).await;
+        let (tap, state) = CipherTap::new(dial(addr).await);
         let tls = connector
-            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .connect(ServerName::try_from("localhost").unwrap(), tap)
             .await
             .expect("client handshake");
-        let (mut send, track, conn) = h1_over(tls, &h1_builder()).await;
+        let (mut send, track, conn) = h1_over_state(tls, &h1_builder(), state).await;
 
         if close_before_dispatch {
             let _ = within("tls conn ends", conn).await;
@@ -225,8 +234,10 @@ async fn p1_through_tls_tracker_counts_plaintext_and_control_holds() {
             assert!(r.is_err());
             assert!(
                 !track.sent(),
-                "P1/TLS control: closed-before-dispatch reported sent"
+                "P1/TLS control: closed-before-dispatch reported sent (ciphertext after arming: {})",
+                track.cipher_armed()
             );
+            assert_eq!(track.cipher_armed(), 0);
             assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 0);
         } else {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -242,9 +253,132 @@ async fn p1_through_tls_tracker_counts_plaintext_and_control_holds() {
                 received.load(std::sync::atomic::Ordering::SeqCst),
                 "P1/TLS exactness: plaintext counted == plaintext the upstream decrypted"
             );
+            assert!(
+                track.cipher_armed() > track.written_armed(),
+                "every plaintext byte travels inside a larger TLS record"
+            );
         }
         server.abort();
     }
+}
+
+/// Below the [`CipherTap`]: once `fail` is set, the FIRST write passes to TCP and every later write
+/// fails with `ConnectionReset` — the real-TCP shape "a partial `writev`, then `ECONNRESET` on the
+/// next syscall within one poll", made deterministic.
+struct FailSecondWrite {
+    inner: tokio::net::TcpStream,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+    writes_after: u32,
+}
+
+impl tokio::io::AsyncRead for FailSecondWrite {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for FailSecondWrite {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            self.writes_after += 1;
+            if self.writes_after > 1 {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// **P1 through TLS, the control the first draft lacked (review F-1).** `tokio-rustls` accepts a
+/// plaintext write into rustls, then writes the resulting records in a loop; if a LATER record's
+/// write fails, the plaintext call returns `Err` although earlier records already reached the
+/// socket. Here the first post-dispatch socket write passes and the second fails: the upstream
+/// DECRYPTS the request head (and 16 KiB of body), while the plaintext layer accepted nothing.
+///
+/// The plaintext tracker alone therefore says "not sent" — asserted, so this control provably
+/// exercises the hole — and the amended rule (`sent` ⇔ plaintext accepted OR ciphertext written
+/// since dispatch) says sent.
+#[tokio::test]
+async fn p1_control_tls_records_written_before_a_write_error_count_as_sent() {
+    use rustls_pki_types::ServerName;
+    use tokio::io::AsyncReadExt;
+    let (server_cfg, client_cfg) = tls_configs();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut tls = acceptor.accept(tcp).await.expect("server handshake");
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(n) = tls.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        got
+    });
+
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let below = FailSecondWrite {
+        inner: dial(addr).await,
+        fail: fail.clone(),
+        writes_after: 0,
+    };
+    let (tap, state) = CipherTap::new(below);
+    let tls = tokio_rustls::TlsConnector::from(client_cfg)
+        .connect(ServerName::try_from("localhost").unwrap(), tap)
+        .await
+        .expect("client handshake");
+    let (mut send, track, conn) = h1_over_state(tls, &h1_builder(), state).await;
+    within("ready", send.ready()).await.unwrap();
+
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    track.arm();
+    let r = within("send", send.send_request(post(vec![9u8; 100 * 1024]))).await;
+    let _ = within("conn", conn).await;
+    let got = within("server", server).await.unwrap();
+    let head_seen = got.windows(15).any(|w| w == b"POST /v1/charge");
+
+    assert!(r.is_err(), "the exchange failed");
+    assert!(
+        head_seen,
+        "the upstream decrypted the request head ({} plaintext bytes)",
+        got.len()
+    );
+    assert!(
+        !track.plaintext_sent() && track.written_armed() == 0,
+        "this control exercises the hole: the plaintext layer accepted nothing ({} B)",
+        track.written_armed()
+    );
+    assert!(track.cipher_armed() > 0, "records reached the socket");
+    assert!(
+        track.sent(),
+        "P1/TLS violated: the upstream decrypted {} request bytes but sent = false",
+        got.len()
+    );
 }
 
 async fn read_tls_request<S: tokio::io::AsyncRead + Unpin>(
