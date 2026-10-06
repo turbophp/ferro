@@ -18,13 +18,20 @@
 //! - [`shape`] — shape verification: the catalog statement (`to_regclass`, `relkind`, the columns by
 //!   oid) and the verdict on its rows.
 //! - [`checks`] — the per-request refusals made before any checkout (payload, queue name, the
-//!   fields v1 refuses).
+//!   fields v1 refuses, and — M7-G1b — a `delay_s` that would overflow the time column), and the
+//!   RESERVE frame clamp.
 //!
-//! The seven verbs' statement builders and the fence land at G1b (SPEC §24.14).
+//! What M7-G1b adds:
+//!
+//! - [`pg`] — the seven verbs' PostgreSQL statements in autocommit, one builder per verb (the CLOSED
+//!   set D22's mitigation names), the database clock and the rounding rules, the widened fence, and
+//!   the decoders that turn each statement's rows into the verb's outcome. MySQL-family builders are
+//!   G6's; the tx-scoped forms G2's.
 
 pub mod checks;
 pub mod config;
 pub mod ident;
+pub mod pg;
 pub mod shape;
 pub mod sql;
 pub mod version;
