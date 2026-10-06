@@ -39,35 +39,9 @@ pub struct HttpVocab {
     pub causes: BTreeMap<String, String>,
 }
 
-/// The one shape rule for `[http.causes]`, applied wherever the table is read (here, `build.rs`,
-/// and `gen-php.php`), so a cause cannot acquire two spellings: a token is non-empty lowercase ASCII
-/// letters, digits and `_`, its KEY is exactly the token upper-cased, and no token appears twice
-/// (the last is implied by the key rule, since keys are unique — it is checked anyway, so the rule
-/// does not lean on that implication). Returns the first violation.
-pub fn check_http_causes(causes: &BTreeMap<String, String>) -> Result<(), String> {
-    let mut seen = std::collections::BTreeSet::new();
-    for (key, token) in causes {
-        if token.is_empty()
-            || !token
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        {
-            return Err(format!(
-                "[http.causes] {key}: token {token:?} is not lowercase [a-z0-9_]+"
-            ));
-        }
-        if *key != token.to_ascii_uppercase() {
-            return Err(format!(
-                "[http.causes] {key}: the key must be the token upper-cased ({})",
-                token.to_ascii_uppercase()
-            ));
-        }
-        if !seen.insert(token.as_str()) {
-            return Err(format!("[http.causes] token {token:?} appears twice"));
-        }
-    }
-    Ok(())
-}
+// `check_http_causes` — the one Rust implementation of the `[http.causes]` shape rule, shared
+// with `build.rs` by `include!` (see the file for why).
+include!("http_causes_rule.rs");
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrCode {

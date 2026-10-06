@@ -503,6 +503,8 @@ fn http_vectors_decode_to_their_named_message_fields() {
     assert_ne!(timeouts[0], timeouts[1]);
     assert_ne!(timeouts[1], timeouts[2]);
     assert_ne!(timeouts[0], timeouts[2]);
+    // ...and the two bools differ, so swapping `idempotent` and `decode` moves the message too.
+    assert_eq!((post.idempotent, post.decode), (Some(true), false));
     assert_eq!(
         post.body.as_deref().map(|b| b[0]),
         Some(0xc0),

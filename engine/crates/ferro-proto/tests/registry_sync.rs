@@ -266,3 +266,42 @@ fn a_misspelled_http_causes_table_fails_the_parse() {
     std::fs::remove_dir_all(&tmp).ok();
     assert!(res.is_err(), "a `[http.cause]` table must not parse");
 }
+
+/// The Rust half of the shape-rule AGREEMENT test: every case in the shared fixture
+/// `proto/tools/http-causes-shape-cases.json` gets the verdict the fixture states. `build.rs` and
+/// `Registry::from_toml_dir` share this one function (`include!`), and `php/client`'s
+/// `HttpCausesShapeRuleTest` runs `gen-php.php` over the SAME cases — so the three readers of
+/// `[http.causes]` cannot disagree about a token.
+#[test]
+fn the_shared_shape_rule_fixture_gets_its_stated_verdicts() {
+    use ferro_proto::registry::check_http_causes;
+    use std::collections::BTreeMap;
+
+    let fixture: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proto_dir().join("tools/http-causes-shape-cases.json")).unwrap(),
+    )
+    .unwrap();
+    let cases = fixture["cases"].as_array().expect("cases");
+    assert!(cases.len() >= 10, "the fixture lost its cases");
+    let (mut valid, mut invalid) = (0, 0);
+    for case in cases {
+        let why = case["why"].as_str().unwrap();
+        let causes: BTreeMap<String, String> = case["causes"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+            .collect();
+        let want = case["valid"].as_bool().unwrap();
+        assert_eq!(
+            check_http_causes(&causes).is_ok(),
+            want,
+            "{why}: {causes:?}"
+        );
+        if want { valid += 1 } else { invalid += 1 }
+    }
+    assert!(
+        valid >= 1 && invalid >= 1,
+        "the fixture must exercise both verdicts"
+    );
+}

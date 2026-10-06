@@ -38,6 +38,9 @@ struct HttpVocab {
     causes: BTreeMap<String, String>,
 }
 
+// The shape rule `registry.rs` also uses — one implementation, so the two readers cannot drift.
+include!("src/http_causes_rule.rs");
+
 fn lock_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../proto/registry.lock.json")
 }
@@ -45,6 +48,7 @@ fn lock_path() -> PathBuf {
 fn main() {
     let lock = lock_path();
     println!("cargo:rerun-if-changed={}", lock.display());
+    println!("cargo:rerun-if-changed=src/http_causes_rule.rs");
     let lock_bytes = fs::read(&lock).unwrap();
     let reg: Registry = serde_json::from_slice(&lock_bytes).unwrap();
 
@@ -139,17 +143,10 @@ fn main() {
     // against the LOCK, because the lock is what this build reads: a hand-edited lock that slipped a
     // second spelling past `Registry::from_toml_dir` must not compile into a constant.
     writeln!(o, "pub mod http_cause {{").unwrap();
-    let mut seen = std::collections::BTreeSet::new();
+    if let Err(why) = check_http_causes(&reg.http.causes) {
+        panic!("registry.lock.json: {why}");
+    }
     for (name, token) in &reg.http.causes {
-        assert!(
-            !token.is_empty()
-                && token
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-                && *name == token.to_ascii_uppercase()
-                && seen.insert(token.clone()),
-            "registry.lock.json http.causes: {name} = {token:?} breaks the shape rule"
-        );
         writeln!(o, "    pub const {name}: &str = \"{token}\";").unwrap();
     }
     writeln!(o, "    pub const ALL: &[&str] = &[").unwrap();

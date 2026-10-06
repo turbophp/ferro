@@ -80,10 +80,20 @@ async fn terminal_error(
         header,
         "rid {rid}: which path built the terminal"
     );
-    match Outcome::decode(&frame.payload).expect("decode Outcome") {
+    let ep = match Outcome::decode(&frame.payload).expect("decode Outcome") {
         Outcome::Error(ep) => ep,
         other => panic!("rid {rid}: expected Outcome::Error, got {other:?}"),
-    }
+    };
+    // SPEC §23.5.6 as amended by §22.2 (cy), and C11: on service HTTP, `detail` is never free
+    // text — it is `nil` on exactly the two non-fate terminals (`Protocol`, `Unsupported`), which
+    // are the only HTTP terminals this build produces — and `sqlstate`/`errno` are always `nil`.
+    // Held on BOTH paths: the handler-built `HTTP`/`REQUEST` terminal and the session-built CORE/0.
+    assert_eq!(
+        (ep.detail.as_deref(), ep.sqlstate.as_deref(), ep.errno),
+        (None, None, None),
+        "rid {rid}: an HTTP Protocol/Unsupported terminal carries no detail, sqlstate or errno"
+    );
+    ep
 }
 
 #[tokio::test]

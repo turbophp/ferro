@@ -47,6 +47,11 @@ final class HttpCodecTest extends TestCase
     {
         yield 'non-UTF-8 target' => [['target' => "/\xff"]];
         yield 'non-UTF-8 header name' => [['headers' => [["x-\xff", 'v']]]];
+        // Every strict `str` the engine decodes, one row each — not only the two above.
+        yield 'non-UTF-8 upstream' => [['upstream' => "billing\xff"]];
+        yield 'non-UTF-8 method' => [['method' => "POS\xc3"]];
+        yield 'non-UTF-8 origin' => [['origin' => "https://api.\xfe.com"]];
+        yield 'non-UTF-8 route' => [['route' => "/v1/\x80"]];
         yield 'timeout past u32' => [['timeout_ms' => 0x1_0000_0000]];
         yield 'negative timeout' => [['read_timeout_ms' => -1]];
         yield 'header not a pair' => [['headers' => [['only-a-name']]]];
@@ -78,6 +83,10 @@ final class HttpCodecTest extends TestCase
         foreach ([
             'status past u16' => $head($p->packUint(70_000), $p->packNil() . $p->packBool(false)),
             'status a string' => $head($p->packStr('200'), $p->packNil() . $p->packBool(false)),
+            'version past u8' => $p->packArrayLen(6) . $p->packUint(200) . $p->packUint(256) . $p->packNil()
+                . $p->packArrayLen(0) . $p->packNil() . $p->packBool(false),
+            'content_length past PHP_INT_MAX' => $head($p->packUint(200),
+                $p->packArrayLen(2) . $p->packStr('gzip') . $p->packUint('9223372036854775808') . $p->packBool(false)),
             'idempotent nil' => $head($p->packUint(200), $p->packNil() . $p->packNil()),
             'decoded arity 1' => $head($p->packUint(200), $p->packArrayLen(1) . $p->packStr('gzip') . $p->packBool(false)),
             'trailing byte' => $head($p->packUint(200), $p->packNil() . $p->packBool(false)) . $p->packNil(),
@@ -105,8 +114,18 @@ final class HttpCodecTest extends TestCase
         $p = new PurePacker();
         $chunk = "\xc0\x00\x80";
         $this->assertSame($chunk, HttpBody::decode(HttpBody::encode(['chunk' => $chunk], $p), $p));
-        $this->expectException(CodecException::class);
-        HttpBody::decode($p->packArrayLen(2) . $p->packBin('a') . $p->packBin('b'), $p);
+        foreach ([
+            'arity 2' => $p->packArrayLen(2) . $p->packBin('a') . $p->packBin('b'),
+            'trailing byte' => HttpBody::encode(['chunk' => $chunk], $p) . $p->packNil(),
+            'chunk nil' => $p->packArrayLen(1) . $p->packNil(),
+        ] as $why => $bytes) {
+            try {
+                HttpBody::decode($bytes, $p);
+                $this->fail("accepted: {$why}");
+            } catch (CodecException) {
+                $this->addToAssertionCount(1);
+            }
+        }
     }
 
     public function testTheCauseVocabularyIsGeneratedAndClosed(): void

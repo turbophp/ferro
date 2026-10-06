@@ -142,3 +142,47 @@ pub fn hello_ack_frame(
         payload: payload.into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SPEC §23.5 / §22.2 (cy): `feature_engine::HTTP` means "this engine SERVES Ferro HTTP", and
+    /// nothing in this build does, so no configuration may advertise it. Asserted over every input
+    /// `hello_ack_frame` takes — not only the default one an e2e test happens to run — and as
+    /// "nothing but the bits those inputs control", so a coupling of ANY other bit to the manifest
+    /// or memfd path fails here.
+    #[test]
+    fn hello_ack_advertises_only_the_bits_its_inputs_control() {
+        let controlled = u32::from(feature_engine::MANIFEST) | u32::from(feature_engine::MEMFD);
+        for manifest_loaded in [false, true] {
+            for memfd_enabled in [false, true] {
+                let frame =
+                    hello_ack_frame(7, BootEpoch(1), Vec::new(), manifest_loaded, memfd_enabled);
+                let ack = HelloAck::decode(&frame.payload).expect("HELLO_ACK decodes");
+                let case =
+                    format!("manifest_loaded={manifest_loaded} memfd_enabled={memfd_enabled}");
+                assert_eq!(
+                    ack.features & u32::from(feature_engine::HTTP),
+                    0,
+                    "{case}: HTTP advertised"
+                );
+                assert_eq!(
+                    ack.features & !controlled,
+                    0,
+                    "{case}: an uncontrolled bit is set"
+                );
+                assert_eq!(
+                    ack.features & u32::from(feature_engine::MANIFEST) != 0,
+                    manifest_loaded,
+                    "{case}"
+                );
+                assert_eq!(
+                    ack.features & u32::from(feature_engine::MEMFD) != 0,
+                    memfd_enabled,
+                    "{case}"
+                );
+            }
+        }
+    }
+}

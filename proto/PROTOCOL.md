@@ -854,7 +854,7 @@ A positional fixarray of 6:
 | 2 | `version` | `u8` | `10`, `11` or `20` |
 | 3 | `reason` | `bin \| nil` | the HTTP/1.x reason phrase as received; `nil` on HTTP/2 |
 | 4 | `headers` | `array<[str, bin]>` | as received, minus hop-by-hop, plus SPEC §23.9.2's changes; names lowercase |
-| 5 | `decoded` | `[str, u64 \| nil] \| nil` | when the engine decoded the body: the `Content-Encoding` it removed and the `Content-Length` it removed with it. The length is bounded < 2^63 (a native PHP int, §2); the engine sends `nil` for one it cannot represent so |
+| 5 | `decoded` | `[str, u64 \| nil] \| nil` | when the engine decoded the body: the `Content-Encoding` it removed and the `Content-Length` it removed with it. The length is bounded < 2^63 (a native PHP int, §2), STRUCTURALLY: the encoder writes `nil` for one it cannot represent so, and both decoders refuse one ≥ 2^63 on the wire |
 | 6 | `idempotent` | `bool` | the engine's EFFECTIVE idempotency (SPEC §23.7.2) — the authority a client classifies against after `HEAD` (SPEC §23.7.3) |
 
 ### 12.3 `HttpBody` (service `HTTP`, method `BODY` = 3) — server → client, flag `STREAM`
@@ -892,7 +892,7 @@ spec's list):
 
 - `http_request_get` — the smallest real request: every optional field `nil`, so each nil arm is
   locked.
-- `http_request_post` — every field set, each to a distinct value: a body whose first byte is the
+- `http_request_post` — every field set, each distinct from every other field of its type (the six strings, the three timeouts, the two bools — `idempotent` true, `decode` false): a body whose first byte is the
   `0xc0` nil marker (a `bin` that must not be read as `nil`), a header value carrying `0x80`, a
   `read_timeout_ms` past u16, and the W3C specification's example `traceparent`.
 - `http_head` — HTTP/1.1, a reason phrase, a non-UTF-8 header value, `decoded = ["gzip", 70000]`.
@@ -917,7 +917,9 @@ compared against its vector's NAMED fields — a fixpoint alone passes a symmetr
 On service `HTTP`, `ErrorPayload.detail` is exactly one token of `[http.causes]` (`/proto/errors.toml`,
 SPEC §23.5.6) — 45 tokens, generated into both codecs as `consts::http_cause::*` (+ `ALL`) and
 `Constants::HTTP_CAUSE_*` (+ `HTTP_CAUSES`); the registry table maps each constant NAME to its
-token, and the name must be the token upper-cased. A Guzzle handler picks its exception class by
+token, the name must be the token upper-cased, and a token is `[a-z][a-z0-9_]*` (one rule, shared
+by the registry parser and `build.rs`, copied in `gen-php.php`, and held to the shared fixture
+`proto/tools/http-causes-shape-cases.json` in both languages). A Guzzle handler picks its exception class by
 the cause (SPEC §23.11.3), which `message` must never be used for. The registry's table is checked
 against SPEC §23.5.6's own table by `registry_sync.rs::http_causes_are_exactly_the_spec_table`.
 `detail` is `nil` on exactly two HTTP terminals, neither of which is an exchange fate: `Protocol`

@@ -1,7 +1,11 @@
 <?php // /proto/tools/gen-php.php — reads registry.lock.json, emits Generated/Constants.php
 declare(strict_types=1);
 $root = dirname(__DIR__, 2);
-$raw = (string) file_get_contents("$root/proto/registry.lock.json");
+// Optional arguments `[lock path] [output dir]` exist for ONE caller: the shape-rule agreement test
+// (php/client HttpCausesShapeRuleTest), which runs this generator against fixture locks. With no
+// arguments it reads the committed lock and writes the committed Constants.php, as it always has.
+$lockPath = $argv[1] ?? "$root/proto/registry.lock.json";
+$raw = (string) file_get_contents($lockPath);
 $lock = json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
 
 /**
@@ -81,8 +85,12 @@ if (!is_array($causes) || $causes === []) {
 }
 $seen = [];
 foreach ($causes as $name => $token) {
-    if (!is_string($token) || !preg_match('/^[a-z0-9_]+$/', $token) || $name !== strtoupper($token)
-        || isset($seen[$token])) {
+    // The PHP copy of ferro-proto's `src/http_causes_rule.rs`; the shared fixture
+    // proto/tools/http-causes-shape-cases.json holds both to the same verdicts. `/D` so `$` does not
+    // match before a trailing newline; `(string) $name` because json_decode turns a digit-only key
+    // into an int (such a key is refused anyway: a token starts with a letter).
+    if (!is_string($token) || preg_match('/^[a-z][a-z0-9_]*$/D', $token) !== 1
+        || (string) $name !== strtoupper($token) || isset($seen[$token])) {
         fwrite(STDERR, "registry.lock.json http.causes: {$name} breaks the shape rule\n");
         exit(1);
     }
@@ -95,7 +103,7 @@ $out .= "    ];\n";
 $out .= "\n";
 $out .= "    public const TYPE_REGISTRY_HASH = '" . $fnv1a64_hex($raw) . "';\n";
 $out .= "}\n";
-$dir = "$root/php/client/src/Protocol/Generated";
+$dir = $argv[2] ?? "$root/php/client/src/Protocol/Generated";
 @mkdir($dir, 0777, true);
 file_put_contents("$dir/Constants.php", $out);
 fwrite(STDERR, "wrote $dir/Constants.php\n");

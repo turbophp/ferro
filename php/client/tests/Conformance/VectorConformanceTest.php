@@ -164,7 +164,33 @@ final class VectorConformanceTest extends TestCase
         }
         $off = 0;
         $ext = (new ExtPacker())->unpack($payload, $off);
-        $this->assertEquals(json_encode($pure), json_encode($ext), "ext vs pure decode for {$v['name']}");
+        // `serialize()`, not `json_encode()`: json_encode returns FALSE for any value holding a
+        // non-UTF-8 string, so every vector carrying a `bin` such as 0xc0/0x80/0xff (HTTP's, and
+        // `sql_exec_response_typedvalue`/`stream_data_rows` before them) compared false == false
+        // and passed whatever ext-msgpack decoded (M6-F2 review F-a). serialize() is exact on
+        // bytes, int-vs-float and key order.
+        $this->assertSame(self::canonical($pure), self::canonical($ext), "ext vs pure decode for {$v['name']}");
+    }
+
+    /**
+     * The comparator {@see testExtPackerDecodeMatchesPureWhenLoaded} uses, pinned to be NON-VACUOUS on
+     * exactly the values the old one was blind to — so this holds even where ext-msgpack is absent
+     * (it is in this container; CI provisions it).
+     */
+    public function testTheExtVsPureComparatorSeesNonUtf8Bytes(): void
+    {
+        $a = ['x', "\xc0\x00", 1];
+        $b = ['x', "\xc0\x01", 1];
+        $this->assertFalse(json_encode($a), 'the old comparator: json_encode gives up on these');
+        $this->assertSame(json_encode($a), json_encode($b), 'the old comparator called these equal');
+        $this->assertNotSame(self::canonical($a), self::canonical($b));
+        $this->assertNotSame(self::canonical([1]), self::canonical([1.0]), 'int vs float is a difference');
+        $this->assertSame(self::canonical($a), self::canonical(['x', "\xc0\x00", 1]));
+    }
+
+    private static function canonical(mixed $v): string
+    {
+        return serialize($v);
     }
 
     /** @return iterable<string, array{0:array<string,mixed>}> only the SQL EXEC vectors (Task S5). */

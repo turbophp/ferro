@@ -24,7 +24,9 @@ use rmp::decode as dec;
 use rmp::encode as enc;
 
 /// `u64` statistics and lengths on this service are contractually bounded below 2^63, so the PHP
-/// client reads them as native ints (`/proto/PROTOCOL.md` §2). A debug-only tripwire, as on `Stats`.
+/// client reads them as native ints (`/proto/PROTOCOL.md` §2): a debug-only tripwire on `HttpStats`
+/// (as on `Stats` — engine-measured counts), and a structural clamp on `HttpDecoded.content_length`
+/// (an UPSTREAM's number, which no producer can promise).
 const U64_WIRE_BOUND: u64 = 1 << 63;
 
 /// One header line: `[name: str, value: bin]`. A list of these, in wire order, is how every header
@@ -164,13 +166,12 @@ impl HttpHead {
         match &self.decoded {
             None => enc::write_nil(&mut out).unwrap(),
             Some(d) => {
-                debug_assert!(
-                    d.content_length.is_none_or(|n| n < U64_WIRE_BOUND),
-                    "HttpDecoded.content_length is contractually bounded < 2^63; got {d:?}"
-                );
                 enc::write_array_len(&mut out, 2).unwrap();
                 enc::write_str(&mut out, &d.content_encoding).unwrap();
-                match d.content_length {
+                // STRUCTURAL, not a producer promise: a length the PHP client could not hold as a
+                // native int (>= 2^63) is written as `nil` — "not representable" — so no upstream's
+                // `Content-Length` can make a client refuse the whole HEAD (§22.2 (cy) item 5).
+                match d.content_length.filter(|&n| n < U64_WIRE_BOUND) {
                     None => enc::write_nil(&mut out).unwrap(),
                     Some(n) => {
                         enc::write_uint(&mut out, n).unwrap();
@@ -199,9 +200,17 @@ impl HttpHead {
             let content_length = if peek_nil(&mut rd)? {
                 None
             } else {
-                Some(dec::read_int::<u64, _>(&mut rd).map_err(|e| {
+                let n = dec::read_int::<u64, _>(&mut rd).map_err(|e| {
                     CodecError::Malformed(format!("HttpHead content_length: {e:?}"))
-                })?)
+                })?;
+                // The encoder never writes one (it writes `nil`), and PHP refuses one: refuse it
+                // here too, so the two decoders agree on what a well-formed HEAD is.
+                if n >= U64_WIRE_BOUND {
+                    return Err(CodecError::Malformed(format!(
+                        "HttpHead content_length {n} is not below 2^63"
+                    )));
+                }
+                Some(n)
             };
             Some(HttpDecoded {
                 content_encoding,
@@ -578,6 +587,98 @@ mod tests {
             assert_eq!(b[0], 0x96, "HttpHead is a fixarray(6)");
             assert_eq!(HttpHead::decode(&b).unwrap(), head);
         }
+    }
+
+    fn head_bytes(status: u64, version: u64, tail: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut b = Vec::new();
+        enc::write_array_len(&mut b, 6).unwrap();
+        enc::write_uint(&mut b, status).unwrap();
+        enc::write_uint(&mut b, version).unwrap();
+        enc::write_nil(&mut b).unwrap();
+        enc::write_array_len(&mut b, 0).unwrap();
+        tail(&mut b);
+        b
+    }
+
+    fn plain_tail(b: &mut Vec<u8>) {
+        enc::write_nil(b).unwrap();
+        enc::write_bool(b, false).unwrap();
+    }
+
+    #[test]
+    fn a_version_that_does_not_fit_u8_is_refused() {
+        let ok = head_bytes(200, 255, plain_tail);
+        assert_eq!(
+            HttpHead::decode(&ok).unwrap().version,
+            255,
+            "the control: u8::MAX fits"
+        );
+        assert!(matches!(
+            HttpHead::decode(&head_bytes(200, 256, plain_tail)),
+            Err(CodecError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn head_and_body_refuse_trailing_bytes() {
+        let mut head = head_bytes(200, 11, plain_tail);
+        assert!(HttpHead::decode(&head).is_ok(), "the control");
+        head.push(0xc0);
+        assert!(matches!(
+            HttpHead::decode(&head),
+            Err(CodecError::TrailingBytes(1))
+        ));
+        let mut body = HttpBody { chunk: vec![1] }.encode();
+        body.push(0xc0);
+        assert!(matches!(
+            HttpBody::decode(&body),
+            Err(CodecError::TrailingBytes(1))
+        ));
+    }
+
+    #[test]
+    fn a_content_length_past_2_63_is_written_as_nil_and_refused_on_decode() {
+        let head = |content_length| HttpHead {
+            status: 200,
+            version: 11,
+            reason: None,
+            headers: vec![],
+            decoded: Some(HttpDecoded {
+                content_encoding: "gzip".into(),
+                content_length,
+            }),
+            idempotent: false,
+        };
+        let length_back = |n| {
+            HttpHead::decode(&head(Some(n)).encode())
+                .unwrap()
+                .decoded
+                .unwrap()
+                .content_length
+        };
+        for n in [U64_WIRE_BOUND, u64::MAX] {
+            assert_eq!(
+                length_back(n),
+                None,
+                "{n} is not representable: written as nil"
+            );
+        }
+        assert_eq!(
+            length_back(U64_WIRE_BOUND - 1),
+            Some(U64_WIRE_BOUND - 1),
+            "the control: 2^63 - 1 survives"
+        );
+        // A hand-built wire value of 2^63 is refused, as PHP refuses it.
+        let wire = head_bytes(200, 11, |b| {
+            enc::write_array_len(b, 2).unwrap();
+            enc::write_str(b, "gzip").unwrap();
+            enc::write_uint(b, U64_WIRE_BOUND).unwrap();
+            enc::write_bool(b, false).unwrap();
+        });
+        assert!(matches!(
+            HttpHead::decode(&wire),
+            Err(CodecError::Malformed(_))
+        ));
     }
 
     #[test]

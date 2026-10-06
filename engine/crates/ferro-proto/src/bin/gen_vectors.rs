@@ -1171,7 +1171,11 @@ fn http_vectors() {
     );
     // Every field set: a body whose first byte is the 0xc0 nil marker (a `bin` that must not be
     // read as `nil`), a header value carrying 0x80 (not UTF-8, so it must ride `bin`), a read
-    // timeout past u16 (uint32 width), and the W3C specification's own example traceparent.
+    // timeout past u16 (uint32 width), and the W3C specification's own example traceparent. Every
+    // field of a given type holds a DISTINCT value — the six strings, the three timeouts, and the
+    // two bools (`idempotent` true, `decode` false) — so a swap of two same-typed fields moves the
+    // decoded message (a review finding: both bools were once false, so a swap of those two was
+    // invisible here and caught only by `http_request_get`).
     write_http_request(
         "http_request_post",
         61,
@@ -1189,7 +1193,7 @@ fn http_vectors() {
             timeout_ms: Some(30_000),
             connect_timeout_ms: Some(2_000),
             read_timeout_ms: Some(70_000),
-            idempotent: Some(false),
+            idempotent: Some(true),
             decode: false,
             route: Some("/v1/charges".into()),
             traceparent: Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".into()),
@@ -1325,7 +1329,7 @@ fn http_vectors() {
         http_error(
             errc::FORBIDDEN,
             errc::FORBIDDEN_BRANCH,
-            "request refused by the upstream's policy",
+            "request refused by the engine's policy for this upstream",
             http_cause::FORBIDDEN_TARGET,
             None,
         ),

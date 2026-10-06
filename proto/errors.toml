@@ -121,8 +121,10 @@ branch = 3
 #
 # Shape: `KEY = "token"`, where the KEY is the constant's name and the VALUE is the wire token. The
 # key MUST be the token upper-cased — `Registry::from_toml_dir` and both generators refuse anything
-# else — so the table cannot drift into two spellings of one cause. A token is lowercase ASCII
-# letters, digits and `_`, and appears once. The table is unordered on the wire; it is grouped here by
+# else — so the table cannot drift into two spellings of one cause. A token is a lowercase ASCII
+# letter followed by lowercase ASCII letters, digits and `_`, appears once, and the table is not
+# empty (the rule: ferro-proto `src/http_causes_rule.rs`; its PHP copy in `tools/gen-php.php`; both
+# held to `tools/http-causes-shape-cases.json`). The table is unordered on the wire; it is grouped here by
 # §23.5.6's phase only to make review easier, and a token named in two phases there (`deadline`,
 # `timeout`, `cancelled`) is listed once, at its first group.
 [http.causes]
