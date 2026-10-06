@@ -27,6 +27,13 @@ final class ReconnectLiveTest extends LaravelLiveTestCase
 {
     private DatabaseManager $db;
 
+    protected function tearDown(): void
+    {
+        // Released before the parent stops ferrod, so an idle session does not hold the drain.
+        unset($this->db);
+        parent::tearDown();
+    }
+
     /** A connection named `ferro` from a real `DatabaseManager`, with the contact assertion. */
     private function managed(): FerroPostgresConnection
     {

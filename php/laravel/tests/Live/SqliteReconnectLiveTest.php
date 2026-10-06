@@ -21,6 +21,13 @@ final class SqliteReconnectLiveTest extends SqliteLiveTestCase
 {
     private DatabaseManager $db;
 
+    protected function tearDown(): void
+    {
+        // Released before the parent stops ferrod, so an idle session does not hold the drain.
+        unset($this->db);
+        parent::tearDown();
+    }
+
     private function managed(): FerroSQLiteConnection
     {
         FerroConnections::register();
