@@ -16,4 +16,11 @@ interface SelectableTransportInterface extends TransportInterface
      * uses it as the session's deadline, so a silent peer fails as soon as it would synchronously.
      */
     public function readTimeout(): float;
+
+    /**
+     * Set how long the NEXT reads wait, in seconds (M3-D1c): a request deadline nearer than the
+     * read timeout shortens the wait so the session can act on it. {@see readTimeout} still reports
+     * the configured value.
+     */
+    public function setReadWait(float $seconds): void;
 }

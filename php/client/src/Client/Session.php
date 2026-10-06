@@ -149,6 +149,40 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     private array $discarded = [];
 
     /**
+     * M3-D1c liveness: the id of the PING sent when a read waited its whole timeout in silence, and
+     * when it was sent. Silence is not failure — a statement may simply take longer than the read
+     * timeout — so the session asks the engine whether it is still there instead of giving up. Only
+     * a second full timeout with no reply to that PING closes the session.
+     */
+    private ?int $probeRid = null;
+
+    private float $probeSentAt = 0.0;
+
+    /** When the last whole frame was read off the wire (M3-D1c review F6), for {@see onSilence}. */
+    private float $lastFrameAt = 0.0;
+
+    /**
+     * M3-D1c per-request deadlines, as absolute `microtime(true)` values ({@see setDeadline}). When
+     * one passes, the request is CANCELled ({@see enforceDeadlines}) and its deadline moves out by
+     * one read timeout of grace for the engine's terminal; if that passes too the session closes.
+     *
+     * @var array<int, float>
+     */
+    private array $deadlines = [];
+
+    /** @var array<int, true> requests already CANCELled for their deadline */
+    private array $deadlineCancelled = [];
+
+    /**
+     * The header of a frame whose payload read timed out (M3-D1c): the next read resumes with its
+     * payload, so a timeout between the two reads never puts the stream out of step.
+     */
+    private ?Header $partialHeader = null;
+
+    /** See {@see setRequestTimeout}. */
+    private ?float $requestTimeout = null;
+
+    /**
      * @param int $maxInFlight the most requests this session keeps in flight at once. At the limit,
      *                         {@see submit} reads frames until a terminal frees a slot before it
      *                         writes. It must stay below the engine's own per-session limit
@@ -241,7 +275,42 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
      */
     public function sendRequest(int $service, int $method, string $payload): Outcome
     {
-        return $this->awaitTerminal($this->submit($service, $method, $payload));
+        $rid = $this->submit($service, $method, $payload);
+        if ($service === C::SERVICE_SQL && $method === C::METHOD_SQL_EXEC) {
+            $this->armRequestTimeout($rid);
+        }
+        return $this->awaitTerminal($rid);
+    }
+
+    /**
+     * Give every buffered SQL EXEC a deadline this long after it is sent (M3-D1c), or none. Set by
+     * `Ferro::connect(statementTimeout: …)` as the statement timeout plus a margin: the engine
+     * enforces the statement timeout itself (`timeout_ms`, which bounds the wait for a pooled
+     * connection as well as the statement) and answers; this is the client's backstop for an engine
+     * that does not.
+     *
+     * **Only a buffered SQL EXEC is given one** (M3-D1c review F1), because only an EXEC carries
+     * `timeout_ms` and has a handler that acts on a CANCEL. Transaction control (BEGIN, COMMIT,
+     * ROLLBACK, savepoints) and admin requests carry no timeout and their handlers ignore a CANCEL,
+     * so a backstop there could only end in closing the session — and a slow COMMIT that then
+     * committed would have been reported `Indeterminate` with every other request on the socket.
+     * Nor is a stream (review F5): it is not sent `timeout_ms` either, and is bounded only by the
+     * transport's liveness rule while the caller consumes it.
+     */
+    public function setRequestTimeout(?float $seconds): void
+    {
+        $this->requestTimeout = $seconds;
+    }
+
+    /**
+     * Arm {@see setRequestTimeout}'s deadline on a just-submitted request, if one is configured.
+     * The caller vouches that the request is a buffered SQL EXEC (see {@see setRequestTimeout}).
+     */
+    public function armRequestTimeout(int $requestId): void
+    {
+        if ($this->requestTimeout !== null) {
+            $this->setDeadline($requestId, microtime(true) + $this->requestTimeout);
+        }
     }
 
     /**
@@ -261,7 +330,12 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             // This request has not been written: whatever goes wrong while waiting for a slot, it
             // cannot have executed, so every failure here is `requestNotSent` (the C1e-3 rule).
             try {
-                $this->pump();
+                $this->enforceDeadlines();
+                if ($this->poisoned === null) {
+                    $this->pump($this->nearestDeadline());
+                }
+            } catch (DeadlineSignal) {
+                continue; // another request's deadline: acted on at the top of the next pass
             } catch (TransportException $e) {
                 throw $e->requestUnsent() ? $e : TransportException::requestNotSent(
                     'not sent: the session failed while this request waited for an in-flight slot ('
@@ -314,7 +388,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
      */
     public function discard(int $requestId): void
     {
-        unset($this->inbox[$requestId]);
+        unset($this->inbox[$requestId], $this->deadlines[$requestId], $this->deadlineCancelled[$requestId]);
         if (isset($this->inFlight[$requestId])) {
             $this->discarded[$requestId] = true;
         }
@@ -363,7 +437,12 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             return;
         }
         try {
-            $this->pump();
+            $this->enforceDeadlines();
+            if ($this->poisoned === null) {
+                $this->pump($this->nearestDeadline());
+            }
+        } catch (DeadlineSignal) {
+            $this->enforceDeadlines();
         } catch (TransportException | ProtocolException) {
             // `pump` has already poisoned the session (or recorded a fatal before EOF): every
             // pending request is now ready, and fails at its own await.
@@ -620,8 +699,14 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
                 throw new TransportException('the session closed while this request was in flight ('
                     . $this->poisoned . ')');
             }
+            $this->enforceDeadlines();
+            if ($this->poisoned !== null) {
+                continue; // a deadline's grace ran out: the branches above fail this request
+            }
             try {
-                $this->pump();
+                $this->pump($this->nearestDeadline());
+            } catch (DeadlineSignal) {
+                continue; // a deadline was reached: act on it at the top of the loop
             } catch (TransportException $e) {
                 if ($this->fatal === null) {
                     throw $e;
@@ -640,11 +725,22 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
      * nothing later can be trusted: the session is poisoned. A session-fatal `request_id=0`
      * terminal is recorded so that every pending request fails with it.
      */
-    private function pump(): void
+    private function pump(?float $until = null): void
     {
-        [$header, $body] = $this->readFrame();
+        [$header, $body] = $this->readFrame($until);
         $rid = $header->requestId;
         $isEnd = ($header->flags & C::FLAG_END) !== 0;
+
+        if ($this->probeRid !== null && $rid === $this->probeRid) {
+            // The answer to a liveness PING (M3-D1c): the engine is there.
+            if ($header->service !== C::SERVICE_CORE || $header->method !== C::METHOD_CORE_PONG || $isEnd) {
+                $error = new ProtocolException(sprintf('expected the liveness PONG on request_id %d', $rid));
+                $this->poison(new TransportException($error->getMessage()));
+                throw $error;
+            }
+            $this->probeRid = null;
+            return;
+        }
 
         if ($rid === 0) {
             // Record it and keep reading: the engine drains every in-flight request's own terminal
@@ -654,7 +750,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         }
         if (isset($this->discarded[$rid])) {
             if ($isEnd) {
-                unset($this->discarded[$rid], $this->inFlight[$rid]);
+                unset($this->discarded[$rid], $this->inFlight[$rid], $this->deadlines[$rid], $this->deadlineCancelled[$rid]);
             }
             return;
         }
@@ -671,7 +767,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             throw $error;
         }
         if ($isEnd) {
-            unset($this->inFlight[$rid]);
+            unset($this->inFlight[$rid], $this->deadlines[$rid], $this->deadlineCancelled[$rid]);
         }
         $this->inbox[$rid][] = [$header, $body];
     }
@@ -699,7 +795,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     {
         do {
             $rid = $this->ids->next();
-        } while ($this->isPending($rid));
+        } while ($this->isPending($rid) || $rid === $this->probeRid);
         return $rid;
     }
 
@@ -730,34 +826,192 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     }
 
     /**
+     * Read one frame. With a selectable transport, a read that waits its whole timeout in silence
+     * does not fail the session (M3-D1c): the session probes liveness with a PING
+     * ({@see onSilence}) and reads on, and only a second silent timeout after that PING closes it.
+     * With `$until` (an absolute deadline), the wait is shortened to it, and reaching it raises
+     * {@see DeadlineSignal} for the caller to act on — nothing has been lost, the stream is in step.
+     *
      * @return array{0:Header,1:string} the decoded header + its exact-length payload. An `OOB_FD`
      *   frame (M3-D3) is returned as the frame it stands for: its payload read from the memfd, and a
      *   header carrying that payload's length and no `OOB_FD`, so nothing above this method can tell
      *   the two paths apart.
      */
-    private function readFrame(): array
+    private function readFrame(?float $until = null): array
     {
         try {
-            $head = $this->transport->readExact(16);
-            $header = Header::decode($head);
-            $payload = $header->payloadLen > 0 ? $this->transport->readExact($header->payloadLen) : '';
-            if (($header->flags & C::FLAG_OOB_FD) !== 0) {
-                [$header, $payload] = $this->resolveOob($header, $payload);
+            return $this->readFrameWithin($until);
+        } finally {
+            // A deadline-shortened wait never outlives this read (M3-D1c review F2): the transport
+            // re-applies its full timeout before every write as well, because PHP's socket stream
+            // bounds writes with the same timeout.
+            if ($until !== null && $this->transport instanceof SelectableTransportInterface) {
+                $this->transport->setReadWait($this->transport->readTimeout());
             }
-        } catch (CodecException $e) {
-            // An undecodable header (bad magic, version, oversized length) leaves the stream at an
-            // unknown offset: every later read would be out of step. It is a desync, so the session
-            // is poisoned and the fault is a ProtocolException, which the router's callers handle
-            // (M3-D1b review F4: a raw CodecException escaped Ferro\Loop past every task's catch).
-            $this->poison(new TransportException('undecodable frame: ' . $e->getMessage()));
-            throw new ProtocolException('undecodable frame: ' . $e->getMessage(), 0, $e);
-        } catch (TransportException $e) {
-            // The request (if any) WAS fully written, so its fate is the caller's to classify; the
-            // session is unusable either way, because what is left unread is unknown.
+        }
+    }
+
+    /** @return array{0:Header,1:string} */
+    private function readFrameWithin(?float $until): array
+    {
+        while (true) {
+            $live = $this->transport instanceof SelectableTransportInterface;
+            if ($live) {
+                $wait = $this->transport->readTimeout();
+                if ($until !== null) {
+                    $wait = min($wait, max($until - microtime(true), 0.001));
+                }
+                $this->transport->setReadWait($wait);
+            }
+            try {
+                $this->partialHeader ??= Header::decode($this->transport->readExact(16));
+                $header = $this->partialHeader;
+                $payload = $header->payloadLen > 0 ? $this->transport->readExact($header->payloadLen) : '';
+                $this->partialHeader = null;
+                if (($header->flags & C::FLAG_OOB_FD) !== 0) {
+                    // M3-D3: the frame it stands for. Inside this `try`, so a disagreement about the
+                    // OOB frame is the desync below. Its fd was queued by the transport no later
+                    // than the payload just read, even if an earlier read of this frame timed out.
+                    [$header, $payload] = $this->resolveOob($header, $payload);
+                }
+                $this->lastFrameAt = microtime(true);
+                return [$header, $payload];
+            } catch (CodecException $e) {
+                // An undecodable header (bad magic, version, oversized length) leaves the stream at an
+                // unknown offset: every later read would be out of step. It is a desync, so the session
+                // is poisoned and the fault is a ProtocolException, which the router's callers handle
+                // (M3-D1b review F4: a raw CodecException escaped Ferro\Loop past every task's catch).
+                $this->poison(new TransportException('undecodable frame: ' . $e->getMessage()));
+                throw new ProtocolException('undecodable frame: ' . $e->getMessage(), 0, $e);
+            } catch (TransportException $e) {
+                if ($live && $e->isReadTimeout()) {
+                    if ($until !== null && microtime(true) >= $until) {
+                        throw new DeadlineSignal();
+                    }
+                    $this->onSilence(); // probes, or closes the session after an unanswered probe
+                    continue;
+                }
+                // The request (if any) WAS fully written, so its fate is the caller's to classify; the
+                // session is unusable either way, because what is left unread is unknown.
+                $this->poison($e);
+                throw $e;
+            }
+        }
+    }
+
+    /**
+     * A read waited its whole timeout and nothing arrived (M3-D1c). The first time, send a liveness
+     * PING and keep waiting; if a PING is already out and has gone unanswered for a whole read
+     * timeout, the engine (or the link) is gone: close the session, which fails every pending
+     * request as sent-and-lost.
+     */
+    private function onSilence(): void
+    {
+        $timeout = $this->transport instanceof SelectableTransportInterface ? $this->transport->readTimeout() : 0.0;
+        if ($this->fatal !== null) {
+            // The engine said the session is over and promised to close it; a PING cannot be sent
+            // (nothing is, after a fatal) and silence this long means the close never came.
+            $e = new TransportException('the engine ended the session (' . $this->fatal . ') and then went silent');
             $this->poison($e);
             throw $e;
         }
-        return [$header, $payload];
+        if ($this->probeRid !== null) {
+            // The engine is judged dead only if NOTHING arrived since the PING went out (M3-D1c
+            // review F6): a frame read after it — the PONG may legally follow a slow request's
+            // terminal — proves it alive, so the clock restarts from that frame.
+            $since = max($this->probeSentAt, $this->lastFrameAt);
+            if (microtime(true) - $since >= $timeout) {
+                $e = new TransportException(sprintf(
+                    'the engine sent nothing for %.1f s and did not answer a liveness PING',
+                    microtime(true) - $since + $timeout,
+                ));
+                $this->poison($e);
+                throw $e;
+            }
+            return;
+        }
+        $rid = $this->nextFreeId();
+        $payload = Message::encode('ping', ['token' => $rid], $this->encodePacker);
+        $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_PING, $payload, $rid);
+        $this->probeRid = $rid;
+        $this->probeSentAt = microtime(true);
+    }
+
+    /**
+     * Give request `$requestId` an absolute deadline (`microtime(true)`, M3-D1c). Past it the
+     * request is CANCELled — only that request; the session and every other request carry on — and
+     * the engine's terminal decides its fate (a cancelled write is `Indeterminate`, as the engine's
+     * own §19.3 matrix says). If the engine does not answer within one more read timeout, the
+     * session is closed.
+     */
+    public function setDeadline(int $requestId, float $at): void
+    {
+        if (isset($this->inFlight[$requestId])) {
+            $this->deadlines[$requestId] = $at;
+        }
+    }
+
+    /**
+     * Non-blocking liveness probe for a scheduler that selects instead of reading (M3-D1c): the
+     * session has been silent for a whole read timeout, so PING it — or, if a PING is already out
+     * and unanswered for that long, close it. A failure is recorded on the session, never thrown,
+     * like {@see pollOnce}.
+     */
+    public function probeLiveness(): void
+    {
+        if ($this->poisoned !== null || $this->inFlight === []) {
+            return;
+        }
+        try {
+            $this->onSilence();
+        } catch (TransportException) {
+            // poisoned: every pending request is now ready, and fails at its own await
+        }
+    }
+
+    /** The nearest pending request deadline, or null. */
+    public function nearestDeadline(): ?float
+    {
+        return $this->deadlines === [] ? null : min($this->deadlines);
+    }
+
+    /**
+     * Act on every deadline that has passed: CANCEL once, then close the session after the grace.
+     *
+     * **Never throws** (M3-D1c review F4). A CANCEL that cannot be written means the link is gone:
+     * the write failure has already closed the session, and every request in flight on it — each
+     * one completely written — then fails at its own await as sent-and-lost, with its own fate. A
+     * throw here used to escape {@see \Ferro\Loop::run} past every task's catch, abandoning every
+     * other task mid-await. After a session-fatal terminal nothing is sent at all, so there is
+     * nothing to CANCEL with: the engine is draining every request's own terminal before it closes.
+     */
+    public function enforceDeadlines(): void
+    {
+        if ($this->poisoned !== null || $this->fatal !== null) {
+            return;
+        }
+        $now = microtime(true);
+        foreach ($this->deadlines as $rid => $at) {
+            if ($now < $at) {
+                continue;
+            }
+            if (!isset($this->deadlineCancelled[$rid])) {
+                $this->deadlineCancelled[$rid] = true;
+                $grace = $this->transport instanceof SelectableTransportInterface ? $this->transport->readTimeout() : 0.0;
+                $this->deadlines[$rid] = $now + $grace;
+                try {
+                    $this->sendCancel($rid);
+                } catch (TransportException) {
+                    return; // `writeFrame` closed the session: see the docblock
+                }
+                continue;
+            }
+            $e = new TransportException(sprintf(
+                'request %d passed its deadline and the engine did not answer its CANCEL', $rid,
+            ));
+            $this->poison($e);
+            return;
+        }
     }
 
     /**

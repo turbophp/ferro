@@ -13,13 +13,16 @@ use Ferro\Manifest;
  * **M3-D2e, live: queries by id, and SPEC §9.2's one licence to re-send a write whose fate is
  * unknown, against a real `ferrod` with `FERRO_MANIFEST` and a real PostgreSQL.**
  *
- * The chaos shape: the client's read timeout is 0.5 s and the statement's FIRST execution sleeps
- * 1 s, so the reply is lost AFTER the request was sent — the `Indeterminate` case. Only the first
- * execution sleeps: the sleep is gated on a SEQUENCE, which is non-transactional, so a re-send sees
- * the counter already moved and runs at once, and the counter afterwards says exactly how many times
- * the engine was asked to run the statement. The loss is a link cut on the client's side (the read
- * deadline closes the socket), the same fate class as a daemon restart: the request was written and
- * its answer never came.
+ * The chaos shape: the statement timeout is 0.5 s and the statement's FIRST execution sleeps 1 s,
+ * so the engine cancels it after it was sent and answers `WriteUnconfirmed` — the `Indeterminate`
+ * case, declared by the engine. Only the first execution sleeps: the sleep is gated on a SEQUENCE,
+ * which is non-transactional, so a re-send sees the counter already moved and runs at once, and the
+ * counter afterwards says exactly how many times the engine was asked to run the statement.
+ *
+ * Until M3-D1c the loss was a client-side link cut instead: a 0.5 s READ timeout closed the socket
+ * mid-statement. D1c made a read timeout a liveness probe rather than a failure — a 1 s statement
+ * under a 0.5 s read timeout now simply succeeds — so the shape moved to the engine-declared half of
+ * the same licence, which the client treats identically (SPEC §22.2 (co), (cp)).
  */
 final class ManifestLiveTest extends LiveTestCase
 {
@@ -71,9 +74,9 @@ final class ManifestLiveTest extends LiveTestCase
         }
     }
 
-    private function withManifest(float $ioTimeout = 5.0, ?RetryPolicy $policy = null): \Ferro\Client\Connection
+    private function withManifest(?float $statementTimeout = null, ?RetryPolicy $policy = null): \Ferro\Client\Connection
     {
-        return Ferro::connect($this->socketPath, 'default', 2.0, $ioTimeout, $policy, manifest: Manifest::fromFile($this->manifestPath));
+        return Ferro::connect($this->socketPath, 'default', 2.0, 5.0, $policy, statementTimeout: $statementTimeout, manifest: Manifest::fromFile($this->manifestPath));
     }
 
     /** @return int how many times the engine was asked to run the statement */
@@ -98,17 +101,17 @@ final class ManifestLiveTest extends LiveTestCase
     public function testALostIdempotentWriteIsResentAndAppliedOnce(): void
     {
         $this->setUpTables();
-        $c = $this->withManifest(ioTimeout: 0.5);
+        $c = $this->withManifest(statementTimeout: 0.5);
         $this->assertSame(1, $c->execById('kv.put', [7, 'seven']));
 
         $this->assertSame(2, $this->attempts('d2e_put_attempts'), 'sent twice: the loss, then the licensed re-send');
         $check = $this->connectConnection();
         $this->assertSame(1, (int) $check->scalar('SELECT count(*) FROM d2e_kv WHERE k = 7', []));
         $this->assertSame('seven', $check->scalar('SELECT v FROM d2e_kv WHERE k = 7', []));
-        // Two sends, ONE application: the first send's statement was cancelled by `ferrod` when the
-        // client's read deadline closed the socket mid-sleep, so the licensed re-send is the only
-        // one that applied. (Had it applied too, the declared-idempotent upsert would still leave
-        // one row — which is why the licence is safe — but `hits` would read 2.)
+        // Two sends, ONE application: the first send's statement was cancelled by `ferrod` at its
+        // statement timeout mid-sleep, so the licensed re-send is the only one that applied. (Had
+        // it applied too, the declared-idempotent upsert would still leave one row — which is why
+        // the licence is safe — but `hits` would read 2.)
         $this->assertSame(1, (int) $check->scalar('SELECT hits FROM d2e_kv WHERE k = 7', []));
     }
 
@@ -131,7 +134,7 @@ final class ManifestLiveTest extends LiveTestCase
     public function testALostUndeclaredWriteIsIndeterminateAndSentOnce(): void
     {
         $this->setUpTables();
-        $c = $this->withManifest(ioTimeout: 0.5);
+        $c = $this->withManifest(statementTimeout: 0.5);
         try {
             $c->execById('log.add', ['x']);
             $this->fail('a lost undeclared write must surface');

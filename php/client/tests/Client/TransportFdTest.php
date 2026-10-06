@@ -136,6 +136,33 @@ final class TransportFdTest extends TestCase
         $t->readExact(1);
     }
 
+    /**
+     * M3-D1c's two read rules hold on the `recvmsg` path too: a deadline-shortened wait
+     * ({@see Transport::setReadWait}) bounds `recvmsg` — which `stream_set_timeout` alone would not,
+     * since this path waits on `SO_RCVTIMEO` — and a read that times out mid-frame keeps what it read
+     * (and the fd that came with it), so the next read resumes in step.
+     */
+    public function testAShortenedWaitBoundsRecvmsgAndAPartialReadResumes(): void
+    {
+        $t = $this->connect(readTimeout: 5.0);
+        $t->setReadWait(0.1);
+        $this->send('abc', [self::file('F')]);
+        $start = microtime(true);
+        try {
+            $t->readExact(5);
+            $this->fail('a short wait must time out');
+        } catch (TransportException $e) {
+            $this->assertTrue($e->isReadTimeout(), $e->getMessage());
+        }
+        $this->assertLessThan(1.0, microtime(true) - $start, 'the 0.1 s wait applied, not the 5 s timeout');
+        $this->assertSame(1, $t->fdsReceived(), 'the fd that arrived before the timeout is kept');
+
+        $this->send('de');
+        $this->assertSame('abcde', $t->readExact(5), 'no byte lost, none repeated');
+        $this->assertSame('F', self::contentOf($t->takeFd()));
+        $t->close();
+    }
+
     /** The CONTROL: the `fread` path reads the same bytes and loses the fd without a trace. */
     public function testTheFreadPathSilentlyLosesAnFd(): void
     {

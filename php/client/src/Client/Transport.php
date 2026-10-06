@@ -12,7 +12,8 @@ use Ferro\Client\Error\TransportException;
  * **Two read paths (M3-D3).** By default every byte is read with `fread`. When `ext-sockets` is
  * loaded, the OS is Linux and the transport is a Unix domain socket, the stream is also imported as
  * an `ext-sockets` socket and EVERY byte — from the handshake on — is read with `socket_recvmsg`
- * instead, so the engine can pass a sealed memfd with `SCM_RIGHTS` (SPEC §5.1;
+ * instead (its wait is `SO_RCVTIMEO`, which {@see setReadWait} moves together with the stream
+ * timeout), so the engine can pass a sealed memfd with `SCM_RIGHTS` (SPEC §5.1;
  * {@see FdReceivingTransportInterface}). Every byte, because the kernel discards an fd attached to
  * bytes read with plain `read(2)`, and because PHP's stream layer may read ahead into a buffer that a
  * later `recvmsg` would never see. Reads ask for EXACTLY the bytes needed, never more, so there is no
@@ -50,11 +51,64 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
     private int $fdsReceived = 0;
 
     /**
+     * Bytes of a frame already read when a read timed out (M3-D1c). The next {@see readExact}
+     * starts from them, so a timeout never drops bytes and never puts the stream out of step.
+     */
+    private string $pending = '';
+
+    /** The wait currently applied with `stream_set_timeout`, to skip redundant calls. */
+    private float $appliedWait;
+
+    /** The wait currently applied as `SO_RCVTIMEO` on the `recvmsg` path (M3-D3); -1 before any. */
+    private float $appliedRcvWait = -1.0;
+
+    /**
      * @param resource $sock an already-connected, blocking stream
      */
     private function __construct($sock, private readonly float $readTimeout = self::DEFAULT_READ_TIMEOUT)
     {
         $this->sock = $sock;
+        $this->appliedWait = $readTimeout;
+    }
+
+    public function setReadWait(float $seconds): void
+    {
+        $seconds = max($seconds, 0.001);
+        if ($seconds === $this->appliedWait || !is_resource($this->sock)) {
+            return;
+        }
+        $this->applyTimeout($seconds);
+    }
+
+    /**
+     * `stream_set_timeout` bounds WRITES as well as reads, and it also clears the stream's
+     * `timed_out` flag. Both matter to {@see writeAll} (M3-D1c review F2).
+     */
+    private function applyTimeout(float $seconds): void
+    {
+        $sec = (int) $seconds;
+        stream_set_timeout($this->sock, $sec, (int) round(($seconds - $sec) * 1_000_000));
+        $this->appliedWait = $seconds;
+        // On the `recvmsg` path (M3-D3) the read wait is the socket's `SO_RCVTIMEO`, which
+        // `stream_set_timeout` does not touch. Writes stay on `fwrite`, bounded above.
+        if ($this->fdSocket !== null && $seconds !== $this->appliedRcvWait) {
+            $this->setRcvTimeout($this->fdSocket, $seconds);
+        }
+    }
+
+    /** `SO_RCVTIMEO` for the `recvmsg` path. `{0, 0}` would mean "forever"; callers pass >= 1 ms. */
+    private function setRcvTimeout(\Socket $socket, float $seconds): bool
+    {
+        $sec = (int) $seconds;
+        $usec = (int) round(($seconds - $sec) * 1_000_000);
+        if ($sec === 0 && $usec === 0) {
+            $usec = 1;
+        }
+        $ok = @socket_set_option($socket, SOL_SOCKET, SO_RCVTIMEO, ['sec' => $sec, 'usec' => $usec]);
+        if ($ok) {
+            $this->appliedRcvWait = $seconds;
+        }
+        return $ok;
     }
 
     public function readTimeout(): float
@@ -149,9 +203,7 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
             $this->close();
             throw new TransportException('could not import the Unix socket for fd passing');
         }
-        $sec = (int) $this->readTimeout;
-        $usec = (int) round(($this->readTimeout - $sec) * 1_000_000);
-        if (!@socket_set_option($socket, SOL_SOCKET, SO_RCVTIMEO, ['sec' => $sec, 'usec' => $usec])) {
+        if (!$this->setRcvTimeout($socket, $this->appliedWait)) {
             $this->close();
             throw new TransportException('could not set the receive timeout for fd passing');
         }
@@ -178,12 +230,14 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
         if ($n < 0) { throw new TransportException("readExact: negative length {$n}"); }
         if ($n === 0) { return ''; }
         $this->assertOpen('read');
-        if ($this->fdSocket !== null) {
-            return $this->recvExact($this->fdSocket, $n);
-        }
 
-        $buf = '';
-        $remaining = $n;
+        // Resume from what an earlier timed-out read had already received.
+        $buf = (string) substr($this->pending, 0, $n);
+        $this->pending = (string) substr($this->pending, $n);
+        $remaining = $n - strlen($buf);
+        if ($this->fdSocket !== null) {
+            return $this->recvExact($this->fdSocket, $buf, $n);
+        }
         while ($remaining > 0) {
             // Suppress the PHP-level warning (a dead peer raises one): the return value + stream meta
             // below are the authoritative error signal, surfaced as a typed TransportException.
@@ -191,7 +245,9 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
             if ($chunk === false || $chunk === '') {
                 $meta = stream_get_meta_data($this->sock);
                 if ($meta['timed_out'] === true) {
-                    throw new TransportException(sprintf('read timed out after %d of %d bytes', $n - $remaining, $n));
+                    // Keep what was read: the frame is still in step, and the caller may wait on.
+                    $this->pending = $buf . $this->pending;
+                    throw TransportException::readTimedOut(sprintf('read timed out after %d of %d bytes', $n - $remaining, $n));
                 }
                 if (feof($this->sock)) {
                     throw new TransportException(sprintf('unexpected EOF after %d of %d bytes', $n - $remaining, $n));
@@ -204,11 +260,14 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
         return $buf;
     }
 
-    /** The `recvmsg` read path: exactly `$n` bytes, queueing every fd that arrives with them. */
-    private function recvExact(\Socket $socket, int $n): string
+    /**
+     * The `recvmsg` read path: complete `$buf` (what an earlier timed-out read left, M3-D1c) to
+     * exactly `$n` bytes, queueing every fd that arrives with them. A timeout keeps what was read,
+     * exactly as the `fread` path does; an fd that arrived before it stays queued.
+     */
+    private function recvExact(\Socket $socket, string $buf, int $n): string
     {
-        $buf = '';
-        $remaining = $n;
+        $remaining = $n - strlen($buf);
         $controlLen = socket_cmsg_space(SOL_SOCKET, SCM_RIGHTS, self::FD_SLOTS) ?? 0;
         // Received fds are close-on-exec from the moment they exist, so a `proc_open` elsewhere in
         // the process cannot inherit one in the window before it is read and closed.
@@ -224,7 +283,9 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
                     continue;
                 }
                 if ($err === SOCKET_EAGAIN) { // == EWOULDBLOCK on Linux: SO_RCVTIMEO expired
-                    throw new TransportException(sprintf('read timed out after %d of %d bytes', $n - $remaining, $n));
+                    // Keep what was read: the frame is still in step, and the caller may wait on.
+                    $this->pending = $buf . $this->pending;
+                    throw TransportException::readTimedOut(sprintf('read timed out after %d of %d bytes', $n - $remaining, $n));
                 }
                 throw new TransportException(sprintf(
                     'read failed after %d of %d bytes: %s',
@@ -282,6 +343,13 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
     public function writeAll(string $bytes): void
     {
         $this->assertOpen('write');
+        // A write is bounded by the configured timeout, never by a read wait that a request
+        // deadline shortened (M3-D1c review F2): PHP's socket stream applies ONE timeout to both
+        // directions, so a wait shortened to milliseconds would make the next large request fail
+        // mid-frame — which closes the session. Re-applying it unconditionally also clears a
+        // `timed_out` flag left by an earlier read, so a broken pipe below is not reported as a
+        // timeout.
+        $this->applyTimeout($this->readTimeout);
         $len = strlen($bytes);
         $written = 0;
         while ($written < $len) {

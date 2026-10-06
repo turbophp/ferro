@@ -20,6 +20,26 @@ final class TransportException extends FerroException
 {
     private bool $requestUnsent = false;
 
+    private bool $readTimedOut = false;
+
+    /**
+     * A read waited its whole timeout and received nothing more (M3-D1c). The transport KEEPS any
+     * bytes it had already read of the frame, so the stream is still in step and the session may
+     * keep reading: silence is a liveness question ({@see \Ferro\Client\Session}), not a failure.
+     */
+    public static function readTimedOut(string $message): self
+    {
+        $e = new self($message);
+        $e->readTimedOut = true;
+        return $e;
+    }
+
+    /** True for a read that timed out with the stream still in step — see {@see readTimedOut}. */
+    public function isReadTimeout(): bool
+    {
+        return $this->readTimedOut;
+    }
+
     /**
      * The transport failed while a request frame was being WRITTEN — or the session was already
      * poisoned, so nothing was written at all. Wraps the underlying failure.

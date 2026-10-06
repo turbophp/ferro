@@ -120,6 +120,7 @@ final class Connection
         ?PackerInterface $encodePacker = null,
         ?PackerInterface $decodePacker = null,
         ?TypePolicyOptions $types = null,
+        private readonly ?float $statementTimeout = null,
         private readonly ?\Ferro\Manifest $manifest = null,
     ) {
         // A supplied ExecCodec already carries its own ValuePolicy and PlanCache, so `values:`,
@@ -160,6 +161,33 @@ final class Connection
         );
         $this->policy = $policy ?? RetryPolicy::default();
         $this->fate = $fate ?? new FateClassifier($this->policy->retryReads);
+        if ($statementTimeout !== null) {
+            // The ENGINE enforces it (`timeout_ms`, M1-S4) and answers with the statement's fate;
+            // the session's request deadline (set by `Ferro::connect`) is the client's backstop.
+            $this->codec->setTimeoutMs(self::statementTimeoutMs($statementTimeout));
+        }
+    }
+
+    /**
+     * The wire's `timeout_ms` for a statement timeout given in seconds (M3-D1c review F3), and the
+     * ONE place such a value is validated — `Ferro::connect` calls it before dialling, and the
+     * constructor calls it for a Connection built directly. It must be a finite number of seconds
+     * greater than zero whose millisecond count fits the wire's u32 (at most 4 294 967.295 s);
+     * a positive value under half a millisecond is sent as 1 ms, the smallest the wire can say.
+     * `INF`, `NAN`, zero, a negative value and anything past the u32 are refused, where they used to
+     * become a 1 ms timeout (which fails every statement) or an EXEC the engine rejects as malformed.
+     *
+     * @throws \InvalidArgumentException
+     */
+    public static function statementTimeoutMs(float $seconds): int
+    {
+        if (!is_finite($seconds) || $seconds <= 0.0 || $seconds * 1000 > 0xFFFFFFFF) {
+            throw new \InvalidArgumentException(sprintf(
+                'statementTimeout must be a finite number of seconds in (0, 4294967.295], got %s',
+                var_export($seconds, true),
+            ));
+        }
+        return max(1, (int) round($seconds * 1000));
     }
 
     /** The SPEC §9.1 type policy this connection decodes with (client-side in M1). */
@@ -1467,6 +1495,9 @@ final class Connection
             $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, null);
             try {
                 $rid = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
+                if ($session instanceof Session) {
+                    $session->armRequestTimeout($rid);
+                }
             } catch (ConnectionLostException | TransportException $e) {
                 if (!self::wasSent($e)) {
                     // Nothing was sent: the synchronous path reconnects, re-sends and classifies
