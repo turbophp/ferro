@@ -564,6 +564,54 @@ async fn a_table_whose_id_is_not_unique_is_refused() {
     );
     assert_eq!(w.count().await, 0, "nothing was inserted");
     w.drop_schema().await;
+
+    // Each index shape that does NOT make `id` unique on its own is refused; a unique index on
+    // `id` alone (with INCLUDE columns) passes. Measured per clause of the catalog predicate.
+    for (tag, index, unique) in [
+        (
+            "partial",
+            "CREATE UNIQUE INDEX ON {t} (id) WHERE queue = 'x'",
+            false,
+        ),
+        ("composite", "CREATE UNIQUE INDEX ON {t} (id, queue)", false),
+        ("expression", "CREATE UNIQUE INDEX ON {t} ((id + 0))", false),
+        (
+            "deferrable",
+            "ALTER TABLE {t} ADD CONSTRAINT u UNIQUE (id) DEFERRABLE INITIALLY DEFERRED",
+            false,
+        ),
+        (
+            "include",
+            "CREATE UNIQUE INDEX ON {t} (id) INCLUDE (queue)",
+            true,
+        ),
+    ] {
+        let Some(mut w) = World::new(tag, &[]).await else {
+            return;
+        };
+        w.exec(&format!(
+            "ALTER TABLE {t} DROP CONSTRAINT ferro_jobs_pkey; {}",
+            index.replace("{t}", &w.table),
+            t = w.table
+        ))
+        .await;
+        match w
+            .c
+            .send(method_queue::SIZE, scope_req("default", None))
+            .await
+        {
+            Outcome::Ok(_) => assert!(unique, "{tag}: served"),
+            Outcome::Error(ep) => {
+                assert!(!unique, "{tag}: {ep:?}");
+                assert!(
+                    ep.message.contains("column id is not unique"),
+                    "{tag}: {ep:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        w.drop_schema().await;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -706,6 +754,13 @@ async fn a_stale_token_is_lease_lost_for_every_fenced_verb_and_changes_nothing()
     assert_lease_lost(w.c.ack(&first.job_id, &first.token).await);
     assert_lease_lost(w.c.release(&first.job_id, &first.token, 0).await);
     assert_lease_lost(w.c.extend(&first.job_id, &first.token).await);
+    // The fence's THIRD column: the current id and attempts with another `created_at` (an id reused
+    // after `TRUNCATE … RESTART IDENTITY`, §24.3's precondition) is stale too.
+    let row = w.row(id).await.unwrap();
+    let forged = Token::from_pg(row.created_at - 1, row.attempts).encode();
+    assert_lease_lost(w.c.ack(&second.job_id, &forged).await);
+    assert_lease_lost(w.c.release(&second.job_id, &forged, 0).await);
+    assert_lease_lost(w.c.extend(&second.job_id, &forged).await);
     assert_eq!(w.row(id).await.unwrap(), before, "no row changed");
     assert_eq!(w.count().await, 1, "RELEASE inserted nothing");
 
@@ -1369,6 +1424,28 @@ async fn an_unsent_write_is_never_indeterminate() {
             "method {method}: {ep:?}"
         );
     }
+    // A CANCEL while the verb still waits for its connection is the same known non-execution: a
+    // write that was never dispatched is Retryable, never `Indeterminate`.
+    w.c.rid += 1;
+    let rid = w.c.rid;
+    w.c.c
+        .send_request(
+            rid,
+            service::QUEUE,
+            method_queue::ENQUEUE,
+            enqueue_req(&[("default", "x", 0)], None),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    w.c.c.cancel(rid).await;
+    let Outcome::Error(ep) = w.c.terminal(rid, method_queue::ENQUEUE).await else {
+        panic!("expected an error terminal");
+    };
+    assert_eq!(
+        (ep.code, ep.branch),
+        (errc::CONNECTION_LOST, errc::CONNECTION_LOST_BRANCH),
+        "{ep:?}"
+    );
     drop(held);
     assert_eq!(w.count().await, 0);
     w.drop_schema().await;

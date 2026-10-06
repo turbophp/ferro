@@ -329,6 +329,14 @@ mod tests {
         let now = 1_790_000_000i64;
         let max = i64::from(i32::MAX) - now - 1 - DELAY_CLOCK_MARGIN_S;
         let pg = Dialect::Postgres;
+        // Pinned LITERALLY too, so a change to the margin constant (which `max` above derives from)
+        // is caught rather than followed (the G1a review's A31 lesson).
+        assert_eq!(DELAY_CLOCK_MARGIN_S, 86_400);
+        assert_eq!(delay(357_397_246, now, pg), Ok(()));
+        assert_eq!(
+            delay(357_397_247, now, pg),
+            Err(Refusal::DelayTooLarge { max: 357_397_246 })
+        );
         assert_eq!(delay(0, now, pg), Ok(()));
         assert_eq!(
             delay(0, i64::from(i32::MAX), pg),
