@@ -1,0 +1,22 @@
+[package]
+name = "ferro-http"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# SPEC §23 (Ferro HTTP). Slice M6-F3 builds ONLY the configuration model and the request validator
+# (§23.3.1, §23.4, the §23.8.5 address classification) — no network, no TLS, no tokio. The D20
+# network set (`hyper`, `rustls`, …) arrives with F4/F5, and so does the default-on `http` cargo
+# feature on `ferrod` that gates this crate (§23.13).
+#
+# `unicode-normalization` is D20's one non-network dependency, used ONLY by `PATH_ENCODING=utf8`'s
+# NFKC dot check (§23.4.2 step 8). Its licence (MIT OR Apache-2.0, and `tinyvec`'s
+# Zlib OR Apache-2.0 OR MIT) is on `deny.toml`'s allow-list — premise P16, which spike F1a measured
+# as HOLDS. It was already in the workspace lock (through `stringprep`), so this adds no new crate.
+[dependencies]
+unicode-normalization = "0.1.25"
