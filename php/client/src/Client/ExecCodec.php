@@ -59,6 +59,20 @@ final class ExecCodec
     public function plans(): PlanCache { return $this->plans; }
 
     /**
+     * The per-statement timeout every BUFFERED EXEC carries (M3-D1c), enforced by the engine; null
+     * for none. A streamed EXEC never carries it (see {@see encode}).
+     */
+    private ?int $timeoutMs = null;
+
+    public function setTimeoutMs(?int $timeoutMs): void
+    {
+        if ($timeoutMs !== null && ($timeoutMs < 1 || $timeoutMs > 0xFFFFFFFF)) {
+            throw new \InvalidArgumentException("a statement timeout must be 1..4294967295 ms (the wire's u32), got {$timeoutMs}");
+        }
+        $this->timeoutMs = $timeoutMs;
+    }
+
+    /**
      * Build one EXEC payload. `$txId = null` is the autocommit path; a non-null `$txId` scopes the
      * statement to that transaction's actor on the engine. With a `$queryId` (M3-D2e) the engine
      * runs its manifest's SQL for that id and `sql` is sent as nil (PROTOCOL.md §6: exactly one).
@@ -72,7 +86,11 @@ final class ExecCodec
             'sql' => $queryId === null ? $sql : null,
             'query_id' => $queryId,
             'params' => $this->bindParams($params),
-            'timeout_ms' => null,
+            // Never on a stream (M3-D1c review F5): the engine applies `timeout_ms` to the WHOLE
+            // streamed request — every pull and every wait for the caller to replenish its credit
+            // window — so it would cut off a caller that simply consumes rows slower than the
+            // timeout. A stream is bounded by the transport's liveness rule instead.
+            'timeout_ms' => $fetch === self::FETCH_STREAM ? null : $this->timeoutMs,
             'readonly' => $readonly,
             'fetch' => $fetch,
             'tx_id' => $txId,

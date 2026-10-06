@@ -245,6 +245,14 @@ abstract class LiveTestCase extends TestCase
         return $kinds;
     }
 
+    /** The running ferrod's pid (M3-D1c: a test SIGSTOPs it to model a stalled engine). */
+    protected function ferrodPid(): int
+    {
+        $this->assertNotNull($this->proc, 'ferrod is not running');
+        $s = proc_get_status($this->proc);
+        return $s['pid'];
+    }
+
     /**
      * SIGTERM the running ferrod and relaunch a fresh one on the SAME socket — the §19.1 restart
      * proof. The new process draws a NEW random `boot_epoch`, so a cached epoch no longer matches
