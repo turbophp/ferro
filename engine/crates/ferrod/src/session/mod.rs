@@ -171,6 +171,7 @@ use crate::config::Config;
 use crate::dispatch::{self, CoreMethod, Route};
 use crate::epoch::BootEpoch;
 use crate::pools::PoolRegistry;
+use crate::shutdown::Drain;
 use crate::tx::TxRegistry;
 use classify::Classification;
 use codec::{ControlMsg, FrameCodec, InFrame, OutFrame};
@@ -211,7 +212,7 @@ pub type HandlerFactory = Arc<dyn Fn(SessionId, SessionInfo) -> HandlerFn + Send
 
 /// What the handshake established about a session, handed to the [`HandlerFactory`] once HELLO has
 /// been validated (the handler is built AFTER the handshake, so it can depend on it).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionInfo {
     /// The client sent a `manifest_hash` and it equals the engine's (M3-D2d). Only such a session
     /// may run EXEC by `query_id`: the request carries `readonly` and runs on a pool the engine can
@@ -223,6 +224,13 @@ pub struct SessionInfo {
     /// `ALLOW_UIDS` and `PARTITION=uid` key on it (§23.3.1, §23.8.1, M6-F4a); an upstream with
     /// `ALLOW_UIDS` refuses a peer with none.
     pub peer_uid: Option<u32>,
+    /// The daemon's drain signal (SPEC §23.6.1 chassis change 1, M6-F4b). Before it, `serve` stopped
+    /// accepting on `SIGTERM` and then hard-aborted every session when its wait ended, and sessions
+    /// were never told the daemon was draining. Ferro HTTP refuses a request that arrives during the
+    /// drain (`draining`) and stops in-flight exchanges at `FERRO_HTTP_DRAIN_MS`; Ferro Queue's parked
+    /// `RESERVE`s will read the same signal (§24.8). A session `serve` did not start (the test
+    /// harnesses' `run_with_handler`) gets one that never fires.
+    pub drain: Drain,
 }
 
 /// The session task's entry point, one call per accepted connection.
@@ -273,6 +281,32 @@ impl Session {
         pool_registry: Arc<PoolRegistry>,
         tx_registry: Arc<TxRegistry>,
         factory: HandlerFactory,
+    ) {
+        Self::run_draining(
+            stream,
+            config,
+            epoch,
+            pool_registry,
+            tx_registry,
+            factory,
+            Drain::new(),
+        )
+        .await;
+    }
+
+    /// [`Session::run_with_handler`], told about the daemon's drain (SPEC §23.6.1 chassis change 1,
+    /// M6-F4b): `serve` hands every session it spawns the one `Drain` its `SIGTERM` watcher
+    /// triggers, and the session hands it to its handler through [`SessionInfo::drain`]. The session
+    /// layer itself changes nothing on a drain — SQL draining is unchanged (§23.6.1); a service
+    /// decides what the drain means for its own requests.
+    pub async fn run_draining(
+        stream: UnixStream,
+        config: Config,
+        epoch: BootEpoch,
+        pool_registry: Arc<PoolRegistry>,
+        tx_registry: Arc<TxRegistry>,
+        factory: HandlerFactory,
+        drain: Drain,
     ) {
         // Draw this connection's SessionId once (S6 seam) and build its handler. `session_id` is
         // used both to key tx ownership (inside the handler) and to abort this session's
@@ -402,6 +436,7 @@ impl Session {
             SessionInfo {
                 manifest_agreed: hello.manifest_hash.is_some(),
                 peer_uid,
+                drain,
             },
         );
 

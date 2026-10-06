@@ -487,6 +487,22 @@ impl PoolRegistry {
         }
     }
 
+    /// What `serve`'s drain needs from Ferro HTTP (SPEC §23.6.1 chassis change 2, M6-F4b):
+    /// `FERRO_HTTP_DRAIN_MS`, and a live count of HTTP exchanges in flight. `None` when HTTP is not
+    /// configured or not built — `serve` then drains exactly as before.
+    pub fn http_drain(&self) -> Option<(std::time::Duration, tokio::sync::watch::Receiver<usize>)> {
+        #[cfg(feature = "http")]
+        {
+            self.http
+                .as_ref()
+                .map(|e| (e.drain_cap(), e.in_flight_watch()))
+        }
+        #[cfg(not(feature = "http"))]
+        {
+            None
+        }
+    }
+
     /// The loaded checked-SQL manifest, if any.
     pub fn manifest(&self) -> Option<&crate::manifest::LoadedManifest> {
         self.manifest.as_deref()

@@ -65,6 +65,8 @@ pub enum DispatchedNotSent {
     UnsentClosed,
     Deadline,
     Cancel,
+    /// The daemon's HTTP drain cap (`FERRO_HTTP_DRAIN_MS`, §23.6.1) ended the exchange (M6-F4b).
+    Drain,
 }
 
 /// Sent, no head: at least one request byte reached the upstream connection, and no final head
@@ -85,6 +87,9 @@ pub enum SentNoHead {
     /// The request's total deadline.
     Timeout,
     Cancel,
+    /// The daemon's HTTP drain cap ended the exchange (§23.6.1, M6-F4b): the engine tore the
+    /// connection down, so it is classified as the link-level rows are.
+    Drain,
 }
 
 /// After a final head: the upstream received the request and answered.
@@ -100,6 +105,8 @@ pub enum HeadReceived {
     /// The request's total deadline.
     Timeout,
     Cancel,
+    /// The daemon's HTTP drain cap ended the delivery (§23.6.1, M6-F4b): a link-level row.
+    Drain,
 }
 
 /// One cell's row: the phase, carrying the event.
@@ -180,6 +187,18 @@ const BODY_IDEM: &str = "the upstream connection failed while the response body 
                          the request was declared idempotent (retryable)";
 const BODY_WRITE: &str = "the upstream connection failed while the response body was delivered; \
                           the upstream received and answered the request";
+const DRAIN_UNSENT: &str = "the daemon is draining: the exchange outlived FERRO_HTTP_DRAIN_MS and was \
+                            stopped before any byte was sent (retryable — the engine never re-sends)";
+const DRAIN_IDEM: &str = "the daemon is draining: the exchange outlived FERRO_HTTP_DRAIN_MS and was \
+                          stopped; the request was declared idempotent (retryable — the engine \
+                          never re-sends)";
+const DRAIN_WRITE: &str = "the daemon is draining: the exchange outlived FERRO_HTTP_DRAIN_MS and was \
+                           stopped after the request was sent and before a response head; it may \
+                           or may not have been applied (§9.2 indeterminate — the engine never \
+                           re-sends)";
+const DRAIN_BODY: &str = "the daemon is draining: the exchange outlived FERRO_HTTP_DRAIN_MS and was \
+                          stopped while the response body was delivered; the upstream received and \
+                          answered the request";
 
 /// SPEC §23.7.1's table. `idempotent` is the request's EFFECTIVE idempotency (§23.7.2); it changes
 /// only the "sent, no head" and the link-level "head received" rows.
@@ -289,6 +308,13 @@ pub fn classify(s: Situation, idempotent: bool) -> Fate {
                  (retryable — the engine never re-sends)",
             ),
             DispatchedNotSent::Cancel => Fate::Cancelled,
+            // Nothing was sent: the same answer as a request refused at admission (`draining`).
+            DispatchedNotSent::Drain => err(
+                UPSTREAM_UNAVAILABLE,
+                UPSTREAM_UNAVAILABLE_BRANCH,
+                http_cause::DRAINING,
+                DRAIN_UNSENT,
+            ),
         },
         Situation::SentNoHead(e) => {
             let link = |cause| {
@@ -341,6 +367,21 @@ pub fn classify(s: Situation, idempotent: bool) -> Fate {
                     http_cause::CANCELLED,
                     TIMEOUT_WRITE,
                 ),
+                // §23.6.1: the engine tore the connection down at the drain cap — the link rows, so
+                // a declared-idempotent request is Retryable (chassis change 2's whole point) and a
+                // non-idempotent one Indeterminate.
+                SentNoHead::Drain if idempotent => err(
+                    CONNECTION_LOST,
+                    CONNECTION_LOST_BRANCH,
+                    http_cause::DRAINING,
+                    DRAIN_IDEM,
+                ),
+                SentNoHead::Drain => err(
+                    WRITE_UNCONFIRMED,
+                    WRITE_UNCONFIRMED_BRANCH,
+                    http_cause::DRAINING,
+                    DRAIN_WRITE,
+                ),
             }
         }
         Situation::HeadReceived(e) => {
@@ -386,6 +427,19 @@ pub fn classify(s: Situation, idempotent: bool) -> Fate {
                     "the request timed out while the response was delivered",
                 ),
                 HeadReceived::Cancel => Fate::Cancelled,
+                // §23.6.1: "a delivery in progress is ResponseIncomplete" — the link rows.
+                HeadReceived::Drain if idempotent => err(
+                    CONNECTION_LOST,
+                    CONNECTION_LOST_BRANCH,
+                    http_cause::DRAINING,
+                    DRAIN_IDEM,
+                ),
+                HeadReceived::Drain => err(
+                    RESPONSE_INCOMPLETE,
+                    RESPONSE_INCOMPLETE_BRANCH,
+                    http_cause::DRAINING,
+                    DRAIN_BODY,
+                ),
             }
         }
     }
@@ -451,7 +505,13 @@ pub fn all_situations() -> Vec<Situation> {
     ] {
         v.push(Situation::BeforeDispatch(b));
     }
-    for n in [N::UnsentWrite, N::UnsentClosed, N::Deadline, N::Cancel] {
+    for n in [
+        N::UnsentWrite,
+        N::UnsentClosed,
+        N::Deadline,
+        N::Cancel,
+        N::Drain,
+    ] {
         v.push(Situation::DispatchedNotSent(n));
     }
     for s in [
@@ -468,6 +528,7 @@ pub fn all_situations() -> Vec<Situation> {
         S::H2ConnectionError,
         S::Timeout,
         S::Cancel,
+        S::Drain,
     ] {
         v.push(Situation::SentNoHead(s));
     }
@@ -481,6 +542,7 @@ pub fn all_situations() -> Vec<Situation> {
         A::ReadIdle,
         A::Timeout,
         A::Cancel,
+        A::Drain,
     ] {
         v.push(Situation::HeadReceived(a));
     }
@@ -530,7 +592,8 @@ mod tests {
                         DispatchedNotSent::UnsentWrite
                         | DispatchedNotSent::UnsentClosed
                         | DispatchedNotSent::Deadline
-                        | DispatchedNotSent::Cancel => {}
+                        | DispatchedNotSent::Cancel
+                        | DispatchedNotSent::Drain => {}
                     }
                     1
                 }
@@ -548,7 +611,8 @@ mod tests {
                         | SentNoHead::H2StreamError
                         | SentNoHead::H2ConnectionError
                         | SentNoHead::Timeout
-                        | SentNoHead::Cancel => {}
+                        | SentNoHead::Cancel
+                        | SentNoHead::Drain => {}
                     }
                     2
                 }
@@ -562,15 +626,17 @@ mod tests {
                         | HeadReceived::MaxResponseBytes
                         | HeadReceived::ReadIdle
                         | HeadReceived::Timeout
-                        | HeadReceived::Cancel => {}
+                        | HeadReceived::Cancel
+                        | HeadReceived::Drain => {}
                     }
                     3
                 }
             };
             counts[i] += 1;
         }
-        // 7 policy groups + 18 other pre-dispatch events; 4; 13; 9.
-        assert_eq!(counts, [25, 4, 13, 9]);
+        // 7 policy groups + 18 other pre-dispatch events; 5; 14; 10 (M6-F4b added each phase's
+        // drain-cap event).
+        assert_eq!(counts, [25, 5, 14, 10]);
         let mut dedup = all.clone();
         dedup.dedup();
         assert_eq!(dedup.len(), all.len());
@@ -623,6 +689,7 @@ mod tests {
                 )),
                 DispatchedNotSent::Deadline => pool(http_cause::DEADLINE),
                 DispatchedNotSent::Cancel => None,
+                DispatchedNotSent::Drain => up(http_cause::DRAINING),
             },
             Situation::SentNoHead(e) => {
                 let token = match e {
@@ -639,6 +706,7 @@ mod tests {
                     SentNoHead::H2ConnectionError => http_cause::H2_CONNECTION_ERROR,
                     SentNoHead::Timeout => http_cause::TIMEOUT,
                     SentNoHead::Cancel => http_cause::CANCELLED,
+                    SentNoHead::Drain => http_cause::DRAINING,
                 };
                 match (e, idem) {
                     (SentNoHead::Cancel, true) => None,
@@ -653,11 +721,13 @@ mod tests {
                 HeadReceived::BodyReset
                 | HeadReceived::BodyEof
                 | HeadReceived::BodyFraming
-                | HeadReceived::H2StreamError => {
+                | HeadReceived::H2StreamError
+                | HeadReceived::Drain => {
                     let token = match a {
                         HeadReceived::BodyReset => http_cause::BODY_RESET,
                         HeadReceived::BodyEof => http_cause::BODY_EOF,
                         HeadReceived::BodyFraming => http_cause::BODY_FRAMING,
+                        HeadReceived::Drain => http_cause::DRAINING,
                         _ => http_cause::H2_STREAM_ERROR,
                     };
                     if idem {
@@ -743,7 +813,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(cells, 102);
+        assert_eq!(cells, 108);
     }
 
     /// The table and the registry vocabulary are the same set: every `[http.causes]` token is the

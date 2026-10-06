@@ -115,6 +115,7 @@ pub fn make_handler(
         Arc::new(move |frame, responder, cancel| {
             let registry = registry.clone();
             let tx_registry = tx_registry.clone();
+            let info = info.clone();
             async move {
                 handle(
                     frame,
@@ -232,18 +233,18 @@ async fn handle(
         // advertise `feature_engine::HTTP`.
         (service::HTTP, method_http::REQUEST) => {
             let started = std::time::Instant::now();
-            match ferro_proto::messages::HttpRequest::decode(&frame.payload) {
+            let decoded = ferro_proto::messages::HttpRequest::decode(&frame.payload);
+            // The decoded request owns a copy of the body; the frame's own copy is released now
+            // rather than held for the whole exchange, so the body budget (§23.8.6, M6-F4b) charges
+            // memory that is actually held exactly once.
+            drop(frame);
+            match decoded {
                 Err(e) => responder.end_error(protocol(format!("malformed HttpRequest: {e}"))),
                 Ok(req) => {
                     #[cfg(feature = "http")]
                     if let Some(engine) = registry.http() {
                         crate::services::http::handle_request(
-                            engine,
-                            req,
-                            info.peer_uid,
-                            started,
-                            responder,
-                            cancel,
+                            engine, req, &info, started, responder, cancel,
                         )
                         .await;
                         return;

@@ -2580,6 +2580,7 @@ impl ResponseSink for VecSink {
         frame: SinkFrame,
         payload: Vec<u8>,
         _deadline: tokio::time::Instant,
+        _cancel: &'a tokio_util::sync::CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
         self.0.lock().unwrap().push((frame, payload));
         Box::pin(async { Ok(()) })

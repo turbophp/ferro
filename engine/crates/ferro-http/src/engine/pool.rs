@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,16 +47,44 @@ pub struct HttpConn {
     pub idle_since: Instant,
     /// `IDLE_TIMEOUT_MS`, clamped by the last response's `Keep-Alive: timeout` (§23.8.2).
     pub idle_limit: Duration,
+    /// Counts this connection in the engine's live-connection gauge for exactly its life.
+    pub live: LiveConn,
 }
 
 impl HttpConn {
     /// Abort `hyper`'s connection task and wait until it is gone, so the I/O is dropped and no
     /// later byte can follow. Only after this is the tracker's `sent` final (§23.7.1).
-    pub async fn discard(self) {
-        let HttpConn { sender, task, .. } = self;
-        task.abort();
-        let _ = task.await;
-        drop(sender);
+    pub async fn discard(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+}
+
+/// **No connection outlives its `HttpConn` (M6-F4b, chaos 12).** Dropping a `JoinHandle` does NOT
+/// stop a tokio task, so before this an `HttpConn` dropped without [`HttpConn::discard`] — the
+/// exchange's future dropped mid-flight, a stale or surplus pooled connection — left `hyper`'s
+/// connection task, and with it the socket, running. Every drop now aborts it; `discard` remains the
+/// path that also WAITS, which is what reading `sent` needs.
+impl Drop for HttpConn {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// One live connection, counted in the engine's gauge from dial to drop.
+#[derive(Debug)]
+pub struct LiveConn(Arc<AtomicUsize>);
+
+impl LiveConn {
+    pub fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        LiveConn(Arc::clone(count))
+    }
+}
+
+impl Drop for LiveConn {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -107,9 +136,7 @@ impl Pools {
             }
             picked
         };
-        for c in stale {
-            c.task.abort();
-        }
+        drop(stale); // each drop aborts its connection task
         picked
     }
 
@@ -120,7 +147,7 @@ impl Pools {
         let mut map = self.idle.lock().unwrap_or_else(|p| p.into_inner());
         let stack = map.entry(key).or_default();
         if stack.len() >= max_idle {
-            conn.task.abort();
+            drop(conn); // aborts its connection task
             return;
         }
         stack.push(conn);
@@ -133,7 +160,7 @@ impl Pools {
         let mut map = self.idle.lock().unwrap_or_else(|p| p.into_inner());
         let stack = map.entry(key).or_default();
         if stack.len() >= max_idle {
-            conn.task.abort();
+            drop(conn); // aborts its connection task
             return;
         }
         stack.push(conn);
@@ -191,6 +218,7 @@ mod tests {
             created: now,
             idle_since: now.checked_sub(idle_ago).unwrap(),
             idle_limit: Duration::from_secs(60),
+            live: LiveConn::new(&Arc::new(AtomicUsize::new(0))),
         };
         (conn, b)
     }

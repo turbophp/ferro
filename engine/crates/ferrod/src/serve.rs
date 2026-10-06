@@ -26,12 +26,26 @@
 //! `serve` waits for that same `JoinSet` to drain up to `config.drain_deadline`, then — if
 //! anything is still outstanding — hard-closes by aborting whatever remains (`JoinSet::drop`
 //! aborts every task still in the set) rather than waiting indefinitely.
+//!
+//! **The HTTP drain (SPEC §23.6.1, M6-F4b) — both chassis changes live here.** (1) Every session is
+//! spawned with the same `Drain` the `SIGTERM` watcher triggers (`Session::run_draining`), so a
+//! session's services are TOLD the daemon is draining instead of finding out from the hard abort;
+//! Ferro HTTP refuses new requests at once (`draining`) and stops in-flight exchanges at
+//! `FERRO_HTTP_DRAIN_MS`. (2) `serve` outlasts that cap: if HTTP exchanges are still in flight when
+//! `drain_deadline` expires, the wait extends to `FERRO_HTTP_DRAIN_MS + drain_deadline` from the
+//! drain's start — not their maximum — so an exchange stopped AT the cap still has `drain_deadline`
+//! to emit its engine-classified `END` before the hard abort (otherwise the client classifies it by
+//! §23.7.3, which cannot see an operator's `IDEMPOTENT_METHODS`). The extension ends early,
+//! `drain_deadline` after the last exchange's terminal ([`http_drain_end`]). With no HTTP in flight
+//! at `drain_deadline`, the drain is exactly what it was. Cost, stated: sessions live — and keep
+//! serving SQL — for the extension too, because an HTTP exchange and SQL statements share a session.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::SinkExt;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio_util::codec::Framed;
 
@@ -111,14 +125,16 @@ pub async fn serve(
                         let session_factory = factory.clone();
                         let session_pool_registry = pool_registry.clone();
                         let session_tx_registry = tx_registry.clone();
+                        let session_drain = drain.clone();
                         sessions.spawn(async move {
-                            Session::run_with_handler(
+                            Session::run_draining(
                                 stream,
                                 session_config,
                                 epoch,
                                 session_pool_registry,
                                 session_tx_registry,
                                 session_factory,
+                                session_drain,
                             )
                             .await;
                         });
@@ -141,7 +157,14 @@ pub async fn serve(
         }
     }
 
-    drain_sessions(sessions, config.drain_deadline).await;
+    let started = drain.started_at().unwrap_or_else(tokio::time::Instant::now);
+    drain_sessions(
+        sessions,
+        config.drain_deadline,
+        started,
+        pool_registry.http_drain(),
+    )
+    .await;
 }
 
 /// Send one session-fatal Auth frame on a just-accepted, not-yet-a-`Session` stream, then close
@@ -156,19 +179,75 @@ async fn deny_connection(stream: UnixStream, err: SessionError) {
     }
 }
 
-/// Wait for every session task in `sessions` to finish, up to `deadline`. Anything still
-/// outstanding past the deadline is hard-closed: `abort_all` (and the `JoinSet`'s own `Drop`,
-/// belt-and-suspenders) aborts every remaining task rather than waiting on it indefinitely.
-async fn drain_sessions(mut sessions: JoinSet<()>, deadline: Duration) {
-    let wait_all = async { while sessions.join_next().await.is_some() {} };
-
-    if tokio::time::timeout(deadline, wait_all).await.is_err() {
-        tracing::warn!(
-            ?deadline,
-            "drain deadline exceeded: hard-closing remaining sessions"
-        );
-        sessions.abort_all();
+/// When `serve`'s extended HTTP wait ends (SPEC §23.6.1 chassis change 2): `FERRO_HTTP_DRAIN_MS +
+/// drain_deadline` after the drain began, or — if every HTTP exchange has already returned its
+/// terminal, at `zero_at` — `drain_deadline` after that, whichever is first. Pure, so the formula
+/// (a SUM, not the maximum) is pinned by a unit test rather than by a timing race.
+pub fn http_drain_end(
+    started: tokio::time::Instant,
+    drain_deadline: Duration,
+    http_cap: Duration,
+    zero_at: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let hard = started + http_cap + drain_deadline;
+    match zero_at {
+        Some(z) => hard.min(z + drain_deadline),
+        None => hard,
     }
+}
+
+/// Wait for every session task in `sessions` to finish, up to `deadline` after the drain began —
+/// extended while Ferro HTTP exchanges are in flight (see the module docs and [`http_drain_end`]).
+/// Anything still outstanding past the wait is hard-closed: `abort_all` (and the `JoinSet`'s own
+/// `Drop`, belt-and-suspenders) aborts every remaining task rather than waiting on it indefinitely.
+async fn drain_sessions(
+    mut sessions: JoinSet<()>,
+    deadline: Duration,
+    started: tokio::time::Instant,
+    http: Option<(Duration, watch::Receiver<usize>)>,
+) {
+    let wait_all = async { while sessions.join_next().await.is_some() {} };
+    if tokio::time::timeout_at(started + deadline, wait_all)
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    if let Some((cap, mut in_flight)) = http
+        && *in_flight.borrow() > 0
+    {
+        tracing::info!(
+            in_flight = *in_flight.borrow(),
+            ?cap,
+            "drain: HTTP exchanges in flight; waiting up to FERRO_HTTP_DRAIN_MS + drain_deadline"
+        );
+        let mut end = http_drain_end(started, deadline, cap, None);
+        let mut zero_seen = false;
+        loop {
+            tokio::select! {
+                biased;
+                r = sessions.join_next() => {
+                    if r.is_none() {
+                        return;
+                    }
+                }
+                () = tokio::time::sleep_until(end) => break,
+                _ = in_flight.wait_for(|n| *n == 0), if !zero_seen => {
+                    // Every exchange has returned its terminal (or the engine is gone): give the
+                    // last `END`s `drain_deadline` to leave, never past the hard end.
+                    zero_seen = true;
+                    end = http_drain_end(started, deadline, cap, Some(tokio::time::Instant::now()));
+                }
+            }
+        }
+    }
+
+    tracing::warn!(
+        ?deadline,
+        "drain deadline exceeded: hard-closing remaining sessions"
+    );
+    sessions.abort_all();
 }
 
 /// How long the accept loop pauses after an `accept` that failed for lack of fds or kernel memory.
@@ -188,6 +267,35 @@ fn accept_error_is_resource_exhaustion(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC §23.6.1 chassis change 2: the extended wait is the SUM `FERRO_HTTP_DRAIN_MS +
+    /// drain_deadline` from the drain's start (not the maximum, which would hard-abort at the very
+    /// instant an exchange is stopped at the cap), cut short to `drain_deadline` after the last HTTP
+    /// terminal, and never beyond the sum.
+    #[test]
+    fn the_http_drain_wait_is_the_sum_cut_short_after_the_last_terminal() {
+        let t0 = tokio::time::Instant::now();
+        let dd = Duration::from_secs(5);
+        let cap = Duration::from_secs(30);
+        assert_eq!(
+            http_drain_end(t0, dd, cap, None),
+            t0 + Duration::from_secs(35)
+        );
+        assert_eq!(
+            http_drain_end(t0, dd, cap, Some(t0 + Duration::from_secs(12))),
+            t0 + Duration::from_secs(17)
+        );
+        assert_eq!(
+            http_drain_end(t0, dd, cap, Some(t0 + Duration::from_secs(33))),
+            t0 + Duration::from_secs(35),
+            "never past the sum"
+        );
+        assert_eq!(
+            http_drain_end(t0, dd, Duration::ZERO, None),
+            t0 + dd,
+            "a zero cap still leaves drain_deadline for the stopped exchanges' terminals"
+        );
+    }
 
     #[test]
     fn only_resource_exhaustion_backs_off() {

@@ -61,3 +61,6 @@ mysql_async = { version = "0.37", default-features = false, features = ["minimal
 # SAME rusqlite `ferro-backend-sqlite` uses, so no second copy of the driver is compiled in.
 rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
+# The Ferro HTTP decoding suites (M6-F4b, `tests/http_f4b_it.rs`, `tests/http_rss_it.rs`) build gzip
+# and deflate response bodies. The SAME `flate2` `ferro-http` decodes with (already in the lock).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

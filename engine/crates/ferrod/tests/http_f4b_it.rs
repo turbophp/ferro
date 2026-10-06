@@ -1,0 +1,1301 @@
+//! **M6-F4b — Ferro HTTP's body budgets, the HTTP drain, content decoding, and the chaos cases F4a
+//! left (SPEC §23.6.1, §23.8.6, §23.9.2, §23.14 cases 4, 5, 12, 15, 16).**
+//!
+//! Every test drives the REAL handler factory over a real Unix socket against loopback upstreams
+//! that record what they received, so "received 0" and "never re-sent" are read-back assertions
+//! (charter rule 3). The drain tests drive the REAL `serve` — the accept loop `main` runs — and
+//! trigger the same `Drain` the `SIGTERM` watcher does. The RSS half of chaos 6 is its own binary
+//! (`http_rss_it.rs`), so no other test shares the process it measures.
+#![cfg(feature = "http")]
+
+mod common;
+mod http_support;
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::io::Write as _;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use ferro_http::engine::{ResponseSink, SinkError, SinkFrame, TcpConnect};
+use ferro_proto::consts::{branch, errc, flags, http_cause, method_http, service};
+use ferro_proto::messages::{HttpDecoded, HttpHeaderField, HttpRequest, Outcome};
+use http_support::*;
+use tokio_util::sync::CancellationToken;
+
+const MIB: usize = 1024 * 1024;
+const OK_EMPTY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+fn body_of(len: usize, tag: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| tag.wrapping_add((i % 251) as u8))
+        .collect()
+}
+
+// =================================================================================================
+// Chaos 16: body budgets (§23.8.6)
+// =================================================================================================
+
+/// An upstream that reads each whole request and answers it; on a stalled connection the read
+/// never completes and the script waits for the engine to close it.
+async fn answering() -> Upstream {
+    upstream(|mut s, rec| async move {
+        loop {
+            if rec.read_request(&mut s).await.is_none() {
+                rec.closed_by_peer.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            if rec.write(&mut s, OK_EMPTY).await.is_err() {
+                return;
+            }
+        }
+    })
+    .await
+}
+
+/// **Chaos 16, per upstream.** A 3 MiB body that can never be fully written (its connection stops
+/// accepting bytes after the head) holds 3 MiB of a 4 MiB `MAX_BODY_BYTES`; a concurrent 2 MiB
+/// body is refused Retryable `PoolTimeout` (`body_budget`) and never dialled (received 0). Once the
+/// first request ends (a `CANCEL`), the charge is back at 0 and the same 2 MiB body is admitted.
+#[tokio::test]
+async fn chaos16_a_body_past_the_upstream_budget_is_refused_unsent() {
+    let up = answering().await;
+    let stall = StallConnect::new(1024, 1);
+    let d = daemon_with(
+        upstreams(&[("u", up.addr)], &[("u", "MAX_BODY_BYTES", "4194304")]),
+        stall,
+        |_| {},
+    );
+    let mut c = d.client().await;
+
+    send(&mut c, 2, &post("u", &body_of(3 * MIB, 1))).await;
+    wait_for("A's head at the upstream", || up.rec.heads() == 1).await;
+    assert_eq!(d.engine.body_budget_in_use("u"), 3 * MIB as u64);
+    assert_eq!(d.engine.body_budget_daemon_in_use(), 3 * MIB as u64);
+
+    let b = exchange(&mut c, 3, &post("u", &body_of(2 * MIB, 2))).await;
+    b.assert_error(
+        errc::POOL_TIMEOUT,
+        branch::RETRYABLE,
+        http_cause::BODY_BUDGET,
+    );
+    assert!(b.head.is_none());
+    assert_eq!(up.rec.conns(), 1, "the refused request dialled nothing");
+    assert_eq!(up.rec.heads(), 1, "received 0");
+    assert_eq!(
+        d.engine.body_budget_in_use("u"),
+        3 * MIB as u64,
+        "a refused charge takes nothing"
+    );
+
+    c.cancel(2).await;
+    let a = collect(&mut c, 2).await;
+    // A sent, non-idempotent POST cancelled before a head (§23.7.1).
+    a.assert_error(
+        errc::WRITE_UNCONFIRMED,
+        branch::INDETERMINATE,
+        http_cause::CANCELLED,
+    );
+    wait_for("the budget back at 0", || {
+        d.engine.body_budget_in_use("u") == 0 && d.engine.body_budget_daemon_in_use() == 0
+    })
+    .await;
+
+    let b = exchange(&mut c, 4, &post("u", &body_of(2 * MIB, 2))).await;
+    b.done();
+    assert_eq!(up.rec.requests().len(), 1, "B, once, on a fresh connection");
+    assert_eq!(up.rec.requests()[0].body, body_of(2 * MIB, 2));
+    assert_eq!(d.engine.body_budget_in_use("u"), 0);
+}
+
+/// **Chaos 16, daemon-wide.** Two upstreams with room each, a daemon budget that holds only one
+/// of the two bodies: the second is refused `body_budget` even though its own upstream is empty.
+#[tokio::test]
+async fn chaos16_the_daemon_wide_budget_spans_upstreams() {
+    let u1 = answering().await;
+    let u2 = answering().await;
+    let d = daemon_with(
+        upstreams(
+            &[("u1", u1.addr), ("u2", u2.addr)],
+            &[
+                ("u1", "MAX_BODY_BYTES", "4194304"),
+                ("u2", "MAX_BODY_BYTES", "4194304"),
+                ("", "MAX_BODY_BYTES", "5242880"),
+            ],
+        ),
+        StallConnect::new(1024, 1),
+        |_| {},
+    );
+    let mut c = d.client().await;
+    send(&mut c, 2, &post("u1", &body_of(3 * MIB, 1))).await;
+    wait_for("A's head", || u1.rec.heads() == 1).await;
+    let b = exchange(&mut c, 3, &post("u2", &body_of(3 * MIB, 2))).await;
+    b.assert_error(
+        errc::POOL_TIMEOUT,
+        branch::RETRYABLE,
+        http_cause::BODY_BUDGET,
+    );
+    assert_eq!(u2.rec.conns(), 0, "received 0");
+    assert_eq!(d.engine.body_budget_in_use("u2"), 0);
+    c.cancel(2).await;
+    collect(&mut c, 2).await;
+    wait_for("both budgets at 0", || {
+        d.engine.body_budget_daemon_in_use() == 0 && d.engine.body_budget_in_use("u1") == 0
+    })
+    .await;
+}
+
+/// **Released when fully written, not at the terminal (§23.8.6).** The upstream reads the whole
+/// 3 MiB body and then sits on its answer: the charge is already back at 0 while the request is
+/// still in flight, so a second 3 MiB body fits a 4 MiB budget at once.
+#[tokio::test]
+async fn the_budget_is_released_when_the_body_is_written_not_at_the_terminal() {
+    let up = upstream(|mut s, rec| async move {
+        while rec.read_request(&mut s).await.is_some() {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if rec.write(&mut s, OK_EMPTY).await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
+    let d = daemon(upstreams(
+        &[("u", up.addr)],
+        &[("u", "MAX_BODY_BYTES", "4194304")],
+    ));
+    let mut c = d.client().await;
+    send(&mut c, 2, &post("u", &body_of(3 * MIB, 1))).await;
+    wait_for("the whole body at the upstream", || {
+        up.rec.requests().len() == 1
+    })
+    .await;
+    wait_for("the charge released once written", || {
+        d.engine.body_budget_in_use("u") == 0
+    })
+    .await;
+    assert!(
+        c.recv_or_none(Duration::from_millis(20)).await.is_none(),
+        "A is still in flight (no head, no terminal)"
+    );
+    send(&mut c, 3, &post("u", &body_of(3 * MIB, 2))).await;
+    let mut done = 0;
+    while done < 2 {
+        let f = c.recv().await;
+        if f.header.flags & flags::END == 0 {
+            continue; // each one's HEAD
+        }
+        assert!(matches!(
+            Outcome::decode(&f.payload).unwrap(),
+            Outcome::Ok(_)
+        ));
+        done += 1;
+    }
+    assert_eq!(up.rec.requests().len(), 2);
+    assert_eq!(d.engine.body_budget_daemon_in_use(), 0);
+}
+
+// =================================================================================================
+// Chaos 12: session death
+// =================================================================================================
+
+/// **Chaos 12.** A session dies with three exchanges in flight — a POST whose body can never be
+/// fully written (charged), a GET waiting for its head, and a GET whose body is parked on credit.
+/// Every exchange is aborted, every upstream connection is closed, no connection is left in the
+/// engine, and the budget is back at 0.
+#[tokio::test]
+async fn chaos12_session_death_leaks_no_connection_and_returns_the_budget() {
+    let stalled = answering().await;
+    let silent = silent().await;
+    let streaming = upstream(|mut s, rec| async move {
+        if rec.read_request(&mut s).await.is_none() {
+            return;
+        }
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\n\r\n";
+        if rec.write(&mut s, head).await.is_err() {
+            return;
+        }
+        let piece = vec![b'z'; 64 * 1024];
+        while rec.write(&mut s, &piece).await.is_ok() {}
+        rec.closed_by_peer.fetch_add(1, Ordering::SeqCst);
+    })
+    .await;
+    let d = daemon_with(
+        upstreams(
+            &[
+                ("stalled", stalled.addr),
+                ("silent", silent.addr),
+                ("streaming", streaming.addr),
+            ],
+            &[],
+        ),
+        StallConnect::new(1024, 1),
+        |cfg| cfg.credit_frames = 2,
+    );
+    let mut c = d.client().await;
+    send(&mut c, 2, &post("stalled", &body_of(3 * MIB, 7))).await;
+    wait_for("the stalled POST's head", || stalled.rec.heads() == 1).await;
+    send(&mut c, 3, &idempotent_get("silent")).await;
+    wait_for("the GET at the silent upstream", || {
+        silent.rec.requests().len() == 1
+    })
+    .await;
+    send(&mut c, 4, &idempotent_get("streaming")).await;
+    // HEAD + one BODY: the credit window (2 frames), never replenished.
+    for _ in 0..2 {
+        let f = c.recv().await;
+        assert_eq!(f.header.request_id, 4);
+    }
+    assert_eq!(d.engine.in_flight(), 3);
+    assert_eq!(d.engine.live_connections(), 3);
+    assert_eq!(d.engine.body_budget_in_use("stalled"), 3 * MIB as u64);
+
+    drop(c); // the session dies
+
+    wait_for("every exchange aborted", || d.engine.in_flight() == 0).await;
+    wait_for("no connection left", || d.engine.live_connections() == 0).await;
+    assert_eq!(
+        d.engine.body_budget_daemon_in_use(),
+        0,
+        "the budget is back at 0"
+    );
+    for (name, rec) in [
+        ("stalled", &stalled.rec),
+        ("silent", &silent.rec),
+        ("streaming", &streaming.rec),
+    ] {
+        wait_for(&format!("{name}'s connection closed"), || {
+            rec.closed_by_peer() == 1
+        })
+        .await;
+    }
+    for name in ["stalled", "silent", "streaming"] {
+        assert_eq!(d.engine.idle_connections(name), 0, "{name} pooled nothing");
+    }
+}
+
+/// A sink that never delivers (and ignores cancellation): the exchange parks in it forever.
+struct BlackHole;
+impl ResponseSink for BlackHole {
+    fn send<'a>(
+        &'a self,
+        _: SinkFrame,
+        _: Vec<u8>,
+        _: tokio::time::Instant,
+        _: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// **No connection outlives its exchange, even when the exchange's future is DROPPED** (a panic
+/// unwinding through it, a task aborted, a runtime shutting down): dropping a tokio `JoinHandle`
+/// does not stop `hyper`'s connection task, so before F4b such an exchange left its socket open.
+#[tokio::test]
+async fn a_dropped_exchange_closes_its_connection() {
+    let up = upstream(|mut s, rec| async move {
+        if rec.read_request(&mut s).await.is_none() {
+            return;
+        }
+        let _ = rec
+            .write(&mut s, b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+            .await;
+        rec.hold_until_closed(&mut s, Duration::from_secs(60)).await;
+    })
+    .await;
+    let engine = engine_with(upstreams(&[("u", up.addr)], &[]), Arc::new(TcpConnect));
+    let e = engine.clone();
+    let task = tokio::spawn(async move {
+        e.exchange(
+            &idempotent_get("u"),
+            None,
+            Instant::now(),
+            &CancellationToken::new(),
+            &BlackHole,
+        )
+        .await
+    });
+    wait_for("the head written", || up.rec.written() > 0).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(engine.live_connections(), 1);
+    task.abort();
+    let _ = task.await;
+    wait_for("the connection dropped", || engine.live_connections() == 0).await;
+    wait_for("the upstream saw the close", || {
+        up.rec.closed_by_peer() == 1
+    })
+    .await;
+    assert_eq!(engine.in_flight(), 0);
+}
+
+// =================================================================================================
+// Content decoding (§23.9.2)
+// =================================================================================================
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+fn zlib(data: &[u8]) -> Vec<u8> {
+    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+fn raw_deflate(data: &[u8]) -> Vec<u8> {
+    let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+fn plain() -> Vec<u8> {
+    (0..300_000u32)
+        .flat_map(|i| format!("line {i}\n").into_bytes())
+        .collect()
+}
+
+/// The response for a target: `/<encoding>/<shape>` where shape is `cl` (Content-Length) or
+/// `chunked`.
+fn encoded_response(target: &str) -> Vec<u8> {
+    let data = plain();
+    let (ce, body): (&str, Vec<u8>) = match target.split('/').nth(1).unwrap_or("") {
+        "gzip" => ("gzip", gzip(&data)),
+        "xgzip" => ("x-gzip", gzip(&data)),
+        "zlib" => ("deflate", zlib(&data)),
+        "raw" => ("Deflate", raw_deflate(&data)),
+        "br" => ("br", b"not really brotli".to_vec()),
+        "stacked" => ("gzip, br", b"stacked".to_vec()),
+        "corrupt" => {
+            let mut g = gzip(&data);
+            let n = g.len();
+            g[n - 6] ^= 0xff; // the CRC32
+            ("gzip", g)
+        }
+        "truncated" => {
+            let g = gzip(&data);
+            ("gzip", g[..g.len() / 2].to_vec())
+        }
+        other => panic!("unknown target {other}"),
+    };
+    let mut out =
+        format!("HTTP/1.1 200 OK\r\nContent-Encoding: {ce}\r\nX-Kept: yes\r\n").into_bytes();
+    if target.ends_with("/chunked") {
+        out.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+        for piece in body.chunks(7_000) {
+            out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+            out.extend_from_slice(piece);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+    } else {
+        out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        out.extend_from_slice(&body);
+    }
+    out
+}
+
+async fn encoding_upstream() -> Upstream {
+    upstream(|mut s, rec| async move {
+        while let Some(seen) = rec.read_request(&mut s).await {
+            let target = seen.head.split(' ').nth(1).unwrap_or("/").to_string();
+            if rec.write(&mut s, &encoded_response(&target)).await.is_err() {
+                return;
+            }
+        }
+    })
+    .await
+}
+
+fn decode_get(target: &str) -> HttpRequest {
+    HttpRequest {
+        decode: true,
+        idempotent: Some(true),
+        ..request("u", "GET", target)
+    }
+}
+
+fn head_value<'a>(h: &'a [HttpHeaderField], name: &str) -> Option<&'a [u8]> {
+    h.iter()
+        .find(|f| f.name == name)
+        .map(|f| f.value.as_slice())
+}
+
+/// **§23.9.2 end to end.** With `decode = true` and no `Accept-Encoding` from PHP, the engine asks
+/// for `gzip, deflate`; a `gzip`, `x-gzip`, zlib-`deflate` or raw-`deflate` body — Content-Length
+/// or chunked — arrives decoded, its head without `content-encoding`/`content-length`, both
+/// reported in `decoded`. `br` and a stacked list pass through untouched with `decoded = nil`.
+#[tokio::test]
+async fn gzip_and_deflate_are_decoded_and_everything_else_passes_through() {
+    let up = encoding_upstream().await;
+    let d = daemon(upstreams(&[("u", up.addr)], &[]));
+    let mut c = d.client().await;
+    let data = plain();
+    let mut rid = 2;
+    for (enc, received) in [
+        ("gzip", "gzip"),
+        ("xgzip", "x-gzip"),
+        ("zlib", "deflate"),
+        ("raw", "Deflate"),
+    ] {
+        for shape in ["cl", "chunked"] {
+            let target = format!("/{enc}/{shape}");
+            let r = exchange(&mut c, rid, &decode_get(&target)).await;
+            rid += 1;
+            r.done();
+            let head = r.head.as_ref().unwrap();
+            assert!(r.body == data, "{target}: the decoded body");
+            assert_eq!(
+                head_value(&head.headers, "content-encoding"),
+                None,
+                "{target}"
+            );
+            assert_eq!(
+                head_value(&head.headers, "content-length"),
+                None,
+                "{target}"
+            );
+            assert_eq!(head_value(&head.headers, "x-kept"), Some(&b"yes"[..]));
+            let wire_len = encoded_response(&target).len() as u64;
+            let want_len = (shape == "cl").then(|| {
+                // The Content-Length the upstream sent: the encoded body's length.
+                let resp = encoded_response(&target);
+                let head_end = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                (resp.len() - head_end) as u64
+            });
+            assert_eq!(
+                head.decoded,
+                Some(HttpDecoded {
+                    content_encoding: received.into(),
+                    content_length: want_len,
+                }),
+                "{target}"
+            );
+            assert_eq!(
+                r.done().stats.bytes_received,
+                wire_len,
+                "wire bytes, not decoded ones"
+            );
+        }
+    }
+    let seen = up.rec.requests();
+    assert!(
+        seen.iter()
+            .all(|s| s.header("accept-encoding").as_deref() == Some("gzip, deflate")),
+        "the engine asked for what it decodes"
+    );
+
+    for target in ["/br/cl", "/stacked/cl"] {
+        let r = exchange(&mut c, rid, &decode_get(target)).await;
+        rid += 1;
+        let head = r.head.as_ref().unwrap();
+        assert_eq!(head.decoded, None, "{target} passes through");
+        assert!(head_value(&head.headers, "content-encoding").is_some());
+        assert!(head_value(&head.headers, "content-length").is_some());
+        let resp = encoded_response(target);
+        let head_end = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert_eq!(r.body, resp[head_end..], "{target}: untouched");
+    }
+}
+
+/// `decode = false` is F4a's behaviour, unchanged: no `Accept-Encoding` is added and an encoded
+/// body arrives encoded. A PHP-supplied `Accept-Encoding` is never replaced, and a body it asked
+/// for in a coding the engine decodes is still decoded.
+#[tokio::test]
+async fn decode_false_and_a_php_accept_encoding_are_respected() {
+    let up = encoding_upstream().await;
+    let d = daemon(upstreams(&[("u", up.addr)], &[]));
+    let mut c = d.client().await;
+    let r = exchange(
+        &mut c,
+        2,
+        &HttpRequest {
+            decode: false,
+            ..decode_get("/gzip/cl")
+        },
+    )
+    .await;
+    assert_eq!(r.head.as_ref().unwrap().decoded, None);
+    assert_eq!(r.body, gzip(&plain()), "still encoded");
+    assert_eq!(up.rec.requests()[0].header("accept-encoding"), None);
+
+    let r = exchange(
+        &mut c,
+        3,
+        &HttpRequest {
+            headers: vec![HttpHeaderField {
+                name: "Accept-Encoding".into(),
+                value: b"gzip".to_vec(),
+            }],
+            ..decode_get("/gzip/cl")
+        },
+    )
+    .await;
+    assert!(r.body == plain());
+    assert_eq!(
+        up.rec.requests()[1].header("accept-encoding").as_deref(),
+        Some("gzip"),
+        "PHP's own value, not replaced"
+    );
+}
+
+/// **A corrupt or truncated encoded body is `ResponseIncomplete` (`decode`)** after the `HEAD`,
+/// NonRetryable in both idempotency columns (§23.7.1), and the connection is discarded.
+#[tokio::test]
+async fn a_corrupt_or_truncated_body_is_response_incomplete_decode() {
+    let up = encoding_upstream().await;
+    let d = daemon(upstreams(&[("u", up.addr)], &[]));
+    let mut c = d.client().await;
+    let mut rid = 2;
+    for target in ["/corrupt/cl", "/truncated/cl", "/corrupt/chunked"] {
+        for idem in [Some(true), None] {
+            let r = exchange(
+                &mut c,
+                rid,
+                &HttpRequest {
+                    idempotent: idem,
+                    ..decode_get(target)
+                },
+            )
+            .await;
+            rid += 1;
+            assert!(r.head.is_some(), "{target}: the head was delivered");
+            r.assert_error(
+                errc::RESPONSE_INCOMPLETE,
+                branch::NON_RETRYABLE,
+                http_cause::DECODE,
+            );
+        }
+    }
+    assert_eq!(
+        d.engine.idle_connections("u"),
+        0,
+        "never pooled after a decode failure"
+    );
+    wait_for("discarded", || d.engine.live_connections() == 0).await;
+}
+
+/// An EMPTY body is never a decode error: a `HEAD` response and a 204 routinely carry
+/// `Content-Encoding: gzip` with nothing after the head.
+#[tokio::test]
+async fn an_empty_encoded_body_is_not_an_error() {
+    let up = upstream(|mut s, rec| async move {
+        while let Some(seen) = rec.read_request(&mut s).await {
+            let resp: &[u8] = if seen.head.starts_with("HEAD ") {
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 1234\r\n\r\n"
+            } else {
+                b"HTTP/1.1 204 No Content\r\nContent-Encoding: gzip\r\n\r\n"
+            };
+            if rec.write(&mut s, resp).await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
+    let d = daemon(upstreams(&[("u", up.addr)], &[]));
+    let mut c = d.client().await;
+    let r = exchange(
+        &mut c,
+        2,
+        &HttpRequest {
+            decode: true,
+            ..request("u", "HEAD", "/x")
+        },
+    )
+    .await;
+    r.done();
+    assert!(r.body.is_empty());
+    assert_eq!(
+        r.head.unwrap().decoded,
+        Some(HttpDecoded {
+            content_encoding: "gzip".into(),
+            content_length: Some(1234),
+        })
+    );
+    let r = exchange(&mut c, 3, &decode_get("/x")).await;
+    r.done();
+    assert_eq!(r.head.unwrap().status, 204);
+}
+
+/// A gzip stream of zeros, endless: each piece is a complete member of `piece` zeros compressed.
+fn zeros_member(piece: usize) -> Vec<u8> {
+    gzip(&vec![0u8; piece])
+}
+
+/// **A decompression bomb, memory side: the window bounds it** (§23.9.2). 512 MiB of zeros arrive
+/// as ~0.5 MiB of gzip; a client that reads but never replenishes receives exactly the credit's
+/// frames (the `HEAD` and 3 `BODY` of ≤ 256 KiB each) and nothing more, however much the engine
+/// could still inflate — decoding stops with the parked frame.
+#[tokio::test]
+async fn a_bomb_is_bounded_by_the_window() {
+    // Compressed BEFORE the upstream exists: in a debug build, compressing 64 MiB takes seconds.
+    let member = Arc::new(zeros_member(64 * MIB));
+    let up = upstream(move |mut s, rec| {
+        let member = Arc::clone(&member);
+        async move {
+            if rec.read_request(&mut s).await.is_none() {
+                return;
+            }
+            let mut out =
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    .to_vec();
+            for _ in 0..8 {
+                out.extend_from_slice(format!("{:x}\r\n", member.len()).as_bytes());
+                out.extend_from_slice(&member);
+                out.extend_from_slice(b"\r\n");
+            }
+            out.extend_from_slice(b"0\r\n\r\n");
+            if rec.write(&mut s, &out).await.is_err() {
+                return;
+            }
+            rec.hold_until_closed(&mut s, Duration::from_secs(60)).await;
+        }
+    })
+    .await;
+    let d = daemon_with(
+        upstreams(&[("u", up.addr)], &[]),
+        Arc::new(TcpConnect),
+        |cfg| cfg.credit_frames = 4,
+    );
+    let mut c = d.client().await;
+    send(&mut c, 2, &decode_get("/bomb")).await;
+    let mut frames = 0;
+    let mut decoded = 0usize;
+    while let Some(f) = c.recv_or_none(Duration::from_millis(1000)).await {
+        assert_eq!(f.header.flags & flags::END, 0, "no terminal while parked");
+        frames += 1;
+        if f.header.method == method_http::BODY {
+            decoded += ferro_proto::messages::HttpBody::decode(&f.payload)
+                .unwrap()
+                .chunk
+                .len();
+        }
+    }
+    assert_eq!(frames, 4, "exactly the window: HEAD + 3 BODY");
+    assert!(decoded <= 3 * 256 * 1024);
+    c.cancel(2).await;
+    let r = collect(&mut c, 2).await;
+    assert!(matches!(r.end, Outcome::Cancelled));
+}
+
+/// **A decompression bomb, CPU side: the deadline bounds it** (§23.9.2). An endless gzip stream
+/// whose every chunk inflates ~1000×, read by a client that always has credit, ends at the
+/// request's total deadline with `QueryTimeout` (`timeout`), promptly — the deadline is checked
+/// between decode steps, not only between the network reads one of which may inflate to hundreds
+/// of MiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bomb_is_bounded_by_the_deadline() {
+    let member = Arc::new(zeros_member(256 * MIB));
+    let up = upstream(move |mut s, rec| {
+        let member = Arc::clone(&member);
+        async move {
+            if rec.read_request(&mut s).await.is_none() {
+                return;
+            }
+            if rec
+            .write(
+                &mut s,
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+            loop {
+                let mut out = format!("{:x}\r\n", member.len()).into_bytes();
+                out.extend_from_slice(&member);
+                out.extend_from_slice(b"\r\n");
+                if rec.write(&mut s, &out).await.is_err() {
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+    let d = daemon(upstreams(&[("u", up.addr)], &[]));
+    let mut c = d.client().await;
+    let started = Instant::now();
+    let r = exchange(
+        &mut c,
+        2,
+        &HttpRequest {
+            timeout_ms: Some(1_000),
+            ..decode_get("/bomb")
+        },
+    )
+    .await;
+    let took = started.elapsed();
+    assert!(r.head.is_some());
+    r.assert_error(
+        errc::QUERY_TIMEOUT,
+        branch::NON_RETRYABLE,
+        http_cause::TIMEOUT,
+    );
+    eprintln!(
+        "F4b decode deadline: terminal after {took:?}, {} B decoded",
+        r.body.len()
+    );
+    assert!(
+        took < Duration::from_millis(1_000 + 700),
+        "the deadline stopped the decoding promptly: {took:?}"
+    );
+}
+
+// =================================================================================================
+// Chaos 5: slow-loris heads
+// =================================================================================================
+
+/// An upstream that reads the request, then dribbles a head one byte every 40 ms, forever.
+async fn slow_loris_head() -> Upstream {
+    upstream(|mut s, rec| async move {
+        if rec.read_request(&mut s).await.is_none() {
+            return;
+        }
+        if rec
+            .write(&mut s, b"HTTP/1.1 200 OK\r\nx-slow: ")
+            .await
+            .is_err()
+        {
+            rec.closed_by_peer.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
+        loop {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            if rec.write(&mut s, b"a").await.is_err() {
+                rec.closed_by_peer.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+        }
+    })
+    .await
+}
+
+/// **Chaos 5.** A head that keeps arriving, one byte at a time, never completes: the request's
+/// total deadline still fires — bytes arriving do not extend it — so a POST is Indeterminate
+/// (`timeout`) and a declared GET `QueryTimeout`, and the connection is evicted (closed, never
+/// pooled). Each received exactly once.
+#[tokio::test]
+async fn chaos5_a_slow_loris_head_is_ended_by_the_deadline_and_evicted() {
+    let up = slow_loris_head().await;
+    let d = daemon(upstreams(&[("u", up.addr)], &[]));
+    let mut c = d.client().await;
+    for (rid, req, code, br) in [
+        (
+            2,
+            post("u", b"charge"),
+            errc::WRITE_UNCONFIRMED,
+            branch::INDETERMINATE,
+        ),
+        (
+            3,
+            idempotent_get("u"),
+            errc::QUERY_TIMEOUT,
+            branch::NON_RETRYABLE,
+        ),
+    ] {
+        let started = Instant::now();
+        let r = exchange(
+            &mut c,
+            rid,
+            &HttpRequest {
+                timeout_ms: Some(700),
+                ..req
+            },
+        )
+        .await;
+        let took = started.elapsed();
+        assert!(r.head.is_none(), "no head ever completed");
+        r.assert_error(code, br, http_cause::TIMEOUT);
+        assert!(
+            took >= Duration::from_millis(650) && took < Duration::from_millis(1_700),
+            "the deadline, not the trickle, ended it: {took:?}"
+        );
+    }
+    assert_eq!(up.rec.requests().len(), 2, "each received exactly once");
+    wait_for("both connections closed by the engine", || {
+        up.rec.closed_by_peer() == 2
+    })
+    .await;
+    assert_eq!(d.engine.idle_connections("u"), 0, "evicted, never pooled");
+    wait_for("no live connection", || d.engine.live_connections() == 0).await;
+}
+
+/// The body-phase slow loris: a body dribbled one byte every 40 ms defeats the idle bound by
+/// design (bytes keep arriving) and is ended by the total deadline, `QueryTimeout` (`timeout`)
+/// after the head.
+#[tokio::test]
+async fn a_slow_loris_body_is_ended_by_the_total_deadline() {
+    let up = upstream(|mut s, rec| async move {
+        if rec.read_request(&mut s).await.is_none() {
+            return;
+        }
+        if rec
+            .write(
+                &mut s,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n",
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        while rec.write(&mut s, b"b").await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        rec.closed_by_peer.fetch_add(1, Ordering::SeqCst);
+    })
+    .await;
+    let d = daemon(upstreams(&[("u", up.addr)], &[]));
+    let mut c = d.client().await;
+    let r = exchange(
+        &mut c,
+        2,
+        &HttpRequest {
+            timeout_ms: Some(700),
+            read_timeout_ms: Some(300),
+            ..post("u", b"x")
+        },
+    )
+    .await;
+    assert!(r.head.is_some());
+    r.assert_error(
+        errc::QUERY_TIMEOUT,
+        branch::NON_RETRYABLE,
+        http_cause::TIMEOUT,
+    );
+    wait_for("closed by the engine", || up.rec.closed_by_peer() == 1).await;
+}
+
+// =================================================================================================
+// Chaos 15: the HTTP drain (§23.6.1)
+// =================================================================================================
+
+/// One request's reply, and when its terminal arrived (relative to `t0`).
+struct Timed {
+    reply: Reply,
+    at: Duration,
+}
+
+/// Collect every request in `rids` to its terminal, interleaved, replenishing credit. Panics if a
+/// read waits longer than `wait`.
+async fn collect_many(
+    c: &mut common::TestClient,
+    rids: &[u32],
+    t0: Instant,
+    wait: Duration,
+) -> HashMap<u32, Timed> {
+    let mut partial: HashMap<u32, Reply> = rids
+        .iter()
+        .map(|&r| {
+            (
+                r,
+                Reply {
+                    head: None,
+                    body: Vec::new(),
+                    body_frames: 0,
+                    end: Outcome::Cancelled,
+                },
+            )
+        })
+        .collect();
+    let mut done = HashMap::new();
+    while done.len() < rids.len() {
+        let f = c
+            .recv_or_none(wait)
+            .await
+            .unwrap_or_else(|| panic!("no frame within {wait:?}; done: {:?}", done.keys()));
+        let rid = f.header.request_id;
+        assert_eq!(f.header.service, service::HTTP);
+        let p = partial
+            .get_mut(&rid)
+            .expect("a frame for an expected request");
+        if f.header.flags & flags::END != 0 {
+            let mut reply = partial.remove(&rid).unwrap();
+            reply.end = Outcome::decode(&f.payload).unwrap();
+            done.insert(
+                rid,
+                Timed {
+                    reply,
+                    at: t0.elapsed(),
+                },
+            );
+            continue;
+        }
+        if f.header.method == method_http::HEAD {
+            p.head = Some(ferro_proto::messages::HttpHead::decode(&f.payload).unwrap());
+        } else {
+            p.body.extend_from_slice(
+                &ferro_proto::messages::HttpBody::decode(&f.payload)
+                    .unwrap()
+                    .chunk,
+            );
+            p.body_frames += 1;
+        }
+        c.window_update(rid, 1, f.payload.len() as u32).await;
+    }
+    done
+}
+
+/// An upstream whose body never ends: a head, then a byte every 20 ms.
+async fn endless_body() -> Upstream {
+    upstream(|mut s, rec| async move {
+        if rec.read_request(&mut s).await.is_none() {
+            return;
+        }
+        if rec
+            .write(
+                &mut s,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n",
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        while rec.write(&mut s, b"s").await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        rec.closed_by_peer.fetch_add(1, Ordering::SeqCst);
+    })
+    .await
+}
+
+/// **Chaos 15, scaled** (`FERRO_HTTP_DRAIN_MS` = 1.5 s, `drain_deadline` = 300 ms, through the real
+/// `serve`): at the drain, in flight are a POST its upstream answers after 800 ms (§23.14's "10 s
+/// POST"), a POST its upstream never answers (the "60 s POST"), a declared-idempotent GET that is
+/// never answered, and two GETs mid-body.
+///
+/// - a NEW request during the drain is refused at once, Retryable `UpstreamUnavailable`
+///   (`draining`), received 0 — chassis change 1: the session was told;
+/// - the 800 ms POST completes `Ok` — AFTER `drain_deadline` has passed, which is chassis change
+///   2: `serve` outlasted it because an HTTP exchange was in flight;
+/// - at the 1.5 s cap the unanswered POST is Indeterminate (`draining`), received exactly 1; the
+///   declared GET is Retryable `ConnectionLost` — what the engine says and §23.7.3 could not; the
+///   GETs mid-body are `ResponseIncomplete` (undeclared) and Retryable (declared) — and every one
+///   of those terminals reaches the client BEFORE the hard abort;
+/// - then `serve` ends: `drain_deadline` after the last HTTP terminal, not at the 1.8 s sum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chaos15_the_drain_refuses_new_requests_finishes_short_ones_and_caps_the_rest() {
+    let slow = upstream(|mut s, rec| async move {
+        if rec.read_request(&mut s).await.is_some() {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let _ = rec.write(&mut s, OK_EMPTY).await;
+        }
+    })
+    .await;
+    let stuck = silent().await;
+    let stream = endless_body().await;
+    let fresh = responder(OK_EMPTY).await;
+    let s = served(
+        upstreams(
+            &[
+                ("slow", slow.addr),
+                ("stuck", stuck.addr),
+                ("stream", stream.addr),
+                ("fresh", fresh.addr),
+            ],
+            &[("", "DRAIN_MS", "1500")],
+        ),
+        Duration::from_millis(300),
+    );
+    let mut c = s.client().await;
+    send(&mut c, 2, &post("slow", b"ten-second")).await;
+    send(&mut c, 3, &post("stuck", b"sixty-second")).await;
+    send(&mut c, 4, &idempotent_get("stuck")).await;
+    send(&mut c, 5, &request("stream", "GET", "/feed")).await;
+    send(&mut c, 6, &idempotent_get("stream")).await;
+    wait_for("all five at their upstreams", || {
+        slow.rec.requests().len() == 1
+            && stuck.rec.requests().len() == 2
+            && stream.rec.requests().len() == 2
+    })
+    .await;
+    wait_for("both streams' heads written", || stream.rec.written() > 0).await;
+
+    let t0 = Instant::now();
+    s.drain.trigger();
+    send(&mut c, 7, &post("fresh", b"during-the-drain")).await;
+    let r = collect_many(&mut c, &[2, 3, 4, 5, 6, 7], t0, Duration::from_secs(3)).await;
+
+    let e = &r[&7];
+    e.reply.assert_error(
+        errc::UPSTREAM_UNAVAILABLE,
+        branch::RETRYABLE,
+        http_cause::DRAINING,
+    );
+    assert!(
+        e.at < Duration::from_millis(300),
+        "refused at once: {:?}",
+        e.at
+    );
+    assert_eq!(fresh.rec.conns(), 0, "received 0");
+
+    let a = &r[&2];
+    a.reply.done();
+    assert!(
+        a.at > Duration::from_millis(300),
+        "the 800 ms POST finished after drain_deadline: {:?}",
+        a.at
+    );
+
+    let b = &r[&3];
+    b.reply.assert_error(
+        errc::WRITE_UNCONFIRMED,
+        branch::INDETERMINATE,
+        http_cause::DRAINING,
+    );
+    assert!(
+        b.at >= Duration::from_millis(1_400),
+        "stopped at the cap, not before: {:?}",
+        b.at
+    );
+    r[&4].reply.assert_error(
+        errc::CONNECTION_LOST,
+        branch::RETRYABLE,
+        http_cause::DRAINING,
+    );
+    assert!(r[&5].reply.head.is_some() && r[&6].reply.head.is_some());
+    r[&5].reply.assert_error(
+        errc::RESPONSE_INCOMPLETE,
+        branch::NON_RETRYABLE,
+        http_cause::DRAINING,
+    );
+    r[&6].reply.assert_error(
+        errc::CONNECTION_LOST,
+        branch::RETRYABLE,
+        http_cause::DRAINING,
+    );
+    let bodies: Vec<Vec<u8>> = stuck.rec.requests().into_iter().map(|s| s.body).collect();
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|b| b.as_slice() == b"sixty-second")
+            .count(),
+        1,
+        "the Indeterminate POST was received exactly once"
+    );
+
+    // The session is hard-closed `drain_deadline` after the last HTTP terminal: well before the
+    // 1.8 s sum would have it, and never before the cap.
+    tokio::time::timeout(Duration::from_secs(3), s.served)
+        .await
+        .expect("serve returned")
+        .unwrap();
+    let ended = t0.elapsed();
+    assert!(
+        ended >= Duration::from_millis(1_500) && ended < Duration::from_millis(2_600),
+        "serve ended at {ended:?}"
+    );
+    assert_eq!(s.engine.in_flight(), 0);
+    wait_for("no connection left", || s.engine.live_connections() == 0).await;
+}
+
+/// **The extension ends early, and only when HTTP is in flight.** An idle session drains in
+/// `drain_deadline` exactly as before F4b; one 400 ms exchange in flight at a 5 s cap ends `serve`
+/// `drain_deadline` after its terminal, not at the 5.3 s sum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_drain_extension_is_bounded_by_the_last_http_terminal() {
+    let slow = upstream(|mut s, rec| async move {
+        if rec.read_request(&mut s).await.is_some() {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let _ = rec.write(&mut s, OK_EMPTY).await;
+        }
+    })
+    .await;
+    let env = upstreams(&[("slow", slow.addr)], &[("", "DRAIN_MS", "5000")]);
+
+    // An idle session: unchanged.
+    let s = served(env.clone(), Duration::from_millis(300));
+    let _c = s.client().await;
+    let t0 = Instant::now();
+    s.drain.trigger();
+    s.served.await.unwrap();
+    let idle = t0.elapsed();
+    assert!(
+        idle >= Duration::from_millis(280) && idle < Duration::from_millis(1_000),
+        "{idle:?}"
+    );
+
+    // One short exchange in flight.
+    let s = served(env, Duration::from_millis(300));
+    let mut c = s.client().await;
+    send(&mut c, 2, &post("slow", b"short")).await;
+    wait_for("at the upstream", || {
+        slow.rec.requests().len() == 2 || slow.rec.requests().len() == 1
+    })
+    .await;
+    let t0 = Instant::now();
+    s.drain.trigger();
+    let r = collect_within(&mut c, 2, Duration::from_secs(3)).await;
+    r.done();
+    s.served.await.unwrap();
+    let ended = t0.elapsed();
+    assert!(
+        ended < Duration::from_millis(1_500),
+        "ended drain_deadline after the last terminal, not at the 5.3 s sum: {ended:?}"
+    );
+}
+
+// =================================================================================================
+// Chaos 4: the stale keep-alive residual (§23.8.2)
+// =================================================================================================
+
+#[derive(Default, Debug)]
+struct Tally {
+    ok: u32,
+    indeterminate: u32,
+    retryable_unsent: u32,
+}
+
+/// Run `n` POSTs on one session with the given idle gaps; every body is unique, and the upstream
+/// must have received each AT MOST once (charter rule 3). Outcomes are tallied.
+async fn run_posts(
+    c: &mut common::TestClient,
+    rec: &Rec,
+    gaps: &[Duration],
+    first_rid: u32,
+) -> Tally {
+    let mut t = Tally::default();
+    for (i, gap) in gaps.iter().enumerate() {
+        tokio::time::sleep(*gap).await;
+        let body = format!("post-{first_rid}-{i}").into_bytes();
+        let r = exchange(c, first_rid + i as u32, &post("u", &body)).await;
+        match &r.end {
+            Outcome::Ok(_) => t.ok += 1,
+            Outcome::Error(ep) if ep.branch == branch::INDETERMINATE => t.indeterminate += 1,
+            Outcome::Error(ep)
+                if ep.branch == branch::RETRYABLE
+                    && matches!(
+                        ep.detail.as_deref(),
+                        Some(http_cause::UNSENT_CLOSED | http_cause::UNSENT_WRITE)
+                    ) =>
+            {
+                t.retryable_unsent += 1
+            }
+            other => panic!("POST {i}: neither success, Indeterminate nor unsent: {other:?}"),
+        }
+        let received = rec.requests().iter().filter(|s| s.body == body).count();
+        assert!(received <= 1, "POST {i} received {received} times: re-sent");
+    }
+    t
+}
+
+/// The "crossing" upstream: a keep-alive server whose idle close crossed the next request — it
+/// reads a request that arrives on a connection idle for ≥ 100 ms, and closes without answering.
+/// The race §23.8.2 narrows, made deterministic.
+async fn crossing_upstream() -> Upstream {
+    upstream(|mut s, rec| async move {
+        let mut last: Option<Instant> = None;
+        loop {
+            let Some(_seen) = rec.read_request(&mut s).await else {
+                return;
+            };
+            if last.is_some_and(|l| l.elapsed() >= Duration::from_millis(100)) {
+                return; // closed without an answer: the request crossed the close
+            }
+            if rec.write(&mut s, OK_EMPTY).await.is_err() {
+                return;
+            }
+            last = Some(Instant::now());
+        }
+    })
+    .await
+}
+
+/// A keep-alive upstream with a real 100 ms idle timer: it closes a connection that has been idle
+/// that long (a FIN), the way servers do.
+async fn idle_timer_upstream() -> Upstream {
+    upstream(|mut s, rec| async move {
+        loop {
+            let got = tokio::time::timeout(Duration::from_millis(100), async {
+                let mut b = [0u8; 1];
+                s.peek(&mut b).await
+            })
+            .await;
+            match got {
+                Err(_) | Ok(Ok(0)) | Ok(Err(_)) => return,
+                Ok(Ok(_)) => {}
+            }
+            if rec.read_request(&mut s).await.is_none() {
+                return;
+            }
+            if rec.write(&mut s, OK_EMPTY).await.is_err() {
+                return;
+            }
+        }
+    })
+    .await
+}
+
+fn gaps(n: usize, lo_ms: u64, hi_ms: u64) -> Vec<Duration> {
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            Duration::from_millis(lo_ms + x % (hi_ms - lo_ms + 1))
+        })
+        .collect()
+}
+
+/// **Chaos 4.** The stale keep-alive race: a POST is a success or Indeterminate (or, when the
+/// close is noticed before a byte leaves, Retryable `unsent_*`), and is NEVER re-sent. The
+/// residual Indeterminate rate is measured at `H1_UNSAFE_REUSE_MAX_IDLE_MS` = its default (2 s)
+/// and = 0, against a server whose close crosses the request (deterministic) and one with a real
+/// 100 ms idle timer (the race as it happens). At 0 a POST never reuses an idle connection, so the
+/// residual is 0 — at the cost of a dial per POST.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chaos4_the_stale_keep_alive_residual_at_the_default_and_at_zero() {
+    for (model, unsafe_idle) in [
+        ("crossing", None),
+        ("crossing", Some("0")),
+        ("idle-timer", None),
+        ("idle-timer", Some("0")),
+    ] {
+        let up = if model == "crossing" {
+            crossing_upstream().await
+        } else {
+            idle_timer_upstream().await
+        };
+        let extra: Vec<(&str, &str, &str)> = unsafe_idle
+            .map(|v| vec![("u", "H1_UNSAFE_REUSE_MAX_IDLE_MS", v)])
+            .unwrap_or_default();
+        let d = daemon(upstreams(&[("u", up.addr)], &extra));
+        let mut c = d.client().await;
+        let g = if model == "crossing" {
+            vec![Duration::from_millis(150); 20]
+        } else {
+            gaps(40, 80, 120)
+        };
+        let t = run_posts(&mut c, &up.rec, &g, 2).await;
+        let n = g.len() as u32;
+        assert_eq!(t.ok + t.indeterminate + t.retryable_unsent, n);
+        let received = up.rec.requests().len() as u32;
+        assert!(received <= n, "never more requests than POSTs");
+        let label = format!(
+            "{model} @ H1_UNSAFE_REUSE_MAX_IDLE_MS={}",
+            unsafe_idle.unwrap_or("2000 (default)")
+        );
+        eprintln!(
+            "F4b chaos 4: {label}: {n} POSTs → ok {} / indeterminate {} / unsent {}; {} connections",
+            t.ok,
+            t.indeterminate,
+            t.retryable_unsent,
+            up.rec.conns()
+        );
+        if unsafe_idle == Some("0") {
+            assert_eq!(
+                t.indeterminate, 0,
+                "{model}: at 0 no POST reuses an idle connection"
+            );
+            assert_eq!(up.rec.conns(), u64::from(n), "{model}: one dial per POST");
+        } else if model == "crossing" {
+            assert!(
+                t.indeterminate >= n / 3,
+                "the crossing close reaches a reused POST at the default: {t:?}"
+            );
+        }
+    }
+}

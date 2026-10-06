@@ -1,6 +1,6 @@
-//! The Ferro HTTP engine, HTTP/1.1 plaintext path (SPEC §23.6; slice M6-F4a).
+//! The Ferro HTTP engine, HTTP/1.1 plaintext path (SPEC §23.6; slices M6-F4a and M6-F4b).
 //!
-//! [`HttpEngine::exchange`] runs one `REQUEST` through §23.6's lifecycle and returns its ONE
+//! [`HttpEngine::serve_request`] runs one `REQUEST` through §23.6's lifecycle and returns its ONE
 //! terminal ([`Terminal`]); the caller (`ferrod`'s HTTP service) declares it, so exactly one `END`
 //! follows every request (charter rule 4). Response frames go out through a [`ResponseSink`], the
 //! seam that keeps this crate free of `ferrod`'s session types.
@@ -10,28 +10,43 @@
 //! 2. **Bounds** (§23.8.4): the total deadline runs from DECODE (`started`); each bound is
 //!    `min(request field ?? upstream default, upstream ceiling)` — `read_timeout_ms` has no ceiling,
 //!    `READ_TIMEOUT_MS` being only its default.
-//! 3. **Acquire** (§23.6 step 5): reuse an idle connection (§23.8.2) or dial: DNS, the address guard,
+//! 3. **Admit** (§23.6 step 4, F4b): (a) the daemon's drain — a request that arrives while it is
+//!    draining is refused `draining`; (d) the body budget ([`budget`]) — over either account,
+//!    `body_budget`. Breaker, rate limit and the queue (b, c, e) are slice F6's.
+//! 4. **Acquire** (step 5): reuse an idle connection (§23.8.2) or dial: DNS, the address guard,
 //!    TCP to the checked `SocketAddr` (§23.8.5). A deadline or `CANCEL` here is "before dispatch".
-//! 4. **Dispatch** (step 6): arm the write tracker, hand the request to `hyper`.
-//! 5. **Head** (step 7): a 101 is `informational_101`, a head over [`MAX_HEAD_BYTES`] by the engine's
-//!    exact measure is `oversize_head`; both are "sent, no head". Otherwise one `HEAD` frame.
-//! 6. **Body** (step 8): `BODY` frames of at most 256 KiB, each a credit debit; while credit is
-//!    exhausted the sink parks and the engine stops polling the body, so `hyper` stops reading and
-//!    the upstream sees TCP backpressure (P7).
-//! 7. **Terminal** (step 9): `HttpDone`, an error from [`fate::classify`], or `Cancelled`.
+//! 5. **Dispatch** (step 6): arm the write tracker, hand the request to `hyper`.
+//! 6. **Head** (step 7): a 101 is `informational_101`, a head over [`MAX_HEAD_BYTES`] by the engine's
+//!    exact measure is `oversize_head`; both are "sent, no head". Otherwise one `HEAD` frame — with
+//!    `content-encoding`/`content-length` moved into `decoded` when the engine decodes (§23.9.2).
+//! 7. **Body** (step 8): `BODY` frames of at most 256 KiB, each a credit debit; while credit is
+//!    exhausted the sink parks and the engine stops polling the body (and stops DECODING it), so
+//!    `hyper` stops reading and the upstream sees TCP backpressure (P7).
+//! 8. **Terminal** (step 9): `HttpDone`, an error from [`fate::classify`], or `Cancelled`.
 //!
 //! **The engine never re-sends a request** (charter rule 3, §23.7): a dispatched request is never
 //! moved to another connection, and a failed dial is not a retry (no byte of the request exists
 //! anywhere yet). After a cancel, a timeout or any failure the connection is discarded, never
-//! drained (§23.8.2), and `sent` is read only after `hyper`'s connection task is gone (§23.7.1).
+//! drained (§23.8.2), and `sent` is read only after `hyper`'s connection task is gone (§23.7.1) —
+//! `hyper` keeps flushing a buffered request even after it has delivered a head-read error
+//! (`track.rs`'s `hyper_keeps_writing_the_request_after_delivering_a_head_error`), so every arm
+//! discards BEFORE it reads `sent`.
 //!
-//! **Not in F4a (slice F4b, §22.2 (cz)):** the body budget, the HTTP drain, content decoding
-//! (§23.9.2: `decode` is accepted and has no effect — the engine neither asks for an encoding nor
-//! removes one, and `HttpHead.decoded` is `nil`). **Slice F6:** concurrency limits, the queue,
-//! breaker and rate limits. **F5:** TLS (`https` upstreams are refused `tls_handshake` until then).
-//! **F7:** metrics, spans and the slow log.
+//! **The drain (§23.6.1, F4b).** `ferrod` hands every request a [`DrainView`] of the daemon's drain
+//! signal. A request admitted before the drain keeps running until its own terminal or
+//! `FERRO_HTTP_DRAIN_MS` after the drain began, whichever is first; at that cap the engine stops it
+//! through the same cancellation path a `CANCEL` takes, and classifies it with the `Drain` rows
+//! (§23.7.1 as amended: the link-level rows, cause `draining`) — so a sent non-idempotent request
+//! with no head is Indeterminate, a delivery in progress is `ResponseIncomplete`, and a declared-
+//! idempotent request is Retryable. [`HttpEngine::in_flight_watch`] lets `serve` outlast the cap
+//! (chassis change 2).
+//!
+//! **Slice F6:** concurrency limits, the queue, breaker and rate limits. **F5:** TLS (`https`
+//! upstreams are `Unsupported` until then). **F7:** metrics, spans and the slow log.
 
 pub mod body;
+pub mod budget;
+pub mod decode;
 pub mod dial;
 pub mod head;
 pub mod pool;
@@ -39,7 +54,8 @@ pub mod track;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -47,6 +63,7 @@ use ferro_proto::messages::{HttpBody, HttpDone, HttpHeaderField, HttpRequest, Ht
 use http_body::Body as _;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{HttpConfig, Partition, Upstream};
@@ -60,8 +77,9 @@ pub use dial::{BoxIo, Connect, Io, Resolve, StaticResolver, SystemResolver, TcpC
 pub use head::MAX_HEAD_BYTES;
 
 use body::OneChunk;
+use budget::Budgets;
 use dial::{DialFailure, DnsCache};
-use pool::{HttpConn, PoolKey, Pools, ReusePolicy};
+use pool::{HttpConn, LiveConn, PoolKey, Pools, ReusePolicy};
 use track::Tracker;
 
 /// The largest `BODY` chunk (§23.5.3). Not a registry constant: no receiver enforces it (§22.2 (cy)).
@@ -70,6 +88,9 @@ pub const MAX_BODY_CHUNK: usize = 256 * 1024;
 /// How long a returned connection may take to become ready for its next request before it is
 /// discarded instead of pooled. Normally immediate once the body's end was read.
 const READY_ON_RETURN: Duration = Duration::from_millis(250);
+
+/// The `Accept-Encoding` the engine adds when a request asks for decoding and names none (§23.9.2).
+const DECODE_ACCEPT_ENCODING: &str = "gzip, deflate";
 
 /// One request's terminal, for the caller to declare.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +121,7 @@ pub enum SinkFrame {
 /// Why a sink did not send a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkError {
-    /// The request was cancelled while the frame waited for credit.
+    /// The request was cancelled (a `CANCEL`, or the daemon's drain cap) while the frame waited.
     Cancelled,
     /// The request's deadline passed while the frame waited for credit.
     Deadline,
@@ -112,23 +133,102 @@ pub enum SinkError {
 }
 
 /// Where response frames go: `ferrod` implements it over its `Responder` (credit debit, session
-/// cap, the one ordered control channel). `send` parks while credit is exhausted.
+/// cap, the one ordered control channel). `send` parks while credit is exhausted, and gives up when
+/// `cancel` fires or `deadline` passes. `cancel` is passed per call (M6-F4b) because it is the
+/// ENGINE's token for the request — the client's `CANCEL` and the daemon's drain cap both fire it —
+/// so a frame parked on credit wakes for either.
 pub trait ResponseSink: Send + Sync {
     fn send<'a>(
         &'a self,
         frame: SinkFrame,
         payload: Vec<u8>,
         deadline: tokio::time::Instant,
+        cancel: &'a CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 }
 
-/// The engine: configuration, resolver, DNS cache and connection pools. One per daemon.
+/// The daemon's drain signal as the engine sees it (§23.6.1, M6-F4b): whether the drain has begun,
+/// and WHEN — one instant for every exchange, so the cap is the same wall-clock moment for all of
+/// them however often an exchange re-arms its wait. `ferrod` builds it from the session layer's
+/// drain signal (chassis change 1).
+#[derive(Clone, Debug, Default)]
+pub struct DrainView {
+    started: CancellationToken,
+    at: Arc<OnceLock<tokio::time::Instant>>,
+}
+
+impl DrainView {
+    /// `started` is cancelled when the drain begins; `at` holds that instant, set BEFORE `started`
+    /// is cancelled (so an observer of the token always finds it).
+    pub fn new(started: CancellationToken, at: Arc<OnceLock<tokio::time::Instant>>) -> Self {
+        DrainView { started, at }
+    }
+
+    /// A drain that never begins (a caller with no daemon, such as an engine-level test).
+    pub fn never() -> Self {
+        DrainView::default()
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.started.is_cancelled()
+    }
+
+    /// Resolves `after` the drain began (never, if it never does).
+    async fn cap(&self, after: Duration) {
+        self.started.cancelled().await;
+        let at = self
+            .at
+            .get()
+            .copied()
+            .unwrap_or_else(tokio::time::Instant::now);
+        tokio::time::sleep_until(at + after).await;
+    }
+}
+
+/// The number of requests inside [`HttpEngine::serve_request`], observable as a `watch` so `serve`
+/// can wait for it to reach zero (§23.6.1 chassis change 2).
+struct InFlight(watch::Sender<usize>);
+
+struct InFlightGuard<'a>(&'a watch::Sender<usize>);
+
+impl InFlight {
+    fn enter(&self) -> InFlightGuard<'_> {
+        self.0.send_modify(|n| *n += 1);
+        InFlightGuard(&self.0)
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
+    }
+}
+
+/// The engine's stop signal for ONE request: a child of the client's `CANCEL` token that the drain
+/// cap also fires, plus the flag that says which of the two it was. The flag is set BEFORE the
+/// token is cancelled, so every observer of the cancellation reads the right reason.
+struct Stop {
+    token: CancellationToken,
+    drained: AtomicBool,
+}
+
+impl Stop {
+    fn drained(&self) -> bool {
+        self.drained.load(Ordering::SeqCst)
+    }
+}
+
+/// The engine: configuration, resolver, DNS cache, connection pools and body budgets. One per
+/// daemon.
 pub struct HttpEngine {
     config: Arc<HttpConfig>,
     resolver: Arc<dyn Resolve>,
     connector: Arc<dyn Connect>,
     dns: DnsCache,
     pools: Pools,
+    budgets: Budgets,
+    in_flight: InFlight,
+    live: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for HttpEngine {
@@ -165,12 +265,16 @@ impl HttpEngine {
         resolver: Arc<dyn Resolve>,
         connector: Arc<dyn Connect>,
     ) -> Self {
+        let budgets = Budgets::new(&config);
         HttpEngine {
             config,
             resolver,
             connector,
             dns: DnsCache::default(),
             pools: Pools::default(),
+            budgets,
+            in_flight: InFlight(watch::Sender::new(0)),
+            live: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -190,14 +294,103 @@ impl HttpEngine {
         self.pools.idle_count(&(upstream.to_string(), None))
     }
 
-    /// Run one request to its terminal. `started` is when its frame was decoded: the total deadline
-    /// runs from there (§23.6 step 4). `cancel` is the request's `CANCEL` (and session death).
+    /// Upstream connections alive anywhere in the engine — pooled, in use, or being torn down —
+    /// counted from dial to drop (chaos 12; the `ferro_http_connections` gauge is F7's).
+    pub fn live_connections(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    /// Body bytes currently charged to `upstream`'s budget (§23.8.6; the gauge is F7's).
+    pub fn body_budget_in_use(&self, upstream: &str) -> u64 {
+        self.budgets.in_use(upstream)
+    }
+
+    /// Body bytes currently charged to the daemon-wide budget.
+    pub fn body_budget_daemon_in_use(&self) -> u64 {
+        self.budgets.daemon_in_use()
+    }
+
+    /// Requests currently inside [`HttpEngine::serve_request`].
+    pub fn in_flight(&self) -> usize {
+        *self.in_flight.0.borrow()
+    }
+
+    /// The in-flight count as a `watch`, for `serve`'s drain wait (§23.6.1 chassis change 2).
+    pub fn in_flight_watch(&self) -> watch::Receiver<usize> {
+        self.in_flight.0.subscribe()
+    }
+
+    /// `FERRO_HTTP_DRAIN_MS` (§23.6.1).
+    pub fn drain_cap(&self) -> Duration {
+        ms(self.config.daemon.drain_ms)
+    }
+
+    /// [`HttpEngine::serve_request`] for a borrowed request that can never be drained (engine-level
+    /// tests and callers with no daemon). Clones the request, body included.
     pub async fn exchange(
         &self,
         req: &HttpRequest,
         peer_uid: Option<u32>,
         started: Instant,
         cancel: &CancellationToken,
+        sink: &dyn ResponseSink,
+    ) -> Terminal {
+        self.serve_request(
+            req.clone(),
+            peer_uid,
+            started,
+            cancel,
+            &DrainView::never(),
+            sink,
+        )
+        .await
+    }
+
+    /// Run one request to its terminal. `started` is when its frame was decoded: the total deadline
+    /// runs from there (§23.6 step 4). `cancel` is the request's `CANCEL` (and session death);
+    /// `drain` is the daemon's drain signal (§23.6.1). The request is taken by value so its body can
+    /// be handed to `hyper` without a copy, charged to the body budget (§23.8.6).
+    pub async fn serve_request(
+        &self,
+        req: HttpRequest,
+        peer_uid: Option<u32>,
+        started: Instant,
+        cancel: &CancellationToken,
+        drain: &DrainView,
+        sink: &dyn ResponseSink,
+    ) -> Terminal {
+        let _in_flight = self.in_flight.enter();
+        let stop = Stop {
+            token: cancel.child_token(),
+            drained: AtomicBool::new(false),
+        };
+        let run = self.run(req, peer_uid, started, &stop, drain, sink);
+        let cap = drain.cap(self.drain_cap());
+        tokio::pin!(run, cap);
+        let mut capped = false;
+        loop {
+            tokio::select! {
+                biased;
+                t = &mut run => return t,
+                () = &mut cap, if !capped => {
+                    // §23.6.1: the exchange outlived `FERRO_HTTP_DRAIN_MS`. Stop it through the
+                    // cancellation path every phase already handles — which discards the connection
+                    // before reading `sent` — and let it classify itself with the `Drain` rows.
+                    capped = true;
+                    stop.drained.store(true, Ordering::SeqCst);
+                    stop.token.cancel();
+                }
+            }
+        }
+    }
+
+    async fn run(
+        &self,
+        mut req: HttpRequest,
+        peer_uid: Option<u32>,
+        started: Instant,
+        stop: &Stop,
+        drain: &DrainView,
         sink: &dyn ResponseSink,
     ) -> Terminal {
         let headers: Vec<(String, Vec<u8>)> = req
@@ -254,8 +447,9 @@ impl HttpEngine {
         };
 
         // The request `hyper` will send, built before any dial: a target or header the `http`
-        // crate cannot represent byte-exactly is refused before anything is dialled.
-        let hreq = match build_request(&v, req, &headers) {
+        // crate cannot represent byte-exactly is refused before anything is dialled. Its body is
+        // attached after admission (the budget charge travels with it).
+        let parts = match build_request(&v, &req, &headers) {
             Ok(r) => r,
             Err(cause) => return policy(cause, None),
         };
@@ -277,13 +471,39 @@ impl HttpEngine {
                 (Partition::None, _) => None,
             },
         );
+
+        // ---- admission (§23.6 step 4; F4b: (a) and (d)) -------------------------------------------
+        // (a) The drain: a request that arrives while the daemon drains is refused, unsent.
+        if drain.is_draining() {
+            return classify(Situation::BeforeDispatch(BeforeDispatch::Draining), idem);
+        }
+        // (d) The body budget: charged now, released when the body is fully written or at this
+        // request's terminal, whichever is first (`budget`'s module docs).
+        let body = req.body.take();
+        let body_len = body.as_ref().map_or(0, |b| b.len() as u64);
+        let charge = match self.budgets.charge(&up.name, body_len) {
+            Ok(c) => c,
+            Err(()) => {
+                return classify(Situation::BeforeDispatch(BeforeDispatch::BodyBudget), idem);
+            }
+        };
+        let body = match (body, &charge) {
+            (Some(b), Some(c)) => OneChunk::new(c.wrap_body(b)),
+            (Some(b), None) => OneChunk::new(Bytes::from(b)),
+            (None, _) => OneChunk::empty(),
+        };
+        let hreq = http::Request::from_parts(parts, body);
+        // This holder drops when `run` returns: the "at its terminal" half of the release rule.
+        let _charge = charge;
         let admitted = Instant::now();
 
         // ---- before dispatch: acquire a connection ------------------------------------------------
         let acquire = self.acquire(&key, up, idem, bounds.connect);
         let (mut conn, reused, connect_us) = tokio::select! {
             biased;
-            () = cancel.cancelled() => return classify(Situation::BeforeDispatch(BeforeDispatch::Cancel), idem),
+            () = stop.token.cancelled() => {
+                return classify(Situation::BeforeDispatch(before_dispatch_stop(stop)), idem)
+            }
             () = tokio::time::sleep_until(bounds.deadline) => {
                 return classify(Situation::BeforeDispatch(BeforeDispatch::Deadline), idem)
             }
@@ -294,13 +514,13 @@ impl HttpEngine {
         };
 
         // ---- dispatch -----------------------------------------------------------------------------
-        // A `CANCEL` or the deadline that arrived while the connection was being handed over is
-        // honoured BEFORE dispatch: a request not yet given to `hyper` is not sent, and giving it
-        // only to classify it a moment later could put bytes on the wire for nothing. The idle
-        // connection is still good, so it goes back to the pool.
-        if cancel.is_cancelled() || tokio::time::Instant::now() >= bounds.deadline {
-            let event = if cancel.is_cancelled() {
-                BeforeDispatch::Cancel
+        // A `CANCEL`, the drain cap or the deadline that arrived while the connection was being
+        // handed over is honoured BEFORE dispatch: a request not yet given to `hyper` is not sent,
+        // and giving it only to classify it a moment later could put bytes on the wire for nothing.
+        // The idle connection is still good, so it goes back to the pool.
+        if stop.token.is_cancelled() || tokio::time::Instant::now() >= bounds.deadline {
+            let event = if stop.token.is_cancelled() {
+                before_dispatch_stop(stop)
             } else {
                 BeforeDispatch::Deadline
             };
@@ -321,7 +541,7 @@ impl HttpEngine {
             // The response first: a head that arrived is a head received, whatever raced it.
             biased;
             r = send => Ok(r),
-            () = cancel.cancelled() => Err(true),
+            () = stop.token.cancelled() => Err(true),
             () = tokio::time::sleep_until(bounds.deadline) => Err(false),
         };
         let resp = match outcome {
@@ -347,15 +567,25 @@ impl HttpEngine {
                     idem,
                 );
             }
-            Err(cancelled) => {
+            Err(stopped) => {
+                // Read the reason BEFORE the teardown, at the moment the stop was observed.
+                let drained = stopped && stop.drained();
                 let track = conn.track.clone();
                 conn.discard().await;
                 return classify(
-                    match (track.sent(), cancelled) {
-                        (false, true) => Situation::DispatchedNotSent(DispatchedNotSent::Cancel),
-                        (false, false) => Situation::DispatchedNotSent(DispatchedNotSent::Deadline),
-                        (true, true) => Situation::SentNoHead(SentNoHead::Cancel),
-                        (true, false) => Situation::SentNoHead(SentNoHead::Timeout),
+                    match (track.sent(), stopped, drained) {
+                        (false, true, true) => {
+                            Situation::DispatchedNotSent(DispatchedNotSent::Drain)
+                        }
+                        (false, true, false) => {
+                            Situation::DispatchedNotSent(DispatchedNotSent::Cancel)
+                        }
+                        (false, false, _) => {
+                            Situation::DispatchedNotSent(DispatchedNotSent::Deadline)
+                        }
+                        (true, true, true) => Situation::SentNoHead(SentNoHead::Drain),
+                        (true, true, false) => Situation::SentNoHead(SentNoHead::Cancel),
+                        (true, false, _) => Situation::SentNoHead(SentNoHead::Timeout),
                     },
                     idem,
                 );
@@ -417,13 +647,36 @@ impl HttpEngine {
                 v.to_str()
                     .is_ok_and(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")))
             });
-        let head_frame = head::http_head(parts.status, parts.version, reason, &parts.headers, idem);
+        // §23.9.2: decode only when the request asked AND the response carries exactly one coding
+        // the engine decodes; everything else passes through with `decoded = nil`.
+        let decoding = if req.decode {
+            decode::coding_of(&parts.headers)
+        } else {
+            None
+        };
+        let mut decoder = decoding
+            .as_ref()
+            .map(|(c, _)| decode::Decoder::new(*c, MAX_BODY_CHUNK));
+        let head_frame = head::http_head(
+            parts.status,
+            parts.version,
+            reason,
+            &parts.headers,
+            idem,
+            decoding.map(|(_, as_received)| as_received),
+        );
         if let Err(e) = sink
-            .send(SinkFrame::Head, head_frame.encode(), bounds.deadline)
+            .send(
+                SinkFrame::Head,
+                head_frame.encode(),
+                bounds.deadline,
+                &stop.token,
+            )
             .await
         {
+            let event = sink_failure(e, stop);
             conn.discard().await;
-            return classify(Situation::HeadReceived(sink_failure(e)), idem);
+            return classify(Situation::HeadReceived(event), idem);
         }
 
         // ---- body ---------------------------------------------------------------------------------
@@ -439,7 +692,7 @@ impl HttpEngine {
             let polled = tokio::select! {
                 // Cancel and deadline FIRST: a body that is always ready must not starve them.
                 biased;
-                () = cancel.cancelled() => Err(HeadReceived::Cancel),
+                () = stop.token.cancelled() => Err(after_head_stop(stop)),
                 () = tokio::time::sleep_until(bounds.deadline) => Err(HeadReceived::Timeout),
                 f = next => match f {
                     Err(()) => Err(HeadReceived::ReadIdle),
@@ -451,7 +704,14 @@ impl HttpEngine {
                     conn.discard().await;
                     return classify(Situation::HeadReceived(e), idem);
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    // The body's end: a decoded stream must end cleanly too.
+                    if decoder.as_ref().is_some_and(|d| d.finish().is_err()) {
+                        conn.discard().await;
+                        return classify(Situation::HeadReceived(HeadReceived::Decode), idem);
+                    }
+                    break;
+                }
                 Ok(Some(Err(e))) => {
                     let cause = head::after_head(&e);
                     conn.discard().await;
@@ -468,15 +728,16 @@ impl HttpEngine {
             }
             match frame.into_data() {
                 Ok(data) => {
-                    for chunk in data.chunks(MAX_BODY_CHUNK) {
-                        let payload = HttpBody {
-                            chunk: chunk.to_vec(),
+                    let sent = match decoder.as_mut() {
+                        None => send_chunks(sink, &data, &bounds, stop).await,
+                        Some(d) => {
+                            d.feed(data);
+                            send_decoded(sink, d, &bounds, stop).await
                         }
-                        .encode();
-                        if let Err(e) = sink.send(SinkFrame::Body, payload, bounds.deadline).await {
-                            conn.discard().await;
-                            return classify(Situation::HeadReceived(sink_failure(e)), idem);
-                        }
+                    };
+                    if let Err(event) = sent {
+                        conn.discard().await;
+                        return classify(Situation::HeadReceived(event), idem);
                     }
                 }
                 Err(frame) => {
@@ -548,7 +809,12 @@ impl HttpEngine {
         builder
             .max_buf_size(head::H1_MAX_BUF_SIZE)
             .max_headers(head::H1_MAX_HEADERS)
-            .title_case_headers(true);
+            .title_case_headers(true)
+            // M6-F4b: the `Queue` write strategy, PINNED rather than inherited from the transport's
+            // `is_write_vectored`. Under it `hyper` keeps the request body's own `Bytes` until its
+            // last byte is written, which is what the body budget's release-when-written rule
+            // observes (`budget`'s module docs); `Flatten` would copy the body and drop ours at once.
+            .writev(true);
         let (sender, conn) = match builder.handshake(TokioIo::new(tracked)).await {
             Ok(x) => x,
             // No I/O happens in an h1 handshake (P1); a failure here is not a dial outcome the
@@ -568,10 +834,59 @@ impl HttpEngine {
                 created: now,
                 idle_since: now,
                 idle_limit: ms(up.limits.idle_timeout_ms),
+                live: LiveConn::new(&self.live),
             },
             false,
             micros(d.elapsed),
         ))
+    }
+}
+
+/// Send a raw body chunk as `BODY` frames of at most [`MAX_BODY_CHUNK`].
+async fn send_chunks(
+    sink: &dyn ResponseSink,
+    data: &[u8],
+    bounds: &Bounds,
+    stop: &Stop,
+) -> Result<(), HeadReceived> {
+    for chunk in data.chunks(MAX_BODY_CHUNK) {
+        let payload = HttpBody {
+            chunk: chunk.to_vec(),
+        }
+        .encode();
+        sink.send(SinkFrame::Body, payload, bounds.deadline, &stop.token)
+            .await
+            .map_err(|e| sink_failure(e, stop))?;
+    }
+    Ok(())
+}
+
+/// Drain a decoder into `BODY` frames, one bounded step at a time (§23.9.2). Each step is sent —
+/// through the credit gauntlet — before the next is decoded, so a frame parked on credit stops
+/// decompression (memory bounded by the window), and the stop token and the total deadline are
+/// checked between steps (CPU bounded by the deadline, even for a bomb that never lacks credit).
+async fn send_decoded(
+    sink: &dyn ResponseSink,
+    d: &mut decode::Decoder,
+    bounds: &Bounds,
+    stop: &Stop,
+) -> Result<(), HeadReceived> {
+    loop {
+        if stop.token.is_cancelled() {
+            return Err(after_head_stop(stop));
+        }
+        if tokio::time::Instant::now() >= bounds.deadline {
+            return Err(HeadReceived::Timeout);
+        }
+        let Some(chunk) = d.next_chunk().map_err(|_| HeadReceived::Decode)? else {
+            return Ok(());
+        };
+        let payload = HttpBody { chunk }.encode();
+        sink.send(SinkFrame::Body, payload, bounds.deadline, &stop.token)
+            .await
+            .map_err(|e| sink_failure(e, stop))?;
+        // A step that never waits (credit to spare) must still let other tasks run.
+        tokio::task::yield_now().await;
     }
 }
 
@@ -581,6 +896,24 @@ fn micros(d: Duration) -> u64 {
 
 fn classify(s: Situation, idempotent: bool) -> Terminal {
     fate::classify(s, idempotent).into()
+}
+
+/// The stop token fired before dispatch: the drain cap, or a `CANCEL`.
+fn before_dispatch_stop(stop: &Stop) -> BeforeDispatch {
+    if stop.drained() {
+        BeforeDispatch::Draining
+    } else {
+        BeforeDispatch::Cancel
+    }
+}
+
+/// The stop token fired after the head: the drain cap, or a `CANCEL`.
+fn after_head_stop(stop: &Stop) -> HeadReceived {
+    if stop.drained() {
+        HeadReceived::Drain
+    } else {
+        HeadReceived::Cancel
+    }
 }
 
 /// A policy refusal, optionally with the validator's own (log-safe) sentence as the message.
@@ -609,23 +942,25 @@ fn dial_situation(f: DialFailure) -> BeforeDispatch {
     }
 }
 
-fn sink_failure(e: SinkError) -> HeadReceived {
+fn sink_failure(e: SinkError, stop: &Stop) -> HeadReceived {
     match e {
         SinkError::Deadline => HeadReceived::Timeout,
+        SinkError::Cancelled => after_head_stop(stop),
         // A session that is gone is a cancel nobody will read (§23.6 "session death").
-        SinkError::Cancelled | SinkError::LinkLost => HeadReceived::Cancel,
+        SinkError::LinkLost => HeadReceived::Cancel,
         SinkError::Oversized => HeadReceived::BodyFraming,
     }
 }
 
-/// The `hyper` request for a validated one: the method and target bytes as accepted, `Host` from
-/// `ORIGIN` alone, PHP's kept headers verbatim and in order, the attached headers, and a recomputed
-/// `Content-Length` when a body is present. Nothing else is added (§23.4.3).
+/// The `hyper` request for a validated one, without its body: the method and target bytes as
+/// accepted, `Host` from `ORIGIN` alone, PHP's kept headers verbatim and in order, the attached
+/// headers, the decode-only `Accept-Encoding` (§23.9.2), and a recomputed `Content-Length` when a
+/// body is present. Nothing else is added (§23.4.3).
 fn build_request(
     v: &Validated<'_>,
     req: &HttpRequest,
     headers: &[(String, Vec<u8>)],
-) -> Result<http::Request<OneChunk>, PolicyCause> {
+) -> Result<http::request::Parts, PolicyCause> {
     let method =
         http::Method::from_bytes(req.method.as_bytes()).map_err(|_| PolicyCause::Method)?;
     let uri: http::Uri = req.target.parse().map_err(|_| PolicyCause::Target)?;
@@ -653,15 +988,20 @@ fn build_request(
             .map_err(|_| PolicyCause::Header)?;
         map.append(name, value);
     }
-    let body = match &req.body {
-        Some(bytes) => {
-            map.insert(
-                http::header::CONTENT_LENGTH,
-                http::HeaderValue::from(v.content_length),
-            );
-            OneChunk::new(Bytes::copy_from_slice(bytes))
-        }
-        None => OneChunk::empty(),
-    };
-    b.body(body).map_err(|_| PolicyCause::Target)
+    if v.add_accept_encoding {
+        // §23.9.2 "Asking": the request asked for decoding and neither PHP nor the attached set
+        // named an `Accept-Encoding` (the validator decided that, F3).
+        map.insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static(DECODE_ACCEPT_ENCODING),
+        );
+    }
+    if req.body.is_some() {
+        map.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from(v.content_length),
+        );
+    }
+    let (parts, ()) = b.body(()).map_err(|_| PolicyCause::Target)?.into_parts();
+    Ok(parts)
 }
