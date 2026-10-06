@@ -302,6 +302,35 @@ final class TransportFdTest extends TestCase
         }
     }
 
+    /**
+     * A frame-start read waits ONCE: the header peek that decides whether to free the fd reserve
+     * waits on `SO_RCVTIMEO` like the read itself, and its timeout IS the read's timeout — not a
+     * first wait followed by a second one in `recvmsg`. Nothing is consumed, so the frame that
+     * arrives afterwards reads intact, with its fd.
+     */
+    public function testAFrameStartReadOnASilentPeerTimesOutOnce(): void
+    {
+        $t = $this->connect(readTimeout: 5.0);
+        $t->setReadWait(0.3);
+        $t->beginFrame();
+        $start = microtime(true);
+        try {
+            $t->readExact(16);
+            $this->fail('a silent peer must time out');
+        } catch (TransportException $e) {
+            $this->assertTrue($e->isReadTimeout(), $e->getMessage());
+        }
+        $waited = microtime(true) - $start;
+        $this->assertLessThan(0.5, $waited, "one 0.3 s wait, not two ({$waited} s)");
+
+        $head = (new \Ferro\Protocol\Header(\Ferro\Protocol\Generated\Constants::FLAG_END | \Ferro\Protocol\Generated\Constants::FLAG_OOB_FD, 2, 1, 7, 0))->encode();
+        $this->send($head, [self::file('late')]);
+        $t->beginFrame();
+        $this->assertSame($head, $t->readExact(16));
+        $this->assertSame('late', self::contentOf($t->takeFd()));
+        $t->close();
+    }
+
     /** The CONTROL: the `fread` path reads the same bytes and loses the fd without a trace. */
     public function testTheFreadPathSilentlyLosesAnFd(): void
     {
