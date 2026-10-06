@@ -33,7 +33,8 @@ use Ferro\Client\Waiter;
  * **Only `await` on a Future returned by an `…Async` method suspends.** A synchronous call inside a
  * task, and an `await` on a Future that settled at once (inside a transaction, for example), block
  * the whole loop until they complete, which is still correct: frames for other Fibers that arrive
- * meanwhile are kept for them. A Fiber this loop did not start never suspends into it.
+ * meanwhile are kept for them. A Fiber this loop did not start never suspends into it; with
+ * {@see Revolt} installed, the Revolt event loop may suspend it instead (M3-D1d).
  *
  * Swoole coroutines and Fibers do not compose: under Octane/Swoole, do not run this loop (§10.1).
  */
@@ -82,12 +83,36 @@ final class Loop
     public static function waitFor(Waiter $waiter): void
     {
         $fiber = \Fiber::getCurrent();
-        if ($fiber === null || self::$owned === null || !isset(self::$owned[$fiber])) {
+        if ($fiber !== null && self::$owned !== null && isset(self::$owned[$fiber])) {
+            while (!$waiter->ready()) {
+                \Fiber::suspend($waiter);
+            }
             return;
         }
-        while (!$waiter->ready()) {
-            \Fiber::suspend($waiter);
+        // Not this loop's Fiber. With {@see Revolt::install}ed, the Revolt event loop may be the one
+        // to suspend it (M3-D1d); it decides, and returns at once — the caller blocks — when it
+        // cannot. Without it, nothing here changes: the caller blocks, as it always has.
+        if (self::$foreign !== null) {
+            (self::$foreign)($waiter);
         }
+    }
+
+    /**
+     * The other scheduler {@see waitFor} hands a Fiber this loop does not own to, if one is
+     * installed ({@see Revolt::install}). A closure rather than a class reference, so a process that
+     * never installs one never loads it (charter rule 7).
+     *
+     * @var (\Closure(Waiter): void)|null
+     */
+    private static ?\Closure $foreign = null;
+
+    /**
+     * @internal {@see Revolt::install} / {@see Revolt::uninstall}
+     * @param (\Closure(Waiter): void)|null $wait
+     */
+    public static function delegate(?\Closure $wait): void
+    {
+        self::$foreign = $wait;
     }
 
     /**
