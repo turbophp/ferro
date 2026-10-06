@@ -47,6 +47,15 @@ final class Transport implements SelectableTransportInterface
         if ($seconds === $this->appliedWait || !is_resource($this->sock)) {
             return;
         }
+        $this->applyTimeout($seconds);
+    }
+
+    /**
+     * `stream_set_timeout` bounds WRITES as well as reads, and it also clears the stream's
+     * `timed_out` flag. Both matter to {@see writeAll} (M3-D1c review F2).
+     */
+    private function applyTimeout(float $seconds): void
+    {
         $sec = (int) $seconds;
         stream_set_timeout($this->sock, $sec, (int) round(($seconds - $sec) * 1_000_000));
         $this->appliedWait = $seconds;
@@ -139,6 +148,13 @@ final class Transport implements SelectableTransportInterface
     public function writeAll(string $bytes): void
     {
         $this->assertOpen('write');
+        // A write is bounded by the configured timeout, never by a read wait that a request
+        // deadline shortened (M3-D1c review F2): PHP's socket stream applies ONE timeout to both
+        // directions, so a wait shortened to milliseconds would make the next large request fail
+        // mid-frame — which closes the session. Re-applying it unconditionally also clears a
+        // `timed_out` flag left by an earlier read, so a broken pipe below is not reported as a
+        // timeout.
+        $this->applyTimeout($this->readTimeout);
         $len = strlen($bytes);
         $written = 0;
         while ($written < $len) {

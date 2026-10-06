@@ -169,7 +169,8 @@ final class Loop
      * One session: a blocking read, exactly the synchronous behaviour, read timeout included.
      * Several: `stream_select` across the ones that can be selected, waiting no longer than the
      * nearest liveness clock or request deadline. A session that has delivered nothing for its own
-     * read timeout is PINGed, and closed if a PING is already out unanswered; due requests are
+     * read timeout is selected on first, and only if nothing is waiting on its socket is it PINGed —
+     * or closed, if a PING is already out and nothing at all has arrived since; due requests are
      * CANCELled after every select. A session that cannot be selected (a test double) is read
      * directly.
      *
@@ -189,6 +190,8 @@ final class Loop
 
         $now = microtime(true);
         $streams = [];
+        /** @var array<int, true> $silent sessions silent for their whole read timeout */
+        $silent = [];
         $nearest = 1.0;
         foreach ($sessions as $id => $session) {
             $stream = $session->selectableStream();
@@ -201,16 +204,12 @@ final class Loop
             $since = self::$lastProgress[$id] ??= $now;
             $remaining = $timeout - ($now - $since);
             if ($remaining <= 0.0) {
-                // Silent for its whole read timeout. Silence is not failure (M3-D1c): probe it with a
-                // PING — without blocking the other sessions — and give it another timeout; a second
-                // silent timeout with the PING unanswered closes it.
-                $session->probeLiveness();
-                self::$lastProgress[$id] = $now;
-                $remaining = $timeout;
-                $stream = $session->selectableStream();
-                if ($stream === null) {
-                    return; // the probe closed it: its waiters are ready, and fail at their await
-                }
+                // Silent for its whole read timeout — as far as this loop has READ. It is judged only
+                // after the select below has looked at its socket (M3-D1c review F6): an answer may
+                // already be waiting there unread (a liveness PONG that followed the last request's
+                // terminal is the legal case), and judging first closed a healthy session.
+                $silent[$id] = true;
+                $remaining = 0.0;
             }
             $nearest = min($nearest, $remaining);
             $deadline = $session->nearestDeadline();
@@ -229,12 +228,16 @@ final class Loop
         foreach ($sessions as $session) {
             $session->enforceDeadlines(); // CANCEL whatever is due; close a session past its grace
         }
-        if ($n === false || $n === 0) {
-            return;
-        }
+        $readable = ($n === false || $n === 0) ? [] : $read;
         foreach ($streams as $id => $stream) {
-            if (in_array($stream, $read, true)) {
+            if (in_array($stream, $readable, true)) {
                 $sessions[$id]->pollOnce();
+                self::$lastProgress[$id] = microtime(true);
+            } elseif (isset($silent[$id])) {
+                // Nothing to read after a whole read timeout. Silence is not failure (M3-D1c): probe
+                // it with a PING — without blocking the other sessions — and give it another
+                // timeout; a second one with nothing read since the PING went out closes it.
+                $sessions[$id]->probeLiveness();
                 self::$lastProgress[$id] = microtime(true);
             }
         }

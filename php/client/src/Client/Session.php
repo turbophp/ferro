@@ -154,6 +154,9 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
 
     private float $probeSentAt = 0.0;
 
+    /** When the last whole frame was read off the wire (M3-D1c review F6), for {@see onSilence}. */
+    private float $lastFrameAt = 0.0;
+
     /**
      * M3-D1c per-request deadlines, as absolute `microtime(true)` values ({@see setDeadline}). When
      * one passes, the request is CANCELled ({@see enforceDeadlines}) and its deadline moves out by
@@ -267,23 +270,36 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     public function sendRequest(int $service, int $method, string $payload): Outcome
     {
         $rid = $this->submit($service, $method, $payload);
-        $this->armRequestTimeout($rid);
+        if ($service === C::SERVICE_SQL && $method === C::METHOD_SQL_EXEC) {
+            $this->armRequestTimeout($rid);
+        }
         return $this->awaitTerminal($rid);
     }
 
     /**
-     * Give every buffered request a deadline this long after it is sent (M3-D1c), or none. Set by
+     * Give every buffered SQL EXEC a deadline this long after it is sent (M3-D1c), or none. Set by
      * `Ferro::connect(statementTimeout: …)` as the statement timeout plus a margin: the engine
-     * enforces the statement timeout itself (`timeout_ms`) and answers; this is the client's
-     * backstop for an engine that does not. A stream is not given one — it legitimately outlives
-     * any per-request bound while the caller consumes it.
+     * enforces the statement timeout itself (`timeout_ms`, which bounds the wait for a pooled
+     * connection as well as the statement) and answers; this is the client's backstop for an engine
+     * that does not.
+     *
+     * **Only a buffered SQL EXEC is given one** (M3-D1c review F1), because only an EXEC carries
+     * `timeout_ms` and has a handler that acts on a CANCEL. Transaction control (BEGIN, COMMIT,
+     * ROLLBACK, savepoints) and admin requests carry no timeout and their handlers ignore a CANCEL,
+     * so a backstop there could only end in closing the session — and a slow COMMIT that then
+     * committed would have been reported `Indeterminate` with every other request on the socket.
+     * Nor is a stream (review F5): it is not sent `timeout_ms` either, and is bounded only by the
+     * transport's liveness rule while the caller consumes it.
      */
     public function setRequestTimeout(?float $seconds): void
     {
         $this->requestTimeout = $seconds;
     }
 
-    /** Arm {@see setRequestTimeout}'s deadline on a just-submitted request, if one is configured. */
+    /**
+     * Arm {@see setRequestTimeout}'s deadline on a just-submitted request, if one is configured.
+     * The caller vouches that the request is a buffered SQL EXEC (see {@see setRequestTimeout}).
+     */
     public function armRequestTimeout(int $requestId): void
     {
         if ($this->requestTimeout !== null) {
@@ -798,6 +814,21 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
      */
     private function readFrame(?float $until = null): array
     {
+        try {
+            return $this->readFrameWithin($until);
+        } finally {
+            // A deadline-shortened wait never outlives this read (M3-D1c review F2): the transport
+            // re-applies its full timeout before every write as well, because PHP's socket stream
+            // bounds writes with the same timeout.
+            if ($until !== null && $this->transport instanceof SelectableTransportInterface) {
+                $this->transport->setReadWait($this->transport->readTimeout());
+            }
+        }
+    }
+
+    /** @return array{0:Header,1:string} */
+    private function readFrameWithin(?float $until): array
+    {
         while (true) {
             $live = $this->transport instanceof SelectableTransportInterface;
             if ($live) {
@@ -812,6 +843,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
                 $header = $this->partialHeader;
                 $payload = $header->payloadLen > 0 ? $this->transport->readExact($header->payloadLen) : '';
                 $this->partialHeader = null;
+                $this->lastFrameAt = microtime(true);
                 return [$header, $payload];
             } catch (CodecException $e) {
                 // An undecodable header (bad magic, version, oversized length) leaves the stream at an
@@ -845,11 +877,22 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
     private function onSilence(): void
     {
         $timeout = $this->transport instanceof SelectableTransportInterface ? $this->transport->readTimeout() : 0.0;
+        if ($this->fatal !== null) {
+            // The engine said the session is over and promised to close it; a PING cannot be sent
+            // (nothing is, after a fatal) and silence this long means the close never came.
+            $e = new TransportException('the engine ended the session (' . $this->fatal . ') and then went silent');
+            $this->poison($e);
+            throw $e;
+        }
         if ($this->probeRid !== null) {
-            if (microtime(true) - $this->probeSentAt >= $timeout) {
+            // The engine is judged dead only if NOTHING arrived since the PING went out (M3-D1c
+            // review F6): a frame read after it — the PONG may legally follow a slow request's
+            // terminal — proves it alive, so the clock restarts from that frame.
+            $since = max($this->probeSentAt, $this->lastFrameAt);
+            if (microtime(true) - $since >= $timeout) {
                 $e = new TransportException(sprintf(
                     'the engine sent nothing for %.1f s and did not answer a liveness PING',
-                    microtime(true) - $this->probeSentAt + $timeout,
+                    microtime(true) - $since + $timeout,
                 ));
                 $this->poison($e);
                 throw $e;
@@ -901,10 +944,19 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         return $this->deadlines === [] ? null : min($this->deadlines);
     }
 
-    /** Act on every deadline that has passed: CANCEL once, then close the session after the grace. */
+    /**
+     * Act on every deadline that has passed: CANCEL once, then close the session after the grace.
+     *
+     * **Never throws** (M3-D1c review F4). A CANCEL that cannot be written means the link is gone:
+     * the write failure has already closed the session, and every request in flight on it — each
+     * one completely written — then fails at its own await as sent-and-lost, with its own fate. A
+     * throw here used to escape {@see \Ferro\Loop::run} past every task's catch, abandoning every
+     * other task mid-await. After a session-fatal terminal nothing is sent at all, so there is
+     * nothing to CANCEL with: the engine is draining every request's own terminal before it closes.
+     */
     public function enforceDeadlines(): void
     {
-        if ($this->poisoned !== null) {
+        if ($this->poisoned !== null || $this->fatal !== null) {
             return;
         }
         $now = microtime(true);
@@ -916,7 +968,11 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
                 $this->deadlineCancelled[$rid] = true;
                 $grace = $this->transport instanceof SelectableTransportInterface ? $this->transport->readTimeout() : 0.0;
                 $this->deadlines[$rid] = $now + $grace;
-                $this->sendCancel($rid);
+                try {
+                    $this->sendCancel($rid);
+                } catch (TransportException) {
+                    return; // `writeFrame` closed the session: see the docblock
+                }
                 continue;
             }
             $e = new TransportException(sprintf(

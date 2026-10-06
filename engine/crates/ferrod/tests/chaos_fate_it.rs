@@ -1114,3 +1114,143 @@ async fn commit_time_serialization_write_skew_is_retryable_live() {
 
     assert_session_alive(&mut client, 102).await;
 }
+
+// -------------------------------------------------------------------------------------------------
+// M3-D1c review F1 — `timeout_ms` and the per-request CANCEL bound the wait for a pooled connection
+// too, and a request that never got one is a KNOWN did-not-apply.
+// -------------------------------------------------------------------------------------------------
+
+/// The pool size `ferrod` builds every pool with (`pools.rs`'s `DEFAULT_POOL_MAX_SIZE`).
+const DAEMON_POOL_MAX: u32 = 16;
+
+/// With every pooled connection pinned by an open transaction, an autocommit write that waits for
+/// a connection is answered by ITS OWN `timeout_ms` (not the pool's 5 s `checkout_timeout`, which
+/// would also outlast the harness's 2 s per-frame bound) as `PoolTimeout{Retryable}`; one CANCELled
+/// while it waits is answered at once as a known did-not-apply (`ConnectionLost{Retryable}` for a
+/// write, `Cancelled` for a read) — never `Indeterminate`, because nothing was sent. The read-back
+/// proves the write never applied. Before the fix, neither bound reached the checkout: the request
+/// waited the full `checkout_timeout` and ignored its CANCEL, which is what made the client's
+/// backstop close a healthy session over a write that was never dispatched.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkout_wait_is_bounded_by_timeout_ms_and_cancel_live() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = exec_server(url);
+    let mut c = server.connect().await;
+    c.hello(1).await;
+    ensure_ctr_table(&mut c, 2).await;
+    let key = unique_key("d1c_checkout");
+    seed_ctr(&mut c, 3, &key).await;
+
+    // Pin every connection the pool can hold.
+    let mut txs = Vec::new();
+    for i in 0..DAEMON_POOL_MAX {
+        txs.push(begin(&mut c, 100 + i, "default", None, false).await);
+    }
+
+    let mut w = req(&format!(
+        "UPDATE {CTR_TABLE} SET n = n + 1 WHERE key = ? RETURNING n"
+    ));
+    w.readonly = false;
+    w.params = vec![Value::Text(key.clone())];
+
+    // (1) timeout_ms bounds the checkout wait.
+    let mut timed = w.clone();
+    timed.timeout_ms = Some(300);
+    let start = Instant::now();
+    let ep = exec_err(&mut c, 200, &timed).await;
+    let took = start.elapsed();
+    assert_eq!(
+        ep.code,
+        errc::POOL_TIMEOUT,
+        "a checkout that ran out of time: {ep:?}"
+    );
+    assert_eq!(
+        ep.branch,
+        branch::RETRYABLE,
+        "nothing was sent: a known did-not-apply"
+    );
+    assert!(
+        took >= Duration::from_millis(250) && took < Duration::from_millis(1500),
+        "answered by timeout_ms (300 ms), not checkout_timeout (5 s): took {took:?}"
+    );
+
+    // (2) a CANCEL reaches a request still waiting for a connection: write and read.
+    for (rid, readonly) in [(201u32, false), (202u32, true)] {
+        let r = if readonly { req("SELECT 1") } else { w.clone() };
+        c.send_request(rid, service::SQL, method_sql::EXEC, r.encode())
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let start = Instant::now();
+        c.cancel(rid).await;
+        let t = c.recv().await;
+        let took = start.elapsed();
+        assert_eq!(t.header.request_id, rid);
+        assert_eq!(t.header.flags & flags::END, flags::END);
+        let ep = match Outcome::decode(&t.payload).expect("decode") {
+            Outcome::Error(ep) => ep,
+            other => panic!("a cancelled checkout wait must be an error, got {other:?}"),
+        };
+        if readonly {
+            assert_eq!(ep.code, errc::CANCELLED, "{ep:?}");
+        } else {
+            assert_eq!(ep.code, errc::CONNECTION_LOST, "{ep:?}");
+            assert_eq!(
+                ep.branch,
+                branch::RETRYABLE,
+                "an unsent write is never Indeterminate"
+            );
+        }
+        assert!(
+            took < Duration::from_millis(1000),
+            "the CANCEL was acted on at once, not after checkout_timeout: took {took:?}"
+        );
+    }
+
+    // (3) ONE deadline covers the checkout AND the statement: a request that waited 400 ms for a
+    // connection has 400 ms left of its 800, not a fresh 800 — otherwise it would outlast the
+    // client's backstop (`timeout_ms` + 2 s) whenever the wait was long enough.
+    let mut slow = req("SELECT 1 FROM pg_sleep(5)");
+    slow.timeout_ms = Some(800);
+    let start = Instant::now();
+    c.send_request(203, service::SQL, method_sql::EXEC, slow.encode())
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let freed = txs.pop().expect("a pinned tx");
+    c.send_request(
+        204,
+        service::TX,
+        method_tx::ROLLBACK,
+        TxControl { tx_id: freed }.encode(),
+    )
+    .await;
+    let got = collect_terminals(&mut c, vec![203, 204]).await;
+    let took = start.elapsed();
+    assert!(
+        matches!(got[&204], Outcome::Ok(_)),
+        "rollback: {:?}",
+        got[&204]
+    );
+    match &got[&203] {
+        Outcome::Error(ep) => assert_eq!(ep.code, errc::CANCELLED, "{ep:?}"),
+        other => panic!("the statement must be cut at the deadline, got {other:?}"),
+    }
+    assert!(
+        took >= Duration::from_millis(750) && took < Duration::from_millis(1100),
+        "answered at the request's ONE 800 ms deadline, checkout included: took {took:?}"
+    );
+
+    // Release the pool, then prove the write never applied and the session is intact.
+    for (i, tx_id) in txs.into_iter().enumerate() {
+        let out = tx_control(&mut c, 300 + i as u32, tx_id, method_tx::ROLLBACK).await;
+        assert!(matches!(out, Outcome::Ok(_)), "rollback: {out:?}");
+    }
+    assert_eq!(
+        read_ctr(&mut c, 400, &key).await,
+        0,
+        "the write was never dispatched"
+    );
+    cleanup_ctr(&mut c, 401, &key).await;
+    assert_session_alive(&mut c, 7).await;
+}

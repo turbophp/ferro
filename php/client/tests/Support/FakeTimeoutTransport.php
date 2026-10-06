@@ -54,8 +54,14 @@ final class FakeTimeoutTransport implements SelectableTransportInterface
         throw TransportException::readTimedOut(sprintf('fake: read timed out (%d of %d bytes)', strlen($this->inbound), $n));
     }
 
+    /** When set, every write fails as a broken pipe would (nothing written). */
+    public bool $failWrites = false;
+
     public function writeAll(string $bytes): void
     {
+        if ($this->failWrites) {
+            throw new TransportException('fake: write failed after 0 of ' . strlen($bytes) . ' bytes');
+        }
         $this->written .= $bytes;
     }
 

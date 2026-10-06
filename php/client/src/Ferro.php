@@ -26,8 +26,12 @@ use Ferro\Client\Value\ValuePolicy;
  */
 final class Ferro
 {
-    /** Seconds the client waits past a statement timeout for the engine's own answer (M3-D1c). */
-    private const DEADLINE_MARGIN = 1.0;
+    /**
+     * Seconds the client waits past a statement timeout for the engine's own answer (M3-D1c): the
+     * margin of `docs/spec/23-http.md` §23.11.0. It covers the engine's out-of-band cancel, whose
+     * side connection alone may take up to 2 s to dial (SPEC §22.2 (aj)).
+     */
+    private const DEADLINE_MARGIN = 2.0;
 
     /**
      * Connect to a `ferrod` over its Unix domain socket, complete the handshake, and return a
@@ -155,9 +159,7 @@ final class Ferro
         if ($statementTimeout === null) {
             return null;
         }
-        if ($statementTimeout <= 0.0) {
-            throw new \InvalidArgumentException("statementTimeout must be positive, got {$statementTimeout}");
-        }
+        Connection::statementTimeoutMs($statementTimeout); // validates, before anything is dialled
         return $statementTimeout + self::DEADLINE_MARGIN;
     }
 }

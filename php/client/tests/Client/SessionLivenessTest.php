@@ -190,7 +190,148 @@ final class SessionLivenessTest extends TestCase
         };
         $s->awaitTerminal($rid);
         $this->assertNotEmpty($t->waits);
-        $this->assertLessThanOrEqual(0.2, end($t->waits));
+        $this->assertLessThanOrEqual(0.2, min($t->waits), 'the read waited no longer than the deadline');
+        // ...and the shortened wait did not outlive the read (review F2): PHP's socket stream bounds
+        // WRITES with the same timeout, so a wait left at milliseconds failed the next large write.
+        $this->assertSame(5.0, end($t->waits), 'the full read timeout is restored after the read');
+    }
+
+    /**
+     * Review F1: only a buffered SQL EXEC gets the backstop. Transaction control and admin requests
+     * carry no `timeout_ms` and their handlers ignore a CANCEL, so a deadline there could only end
+     * in closing the session — a slow COMMIT that then committed was reported `Indeterminate`.
+     *
+     * @return array<string, array{0:int,1:int}>
+     */
+    public static function requestsTheEngineDoesNotBound(): array
+    {
+        return [
+            'BEGIN' => [C::SERVICE_TX, C::METHOD_TX_BEGIN],
+            'COMMIT' => [C::SERVICE_TX, C::METHOD_TX_COMMIT],
+            'ROLLBACK' => [C::SERVICE_TX, C::METHOD_TX_ROLLBACK],
+            'SAVEPOINT' => [C::SERVICE_TX, C::METHOD_TX_SAVEPOINT],
+            'BACKUP' => [C::SERVICE_ADMIN, C::METHOD_ADMIN_BACKUP],
+        ];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('requestsTheEngineDoesNotBound')]
+    public function testOnlyASqlExecIsGivenTheRequestTimeout(int $service, int $method): void
+    {
+        $t = new FakeTimeoutTransport(0.01);
+        $s = self::session($t);
+        $s->setRequestTimeout(0.0001);
+        $t->onTimeout = static function (FakeTimeoutTransport $t) use ($service, $method): void {
+            if ($t->timeouts === 1) {
+                usleep(30_000); // past the 0.1 ms "deadline" AND past one read timeout of grace
+                $t->feed(self::pong(2));
+            } elseif ($t->timeouts === 2) {
+                $t->feed(self::frame(C::FLAG_END, $service, $method, 1, Outcome::ok('')->encode(PackerFactory::forEncode())));
+            }
+        };
+        $this->assertTrue($s->sendRequest($service, $method, 'x')->isOk(), 'the slow request completed');
+        $this->assertFalse($s->isPoisoned());
+        $cancels = array_filter(self::written($t), static fn (Header $h): bool => ($h->flags & C::FLAG_CANCEL) !== 0);
+        $this->assertCount(0, $cancels, 'no CANCEL for a request the engine does not bound');
+    }
+
+    /**
+     * Review F7 (M18): a request's deadline goes with its terminal. A finished request whose
+     * deadline then passed used to be CANCELled — and, since nothing answers a CANCEL for a request
+     * that is over, the session closed after the grace, failing whatever was still in flight.
+     */
+    public function testADeadlineIsClearedWhenItsTerminalArrives(): void
+    {
+        // A 0.5 s read timeout: the liveness probe this wait sends stays within its grace throughout.
+        $t = new FakeTimeoutTransport(0.5);
+        $s = self::session($t);
+        $done = $s->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'quick');
+        $s->setDeadline($done, microtime(true) + 0.03);
+        $t->feed(self::ok($done));
+        $this->assertTrue($s->awaitTerminal($done)->isOk());
+
+        $other = $s->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'slow');
+        $start = microtime(true);
+        $t->onTimeout = static function (FakeTimeoutTransport $t) use ($start, $other): void {
+            usleep(5_000);
+            if (microtime(true) - $start > 0.15) { // well past the finished request's deadline
+                $t->feed(self::ok($other));
+                $t->onTimeout = null;
+            }
+        };
+        $this->assertTrue($s->awaitTerminal($other)->isOk(), 'the other request was not failed by a stale deadline');
+        $this->assertFalse($s->isPoisoned());
+        $cancels = array_filter(self::written($t), static fn (Header $h): bool => ($h->flags & C::FLAG_CANCEL) !== 0);
+        $this->assertCount(0, $cancels, 'a finished request is never CANCELled');
+    }
+
+    /**
+     * Review F4: a CANCEL that cannot be written never escapes as an exception. The write failure
+     * closes the session, and the request — completely written before — fails at its own await as
+     * sent-and-lost. Both entry points a scheduler uses are covered.
+     */
+    public function testACancelThatCannotBeWrittenIsRecordedNotThrown(): void
+    {
+        foreach (['enforceDeadlines', 'pollOnce'] as $entry) {
+            $t = new FakeTimeoutTransport(0.01);
+            $s = self::session($t);
+            $rid = $s->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'slow');
+            $s->setDeadline($rid, microtime(true) - 1.0);
+            $t->failWrites = true;
+            $s->{$entry}(); // must not throw
+            $this->assertTrue($s->isPoisoned(), "{$entry}: the failed CANCEL closed the session");
+            try {
+                $s->awaitTerminal($rid);
+                $this->fail("{$entry}: the request must fail at its await");
+            } catch (TransportException $e) {
+                $this->assertFalse($e->requestUnsent(), "{$entry}: the request WAS sent; its fate is unknown");
+            }
+        }
+    }
+
+    /**
+     * Review F6: the liveness verdict needs NOTHING read since the probe went out. A PONG may
+     * legally arrive after a slow request's terminal, so a probe can be outstanding while the engine
+     * is plainly alive; judging by the probe's age alone closed such a session.
+     */
+    public function testAFrameReadAfterTheProbeKeepsTheSessionAlive(): void
+    {
+        $t = new FakeTimeoutTransport(0.05);
+        $s = self::session($t);
+        $a = $s->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'a');
+        $b = $s->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'b');
+        $s->probeLiveness(); // PING out, unanswered
+        usleep(40_000);
+        $t->feed(self::ok($a)); // the engine answers a request, but not (yet) the PING
+        $this->assertTrue($s->awaitTerminal($a)->isOk());
+        usleep(20_000); // the probe is now older than the read timeout; the last frame is not
+        $s->probeLiveness();
+        $this->assertFalse($s->isPoisoned(), 'a frame since the probe proves the engine alive');
+        $this->assertTrue($s->isPending($b));
+    }
+
+    /**
+     * After a session-fatal terminal the session sends nothing, so it cannot probe; an engine that
+     * then goes silent instead of closing closes the session (review F4's neighbour: the probe's
+     * PING write used to fail without closing it, and the read loop spun on).
+     */
+    public function testSilenceAfterAFatalClosesTheSession(): void
+    {
+        $t = new FakeTimeoutTransport(0.01);
+        $s = self::session($t);
+        $rid = $s->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'x');
+        $t->feed(self::frame(C::FLAG_END, C::SERVICE_CORE, 0, 0, Outcome::cancelled()->encode(PackerFactory::forEncode())));
+        $t->onTimeout = static function (FakeTimeoutTransport $t): void {
+            if ($t->timeouts > 20) {
+                throw new \LogicException('the session spun on a silent engine after its fatal');
+            }
+        };
+        try {
+            $s->awaitTerminal($rid);
+            $this->fail('must fail');
+        } catch (\Ferro\Client\Error\ConnectionLostException | TransportException $e) {
+            $this->assertNotInstanceOf(\LogicException::class, $e);
+        }
+        $this->assertTrue($s->isPoisoned());
     }
 
     /** `setRequestTimeout` arms a deadline on every buffered request; none by default. */

@@ -164,8 +164,30 @@ final class Connection
         if ($statementTimeout !== null) {
             // The ENGINE enforces it (`timeout_ms`, M1-S4) and answers with the statement's fate;
             // the session's request deadline (set by `Ferro::connect`) is the client's backstop.
-            $this->codec->setTimeoutMs(max(1, (int) round($statementTimeout * 1000)));
+            $this->codec->setTimeoutMs(self::statementTimeoutMs($statementTimeout));
         }
+    }
+
+    /**
+     * The wire's `timeout_ms` for a statement timeout given in seconds (M3-D1c review F3), and the
+     * ONE place such a value is validated — `Ferro::connect` calls it before dialling, and the
+     * constructor calls it for a Connection built directly. It must be a finite number of seconds
+     * greater than zero whose millisecond count fits the wire's u32 (at most 4 294 967.295 s);
+     * a positive value under half a millisecond is sent as 1 ms, the smallest the wire can say.
+     * `INF`, `NAN`, zero, a negative value and anything past the u32 are refused, where they used to
+     * become a 1 ms timeout (which fails every statement) or an EXEC the engine rejects as malformed.
+     *
+     * @throws \InvalidArgumentException
+     */
+    public static function statementTimeoutMs(float $seconds): int
+    {
+        if (!is_finite($seconds) || $seconds <= 0.0 || $seconds * 1000 > 0xFFFFFFFF) {
+            throw new \InvalidArgumentException(sprintf(
+                'statementTimeout must be a finite number of seconds in (0, 4294967.295], got %s',
+                var_export($seconds, true),
+            ));
+        }
+        return max(1, (int) round($seconds * 1000));
     }
 
     /** The SPEC §9.1 type policy this connection decodes with (client-side in M1). */
