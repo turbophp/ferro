@@ -77,5 +77,8 @@ echo "== d12 gate ==" ; ./ci/check-d12-recorded.sh
 # The §14–15 incompatibilities page: its citations must still resolve. A file check, so it costs
 # nothing and runs in both modes — and it is in ci.yml, which this script may never be weaker than.
 echo "== incompatibilities doc gate ==" ; ./ci/check-incompatibilities-doc.sh
+# The D18 suite triage files (E9): the same kind of check, for the same reason.
+echo "== suite triage gate ==" ; ./ci/check-suite-triage.sh
+echo "== suite gate tests ==" ; ./ci/test-suite-gate.sh
 if [ "$live" = 1 ]; then echo "ALL GATES GREEN (live: pg + mysql + mariadb + php live tier)"
 else echo "ALL GATES GREEN (OFFLINE — live suites skipped; re-run with --live before pushing)"; fi

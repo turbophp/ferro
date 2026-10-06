@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="fixture" tests="13">
+    <testcase name="testPlain" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001"/>
+    <testcase name="testRefused" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <error type="Fx\Refusal">Fx\SuiteTest::testRefused
+Fx\Refusal: Fx\Refusal: refused: no credentials in PHP (code=12289)
+
+/fixture/tests/SuiteTest.php:42</error>
+    </testcase>
+    <testcase name="testNameGated" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <skipped/>
+    </testcase>
+    <testcase name="testControlSkips" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001"/>
+    <testcase name="testBothSkip" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <error type="Fx\Boom">Fx\SuiteTest::testBothSkip
+Fx\Boom: boom
+
+/fixture/tests/SuiteTest.php:42</error>
+    </testcase>
+    <testcase name="testSharedAssert" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <failure type="PHPUnit\Framework\ExpectationFailedException">Fx\SuiteTest::testSharedAssert
+Failed asserting that two strings are identical.
+--- Expected
++++ Actual
+@@ @@
+-'a'
++'b'
+
+/fixture/tests/SuiteTest.php:42</failure>
+    </testcase>
+    <testcase name="testSharedPath" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <failure type="PHPUnit\Framework\ExpectationFailedException">Fx\SuiteTest::testSharedPath
+Failed asserting that file "/run/ferro-7/x.db" exists.
+
+/fixture/tests/SuiteTest.php:42</failure>
+    </testcase>
+    <testcase name="testSharedError" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <error type="Fx\Boom">Fx\SuiteTest::testSharedError
+Fx\Boom: boom
+
+/fixture/tests/SuiteTest.php:42</error>
+    </testcase>
+    <testcase name="testCollected" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001"/>
+    <testcase name="testTemp with data set #0" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <error type="Fx\Gone">Fx\SuiteTest::testTemp with data set #0
+Fx\Gone: no such table: __temp__a
+
+/fixture/tests/SuiteTest.php:42</error>
+    </testcase>
+    <testcase name="testTemp with data set #1" class="Fx\SuiteTest" classname="Fx.SuiteTest" assertions="1" time="0.001">
+      <error type="Fx\Gone">Fx\SuiteTest::testTemp with data set #1
+Fx\Gone: no such table: __temp__b
+
+/fixture/tests/SuiteTest.php:42</error>
+    </testcase>
+    <testcase name="testOne" class="Fx\GatedTest" classname="Fx.GatedTest" assertions="1" time="0.001">
+      <skipped/>
+    </testcase>
+    <testcase name="testTwo" class="Fx\GatedTest" classname="Fx.GatedTest" assertions="1" time="0.001">
+      <skipped/>
+    </testcase>
+  </testsuite>
+</testsuites>
