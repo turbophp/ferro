@@ -254,6 +254,53 @@ abstract class LiveTestCase extends TestCase
     }
 
     /**
+     * SIGSTOP the running ferrod and return only once it IS stopped: every one of its threads in
+     * state `T` (M6-F8 review round 2). `kill(2)` returns once the signal is QUEUED; the group stop
+     * completes as each thread next runs, so right after it a tokio worker can still answer a
+     * request — measured in 7 of 20 runs idle and about half of 40 under load, which made "a stalled
+     * engine must not answer" flake. Fails the test if the stop does not complete within 5 s.
+     * Undo with {@see continueFerrod}.
+     */
+    protected function stopFerrodAndWait(): int
+    {
+        $pid = $this->ferrodPid();
+        exec('kill -STOP ' . $pid, $out, $rc);
+        $this->assertSame(0, $rc, 'SIGSTOP was sent');
+        $deadline = microtime(true) + 5.0;
+        while (true) {
+            $states = self::taskStates($pid);
+            if ($states !== '' && preg_match('/[^Tt]/', $states) !== 1) {
+                return $pid;
+            }
+            if (microtime(true) >= $deadline) {
+                $this->fail("ferrod {$pid} did not stop within 5 s (task states: {$states})");
+            }
+            usleep(200);
+        }
+    }
+
+    /** SIGCONT a ferrod stopped by {@see stopFerrodAndWait}. */
+    protected function continueFerrod(int $pid): void
+    {
+        exec('kill -CONT ' . $pid);
+    }
+
+    /** One state letter per thread of `$pid` (`/proc/<pid>/task/<tid>/stat`), '' if unreadable. */
+    private static function taskStates(int $pid): string
+    {
+        $out = '';
+        foreach (glob("/proc/{$pid}/task/*/stat") ?: [] as $file) {
+            $stat = @file_get_contents($file);
+            // The state follows the `(comm)` field, whose name may itself contain spaces or ')'.
+            $tail = is_string($stat) ? strrchr($stat, ')') : false;
+            if (is_string($tail) && preg_match('/^\) (\S) /', $tail, $m) === 1) {
+                $out .= $m[1];
+            }
+        }
+        return $out;
+    }
+
+    /**
      * SIGTERM the running ferrod and relaunch a fresh one on the SAME socket — the §19.1 restart
      * proof. The new process draws a NEW random `boot_epoch`, so a cached epoch no longer matches
      * and the reconnect loop must void engine-side state. Blocks until the new instance is ready.
@@ -266,6 +313,26 @@ abstract class LiveTestCase extends TestCase
         }
         $this->launchFerrod();
         $this->waitUntilReady();
+    }
+
+    /**
+     * SIGKILL the running ferrod and reap it — no drain, no terminal for anything in flight (the
+     * M6-F8 chaos 8 shape, SPEC §23.14). {@see restartFerrod} relaunches it afterwards.
+     */
+    protected function killFerrod(): void
+    {
+        if ($this->proc === null || !is_resource($this->proc)) {
+            return;
+        }
+        @proc_terminate($this->proc, self::SIGKILL);
+        $deadline = microtime(true) + self::STOP_TIMEOUT_SEC;
+        while (microtime(true) < $deadline) {
+            $s = $this->procStatus();
+            if ($s === null || $s['running'] === false) { break; }
+            usleep(10_000);
+        }
+        proc_close($this->proc);
+        $this->proc = null;
     }
 
     /** The repo-relative candidate binary paths, plus `FERRO_FERROD_BIN`. */

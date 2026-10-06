@@ -856,7 +856,7 @@ A positional fixarray of 6:
 
 | # | field | type | notes |
 |---|---|---|---|
-| 1 | `status` | `u16` | the producer sends `200..=599` (a 1xx is consumed; a 101 is malformed, SPEC §23.5.6) |
+| 1 | `status` | `u16` | the producer sends `200..=999`: the upstream's status, passed through (a 1xx is consumed; a 101 is malformed, SPEC §23.5.6). 600..=999 is not an HTTP status; a client processes it as a 5xx (RFC 9110 §15, SPEC §23.7.4) |
 | 2 | `version` | `u8` | `10`, `11` or `20` |
 | 3 | `reason` | `bin \| nil` | the HTTP/1.x reason phrase as received; `nil` on HTTP/2 |
 | 4 | `headers` | `array<[str, bin]>` | as received, minus hop-by-hop, plus SPEC §23.9.2's changes; names lowercase |

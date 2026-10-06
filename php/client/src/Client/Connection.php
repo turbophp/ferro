@@ -221,19 +221,55 @@ final class Connection
      */
     private function requestSession(OpKind $kind, bool $readonly): SessionInterface
     {
+        try {
+            return $this->liveSession();
+        } catch (TransportException | ConnectionLostException $e) {
+            throw $this->fate->classifyLoss(
+                $kind,
+                $readonly,
+                'reconnecting a session closed by an earlier failure failed: ' . $e->getMessage(),
+                sent: false,
+            );
+        }
+    }
+
+    /**
+     * {@see requestSession} before classification: the live session, replaced first if a transport
+     * failure closed it. A failed reconnect is thrown RAW — nothing was sent — for the caller to
+     * classify by its own table (SQL: {@see FateClassifier}; Ferro HTTP: §23.7.3).
+     *
+     * @throws TransportException|ConnectionLostException
+     */
+    private function liveSession(): SessionInterface
+    {
         if ($this->reconnect !== null && $this->tx === null && $this->reconnect->session()->isPoisoned()) {
-            try {
-                $this->reconnect->reconnect();
-            } catch (TransportException | ConnectionLostException $e) {
-                throw $this->fate->classifyLoss(
-                    $kind,
-                    $readonly,
-                    'reconnecting a session closed by an earlier failure failed: ' . $e->getMessage(),
-                    sent: false,
-                );
-            }
+            $this->reconnect->reconnect();
         }
         return $this->session();
+    }
+
+    /**
+     * The operator-declared Ferro HTTP upstream `$name` on this connection's session (SPEC §23.11.1):
+     * its requests share the one multiplexed socket with this connection's SQL.
+     *
+     * Each request goes out on the live session — replaced first if a transport failure closed it,
+     * which is not a retry, since that request has been sent nowhere — and, inside an open imperative
+     * transaction, on the transaction's session (an HTTP request takes no part in it). Nothing on
+     * this path ever re-sends a request (§23.7.3).
+     *
+     * @param ?string $origin the origin PHP believes `$name` has (`https://api.example.com`); the
+     *   engine refuses a mismatch with its configuration (`forbidden_origin`), turning a drifted
+     *   PHP-side map into a loud error. Null sends none.
+     */
+    public function upstream(string $name, ?string $origin = null): \Ferro\Http\Upstream
+    {
+        return new \Ferro\Http\Upstream(
+            $name,
+            $origin,
+            fn (): SessionInterface => $this->liveSession(),
+            $this->encodePacker,
+            $this->decodePacker,
+        );
     }
 
     /**

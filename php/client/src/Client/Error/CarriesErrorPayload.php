@@ -48,4 +48,11 @@ trait CarriesErrorPayload
      * `23000` (duplicate key vs NOT NULL) has to read this, not {@see sqlstate}.
      */
     public function errno(): ?int { return $this->errorPayload->errno; }
+
+    /**
+     * How long the engine says to wait before a retry, in milliseconds, or null. Set on Ferro HTTP's
+     * `RateLimited` and on a breaker's `UpstreamUnavailable` (SPEC §23.7.1); null on every SQL
+     * error today. Advice for the caller's own retry policy — nothing in this client retries.
+     */
+    public function retryAfterMs(): ?int { return $this->errorPayload->retryAfterMs; }
 }

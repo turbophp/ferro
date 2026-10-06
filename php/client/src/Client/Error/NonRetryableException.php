@@ -11,8 +11,11 @@ namespace Ferro\Client\Error;
  * defaulting a garbled branch to Retryable would breach the never-retry property (§19.3), so
  * {@see ErrorMapper} maps the unknown case here — the strictly safe (non-retryable) fate. Carries the
  * decoded `ErrorPayload`.
+ *
+ * Not `final` since M6-F8: Ferro HTTP's NonRetryable failures ({@see \Ferro\Http\Error\HttpNonRetryableException},
+ * {@see \Ferro\Http\Error\ResponseIncompleteException}) extend it (SPEC §23.11.1).
  */
-final class NonRetryableException extends FerroException
+class NonRetryableException extends FerroException
 {
     use CarriesErrorPayload;
 }
