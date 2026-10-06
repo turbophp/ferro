@@ -1212,6 +1212,43 @@ async fn a_timed_out_or_cancelled_in_tx_verb_rolls_the_transaction_back() {
     w.drop_schema().await;
 }
 
+/// A tx-scoped verb with NO time left once its store is verified (`timeout_ms = 0` on a verified
+/// store) is answered unsent — `PoolTimeout`, never dispatched with no time — and the transaction is
+/// untouched: it commits its business write afterwards. Dispatching it instead would send the
+/// statement, cancel it at once, and roll the application's transaction back (`TxDeadline`).
+#[tokio::test]
+async fn a_tx_scoped_verb_with_no_time_left_is_answered_unsent_and_the_tx_survives() {
+    let Some(mut w) = World::new("notime").await else {
+        return;
+    };
+    let s = w.schema.clone();
+    w.c.queue(method_queue::SIZE, scope_req("default", None))
+        .await
+        .unwrap(); // verified
+    let tx = w.c.begin(None, false).await;
+    let ep =
+        w.c.queue(
+            method_queue::ENQUEUE,
+            enqueue_req(&[("default", "never", 0)], Some(tx), Some(0)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (ep.code, ep.branch),
+        (errc::POOL_TIMEOUT, errc::POOL_TIMEOUT_BRANCH),
+        "{ep:?}"
+    );
+    w.c.business(tx, &s, 1, "survived").await;
+    w.c.commit(tx).await;
+    assert_eq!(
+        w.business(1).await.len(),
+        1,
+        "the transaction was untouched"
+    );
+    assert_eq!(w.jobs().await, 0, "nothing was sent");
+    w.drop_schema().await;
+}
+
 /// Session death (§24.5 step 3: "session-death abort"): a session that ends holding a transaction
 /// with an ENQUEUE and a business write leaves neither.
 #[tokio::test]
