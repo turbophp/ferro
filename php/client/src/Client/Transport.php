@@ -51,6 +51,21 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
     private int $fdsReceived = 0;
 
     /**
+     * One fd-table slot held in reserve while this transport receives fds (review F1). When a
+     * process is at its `RLIMIT_NOFILE`, the kernel cannot install a received fd: it CLOSES it and
+     * reports a truncated control message, and a result the engine had already produced — a
+     * committed write — is lost, where the `fread` path would have read it. The reserve is released
+     * immediately before the one read an fd can arrive with ({@see beginFrame}) and retaken as soon
+     * as a slot is free again ({@see fdClosed}). PHP runs one thing at a time, so nothing can take the
+     * freed slot between the release and the `recvmsg`. An `ext-sockets` socket rather than an open
+     * file: one descriptor, and not subject to `open_basedir`.
+     */
+    private ?\Socket $reserve = null;
+
+    /** Set by {@see beginFrame}, consumed by the next {@see readExact}. */
+    private bool $frameStart = false;
+
+    /**
      * Bytes of a frame already read when a read timed out (M3-D1c). The next {@see readExact}
      * starts from them, so a timeout never drops bytes and never puts the stream out of step.
      */
@@ -147,8 +162,13 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
             throw new TransportException('receiving fds needs Linux and ext-sockets (socket_recvmsg, SCM_RIGHTS)');
         }
         $t = self::open('unix://' . $socketPath, $connectTimeout, $readTimeout);
-        if ($wantFds) {
-            $t->enableFdReceive();
+        if ($wantFds && !$t->enableFdReceive()) {
+            // Asked for explicitly, a failure is the caller's to see. In AUTO mode it is not a
+            // reason to fail a connection the `fread` path serves perfectly well (review F6).
+            if ($receiveFds === true) {
+                $t->close();
+                throw new TransportException('could not set up fd receiving on the Unix socket');
+            }
         }
         return $t;
     }
@@ -194,20 +214,63 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
     /**
      * Switch to the `recvmsg` read path, before anything has been read. The read timeout becomes the
      * socket's `SO_RCVTIMEO`, which bounds each `recvmsg` the way `stream_set_timeout` bounds each
-     * `fread`.
+     * `fread`. `false` — the stream untouched, still on the `fread` path — when the socket cannot be
+     * imported or its receive timeout set.
      */
-    private function enableFdReceive(): void
+    private function enableFdReceive(): bool
     {
-        $socket = @socket_import_stream($this->sock);
+        $socket = self::$importStream !== null ? (self::$importStream)($this->sock) : @socket_import_stream($this->sock);
         if (!$socket instanceof \Socket) {
-            $this->close();
-            throw new TransportException('could not import the Unix socket for fd passing');
+            return false;
         }
         if (!$this->setRcvTimeout($socket, $this->appliedWait)) {
-            $this->close();
-            throw new TransportException('could not set the receive timeout for fd passing');
+            return false;
         }
         $this->fdSocket = $socket;
+        $this->acquireReserve();
+        return true;
+    }
+
+    /**
+     * Test seam (review F6): replaces `socket_import_stream` so a test can make the import fail.
+     * `null` restores it.
+     *
+     * @internal
+     * @var (\Closure(resource): (\Socket|false))|null
+     */
+    public static ?\Closure $importStream = null;
+
+    private function acquireReserve(): void
+    {
+        if ($this->reserve !== null || $this->fdSocket === null) {
+            return;
+        }
+        $reserve = @socket_create(AF_UNIX, SOCK_DGRAM, 0);
+        $this->reserve = $reserve instanceof \Socket ? $reserve : null;
+    }
+
+    private function releaseReserve(): void
+    {
+        if ($this->reserve !== null) {
+            socket_close($this->reserve);
+            $this->reserve = null;
+        }
+    }
+
+    /** Whether the fd-table reserve is currently held. Diagnostic, for the tests. */
+    public function holdsFdReserve(): bool
+    {
+        return $this->reserve !== null;
+    }
+
+    public function beginFrame(): void
+    {
+        $this->frameStart = true;
+    }
+
+    public function fdClosed(): void
+    {
+        $this->acquireReserve();
     }
 
     public function receivesFds(): bool
@@ -230,13 +293,27 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
         if ($n < 0) { throw new TransportException("readExact: negative length {$n}"); }
         if ($n === 0) { return ''; }
         $this->assertOpen('read');
+        $frameStart = $this->frameStart;
+        $this->frameStart = false;
 
         // Resume from what an earlier timed-out read had already received.
         $buf = (string) substr($this->pending, 0, $n);
         $this->pending = (string) substr($this->pending, $n);
         $remaining = $n - strlen($buf);
-        if ($this->fdSocket !== null) {
-            return $this->recvExact($this->fdSocket, $buf, $n);
+        $fdSocket = $this->fdSocket;
+        if ($fdSocket !== null) {
+            // A frame's first byte is the only byte an fd rides; a read resuming a frame already
+            // has it (and its fd).
+            if (!$frameStart || $buf !== '') {
+                return $this->recvExact($fdSocket, $buf, $n);
+            }
+            $this->releaseReserve();
+            try {
+                return $this->recvExact($fdSocket, $buf, $n);
+            } finally {
+                // Fails while the fd just received holds the slot; {@see fdClosed} retakes it.
+                $this->acquireReserve();
+            }
         }
         while ($remaining > 0) {
             // Suppress the PHP-level warning (a dead peer raises one): the return value + stream meta
@@ -393,6 +470,7 @@ final class Transport implements SelectableTransportInterface, FdReceivingTransp
             }
         }
         $this->fds = [];
+        $this->releaseReserve();
         // The imported socket shares the stream's descriptor and does not close it; dropping it
         // before the stream closes means nothing can read a descriptor number the OS may reuse.
         $this->fdSocket = null;

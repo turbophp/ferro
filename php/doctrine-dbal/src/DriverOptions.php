@@ -23,6 +23,9 @@ namespace Ferro\DBAL;
  *      charter-compliant shape of §14's `read_pool` idea — a second, explicitly-configured
  *      connection, never inference.
  *   `driverOptions.connect_timeout` / `driverOptions.io_timeout` — seconds, floats.
+ *   `driverOptions.receive_fds` — bool or null (the default, auto): whether the connection may
+ *      receive large results as a sealed memfd (SPEC §5.1, `Ferro::connect(receiveFds:)`). `false`
+ *      opts this connection out of the out-of-band path.
  */
 final class DriverOptions
 {
@@ -34,6 +37,7 @@ final class DriverOptions
         public readonly bool $readonly,
         public readonly float $connectTimeout,
         public readonly float $ioTimeout,
+        public readonly ?bool $receiveFds = null,
     ) {}
 
     /** @param array<string,mixed> $params */
@@ -75,6 +79,7 @@ final class DriverOptions
             self::optBool($opts, 'readonly'),
             self::optFloat($opts, 'connect_timeout') ?? 2.0,
             self::optFloat($opts, 'io_timeout') ?? 5.0,
+            self::optNullableBool($opts, 'receive_fds'),
         );
     }
 
@@ -100,6 +105,16 @@ final class DriverOptions
         $v = $opts[$key];
         if (!is_bool($v)) {
             throw new \InvalidArgumentException("Ferro: driverOptions.$key must be a bool.");
+        }
+        return $v;
+    }
+
+    /** @param array<string,mixed> $opts */
+    private static function optNullableBool(array $opts, string $key): ?bool
+    {
+        $v = $opts[$key] ?? null;
+        if ($v !== null && !is_bool($v)) {
+            throw new \InvalidArgumentException("Ferro: driverOptions.$key must be a bool or null.");
         }
         return $v;
     }

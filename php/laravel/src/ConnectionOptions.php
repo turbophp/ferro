@@ -21,6 +21,7 @@ final class ConnectionOptions
         public readonly int $port,
         public readonly float $connectTimeout,
         public readonly float $ioTimeout,
+        public readonly ?bool $receiveFds = null,
     ) {}
 
     /**
@@ -52,7 +53,40 @@ final class ConnectionOptions
             $port,
             self::float($config, 'ferro_connect_timeout') ?? 2.0,
             self::float($config, 'ferro_io_timeout') ?? 30.0,
+            self::nullableBool($config, 'ferro_receive_fds'),
         );
+    }
+
+    /**
+     * `ferro_receive_fds` (SPEC §5.1, `Ferro::connect(receiveFds:)`): unset or null is auto; `false`
+     * opts the connection out of receiving large results as a memfd. Also read from the strings an
+     * uncast `env()` hands over. Anything else is refused rather than guessed, since the point of the
+     * key is to switch a path OFF.
+     *
+     * @param array<string,mixed> $c
+     */
+    private static function nullableBool(array $c, string $k): ?bool
+    {
+        $v = $c[$k] ?? null;
+        if ($v === null || is_bool($v)) {
+            return $v;
+        }
+        if (is_string($v)) {
+            $t = strtolower(trim($v));
+            if (in_array($t, ['', 'null', 'auto'], true)) {
+                return null;
+            }
+            if (in_array($t, ['true', '1', 'on', 'yes'], true)) {
+                return true;
+            }
+            if (in_array($t, ['false', '0', 'off', 'no'], true)) {
+                return false;
+            }
+        }
+        if ($v === 0 || $v === 1) {
+            return $v === 1;
+        }
+        throw new \InvalidArgumentException("Ferro: \"$k\" must be true, false or null (auto).");
     }
 
     /** @param array<string,mixed> $c */

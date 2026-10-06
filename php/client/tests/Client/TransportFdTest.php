@@ -163,6 +163,130 @@ final class TransportFdTest extends TestCase
         $t->close();
     }
 
+    /**
+     * Review F1: a process at its fd limit still receives the engine's fd, because the transport
+     * keeps one slot in reserve and frees it for the read a frame starts with. Without the reserve
+     * the kernel closes the fd and truncates the control message — a result that SUCCEEDED (a
+     * committed write) would be lost, where the `fread` path would have read it inline.
+     *
+     * Run in a child PHP process, so lowering `RLIMIT_NOFILE` and filling the fd table cannot
+     * disturb this one. The child fills the table completely, receives a frame with an fd, closes
+     * it (the reserve retakes the slot, so the application still cannot open a file), and receives
+     * a second.
+     */
+    public function testAProcessAtItsFdLimitStillReceivesTheFd(): void
+    {
+        if (!function_exists('posix_setrlimit')) {
+            $this->markTestSkipped('needs ext-posix to lower RLIMIT_NOFILE in the child');
+        }
+        $autoload = dirname(__DIR__, 2) . '/vendor/autoload.php';
+        $code = <<<'PHP'
+            require $argv[1];
+            $path = $argv[2];
+            posix_setrlimit(POSIX_RLIMIT_NOFILE, 64, 64);
+            $server = stream_socket_server('unix://' . $path);
+            $t = \Ferro\Client\Transport::connectUnix($path, 1.0, 2.0, true);
+            $peer = stream_socket_accept($server, 1.0);
+            $sock = socket_import_stream($peer);
+            $files = [];
+            foreach (['ONE', 'TWO'] as $c) { $f = tmpfile(); fwrite($f, $c); $files[] = $f; }
+            $out = ['reserve_at_connect' => $t->holdsFdReserve()];
+            $hold = [];
+            while (($h = @fopen('/dev/null', 'r')) !== false) { $hold[] = $h; }
+            $out['table_full'] = @fopen('/dev/null', 'r') === false;
+            foreach ($files as $i => $f) {
+                socket_sendmsg($sock, ['iov' => [str_pad("frame$i", 16, '.')],
+                    'control' => [['level' => SOL_SOCKET, 'type' => SCM_RIGHTS, 'data' => [$f]]]], 0);
+                try {
+                    $t->beginFrame();
+                    $bytes = $t->readExact(16);
+                    $fd = $t->takeFd();
+                    $out["frame$i"] = $bytes . ':' . (is_resource($fd) ? stream_get_contents($fd, -1, 0) : 'NO FD');
+                    if (is_resource($fd)) { fclose($fd); $t->fdClosed(); }
+                } catch (\Throwable $e) {
+                    $out["frame$i"] = 'ERROR ' . $e->getMessage();
+                }
+                $out["reserve_after_$i"] = $t->holdsFdReserve();
+                $out["app_can_open_after_$i"] = @fopen('/dev/null', 'r') !== false;
+            }
+            echo json_encode($out);
+            PHP;
+        $proc = proc_open([PHP_BINARY, '-r', $code, $autoload, $this->path . '.child'], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        $this->assertIsResource($proc);
+        $stdout = (string) stream_get_contents($pipes[1]);
+        $stderr = (string) stream_get_contents($pipes[2]);
+        proc_close($proc);
+        @unlink($this->path . '.child');
+        $out = json_decode($stdout, true);
+        $this->assertIsArray($out, "child output: {$stdout} {$stderr}");
+        $this->assertSame([
+            'reserve_at_connect' => true,
+            'table_full' => true,
+            'frame0' => 'frame0..........:ONE',
+            'reserve_after_0' => true,
+            'app_can_open_after_0' => false,
+            'frame1' => 'frame1..........:TWO',
+            'reserve_after_1' => true,
+            'app_can_open_after_1' => false,
+        ], $out);
+    }
+
+    /**
+     * Review F4: a received fd is close-on-exec from the moment it exists (`MSG_CMSG_CLOEXEC`), so a
+     * child process the application starts never inherits a result's memfd.
+     */
+    public function testAReceivedFdIsNotInheritedByAChildProcess(): void
+    {
+        $t = $this->connect();
+        $f = self::file('secret');
+        $this->send('w', [$f]);
+        // The sender's copy closes, so the only descriptor for this file is the received one.
+        fclose($f);
+        $this->assertSame('w', $t->readExact(1));
+        $fd = $t->takeFd();
+        $this->assertIsResource($fd);
+        $st = fstat($fd);
+        $this->assertIsArray($st);
+        $mine = $st['dev'] . ':' . $st['ino'];
+
+        $code = 'foreach (scandir("/proc/self/fd") as $n) { if ($n[0] !== ".") { $s = @stat("/proc/self/fd/$n"); '
+            . 'if ($s) { echo $s["dev"], ":", $s["ino"], "\n"; } } }';
+        $proc = proc_open([PHP_BINARY, '-r', $code], [1 => ['pipe', 'w']], $pipes);
+        $this->assertIsResource($proc);
+        $childFds = array_filter(explode("\n", (string) stream_get_contents($pipes[1])));
+        proc_close($proc);
+        $this->assertNotEmpty($childFds, 'the child listed its fds');
+        $this->assertNotContains($mine, $childFds, 'the child inherited the received fd');
+        fclose($fd);
+        $t->close();
+    }
+
+    /**
+     * Review F6: in AUTO mode a failure to set up `recvmsg` (importing the socket, or setting its
+     * receive timeout) falls back to the `fread` path instead of failing the connection; asked for
+     * explicitly, it throws.
+     */
+    public function testAutoModeFallsBackToFreadWhenFdReceivingCannotBeSetUp(): void
+    {
+        Transport::$importStream = static fn ($s): bool => false;
+        try {
+            $t = Transport::connectUnix($this->path, 1.0, 2.0);
+            $this->assertIsResource($this->server);
+            $peer = stream_socket_accept($this->server, 1.0);
+            $this->assertIsResource($peer);
+            $this->assertFalse($t->receivesFds(), 'auto mode fell back to fread');
+            fwrite($peer, 'ok');
+            $this->assertSame('ok', $t->readExact(2));
+            $t->close();
+            fclose($peer);
+
+            $this->expectException(TransportException::class);
+            Transport::connectUnix($this->path, 1.0, 2.0, true);
+        } finally {
+            Transport::$importStream = null;
+        }
+    }
+
     /** The CONTROL: the `fread` path reads the same bytes and loses the fd without a trace. */
     public function testTheFreadPathSilentlyLosesAnFd(): void
     {

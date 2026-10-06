@@ -129,8 +129,9 @@ jobs:
       - run: (cd php/client && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
       # The same live tier on the `fread` read path — what every client WITHOUT ext-sockets runs.
       # Disabling `socket_recvmsg` makes `Transport::canReceiveFds()` false, so no session advertises
-      # MEMFD_RX; only `OobLiveTest` skips (by design), so this step cannot be `--fail-on-skipped`.
-      - run: (cd php/client && php -d disable_functions=socket_recvmsg ./vendor/bin/phpunit tests/Live)
+      # MEMFD_RX. `OobLiveTest` (group `oob`) needs the memfd path, so it is EXCLUDED rather than left
+      # to skip, and the step stays `--fail-on-skipped`: a run where everything skipped cannot pass.
+      - run: (cd php/client && php -d disable_functions=socket_recvmsg ./vendor/bin/phpunit tests/Live --exclude-group oob --fail-on-skipped)
       - run: (cd php/client && ./vendor/bin/phpstan analyse src --level 9)
       # M1-S8b: the Doctrine driver package. It has its OWN vendor/ (there is no composer
       # workspace), so it needs its own install/test/stan lanes — omitting them would make the whole

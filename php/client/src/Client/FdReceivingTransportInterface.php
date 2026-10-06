@@ -30,4 +30,16 @@ interface FdReceivingTransportInterface extends TransportInterface
 
     /** How many fds this transport has received so far. Diagnostic: proves the path was taken. */
     public function fdsReceived(): int;
+
+    /**
+     * The next {@see readExact} begins a frame. That is the only read an fd can arrive with — the
+     * engine attaches it to an `OOB_FD` frame's FIRST byte, and every read is exact-length, so no
+     * other read starts on that byte — and a transport that keeps one fd-table slot in reserve
+     * frees it for exactly that read (review F1: with the table full, the kernel would otherwise
+     * close the fd and report a truncated control message, losing a result that had succeeded).
+     */
+    public function beginFrame(): void;
+
+    /** The caller closed a fd taken with {@see takeFd}: a transport keeping a reserve retakes the slot. */
+    public function fdClosed(): void;
 }

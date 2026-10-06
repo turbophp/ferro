@@ -70,6 +70,30 @@ final class SessionOobTest extends TestCase
         $this->assertSame(1, $session->oobPayloadsReceived());
     }
 
+    /**
+     * The session tells a fd-receiving transport where frames start — the only read an fd can
+     * arrive with, which is when the transport frees its reserved fd-table slot — and when it has
+     * closed a received fd, so the transport can take the slot back (review F1).
+     */
+    public function testTheSessionAnnouncesFrameStartsAndClosedFds(): void
+    {
+        $p = PackerFactory::forEncode();
+        $inline = Outcome::ok($p->packStr('x'))->encode($p);
+        $t = new FakeFdTransport();
+        $t->queueFd(self::memfdStandIn($inline));
+        $t->feed(self::oobFrame(1, strlen($inline)) . self::inlineFrame(2, $inline));
+
+        $session = new Session($t, new RequestIdAllocator(0));
+        $r1 = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'a');
+        $r2 = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'b');
+        $session->awaitTerminal($r1);
+        $this->assertSame(1, $t->frameStarts, 'one frame read, one frame start');
+        $this->assertSame(1, $t->fdsClosed, 'the OOB fd was closed and announced');
+        $session->awaitTerminal($r2);
+        $this->assertSame(2, $t->frameStarts);
+        $this->assertSame(1, $t->fdsClosed, 'an inline frame closes no fd');
+    }
+
     /** The fd's shared OFFSET must not matter: a sender that left it at EOF still reads in full. */
     public function testTheMemfdIsReadFromOffsetZeroWhateverItsSharedOffset(): void
     {
@@ -110,45 +134,51 @@ final class SessionOobTest extends TestCase
         $this->assertSame('first', (new PurePacker())->unpack($o1->body(), $off));
     }
 
-    /** @return iterable<string, array{0:\Closure(FakeFdTransport):void, 1:bool}> */
+    /**
+     * The third element is a fragment of the refusal's message, so a case is pinned to the CHECK
+     * that refuses it — not merely to some check refusing it (review RV5: with the `len` ceiling
+     * removed, the size check refused the same frame and the case still passed).
+     *
+     * @return iterable<string, array{0:\Closure(FakeFdTransport):void, 1:bool, 2:string}>
+     */
     public static function desyncs(): iterable
     {
         $p = PackerFactory::forEncode();
         $inline = Outcome::ok($p->packNil())->encode($p);
         yield 'no fd queued for the frame' => [static function (FakeFdTransport $t) use ($inline): void {
             $t->feed(self::oobFrame(self::RID, strlen($inline)));
-        }, true];
+        }, true, 'without its fd'];
         yield 'memfd shorter than len' => [static function (FakeFdTransport $t) use ($inline): void {
             $t->queueFd(self::memfdStandIn($inline));
             $t->feed(self::oobFrame(self::RID, strlen($inline) + 1));
-        }, true];
+        }, true, 'not exactly the length'];
         yield 'memfd longer than len' => [static function (FakeFdTransport $t) use ($inline): void {
             $t->queueFd(self::memfdStandIn($inline . 'x'));
             $t->feed(self::oobFrame(self::RID, strlen($inline)));
-        }, true];
+        }, true, 'not exactly the length'];
         yield 'fd_index other than 0' => [static function (FakeFdTransport $t) use ($inline): void {
             $t->queueFd(self::memfdStandIn($inline));
             $t->feed(self::oobFrame(self::RID, strlen($inline), fdIndex: 1));
-        }, true];
+        }, true, 'fd_index must be 0'];
         yield 'an encoding this client does not implement' => [static function (FakeFdTransport $t) use ($inline): void {
             $t->queueFd(self::memfdStandIn($inline));
             $t->feed(self::oobFrame(self::RID, strlen($inline), encoding: C::OOB_ENCODING_FRAME_PAYLOAD + 1));
-        }, true];
+        }, true, 'encoding is not one'];
         yield 'len above MAX_FRAME_PAYLOAD' => [static function (FakeFdTransport $t) use ($inline): void {
             $t->queueFd(self::memfdStandIn($inline));
             $t->feed(self::oobFrame(self::RID, C::MAX_FRAME_PAYLOAD + 1));
-        }, true];
+        }, true, 'within MAX_FRAME_PAYLOAD'];
         yield 'an OOB frame on a session that never advertised MEMFD_RX' => [static function (FakeFdTransport $t) use ($inline): void {
             $t->queueFd(self::memfdStandIn($inline));
             $t->feed(self::oobFrame(self::RID, strlen($inline)));
-        }, false];
+        }, false, 'did not advertise MEMFD_RX'];
     }
 
     /**
      * @param \Closure(FakeFdTransport):void $arrange
      */
     #[\PHPUnit\Framework\Attributes\DataProvider('desyncs')]
-    public function testEveryDisagreementIsADesyncThatPoisonsTheSession(\Closure $arrange, bool $receives): void
+    public function testEveryDisagreementIsADesyncThatPoisonsTheSession(\Closure $arrange, bool $receives, string $why): void
     {
         $t = new FakeFdTransport($receives);
         $arrange($t);
@@ -156,8 +186,8 @@ final class SessionOobTest extends TestCase
         try {
             $session->sendRequest(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'req');
             $this->fail('a disagreement about the OOB frame must not be accepted');
-        } catch (ProtocolException) {
-            // expected
+        } catch (ProtocolException $e) {
+            $this->assertStringContainsString($why, $e->getMessage());
         }
         $this->assertTrue($session->isPoisoned(), 'the byte stream can no longer be trusted');
         $this->assertTrue($t->closed);
@@ -210,6 +240,14 @@ final class SessionOobTest extends TestCase
         return (new Codec())->encodeFrame(
             new Header(C::FLAG_END | C::FLAG_OOB_FD, C::SERVICE_SQL, C::METHOD_SQL_EXEC, $rid, strlen($ref)),
             $ref,
+        );
+    }
+
+    private static function inlineFrame(int $rid, string $payload): string
+    {
+        return (new Codec())->encodeFrame(
+            new Header(C::FLAG_END, C::SERVICE_SQL, C::METHOD_SQL_EXEC, $rid, strlen($payload)),
+            $payload,
         );
     }
 

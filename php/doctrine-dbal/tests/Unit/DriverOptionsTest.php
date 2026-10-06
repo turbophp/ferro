@@ -51,6 +51,21 @@ final class DriverOptionsTest extends TestCase
         DriverOptions::fromParams([]);
     }
 
+    /**
+     * `receive_fds` (SPEC §5.1): unset is AUTO (null), and an application can opt this connection
+     * out of the memfd path (`false`) or insist on it (`true`). Anything else is refused.
+     */
+    public function testReceiveFdsIsAutoUnlessSetAndOnlyABoolOrNull(): void
+    {
+        self::assertNull(DriverOptions::fromParams(['unix_socket' => '/s'])->receiveFds);
+        foreach ([false, true, null] as $v) {
+            $o = DriverOptions::fromParams(['unix_socket' => '/s', 'driverOptions' => ['receive_fds' => $v]]);
+            self::assertSame($v, $o->receiveFds);
+        }
+        $this->expectException(\InvalidArgumentException::class);
+        DriverOptions::fromParams(['unix_socket' => '/s', 'driverOptions' => ['receive_fds' => 'no']]);
+    }
+
     /** A wrongly-typed option is refused, not silently coerced (level 9 narrows, but so do we). */
     public function testAWronglyTypedOptionIsRefused(): void
     {

@@ -809,8 +809,11 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         return $this->poisoned !== null;
     }
 
-    /** Whether this session's transport can be sent fds, so it advertises `MEMFD_RX` (M3-D3). */
-    private function receivesFds(): bool
+    /**
+     * Whether this session's transport can be sent fds, so it advertises `MEMFD_RX` (M3-D3).
+     * Diagnostic as well: what `Ferro::connect(receiveFds: …)` and the tiers' opt-outs decided.
+     */
+    public function receivesFds(): bool
     {
         return $this->transport instanceof FdReceivingTransportInterface && $this->transport->receivesFds();
     }
@@ -864,6 +867,9 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
                 $this->transport->setReadWait($wait);
             }
             try {
+                if ($this->partialHeader === null && $this->transport instanceof FdReceivingTransportInterface) {
+                    $this->transport->beginFrame();
+                }
                 $this->partialHeader ??= Header::decode($this->transport->readExact(16));
                 $header = $this->partialHeader;
                 $payload = $header->payloadLen > 0 ? $this->transport->readExact($header->payloadLen) : '';
@@ -1047,6 +1053,7 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             }
         } finally {
             fclose($fd);
+            $this->transport->fdClosed();
         }
         $this->oobPayloads++;
         $flags = $header->flags & ~C::FLAG_OOB_FD;

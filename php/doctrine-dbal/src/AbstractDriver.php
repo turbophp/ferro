@@ -38,7 +38,7 @@ abstract class AbstractDriver
         // and a loud refusal for the values it would parse into something ELSE.
         $policy = new DbalValuePolicy();
         $ferro = $o->socketPath !== null
-            ? Ferro::connect($o->socketPath, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $policy)
+            ? Ferro::connect($o->socketPath, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $policy, receiveFds: $o->receiveFds)
             : Ferro::connectTcp((string) $o->host, $o->port, $o->pool, $o->connectTimeout, $o->ioTimeout, RetryPolicy::none(), null, $policy);
 
         $info = $ferro->poolInfo();

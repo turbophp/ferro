@@ -53,6 +53,20 @@ final class FakeFdTransport implements FdReceivingTransportInterface
         return $this->received;
     }
 
+    /** How many times the session announced a frame start / a closed fd (asserted by the tests). */
+    public int $frameStarts = 0;
+    public int $fdsClosed = 0;
+
+    public function beginFrame(): void
+    {
+        $this->frameStarts++;
+    }
+
+    public function fdClosed(): void
+    {
+        $this->fdsClosed++;
+    }
+
     public function readExact(int $n): string
     {
         if ($n === 0) { return ''; }

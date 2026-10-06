@@ -5,12 +5,14 @@ namespace Ferro\Tests\Live;
 use Ferro\Client\Connection;
 use Ferro\Client\Session;
 use Ferro\Client\Transport;
+use Ferro\Ferro;
 use Ferro\Protocol\ExecRequest;
 use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Header;
 use Ferro\Protocol\Msgpack\PackerFactory;
 use Ferro\Protocol\OobRef;
 use Ferro\Protocol\Outcome;
+use PHPUnit\Framework\Attributes\Group;
 use function Ferro\await;
 
 /**
@@ -23,8 +25,10 @@ use function Ferro\await;
  * OOB count), not only that the data is right — the inline fallback would produce the same rows,
  * which is precisely what SPEC §5.1 requires and precisely why the data alone proves nothing.
  *
- * Needs `ext-sockets` on Linux; CI's PHP job provides it, so a skip here fails that lane.
+ * Needs `ext-sockets` on Linux; CI's PHP job provides it, so a skip here fails that lane. The
+ * `oob` group is what CI's `fread`-path re-run excludes (it runs with `socket_recvmsg` disabled).
  */
+#[Group('oob')]
 final class OobLiveTest extends LiveTestCase
 {
     /** 2 MiB of payload: well past the 1 MiB default threshold. */
@@ -41,6 +45,28 @@ final class OobLiveTest extends LiveTestCase
     private static function bigSql(): string
     {
         return 'SELECT ?::text || repeat(\'x\', ' . self::BIG . ') AS big, 7 AS seven';
+    }
+
+    /**
+     * Review F6: the per-connection switch an application can reach. `Ferro::connect()` receives
+     * fds by default (auto) and takes a large result by memfd; `receiveFds: false` keeps that
+     * connection on the `fread` path, where the same result arrives inline.
+     */
+    public function testFerroConnectReceivesFdsByDefaultAndCanOptOut(): void
+    {
+        foreach ([[null, 1], [false, 0]] as [$receiveFds, $expectedOob]) {
+            $c = Ferro::connect($this->socketPath, receiveFds: $receiveFds);
+            $session = $c->session();
+            try {
+                $this->assertInstanceOf(Session::class, $session);
+                $this->assertSame($receiveFds === null, $session->receivesFds());
+                $rows = $c->rows(self::bigSql(), ['sw-']);
+                $this->assertSame(strlen('sw-') + self::BIG, strlen((string) $rows[0]['big']));
+                $this->assertSame($expectedOob, $session->oobPayloadsReceived());
+            } finally {
+                $session->close();
+            }
+        }
     }
 
     public function testALargeResultArrivesThroughAMemfdAndEqualsTheInlineResult(): void
