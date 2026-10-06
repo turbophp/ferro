@@ -25,10 +25,30 @@ final class Future
     /** @var (\Closure(): T)|null */
     private ?\Closure $resolver;
 
-    /** @param \Closure(): T $resolver reads the terminal and produces the value (or throws). */
-    public function __construct(\Closure $resolver)
+    /** @var (\Closure(): void)|null */
+    private ?\Closure $onDrop;
+
+    /**
+     * @param \Closure(): T          $resolver reads the terminal and produces the value (or throws).
+     * @param (\Closure(): void)|null $onDrop  runs if this Future is destroyed before it settled, so
+     *                                         the session can throw its terminal away on arrival
+     *                                         instead of keeping it forever (M3-D1a review F6).
+     */
+    public function __construct(\Closure $resolver, ?\Closure $onDrop = null)
     {
         $this->resolver = $resolver;
+        $this->onDrop = $onDrop;
+    }
+
+    public function __destruct()
+    {
+        if (!$this->settled && $this->onDrop !== null) {
+            try {
+                ($this->onDrop)();
+            } catch (\Throwable) {
+                // A destructor must not throw; an un-discarded terminal only costs memory.
+            }
+        }
     }
 
     /**
@@ -75,6 +95,7 @@ final class Future
         }
         $resolver = $this->resolver;
         $this->resolver = null;
+        $this->onDrop = null;
         try {
             $this->value = $resolver !== null ? $resolver() : null;
         } catch (\Throwable $e) {

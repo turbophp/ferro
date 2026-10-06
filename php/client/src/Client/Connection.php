@@ -1281,9 +1281,13 @@ final class Connection
      *  - **a session that cannot multiplex**, or a submit that fails (for example while reconnecting a
      *    closed session). The synchronous path already classifies and recovers from those.
      *
-     * **`lastInsertId()` is NOT updated by an asynchronous statement.** "The most recent statement"
-     * has no meaning when several are in flight at once. The key is on the raw result shape
-     * ({@see fetchRaw}).
+     * **`lastInsertId()` is NOT touched by an asynchronous statement, on ANY of these paths.** "The
+     * most recent statement" has no meaning when several are in flight at once, so every path below,
+     * including the ones that settle at once and the read re-issue, runs inside
+     * {@see preservingLastInsertId} (M3-D1a review F4: they used to set or clear it).
+     *
+     * **Every error surfaces at `await`, never at the call** (review F7): a failure to submit is held
+     * by a settled Future like any other.
      *
      * @template R
      * @param list<mixed> $params
@@ -1293,27 +1297,35 @@ final class Connection
     private function dispatchAsync(string $sql, array $params, bool $readonly, int $fetch, \Closure $shape): \Ferro\Future
     {
         if ($this->tx !== null) {
-            return \Ferro\Future::settleNow(fn () => $shape($this->dispatch($sql, $params, $readonly, $fetch)));
+            return \Ferro\Future::settleNow(fn () => $shape($this->preservingLastInsertId(
+                fn () => $this->dispatch($sql, $params, $readonly, $fetch),
+            )));
         }
+        $sync = fn () => $shape($this->preservingLastInsertId(
+            fn () => $this->dispatchAutocommit($sql, $params, $readonly, $fetch),
+        ));
         $opKind = $readonly ? OpKind::Read : OpKind::Write;
         try {
             $session = $this->requestSession($opKind, $readonly);
-        } catch (FerroException $e) {
+            if (!$session instanceof MultiplexingSessionInterface) {
+                return \Ferro\Future::settleNow($sync);
+            }
+            $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, null);
+            try {
+                $rid = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
+            } catch (ConnectionLostException | TransportException $e) {
+                if (!self::wasSent($e)) {
+                    // Nothing was sent: the synchronous path reconnects, re-sends and classifies
+                    // exactly as it would for a synchronous call.
+                    return \Ferro\Future::settleNow($sync);
+                }
+                throw $e;
+            }
+        } catch (\Throwable $e) {
             return \Ferro\Future::settleNow(static fn () => throw $e);
         }
-        if (!$session instanceof MultiplexingSessionInterface) {
-            return \Ferro\Future::settleNow(fn () => $shape($this->dispatchAutocommit($sql, $params, $readonly, $fetch)));
-        }
-        $payload = $this->codec->encode($this->pool, $sql, $params, $readonly, $fetch, null);
-        try {
-            $rid = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, $payload);
-        } catch (ConnectionLostException | TransportException) {
-            // Nothing was sent, or the session is gone: the synchronous path reconnects, re-sends
-            // and classifies exactly as it would for a synchronous call.
-            return \Ferro\Future::settleNow(fn () => $shape($this->dispatchAutocommit($sql, $params, $readonly, $fetch)));
-        }
 
-        return new \Ferro\Future(function () use ($session, $rid, $opKind, $readonly, $sql, $params, $fetch, $shape): mixed {
+        return new \Ferro\Future(fn (): mixed => $this->preservingLastInsertId(function () use ($session, $rid, $opKind, $readonly, $sql, $params, $fetch, $shape): mixed {
             try {
                 $outcome = $session->awaitTerminal($rid);
             } catch (ConnectionLostException | TransportException $e) {
@@ -1348,7 +1360,25 @@ final class Connection
                 return $shape($this->dispatchAutocommit($sql, $params, $readonly, $fetch, 1));
             }
             throw $ex;
-        });
+        }), static fn () => $session instanceof Session ? $session->discard($rid) : null);
+    }
+
+    /**
+     * Run `$work` and put {@see $lastInsertId} back as it was, whatever `$work` did to it — the
+     * asynchronous paths' "never touches it" rule (M3-D1a review F4).
+     *
+     * @template R
+     * @param \Closure(): R $work
+     * @return R
+     */
+    private function preservingLastInsertId(\Closure $work): mixed
+    {
+        $saved = $this->lastInsertId;
+        try {
+            return $work();
+        } finally {
+            $this->lastInsertId = $saved;
+        }
     }
 
     /**

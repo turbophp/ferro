@@ -2,6 +2,10 @@
 declare(strict_types=1);
 namespace Ferro;
 
+if (\function_exists('Ferro\\await')) {
+    return;
+}
+
 /**
  * Await every Future and return their values, keyed as given (SPEC §10.1):
  *

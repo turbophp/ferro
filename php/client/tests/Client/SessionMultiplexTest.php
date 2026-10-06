@@ -122,35 +122,59 @@ final class SessionMultiplexTest extends TestCase
         $this->assertSame($writes, $t->writeCalls, 'nothing reached the transport');
     }
 
+    /** A session-fatal terminal on request_id 0 (an engine-side protocol error). */
+    private static function fatalFrame(string $message): string
+    {
+        $packer = PackerFactory::forEncode();
+        $ep = new ErrorPayload(C::ERR_PROTOCOL, C::BRANCH_NON_RETRYABLE, null, null, $message, null, null);
+        $payload = Outcome::error($ep)->encode($packer);
+        return (new Codec())->encodeFrame(new Header(C::FLAG_END, C::SERVICE_CORE, 0, 0, strlen($payload)), $payload);
+    }
+
     /**
-     * A session-fatal terminal on request_id 0 fails EVERY pending request, each with its own
-     * ConnectionLostException carrying the server's payload, so each caller classifies its own fate.
+     * M3-D1a review F1. A session-fatal terminal decides NO pending request's fate: it may concern
+     * any of them, or a control frame. The session keeps reading, because the engine drains each
+     * in-flight request's OWN terminal before it closes — and those real terminals are what decide.
      */
-    public function testASessionFatalTerminalFailsEveryPendingRequest(): void
+    public function testASessionFatalDoesNotDecideThePendingRequestsTheEngineStillAnswers(): void
     {
         $t = new FakeTransport();
         $session = new Session($t, new RequestIdAllocator(0));
         $a = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'a');
         $b = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'b');
 
-        $packer = PackerFactory::forEncode();
-        $ep = new ErrorPayload(C::ERR_CONNECTION_LOST, C::ERR_CONNECTION_LOST_BRANCH, null, null, 'engine draining', null, null);
-        $payload = Outcome::error($ep)->encode($packer);
-        $t->feed((new Codec())->encodeFrame(new Header(C::FLAG_END, C::SERVICE_CORE, 0, 0, strlen($payload)), $payload));
+        // The fatal arrives first, then the engine's drain delivers request a's real terminal, then
+        // EOF (nothing more is fed) before request b is answered.
+        $t->feed(self::fatalFrame('a malformed frame on another request') . self::okTerminal($a, 'applied'));
 
-        $seen = [];
-        foreach ([$a, $b] as $rid) {
-            try {
-                $session->awaitTerminal($rid);
-                $this->fail("request {$rid} must fail");
-            } catch (ConnectionLostException $e) {
-                $this->assertSame(C::ERR_CONNECTION_LOST, $e->errorPayload()?->code);
-                $seen[] = spl_object_id($e);
-            }
+        $this->assertSame('applied', self::marker($session->awaitTerminal($a)), 'the drained terminal is read, not discarded');
+
+        try {
+            $session->awaitTerminal($b);
+            $this->fail('request b got no terminal');
+        } catch (ConnectionLostException $e) {
+            $this->assertNull($e->errorPayload(), 'the fatal payload is NOT attributed to request b');
+            $this->assertStringContainsString('a malformed frame on another request', $e->getMessage());
         }
-        $this->assertCount(2, array_unique($seen), 'each awaiter gets its own exception object');
-        $this->assertFalse($session->isPending($a));
-        $this->assertFalse($session->isPending($b));
+    }
+
+    /** After a fatal the session sends nothing: a new request is refused as never sent. */
+    public function testAfterASessionFatalNothingMoreIsSent(): void
+    {
+        $t = new FakeTransport();
+        $session = new Session($t, new RequestIdAllocator(0));
+        $a = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'a');
+        $t->feed(self::fatalFrame('protocol fault') . self::okTerminal($a, 'x'));
+        $session->awaitTerminal($a);
+
+        $writes = $t->writeCalls;
+        try {
+            $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'b');
+            $this->fail('nothing may be sent after a fatal');
+        } catch (TransportException $e) {
+            $this->assertTrue($e->requestUnsent());
+        }
+        $this->assertSame($writes, $t->writeCalls);
     }
 
     /**
@@ -189,6 +213,10 @@ final class SessionMultiplexTest extends TestCase
 
         $b = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'b');
         $this->assertCount(2, self::writtenHeaders($t));
+        // w (request a), then the reads of a's terminal (header + payload), THEN w (request b).
+        $this->assertSame('w', $t->events[0]);
+        $this->assertSame('w', $t->events[array_key_last($t->events)]);
+        $this->assertContains('r', array_slice($t->events, 1, -1), 'a terminal was read before the second write');
         $this->assertSame('first', self::marker($session->awaitTerminal($a)), 'the terminal read to free the slot was kept');
 
         $t->feed(self::okTerminal($b, 'second'));
@@ -204,6 +232,74 @@ final class SessionMultiplexTest extends TestCase
         $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'b');
         $this->assertCount(2, self::writtenHeaders($t));
         $this->assertFalse($session->isPoisoned(), 'no read was attempted');
+    }
+
+    /**
+     * Review F2/F2b: a request waiting for an in-flight slot on a session that dies was never
+     * written, so it is `requestNotSent` — never a sent-and-lost write.
+     */
+    public function testARequestWaitingForASlotOnADyingSessionIsNotSent(): void
+    {
+        $t = new FakeTransport();
+        $session = new Session($t, new RequestIdAllocator(0), maxInFlight: 1);
+        $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'a');
+        // Nothing fed: the read for a free slot hits EOF.
+        try {
+            $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'b');
+            $this->fail('the second request must not be reported sent');
+        } catch (TransportException $e) {
+            $this->assertTrue($e->requestUnsent());
+        }
+        $this->assertSame(1, $t->writeCalls, 'only request a was written');
+    }
+
+    /** Review F3: closing with requests pending fails them as SENT, not with a read on a closed socket. */
+    public function testClosingWithRequestsPendingFailsThemAsSent(): void
+    {
+        $t = new FakeTransport();
+        $session = new Session($t, new RequestIdAllocator(0));
+        $a = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'a');
+        $session->close();
+        $reads = count(array_filter($t->events, static fn (string $e): bool => $e === 'r'));
+        try {
+            $session->awaitTerminal($a);
+            $this->fail('a closed session cannot answer');
+        } catch (TransportException $e) {
+            $this->assertFalse($e->requestUnsent(), 'request a was sent');
+        }
+        $this->assertSame($reads, count(array_filter($t->events, static fn (string $e): bool => $e === 'r')), 'no read after close');
+    }
+
+    /** Review F6: a discarded request's terminal is thrown away on arrival, not kept. */
+    public function testADiscardedRequestsTerminalIsNotKept(): void
+    {
+        $t = new FakeTransport();
+        $session = new Session($t, new RequestIdAllocator(0));
+        $a = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'a');
+        $b = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'b');
+        $session->discard($a);
+        $this->assertFalse($session->isPending($a));
+        $t->feed(self::okTerminal($a, 'dropped') . self::okTerminal($b, 'kept'));
+        $this->assertSame('kept', self::marker($session->awaitTerminal($b)));
+        $inbox = new \ReflectionProperty(Session::class, 'inbox');
+        $this->assertSame([], $inbox->getValue($session), 'nothing left behind');
+    }
+
+    /** Review F6: a non-terminal frame for a buffered request is a desync, so it poisons the session. */
+    public function testANonTerminalFrameForABufferedRequestPoisons(): void
+    {
+        $t = new FakeTransport();
+        $session = new Session($t, new RequestIdAllocator(0));
+        $a = $session->submit(C::SERVICE_SQL, C::METHOD_SQL_EXEC, 'a');
+        $packer = PackerFactory::forEncode();
+        $payload = Outcome::ok($packer->packNil())->encode($packer);
+        $t->feed((new Codec())->encodeFrame(new Header(0, C::SERVICE_SQL, C::METHOD_SQL_EXEC, $a, strlen($payload)), $payload));
+        try {
+            $session->awaitTerminal($a);
+            $this->fail('a non-terminal frame for a buffered request is a fault');
+        } catch (ProtocolException) {
+        }
+        $this->assertTrue($session->isPoisoned());
     }
 
     /** A PING while requests are in flight: its PONG is routed, and the request terminals are kept. */
