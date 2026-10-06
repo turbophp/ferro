@@ -80,3 +80,22 @@ async fn describe_fails_loudly_for_what_check_must_catch() {
         Err(PoolError::Sql { .. })
     ));
 }
+
+/// Review F10: an EXPRESSION's prepared type is not its executed type (`? + 1` prepares as a DOUBLE
+/// and executes as a LONGLONG for an integer bind), and the engine reports the executed one — so
+/// describe leaves an expression untagged instead of recording a wrong tag `ferro gen` would type.
+#[tokio::test]
+async fn an_expression_column_is_untagged_and_a_table_column_is_tagged() {
+    let Some(url) = test_url() else { return };
+    let b = MysqlBackend::new(url);
+    let mut c = b.connect().await.expect("connect");
+    b.simple_query(&mut c, "CREATE TEMPORARY TABLE d2b_e (id BIGINT)")
+        .await
+        .unwrap();
+    let d = b
+        .describe(&mut c, "SELECT id, ? + 1 AS n FROM d2b_e")
+        .await
+        .expect("describes");
+    assert_eq!(d.cols[0].tag, Some(tag::I64));
+    assert_eq!(d.cols[1].tag, None);
+}

@@ -1088,4 +1088,3 @@ mod tests {
         assert!(Manifest::from_json(bad.as_bytes()).is_err());
     }
 }
-

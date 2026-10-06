@@ -48,6 +48,14 @@ usage:
 ";
 
 fn main() -> ExitCode {
+    // Backend diagnostics (a connect failure's real reason) are `tracing` events; shown only when
+    // asked for with RUST_LOG, on stderr. The backends never put a DSN in them.
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    }
     // `args_os`, not `args`: `std::env::args` PANICS on a non-UTF-8 argument (exit 101, outside
     // the documented codes). A path that is not UTF-8 is a usage error here (M3-D2a review F13).
     let mut args = Vec::new();
@@ -379,20 +387,6 @@ async fn cmd_schema_sync(args: &[String]) -> ExitCode {
     };
     let at = format!("pool `{pool}`");
 
-    // The guard: this EMPTIES a database. Name-based, because the name is the one thing a shadow
-    // database reliably has that a production one does not.
-    let name = db::database_name(&spec);
-    if !disposable && !name.as_deref().is_some_and(|n| n.ends_with("_shadow")) {
-        return report(&[Problem {
-            at,
-            message: format!(
-                "refusing to empty database {}: its name does not end in `_shadow` (pass \
-                 --i-know-this-is-disposable only for a database you can lose)",
-                name.map_or_else(|| "<unnamed>".to_string(), |n| format!("`{n}`"))
-            ),
-        }]);
-    }
-
     let mut files: Vec<PathBuf> = match std::fs::read_dir(&migrations) {
         Ok(rd) => rd
             .flatten()
@@ -408,52 +402,101 @@ async fn cmd_schema_sync(args: &[String]) -> ExitCode {
     };
     files.sort();
 
-    if spec.kind == ferrod::config::PoolKind::Sqlite {
-        let path = spec.dsn.strip_prefix("sqlite://").unwrap_or(&spec.dsn);
-        let path = path.split('?').next().unwrap_or(path);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{path}{suffix}"));
-        }
-    }
     let mut conn = match db::Db::connect(&spec).await {
         Ok(c) => c,
         Err(m) => return report(&[Problem { at, message: m }]),
     };
-    if let Err(m) = reset(&mut conn).await {
+
+    // THE GUARD: this EMPTIES a database. The name checked is the one the SERVER reports for the
+    // connection — never one parsed out of the DSN, which the drivers resolve differently (a
+    // `?dbname=` overrides the path on PostgreSQL; MySQL reads only the first path segment and
+    // ignores a `#fragment`), so a parsed name let a crafted DSN empty a production database
+    // (review F1/F2). The name is printed; the DSN never is.
+    let name = match conn.current_database().await {
+        Ok(n) => n,
+        Err(m) => {
+            return report(&[Problem {
+                at,
+                message: format!("cannot tell which database this is: {m}"),
+            }]);
+        }
+    };
+    if !disposable && !name.ends_with("_shadow") {
         return report(&[Problem {
             at,
-            message: format!("cannot empty the database: {m}"),
+            message: format!(
+                "refusing to empty database `{name}`: its name does not end in `_shadow` (pass \
+                 --i-know-this-is-disposable only for a database you can lose)"
+            ),
         }]);
     }
+
+    if let Err(m) = reset(&mut conn, &name).await {
+        return report_after_reset(&at, &format!("could not empty database `{name}`: {m}"));
+    }
+    let mut applied = 0usize;
     for file in &files {
         let sql = match std::fs::read_to_string(file) {
             Ok(s) => s,
             Err(e) => {
-                return report(&[Problem {
-                    at: file.display().to_string(),
-                    message: format!("cannot read: {e}"),
-                }]);
+                return report_after_reset(
+                    &file.display().to_string(),
+                    &format!(
+                        "cannot read: {e} — database `{name}` was emptied and {applied} of {} migrations applied",
+                        files.len()
+                    ),
+                );
             }
         };
-        if let Err(m) = conn.batch(&sql).await {
-            return report(&[Problem {
-                at: file.display().to_string(),
-                message: format!("migration failed: {m}"),
-            }]);
+        if sql.trim().is_empty() {
+            // An empty file is nothing to apply. (MySQL refuses an empty query; review F8.)
+            continue;
         }
+        if let Err(m) = conn.batch(&sql).await {
+            return report_after_reset(
+                &file.display().to_string(),
+                &format!(
+                    "migration failed: {m} — database `{name}` was emptied and {applied} of {} migrations applied before it",
+                    files.len()
+                ),
+            );
+        }
+        if conn.in_tx() {
+            // A migration that leaves a transaction open would be rolled back when this process
+            // exits, losing it and every later migration while reporting success (review F7).
+            return report_after_reset(
+                &file.display().to_string(),
+                "the migration left a transaction open: end it with COMMIT (or remove the BEGIN)",
+            );
+        }
+        applied += 1;
     }
     eprintln!(
-        "ferro: pool `{pool}` emptied and {} migration{} applied",
-        files.len(),
-        if files.len() == 1 { "" } else { "s" }
+        "ferro: database `{name}` (pool `{pool}`) emptied and {applied} migration{} applied",
+        if applied == 1 { "" } else { "s" }
     );
     ExitCode::SUCCESS
 }
 
-/// Empty the connected database: every non-system schema on PostgreSQL (enumerated, never a fixed
-/// list — a hand-kept list measurably rotted in the DBAL harness), every table and view on MySQL.
-/// A SQLite database was deleted before connecting.
-async fn reset(conn: &mut db::Db) -> Result<(), String> {
+/// A failure AFTER the database was emptied: the usual "nothing was written" would be false.
+fn report_after_reset(at: &str, message: &str) -> ExitCode {
+    eprintln!("error: {at}: {message}");
+    ExitCode::from(1)
+}
+
+/// Empty the connected database `name`, then VERIFY it is empty — a reset that silently left
+/// objects behind used to report success (review F3/F5).
+///
+/// - **PostgreSQL:** every non-system schema, ENUMERATED from `pg_namespace` (a hand-kept list
+///   measurably rotted in the DBAL harness), every publication, every large object, and the
+///   database's own settings (`ALTER DATABASE … RESET ALL` — a stale `search_path` changes how
+///   `check` resolves names); `public` is recreated with PUBLIC's USAGE, as a fresh database has it.
+/// - **MySQL/MariaDB:** `DROP DATABASE` and `CREATE DATABASE` with the original character set and
+///   collation — the only reset that also removes routines, events, sequences and versioned tables.
+/// - **SQLite:** every table, view and trigger in `sqlite_master` is dropped in-database, with
+///   foreign keys off; nothing deletes the file, so a path trick cannot point the drop and the open
+///   at different files.
+async fn reset(conn: &mut db::Db, name: &str) -> Result<(), String> {
     match conn {
         db::Db::Pg(..) => {
             let schemas = conn
@@ -462,36 +505,96 @@ async fn reset(conn: &mut db::Db) -> Result<(), String> {
                      ('pg_catalog', 'information_schema') AND nspname NOT LIKE 'pg\\_%'",
                 )
                 .await?;
-            let mut sql: String = schemas
+            let pubs = conn
+                .texts("SELECT pubname::text FROM pg_publication")
+                .await?;
+            let mut sql: String = pubs
                 .iter()
-                .map(|s| format!("DROP SCHEMA {} CASCADE;", db::quote_dq(s)))
+                .map(|p| format!("DROP PUBLICATION {};", db::quote_dq(p)))
                 .collect();
-            sql.push_str("CREATE SCHEMA public;");
-            conn.batch(&sql).await
+            for s in &schemas {
+                sql.push_str(&format!("DROP SCHEMA {} CASCADE;", db::quote_dq(s)));
+            }
+            sql.push_str("SELECT lo_unlink(oid) FROM pg_largeobject_metadata;");
+            sql.push_str(&format!("ALTER DATABASE {} RESET ALL;", db::quote_dq(name)));
+            sql.push_str("CREATE SCHEMA public; GRANT USAGE ON SCHEMA public TO PUBLIC;");
+            conn.batch(&sql).await?;
+            let left = conn
+                .count(
+                    "SELECT count(*)::int8 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                     AND n.nspname NOT LIKE 'pg\\_%'",
+                )
+                .await?;
+            if left != 0 {
+                return Err(format!("{left} relation(s) survived the reset"));
+            }
+            Ok(())
         }
         db::Db::Mysql(..) => {
-            let views = conn
-                .texts(
-                    "SELECT CAST(table_name AS CHAR) FROM information_schema.tables \
-                     WHERE table_schema = DATABASE() AND table_type = 'VIEW'",
+            let row = conn
+                .rows(
+                    "SELECT CAST(DEFAULT_CHARACTER_SET_NAME AS CHAR), CAST(DEFAULT_COLLATION_NAME AS CHAR) \
+                     FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = DATABASE()",
                 )
                 .await?;
-            let tables = conn
-                .texts(
-                    "SELECT CAST(table_name AS CHAR) FROM information_schema.tables \
-                     WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'",
+            let text = |v: Option<&ferro_proto::value::Value>| match v {
+                Some(ferro_proto::value::Value::Text(s)) => Ok(s.clone()),
+                other => Err(format!("unexpected catalog value {other:?}")),
+            };
+            let first = row
+                .first()
+                .ok_or("the database is not in information_schema")?;
+            let (charset, collation) = (text(first.first())?, text(first.get(1))?);
+            let q = db::quote_bq(name);
+            conn.batch(&format!(
+                "DROP DATABASE {q}; CREATE DATABASE {q} CHARACTER SET {} COLLATE {}; USE {q};",
+                db::quote_bq(&charset),
+                db::quote_bq(&collation)
+            ))
+            .await?;
+            let left = conn
+                .count(
+                    "SELECT CAST(COUNT(*) AS SIGNED) FROM information_schema.tables WHERE table_schema = DATABASE()",
                 )
                 .await?;
-            let mut sql = String::from("SET FOREIGN_KEY_CHECKS = 0;");
-            for v in &views {
-                sql.push_str(&format!("DROP VIEW IF EXISTS {};", db::quote_bq(v)));
+            if left != 0 {
+                return Err(format!("{left} table(s) survived the reset"));
             }
-            for t in &tables {
-                sql.push_str(&format!("DROP TABLE IF EXISTS {};", db::quote_bq(t)));
-            }
-            sql.push_str("SET FOREIGN_KEY_CHECKS = 1;");
-            conn.batch(&sql).await
+            Ok(())
         }
-        db::Db::Sqlite(..) => Ok(()),
+        db::Db::Sqlite(..) => {
+            let objects = conn
+                .rows(
+                    "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+                     AND type IN ('table', 'view', 'trigger')",
+                )
+                .await?;
+            let mut sql = String::from("PRAGMA foreign_keys = OFF;");
+            for o in &objects {
+                let (
+                    Some(ferro_proto::value::Value::Text(kind)),
+                    Some(ferro_proto::value::Value::Text(obj)),
+                ) = (o.first(), o.get(1))
+                else {
+                    return Err(format!("unexpected catalog row {o:?}"));
+                };
+                let verb = match kind.as_str() {
+                    "table" => "TABLE",
+                    "view" => "VIEW",
+                    _ => "TRIGGER",
+                };
+                sql.push_str(&format!("DROP {verb} IF EXISTS {};", db::quote_dq(obj)));
+            }
+            sql.push_str("PRAGMA foreign_keys = ON;");
+            conn.batch(&sql).await?;
+            let left = conn
+                .count("SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'")
+                .await?;
+            if left != 0 {
+                return Err(format!("{left} object(s) survived the reset"));
+            }
+            Ok(())
+        }
     }
 }

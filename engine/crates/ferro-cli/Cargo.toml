@@ -21,6 +21,7 @@ ferro-backend-mysql = { path = "../ferro-backend-mysql" }
 ferro-backend-sqlite = { path = "../ferro-backend-sqlite" }
 ferrod = { path = "../ferrod" }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints]
 workspace = true
