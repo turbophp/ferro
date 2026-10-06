@@ -265,6 +265,30 @@ pub fn render(registry: &PoolRegistry, boot_epoch: u64) -> String {
         "ferro_traceparent_invalid_total {}",
         crate::trace::invalid_total()
     );
+    // SPEC §5.1 out-of-band terminals (M3-D3). Present — as zeroes — on a daemon that never sent
+    // one, for the same "no data vs nothing happened" reason as everything else here.
+    let oob = &crate::session::oob::COUNTERS;
+    for (name, help, value) in [
+        (
+            "ferro_oob_payloads_total",
+            "Success terminals sent through a sealed memfd to a MEMFD_RX client (SPEC §5.1).",
+            oob.sent(),
+        ),
+        (
+            "ferro_oob_bytes_total",
+            "Bytes of the payloads sent through a sealed memfd (SPEC §5.1).",
+            oob.bytes(),
+        ),
+        (
+            "ferro_oob_fallbacks_total",
+            "Terminals that qualified for a memfd but were sent inline: the memfd could not be made, or the kernel refused the fd (SPEC §5.1).",
+            oob.fallbacks(),
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        let _ = writeln!(out, "{name} {value}");
+    }
     // SPEC §13 OTLP export (M2-C4c-2). Present — as zeroes — when export is off, like every other
     // series here: "no data" and "nothing happened" must not be the same observation to an alert.
     let otlp = &crate::otlp::COUNTERS;

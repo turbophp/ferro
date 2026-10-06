@@ -1,3 +1,5 @@
+use std::os::fd::OwnedFd;
+
 use bytes::{Buf, Bytes, BytesMut};
 use ferro_proto::consts::MAX_FRAME_PAYLOAD;
 use ferro_proto::header::{HEADER_LEN, Header};
@@ -39,17 +41,27 @@ pub struct OutFrame {
 /// terminal — carries `cap: None`. A streamed `Responder::send_head`/`send_data` frame carries
 /// `Some(guard)`; because the guard travels IN the message, a cancelled/failed enqueue drops the
 /// message and releases the reservation (no leak), and there is exactly one release, on the drop.
+///
+/// `fd` (M3-D3) is the sealed memfd an `OOB_FD` terminal names (`session::oob`). It is `Some` on
+/// exactly the frames whose header sets `OOB_FD`, and the writer sends it with `SCM_RIGHTS` attached
+/// to that frame's first byte, then drops it — closing the engine's copy once the kernel holds the
+/// in-flight reference.
 #[derive(Debug)]
 pub struct ControlMsg {
     pub frame: OutFrame,
     pub cap: Option<CapReserve>,
+    pub fd: Option<OwnedFd>,
 }
 
 impl ControlMsg {
     /// A control/liveness/terminal frame with no cap reservation to release (the common,
     /// non-streamed case).
     pub fn bare(frame: OutFrame) -> Self {
-        ControlMsg { frame, cap: None }
+        ControlMsg {
+            frame,
+            cap: None,
+            fd: None,
+        }
     }
 }
 

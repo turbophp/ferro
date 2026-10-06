@@ -12,6 +12,7 @@ use Ferro\Protocol\Generated\Constants as C;
 use Ferro\Protocol\Header;
 use Ferro\Protocol\Message;
 use Ferro\Protocol\Msgpack\{PurePacker, ExtPacker};
+use Ferro\Protocol\OobRef;
 use Ferro\Protocol\Outcome;
 use Ferro\Protocol\PoolInfo;
 use Ferro\Protocol\SavepointRequest;
@@ -493,6 +494,31 @@ final class VectorConformanceTest extends TestCase
 
         $this->assertSame(bin2hex($payload), bin2hex(Outcome::ok(BackupResponse::encode($resp, $p))->encode($p)),
             'admin_backup_response decode->encode fixpoint');
+    }
+
+    /**
+     * `oob_ref` (M3-D3): an `END | OOB_FD` terminal whose payload is the `OobRef` naming a sealed
+     * memfd — NOT an Outcome (the Outcome is what the memfd holds). PHP must re-encode the "message"
+     * JSON to the Rust bytes and decode them back through the STRICT decoder the session uses. `len`
+     * is past u16, so the field's width is locked.
+     */
+    public function testOobRefVectorByteMatchesBothDirections(): void
+    {
+        $v = self::loadVector('oob_ref.json');
+        $message = is_array($v['message']) ? $v['message'] : [];
+        $payload = substr((string) hex2bin((string) $v['frame_hex']), 16);
+        $p = new PurePacker();
+        $this->assertSame(C::FLAG_END | C::FLAG_OOB_FD, $v['header']['flags'] ?? null,
+            'an OOB terminal is END | OOB_FD');
+
+        $this->assertSame(bin2hex($payload), bin2hex(OobRef::encode($message, $p)),
+            'PHP OobRef encode must byte-match oob_ref');
+        $decoded = OobRef::decode($payload, $p);
+        $this->assertEquals($message, $decoded, 'PHP OobRef decode==value (the vector JSON is key-sorted)');
+        $this->assertGreaterThan(0xFFFF, $decoded['len'], 'the vector locks a len past u16');
+        $this->assertSame(C::OOB_ENCODING_FRAME_PAYLOAD, $decoded['encoding']);
+        $this->assertSame(bin2hex($payload), bin2hex(OobRef::encode($decoded, $p)),
+            'oob_ref decode->encode fixpoint');
     }
 
     /**

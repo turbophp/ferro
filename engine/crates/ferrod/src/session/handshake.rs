@@ -104,21 +104,29 @@ fn shown(value: &str) -> String {
 /// secret). Build it with [`crate::pools::PoolRegistry::pool_info`] — the ONE derivation of this
 /// list, so the names/kinds a session advertises are always the registry's own (M1-S8a Task 12).
 ///
-/// `manifest_loaded` sets `feature_engine::MANIFEST` (M3-D2d).
+/// `manifest_loaded` sets `feature_engine::MANIFEST` (M3-D2d); `memfd_enabled` sets
+/// `feature_engine::MEMFD` (M3-D3).
 pub fn hello_ack_frame(
     request_id: u32,
     epoch: BootEpoch,
     pools: Vec<PoolInfo>,
     manifest_loaded: bool,
+    memfd_enabled: bool,
 ) -> OutFrame {
+    let mut features = 0u32;
+    if manifest_loaded {
+        features |= u32::from(feature_engine::MANIFEST);
+    }
+    // M3-D3: the engine CAN send a sealed memfd (SPEC §5.1). It still sends one only to a client
+    // that advertised `MEMFD_RX`; the bit is informational for the client, which reacts to the
+    // `OOB_FD` flag on a frame rather than to this.
+    if memfd_enabled {
+        features |= u32::from(feature_engine::MEMFD);
+    }
     let ack = HelloAck {
         engine_version: ENGINE_VERSION,
         boot_epoch: epoch.0,
-        features: if manifest_loaded {
-            u32::from(feature_engine::MANIFEST)
-        } else {
-            0
-        },
+        features,
         pools,
         type_registry_hash: TYPE_REGISTRY_HASH.to_string(),
     };

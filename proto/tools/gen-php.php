@@ -50,6 +50,8 @@ foreach ($lock['methods'] as $svc => $kv) {
 $out .= "\n";
 foreach ($lock['outcome'] as $k => $v) { $out .= "    public const OUTCOME_{$k} = {$v};\n"; }
 $out .= "\n";
+foreach ($lock['oob_encoding'] as $k => $v) { $out .= "    public const OOB_ENCODING_{$k} = {$v};\n"; }
+$out .= "\n";
 foreach ($lock['tags'] as $k => $v) { $out .= "    public const TAG_{$k} = {$v};\n"; }
 $out .= "\n";
 foreach ($lock['branches'] as $k => $v) {

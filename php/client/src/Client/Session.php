@@ -17,6 +17,7 @@ use Ferro\Protocol\Outcome;
 use Ferro\Protocol\PoolInfo;
 use Ferro\Protocol\Msgpack\PackerFactory;
 use Ferro\Protocol\Msgpack\PackerInterface;
+use Ferro\Protocol\OobRef;
 use Ferro\Protocol\StreamData;
 use Ferro\Protocol\StreamHead;
 
@@ -112,6 +113,9 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
      */
     private ?string $poisoned = null;
 
+    /** Results received through a sealed memfd ({@see oobPayloadsReceived}, M3-D3). */
+    private int $oobPayloads = 0;
+
     /**
      * Ids whose request frame was written and whose final frame (a terminal, or a PONG) has not yet
      * been read off the wire. Its size is what {@see $maxInFlight} bounds.
@@ -184,8 +188,10 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             manifestHash: $manifestHash,
             pid: getmypid() ?: 0,
             // Informational: this client can multiplex requests over the session (M3-D1). The engine
-            // has always served requests concurrently and does not read this bit.
-            features: C::FEATURE_CLIENT_FIBERS,
+            // has always served requests concurrently and does not read this bit. `MEMFD_RX`
+            // (M3-D3) is NOT informational: it licenses the engine to send a large result as a
+            // sealed memfd, so it is set only when this transport actually reads with `recvmsg`.
+            features: C::FEATURE_CLIENT_FIBERS | ($this->receivesFds() ? C::FEATURE_CLIENT_MEMFD_RX : 0),
         );
         $payload = $hello->encode($this->encodePacker);
         $this->writeFrame(0, C::SERVICE_CORE, C::METHOD_CORE_HELLO, $payload, 0, true);
@@ -707,13 +713,37 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
         return $this->poisoned !== null;
     }
 
-    /** @return array{0:Header,1:string} the decoded header + its exact-length payload. */
+    /** Whether this session's transport can be sent fds, so it advertises `MEMFD_RX` (M3-D3). */
+    private function receivesFds(): bool
+    {
+        return $this->transport instanceof FdReceivingTransportInterface && $this->transport->receivesFds();
+    }
+
+    /**
+     * How many results this session has received through a sealed memfd (M3-D3, SPEC §5.1).
+     * Diagnostic — the two paths are otherwise indistinguishable above this class, which is the
+     * point — so a test or an operator can tell the out-of-band path was actually taken.
+     */
+    public function oobPayloadsReceived(): int
+    {
+        return $this->oobPayloads;
+    }
+
+    /**
+     * @return array{0:Header,1:string} the decoded header + its exact-length payload. An `OOB_FD`
+     *   frame (M3-D3) is returned as the frame it stands for: its payload read from the memfd, and a
+     *   header carrying that payload's length and no `OOB_FD`, so nothing above this method can tell
+     *   the two paths apart.
+     */
     private function readFrame(): array
     {
         try {
             $head = $this->transport->readExact(16);
             $header = Header::decode($head);
             $payload = $header->payloadLen > 0 ? $this->transport->readExact($header->payloadLen) : '';
+            if (($header->flags & C::FLAG_OOB_FD) !== 0) {
+                [$header, $payload] = $this->resolveOob($header, $payload);
+            }
         } catch (CodecException $e) {
             // An undecodable header (bad magic, version, oversized length) leaves the stream at an
             // unknown offset: every later read would be out of step. It is a desync, so the session
@@ -728,6 +758,45 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
             throw $e;
         }
         return [$header, $payload];
+    }
+
+    /**
+     * Turn an `OOB_FD` frame into the frame it stands for (M3-D3, SPEC §5.1): pair it with the
+     * oldest received fd ({@see FdReceivingTransportInterface} for why the pairing is FIFO and never
+     * positional), read the memfd's `len` bytes from offset 0 — one copy; PHP cannot mmap — and
+     * close the fd. Any mismatch (an `OOB_FD` frame on a session that never advertised `MEMFD_RX`,
+     * no fd queued, a malformed {@see OobRef}, a memfd shorter or longer than `len`) means the two ends
+     * disagree about the byte stream: a {@see CodecException}, which poisons the session as a desync.
+     *
+     * @return array{0:Header,1:string}
+     */
+    private function resolveOob(Header $header, string $refPayload): array
+    {
+        if (!$this->receivesFds() || !$this->transport instanceof FdReceivingTransportInterface) {
+            throw new CodecException('an OOB_FD frame arrived on a session that did not advertise MEMFD_RX');
+        }
+        $fd = $this->transport->takeFd();
+        if (!is_resource($fd)) {
+            throw new CodecException('an OOB_FD frame arrived without its fd');
+        }
+        try {
+            $ref = OobRef::decode($refPayload, $this->decodePacker);
+            $len = $ref['len'];
+            $stat = fstat($fd);
+            if ($stat === false || $stat['size'] !== $len) {
+                throw new CodecException('the OOB memfd is not exactly the length its OobRef names');
+            }
+            // From offset 0, explicitly: an SCM_RIGHTS fd shares its file OFFSET with the sender's.
+            $payload = $len === 0 ? '' : stream_get_contents($fd, $len, 0);
+            if (!is_string($payload) || strlen($payload) !== $len) {
+                throw new CodecException('could not read the whole OOB memfd');
+            }
+        } finally {
+            fclose($fd);
+        }
+        $this->oobPayloads++;
+        $flags = $header->flags & ~C::FLAG_OOB_FD;
+        return [new Header($flags, $header->service, $header->method, $header->requestId, $len), $payload];
     }
 
     /** Close the socket on the first transport failure and remember why. Idempotent. */

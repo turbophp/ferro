@@ -963,6 +963,25 @@ fn main() {
             "detail":null, "retry_after_ms":null } }),
     );
 
+    // --- The out-of-band terminal (M3-D3; /proto/PROTOCOL.md §1.1). A buffered EXEC result moved
+    // into a sealed memfd: the frame is the request's ONE terminal (END) with OOB_FD set, and its
+    // payload is the OobRef, not an Outcome — the Outcome is what the memfd holds. `len` is past
+    // u16 so the field's width is locked rather than a fixint every width would pass. ---
+    let oob = OobRef {
+        fd_index: 0,
+        len: 1_048_578,
+        encoding: consts::oob_encoding::FRAME_PAYLOAD,
+    };
+    write_case(
+        "oob_ref",
+        flags::END | flags::OOB_FD,
+        service::SQL,
+        method_sql::EXEC,
+        50,
+        oob.encode(),
+        serde_json::json!({ "fd_index": oob.fd_index, "len": oob.len, "encoding": oob.encoding }),
+    );
+
     // Negative seeds (decoder must reject; also fuzz corpus).
     let mut bad_magic = frame(
         0,

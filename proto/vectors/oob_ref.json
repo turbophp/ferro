@@ -1,0 +1,15 @@
+{
+  "frame_hex": "f7040a000200010032000000080000009300ce0010000200",
+  "header": {
+    "flags": 10,
+    "method": 1,
+    "request_id": 50,
+    "service": 2
+  },
+  "message": {
+    "encoding": 0,
+    "fd_index": 0,
+    "len": 1048578
+  },
+  "name": "oob_ref"
+}

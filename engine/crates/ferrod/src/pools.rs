@@ -1134,6 +1134,7 @@ mod tests {
             crate::epoch::BootEpoch(7),
             registry.pool_info().await,
             false,
+            false,
         );
         let bytes = frame.payload.to_vec();
         let as_text = String::from_utf8_lossy(&bytes).into_owned();

@@ -200,7 +200,7 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 | D2c | `ferro gen`: DTOs, a `Queries` id-constant class, PHPStan stubs | OPEN | |
 | D2d | Engine: load `FERRO_MANIFEST`, advertise `MANIFEST`, refuse a HELLO with a different `manifest_hash`, run EXEC by `query_id` | DONE — SPEC §22.2 (cm) | No `/proto` shape change. The request must AGREE with the manifest's pool and `readonly`, and the session must have sent the matching hash. |
 | D2e | Client: `…ById` methods + the `idempotent` retry licence + a chaos test | DONE — SPEC §22.2 (co) | The only licensed auto-retry (§9.2). Live: a lost declared-idempotent upsert succeeds after exactly two sends, applied once; the undeclared control surfaces Indeterminate after one. The loss is a client link cut, not a daemon kill. Async/stream by id not built. |
-| D3 | memfd large-payload path behind `MEMFD_RX` (§5.1) | OPEN | |
+| D3 | memfd large-payload path behind `MEMFD_RX` (§5.1) | DONE — SPEC §22.2 (cs) | Engine → client, buffered success terminals ≥ `FERRO_MEMFD_THRESHOLD_BYTES` (1 MiB) as a sealed memfd over `SCM_RIGHTS`; fd paired FIFO with its `END \| OOB_FD` frame; PHP reads with `recvmsg` when ext-sockets is loaded. Ceiling unchanged; params not moved; `ETOOMANYREFS` fallback untested. |
 | D4 | COPY API | OPEN | |
 
 ### Phase F — M6: Ferro HTTP (SPEC D16; product-vision §4.2)
