@@ -197,27 +197,45 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 
 ### Phase F — M6: Ferro HTTP (SPEC D16; product-vision §4.2)
 
+The rows follow SPEC §23.15's slice plan (replaced at F0). Pre-F0 rows map as: F1 → F4+F5 (+F5b); F2 →
+F4's fate and §23.14's chaos suite; F3 → F4's streaming; F4 → F6; F5 → F8+F9; F6 → F10.
+
 | # | Item | State | Notes |
-|---|------|-------|-------|
-| F0 | SPEC section for the HTTP engine plus its `/proto` service id, before any code. It must cover the §3 admission test in writing, the fate taxonomy mapping (connect failure / 503+Retry-After → Retryable; dispatched with no response, non-idempotent → Indeterminate; 4xx → NonRetryable), named upstreams with daemon-held credentials, the SSRF rule (no request to an undeclared upstream), and streaming bodies over the credit path | OPEN | The design slice. The adversarial reviewer attacks the fate table and the SSRF rule before anything is built. |
-| F1 | Engine: named upstreams, per-upstream connection pools with TLS (rustls), request/response, timeouts and `CANCEL` | OPEN | |
-| F2 | Fate classification + chaos suite for HTTP (a request dispatched with no response must be Indeterminate; nothing is ever retried by the engine) | OPEN | Charter rule 3 holds for HTTP too. |
-| F3 | Streaming response bodies (SSE/chunked) on the credit path | OPEN | |
-| F4 | Per-upstream circuit breakers and host-level rate limits | OPEN | |
-| F5 | PHP: a Guzzle handler and a PSR-18 client over `ferro/client` | OPEN | Seam: `HandlerStack`. |
-| F6 | Drop-in acceptance: Guzzle's own handler-level suite (or a curated subset) through the Ferro handler, with a stock-curl-handler control (D18) | OPEN | The bar for M6. |
+|------|------|-------|-------|
+| F0 | SPEC §23 (`docs/spec/23-http.md`): the admission test in writing, the fate taxonomy, named upstreams, the SSRF rule, streaming; D19–D21 in §21; service id `HTTP = 6`, codes `0x1007`/`0x1008`/`0x300D`/`0x300E` and feature bit `0x08` allocated in the spec | DONE — SPEC §22.2 (cn) | Adversarially reviewed before adoption (26 findings, all dispositioned). The ten open choices were decided under the owner's full-freedom grant (§23.18). No `/proto` change: the registry entries land at F2. |
+| D1c | Per-request client deadlines + PING liveness (Phase D's row, M3) | prerequisite | **Hard prerequisite of F8** (SPEC §23.11.0 specifies the change). Not an M6 slice. |
+| F1a | Spike `engine/crates/ferro-http-spike` (no library code), the v1 critical path: P1, P14, P15, P19, P7 (h1), P3, P16, P17 | OPEN | A false premise changes §23.7 before F2 starts. |
+| F1b | Spike, off the critical path: P2 with the library-GOAWAY negative control, P5, P7 (h2), P4, P6, P20 | OPEN | Gates F5b, the post-v1 HTTP/2-writes slice and incompatibility entries only. |
+| F2 | `/proto`: `HTTP = 6`, `REQUEST`/`HEAD`/`BODY`, the four codes, `[http.causes]`, the feature bit, golden vectors, both codecs, PROTOCOL.md §1/§5/§12; `ferrod` routes `REQUEST` → `Unsupported` and every other HTTP method → `Unsupported` (tested) | OPEN | The wire is pinned before behaviour. |
+| F3 | `ferro-http` configuration and the request validator (§23.4), with the fuzz target, property gate and refusal corpus | OPEN | No network. |
+| F4 | HTTP/1.1 plaintext engine: DNS, address guard with pinning, pool, write tracker, `ferro_http::fate`, head limits, `HEAD`/`BODY`/`END`, `CANCEL`, deadlines, budgets, the HTTP drain; chaos 1, 2, 4, 5, 6, 11, 12, 14, 15, 16, 17 | OPEN | Charter rules 3 and 4 hold for HTTP. |
+| F5 | TLS: rustls, OS roots, `CA_FILE`, mTLS, resumption; chaos 3 | OPEN | |
+| F5b | `HTTP=auto`: the HTTP/2 sub-pool for declared-idempotent requests; chaos 7 | OPEN | Cuttable without touching anything else. |
+| F6 | Limits: concurrency, queue, breaker (RAII probe), rate limit, Retry-After hold; chaos 9, 10 | OPEN | Every refusal is unsent and Retryable. |
+| F7 | Observability: spans read back from `otelcol`, metrics, slow log, the canary gate | OPEN | The redaction contract, mutation-proven. |
+| F8 | Native PHP API: `upstream()`, Futures, streams, §23.7.3, (cj)'s stream exclusivity lifted for HTTP; chaos 8 | OPEN | **Requires D1c.** |
+| F9 | `ferro/guzzle` (cause mapping, `delay` scheduling, `FerroResponse`, decider), `ferro/psr18` (synchronous), the Laravel `Factory` rebinding with the `Http::fake()` proof | OPEN | Seam: `HandlerStack`. |
+| F10 | Drop-in acceptance: Lane C (Ferro-authored, stock-controlled) and Lane B (`php-http` `HttpClientTest`, two Ferro columns, curl control), contact assertions both ways; incompatibility entries; the demo app's outbound call | OPEN | **The bar for M6** (D18, §23.12). |
+| F11 | Bench on the D17 runner: added latency vs curl keep-alive; handshake and connection counts for N workers × M calls; a recorded §16 HTTP row | OPEN | Admission point A, measured. |
+
+**Post-v1, not in the plan** (SPEC §23.2, §23.18): Lane S and a Symfony `HttpClientInterface`; non-idempotent requests over HTTP/2 (after F1b proves the licence); a SIGHUP reload; a large-request-body path; `h2c` and gRPC; per-pool uid allow-lists.
 
 ### Phase G — M7: Ferro Queue (SPEC D16; product-vision §4.3)
 
+The rows follow SPEC §24.14's slice plan (replaced at G0). Pre-G0 rows map as: G1 → G1+G3; G2 → G2; G3
+(Laravel driver) → G5; G4 (Messenger) → post-v1; G5 (acceptance) → G5 and G6; G6 (MySQL) → G6.
+
 | # | Item | State | Notes |
-|---|------|-------|-------|
-| G0 | SPEC section for the queue engine plus its service id, before any code. It must cover the §3 admission test, the "never owns a durable log" rule, lease/ack/retry/backoff/delayed semantics, transactional enqueue on `tx_id`, and the fate of a lease that dies mid-job | OPEN | The design slice. |
-| G1 | Engine over PG `SKIP LOCKED`: enqueue, reserve with lease, ack, release/retry with backoff, delayed jobs | OPEN | Reuses the pools and pin machinery. |
-| G2 | Transactional enqueue: a job enqueued inside a transaction rides that `tx_id` and commits or rolls back with it | OPEN | The headline. |
-| G3 | Laravel Queue driver (`ferro` connection) | OPEN | |
-| G4 | Symfony Messenger transport | OPEN | |
-| G5 | Drop-in acceptance: Laravel's queue integration tests and the §15 demo's queue paths through Ferro Queue, with a stock `database`-driver control (D18) | OPEN | |
-| G6 | MySQL backend for the queue engine (`SKIP LOCKED` exists from MySQL 8.0 / MariaDB 10.6) | OPEN | Redis Streams stays post-v1 unless a slice proves it cheap. |
+|------|------|-------|-------|
+| G0 | SPEC §24 (`docs/spec/24-queue.md`): the admission test, "never owns a durable log", leases/acks/redelivery/delays, transactional enqueue on `tx_id`, the fate of a lease that dies mid-job; D21 (merged) and D22 in §21; `QUEUE = 7`, `LeaseLost` `0x300F`, `PoolMismatch` `0x3010` and `queue_wait_grace_ms` allocated in the spec | DONE — SPEC §22.2 (cn) | Adversarially reviewed before adoption (21 findings + 4 found on re-verification). The eight open choices were decided under the owner's full-freedom grant (§24.17). No `/proto` change: the registry entries land at G1. |
+| G1 | `/proto` (service, methods, codes, constant; all shapes frozen) + store config, version gate, shape verification; every verb autocommit on PG; the widened fence; the clock and rounding rules | OPEN | Asserts affected ≤ LIMIT under concurrent reservers (the `MATERIALIZED` CTE premise). |
+| G2 | Transactional path: `TxCommand::Queue` + `after_commit`, `PoolMismatch`, in-tx `LeaseLost`, refused tx-scoped `RESERVE` | OPEN | The headline; chaos rows 2 and 7. |
+| G3 | The waker: long-poll, wait bound, unreserve, wake hints, coalesced polls, drain; queue metrics and spans | OPEN | Cost bound (row 11), deliver-xor-unreserve (row 12), idle-polling bench vs stock (admission A); R4 reproduced. |
+| G4 | Native PHP API, `queueWorker()`, the client wait rule (§24.8: D1c deadline or `ioTimeout` clamp), licensed re-sends; dedup table + purge after the dedup spike | OPEN | Chaos rows 1, 3–6, 8, 9, 15. |
+| G5 | Laravel driver: `FerroQueue` (dedicated reserve session), `FerroJob` (`delete`/`release`, the `fail()` override); demo engine column; the three-column upstream run on PG | OPEN | **D18 on PostgreSQL — the bar for M7 starts here**; chaos rows 13, 14, 16. |
+| G6 | MySQL/MariaDB stores and their D18 columns | OPEN | Chaos rows 17, 19; MySQL dedup spike. Redis Streams stays post-v1. |
+
+**Post-v1, not in the plan** (SPEC §24.15, §24.17): **G7**, the Symfony Messenger transport and its parity suite (demoted: v1's drop-in tier is Laravel); **G8**, liveness release (dropped: the one engine write that could enable a second execution; its constraints are kept in §24.8); `at_most_once` (cut); Redis Streams, Kafka, SQS and a SQLite store; the scheduler and `onOneServer`; per-store uid allow-lists.
 
 ### Phase E — M4 + M5 (SPEC §17), then the v1 gate
 
