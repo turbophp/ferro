@@ -37,7 +37,9 @@ nothing in this file overrides any of them.
   - the §16 numbers are measured on GitHub runners;
   - "green" means parity with a stock-driver control.
 - Build order: **M3 → M6 → M7 → M4 → M5 → v1 exit**. **M3 is IN PROGRESS** (Phase D).
-- Not started: M6, M7, M4 (MSSQL, replica routing, `ferro top`) and M5 (streams, packaging).
+- **M6 and M7 are designed, not built:** SPEC §23 (Ferro HTTP) and §24 (Ferro Queue) landed with
+  D19–D22 (§22.2 (cn)); no engine code exists for either, and D22 awaits owner ratification before
+  any Queue code. Not started: M4 (MSSQL, replica routing, `ferro top`) and M5 (streams, packaging).
 
 ## Protocol (one iteration)
 
@@ -191,37 +193,57 @@ What stands between the recorded DBAL numbers and the §14 bar, in measured-impa
 | D1a | Multiplexed session + `Future`/`Ferro\await()` + async `Connection` methods (§10.1) | DONE — SPEC §22.2 (cj) | Fan-out ≈ max(query) under plain FPM (measured live with a sequential control). Limits recorded: in-tx statements settle at once, async does not update `lastInsertId()`, an open stream stays exclusive. |
 | D1b | Fiber suspension: `Ferro\Loop` + the `FIBERS` feature bit | DONE — SPEC §22.2 (ck) | An `await` inside a Loop-run Fiber suspends; measured live on one session and across two. |
 | D1c | Per-request client deadlines + PING-probed liveness (SPEC §23.11.0's prerequisite for HTTP) | DONE — SPEC §22.2 (cp) | Silence is probed with a PING; only an unanswered probe closes the session. `statementTimeout` sends `timeout_ms` (engine-enforced) and arms a client backstop that CANCELs one request. Revolt adapter and the fan-out bench stay open (D1d/D1e). |
+| D1d | Revolt/AMPHP adapter | OPEN | Split out of D1c. Revolt is not installed in the container; fetch it with `--prefer-source` as a dev dependency. Not an HTTP prerequisite. |
+| D1e | §16 fan-out bench on the D17 runner | OPEN | Split out of D1c. Not an HTTP prerequisite. |
 | D2a | `ferro-manifest` + `ferro manifest`/`manifest-hash` + `vendor/bin/ferro-queries` (§11) | DONE — SPEC §22.2 (cl) | Formats fixed, hash pinned, attributes read by PHP's tokenizer. |
 | D2b | `ferro check` + `ferro schema sync`: PREPARE every query against a shadow schema, record param/result types | OPEN | PG, MySQL, SQLite through the backend crates. |
 | D2c | `ferro gen`: DTOs, a `Queries` id-constant class, PHPStan stubs | OPEN | |
 | D2d | Engine: load `FERRO_MANIFEST`, advertise `MANIFEST`, refuse a HELLO with a different `manifest_hash`, run EXEC by `query_id` | DONE — SPEC §22.2 (cm) | No `/proto` shape change. The request must AGREE with the manifest's pool and `readonly`, and the session must have sent the matching hash. |
-| D2e | Client: `…ById` methods + the `idempotent` retry licence + a chaos test (idempotent upsert retried across a `ferrod` kill, applied once) | OPEN | The only licensed auto-retry (§9.2). |
+| D2e | Client: `…ById` methods + the `idempotent` retry licence + a chaos test | DONE — SPEC §22.2 (co) | The only licensed auto-retry (§9.2). Live: a lost declared-idempotent upsert succeeds after exactly two sends, applied once; the undeclared control surfaces Indeterminate after one. The loss is a client link cut, not a daemon kill. Async/stream by id not built. |
 | D3 | memfd large-payload path behind `MEMFD_RX` (§5.1) | OPEN | |
 | D4 | COPY API | OPEN | |
 
 ### Phase F — M6: Ferro HTTP (SPEC D16; product-vision §4.2)
 
+The rows follow SPEC §23.15's slice plan (replaced at F0). Pre-F0 rows map as: F1 → F4+F5 (+F5b); F2 →
+F4's fate and §23.14's chaos suite; F3 → F4's streaming; F4 → F6; F5 → F8+F9; F6 → F10.
+
 | # | Item | State | Notes |
-|---|------|-------|-------|
-| F0 | SPEC section for the HTTP engine plus its `/proto` service id, before any code. It must cover the §3 admission test in writing, the fate taxonomy mapping (connect failure / 503+Retry-After → Retryable; dispatched with no response, non-idempotent → Indeterminate; 4xx → NonRetryable), named upstreams with daemon-held credentials, the SSRF rule (no request to an undeclared upstream), and streaming bodies over the credit path | OPEN | The design slice. The adversarial reviewer attacks the fate table and the SSRF rule before anything is built. |
-| F1 | Engine: named upstreams, per-upstream connection pools with TLS (rustls), request/response, timeouts and `CANCEL` | OPEN | |
-| F2 | Fate classification + chaos suite for HTTP (a request dispatched with no response must be Indeterminate; nothing is ever retried by the engine) | OPEN | Charter rule 3 holds for HTTP too. |
-| F3 | Streaming response bodies (SSE/chunked) on the credit path | OPEN | |
-| F4 | Per-upstream circuit breakers and host-level rate limits | OPEN | |
-| F5 | PHP: a Guzzle handler and a PSR-18 client over `ferro/client` | OPEN | Seam: `HandlerStack`. |
-| F6 | Drop-in acceptance: Guzzle's own handler-level suite (or a curated subset) through the Ferro handler, with a stock-curl-handler control (D18) | OPEN | The bar for M6. |
+|------|------|-------|-------|
+| F0 | SPEC §23 (`docs/spec/23-http.md`): the admission test in writing, the fate taxonomy, named upstreams, the SSRF rule, streaming; D19–D21 in §21; service id `HTTP = 6`, codes `0x1007`/`0x1008`/`0x300D`/`0x300E` and feature bit `0x08` allocated in the spec | DONE — SPEC §22.2 (cn) | Adversarially reviewed before adoption (26 findings, all dispositioned). The ten open choices were decided under the owner's full-freedom grant as applied 2026-10-06 ("Owner directives and grants"; §23.18). `/proto` gains reservation comments only; the keys land at F2. |
+| D1c | Per-request client deadlines + PING-probed liveness (Phase D's row, M3) | prerequisite | **Hard prerequisite of F8** (SPEC §23.11.0 specifies the change). Not an M6 slice; D1d/D1e (Revolt, fan-out bench) are not prerequisites. |
+| F1a | Spike `engine/crates/ferro-http-spike` (no library code), the v1 critical path: P1, P14, P15, P19, P7 (h1), P3, P16, P17 | OPEN | A false premise changes §23.7 before F2 starts. |
+| F1b | Spike, off the critical path: P2 with the library-GOAWAY negative control, P5, P7 (h2), P4, P6, P20 | OPEN | Gates F5b, the post-v1 HTTP/2-writes slice and incompatibility entries only. |
+| F2 | `/proto`: `HTTP = 6`, `REQUEST`/`HEAD`/`BODY`, the four codes, `[http.causes]`, the feature bit, golden vectors, both codecs, PROTOCOL.md §1/§5/§12; `ferrod` routes `REQUEST` → `Unsupported` and every other HTTP method → `Unsupported` (tested) | OPEN | The wire is pinned before behaviour. |
+| F3 | `ferro-http` configuration and the request validator (§23.4), with the fuzz target, property gate and refusal corpus | OPEN | No network. |
+| F4 | HTTP/1.1 plaintext engine: DNS, address guard with pinning, pool, write tracker, `ferro_http::fate`, head limits, `HEAD`/`BODY`/`END`, `CANCEL`, deadlines, budgets, the HTTP drain; chaos 1, 2, 4, 5, 6, 11, 12, 14, 15, 16, 17 | OPEN | Charter rules 3 and 4 hold for HTTP. |
+| F5 | TLS: rustls, OS roots, `CA_FILE`, mTLS, resumption; chaos 3 | OPEN | |
+| F5b | `HTTP=auto`: the HTTP/2 sub-pool for declared-idempotent requests; chaos 7 | OPEN | Cuttable without touching anything else. |
+| F6 | Limits: concurrency, queue, breaker (RAII probe), rate limit, Retry-After hold; chaos 9, 10 | OPEN | Every refusal is unsent and Retryable. |
+| F7 | Observability: spans read back from `otelcol`, metrics, slow log, the canary gate | OPEN | The redaction contract, mutation-proven. |
+| F8 | Native PHP API: `upstream()`, Futures, streams, §23.7.3, (cj)'s stream exclusivity lifted for HTTP; chaos 8 | OPEN | **Requires D1c.** |
+| F9 | `ferro/guzzle` (cause mapping, `delay` scheduling, `FerroResponse`, decider), `ferro/psr18` (synchronous), the Laravel `Factory` rebinding with the `Http::fake()` proof | OPEN | Seam: `HandlerStack`. |
+| F10 | Drop-in acceptance: Lane C (Ferro-authored, stock-controlled) and Lane B (`php-http` `HttpClientTest`, two Ferro columns, curl control), contact assertions both ways; incompatibility entries; the demo app's outbound call | OPEN | **The bar for M6** (D18, §23.12). |
+| F11 | Bench on the D17 runner: added latency vs curl keep-alive; handshake and connection counts for N workers × M calls; a recorded §16 HTTP row | OPEN | Admission point A, measured. |
+
+**Post-v1, not in the plan** (SPEC §23.2, §23.18): Lane S and a Symfony `HttpClientInterface`; non-idempotent requests over HTTP/2 (after F1b proves the licence); a SIGHUP reload; a large-request-body path; `h2c` and gRPC; per-pool uid allow-lists.
 
 ### Phase G — M7: Ferro Queue (SPEC D16; product-vision §4.3)
 
+The rows follow SPEC §24.14's slice plan (replaced at G0). Pre-G0 rows map as: G1 → G1+G3; G2 → G2; G3
+(Laravel driver) → G5; G4 (Messenger) → post-v1; G5 (acceptance) → G5 and G6; G6 (MySQL) → G6.
+
 | # | Item | State | Notes |
-|---|------|-------|-------|
-| G0 | SPEC section for the queue engine plus its service id, before any code. It must cover the §3 admission test, the "never owns a durable log" rule, lease/ack/retry/backoff/delayed semantics, transactional enqueue on `tx_id`, and the fate of a lease that dies mid-job | OPEN | The design slice. |
-| G1 | Engine over PG `SKIP LOCKED`: enqueue, reserve with lease, ack, release/retry with backoff, delayed jobs | OPEN | Reuses the pools and pin machinery. |
-| G2 | Transactional enqueue: a job enqueued inside a transaction rides that `tx_id` and commits or rolls back with it | OPEN | The headline. |
-| G3 | Laravel Queue driver (`ferro` connection) | OPEN | |
-| G4 | Symfony Messenger transport | OPEN | |
-| G5 | Drop-in acceptance: Laravel's queue integration tests and the §15 demo's queue paths through Ferro Queue, with a stock `database`-driver control (D18) | OPEN | |
-| G6 | MySQL backend for the queue engine (`SKIP LOCKED` exists from MySQL 8.0 / MariaDB 10.6) | OPEN | Redis Streams stays post-v1 unless a slice proves it cheap. |
+|------|------|-------|-------|
+| G0 | SPEC §24 (`docs/spec/24-queue.md`): the admission test, "never owns a durable log", leases/acks/redelivery/delays, transactional enqueue on `tx_id`, the fate of a lease that dies mid-job; D21 (merged) and D22 in §21; `QUEUE = 7`, `LeaseLost` `0x300F`, `PoolMismatch` `0x3010` and `queue_wait_grace_ms` allocated in the spec | DONE — SPEC §22.2 (cn) | Adversarially reviewed before adoption (21 findings + 4 found on re-verification). The eight open choices were decided under the owner's full-freedom grant as applied 2026-10-06 (§24.17); **D22 is pending owner ratification**. `/proto` gains reservation comments only; the keys land at G1. |
+| G1 | `/proto` (service, methods, codes, constant; all shapes frozen; PROTOCOL.md §13) + store config, version gate, shape verification; every verb autocommit on PG; the widened fence; the clock and rounding rules | BLOCKED on D22's owner ratification | Asserts affected ≤ LIMIT under concurrent reservers (the `MATERIALIZED` CTE premise). |
+| G2 | Transactional path: `TxCommand::Queue` + `after_commit`, `PoolMismatch`, in-tx `LeaseLost`, refused tx-scoped `RESERVE` | OPEN | The headline; chaos rows 2 and 7. |
+| G3 | The waker: long-poll, wait bound, unreserve, wake hints, coalesced polls, drain; queue metrics and spans | OPEN | Cost bound (row 11), deliver-xor-unreserve (row 12), idle-polling bench vs stock (admission A); R4 reproduced. |
+| G4 | Native PHP API, `queueWorker()`, the client wait rule (§24.8: D1c deadline or `ioTimeout` clamp), licensed re-sends; dedup table + purge after the dedup spike | OPEN | Chaos rows 1, 3–6, 8, 9, 15. |
+| G5 | Laravel driver: `FerroQueue` (dedicated reserve session), `FerroJob` (`delete`/`release`, the `fail()` override); demo engine column; the three-column upstream run on PG | OPEN | **D18 on PostgreSQL — the bar for M7 starts here**; chaos rows 13, 14, 16. |
+| G6 | MySQL/MariaDB stores and their D18 columns | OPEN | Chaos rows 17, 19; MySQL dedup spike. Redis Streams stays post-v1. |
+
+**Post-v1, not in the plan** (SPEC §24.15, §24.17): **G7**, the Symfony Messenger transport and its parity suite (demoted: v1's drop-in tier is Laravel); **G8**, liveness release (dropped: the one engine write that could enable a second execution; its constraints are kept in §24.8); `at_most_once` (cut); Redis Streams, Kafka, SQS and a SQLite store; the scheduler and `onOneServer`; per-store uid allow-lists.
 
 ### Phase E — M4 + M5 (SPEC §17), then the v1 gate
 
@@ -459,6 +481,24 @@ every shipped backend and engine. The §16 targets must be **measured and record
 Deviations are recorded in SPEC §22, never silently absorbed. Work beyond that (product-vision
 §4.4+: Streams as a product, Ferro State, request dispatch) stays post-v1.
 
+## Owner directives and grants
+
+Recorded because SPEC text cites them; each line says who decided what, and over what scope.
+
+- **2026-10-02 — freedom on M2's engineering choices.** The owner resumed the loop hourly to finish
+  M2, granted full freedom on M2's engineering choices, required an adversarial reviewer on every
+  slice before push, and decided D15 personally (iteration log, row "C3-7b-0").
+- **2026-10-06 — v1 redefined and asked for finished.** The owner redefined v1 (SPEC D16–D18,
+  product-vision P13) as the database engine plus Ferro HTTP and Ferro Queue, and asked that it be
+  finished: "Start it, i need this finished and ready for v1"; "Resume the routine and pace it. We
+  need this ready within this week". **The full-freedom grant for engineering choices given during
+  M2 was applied to M3-onward engineering choices** from this date. SPEC §23.18 and §24.17 cite it
+  as "the owner's full-freedom grant as applied 2026-10-06". **Its limit, stated:** a decision that
+  amends binding scope text (SPEC §3, the charter) is not an engineering choice. Such a decision
+  made under the grant is recorded as **pending owner ratification**, and nothing that depends on it
+  is built until the owner ratifies it. D22 is the first such decision (no G-slice code, G1 onward,
+  before it is ratified).
+
 ## Iteration log
 
 Newest first. Every session that does loop work appends a row, even for a "nothing to do" or
@@ -466,6 +506,7 @@ failed iteration — a silent iteration is indistinguishable from a dead loop.
 
 | When (UTC) | Iteration | Item(s) | Outcome | PR | Gates run |
 |------------|-----------|---------|---------|----|-----------|
+| 2026-10-06 | F0 + G0 (owner-resumed) | **SPEC §23 Ferro HTTP and §24 Ferro Queue adopted; D19–D22 recorded** | The two reviewed design drafts (F0 v2, G0 v2; their reviews journalled 26 and 21+4 findings) became normative text in `docs/spec/23-http.md` and `docs/spec/24-queue.md`, with stubs in the spec. The open choices were decided under the owner's grant as applied 2026-10-06 (see "Owner directives and grants"): HTTP/1.1 default, `IDEMPOTENT_METHODS` empty, no reload, no Symfony client, bar = Lane B + Lane C; Queue: stock `jobs` layout, liveness release dropped, Messenger demoted, `at_most_once` cut, PG ≥ 12. **D22 is pending owner ratification** (it amends §3 / charter rule 6), and G1 waits on it. Ids and codes are reserved in `/proto` as comments only. **The adversarial review of the adoption found 14 problems, all fixed before merge**: the false claim that a declared-idempotent request is always `Retryable` (a timeout follows §9.2's read rule), an unrecorded grant used to sign a charter exception, numbers reserved only in prose under a false `ADMIN = 5` precedent, the HTTP drain cap racing `serve`'s hard abort with no drain signal plumbed, D1c's deadline formula undefined for HTTP without `timeout_ms` and for a waiting `RESERVE`, `ferro_errors_total` wrongly called SQL-only, an unstated cost of queue verbs on manifest-only pools, and seven smaller ones. SPEC §22.2 (cn). | — | docs only: `ci/check-incompatibilities-doc.sh`; TOML parse of `/proto` |
 | 2026-10-02 | M2 exit (owner-resumed; hourly) | **The M2 exit record (SPEC §22.3) — and the routine is disabled** | Wrote the exit record after the ORM suite, as the loop's own finish line requires: §17's M2 bullet item by item, §14/§15's acceptance with every RECORDED column, and the bars NOT met said in the first paragraph rather than the last. ORM numbers from the on-demand `orm-suite` workflow on `main` (run 37067176160). **The adversarial audit found 12 problems, all in the RECORD**: the DBAL and Laravel numbers had been measured on older branch heads (every suite was then re-dispatched on `main` and reproduced its numbers exactly); C3-6b's SQLite triage named the wrong test (it is `ConnectionThreadsCountTest`, a driver-name artifact); §22.3 had measured §14 against the withdrawn v0.1 bar without (z); §14 still called ORM-on-PG not config-only; §20.3 said nightly; the family directories were misdescribed; not every column has a control; four open FB items were missing; the demo's "met" needed its amendment stated; and the routine was claimed disabled before it was. All corrected. Then the hourly routine was DISABLED and M3 not started. | #77 | doc-only: `ci/check-incompatibilities-doc.sh`; record audited |
 | 2026-10-02 | C14-orm (owner-resumed; hourly) | **The doctrine/orm functional suite runs — and ORM on PostgreSQL becomes config-only** | Upstream doctrine/orm 3.7.3's whole Functional directory with a stock-PDO control per column, compared as SETS including skips. The feasibility scout measured stock-config PG at 397/1594 (1185 `NoIdentityValue`): `lastInsertId()` now answers INSIDE a transaction with `lastval()` on the pinned connection (hygiene's `DISCARD SEQUENCES` makes it safe; a live test proves a recycled connection never answers the previous tenant's value). Also fixed: `fetchFirstColumn()` truncating at a `false` cell, `F64 → numeric`. Two review rounds + two CI findings: admitting `MYSQL_TYPE_NULL` let MariaDB's bare `?` run and then fail to decode (REVERTED, refusal pinned pre-send), and MySQL 8 derives a parameter's type at prepare (documented). §22.2 (ci). | #76 | Rust live (PG16/MariaDB10.11 local; PG17/MySQL8.4/MariaDB11.8 CI), PHP offline+live, PHPStan L9, incompat gate |
 | 2026-10-02 | C15-demo (owner-resumed; hourly) | **The §15 demo app — and its first run found the database queue dead on every Ferro family** | `testkit/laravel-demo/`: sessions over real `web` requests, password reset, the `database` queue (failed jobs, retry, a batch), cache locks; one test file, columns differ only in the connection entry. `DatabaseQueue` reads `PDO::ATTR_DRIVER_NAME` per pop and the shim refused it (the worker swallowed the throw and exited 0). The review found "only the config diff" FALSE — no service provider — so `FerroServiceProvider` is auto-discovered now, proven through `PackageManifest`. Horizon is Redis-only (§15 amended). §22.2 (ch). | #75 | demo on PG/MariaDB/SQLite local + per-PR CI gate incl. MySQL 8.4 |

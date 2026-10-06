@@ -54,15 +54,17 @@ final class Ferro
         ?TypePolicyOptions $types = null,
         ?ValuePolicy $values = null,
         ?float $statementTimeout = null,
+        ?Manifest $manifest = null,
     ): Connection {
         $requestTimeout = self::requestTimeout($statementTimeout);
-        $factory = static function () use ($socketPath, $connectTimeout, $ioTimeout, $requestTimeout): SessionInterface {
+        $hash = $manifest?->hash();
+        $factory = static function () use ($socketPath, $connectTimeout, $ioTimeout, $requestTimeout, $hash): SessionInterface {
             $session = new Session(Transport::connectUnix($socketPath, $connectTimeout, $ioTimeout));
             $session->setRequestTimeout($requestTimeout);
-            $session->hello();
+            $session->hello($hash);
             return $session;
         };
-        return self::assemble($factory, $pool, $policy, $types, $values, $statementTimeout);
+        return self::assemble($factory, $pool, $policy, $types, $values, $statementTimeout, $manifest);
     }
 
     /**
@@ -81,15 +83,17 @@ final class Ferro
         ?TypePolicyOptions $types = null,
         ?ValuePolicy $values = null,
         ?float $statementTimeout = null,
+        ?Manifest $manifest = null,
     ): Connection {
         $requestTimeout = self::requestTimeout($statementTimeout);
-        $factory = static function () use ($host, $port, $connectTimeout, $ioTimeout, $requestTimeout): SessionInterface {
+        $hash = $manifest?->hash();
+        $factory = static function () use ($host, $port, $connectTimeout, $ioTimeout, $requestTimeout, $hash): SessionInterface {
             $session = new Session(Transport::connectTcp($host, $port, $connectTimeout, $ioTimeout));
             $session->setRequestTimeout($requestTimeout);
-            $session->hello();
+            $session->hello($hash);
             return $session;
         };
-        return self::assemble($factory, $pool, $policy, $types, $values, $statementTimeout);
+        return self::assemble($factory, $pool, $policy, $types, $values, $statementTimeout, $manifest);
     }
 
     /**
@@ -118,6 +122,7 @@ final class Ferro
         ?TypePolicyOptions $types,
         ?ValuePolicy $values,
         ?float $statementTimeout,
+        ?Manifest $manifest,
     ): Connection {
         $policy ??= RetryPolicy::default();
         $session = $factory();
@@ -136,6 +141,7 @@ final class Ferro
             values: $values,
             types: $types,
             statementTimeout: $statementTimeout,
+            manifest: $manifest,
         );
     }
 

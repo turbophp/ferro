@@ -74,3 +74,12 @@ branch = 3
 [codes.Forbidden]
 code = 0x300C
 branch = 3
+
+# RESERVED codes, comments only (no keys, so no generated constant and no registry-hash change).
+# Allocated by SPEC §23/§24; each key lands with its engine's first code slice (F2/G1). Do not reuse.
+#   0x1007  UpstreamUnavailable  Retryable     Ferro HTTP  (SPEC §23, docs/spec/23-http.md)
+#   0x1008  RateLimited          Retryable     Ferro HTTP  (SPEC §23)
+#   0x300D  TlsRefused           NonRetryable  Ferro HTTP  (SPEC §23)
+#   0x300E  ResponseIncomplete   NonRetryable  Ferro HTTP  (SPEC §23)
+#   0x300F  LeaseLost            NonRetryable  Ferro Queue (SPEC §24, docs/spec/24-queue.md)
+#   0x3010  PoolMismatch         NonRetryable  Ferro Queue (SPEC §24)

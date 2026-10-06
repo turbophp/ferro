@@ -204,12 +204,15 @@ final class Session implements MultiplexingSessionInterface, StreamingSessionInt
      * the decoded {@see HelloAck}; on a session-fatal handshake rejection throws
      * {@see HandshakeException}.
      */
-    public function hello(): HelloAck
+    public function hello(?string $manifestHash = null): HelloAck
     {
         $hello = new Hello(
             clientVersion: 1,
             typeRegistryHash: C::TYPE_REGISTRY_HASH,
-            manifestHash: null,
+            // M3-D2e: the manifest this client was built against, or none. The engine refuses the
+            // handshake if it differs from its own, and runs a query by id only on a session that
+            // sent the matching hash.
+            manifestHash: $manifestHash,
             pid: getmypid() ?: 0,
             // Informational: this client can multiplex requests over the session (M3-D1). The engine
             // has always served requests concurrently and does not read this bit.
