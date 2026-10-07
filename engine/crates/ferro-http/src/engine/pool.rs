@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hyper::client::conn::http1;
+use rustls::AlertDescription;
 use tokio::task::JoinHandle;
 
 use super::body::OneChunk;
@@ -38,8 +39,11 @@ use super::track::TrackState;
 pub struct HttpConn {
     pub sender: http1::SendRequest<OneChunk>,
     /// `hyper`'s connection task. It writes independently of the response future (§23.7.1), so
-    /// `sent` is final only once it has been aborted and awaited.
-    pub task: JoinHandle<()>,
+    /// `sent` is final only once it has been aborted and awaited. Its output is the TLS
+    /// client-certificate refusal its connection died of, if any (M6-F5c review F4: when the task
+    /// reads the alert before the request is queued, `hyper` hands the request back with an error
+    /// that carries no I/O source, so the task is the only place the alert can still be read).
+    pub task: JoinHandle<Option<AlertDescription>>,
     pub track: Arc<TrackState>,
     /// The checked address this connection is pinned to for life (§23.8.5).
     pub peer: SocketAddr,
@@ -54,9 +58,15 @@ pub struct HttpConn {
 impl HttpConn {
     /// Abort `hyper`'s connection task and wait until it is gone, so the I/O is dropped and no
     /// later byte can follow. Only after this is the tracker's `sent` final (§23.7.1).
-    pub async fn discard(mut self) {
+    pub async fn discard(self) {
+        let _ = self.discard_reporting().await;
+    }
+
+    /// [`discard`](Self::discard), returning the client-certificate refusal the connection task
+    /// died of, if it had already died of one (a task still running is aborted: `None`).
+    pub async fn discard_reporting(mut self) -> Option<AlertDescription> {
         self.task.abort();
-        let _ = (&mut self.task).await;
+        (&mut self.task).await.ok().flatten()
     }
 }
 
@@ -208,6 +218,7 @@ mod tests {
             .unwrap();
         let task = tokio::spawn(async move {
             let _ = c.await;
+            None
         });
         let now = Instant::now();
         let conn = HttpConn {

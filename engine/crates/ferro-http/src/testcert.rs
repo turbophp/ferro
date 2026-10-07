@@ -169,6 +169,10 @@ pub struct Spec {
     pub usage: Usage,
     pub not_before: SystemTime,
     pub not_after: SystemTime,
+    /// An X.509 **v1** certificate: no version field and no extensions (`openssl x509 -req`'s
+    /// default shape for a self-signed root). `webpki` refuses v1 as an end-entity certificate;
+    /// servers that accept it as a chain or root certificate exist (M6-F5c review F2).
+    pub v1: bool,
 }
 
 impl Spec {
@@ -182,6 +186,7 @@ impl Spec {
             usage,
             not_before: now - Duration::from_secs(86_400),
             not_after: now + Duration::from_secs(365 * 86_400),
+            v1: false,
         }
     }
 
@@ -192,6 +197,12 @@ impl Spec {
 
     pub fn ip(mut self, ip: IpAddr) -> Spec {
         self.ips.push(ip);
+        self
+    }
+
+    /// An X.509 v1 certificate (see [`Spec::v1`]'s field).
+    pub fn v1(mut self) -> Spec {
+        self.v1 = true;
         self
     }
 
@@ -259,16 +270,30 @@ fn issue(spec: &Spec, issuer: Option<&Issued>) -> Issued {
         }
         exts.push(extension(OID_SAN, false, seq(&names)));
     }
-    let tbs = seq(&[
-        tlv(0xA0, &uint(2)),
-        uint(SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1000),
-        sig_alg.clone(),
-        issuer_name,
-        seq(&[time(spec.not_before), time(spec.not_after)]),
-        subject.clone(),
-        spki,
-        tlv(0xA3, &seq(&exts)),
-    ]);
+    let serial = uint(SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1000);
+    let validity = seq(&[time(spec.not_before), time(spec.not_after)]);
+    let tbs = if spec.v1 {
+        // v1: the version field is absent (DEFAULT v1) and v1 has no extensions.
+        seq(&[
+            serial,
+            sig_alg.clone(),
+            issuer_name,
+            validity,
+            subject.clone(),
+            spki,
+        ])
+    } else {
+        seq(&[
+            tlv(0xA0, &uint(2)),
+            serial,
+            sig_alg.clone(),
+            issuer_name,
+            validity,
+            subject.clone(),
+            spki,
+            tlv(0xA3, &seq(&exts)),
+        ])
+    };
     let signer = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &signer_pkcs8, &rng)
         .expect("load the issuer key");
     let sig = signer.sign(&rng, &tbs).expect("sign the certificate");
@@ -283,6 +308,11 @@ fn issue(spec: &Spec, issuer: Option<&Issued>) -> Issued {
 /// A self-signed CA.
 pub fn ca(cn: &str) -> Issued {
     issue(&Spec::new(cn, Usage::Ca), None)
+}
+
+/// A self-signed X.509 **v1** root (no extensions), as `openssl x509 -req -signkey` makes one.
+pub fn ca_v1(cn: &str) -> Issued {
+    issue(&Spec::new(cn, Usage::Ca).v1(), None)
 }
 
 impl Issued {
