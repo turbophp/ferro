@@ -546,7 +546,7 @@ impl HttpEngine {
         // F6 review rounds): a post-send `timeout` counts only when it came at least
         // `BREAKER_TIMEOUT_MS` after the SEND, measured from this instant, set at dispatch — so
         // neither the engine's own waits before it nor a caller's shorter deadline can count.
-        let sent_at: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None);
+        let sent_at: OnceLock<Instant> = OnceLock::new();
         let bounds = Bounds {
             deadline: tokio::time::Instant::from_std(started)
                 + ms(req
@@ -618,7 +618,7 @@ impl HttpEngine {
         };
         // Every terminal from here on settles the ticket with what it means to the breaker.
         let fin = |s: Situation| {
-            ticket.record_failure(&s, sent_at.get().map(|t| t.elapsed()));
+            ticket.record_failure(&s, sent_at.get().map(Instant::elapsed));
             classify(s, idem)
         };
         if let Some(hold) = &lim.hold
@@ -802,7 +802,7 @@ impl HttpEngine {
             return fin(Situation::BeforeDispatch(event));
         }
         let dispatched = Instant::now();
-        sent_at.set(Some(dispatched));
+        let _ = sent_at.set(dispatched);
         let queue_us = micros(dispatched.saturating_duration_since(admitted))
             .saturating_sub(connect_us + tls_us);
         conn.track.arm();

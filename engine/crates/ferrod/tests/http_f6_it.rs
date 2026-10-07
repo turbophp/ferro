@@ -143,7 +143,7 @@ enum Act {
     Close,
     /// Never answer; hold the connection until the engine closes it.
     Hold,
-    /// Answer `OK` after a delay (review).
+    /// Answer `OK` after a delay (ms).
     Delay(u64),
 }
 
@@ -633,8 +633,9 @@ async fn a_counted_probe_failure_opens_the_breaker_again() {
 }
 
 /// `BREAKER_COUNTS`: the default `connect` counts neither a timeout nor a 5xx; `connect+timeout`
-/// counts the "sent, no head" `timeout` — but ONLY when the deadline was the upstream's own
-/// `TIMEOUT_MS`, never one the caller shortened (review R2); `connect+timeout+5xx` also counts a
+/// counts the "sent, no head" `timeout` — but ONLY when it came at least `BREAKER_TIMEOUT_MS`
+/// after the SEND, so a caller deadline that ends sooner is not evidence (reviews R2, round 2);
+/// `connect+timeout+5xx` also counts a
 /// completed 502/503/504, which is still delivered to the client as the `Ok` exchange it is
 /// (§23.7.4). A success resets the consecutive count.
 #[tokio::test]
@@ -661,8 +662,11 @@ async fn breaker_counts_selects_what_opens_the_breaker() {
                 ("timed", "BREAKER_FAILURES", "2"),
                 ("timed", "BREAKER_COUNTS", "connect+timeout"),
                 ("timed", "TIMEOUT_MS", "150"),
+                // Measured from the send: the window must fit inside what is left of the 150 ms.
+                ("timed", "BREAKER_TIMEOUT_MS", "100"),
                 ("shortened", "BREAKER_FAILURES", "2"),
                 ("shortened", "BREAKER_COUNTS", "connect+timeout"),
+                ("shortened", "BREAKER_TIMEOUT_MS", "300"),
             ],
         ),
         conn,
@@ -676,8 +680,8 @@ async fn breaker_counts_selects_what_opens_the_breaker() {
     assert_unavailable(&r, http_cause::BREAKER_OPEN);
     assert_eq!(received(&fivexx), 5);
 
-    // The upstream's own TIMEOUT_MS bounds `plaint`/`timed` (no request field); `shortened`'s
-    // requests carry their own 150 ms.
+    // The upstream's own TIMEOUT_MS (150 ms) bounds `plaint`/`timed`, past `timed`'s 100 ms window
+    // after the send; `shortened`'s requests carry their own 150 ms, short of its 300 ms window.
     let engine_bound = |u: &str| HttpRequest {
         timeout_ms: None,
         ..post(u, b"t")
@@ -1637,12 +1641,17 @@ async fn under_partition_uid_the_connection_caps_are_per_partition() {
     assert_eq!(d.engine.idle_connections_for("p", 1002), 1);
 }
 
-// ================================ REVIEW F6b probes ================================
+// =================================================================================================
+// Review round 2: the post-send window, the idle-path recheck, the detached hand-off
+// =================================================================================================
 
-/// N1: engine-side waits (here the rate limit) consume the engine's TIMEOUT_MS before send, so a
-/// healthy upstream (600 ms TTFB << 1500 ms TIMEOUT_MS) gets counted `timeout`s and the breaker opens.
+/// **Review round 2, N1 (the reviewer's repro, inverted): the engine's own waits are not evidence.**
+/// A healthy upstream answers in 600 ms; `TIMEOUT_MS` is 1.5 s and the rate limit (1/s, burst 1)
+/// makes B and C wait for their tokens, so they are SENT with little of their deadline left and
+/// time out. Measured from the send, neither waited `BREAKER_TIMEOUT_MS` (default: `TIMEOUT_MS`), so
+/// neither counts: the breaker stays closed and a well-behaved caller is served.
 #[tokio::test]
-async fn review_n1_engine_waits_make_a_healthy_upstream_count_timeouts() {
+async fn engine_waits_before_the_send_do_not_count_as_timeouts() {
     let (up, _g) = scripted(vec![Act::Delay(600); 8]).await;
     let d = daemon_on(
         upstreams(
@@ -1660,28 +1669,107 @@ async fn review_n1_engine_waits_make_a_healthy_upstream_count_timeouts() {
     );
     let mut a = start(&d, &idempotent_get("r")).await;
     let mut b = start(&d, &idempotent_get("r")).await;
-    tokio::time::sleep(Duration::from_millis(700)).await;
     let mut c = start(&d, &idempotent_get("r")).await;
-    let ra = collect(&mut a, 1).await;
-    eprintln!("A: {:?}", ra.head.as_ref().map(|h| h.status));
-    let rb = collect(&mut b, 1).await;
-    eprintln!("B: {:?}", rb.error());
-    let rc = collect(&mut c, 1).await;
-    eprintln!("C: {:?}", rc.error());
-    eprintln!("breaker: {:?}", d.engine.breaker_state("r"));
-    let r = one(&d, &idempotent_get("r")).await;
-    eprintln!("D (well-behaved): {:?}", r.error());
+    assert_eq!(status(&collect(&mut a, 1).await), 200);
+    for (name, r) in [
+        ("b", collect(&mut b, 1).await),
+        ("c", collect(&mut c, 1).await),
+    ] {
+        // Each either completed or timed out after being sent late; neither is evidence.
+        if r.head.is_none() {
+            let ep = r.error();
+            assert!(
+                ep.detail.as_deref() == Some(http_cause::TIMEOUT)
+                    || ep.detail.as_deref() == Some(http_cause::RATE_LIMITED),
+                "{name}: {ep:?}"
+            );
+        }
+    }
+    assert_eq!(d.engine.breaker_state("r"), Some(BreakerState::Closed));
+    // A well-behaved caller, once the bucket has refilled, is served.
+    let mut served = false;
+    for _ in 0..30 {
+        let r = one(&d, &idempotent_get("r")).await;
+        if r.head.is_some() {
+            assert_eq!(status(&r), 200);
+            served = true;
+            break;
+        }
+        assert_eq!(r.error().detail.as_deref(), Some(http_cause::TIMEOUT));
+    }
+    assert!(served);
+    assert_eq!(d.engine.breaker_state("r"), Some(BreakerState::Closed));
+}
+
+/// **Review round 2, decision 1: a real hang counts, measured from the send, even after the engine
+/// queued the request.** `BREAKER_TIMEOUT_MS` 500 under a 3 s `TIMEOUT_MS`: the second request
+/// waits ~1 s for its rate token, is sent into a hanging upstream, and times out ~2 s after the send
+/// — past the window, so it counts and the breaker opens. On a second upstream a caller deadline of
+/// 300 ms ends sooner than the 500 ms window after the send: it does not count.
+#[tokio::test]
+async fn a_hang_past_the_breaker_window_after_the_send_counts_even_after_queueing() {
+    let (hung, _g) = scripted(vec![Act::Answer(OK), Act::Hold]).await;
+    let (short, _g2) = scripted(vec![Act::Hold]).await;
+    let d = daemon_on(
+        upstreams(
+            &[("h", hung.addr), ("s", short.addr)],
+            &[
+                ("h", "BREAKER_FAILURES", "1"),
+                ("h", "BREAKER_COUNTS", "connect+timeout"),
+                ("h", "TIMEOUT_MS", "3000"),
+                ("h", "BREAKER_TIMEOUT_MS", "500"),
+                ("h", "RATE_PER_SEC", "1"),
+                ("h", "RATE_BURST", "1"),
+                ("h", "RATE_MAX_WAIT_MS", "5000"),
+                ("s", "BREAKER_FAILURES", "1"),
+                ("s", "BREAKER_COUNTS", "connect+timeout"),
+                ("s", "BREAKER_TIMEOUT_MS", "500"),
+            ],
+        ),
+        ScriptConnect::new(TCP),
+    );
+    // A caller deadline shorter than the window after the send: not evidence.
+    let r = one(
+        &d,
+        &HttpRequest {
+            timeout_ms: Some(300),
+            ..idempotent_get("s")
+        },
+    )
+    .await;
+    r.assert_error(
+        errc::QUERY_TIMEOUT,
+        branch::NON_RETRYABLE,
+        http_cause::TIMEOUT,
+    );
+    assert_eq!(d.engine.breaker_state("s"), Some(BreakerState::Closed));
+    // `h`: the first request takes the token; the second waits ~1 s for the next, then hangs.
+    assert_eq!(status(&one(&d, &idempotent_get("h")).await), 200);
+    let sent = Instant::now();
+    let r = one(&d, &idempotent_get("h")).await;
+    r.assert_error(
+        errc::QUERY_TIMEOUT,
+        branch::NON_RETRYABLE,
+        http_cause::TIMEOUT,
+    );
+    assert!(
+        sent.elapsed() >= Duration::from_millis(2_900),
+        "{:?}",
+        sent.elapsed()
+    );
     assert_eq!(
-        d.engine.breaker_state("r"),
+        d.engine.breaker_state("h"),
         Some(BreakerState::Open),
-        "healthy upstream opened"
+        "a hang of ~2 s after the send counts against a 500 ms window"
     );
 }
 
-/// N2: a request waiting for a dial slot (MAX_DIALS held by a hanging dial) is handed an IDLE
-/// connection after the breaker OPENED, and is sent.
+/// **Review round 2, N2 (the reviewer's repro, inverted): the breaker is asked again before ANY
+/// send.** W waits for a dial slot (held by a hanging dial) while H's counted timeout opens the
+/// breaker; X's connection is then returned and handed to W — which is refused `breaker_open`,
+/// unsent, instead of being sent into the hang. The connection goes back to the pool.
 #[tokio::test]
-async fn review_n2_a_waiter_is_sent_on_an_idle_connection_while_open() {
+async fn a_waiter_handed_an_idle_connection_while_open_is_not_sent() {
     let (up, gate) = scripted(vec![Act::Hold, Act::Gated, Act::Answer(OK)]).await;
     let conn = ScriptConnect::new(TCP);
     let d = daemon_on(
@@ -1691,51 +1779,65 @@ async fn review_n2_a_waiter_is_sent_on_an_idle_connection_while_open() {
                 ("w", "BREAKER_FAILURES", "1"),
                 ("w", "BREAKER_OPEN_MS", "60000"),
                 ("w", "BREAKER_COUNTS", "connect+timeout"),
-                ("w", "TIMEOUT_MS", "1000"),
+                ("w", "TIMEOUT_MS", "5000"),
+                ("w", "BREAKER_TIMEOUT_MS", "500"),
                 ("w", "MAX_DIALS", "1"),
+                ("w", "CONNECT_TIMEOUT_MS", "2000"),
                 ("w", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "60000"),
             ],
         ),
         Arc::clone(&conn),
     );
-    let mut h = start(&d, &post("w", b"h")).await;
+    // H's own 1 s deadline is past the 500 ms window after its send: its timeout counts.
+    let mut h = start(
+        &d,
+        &HttpRequest {
+            timeout_ms: Some(1_000),
+            ..post("w", b"h")
+        },
+    )
+    .await;
     wait_for("h at upstream", || received(&up) == 1).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
     let mut x = start(&d, &post("w", b"x")).await;
     wait_for("x at upstream", || received(&up) == 2).await;
     conn.set(HANG);
-    let mut dd = start(&d, &idempotent_get("w")).await;
+    // DD leaves at its own deadline; its detached dial keeps the one dial slot for 2 s.
+    let mut dd = start(
+        &d,
+        &HttpRequest {
+            timeout_ms: Some(300),
+            ..idempotent_get("w")
+        },
+    )
+    .await;
     wait_for("hanging dial", || d.engine.dials_in_progress("w") == 1).await;
     let mut w = start(&d, &post("w", b"w")).await;
-    let rh = collect(&mut h, 1).await;
-    eprintln!("H: {:?}", rh.error());
+    collect(&mut h, 1).await.assert_error(
+        errc::WRITE_UNCONFIRMED,
+        branch::INDETERMINATE,
+        http_cause::TIMEOUT,
+    );
     assert_eq!(d.engine.breaker_state("w"), Some(BreakerState::Open));
     gate.add_permits(1);
-    let rx = collect(&mut x, 1).await;
-    eprintln!("X: {:?}", rx.head.as_ref().map(|h| h.status));
+    assert_eq!(status(&collect(&mut x, 1).await), 200);
     let rw = collect(&mut w, 1).await;
-    eprintln!(
-        "W: head={:?} err={:?}",
-        rw.head.as_ref().map(|h| h.status),
-        rw.head.is_none().then(|| rw.error())
-    );
-    eprintln!(
-        "received={} breaker={:?}",
-        received(&up),
-        d.engine.breaker_state("w")
-    );
-    let _ = collect(&mut dd, 1).await;
+    assert_unavailable(&rw, http_cause::BREAKER_OPEN);
     assert_eq!(
         received(&up),
-        3,
-        "DEFECT N2: W was SENT while the breaker was open"
+        2,
+        "W was not sent while the breaker was open"
     );
-    let _ = rx;
+    wait_for("x's connection back in the pool", || {
+        d.engine.idle_connections("w") == 1
+    })
+    .await;
+    let _ = collect(&mut dd, 1).await;
 }
 
-/// Partition preserved across a detached dial's hand-off.
+/// **Review round 2 (the reviewer's test, killing M3): a detached dial's connection is pooled in
+/// its OWN partition** under `PARTITION=uid`, never the unpartitioned pool or another uid's.
 #[tokio::test]
-async fn review_detached_dial_is_pooled_in_its_own_partition() {
+async fn a_detached_dial_is_pooled_in_its_own_partition() {
     let (up, _g) = scripted(vec![]).await;
     let conn = ScriptConnect::new(DELAY_TCP);
     conn.delay(100);
@@ -1769,9 +1871,13 @@ async fn review_detached_dial_is_pooled_in_its_own_partition() {
     );
 }
 
-/// Starvation by abandoned dials is bounded by CONNECT_TIMEOUT_MS (the stated cost).
+/// **The stated cost is bounded (the reviewer's measurement): abandoned dials hold a `MAX_DIALS`
+/// slot for at most `CONNECT_TIMEOUT_MS`.** Three callers abandon their waits at 50 ms; only one
+/// detached dial holds the one slot; a good caller is served once it ends. The upper bound is
+/// generous (the bound is 600 ms; the assertion allows 4 s) so a slow runner cannot flip it — a
+/// slot that were never released would fail it by never serving at all.
 #[tokio::test]
-async fn review_abandoned_dials_starve_for_at_most_connect_timeout() {
+async fn abandoned_dials_starve_for_at_most_connect_timeout() {
     let (up, _g) = scripted(vec![]).await;
     let conn = ScriptConnect::new(HANG);
     let d = daemon_on(
@@ -1799,20 +1905,13 @@ async fn review_abandoned_dials_starve_for_at_most_connect_timeout() {
     }
     assert_eq!(conn.attempts(), 1, "only one detached dial holds the slot");
     conn.set(TCP);
-    let t1 = Instant::now();
     let r = one(&d, &idempotent_get("s")).await;
     assert_eq!(status(&r), 200);
-    let waited = t1.elapsed();
-    eprintln!(
-        "t1-t0={:?} waited={:?} total since first={:?}",
-        t1 - t0,
-        waited,
-        t0.elapsed()
-    );
     assert!(
-        t0.elapsed() < Duration::from_millis(600 + 400),
-        "{:?}",
+        t0.elapsed() >= Duration::from_millis(600),
+        "served only once the detached dial ended: {:?}",
         t0.elapsed()
     );
+    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
     assert_eq!(conn.attempts(), 2);
 }
