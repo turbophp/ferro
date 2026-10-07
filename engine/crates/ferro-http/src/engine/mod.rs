@@ -600,7 +600,10 @@ impl HttpEngine {
                 );
             }
             Err(BreakerRefusal::ProbeBusy) => {
-                return classify(Situation::BeforeDispatch(BeforeDispatch::BreakerProbeBusy), idem);
+                return classify(
+                    Situation::BeforeDispatch(BeforeDispatch::BreakerProbeBusy),
+                    idem,
+                );
             }
         };
         // Every terminal from here on settles the ticket with what it means to the breaker.
@@ -611,9 +614,9 @@ impl HttpEngine {
         if let Some(hold) = &lim.hold
             && let Err(retry_after_ms) = hold.admit(tokio::time::Instant::now())
         {
-            return fin(Situation::BeforeDispatch(
-                BeforeDispatch::RetryAfterHold { retry_after_ms },
-            ));
+            return fin(Situation::BeforeDispatch(BeforeDispatch::RetryAfterHold {
+                retry_after_ms,
+            }));
         }
         // (c) The rate limit: a token now, or within min(RATE_MAX_WAIT_MS, the time left).
         if let Some(rate) = &lim.rate {
@@ -790,19 +793,13 @@ impl HttpEngine {
                 let track = conn.track.clone();
                 conn.discard().await;
                 return fin(match (track.sent(), stopped, drained) {
-                        (false, true, true) => {
-                            Situation::DispatchedNotSent(DispatchedNotSent::Drain)
-                        }
-                        (false, true, false) => {
-                            Situation::DispatchedNotSent(DispatchedNotSent::Cancel)
-                        }
-                        (false, false, _) => {
-                            Situation::DispatchedNotSent(DispatchedNotSent::Deadline)
-                        }
-                        (true, true, true) => Situation::SentNoHead(SentNoHead::Drain),
-                        (true, true, false) => Situation::SentNoHead(SentNoHead::Cancel),
-                        (true, false, _) => Situation::SentNoHead(SentNoHead::Timeout),
-                    });
+                    (false, true, true) => Situation::DispatchedNotSent(DispatchedNotSent::Drain),
+                    (false, true, false) => Situation::DispatchedNotSent(DispatchedNotSent::Cancel),
+                    (false, false, _) => Situation::DispatchedNotSent(DispatchedNotSent::Deadline),
+                    (true, true, true) => Situation::SentNoHead(SentNoHead::Drain),
+                    (true, true, false) => Situation::SentNoHead(SentNoHead::Cancel),
+                    (true, false, _) => Situation::SentNoHead(SentNoHead::Timeout),
+                });
             }
         };
         let ttfb_us = micros(dispatched.elapsed());
@@ -821,10 +818,10 @@ impl HttpEngine {
             let track = conn.track.clone();
             conn.discard().await;
             return fin(if track.sent() {
-                    Situation::SentNoHead(SentNoHead::MalformedHead)
-                } else {
-                    Situation::DispatchedNotSent(DispatchedNotSent::UnsentClosed)
-                });
+                Situation::SentNoHead(SentNoHead::MalformedHead)
+            } else {
+                Situation::DispatchedNotSent(DispatchedNotSent::UnsentClosed)
+            });
         }
         let (parts, mut body) = resp.into_parts();
         if parts.status == http::StatusCode::SWITCHING_PROTOCOLS {

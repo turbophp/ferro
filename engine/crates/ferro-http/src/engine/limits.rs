@@ -557,7 +557,10 @@ impl Limits {
                         name.to_string(),
                         Arc::new(UpstreamLimits {
                             breaker: Breaker::new(&up.breaker),
-                            hold: up.retry_after.honor.then(|| Hold::new(up.retry_after.max_ms)),
+                            hold: up
+                                .retry_after
+                                .honor
+                                .then(|| Hold::new(up.retry_after.max_ms)),
                             rate: up.rate.as_ref().map(|r| RateBucket::new(r, now)),
                             gate: RequestGate::new(up.limits.max_requests, up.limits.max_queued),
                         }),
@@ -631,7 +634,11 @@ mod tests {
         drop(b.admit(t0).unwrap());
         assert_eq!(b.state(t0), BreakerState::Closed);
         b.admit(t0).unwrap().record_at(BreakerOutcome::Counted, t0);
-        assert_eq!(b.state(t0), BreakerState::Open, "the drop did not reset the count");
+        assert_eq!(
+            b.state(t0),
+            BreakerState::Open,
+            "the drop did not reset the count"
+        );
     }
 
     /// Half-open admits exactly one probe; the probe's outcome decides; a dropped probe (no
@@ -729,7 +736,11 @@ mod tests {
         ];
         for c in [Connect, ConnectTimeout, ConnectTimeout5xx] {
             for s in &counted {
-                assert_eq!(failure_outcome(s, c), BreakerOutcome::Counted, "{s:?} {c:?}");
+                assert_eq!(
+                    failure_outcome(s, c),
+                    BreakerOutcome::Counted,
+                    "{s:?} {c:?}"
+                );
             }
             for s in &never {
                 assert_eq!(failure_outcome(s, c), BreakerOutcome::Other, "{s:?} {c:?}");
@@ -786,7 +797,10 @@ mod tests {
         let ra = |s: &'static str| std::iter::once(s.as_bytes());
         assert_eq!(h.observe(429, ra("5"), t0), Some(Duration::from_secs(5)));
         assert_eq!(h.admit(t0 + ms(1_000)), Err(4_000));
-        assert_eq!(h.observe(503, ra("1"), t0 + ms(1_000)), Some(Duration::from_secs(1)));
+        assert_eq!(
+            h.observe(503, ra("1"), t0 + ms(1_000)),
+            Some(Duration::from_secs(1))
+        );
         assert_eq!(h.admit(t0 + ms(2_500)), Err(2_500), "not shortened");
         assert_eq!(h.observe(200, ra("100"), t0), None);
         assert_eq!(h.admit(t0 + ms(5_000)), Ok(()));
@@ -908,7 +922,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            g.acquire(far, BeforeDispatch::QueueTimeout).await.unwrap_err(),
+            g.acquire(far, BeforeDispatch::QueueTimeout)
+                .await
+                .unwrap_err(),
             BeforeDispatch::QueueFull
         );
         drop(p);
@@ -932,7 +948,9 @@ mod tests {
         let far = Instant::now() + Duration::from_secs(60);
         let _p = g.acquire(far, BeforeDispatch::QueueTimeout).await.unwrap();
         assert_eq!(
-            g.acquire(far, BeforeDispatch::QueueTimeout).await.unwrap_err(),
+            g.acquire(far, BeforeDispatch::QueueTimeout)
+                .await
+                .unwrap_err(),
             BeforeDispatch::QueueFull
         );
     }

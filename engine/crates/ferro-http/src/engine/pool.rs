@@ -469,7 +469,11 @@ mod tests {
             panic!("dial")
         };
         let s3 = d3.connected();
-        assert_eq!(pools.connection_count(&key), 2, "a connected dial keeps its slot");
+        assert_eq!(
+            pools.connection_count(&key),
+            2,
+            "a connected dial keeps its slot"
+        );
         let waiter = pools.take(&key, policy(true), caps);
         tokio::pin!(waiter);
         assert!(pending(&mut waiter).await);
