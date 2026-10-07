@@ -475,14 +475,16 @@ async fn a_counted_probe_failure_opens_the_breaker_again() {
         Arc::clone(&conn),
     );
     half_open(&d, &conn, "b", REFUSE).await;
+    let probe_sent = Instant::now();
     let r = one(&d, &post("b", b"probe")).await;
     assert_unavailable(&r, http_cause::CONNECT_REFUSED);
     assert_eq!(d.engine.breaker_state("b"), Some(BreakerState::Open));
     let attempts = conn.attempts();
-    let before = Instant::now();
     let r = one(&d, &post("b", b"x")).await;
-    let left = assert_unavailable(&r, http_cause::BREAKER_OPEN).unwrap();
-    assert!(u128::from(left) <= 3_000, "{left}");
+    let left = u128::from(assert_unavailable(&r, http_cause::BREAKER_OPEN).unwrap());
+    // Opened again, for the full BREAKER_OPEN_MS, at some instant after `probe_sent`.
+    assert!(left <= 3_000, "{left}");
+    assert!(left + probe_sent.elapsed().as_millis() >= 3_000, "{left}");
     assert_eq!(conn.attempts(), attempts, "no dial while open");
     assert_eq!(received(&up), 0);
 }
