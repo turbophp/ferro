@@ -4,7 +4,9 @@
     "type": "library",
     "license": "Apache-2.0",
     "repositories": [
-        { "type": "path", "url": "../client" }
+        { "type": "path", "url": "../client" },
+        { "type": "path", "url": "../psr18" },
+        { "type": "path", "url": "../guzzle" }
     ],
     "require": {
         "php": ">=8.2",
@@ -12,8 +14,15 @@
         "ferro/client": "@dev"
     },
     "require-dev": {
+        "ferro/guzzle": "@dev",
+        "ferro/psr18": "@dev",
+        "illuminate/http": "^11.0",
         "phpstan/phpstan": "^2.0",
         "phpunit/phpunit": "^11.0"
+    },
+    "suggest": {
+        "ferro/guzzle": "Routes the Http facade through Ferro HTTP when an http.ferro block is configured (SPEC §23.11.6)",
+        "illuminate/http": "The Http client factory Ferro HTTP rebinds"
     },
     "autoload": { "psr-4": { "Ferro\\Laravel\\": "src/" } },
     "autoload-dev": {
