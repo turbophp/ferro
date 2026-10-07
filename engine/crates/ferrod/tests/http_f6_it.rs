@@ -23,7 +23,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ferro_http::engine::limits::BreakerState;
@@ -47,14 +47,20 @@ const TCP: usize = 0;
 const REFUSE: usize = 1;
 const HANG: usize = 2;
 const STALL: usize = 3;
+const GATE: usize = 4;
+const DELAY_TCP: usize = 5;
+const DELAY_REFUSE: usize = 6;
 
 /// A connector whose behaviour the test switches: plain TCP, refuse every connect
-/// (`connect_refused`, counted by the breaker), hang every connect, or connect over TCP and never
-/// write a byte (the request is dispatched and stalls, holding its body charge). Every attempt is
+/// (`connect_refused`, counted by the breaker), hang every connect, connect over TCP and never
+/// write a byte (the request is dispatched and stalls, holding its body charge), hold every connect
+/// until the test releases a permit (`GATE`), or connect / refuse after a delay. Every attempt is
 /// counted.
 struct ScriptConnect {
     mode: AtomicUsize,
     attempts: AtomicUsize,
+    gate: Semaphore,
+    delay_ms: AtomicU64,
 }
 
 impl ScriptConnect {
@@ -62,6 +68,8 @@ impl ScriptConnect {
         Arc::new(ScriptConnect {
             mode: AtomicUsize::new(mode),
             attempts: AtomicUsize::new(0),
+            gate: Semaphore::new(0),
+            delay_ms: AtomicU64::new(0),
         })
     }
     fn set(&self, mode: usize) {
@@ -69,6 +77,13 @@ impl ScriptConnect {
     }
     fn attempts(&self) -> usize {
         self.attempts.load(Ordering::SeqCst)
+    }
+    /// Let `n` gated connects through.
+    fn release(&self, n: usize) {
+        self.gate.add_permits(n);
+    }
+    fn delay(&self, ms: u64) {
+        self.delay_ms.store(ms, Ordering::SeqCst);
     }
 }
 
@@ -79,9 +94,27 @@ impl Connect for ScriptConnect {
     ) -> Pin<Box<dyn Future<Output = io::Result<BoxIo>> + Send + 'a>> {
         Box::pin(async move {
             self.attempts.fetch_add(1, Ordering::SeqCst);
+            let delay = Duration::from_millis(self.delay_ms.load(Ordering::SeqCst));
             match self.mode.load(Ordering::SeqCst) {
                 REFUSE => Err(io::ErrorKind::ConnectionRefused.into()),
                 HANG => std::future::pending().await,
+                DELAY_REFUSE => {
+                    tokio::time::sleep(delay).await;
+                    Err(io::ErrorKind::ConnectionRefused.into())
+                }
+                GATE | DELAY_TCP => {
+                    if self.mode.load(Ordering::SeqCst) == GATE {
+                        let Ok(p) = self.gate.acquire().await else {
+                            return Err(io::ErrorKind::Other.into());
+                        };
+                        p.forget();
+                    } else {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let s = TcpStream::connect(peer).await?;
+                    s.set_nodelay(true)?;
+                    Ok(Box::new(s) as BoxIo)
+                }
                 STALL => {
                     let inner = TcpStream::connect(peer).await?;
                     Ok(Box::new(StallIo {
@@ -188,11 +221,12 @@ fn assert_unavailable(r: &Reply, cause: &str) -> Option<u32> {
 /// refused at once (`breaker_open`, Retryable, `retry_after_ms` the time left) with ZERO dials and
 /// nothing received, whatever its method; a request the policy refuses still gets its `forbidden_*`
 /// (validation precedes admission). Once `BREAKER_OPEN_MS` has passed the breaker is half-open: the
-/// next request is the probe, a request beside it is refused `breaker_probe_busy` (with no
-/// `retry_after_ms`), and the probe's final head closes the breaker.
+/// next request is the probe — held here in its dial — and a request beside it is refused
+/// `breaker_probe_busy` (with no `retry_after_ms`); under the default `connect` class the probe's
+/// ESTABLISHED connection closes the breaker (§23.8.6 as amended at the F6 review).
 #[tokio::test]
 async fn chaos9_k_connect_failures_open_the_breaker_and_a_probe_closes_it() {
-    let (up, gate) = scripted(vec![Act::Gated]).await;
+    let (up, _gate) = scripted(vec![]).await;
     let conn = ScriptConnect::new(REFUSE);
     let d = daemon_on(
         upstreams(
@@ -213,8 +247,11 @@ async fn chaos9_k_connect_failures_open_the_breaker_and_a_probe_closes_it() {
         let r = one(&d, &post("b", b"x")).await;
         assert_unavailable(&r, http_cause::CONNECT_REFUSED);
     }
+    wait_for("the third dial's evidence", || {
+        d.engine.breaker_state("b") == Some(BreakerState::Open)
+    })
+    .await;
     assert_eq!(conn.attempts(), 3);
-    assert_eq!(d.engine.breaker_state("b"), Some(BreakerState::Open));
 
     let opened = Instant::now();
     for r in [
@@ -242,28 +279,26 @@ async fn chaos9_k_connect_failures_open_the_breaker_and_a_probe_closes_it() {
     assert_eq!(conn.attempts(), 3, "zero dials while open");
     assert_eq!(received(&up), 0);
 
-    conn.set(TCP);
+    conn.set(GATE);
     wait_for("the breaker to half-open", || {
         d.engine.breaker_state("b") == Some(BreakerState::HalfOpen)
     })
     .await;
-    // The probe: held at the upstream until the test releases it.
     let mut probe = start(&d, &post("b", b"probe")).await;
-    wait_for("the probe at the upstream", || received(&up) == 1).await;
+    wait_for("the probe's dial", || conn.attempts() == 4).await;
     let busy = one(&d, &idempotent_get("b")).await;
     assert_eq!(
         assert_unavailable(&busy, http_cause::BREAKER_PROBE_BUSY),
         None,
         "breaker_probe_busy carries no retry_after_ms"
     );
-    assert_eq!(received(&up), 1, "the refused request was not sent");
-    gate.add_permits(1);
+    conn.release(1);
     assert_eq!(status(&collect(&mut probe, 1).await), 200);
     assert_eq!(d.engine.breaker_state("b"), Some(BreakerState::Closed));
     for _ in 0..3 {
         assert_eq!(status(&one(&d, &post("b", b"y")).await), 200);
     }
-    assert_eq!(received(&up), 4);
+    assert_eq!(received(&up), 4, "the busy request was not sent");
 }
 
 /// Opens `name`'s breaker with ONE refused connect (`BREAKER_FAILURES=1`) and waits for it to
@@ -273,7 +308,10 @@ async fn half_open(d: &Daemon, conn: &ScriptConnect, name: &str, mode: usize) {
     conn.set(REFUSE);
     let r = one(d, &post(name, b"x")).await;
     assert_unavailable(&r, http_cause::CONNECT_REFUSED);
-    assert_eq!(d.engine.breaker_state(name), Some(BreakerState::Open));
+    wait_for("the breaker open", || {
+        d.engine.breaker_state(name) == Some(BreakerState::Open)
+    })
+    .await;
     conn.set(mode);
     wait_for("the breaker to half-open", || {
         d.engine.breaker_state(name) == Some(BreakerState::HalfOpen)
@@ -282,62 +320,77 @@ async fn half_open(d: &Daemon, conn: &ScriptConnect, name: &str, mode: usize) {
 }
 
 /// Proves the breaker is half-open with a FREE probe slot: the next request is admitted as the
-/// probe (it reaches the gated upstream) and a request beside it is `breaker_probe_busy`; the probe
-/// is then released and closes the breaker.
-async fn next_request_probes(d: &Daemon, up: &Upstream, gate: &Semaphore, name: &str) {
+/// probe (its dial reaches the connector, where it is held) and a request beside it is
+/// `breaker_probe_busy`; the probe is then released, answered, and the breaker is closed.
+async fn next_request_probes(d: &Daemon, conn: &ScriptConnect, up: &Upstream, name: &str) {
     let before = received(up);
+    let dials = conn.attempts();
+    conn.set(GATE);
     let mut probe = start(d, &post(name, b"next")).await;
-    wait_for("the next probe at the upstream", || {
-        received(up) == before + 1
-    })
-    .await;
+    wait_for("the next probe's dial", || conn.attempts() == dials + 1).await;
     let busy = one(d, &post(name, b"busy")).await;
     assert_unavailable(&busy, http_cause::BREAKER_PROBE_BUSY);
-    gate.add_permits(1);
+    conn.release(1);
     assert_eq!(status(&collect(&mut probe, 1).await), 200);
     assert_eq!(d.engine.breaker_state(name), Some(BreakerState::Closed));
     assert_eq!(received(up), before + 1, "the busy request was not sent");
+    conn.set(TCP);
 }
 
-/// **Chaos 9, second half.** A probe that ends Indeterminate (the upstream closes after reading
-/// the POST: `eof_empty`, not a counted failure under the default `connect` class) leaves the
-/// breaker HALF-OPEN with the slot released — not open, not closed — and the next request probes.
+/// **Chaos 9, second half.** Where the probe's answer is its HEAD (`BREAKER_COUNTS=connect+timeout`),
+/// a probe that ends Indeterminate (the upstream closes after reading the POST: `eof_empty`, not a
+/// counted failure) leaves the breaker HALF-OPEN with the slot released — not open, not closed — and
+/// the next request probes. Under the default `connect` class the same probe's ESTABLISHED
+/// connection was the answer, so the breaker is closed although the request itself ended
+/// Indeterminate (§23.8.6 as amended at the F6 review).
 #[tokio::test]
 async fn chaos9_an_indeterminate_probe_leaves_half_open_with_the_slot_released() {
-    let (up, gate) = scripted(vec![Act::Close, Act::Gated]).await;
+    let (up, _gate) = scripted(vec![Act::Close]).await;
+    let (upc, _gatec) = scripted(vec![Act::Close]).await;
     let conn = ScriptConnect::new(TCP);
     let d = daemon_on(
         upstreams(
-            &[("b", up.addr)],
+            &[("b", up.addr), ("c", upc.addr)],
             &[
                 ("b", "BREAKER_FAILURES", "1"),
                 ("b", "BREAKER_OPEN_MS", "1000"),
+                ("b", "BREAKER_COUNTS", "connect+timeout"),
                 ("b", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "0"),
+                ("c", "BREAKER_FAILURES", "1"),
+                ("c", "BREAKER_OPEN_MS", "1000"),
+                ("c", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "0"),
             ],
         ),
         Arc::clone(&conn),
     );
-    half_open(&d, &conn, "b", TCP).await;
-    let r = one(&d, &post("b", b"probe")).await;
-    r.assert_error(
-        errc::WRITE_UNCONFIRMED,
-        branch::INDETERMINATE,
-        http_cause::EOF_EMPTY,
-    );
-    assert_eq!(received(&up), 1, "received exactly once");
-    assert_eq!(d.engine.breaker_state("b"), Some(BreakerState::HalfOpen));
-    next_request_probes(&d, &up, &gate, "b").await;
+    for (name, upstream, after) in [
+        ("b", &up, BreakerState::HalfOpen),
+        ("c", &upc, BreakerState::Closed),
+    ] {
+        half_open(&d, &conn, name, TCP).await;
+        let r = one(&d, &post(name, b"probe")).await;
+        r.assert_error(
+            errc::WRITE_UNCONFIRMED,
+            branch::INDETERMINATE,
+            http_cause::EOF_EMPTY,
+        );
+        assert_eq!(received(upstream), 1, "received exactly once");
+        assert_eq!(d.engine.breaker_state(name), Some(after), "{name}");
+    }
+    next_request_probes(&d, &conn, &up, "b").await;
     assert_eq!(received(&up), 2);
 }
 
-/// **The probe slot cannot leak (review F24's RAII guard), end to end.** A probe ends without an
-/// answer in every way a request can, and each time the breaker stays half-open with the slot
-/// released: (1) `CANCEL`led while its dial hangs (before dispatch: `Cancelled`, nothing sent);
-/// (2) `CANCEL`led after it was sent (a POST: Indeterminate, cause `cancelled`); (3) its session
-/// dies with it in flight. After each, the next request is the probe.
+/// **The probe slot cannot leak (review F24's RAII guard), end to end**, where the probe's answer is
+/// its head (`connect+timeout`). A probe ends without an answer in every way a request can, and
+/// each time the breaker is half-open with the slot released: (1) `CANCEL`led while its dial is
+/// held — the dial is DETACHED and keeps the slot until it reports (here: an established
+/// connection, which under this class is no answer, so the slot is released and the connection
+/// pooled); (2) `CANCEL`led after it was sent (a POST: Indeterminate, cause `cancelled`); (3) its
+/// session dies with it in flight. After each, the next request is the probe.
 #[tokio::test]
 async fn the_probe_slot_is_released_however_the_probe_ends() {
-    let (up, gate) = scripted(vec![Act::Hold, Act::Gated, Act::Hold, Act::Gated]).await;
+    let (up, _gate) = scripted(vec![Act::Hold, Act::Answer(OK), Act::Hold]).await;
     let conn = ScriptConnect::new(TCP);
     let d = daemon_on(
         upstreams(
@@ -345,14 +398,15 @@ async fn the_probe_slot_is_released_however_the_probe_ends() {
             &[
                 ("b", "BREAKER_FAILURES", "1"),
                 ("b", "BREAKER_OPEN_MS", "1000"),
+                ("b", "BREAKER_COUNTS", "connect+timeout"),
                 ("b", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "0"),
             ],
         ),
         Arc::clone(&conn),
     );
 
-    // (1) Cancelled before dispatch: the probe's dial hangs.
-    half_open(&d, &conn, "b", HANG).await;
+    // (1) Cancelled before dispatch, its dial held at the connector.
+    half_open(&d, &conn, "b", GATE).await;
     let attempts = conn.attempts();
     let mut probe = start(&d, &post("b", b"p1")).await;
     wait_for("the probe's dial", || conn.attempts() == attempts + 1).await;
@@ -363,6 +417,14 @@ async fn the_probe_slot_is_released_however_the_probe_ends() {
         collect(&mut probe, 1).await.end,
         Outcome::Cancelled
     ));
+    // The requester has gone; its dial has not, and still holds the slot.
+    let busy = one(&d, &post("b", b"busy")).await;
+    assert_unavailable(&busy, http_cause::BREAKER_PROBE_BUSY);
+    conn.release(1);
+    wait_for("the detached dial's connection pooled", || {
+        d.engine.idle_connections("b") == 1
+    })
+    .await;
     assert_eq!(d.engine.breaker_state("b"), Some(BreakerState::HalfOpen));
     assert_eq!(received(&up), 0);
     conn.set(TCP);
@@ -377,7 +439,7 @@ async fn the_probe_slot_is_released_however_the_probe_ends() {
         http_cause::CANCELLED,
     );
     assert_eq!(d.engine.breaker_state("b"), Some(BreakerState::HalfOpen));
-    next_request_probes(&d, &up, &gate, "b").await; // request 2, gated
+    next_request_probes(&d, &conn, &up, "b").await; // request 2
 
     // (3) The session dies with the probe in flight.
     half_open(&d, &conn, "b", TCP).await;
@@ -386,17 +448,18 @@ async fn the_probe_slot_is_released_however_the_probe_ends() {
     drop(probe);
     wait_for("the probe's exchange ended", || d.engine.in_flight() == 0).await;
     assert_eq!(d.engine.breaker_state("b"), Some(BreakerState::HalfOpen));
-    next_request_probes(&d, &up, &gate, "b").await; // request 4, gated
+    next_request_probes(&d, &conn, &up, "b").await; // request 4
     assert_eq!(received(&up), 4, "every probe was received at most once");
 }
 
 /// **A probe refused by a LATER admission step releases the slot.** The breaker admits the probe at
 /// step (b); the rate limit (c) — or the body budget (d) — then refuses it, unsent. Each refused
 /// probe is followed by another request that is ALSO admitted as the probe and refused by the same
-/// later step: had the first leaked the slot, the second would be `breaker_probe_busy`.
+/// later step: had the first leaked the slot, the second would be `breaker_probe_busy`. (The hold
+/// and the queue: `the_admission_order_…` and `a_probe_refused_by_the_queue_…`.)
 #[tokio::test]
 async fn a_probe_refused_by_a_later_admission_step_releases_the_slot() {
-    let (up, gate) = scripted(vec![Act::Gated]).await;
+    let (up, _gate) = scripted(vec![]).await;
     let (rated, _rgate) = scripted(vec![]).await;
     let (hog, _hgate) = scripted(vec![]).await;
     let conn = ScriptConnect::new(TCP);
@@ -456,7 +519,76 @@ async fn a_probe_refused_by_a_later_admission_step_releases_the_slot() {
     assert_eq!(d.engine.body_budget_daemon_in_use(), 0);
     conn.set(TCP);
     assert_eq!(received(&up), 0);
-    next_request_probes(&d, &up, &gate, "b").await;
+    next_request_probes(&d, &conn, &up, "b").await;
+}
+
+/// **A probe refused by the queue (step (e)) releases the slot.** The one `MAX_REQUESTS` slot is
+/// held by a request admitted while the breaker was CLOSED (reusing a pooled connection, held at the
+/// upstream), and `MAX_QUEUED=0`; the breaker is opened meanwhile by a DETACHED dial — its requester
+/// left at its own deadline, freeing the slot, and the dial ran on to `CONNECT_TIMEOUT_MS` and
+/// counted. Both probes after it are refused `queue_full`, unsent: the first released the slot.
+#[tokio::test]
+async fn a_probe_refused_by_the_queue_releases_the_slot() {
+    let (up, gate) = scripted(vec![Act::Answer(OK), Act::Gated]).await;
+    let conn = ScriptConnect::new(TCP);
+    let d = daemon_on(
+        upstreams(
+            &[("q", up.addr)],
+            &[
+                ("q", "BREAKER_FAILURES", "1"),
+                ("q", "BREAKER_OPEN_MS", "300"),
+                ("q", "CONNECT_TIMEOUT_MS", "500"),
+                ("q", "MAX_REQUESTS", "1"),
+                ("q", "MAX_QUEUED", "0"),
+                ("q", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "0"),
+            ],
+        ),
+        Arc::clone(&conn),
+    );
+    // A pooled connection for the slot holder (an idempotent request reuses it).
+    assert_eq!(status(&one(&d, &idempotent_get("q")).await), 200);
+    assert_eq!(d.engine.idle_connections("q"), 1);
+    // A POST whose dial hangs; it leaves at its deadline, its dial runs on.
+    conn.set(HANG);
+    let r = one(
+        &d,
+        &HttpRequest {
+            timeout_ms: Some(100),
+            ..post("q", b"f")
+        },
+    )
+    .await;
+    r.assert_error(errc::POOL_TIMEOUT, branch::RETRYABLE, http_cause::DEADLINE);
+    // The slot holder, admitted while closed.
+    let mut held = start(
+        &d,
+        &HttpRequest {
+            timeout_ms: Some(30_000),
+            ..idempotent_get("q")
+        },
+    )
+    .await;
+    wait_for("the slot holder at the upstream", || received(&up) == 2).await;
+    wait_for("the detached dial's counted timeout", || {
+        d.engine.breaker_state("q") == Some(BreakerState::Open)
+    })
+    .await;
+    wait_for("the breaker to half-open", || {
+        d.engine.breaker_state("q") == Some(BreakerState::HalfOpen)
+    })
+    .await;
+    for _ in 0..2 {
+        let r = one(&d, &post("q", b"p")).await;
+        r.assert_error(
+            errc::POOL_TIMEOUT,
+            branch::RETRYABLE,
+            http_cause::QUEUE_FULL,
+        );
+        assert_eq!(d.engine.breaker_state("q"), Some(BreakerState::HalfOpen));
+    }
+    gate.add_permits(1);
+    assert_eq!(status(&collect(&mut held, 1).await), 200);
+    assert_eq!(received(&up), 2);
 }
 
 /// A probe that fails with a COUNTED failure opens the breaker again for `BREAKER_OPEN_MS`.
@@ -478,7 +610,10 @@ async fn a_counted_probe_failure_opens_the_breaker_again() {
     let probe_sent = Instant::now();
     let r = one(&d, &post("b", b"probe")).await;
     assert_unavailable(&r, http_cause::CONNECT_REFUSED);
-    assert_eq!(d.engine.breaker_state("b"), Some(BreakerState::Open));
+    wait_for("the probe's evidence", || {
+        d.engine.breaker_state("b") == Some(BreakerState::Open)
+    })
+    .await;
     let attempts = conn.attempts();
     let r = one(&d, &post("b", b"x")).await;
     let left = u128::from(assert_unavailable(&r, http_cause::BREAKER_OPEN).unwrap());
@@ -490,14 +625,15 @@ async fn a_counted_probe_failure_opens_the_breaker_again() {
 }
 
 /// `BREAKER_COUNTS`: the default `connect` counts neither a timeout nor a 5xx; `connect+timeout`
-/// counts the "sent, no head" `timeout`; `connect+timeout+5xx` also counts a completed 502/503/504
-/// — which is still delivered to the client as the `Ok` exchange it is (§23.7.4). A success resets
-/// the consecutive count.
+/// counts the "sent, no head" `timeout` — but ONLY when the deadline was the upstream's own
+/// `TIMEOUT_MS`, never one the caller shortened (review R2); `connect+timeout+5xx` also counts a
+/// completed 502/503/504, which is still delivered to the client as the `Ok` exchange it is
+/// (§23.7.4). A success resets the consecutive count.
 #[tokio::test]
 async fn breaker_counts_selects_what_opens_the_breaker() {
     const BAD: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
     let (fivexx, _g1) = scripted(vec![Act::Answer(BAD); 8]).await;
-    let (slow, _g2) = scripted(vec![Act::Hold; 8]).await;
+    let (slow, _g2) = scripted(vec![Act::Hold; 12]).await;
     let conn = ScriptConnect::new(TCP);
     let d = daemon_on(
         upstreams(
@@ -506,14 +642,19 @@ async fn breaker_counts_selects_what_opens_the_breaker() {
                 ("five", fivexx.addr),
                 ("plaint", slow.addr),
                 ("timed", slow.addr),
+                ("shortened", slow.addr),
             ],
             &[
                 ("plain5", "BREAKER_FAILURES", "2"),
                 ("five", "BREAKER_FAILURES", "2"),
                 ("five", "BREAKER_COUNTS", "connect+timeout+5xx"),
                 ("plaint", "BREAKER_FAILURES", "2"),
+                ("plaint", "TIMEOUT_MS", "150"),
                 ("timed", "BREAKER_FAILURES", "2"),
                 ("timed", "BREAKER_COUNTS", "connect+timeout"),
+                ("timed", "TIMEOUT_MS", "150"),
+                ("shortened", "BREAKER_FAILURES", "2"),
+                ("shortened", "BREAKER_COUNTS", "connect+timeout"),
             ],
         ),
         conn,
@@ -527,12 +668,27 @@ async fn breaker_counts_selects_what_opens_the_breaker() {
     assert_unavailable(&r, http_cause::BREAKER_OPEN);
     assert_eq!(received(&fivexx), 5);
 
-    let timing_out = |u: &str| HttpRequest {
+    // The upstream's own TIMEOUT_MS bounds `plaint`/`timed` (no request field); `shortened`'s
+    // requests carry their own 150 ms.
+    let engine_bound = |u: &str| HttpRequest {
+        timeout_ms: None,
+        ..post(u, b"t")
+    };
+    let caller_bound = |u: &str| HttpRequest {
         timeout_ms: Some(150),
         ..post(u, b"t")
     };
-    for name in ["plaint", "plaint", "plaint", "timed", "timed"] {
-        one(&d, &timing_out(name)).await.assert_error(
+    for r in [
+        engine_bound("plaint"),
+        engine_bound("plaint"),
+        engine_bound("plaint"),
+        engine_bound("timed"),
+        engine_bound("timed"),
+        caller_bound("shortened"),
+        caller_bound("shortened"),
+        caller_bound("shortened"),
+    ] {
+        one(&d, &r).await.assert_error(
             errc::WRITE_UNCONFIRMED,
             branch::INDETERMINATE,
             http_cause::TIMEOUT,
@@ -540,7 +696,180 @@ async fn breaker_counts_selects_what_opens_the_breaker() {
     }
     assert_eq!(d.engine.breaker_state("plaint"), Some(BreakerState::Closed));
     assert_eq!(d.engine.breaker_state("timed"), Some(BreakerState::Open));
-    assert_eq!(received(&slow), 5);
+    assert_eq!(
+        d.engine.breaker_state("shortened"),
+        Some(BreakerState::Closed),
+        "a deadline the caller shortened is not evidence"
+    );
+    assert_eq!(received(&slow), 8);
+}
+
+/// **Review R1: no dial while open, even for requests admitted before it opened.** Five POSTs are
+/// admitted while closed; one dial slot (`MAX_DIALS=1`), and that dial is refused after 300 ms,
+/// opening the breaker (`BREAKER_FAILURES=1`). The four that waited for the dial slot are asked
+/// again before dialling and refused `breaker_open`, unsent: one connection attempt in all.
+#[tokio::test]
+async fn requests_waiting_to_dial_when_the_breaker_opens_do_not_dial() {
+    let (up, _gate) = scripted(vec![]).await;
+    let conn = ScriptConnect::new(DELAY_REFUSE);
+    conn.delay(300);
+    let d = daemon_on(
+        upstreams(
+            &[("b", up.addr)],
+            &[
+                ("b", "BREAKER_FAILURES", "1"),
+                ("b", "BREAKER_OPEN_MS", "60000"),
+                ("b", "MAX_DIALS", "1"),
+            ],
+        ),
+        Arc::clone(&conn),
+    );
+    let mut cs = Vec::new();
+    for i in 0..5u8 {
+        cs.push(start(&d, &post("b", &[b'0' + i])).await);
+    }
+    let mut causes = Vec::new();
+    for c in &mut cs {
+        let r = collect(c, 1).await;
+        let ep = r.error();
+        assert_eq!(ep.branch, branch::RETRYABLE, "{ep:?}");
+        causes.push(ep.detail.clone().unwrap_or_default());
+    }
+    causes.sort();
+    assert_eq!(
+        causes,
+        vec![
+            http_cause::BREAKER_OPEN.to_string(),
+            http_cause::BREAKER_OPEN.to_string(),
+            http_cause::BREAKER_OPEN.to_string(),
+            http_cause::BREAKER_OPEN.to_string(),
+            http_cause::CONNECT_REFUSED.to_string(),
+        ]
+    );
+    assert_eq!(d.engine.breaker_state("b"), Some(BreakerState::Open));
+    assert_eq!(conn.attempts(), 1, "one connection attempt in all");
+    assert_eq!(received(&up), 0);
+}
+
+/// **Review R2: a caller's own short connect bound is not evidence.** The upstream connects in
+/// 50 ms; three callers ask for `connect_timeout_ms` 1. Each of THEM is `connect_timeout`
+/// (Retryable, its own bound), but the dials they started run on to the engine's bound, succeed,
+/// and are pooled: the breaker stays closed and a well-behaved caller is served.
+#[tokio::test]
+async fn a_callers_short_connect_timeout_does_not_open_the_breaker() {
+    let (up, _gate) = scripted(vec![]).await;
+    let conn = ScriptConnect::new(DELAY_TCP);
+    conn.delay(50);
+    let d = daemon_on(
+        upstreams(&[("b", up.addr)], &[("b", "BREAKER_FAILURES", "3")]),
+        Arc::clone(&conn),
+    );
+    for _ in 0..3 {
+        let r = one(
+            &d,
+            &HttpRequest {
+                connect_timeout_ms: Some(1),
+                ..post("b", b"x")
+            },
+        )
+        .await;
+        assert_unavailable(&r, http_cause::CONNECT_TIMEOUT);
+    }
+    wait_for("the detached dials' connections pooled", || {
+        d.engine.idle_connections("b") == 3
+    })
+    .await;
+    assert_eq!(d.engine.breaker_state("b"), Some(BreakerState::Closed));
+    let r = one(&d, &idempotent_get("b")).await;
+    assert_eq!(status(&r), 200);
+    assert_eq!(
+        received(&up),
+        1,
+        "the departed callers' requests were never sent"
+    );
+}
+
+/// **Review R3: a black hole is counted whatever the callers' deadlines.** Every connect hangs; the
+/// callers' 200 ms deadlines end their waits (`deadline`, Retryable, unsent), and the dials they
+/// started run on to the upstream's `CONNECT_TIMEOUT_MS` (300 ms), time out, and count: the breaker
+/// opens.
+#[tokio::test]
+async fn a_black_holed_upstream_opens_the_breaker_under_short_deadlines() {
+    let (up, _gate) = scripted(vec![]).await;
+    let conn = ScriptConnect::new(HANG);
+    let d = daemon_on(
+        upstreams(
+            &[("b", up.addr)],
+            &[
+                ("b", "BREAKER_FAILURES", "2"),
+                ("b", "CONNECT_TIMEOUT_MS", "300"),
+            ],
+        ),
+        Arc::clone(&conn),
+    );
+    for _ in 0..2 {
+        let r = one(
+            &d,
+            &HttpRequest {
+                timeout_ms: Some(200),
+                ..idempotent_get("b")
+            },
+        )
+        .await;
+        r.assert_error(errc::POOL_TIMEOUT, branch::RETRYABLE, http_cause::DEADLINE);
+    }
+    wait_for("the detached dials' counted timeouts", || {
+        d.engine.breaker_state("b") == Some(BreakerState::Open)
+    })
+    .await;
+    assert_eq!(conn.attempts(), 2);
+    assert_eq!(d.engine.dials_in_progress("b"), 0);
+    assert_eq!(d.engine.connections("b"), 0);
+    assert_eq!(received(&up), 0);
+}
+
+/// **How long a probe holds its slot.** Under the default `connect` class the probe's answer is its
+/// ESTABLISHED connection: while the probe waits for its head, the breaker is already closed and
+/// other requests are served. Under `connect+timeout` the answer is the head, so a request beside
+/// the probe is `breaker_probe_busy` until it arrives.
+#[tokio::test]
+async fn under_the_connect_class_a_probe_answers_when_its_connection_is_established() {
+    let (upc, gatec) = scripted(vec![Act::Gated, Act::Answer(OK)]).await;
+    let (upt, gatet) = scripted(vec![Act::Gated]).await;
+    let conn = ScriptConnect::new(TCP);
+    let d = daemon_on(
+        upstreams(
+            &[("c", upc.addr), ("t", upt.addr)],
+            &[
+                ("c", "BREAKER_FAILURES", "1"),
+                ("c", "BREAKER_OPEN_MS", "500"),
+                ("c", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "0"),
+                ("t", "BREAKER_FAILURES", "1"),
+                ("t", "BREAKER_OPEN_MS", "500"),
+                ("t", "BREAKER_COUNTS", "connect+timeout"),
+                ("t", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "0"),
+            ],
+        ),
+        Arc::clone(&conn),
+    );
+    half_open(&d, &conn, "c", TCP).await;
+    let mut probe = start(&d, &post("c", b"slow")).await;
+    wait_for("the probe at the upstream", || received(&upc) == 1).await;
+    assert_eq!(d.engine.breaker_state("c"), Some(BreakerState::Closed));
+    assert_eq!(status(&one(&d, &post("c", b"other")).await), 200);
+    gatec.add_permits(1);
+    assert_eq!(status(&collect(&mut probe, 1).await), 200);
+
+    half_open(&d, &conn, "t", TCP).await;
+    let mut probe = start(&d, &post("t", b"slow")).await;
+    wait_for("the probe at the upstream", || received(&upt) == 1).await;
+    assert_eq!(d.engine.breaker_state("t"), Some(BreakerState::HalfOpen));
+    let busy = one(&d, &post("t", b"other")).await;
+    assert_unavailable(&busy, http_cause::BREAKER_PROBE_BUSY);
+    gatet.add_permits(1);
+    assert_eq!(status(&collect(&mut probe, 1).await), 200);
+    assert_eq!(d.engine.breaker_state("t"), Some(BreakerState::Closed));
+    assert_eq!(received(&upt), 1);
 }
 
 // =================================================================================================
@@ -661,7 +990,8 @@ async fn max_queued_zero_refuses_every_wait() {
 
 /// `MAX_CONNECTIONS` bounds the connections that EXIST, not only the idle ones: with one allowed,
 /// a second concurrent request waits for the first's connection and reuses it — one connection at
-/// the upstream throughout. A waiter past `QUEUE_TIMEOUT_MS` is `queue_timeout`, unsent.
+/// the upstream throughout. The wait is bounded (here a request's own deadline ends it: `deadline`,
+/// unsent).
 #[tokio::test]
 async fn max_connections_bounds_live_connections() {
     let (up, gate) = scripted(vec![Act::Gated; 2]).await;
@@ -670,19 +1000,24 @@ async fn max_connections_bounds_live_connections() {
             &[("c", up.addr)],
             &[
                 ("c", "MAX_CONNECTIONS", "1"),
-                ("c", "QUEUE_TIMEOUT_MS", "300"),
+                // Generous: `b` below must not time out however slow the runner (review LOW).
+                ("c", "QUEUE_TIMEOUT_MS", "60000"),
             ],
         ),
         ScriptConnect::new(TCP),
     );
     let mut a = start(&d, &idempotent_get("c")).await;
     wait_for("the first request at the upstream", || received(&up) == 1).await;
-    let r = one(&d, &idempotent_get("c")).await;
-    r.assert_error(
-        errc::POOL_TIMEOUT,
-        branch::RETRYABLE,
-        http_cause::QUEUE_TIMEOUT,
-    );
+    // The wait for a connection is bounded: here by the request's own (nearer) deadline.
+    let r = one(
+        &d,
+        &HttpRequest {
+            timeout_ms: Some(300),
+            ..idempotent_get("c")
+        },
+    )
+    .await;
+    r.assert_error(errc::POOL_TIMEOUT, branch::RETRYABLE, http_cause::DEADLINE);
     assert_eq!(received(&up), 1);
     let mut b = start(
         &d,
@@ -711,7 +1046,9 @@ async fn max_connections_bounds_live_connections() {
 }
 
 /// `MAX_DIALS` bounds dials in progress: with one allowed and the first dial hanging, a second
-/// request does not dial (one attempt at the connector) and ends `queue_timeout`, unsent.
+/// request does not dial (one attempt at the connector) and ends `queue_timeout`, unsent. The first
+/// request's `CANCEL` does not end its dial, which is DETACHED and runs to `CONNECT_TIMEOUT_MS`,
+/// holding its slots until then (review R3's cost, stated); then both are free.
 #[tokio::test]
 async fn max_dials_bounds_dials_in_progress() {
     let (up, _gate) = scripted(vec![]).await;
@@ -719,7 +1056,11 @@ async fn max_dials_bounds_dials_in_progress() {
     let d = daemon_on(
         upstreams(
             &[("c", up.addr)],
-            &[("c", "MAX_DIALS", "1"), ("c", "QUEUE_TIMEOUT_MS", "300")],
+            &[
+                ("c", "MAX_DIALS", "1"),
+                ("c", "QUEUE_TIMEOUT_MS", "300"),
+                ("c", "CONNECT_TIMEOUT_MS", "1000"),
+            ],
         ),
         Arc::clone(&conn),
     );
@@ -738,17 +1079,54 @@ async fn max_dials_bounds_dials_in_progress() {
         collect(&mut hanging, 1).await.end,
         Outcome::Cancelled
     ));
-    wait_for("the dial slot freed", || {
+    assert_eq!(
+        d.engine.dials_in_progress("c"),
+        1,
+        "the detached dial keeps its slot"
+    );
+    wait_for("the dial slot freed at CONNECT_TIMEOUT_MS", || {
         d.engine.dials_in_progress("c") == 0
     })
     .await;
     assert_eq!(
         d.engine.connections("c"),
         0,
-        "a cancelled dial frees its connection slot"
+        "a failed dial frees its connection slot"
     );
     conn.set(TCP);
     assert_eq!(status(&one(&d, &idempotent_get("c")).await), 200);
+    assert_eq!(received(&up), 1);
+}
+
+/// **Review MC: a failed dial frees its slots.** More dials fail than `MAX_DIALS` allows at once —
+/// each one's `MAX_DIALS` and `MAX_CONNECTIONS` slot comes back — and the next dial succeeds.
+#[tokio::test]
+async fn failed_dials_free_their_slots() {
+    let (up, _gate) = scripted(vec![]).await;
+    let conn = ScriptConnect::new(REFUSE);
+    let d = daemon_on(
+        upstreams(
+            &[("m", up.addr)],
+            &[
+                ("m", "MAX_DIALS", "2"),
+                ("m", "MAX_CONNECTIONS", "2"),
+                ("m", "QUEUE_TIMEOUT_MS", "500"),
+                ("m", "BREAKER_FAILURES", "100"),
+            ],
+        ),
+        Arc::clone(&conn),
+    );
+    for _ in 0..4 {
+        let r = one(&d, &post("m", b"x")).await;
+        assert_unavailable(&r, http_cause::CONNECT_REFUSED);
+    }
+    wait_for("every slot back", || {
+        d.engine.dials_in_progress("m") == 0 && d.engine.connections("m") == 0
+    })
+    .await;
+    conn.set(TCP);
+    assert_eq!(status(&one(&d, &post("m", b"y")).await), 200);
+    assert_eq!(conn.attempts(), 5);
     assert_eq!(received(&up), 1);
 }
 
@@ -889,6 +1267,73 @@ async fn a_rate_wait_is_bounded_by_the_max_wait_and_the_deadline() {
         cancelled_at.elapsed()
     );
     assert_eq!(received(&up), 3, "the cancelled waiter was not sent");
+    // Review MB: the abandoned token — the LAST one scheduled — was given back: the next token is
+    // due ~5 s after the admitted one, not ~10 s (one 5 s slot for the cancelled waiter).
+    let r = one(
+        &d,
+        &HttpRequest {
+            timeout_ms: Some(100),
+            ..idempotent_get("slow")
+        },
+    )
+    .await;
+    let next = r
+        .assert_error(
+            errc::RATE_LIMITED,
+            branch::RETRYABLE,
+            http_cause::RATE_LIMITED,
+        )
+        .retry_after_ms
+        .unwrap();
+    assert!(
+        next <= 5_000,
+        "the cancelled waiter's token was refunded: {next}"
+    );
+}
+
+/// **Review MF: the queue's bound runs from step (e), not from decode.** A request spends ~1 s in
+/// the rate limiter's wait (step (c)), then waits in the queue behind a held slot: it is refused
+/// `queue_timeout` a full `QUEUE_TIMEOUT_MS` (1.5 s) after it reached the queue — so no earlier than
+/// 2.5 s after it was sent.
+#[tokio::test]
+async fn the_queue_bound_runs_from_the_queue_not_from_decode() {
+    let (up, gate) = scripted(vec![Act::Gated]).await;
+    let d = daemon_on(
+        upstreams(
+            &[("f", up.addr)],
+            &[
+                ("f", "RATE_PER_SEC", "1"),
+                ("f", "RATE_MAX_WAIT_MS", "5000"),
+                ("f", "MAX_REQUESTS", "1"),
+                ("f", "QUEUE_TIMEOUT_MS", "1500"),
+            ],
+        ),
+        ScriptConnect::new(TCP),
+    );
+    let mut held = start(
+        &d,
+        &HttpRequest {
+            timeout_ms: Some(30_000),
+            ..idempotent_get("f")
+        },
+    )
+    .await;
+    wait_for("the slot holder at the upstream", || received(&up) == 1).await;
+    let sent = Instant::now();
+    let r = one(&d, &idempotent_get("f")).await;
+    r.assert_error(
+        errc::POOL_TIMEOUT,
+        branch::RETRYABLE,
+        http_cause::QUEUE_TIMEOUT,
+    );
+    assert!(
+        sent.elapsed() >= Duration::from_millis(2_400),
+        "the queue bound counted from the queue: {:?}",
+        sent.elapsed()
+    );
+    gate.add_permits(1);
+    assert_eq!(status(&collect(&mut held, 1).await), 200);
+    assert_eq!(received(&up), 1);
 }
 
 // =================================================================================================
@@ -1043,6 +1488,67 @@ async fn the_admission_order_is_breaker_hold_then_rate() {
         branch::RETRYABLE,
         http_cause::RATE_LIMITED,
     );
+    assert_eq!(received(&up), 2);
+}
+
+/// **Within step (b) the breaker is consulted BEFORE the hold (review MA), and a probe the hold
+/// refuses releases its slot.** The upstream is held (a 429 with `Retry-After: 30`) while the
+/// breaker is opened by a detached dial's counted timeout: a request is refused `breaker_open`, not
+/// `retry_after_hold`. Once half-open, the probe is admitted by the breaker and refused by the hold
+/// — and so is the next request, which would be `breaker_probe_busy` had the first kept the slot.
+#[tokio::test]
+async fn the_breaker_is_consulted_before_the_hold() {
+    const LIMITED: &[u8] =
+        b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\n\r\n";
+    let (up, _gate) = scripted(vec![Act::Answer(OK), Act::Answer(LIMITED)]).await;
+    let conn = ScriptConnect::new(TCP);
+    let d = daemon_on(
+        upstreams(
+            &[("h", up.addr)],
+            &[
+                ("h", "HONOR_RETRY_AFTER", "1"),
+                ("h", "BREAKER_FAILURES", "1"),
+                ("h", "BREAKER_OPEN_MS", "300"),
+                ("h", "CONNECT_TIMEOUT_MS", "500"),
+                ("h", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "0"),
+            ],
+        ),
+        Arc::clone(&conn),
+    );
+    // A pooled connection for the idempotent request that will be answered 429.
+    assert_eq!(status(&one(&d, &idempotent_get("h")).await), 200);
+    // A POST whose dial hangs; it leaves at its own deadline and its dial runs on, to count.
+    conn.set(HANG);
+    let r = one(
+        &d,
+        &HttpRequest {
+            timeout_ms: Some(100),
+            ..post("h", b"f")
+        },
+    )
+    .await;
+    r.assert_error(errc::POOL_TIMEOUT, branch::RETRYABLE, http_cause::DEADLINE);
+    // The hold: a 429 on the pooled connection.
+    assert_eq!(status(&one(&d, &idempotent_get("h")).await), 429);
+    wait_for("the detached dial's counted timeout", || {
+        d.engine.breaker_state("h") == Some(BreakerState::Open)
+    })
+    .await;
+    let r = one(&d, &idempotent_get("h")).await;
+    assert_unavailable(&r, http_cause::BREAKER_OPEN);
+    wait_for("the breaker to half-open", || {
+        d.engine.breaker_state("h") == Some(BreakerState::HalfOpen)
+    })
+    .await;
+    for _ in 0..2 {
+        let r = one(&d, &idempotent_get("h")).await;
+        r.assert_error(
+            errc::RATE_LIMITED,
+            branch::RETRYABLE,
+            http_cause::RETRY_AFTER_HOLD,
+        );
+        assert_eq!(d.engine.breaker_state("h"), Some(BreakerState::HalfOpen));
+    }
     assert_eq!(received(&up), 2);
 }
 
