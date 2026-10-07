@@ -29,9 +29,10 @@ final class Ferro
     /**
      * Seconds the client waits past a statement timeout for the engine's own answer (M3-D1c): the
      * margin of `docs/spec/23-http.md` §23.11.0. It covers the engine's out-of-band cancel, whose
-     * side connection alone may take up to 2 s to dial (SPEC §22.2 (aj)).
+     * side connection alone may take up to 2 s to dial (SPEC §22.2 (aj)). Ferro HTTP's backstop past
+     * a request's `timeoutMs` uses the same margin (M6-F8, {@see \Ferro\Http\Upstream}).
      */
-    private const DEADLINE_MARGIN = 2.0;
+    public const DEADLINE_MARGIN = 2.0;
 
     /**
      * Connect to a `ferrod` over its Unix domain socket, complete the handshake, and return a

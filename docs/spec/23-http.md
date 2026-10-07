@@ -370,7 +370,7 @@ Not terminal and not flagged `STREAM`. It debits the request's credit like `STRE
 
 | # | field | type | notes |
 |---|---|---|---|
-| 1 | `status` | `u16` | 200..=599. A 1xx is consumed by the engine; 101 is malformed. |
+| 1 | `status` | `u16` | 200..=999. A 1xx is consumed by the engine; 101 is malformed. *[Amended M6-F8 review round 2 (§22.2 (dd)): this said 200..=599, which was false. `ferrod` passes the upstream's status through as an `http::StatusCode`, which is 100..=999, and nothing narrows it, so an upstream's 600..=999 reaches the client. RFC 9110 §15 calls those invalid and says a client SHOULD process one as a 5xx, which `ferro/client` does (§23.7.4). The engine keeps passing them through: it does not interpret statuses (§23.7.4, rule E), and mapping one would hide what the upstream sent. Carried to F9: `guzzlehttp/psr7`'s `Response` refuses a status of 600 or more, so the Guzzle handler must decide what such a response becomes.]* |
 | 2 | `version` | `u8` | `10`, `11` or `20` |
 | 3 | `reason` | `bin \| nil` | HTTP/1.x reason phrase; `nil` on HTTP/2 |
 | 4 | `headers` | `array<[str, bin]>` | as received, minus hop-by-hop, plus §23.9.2's changes. **Names are lowercase** (P6). |
@@ -587,6 +587,13 @@ The client does not know the upstream's configuration. Before `HEAD`, it counts 
 
 **Client per-request deadline expiry** is not a link death and does not poison the session (§23.11.0). It is classified by the same table, with the §9.2 cause `timeout`, after a `CANCEL` is sent.
 
+*[Amended M6-F8 (SPEC §22.2 (dd)), as built in `ferro/client` (`Ferro\Http\Error\HttpFates`):*
+
+- *The table is implemented as written, with one change of label: **a client-synthesised cause is `link_lost`, never `engine_restart`.** The client can tell a restart from a lost link only by reconnecting and comparing `boot_epoch`, and the HTTP path re-sends nothing, so it never reconnects to learn it. Every client-synthesised failure is `clientSynthesised()`, with `cause()` = `link_lost`, which is not an `[http.causes]` token.*
+- ***Deadline expiry follows D1c's wait, not the sentence above.** Past `timeout_ms` + 2 s the client sends `CANCEL` and waits one liveness interval for the ENGINE's terminal, which decides the fate exactly; only if none arrives does the session close, and then every request on it takes this table's cell. Failing the request locally at expiry would have to guess, where the engine knows. Cost: a declared-idempotent request whose backstop fires surfaces as the engine's answer to a `CANCEL` (`Cancelled`), not as a `timeout`. This happens only when the engine has been silent for 2 s past its own deadline; normally the engine answers at `timeout_ms` itself.*
+- *"Never re-issues" is pinned by chaos 8 (§23.14) under `Ferro::connect`'s reconnect loop and default retry policy.*
+- ***The backstop runs only until the HEAD, and only on silence** (review round, §22.2 (dd)). A request's client deadline ends when its HEAD is filed: from then on the engine bounds the exchange and PING liveness bounds a dead engine. An expired deadline is acted on only when nothing is readable, so an answer already waiting is read first. The first version measured the consumer's wall time, and a slow reader of a completed stream closed the session under every other request.]*
+
 #### 23.7.4 Status codes are not transport errors (decided)
 
 **Any final status is `Outcome::Ok`.**
@@ -604,6 +611,9 @@ PHP gets an advisory helper, `Ferro\Http\StatusFate::of(int $status, bool $idemp
 | 429; 503 with `Retry-After` | Retryable, delay = `Retry-After` | same |
 | other 4xx; 501, 505 | NonRetryable | NonRetryable |
 | 500, 502, 504, 503 without `Retry-After`, other 5xx | Retryable | **Indeterminate**: an intermediary may have forwarded it, and a 500 promises nothing about partial application |
+| 600–999 *(added M6-F8 review round 2)* | as a 5xx: Retryable | as a 5xx: **Indeterminate** |
+
+*[Amended M6-F8 review round 2 (§22.2 (dd)): a status in 600..=999 is not an HTTP status, but the engine passes one through (§23.5.2). RFC 9110 §15: a client "SHOULD process the response as if it had a 5xx (Server Error) status code". So the native API delivers it like any response, with its head and its status, and `StatusFate` reads it as an "other 5xx". A value outside 100..=999, which no engine produces, fails only its own exchange (`ProtocolException`).]*
 
 This refines product-vision §4.2 D and the ledger's F0 row, both amended in the same change (C2; acknowledged, §23.18 Q5).
 
@@ -930,7 +940,7 @@ Every assertion is mutation-proven (§22.2 (br)).
    - **When the client deadline expires,** the client sends `CANCEL` for that `request_id` and fails **only that request**, using §23.7.3's table (HTTP) or §19.3's (SQL) with the §9.2 cause `timeout`.
    - **The session stays alive.** A late `END` for that id is drained and discarded.
 
-   *[Amended M3-D1c (SPEC §22.2 (cp)), for SQL: on expiry the client sends the `CANCEL` but does not fail the request itself. It waits one liveness interval for the engine's terminal, which carries the exact fate (a statement that finished as the `CANCEL` arrived is the success it was), and only if none arrives does it close the session. A deadline is armed only where the engine bounds the request and acts on a `CANCEL`: a buffered SQL EXEC. Transaction control and admin requests carry no `timeout_ms`, and a stream is deliberately sent none (the engine would bound the stream's whole consumption with it), so all three get no client deadline and are bounded by liveness, as item 1 says of a request that carries no bound. The engine's `timeout_ms` also bounds the wait for a pooled connection. Whether F8 keeps "fails only that request" for HTTP or adopts this wait is F8's decision.]*
+   *[Amended M3-D1c (SPEC §22.2 (cp)), for SQL: on expiry the client sends the `CANCEL` but does not fail the request itself. It waits one liveness interval for the engine's terminal, which carries the exact fate (a statement that finished as the `CANCEL` arrived is the success it was), and only if none arrives does it close the session. A deadline is armed only where the engine bounds the request and acts on a `CANCEL`: a buffered SQL EXEC. Transaction control and admin requests carry no `timeout_ms`, and a stream is deliberately sent none (the engine would bound the stream's whole consumption with it), so all three get no client deadline and are bounded by liveness, as item 1 says of a request that carries no bound. The engine's `timeout_ms` also bounds the wait for a pooled connection. Whether F8 keeps "fails only that request" for HTTP or adopts this wait is F8's decision.]* *[Amended M6-F8 (SPEC §22.2 (dd)): **F8 adopts the wait.** An HTTP request that carries `timeout_ms` gets a client deadline `timeout_ms` + 2 s after it is sent; one without gets none and is bounded by liveness only. Past the deadline the client CANCELs and the engine's terminal decides (§23.7.3 as amended). PING liveness applies to HTTP unchanged, since it is the session's: a 30 s TTFB beside a DB write completes under the default configuration (measured live, `HttpLiveTest`).]*
 2. **The socket read timeout becomes a liveness bound, not a deadline.** Reads wait in slices. Silence on the socket while requests are pending triggers a `PING`, which the engine answers from the session reader independently of busy handlers (P18).
    - Only an unanswered `PING`, after a further liveness interval, is a transport failure. Only that poisons the session, under (bx).
    - An SSE stream with a 15 s gap, or an LLM call with 60 s TTFB, never trips it.
@@ -971,6 +981,18 @@ $s->close();                                 // CANCEL + drain: the RawStream co
   Every HTTP exception exposes `cause(): string`, the registry token from `detail`.
 - **The client re-issues nothing** (§23.7.3).
 - **(cj)'s "an open stream stays exclusive on its session" is lifted for HTTP streams.** It existed because a statement on the same `tx_id` could queue behind a stalled stream, and an HTTP stream has no transaction relation. The router files frames by `request_id`. Each stream is bounded by the global window (16 MiB / 64 frames), which is its client-side memory bound (§23.9.1). Slice F8's guard asserts the *next* query after an abandoned stream (the C1d lesson).
+
+*[Amended M6-F8 (SPEC §22.2 (dd)), as built:*
+
+- ***The surface.** `Connection::upstream(string $name, ?string $origin = null)` returns a `Ferro\Http\Upstream` with `request()`, `requestAsync()` and `stream()`. All three take `method`, `target`, `headers`, `body`, `timeoutMs`, `connectTimeoutMs`, `readTimeoutMs`, `idempotent`, `decode` and `route`. `headers` is `'Name' => value|[values]` or a list of `[name, value]` pairs. `HttpResponse`/`HttpStream` add `version`, `reason`, `headerLines`, `decoded`, `trailers`, `stats` and `statusFate()`. `StatusFate` lives in `ferro/client`.*
+- ***Exceptions.** The mapper is `Ferro\Http\Error\HttpFates`, not `ErrorMapper`. It uses the same branch-byte rule, so a garbled branch is NonRetryable. The classes are `HttpRetryableException`, `HttpIndeterminateException`, `HttpNonRetryableException`, `ResponseIncompleteException` and `HttpCancelledException`. Each extends the `ferro/client` base of its fate (those bases are no longer `final`) and implements `HttpException` (`cause()`, `clientSynthesised()`, `fate(): FateClass`). `ResponseIncompleteException` also has `head()`. `retryAfterMs()` is on every taxonomy exception. `Protocol` and `Unsupported`, which carry no cause, map to the plain base classes.*
+- ***The fate markers and `Fate::of()`** of §23.11.3/§23.11.4 are F9's, built on `fate()`.*
+- ***Exclusivity is lifted in both directions.** An HTTP request may be sent while a SQL stream is open, and an open HTTP stream never blocks SQL or other HTTP. A SQL stream stays exclusive against SQL requests.*
+- ***Fiber suspension happens per frame,** not only until the head. A body read under `Ferro\Loop` or the Revolt adapter lets other Fibers run between chunks.*
+- ***Abandonment.** `close()`, an early exit from `foreach`, or a buffered read that fails part-way sends `CANCEL` and drains to the terminal. A stream or Future that is dropped instead sends `CANCEL` and discards, without blocking.*
+- ***Refused before sending:** an engine without the `HTTP` feature bit (`Unsupported`), and a frame over the cap (`RequestTooLargeException`).*
+- ***Review round (§22.2 (dd)):** a buffered request returns its credit as its frames are filed, half a window at a time. It therefore holds its whole body as it arrives, not one window. When every in-flight slot is a stream parked on credit, the next request is refused (`InFlightLimitException`, Retryable, not sent) instead of blocking. The client keeps reading while a write cannot progress (full duplex): `ferrod`'s session reader stops reading while its writer is full, and a client that only wrote deadlocked against it. A HEAD whose status is not an HTTP status fails only its exchange.*
+- ***Review round 2 (§22.2 (dd)):** a partly read frame is not "readable": an engine that stalls mid-frame meets the backstop and liveness again. A deadline pass re-reads the live deadlines after each `CANCEL`, because that write may read frames. A write is refused while another frame is being written (`ReentrantWriteException`, nothing written), so code a destructor runs mid-write cannot splice a frame. A request is in flight before any deferred write runs. A status of 600..=999 is delivered and read as a 5xx (§23.7.4). The slot refusal reads what is waiting first.]*
 
 #### 23.11.2 The Guzzle handler (`ferro/guzzle`)
 
@@ -1248,6 +1270,17 @@ All cases run in `ferrod`'s tests against a Rust fault-injecting upstream that *
 
 *[Amended M6-F5a (SPEC §22.2 (dc)): case 3 is `ferrod`'s `http_tls_it` (`chaos3_…`), every fault a POST and every one received 0 at the upstream's HTTP layer: refused (`connect_refused`), `.invalid` through the REAL resolver (`dns`), a wrong-host and an expired certificate (`TlsRefused`, `tls_verify`), and a reset during the handshake (`tls_handshake`, dialled exactly once). The same file asserts every other `tls_*` cell for a POST and a declared GET (unknown CA, EOF, garbage instead of a ServerHello, `MIN_TLS=1.3` against a TLS 1.2-only server and against a legacy TLS 1.2 ServerHello, an `h2`-only server) with a positive control beside each, and the handshake against the connect bound.]*
 
+*[Amended M6-F8 (SPEC §22.2 (dd)): **case 8 is a PHP live test**, `php/client`'s `HttpChaosLiveTest`, because §23.7.3 is the client's table. It runs against a real `ferrod` and a recording loopback upstream (a PHP `stream_select` process, not the Rust upstream), so it sits outside `ferrod`'s tests. Nine requests are in flight on ONE session of a `Ferro::connect` connection, which has a reconnect loop and the default retry policy. Then `ferrod` gets `SIGKILL`. The cells are:*
+
+- *A POST, and an undeclared GET to an operator-idempotent upstream, with no head: Indeterminate.*
+- *A declared GET with no head: Retryable.*
+- *A 201 and a 500 head with a partial body: `ResponseIncomplete`, with combined fate NonRetryable and Indeterminate respectively.*
+- *The operator-idempotent GET after its head, and a declared GET after its head: Retryable.*
+- *A streamed POST: its partial chunk, then `ResponseIncomplete`.*
+- *A 15 MiB `REQUEST` that is still being written when the engine dies: Retryable, not sent.*
+
+*Every cell is client-synthesised, cause `link_lost`. After a relaunch the same connection serves again, and the upstream received each request exactly once and the unsent one never.]*
+
 ---
 
 ### 23.15 Slice plan
@@ -1271,7 +1304,7 @@ Every slice runs the adversarial review before push (D15's process note). Every 
 | **F5b** *(DEFERRED post-v1, owner decision 2026-10-06, SPEC §22.2 (de))* | `HTTP=auto`: the HTTP/2 sub-pool for effectively-idempotent requests. Chaos 7. **Cuttable** without touching anything else. *[Cut, as this row allowed. In v1 `HTTP=auto` is refused, disabling that upstream at config load (§23.3.1).]* | Multiplexing for declared reads; writes provably stay on HTTP/1.1. |
 | **F6** | Limits: concurrency, queue, breaker (with the RAII probe), rate limit, hold. Chaos 9, 10. | Host-level coordination, every refusal unsent. |
 | **F7** | Observability: spans from `otelcol`, metrics, slow log, the canary gate. | The redaction contract, mutation-proven. |
-| **F8** | The native PHP API: `upstream()`, Futures, streams, §23.7.3, (cj) lifted for HTTP. Chaos 8. **Requires D1c.** | DB and HTTP fan-out on one socket, including a 30 s-TTFB call beside a DB write. |
+| **F8** *(BUILT, §22.2 (dd); DONE when merged)* | The native PHP API: `upstream()`, Futures, streams, §23.7.3, (cj) lifted for HTTP. Chaos 8. **Requires D1c.** | DB and HTTP fan-out on one socket, including a 30 s-TTFB call beside a DB write. *[As built, §22.2 (dd): built whole, with no `/proto` or engine change. Both claims are measured live: two 400 ms calls, a 400 ms query and an INSERT take about 0.4 s, against ~1.2 s sequential; and a 30 s TTFB beside a DB write passes under the default configuration. Chaos 8 is asserted cell by cell. Every exchange here is plaintext `http`; F5a's TLS merged while it was built.]* |
 | **F9** | `ferro/guzzle` (cause mapping, `delay` scheduling, `FerroResponse`, decider), `ferro/psr18`, the Laravel Factory rebinding with the `Http::fake()` proof. | The seams, config-only where the ecosystem allows it. |
 | **F10** | Lanes C and B (Lane S is post-v1), with controls and contact assertions; incompatibility entries; the demo app's HTTP call. *[Since 2026-10-06 (SPEC §22.2 (de)) it also owes premises P4, P6 and P20, moved from the deferred F1b, which its incompatibility entries rest on.]* | D18 parity, or the gap stated. |
 | **F11** | Bench on D17: added latency against curl keep-alive on loopback; handshake and connection counts for N workers × M calls; §16 gains a *recorded* HTTP row. | Admission A, measured. |
