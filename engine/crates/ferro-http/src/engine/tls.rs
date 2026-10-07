@@ -64,7 +64,9 @@ use rustls::client::Resumption;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{AlertDescription, ClientConfig, RootCertStore};
 
-use crate::config::{HttpConfig, MinTls, Upstream, UpstreamEntry, env_name};
+use crate::config::{
+    HttpConfig, MinTls, NotRegularFile, Upstream, UpstreamEntry, env_name, open_regular,
+};
 use crate::origin::{Host, Scheme};
 
 /// The ALPN the HTTP/1.1 sub-pool offers (§23.8.3).
@@ -358,7 +360,7 @@ fn load_ca_file(
         key: "CA_FILE",
         reason,
     };
-    let bytes = read_file(path).map_err(|e| err(format!("cannot be read ({})", e.kind())))?;
+    let bytes = read_file(path).map_err(|e| err(read_reason(&e)))?;
     let mut store = RootCertStore::empty();
     for (i, c) in CertificateDer::pem_slice_iter(&bytes).enumerate() {
         let c = c.map_err(|_| err(format!("PEM block {} is malformed", i + 1)))?;
@@ -383,8 +385,10 @@ struct ClientAuth {
 }
 
 /// Overwrite a buffer that held key material before it is freed. Best effort: `black_box` keeps the
-/// writes from being elided as dead stores, but earlier reallocations of the buffer, and the copies
-/// the PEM decoder and `rustls` make, are out of reach (this crate forbids `unsafe` and adds no
+/// writes from being elided as dead stores. [`read_capped`] pre-sizes its buffer so a file that does
+/// not change while it is read leaves no freed copy behind. Out of reach: a reallocation if the file
+/// grows mid-read, the DER copy the PEM decoder makes and hands to `rustls`, and `rustls`'s own
+/// signing key, which stays resident for the daemon's life (this crate forbids `unsafe` and adds no
 /// crate for this).
 fn wipe(buf: &mut [u8]) {
     buf.fill(0);
@@ -398,7 +402,6 @@ fn load_client_auth(
     up: &Upstream,
     read_file: &dyn Fn(&Path) -> io::Result<Vec<u8>>,
 ) -> Result<Option<ClientAuth>, TlsSetupError> {
-    use rustls::pki_types::pem::PemObject;
     let (Some(cert_path), Some(key_path)) = (&up.tls.client_cert_file, &up.tls.client_key_file)
     else {
         return Ok(None);
@@ -408,35 +411,83 @@ fn load_client_auth(
         key,
         reason,
     };
-    let bytes = read_file(cert_path)
-        .map_err(|e| err("CLIENT_CERT_FILE", format!("cannot be read ({})", e.kind())))?;
-    let mut chain = Vec::new();
-    for (i, c) in CertificateDer::pem_slice_iter(&bytes).enumerate() {
-        let c = c.map_err(|_| {
-            err(
-                "CLIENT_CERT_FILE",
-                format!("PEM block {} is malformed", i + 1),
-            )
-        })?;
-        // Every certificate must parse: one that does not would be SENT as-is and refused by the
-        // server on every handshake — under TLS 1.3 after dispatch (D23), so every POST
-        // Indeterminate. Refusing it here turns the misconfiguration into a startup error (the
-        // `CA_FILE` rule: never a chain built from whatever happened to parse).
-        rustls::server::ParsedCertificate::try_from(&c).map_err(|_| {
-            err(
-                "CLIENT_CERT_FILE",
-                format!("certificate {} does not parse as X.509", i + 1),
-            )
-        })?;
-        chain.push(c);
-    }
-    if chain.is_empty() {
-        return Err(err("CLIENT_CERT_FILE", "holds no PEM certificate".into()));
-    }
-    let mut bytes = read_file(key_path)
-        .map_err(|e| err("CLIENT_KEY_FILE", format!("cannot be read ({})", e.kind())))?;
+    let mut bytes = read_file(cert_path).map_err(|e| err("CLIENT_CERT_FILE", read_reason(&e)))?;
+    let chain = take_chain(&mut bytes).map_err(|r| err("CLIENT_CERT_FILE", r))?;
+    let mut bytes = read_file(key_path).map_err(|e| err("CLIENT_KEY_FILE", read_reason(&e)))?;
     let key = take_key(&mut bytes).map_err(|r| err("CLIENT_KEY_FILE", r.into()))?;
     Ok(Some(ClientAuth { chain, key }))
+}
+
+/// Why a TLS file could not be read, for [`TlsSetupError::reason`]: the I/O error's KIND only, or
+/// "is not a regular file" ([`read_capped`]'s refusal of a FIFO, a device, a directory).
+fn read_reason(e: &io::Error) -> String {
+    if e.get_ref().is_some_and(|r| r.is::<NotRegularFile>()) {
+        "is not a regular file".into()
+    } else {
+        format!("cannot be read ({})", e.kind())
+    }
+}
+
+/// Parse `CLIENT_CERT_FILE`'s bytes — one or more PEM certificates, end-entity first — and
+/// [`wipe`] them on every path (a combined file, certificate and key in one, is common, and its
+/// key is skipped here but must not linger).
+///
+/// **Only what `rustls` itself needs is checked** (M6-F5c review F2). Every block must be
+/// well-formed DER — one outer `SEQUENCE` covering the block exactly — and the END-ENTITY must
+/// parse as the X.509 v3 certificate `rustls` matches the key against (`webpki`'s strict parser;
+/// `rustls` would refuse the pair at the same point). The rest of the chain is sent as the operator
+/// wrote it and judged by the SERVER: `webpki`'s strict parser refuses a v1 root, which real
+/// servers (OpenSSL's, measured by the review) accept in a client chain.
+fn take_chain(bytes: &mut [u8]) -> Result<Vec<CertificateDer<'static>>, String> {
+    use rustls::pki_types::pem::PemObject;
+    let mut chain = Vec::new();
+    let mut failure = None;
+    for (i, c) in CertificateDer::pem_slice_iter(bytes).enumerate() {
+        let Ok(c) = c else {
+            failure = Some(format!("PEM block {} is malformed", i + 1));
+            break;
+        };
+        if !is_der_sequence(&c) {
+            failure = Some(format!("certificate {} is not DER-encoded", i + 1));
+            break;
+        }
+        if i == 0 && rustls::server::ParsedCertificate::try_from(&c).is_err() {
+            failure = Some(
+                "certificate 1 (the end-entity) is not an X.509 v3 certificate rustls can match \
+                 to the key"
+                    .into(),
+            );
+            break;
+        }
+        chain.push(c);
+    }
+    wipe(bytes);
+    match failure {
+        Some(f) => Err(f),
+        None if chain.is_empty() => Err("holds no PEM certificate".into()),
+        None => Ok(chain),
+    }
+}
+
+/// Whether `b` is exactly one DER `SEQUENCE` (tag `0x30`, a definite length, nothing after it):
+/// the outer shape every X.509 certificate has.
+fn is_der_sequence(b: &[u8]) -> bool {
+    let [0x30, first, rest @ ..] = b else {
+        return false;
+    };
+    let (len, header) = if first & 0x80 == 0 {
+        (usize::from(*first), 0)
+    } else {
+        let n = usize::from(first & 0x7f);
+        if n == 0 || n > 4 || rest.len() < n {
+            return false;
+        }
+        let len = rest[..n]
+            .iter()
+            .fold(0usize, |a, &x| (a << 8) | usize::from(x));
+        (len, n)
+    };
+    rest.len() == header + len
 }
 
 /// Parse `CLIENT_KEY_FILE`'s bytes — exactly one PEM private key (PKCS#8, PKCS#1 or SEC1) — and
@@ -511,16 +562,31 @@ fn build_upstream(
 
 /// The production file reader for TLS material (`CA_FILE`, `CLIENT_CERT_FILE`, `CLIENT_KEY_FILE`),
 /// with a size cap.
+///
+/// - **Regular files only** ([`open_regular`]): a FIFO would block startup forever (review F6).
+/// - **Pre-sized from the file's length** (review F3), so a file that does not change while it is
+///   read is read with no reallocation, and `read_to_end`'s growth leaves no freed copy of key
+///   material behind. A file that grows meanwhile can still reallocate — best effort.
+/// - **Wiped on every error path**, including the over-cap refusal, before the buffer is freed.
 pub fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::Read;
-    let mut buf = Vec::new();
-    std::fs::File::open(path)?
-        .take(MAX_CA_FILE_BYTES + 1)
-        .read_to_end(&mut buf)?;
-    if buf.len() as u64 > MAX_CA_FILE_BYTES {
+    let (file, len) = open_regular(path)?;
+    if len > MAX_CA_FILE_BYTES {
         return Err(io::ErrorKind::FileTooLarge.into());
     }
-    Ok(buf)
+    let mut buf = Vec::with_capacity(usize::try_from(len).unwrap_or(0).saturating_add(1));
+    let r = file.take(MAX_CA_FILE_BYTES + 1).read_to_end(&mut buf);
+    match r {
+        Ok(_) if buf.len() as u64 <= MAX_CA_FILE_BYTES => Ok(buf),
+        Ok(_) => {
+            wipe(&mut buf);
+            Err(io::ErrorKind::FileTooLarge.into())
+        }
+        Err(e) => {
+            wipe(&mut buf);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -929,6 +995,169 @@ mod tests {
         );
     }
 
+    /// Review F2: only what `rustls` needs is checked. A chain whose second certificate is an X.509
+    /// **v1** root — `openssl x509 -req -signkey`'s shape, which `webpki`'s strict parser refuses
+    /// and real servers accept — LOADS, is presented, and a server that trusts that root serves
+    /// the request. (The garbage-DER control is in the unloadable-material test.)
+    #[tokio::test]
+    async fn a_v1_certificate_in_the_client_chain_is_sent_not_refused() {
+        let ca = testcert::ca("Ferro Test CA");
+        let leaf = ca.sign(&Spec::new("api.test", Usage::Server).dns("api.test"));
+        let v1_root = testcert::ca_v1("V1 Root");
+        assert!(
+            rustls::server::ParsedCertificate::try_from(&v1_root.cert()).is_err(),
+            "premise: webpki's strict parser refuses the v1 root"
+        );
+        let client = v1_root.sign(&Spec::new("ferro-client", Usage::Client));
+        let chain = [client.cert_pem(), v1_root.cert_pem()].concat();
+        let ctxs = contexts_with(
+            &ca,
+            &[
+                ("CLIENT_CERT_FILE", "/chain.pem"),
+                ("CLIENT_KEY_FILE", "/client.key"),
+            ],
+            vec![
+                ("/chain.pem", chain.into_bytes()),
+                ("/client.key", client.key_pem().into_bytes()),
+            ],
+        );
+        assert!(ctxs.errors().is_empty(), "{:?}", ctxs.errors());
+        let ctx = ctxs.get("api").unwrap().as_ref().unwrap().clone();
+        let answer = mtls_exchange(&ctx, None, mtls_server(&leaf, &v1_root, false))
+            .await
+            .expect("a server that trusts the v1 root accepts the chain");
+        assert!(answer.starts_with(b"HTTP/1.1 200"), "{answer:?}");
+    }
+
+    /// Review F3: the CERTIFICATE file's buffer is wiped too — a combined file (certificate and key
+    /// in one, common for curl's `cert` and HAProxy) loads as `CLIENT_CERT_FILE`, and its key must
+    /// not linger — on success and on a refusal.
+    #[test]
+    fn the_cert_file_buffer_is_wiped_and_a_combined_file_loads() {
+        let ca = testcert::ca("Ferro Test CA");
+        let client = ca.sign(&Spec::new("ferro-client", Usage::Client));
+        let mut combined = [client.cert_pem(), client.key_pem()].concat().into_bytes();
+        assert_eq!(take_chain(&mut combined).map(|c| c.len()), Ok(1));
+        assert!(combined.iter().all(|b| *b == 0), "wiped on success");
+        let mut bad = [
+            client.key_pem().as_bytes(),
+            b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+        ]
+        .concat();
+        assert!(take_chain(&mut bad).is_err());
+        assert!(bad.iter().all(|b| *b == 0), "wiped on a refusal");
+    }
+
+    /// Review F6: a FIFO (or any non-regular file) configured as `CA_FILE`, `CLIENT_CERT_FILE` or
+    /// `CLIENT_KEY_FILE` is refused WITHOUT being opened — opening a FIFO for reading blocks until a
+    /// writer appears, i.e. forever at start — and disables the upstream naming the key. The
+    /// attached-header reader refuses it the same way. Each call is bounded by a 5 s watchdog, so a
+    /// regression fails instead of hanging the suite.
+    #[test]
+    fn a_fifo_tls_file_is_refused_without_blocking() {
+        let dir = std::env::temp_dir().join(format!("ferro-f5c-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("material.pem");
+        let ok = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(ok.success());
+        let within = |f: Box<dyn FnOnce() -> String + Send>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(f());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("returned instead of blocking on the FIFO")
+        };
+        let p = fifo.clone();
+        let e = within(Box::new(move || {
+            format!("{:?}", read_capped(&p).map(|_| ()).unwrap_err())
+        }));
+        assert!(e.contains("NotRegularFile"), "{e}");
+        let p = fifo.clone();
+        let e = within(Box::new(move || {
+            format!(
+                "{:?}",
+                crate::config::read_capped(&p).map(|_| ()).unwrap_err()
+            )
+        }));
+        assert!(e.contains("NotRegularFile"), "{e}");
+        // Through the production reader: each TLS key disables the upstream, naming the key.
+        let ca = testcert::ca("Ferro Test CA");
+        let client = ca.sign(&Spec::new("ferro-client", Usage::Client));
+        let ca_pem = dir.join("ca.pem");
+        let cert_pem = dir.join("client.pem");
+        let key_pem = dir.join("client.key");
+        std::fs::write(&ca_pem, ca.cert_pem()).unwrap();
+        std::fs::write(&cert_pem, client.cert_pem()).unwrap();
+        std::fs::write(&key_pem, client.key_pem()).unwrap();
+        for bad in ["CA_FILE", "CLIENT_CERT_FILE", "CLIENT_KEY_FILE"] {
+            let path = |k: &str, good: &Path| {
+                if k == bad {
+                    fifo.display().to_string()
+                } else {
+                    good.display().to_string()
+                }
+            };
+            let vars: Vec<(OsString, OsString)> = vec![
+                ("FERRO_UPSTREAMS".into(), "api".into()),
+                (
+                    "FERRO_UPSTREAM_API_ORIGIN".into(),
+                    "https://api.test".into(),
+                ),
+                (
+                    "FERRO_UPSTREAM_API_CA_FILE".into(),
+                    path("CA_FILE", &ca_pem).into(),
+                ),
+                (
+                    "FERRO_UPSTREAM_API_CLIENT_CERT_FILE".into(),
+                    path("CLIENT_CERT_FILE", &cert_pem).into(),
+                ),
+                (
+                    "FERRO_UPSTREAM_API_CLIENT_KEY_FILE".into(),
+                    path("CLIENT_KEY_FILE", &key_pem).into(),
+                ),
+            ];
+            let s = within(Box::new(move || {
+                let cfg = HttpConfig::load(vars, &read_capped);
+                let ctxs = TlsContexts::build(&cfg, &OsRoots::Fixed(Vec::new()), &read_capped);
+                ctxs.errors()
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            }));
+            assert!(
+                s.contains(&format!("FERRO_UPSTREAM_API_{bad} is not a regular file")),
+                "{bad}: {s}"
+            );
+        }
+        // The control: the same three regular files load.
+        let vars: Vec<(OsString, OsString)> = vec![
+            ("FERRO_UPSTREAMS".into(), "api".into()),
+            (
+                "FERRO_UPSTREAM_API_ORIGIN".into(),
+                "https://api.test".into(),
+            ),
+            ("FERRO_UPSTREAM_API_CA_FILE".into(), ca_pem.clone().into()),
+            (
+                "FERRO_UPSTREAM_API_CLIENT_CERT_FILE".into(),
+                cert_pem.clone().into(),
+            ),
+            (
+                "FERRO_UPSTREAM_API_CLIENT_KEY_FILE".into(),
+                key_pem.clone().into(),
+            ),
+        ];
+        let cfg = HttpConfig::load(vars, &read_capped);
+        let ctxs = TlsContexts::build(&cfg, &OsRoots::Fixed(Vec::new()), &read_capped);
+        assert!(ctxs.errors().is_empty(), "{:?}", ctxs.errors());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Key custody (§23.3.2): the key file's buffer is overwritten once it is parsed — on success
     /// and on every refusal — so the PEM does not linger in the buffer this crate owns.
     #[test]
@@ -967,6 +1196,9 @@ mod tests {
             b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".to_vec();
         let garbage_key =
             b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n".to_vec();
+        let bad_b64_cert: &[u8] = b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+        let bad_b64_key: &[u8] = b"-----BEGIN PRIVATE KEY-----\n!!!!\n-----END PRIVATE KEY-----\n";
+        let v1_leaf = ca.sign(&Spec::new("ferro-client", Usage::Client).v1());
         let cat = |a: &[u8], b: &[u8]| [a, b].concat();
         type Case = (
             &'static str,
@@ -998,18 +1230,39 @@ mod tests {
                 "holds no PEM certificate",
             ),
             (
-                "cert block not X.509",
+                "cert block not DER",
                 Some(garbage_cert.clone()),
                 Some(key.clone()),
                 CERT,
-                "certificate 1 does not parse",
+                "certificate 1 is not DER-encoded",
             ),
             (
-                "good cert, then a block not X.509",
+                "good cert, then a block not DER (the control for the v1 chain test)",
                 Some(cat(&cert, &garbage_cert)),
                 Some(key.clone()),
                 CERT,
-                "certificate 2 does not parse",
+                "certificate 2 is not DER-encoded",
+            ),
+            (
+                "cert, then a malformed PEM block",
+                Some(cat(&cert, bad_b64_cert)),
+                Some(key.clone()),
+                CERT,
+                "PEM block 2 is malformed",
+            ),
+            (
+                "a v1 end-entity (rustls cannot match it to the key)",
+                Some(v1_leaf.cert_pem().into_bytes()),
+                Some(v1_leaf.key_pem().into_bytes()),
+                CERT,
+                "certificate 1 (the end-entity) is not an X.509 v3 certificate",
+            ),
+            (
+                "good key, then a malformed PEM block (the twin of the cert-side case)",
+                Some(cert.clone()),
+                Some(cat(&key, bad_b64_key)),
+                KEY,
+                "holds a malformed PEM block",
             ),
             (
                 "key file holds only a certificate",

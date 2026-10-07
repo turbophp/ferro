@@ -1472,6 +1472,9 @@ enum Presented {
     Absent,
     /// One issued by a CA the server does not trust.
     Rejected,
+    /// One issued by the CA the server trusts, but EXPIRED — D23's flagship case, a certificate
+    /// that expires in service (review F1).
+    Expired,
 }
 
 /// **SPEC D23 (was §21 open item O-F5c), measured end to end for one refusal shape.** An upstream
@@ -1493,11 +1496,16 @@ async fn assert_mtls_refusal(presented: Presented) {
     let client_ca = testcert::ca("Client CA");
     let stranger = testcert::ca("Stranger CA");
     let mut extra = vec![("CA_FILE", pki.ca_file().display().to_string())];
-    if let Presented::Rejected = presented {
-        extra.extend(pki.client_files(
+    match presented {
+        Presented::Absent => {}
+        Presented::Rejected => extra.extend(pki.client_files(
             "rejected",
             &stranger.sign(&Spec::new("ferro-client", Usage::Client)),
-        ));
+        )),
+        Presented::Expired => extra.extend(pki.client_files(
+            "expired",
+            &client_ca.sign(&Spec::new("ferro-client", Usage::Client).expired()),
+        )),
     }
 
     // TLS 1.2: before dispatch.
@@ -1548,6 +1556,12 @@ async fn assert_mtls_refusal(presented: Presented) {
                 .contains("refused the TLS client certificate after the handshake"),
             "{presented:?}: the refusal is named: {e:?}"
         );
+        if let Presented::Expired = presented {
+            assert!(
+                e.message.contains("alert CertificateExpired"),
+                "the expiry is what the operator must see: {e:?}"
+            );
+        }
     }
     assert!(
         rec.requests().is_empty(),
@@ -1579,6 +1593,15 @@ async fn mtls_refusal_of_an_absent_certificate_is_tls_verify_under_tls12_and_sen
 async fn mtls_refusal_of_a_rejected_certificate_is_tls_verify_under_tls12_and_sent_no_head_under_tls13()
  {
     assert_mtls_refusal(Presented::Rejected).await;
+}
+
+/// D23, shape 3 (review F1): a configured certificate from the trusted CA that has EXPIRED — the
+/// case D23's cost paragraph singles out. TLS 1.2 `tls_verify`; TLS 1.3 "sent, no head" / `reset`,
+/// named `CertificateExpired`.
+#[tokio::test]
+async fn mtls_refusal_of_an_expired_certificate_is_tls_verify_under_tls12_and_sent_no_head_under_tls13()
+ {
+    assert_mtls_refusal(Presented::Expired).await;
 }
 
 /// A client socket whose first FLUSH after the server's first bytes — the end of the client's last
@@ -2120,4 +2143,132 @@ async fn a_close_delimited_body_ends_cleanly_only_with_close_notify() {
             );
         }
     }
+}
+
+// =================================================================================================
+// The logs (M6-F5c review F5): the refusal `warn`, rate-limited per upstream, and §23.3.3's
+// startup warning for a client key
+// =================================================================================================
+
+/// Captured `tracing` output, for a scoped (thread-local) subscriber. Engine-level calls on the
+/// current-thread test runtime run on this thread, so their events are captured.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl LogCapture {
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        )
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// The per-request refusal `warn` names the upstream and the alert — never a path — and, because
+/// PHP traffic drives it, is logged ONCE per upstream per window however many requests are
+/// refused (review F5); every refused request still names the refusal in its own message.
+#[tokio::test]
+async fn the_refusal_warn_names_the_upstream_and_is_rate_limited() {
+    let pki = Pki::new();
+    let client_ca = testcert::ca("Client CA");
+    let (addr, rec) = tls_upstream_held(
+        mtls_server_cfg(&pki.leaf(), &client_ca, false),
+        Script::Respond(OK_HELLO),
+        Some(Duration::from_millis(100)),
+    )
+    .await;
+    let ca_file = pki.ca_file().display().to_string();
+    let e = engine(env(addr.port(), &[("CA_FILE", ca_file.clone())]));
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    for _ in 0..3 {
+        let t = on_engine(&e, &fresh_post(), None).await;
+        let Terminal::Error(ep) = t else {
+            panic!("expected an error, got {t:?}");
+        };
+        assert!(
+            ep.message
+                .contains("refused the TLS client certificate after the handshake"),
+            "{ep:?}"
+        );
+    }
+    let text = logs.text();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("refused this engine's TLS client certificate"))
+        .collect();
+    assert_eq!(lines.len(), 1, "one line per upstream per window: {text}");
+    assert!(lines[0].contains("WARN"), "{text}");
+    assert!(lines[0].contains("upstream=api"), "{text}");
+    assert!(lines[0].contains("alert=CertificateRequired"), "{text}");
+    assert!(lines[0].contains("suppressed=0"), "{text}");
+    assert!(!text.contains(&ca_file), "never a path: {text}");
+    assert_eq!(rec.tcp(), 3, "three requests, three refusals");
+}
+
+/// §23.3.3 as amended by M6-F5c: the startup isolation warning names an upstream with a
+/// `CLIENT_KEY_FILE` (a client key is credential material) when PHP can share `ferrod`'s uid, and
+/// never quotes the key's path. The control: with a proper uid split it says nothing.
+#[test]
+fn the_startup_isolation_warning_names_an_upstream_with_a_client_key() {
+    let cfg = HttpConfig::load(
+        [
+            ("FERRO_UPSTREAMS", "mtls"),
+            ("FERRO_UPSTREAM_MTLS_ORIGIN", "https://m.example"),
+            ("FERRO_UPSTREAM_MTLS_CLIENT_CERT_FILE", "/secret/client.pem"),
+            ("FERRO_UPSTREAM_MTLS_CLIENT_KEY_FILE", "/secret/client.key"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into())),
+        &read_real,
+    );
+    assert!(cfg.errors().is_empty(), "{:?}", cfg.errors());
+    let own_uid = 999;
+    let logs = LogCapture::default();
+    {
+        let _guard = logs.install();
+        ferrod::http_config::log(&cfg, &[], own_uid);
+    }
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|l| l.contains("credential isolation is VOID"))
+        .unwrap_or_else(|| panic!("the warning: {text}"));
+    assert!(line.contains("WARN") && line.contains("\"mtls\""), "{line}");
+    assert!(line.contains("client-key"), "{line}");
+    assert!(!text.contains("/secret"), "never the path: {text}");
+    // The control: a proper split (PHP's uid listed, ferrod's not) — no warning.
+    let quiet = LogCapture::default();
+    {
+        let _guard = quiet.install();
+        ferrod::http_config::log(&cfg, &[33], own_uid);
+    }
+    assert!(
+        !quiet.text().contains("credential isolation is VOID"),
+        "{}",
+        quiet.text()
+    );
 }

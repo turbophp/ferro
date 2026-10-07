@@ -248,6 +248,12 @@ pub struct HttpEngine {
     in_flight: InFlight,
     live: Arc<AtomicUsize>,
     tls: TlsContexts,
+    refusal_warnings: RefusalWarnings,
+    /// Test hook (this crate's unit tests only): pause after an `https` connection's `hyper`
+    /// handshake, before dispatch, so the connection task can run first — the ordering the
+    /// multi-thread runtime can produce under load (M6-F5c review F4).
+    #[cfg(test)]
+    pause_after_h1: Option<Duration>,
 }
 
 impl std::fmt::Debug for HttpEngine {
@@ -319,6 +325,9 @@ impl HttpEngine {
             in_flight: InFlight(watch::Sender::new(0)),
             live: Arc::new(AtomicUsize::new(0)),
             tls,
+            refusal_warnings: RefusalWarnings::default(),
+            #[cfg(test)]
+            pause_after_h1: None,
         }
     }
 
@@ -611,11 +620,16 @@ impl HttpEngine {
                 let err = e.into_error();
                 // TLS 1.3 client authentication (SPEC D23): the server's refusal of our certificate
                 // is read here, after dispatch. It is NAMED, never re-classified (see the helper).
-                let refusal = tls::client_auth_alert(&err);
+                // It is in `err`'s chain when the request was queued first, and in the connection
+                // task's output when the task read it first (review F4).
+                let in_err = tls::client_auth_alert(&err);
                 let track = conn.track.clone();
-                conn.discard().await; // only now is `sent` final (§23.7.1)
+                // Only after the teardown is `sent` final (§23.7.1).
+                let in_task = conn.discard_reporting().await;
+                let refusal = in_err.or(in_task);
                 if !track.sent() {
                     return name_client_auth_refusal(
+                        &self.refusal_warnings,
                         classify(Situation::DispatchedNotSent(head::not_sent(&track)), idem),
                         refusal,
                         &up.name,
@@ -630,6 +644,7 @@ impl HttpEngine {
                     );
                 }
                 return name_client_auth_refusal(
+                    &self.refusal_warnings,
                     classify(
                         Situation::SentNoHead(head::sent_no_head(&err, &track)),
                         idem,
@@ -899,6 +914,10 @@ impl HttpEngine {
             ctx.counts.record(tls.get_ref().1.handshake_kind());
             let tls_us = micros(tls_start.elapsed());
             let (sender, task) = h1_handshake(Tracker::over_tls(tls, track.clone())).await?;
+            #[cfg(test)]
+            if let Some(d) = self.pause_after_h1 {
+                tokio::time::sleep(d).await;
+            }
             (sender, task, track, tls_us)
         } else {
             let (tracked, track) = Tracker::new(d.stream);
@@ -927,7 +946,13 @@ impl HttpEngine {
 /// `hyper`'s HTTP/1.1 client over a tracked I/O, with its connection task spawned.
 async fn h1_handshake<T: Io>(
     io: Tracker<T>,
-) -> Result<(http1::SendRequest<OneChunk>, tokio::task::JoinHandle<()>), DialFailure> {
+) -> Result<
+    (
+        http1::SendRequest<OneChunk>,
+        tokio::task::JoinHandle<Option<rustls::AlertDescription>>,
+    ),
+    DialFailure,
+> {
     let mut builder = http1::Builder::new();
     builder
         .max_buf_size(head::H1_MAX_BUF_SIZE)
@@ -944,9 +969,11 @@ async fn h1_handshake<T: Io>(
         // table names, so it is the closest one: the connection is unusable.
         Err(_) => return Err(DialFailure::ConnectUnreachable),
     };
-    let task = tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    // The task reports the client-certificate refusal it died of (M6-F5c review F4): if it reads
+    // the alert before the request is queued, `hyper` returns the request with an error that has
+    // no I/O source, and this is where the alert can still be named.
+    let task =
+        tokio::spawn(async move { conn.await.err().and_then(|e| tls::client_auth_alert(&e)) });
     Ok((sender, task))
 }
 
@@ -1019,7 +1046,15 @@ fn classify(s: Situation, idempotent: bool) -> Terminal {
 /// and a prefix on the terminal's message, which is not for programmatic matching (PROTOCOL.md
 /// §5). The code, the branch and the `detail` token are untouched — a `tls_*` token here would map
 /// an `Indeterminate` POST to Guzzle's `ConnectException`, which naive deciders retry (§23.11.3).
+///
+/// The `warn` is driven by PHP traffic — one per refused request — so it is rate-limited per
+/// upstream ([`RefusalWarnings`]): at most one line per [`REFUSAL_WARN_EVERY`], carrying how many
+/// were suppressed since the last (M6-F5c review F5). The message prefix is per request and is not
+/// limited. `access_denied` and the other alerts [`tls::is_client_auth_alert`] lists are named
+/// as a certificate refusal even when a server sends one for another reason; the alert is quoted, so
+/// an operator can tell.
 fn name_client_auth_refusal(
+    warnings: &RefusalWarnings,
     t: Terminal,
     alert: Option<rustls::AlertDescription>,
     upstream: &str,
@@ -1027,13 +1062,16 @@ fn name_client_auth_refusal(
     let Some(alert) = alert else {
         return t;
     };
-    tracing::warn!(
-        upstream = %upstream,
-        alert = ?alert,
-        "http: the upstream refused this engine's TLS client certificate (or its absence) after \
-         the TLS 1.3 handshake, with the request already dispatched (SPEC D23) — check \
-         CLIENT_CERT_FILE, the CA the upstream trusts, and the certificate's expiry"
-    );
+    if let Some(suppressed) = warnings.admit(upstream, Instant::now()) {
+        tracing::warn!(
+            upstream = %upstream,
+            alert = ?alert,
+            suppressed,
+            "http: the upstream refused this engine's TLS client certificate (or its absence) \
+             after the TLS 1.3 handshake, with the request already dispatched (SPEC D23) — check \
+             CLIENT_CERT_FILE, the CA the upstream trusts, and the certificate's expiry"
+        );
+    }
     match t {
         Terminal::Error(mut ep) => {
             ep.message = format!(
@@ -1044,6 +1082,40 @@ fn name_client_auth_refusal(
             Terminal::Error(ep)
         }
         other => other,
+    }
+}
+
+/// The most often [`name_client_auth_refusal`] logs for one upstream.
+pub const REFUSAL_WARN_EVERY: Duration = Duration::from_secs(10);
+
+/// Per-upstream rate limit for the client-certificate refusal `warn` (M6-F5c review F5). Keyed by
+/// upstream NAME, and a refusal is only ever named for a configured upstream, so the map is
+/// bounded by the configuration.
+#[derive(Default)]
+pub struct RefusalWarnings(std::sync::Mutex<std::collections::HashMap<String, (Instant, u64)>>);
+
+impl RefusalWarnings {
+    /// `Some(suppressed)` when a line should be logged now — `suppressed` refusals were not logged
+    /// since the last line — or `None` while the last line is younger than [`REFUSAL_WARN_EVERY`].
+    pub fn admit(&self, upstream: &str, now: Instant) -> Option<u64> {
+        let mut m = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match m.get_mut(upstream) {
+            Some((last, suppressed))
+                if now.saturating_duration_since(*last) < REFUSAL_WARN_EVERY =>
+            {
+                *suppressed += 1;
+                None
+            }
+            Some((last, suppressed)) => {
+                let n = std::mem::take(suppressed);
+                *last = now;
+                Some(n)
+            }
+            None => {
+                m.insert(upstream.to_string(), (now, 0));
+                Some(0)
+            }
+        }
     }
 }
 
@@ -1157,4 +1229,166 @@ fn build_request(
     }
     let (parts, ()) = b.body(()).map_err(|_| PolicyCause::Target)?.into_parts();
     Ok(parts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testcert::{self, Spec, Usage};
+    use ferro_proto::consts::{branch, errc, http_cause};
+    use std::ffi::OsString;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::path::Path;
+
+    struct NullSink;
+    impl ResponseSink for NullSink {
+        fn send<'a>(
+            &'a self,
+            _frame: SinkFrame,
+            _payload: Vec<u8>,
+            _deadline: tokio::time::Instant,
+            _cancel: &'a CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Review F5: the refusal `warn` is driven by PHP traffic, so it is rate-limited per upstream —
+    /// one line, then silence for [`REFUSAL_WARN_EVERY`] with the suppressed count carried into the
+    /// next line; each upstream has its own window.
+    #[test]
+    fn refusal_warnings_are_rate_limited_per_upstream() {
+        let w = RefusalWarnings::default();
+        let t0 = Instant::now();
+        assert_eq!(w.admit("api", t0), Some(0));
+        for i in 1..=3 {
+            assert_eq!(w.admit("api", t0 + Duration::from_secs(i)), None);
+        }
+        assert_eq!(w.admit("other", t0 + Duration::from_secs(1)), Some(0));
+        assert_eq!(w.admit("api", t0 + REFUSAL_WARN_EVERY), Some(3));
+        assert_eq!(w.admit("api", t0 + REFUSAL_WARN_EVERY), None);
+        assert_eq!(
+            w.admit(
+                "api",
+                t0 + REFUSAL_WARN_EVERY * 2 + Duration::from_millis(1)
+            ),
+            Some(1)
+        );
+    }
+
+    /// **Review F4: the refusal is named whichever side reads it.** Held after `hyper`'s handshake
+    /// (the test hook), the connection task runs first — as it can on the multi-thread runtime —
+    /// and reads the TLS 1.3 `certificate_required` alert before the request is queued; `hyper`
+    /// then hands the request back with an error that carries NO I/O source. The fate is
+    /// "dispatched, not sent" (`unsent_closed`, Retryable), and the alert is read from the
+    /// connection task's output, so the message still names it.
+    #[tokio::test]
+    async fn a_refusal_the_connection_task_read_before_dispatch_is_still_named() {
+        let ca = testcert::ca("Ferro Test CA");
+        let client_ca = testcert::ca("Client CA");
+        let leaf = ca.sign(&Spec::new("api.test", Usage::Server).dns("api.test"));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(client_ca.cert()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(vec![leaf.cert()], leaf.key())
+                .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server);
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                let a = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = a.accept(s).await;
+                });
+            }
+        });
+
+        let pem = ca.cert_pem().into_bytes();
+        let read = move |p: &Path| {
+            if p == Path::new("/ca.pem") {
+                Ok(pem.clone())
+            } else {
+                Err(std::io::ErrorKind::NotFound.into())
+            }
+        };
+        let vars: Vec<(OsString, OsString)> = vec![
+            ("FERRO_UPSTREAMS".into(), "api".into()),
+            (
+                "FERRO_UPSTREAM_API_ORIGIN".into(),
+                format!("https://api.test:{port}").into(),
+            ),
+            (
+                "FERRO_UPSTREAM_API_ADDRESS_CLASSES".into(),
+                "loopback".into(),
+            ),
+            ("FERRO_UPSTREAM_API_CA_FILE".into(), "/ca.pem".into()),
+        ];
+        let cfg = HttpConfig::load(vars, &read);
+        assert!(cfg.errors().is_empty(), "{:?}", cfg.errors());
+        let resolver = StaticResolver::new();
+        resolver.set("api.test", vec![vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]]);
+        let mut engine = HttpEngine::with_tls_seams(
+            Arc::new(cfg),
+            resolver,
+            Arc::new(TcpConnect),
+            &OsRoots::Fixed(Vec::new()),
+            &read,
+        );
+        engine.pause_after_h1 = Some(Duration::from_millis(200));
+        let req = HttpRequest {
+            upstream: "api".into(),
+            method: "POST".into(),
+            target: "/".into(),
+            origin: None,
+            headers: Vec::new(),
+            body: Some(b"charge".to_vec()),
+            timeout_ms: Some(10_000),
+            connect_timeout_ms: None,
+            read_timeout_ms: None,
+            idempotent: None,
+            decode: false,
+            route: None,
+            traceparent: None,
+        };
+        let t = engine
+            .exchange(
+                &req,
+                None,
+                Instant::now(),
+                &CancellationToken::new(),
+                &NullSink,
+            )
+            .await;
+        let Terminal::Error(ep) = t else {
+            panic!("expected an error, got {t:?}");
+        };
+        assert_eq!(
+            (ep.code, ep.branch, ep.detail.as_deref()),
+            (
+                errc::CONNECTION_LOST,
+                branch::RETRYABLE,
+                Some(http_cause::UNSENT_CLOSED)
+            ),
+            "{ep:?}"
+        );
+        assert!(
+            ep.message.contains(
+                "refused the TLS client certificate after the handshake (alert CertificateRequired"
+            ),
+            "named from the connection task: {ep:?}"
+        );
+    }
 }
