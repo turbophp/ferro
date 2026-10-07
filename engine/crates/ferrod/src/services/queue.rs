@@ -897,8 +897,6 @@ impl Reply {
         let label = metrics.label_of(queue);
         self.responder
             .push_span_attr(("ferro.queue.store", Str(store.name.clone())));
-        self.responder
-            .push_span_attr(("ferro.queue.queue", Str(metrics.label(label).to_string())));
         self.responder.push_span_attr(("ferro.in_tx", Bool(in_tx)));
         self.obs = Some(Obs {
             metrics: Arc::clone(metrics),
@@ -910,22 +908,30 @@ impl Reply {
         });
     }
 
-    fn error(self, ep: ErrorPayload) {
-        if let Some(o) = &self.obs {
-            let outcome = if ep.code == errc::LEASE_LOST {
-                MetricOutcome::LeaseLost
-            } else {
-                MetricOutcome::Error
-            };
-            o.metrics.op(o.label, o.op, outcome);
-        }
+    /// Count the terminal and label the span with the queue it is FINALLY attributed to — the same
+    /// label for both, so a span and its series never disagree.
+    fn count(&mut self, label: Option<usize>, outcome: MetricOutcome) -> Option<usize> {
+        let o = self.obs.as_ref()?;
+        let label = label.unwrap_or(o.label);
+        o.metrics.op(label, o.op, outcome);
+        let text = o.metrics.label(label).to_string();
+        self.responder
+            .push_span_attr(("ferro.queue.queue", crate::otlp::AttrValue::Str(text)));
+        Some(label)
+    }
+
+    fn error(mut self, ep: ErrorPayload) {
+        let outcome = if ep.code == errc::LEASE_LOST {
+            MetricOutcome::LeaseLost
+        } else {
+            MetricOutcome::Error
+        };
+        self.count(None, outcome);
         self.responder.end_error(ep);
     }
 
-    fn cancelled(self) {
-        if let Some(o) = &self.obs {
-            o.metrics.op(o.label, o.op, MetricOutcome::Error);
-        }
+    fn cancelled(mut self) {
+        self.count(None, MetricOutcome::Error);
         self.responder.end_cancelled();
     }
 
@@ -956,11 +962,12 @@ impl Reply {
             matches!(ok, VerbOk::Ack { .. }),
         );
         let body = ok.encode(stats);
-        if let Some(o) = &self.obs {
-            let label = queue
-                .as_deref()
-                .map_or(o.label, |q| o.metrics.label_of(Some(q)));
-            o.metrics.op(label, o.op, outcome);
+        let final_label = self
+            .obs
+            .as_ref()
+            .and_then(|o| queue.as_deref().map(|q| o.metrics.label_of(Some(q))));
+        let label = self.count(final_label, outcome);
+        if let (Some(o), Some(label)) = (&self.obs, label) {
             let us = stats.queue_us.saturating_add(stats.exec_us);
             if is_enqueue {
                 o.metrics.enqueued(label, o.in_tx, affected);
@@ -3005,5 +3012,182 @@ mod tests {
             "nothing was sent: {:?}",
             co.conn().recorded
         );
+    }
+
+    // ---- M7-G3: the terminal funnel (metrics, span, labels) -----------------------------------
+
+    fn reserved(queue: &str, attempts: u32) -> pgq::Reserved {
+        pgq::Reserved {
+            id: JobId(9),
+            token: Token::from_pg(100, attempts as i16),
+            attempts,
+            queue: queue.into(),
+            payload: "p".into(),
+            created_at: 100,
+            lease_deadline: 1_091,
+        }
+    }
+
+    fn funnel(
+        metrics: &Arc<QueueMetrics>,
+        op: usize,
+        queue: Option<&str>,
+    ) -> (
+        Reply,
+        Arc<std::sync::Mutex<Option<crate::session::responder::Terminal>>>,
+        tokio::sync::mpsc::Receiver<crate::otlp::SpanRecord>,
+    ) {
+        let (tracer, rx) = crate::otlp::Tracer::for_test(
+            crate::otlp::Sampler::ParentBasedAlwaysOn,
+            8,
+            &crate::otlp::COUNTERS,
+        );
+        let (responder, cell) = Responder::new_pair();
+        let responder = responder.with_span(tracer.begin(None, Vec::new));
+        let mut reply = Reply::bare(responder);
+        reply.observe(
+            &store(),
+            metrics,
+            op,
+            queue,
+            false,
+            crate::pools::SlowLogConfig::default(),
+        );
+        (reply, cell, rx)
+    }
+
+    fn attr(span: &crate::otlp::SpanRecord, key: &str) -> Option<crate::otlp::AttrValue> {
+        span.attrs
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// Every terminal passes the ONE funnel: it is counted under its outcome and its labelled queue,
+    /// and its span carries the store, the queue LABEL (never an unlisted name) and the job count.
+    #[tokio::test]
+    async fn every_terminal_is_counted_once_under_its_outcome_and_label() {
+        use crate::otlp::AttrValue::{Int, Str};
+        use crate::services::queue_metrics::Outcome as O;
+        let metrics = Arc::new(QueueMetrics::new("jobs", &["default".into()]));
+        let default = metrics.label_of(Some("default"));
+        let other = metrics.label_of(None);
+
+        // RESERVE with a job from `default`, asked on an unlisted first queue: labelled by the JOB's.
+        let (reply, cell, mut rx) = funnel(&metrics, 1, Some("secret-tenant"));
+        reply.ok(
+            VerbOk::Reserve(vec![reserved("default", 2)]),
+            QueueStats {
+                queue_us: 5,
+                exec_us: 7,
+            },
+        );
+        assert!(matches!(
+            cell.lock().unwrap().take(),
+            Some(crate::session::responder::Terminal::Ok(_))
+        ));
+        assert_eq!(metrics.ops_count(default, 1, O::Ok), 1);
+        assert_eq!(metrics.ops_count(other, 1, O::Ok), 0);
+        let span = rx.try_recv().expect("one span");
+        assert_eq!(attr(&span, "ferro.queue.store"), Some(Str("jobs".into())));
+        assert_eq!(
+            attr(&span, "ferro.queue.queue"),
+            Some(Str("default".into())),
+            "the span's label is the series'"
+        );
+        assert_eq!(attr(&span, "ferro.queue.jobs"), Some(Int(1)));
+        assert_eq!(attr(&span, "ferro.queue.attempts"), Some(Int(2)));
+        assert_eq!(attr(&span, "ferro.queue_us"), Some(Int(5)));
+        assert!(
+            span.attrs
+                .iter()
+                .all(|(_, v)| *v != Str("secret-tenant".into()))
+        );
+        assert!(rx.try_recv().is_err(), "exactly one span");
+
+        // An empty RESERVE is `empty`; a LeaseLost ACK is `lease_lost`, not `error`; a cancel `error`.
+        let (reply, _, _) = funnel(&metrics, 1, Some("default"));
+        reply.ok(VerbOk::Reserve(Vec::new()), QueueStats::default());
+        assert_eq!(metrics.ops_count(default, 1, O::Empty), 1);
+        let (reply, _, mut rx) = funnel(&metrics, 2, None);
+        reply.error(lease_lost("jobs", "ACK", false));
+        assert_eq!(metrics.ops_count(other, 2, O::LeaseLost), 1);
+        assert_eq!(metrics.ops_count(other, 2, O::Error), 0);
+        assert_eq!(
+            attr(&rx.try_recv().unwrap(), "error.type"),
+            Some(Str("LeaseLost".into()))
+        );
+        let (reply, _, _) = funnel(&metrics, 1, Some("default"));
+        reply.cancelled();
+        assert_eq!(metrics.ops_count(default, 1, O::Error), 1);
+
+        // ACK `gone`; RELEASE labelled by its returned queue; ENQUEUE counts its jobs and mode.
+        let (reply, _, _) = funnel(&metrics, 2, None);
+        reply.ok(VerbOk::Ack { gone: true }, QueueStats::default());
+        assert_eq!(metrics.ops_count(other, 2, O::Gone), 1);
+        let (reply, _, _) = funnel(&metrics, 3, None);
+        reply.ok(
+            VerbOk::Release(Some((JobId(10), "default".into()))),
+            QueueStats::default(),
+        );
+        assert_eq!(metrics.ops_count(default, 3, O::Ok), 1);
+        let (reply, _, _) = funnel(&metrics, 3, None);
+        reply.ok(VerbOk::Release(None), QueueStats::default());
+        assert_eq!(metrics.ops_count(other, 3, O::Gone), 1);
+        let (reply, _, _) = funnel(&metrics, 0, Some("default"));
+        reply.ok(
+            VerbOk::Enqueue(pgq::Enqueued {
+                job_id: None,
+                inserted: 3,
+            }),
+            QueueStats::default(),
+        );
+        assert_eq!(metrics.ops_count(default, 0, O::Ok), 1);
+        let mut out = String::new();
+        crate::services::queue_metrics::render(&mut out, &[&metrics]);
+        assert!(
+            out.contains(
+                "ferro_queue_enqueued_total{store=\"jobs\",queue=\"default\",mode=\"autocommit\"} 3"
+            ),
+            "{out}"
+        );
+    }
+
+    /// The autocommit hints (§24.8 trigger 1): an ENQUEUE's distinct queues, a delay-0 RELEASE's row
+    /// queue, and nothing for a delayed RELEASE or any other verb.
+    #[test]
+    fn autocommit_hints_follow_the_verb() {
+        let enq = QueueRequest::Enqueue(EnqueueRequest {
+            store: "jobs".into(),
+            jobs: ["b", "a", "b"]
+                .iter()
+                .map(|q| EnqueueJob {
+                    queue: (*q).into(),
+                    payload: "{}".into(),
+                    delay_s: 5,
+                })
+                .collect(),
+            dedup_key: None,
+            common: QueueCommon::default(),
+        });
+        let ok = VerbOk::Enqueue(pgq::Enqueued {
+            job_id: None,
+            inserted: 3,
+        });
+        assert_eq!(autocommit_hints(&enq, &ok), vec!["a", "b"]);
+        let rel = |delay_s| {
+            QueueRequest::Release(ReleaseRequest {
+                store: "jobs".into(),
+                job_id: b"9".to_vec(),
+                token: Token::from_pg(1, 1).encode().to_vec(),
+                delay_s,
+                common: QueueCommon::default(),
+            })
+        };
+        let released = VerbOk::Release(Some((JobId(10), "emails".into())));
+        assert_eq!(autocommit_hints(&rel(0), &released), vec!["emails"]);
+        assert!(autocommit_hints(&rel(3), &released).is_empty());
+        assert!(autocommit_hints(&rel(0), &VerbOk::Release(None)).is_empty());
+        assert!(autocommit_hints(&enq, &VerbOk::Clear(1)).is_empty());
     }
 }

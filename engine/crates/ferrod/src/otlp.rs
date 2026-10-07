@@ -615,7 +615,7 @@ impl Tracer {
 
     /// A tracer whose spans land on a channel the test reads directly, with private counters.
     #[cfg(test)]
-    fn for_test(
+    pub(crate) fn for_test(
         sampler: Sampler,
         capacity: usize,
         counters: &'static ExportCounters,
