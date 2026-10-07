@@ -266,6 +266,7 @@ async fn handle(
                 registry,
                 tx_registry,
                 session_id,
+                info,
                 cancel,
             )
             .await

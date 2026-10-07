@@ -231,6 +231,55 @@ pub struct SessionInfo {
     /// `RESERVE`s will read the same signal (§24.8). A session `serve` did not start (the test
     /// harnesses' `run_with_handler`) gets one that never fires.
     pub drain: Drain,
+    /// Whether this session can still DELIVER a terminal (M7-G3, SPEC §24.4/§24.8): live until its
+    /// teardown begins, then ended for good. Ferro Queue's RESERVE hands its jobs over through
+    /// [`Liveness::hand_off`], so "a job is DELIVERED iff the terminal carrying it is handed to a live
+    /// session's writer" is decided under the same lock teardown takes.
+    pub liveness: Liveness,
+}
+
+/// Whether a session's terminals still reach a live writer (M7-G3, SPEC §24.4: "a job is DELIVERED
+/// iff the terminal carrying it is handed to a live session's writer").
+///
+/// The session ENDS it at the first instant of its teardown — before `cancel_all` nudges the in-flight
+/// handlers — whatever the reason (EOF, a session-fatal frame, GOODBYE, the writer gone). A handler
+/// that must not declare a terminal into a session that is going away (a RESERVE carrying leased
+/// jobs) declares it through [`Liveness::hand_off`]: the check and the declaration happen under one
+/// lock, so teardown either began before the hand-off (the handler gets its value back and undoes
+/// what the terminal would have carried) or after it (the terminal is delivered, and a session that
+/// dies before its bytes reach the peer is §24.7's stock-equivalent residual). Clones share one state;
+/// the default is live, so a harness that never tears down never ends it.
+#[derive(Debug, Clone, Default)]
+pub struct Liveness {
+    ended: Arc<std::sync::Mutex<bool>>,
+}
+
+impl Liveness {
+    /// A live session's handle.
+    pub fn new() -> Self {
+        Liveness::default()
+    }
+
+    /// Teardown has begun: every later [`Liveness::hand_off`] refuses. Idempotent.
+    pub fn end(&self) {
+        *self.ended.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    /// Whether teardown has not begun yet.
+    pub fn is_live(&self) -> bool {
+        !*self.ended.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run `deliver(value)` iff the session is still live, under the lock [`Liveness::end`] takes;
+    /// otherwise hand `value` back untouched.
+    pub fn hand_off<R>(&self, value: R, deliver: impl FnOnce(R)) -> Result<(), R> {
+        let ended = self.ended.lock().unwrap_or_else(|e| e.into_inner());
+        if *ended {
+            return Err(value);
+        }
+        deliver(value);
+        Ok(())
+    }
 }
 
 /// The session task's entry point, one call per accepted connection.
@@ -314,6 +363,8 @@ impl Session {
         // handler only runs for request-bearing frames, and none are dispatched during the
         // handshake), so the handshake-phase early returns need not — and do not — abort.
         let session_id = tx_registry.next_session_id();
+        // M7-G3: ended at the first instant of this session's teardown (below, before `cancel_all`).
+        let liveness = Liveness::new();
 
         // SPEC D15: the peer's KERNEL-ATTESTED uid, read from this session's own socket — never from
         // anything the client sends — once, before the stream is split. `SO_PEERCRED` reports the
@@ -437,6 +488,7 @@ impl Session {
                 manifest_agreed: hello.manifest_hash.is_some(),
                 peer_uid,
                 drain,
+                liveness: liveness.clone(),
             },
         );
 
@@ -697,6 +749,10 @@ impl Session {
         // recorded, traced-safe deviation (§22.2), not a bug: exactly one teardown, exactly one
         // terminal, no leaked permit, and a losing client sees a safe-or-better fate (the tx is
         // already rolled back, so there is no double-apply risk either way).
+        // M7-G3: teardown has begun — FIRST, so a handler woken by `cancel_all` below can tell a
+        // session teardown from a client CANCEL, and so no RESERVE hands leased jobs to a writer
+        // whose session is going away (SPEC §24.4: such jobs are unreserved).
+        liveness.end();
         registry.cancel_all();
         tx_registry.abort_session(session_id).await;
         drain_supervisors(&mut supervisors, config.drain_deadline).await;

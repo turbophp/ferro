@@ -325,7 +325,9 @@ async fn value_refusals_are_unsupported_before_any_checkout() {
             "DEDUP_TABLE",
         ),
         (method_queue::RESERVE, reserve(true, 0, None), "liveness"),
-        (method_queue::RESERVE, reserve(false, 1, None), "G3"),
+        // M7-G3: a waiting RESERVE is served (`queue_g3_it`), so `wait_ms > 0` is no longer refused;
+        // `liveness: true` still is, waiting or not.
+        (method_queue::RESERVE, reserve(true, 1, None), "liveness"),
         (method_queue::RESERVE, reserve(false, 0, Some(7)), "§24.5"),
         (
             method_queue::CLEAR,

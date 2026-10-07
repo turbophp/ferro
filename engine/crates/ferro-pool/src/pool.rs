@@ -554,6 +554,21 @@ impl<B: PoolBackend> Checkout<B> {
         self.tainted
     }
 
+    /// Never return this connection to the pool (FB-3b's latch, for a caller outside this crate,
+    /// M7-G3 review F1): `Drop` drops it instead of recycling it. For a connection that is alive but
+    /// whose session state is unknown — Ferro Queue's waker abandons a statement that did not answer
+    /// within its bound even after a cancel, and a connection still running a statement handed to the
+    /// next tenant is the M1-S8a cross-tenant hazard. The permit is released as on any drop.
+    ///
+    /// Dropping is NOT closing (review round 2, R-a): the pool forgets the connection, but whether
+    /// its socket closes is the backend driver's business. On PostgreSQL, `tokio-postgres`'s driver
+    /// sends `Terminate` only once no response is pending, so a connection dropped mid-statement
+    /// keeps its socket, driver task and SERVER session until the backend answers or TCP gives up —
+    /// the server can then hold more sessions for the pool than `max_size`, by the number abandoned.
+    pub fn discard(&mut self) {
+        self.discard = true;
+    }
+
     /// The pin hook: opens a transaction on the underlying connection with an ENGINE-COMPOSED
     /// `begin_sql` (e.g. `BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY`) and pins this `Checkout`
     /// to `tx_id` (S6). Drives the RAW, unguarded `PoolBackend::simple_query` (never

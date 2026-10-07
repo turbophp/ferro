@@ -39,8 +39,6 @@ pub enum Refusal {
     Liveness,
     /// `max_jobs = 0`.
     MaxJobsZero,
-    /// A non-zero `wait_ms`: waiting lands with the waker, at slice G3 (§24.14).
-    WaitNotYet,
     /// A `delay_s` whose `available_at = now + 1 + delay_s` would not fit the store's time column
     /// (M7-G1b, carried from the G1a review). Refused BEFORE sending: PostgreSQL would otherwise
     /// answer `22003` after the statement was sent. `max` is the largest `delay_s` the engine's clock
@@ -74,10 +72,6 @@ impl std::fmt::Display for Refusal {
                 "liveness release is not in v1 (SPEC §24.15); RESERVE must send liveness = false",
             ),
             Refusal::MaxJobsZero => f.write_str("RESERVE max_jobs must be at least 1"),
-            Refusal::WaitNotYet => f.write_str(
-                "a waiting RESERVE (wait_ms > 0) is not served before slice G3 (SPEC §24.14); send \
-                 wait_ms = 0",
-            ),
             Refusal::DelayTooLarge { max } => write!(
                 f,
                 "delay_s is too large: available_at = now + 1 + delay_s would overflow the store's \
@@ -180,7 +174,8 @@ pub fn release(req: &ReleaseRequest, store: &StoreConfig, engine_now: i64) -> Re
 }
 
 /// Every RESERVE refusal that does not need the transaction registry (a tx-scoped RESERVE is refused
-/// by `ferrod`, which owns `tx_id`).
+/// by `ferrod`, which owns `tx_id`). A non-zero `wait_ms` is served since M7-G3 (the waker, §24.8):
+/// it is CLAMPED to the store's `MAX_WAIT_MS` ([`wait_clamp`]), never refused.
 pub fn reserve(req: &ReserveRequest) -> Result<(), Refusal> {
     for q in &req.queues {
         queue_name(q)?;
@@ -191,10 +186,31 @@ pub fn reserve(req: &ReserveRequest) -> Result<(), Refusal> {
     if req.max_jobs == 0 {
         return Err(Refusal::MaxJobsZero);
     }
-    if req.wait_ms > 0 {
-        return Err(Refusal::WaitNotYet);
-    }
     Ok(())
+}
+
+/// SPEC §24.8: "The engine also clamps to `MAX_WAIT_MS`." Silently — a `wait_ms` above the store's
+/// ceiling waits for the ceiling, as a client clamps its own to its transport (§24.8's client rule).
+/// A `MAX_WAIT_MS` of 0 makes every RESERVE on the store a non-waiting one.
+pub fn wait_clamp(wait_ms: u32, max_wait_ms: u32) -> u32 {
+    wait_ms.min(max_wait_ms)
+}
+
+/// How many bytes of reserved payload ONE waker statement may bring into the engine at worst
+/// (M7-G3, SPEC §24.8 amendment): four frames, 64 MiB. §24.8's `LIMIT k` is "the sum of the clamped
+/// `max_jobs` of the head waiters", and without a ceiling 200 parked waiters at the 4 MiB default
+/// would let one statement return 600 maximum-size payloads (2.4 GB) into the engine at once. The
+/// sweep therefore takes the longest FIFO prefix of its waiters whose summed clamp fits
+/// [`sweep_cap`], and a sweep that came back FULL is followed by another for the waiters it left.
+pub const WAKER_SWEEP_BUDGET_BYTES: usize = 4 * ferro_proto::consts::MAX_FRAME_PAYLOAD as usize;
+
+/// The most jobs one waker statement may reserve: [`WAKER_SWEEP_BUDGET_BYTES`] of maximum-size jobs,
+/// and never fewer than one waiter's frame clamp ([`reserve_limit`] at `u16::MAX`), so the FIFO head
+/// is always served. 15 at the 4 MiB default; `u16::MAX` for small `MAX_PAYLOAD_BYTES`.
+pub fn sweep_cap(max_payload_bytes: u32) -> u16 {
+    let per_job = max_payload_bytes as usize + SQL_RESERVE_PER_JOB;
+    let fit = u16::try_from(WAKER_SWEEP_BUDGET_BYTES / per_job).unwrap_or(u16::MAX);
+    fit.max(reserve_limit(u16::MAX, max_payload_bytes))
 }
 
 /// An upper bound on the bytes a ONE-job `RESERVE` terminal payload needs besides the job's payload
@@ -448,11 +464,46 @@ mod tests {
         r.max_jobs = 0;
         assert_eq!(reserve(&r), Err(Refusal::MaxJobsZero));
         let mut r = ok.clone();
-        r.wait_ms = 1;
-        assert_eq!(reserve(&r), Err(Refusal::WaitNotYet));
+        r.wait_ms = u32::MAX;
+        assert_eq!(reserve(&r), Ok(()), "M7-G3: a wait is served, clamped");
         let mut r = ok;
         r.queues[1] = "\0".into();
         assert_eq!(reserve(&r), Err(Refusal::QueueName));
+    }
+
+    /// SPEC §24.8: the engine clamps a wait to the store's `MAX_WAIT_MS`, silently.
+    #[test]
+    fn a_wait_is_clamped_to_the_stores_ceiling() {
+        assert_eq!(wait_clamp(3_000, 30_000), 3_000);
+        assert_eq!(wait_clamp(30_000, 30_000), 30_000);
+        assert_eq!(wait_clamp(30_001, 30_000), 30_000);
+        assert_eq!(wait_clamp(u32::MAX, 30_000), 30_000);
+        assert_eq!(wait_clamp(5, 0), 0, "MAX_WAIT_MS = 0: never waits");
+    }
+
+    /// One sweep's worst-case payload stays within its budget, and the head waiter always fits.
+    #[test]
+    fn a_sweep_is_bounded_by_its_byte_budget_and_always_serves_the_head() {
+        let at_default = sweep_cap(4_194_304);
+        assert_eq!(at_default, 15);
+        for max_payload in [1u32, 100, 65_536, 1_048_576, 4_194_304, 8_000_000] {
+            let cap = sweep_cap(max_payload) as usize;
+            let head = reserve_limit(u16::MAX, max_payload) as usize;
+            assert!(cap >= head, "{max_payload}: the head waiter's clamp fits");
+            if cap > head {
+                assert!(
+                    cap * (max_payload as usize + SQL_RESERVE_PER_JOB) <= WAKER_SWEEP_BUDGET_BYTES,
+                    "{max_payload}: within the budget"
+                );
+                assert!(
+                    cap == u16::MAX as usize
+                        || (cap + 1) * (max_payload as usize + SQL_RESERVE_PER_JOB)
+                            > WAKER_SWEEP_BUDGET_BYTES,
+                    "{max_payload}: tight"
+                );
+            }
+        }
+        assert!(sweep_cap(1) > 60_000, "small payloads batch widely");
     }
 
     /// The envelope is a real bound: a one-job reply carrying the worst case of every other field and

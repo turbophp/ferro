@@ -34,12 +34,27 @@
 //!
 //! # The fence (§24.3)
 //!
-//! A token is valid iff a row exists with that `id`, `attempts` and `created_at`. ACK, RELEASE and
-//! EXTEND each match `WHERE id = $1 AND attempts = $2 AND created_at = $3` and nothing else — in
-//! particular NOT `reserved_at`, so a token survives its lease's expiry until someone else reserves the
-//! job (a late ACK is honoured when nobody took the job), and an unreserve (§24.8, slice G3), which
-//! restores `attempts` only for a token nobody received, never invalidates a delivered one. Shape
-//! verification has proven `id` unique, so the fence names at most one row.
+//! A token is valid iff a row exists with that `id`, `attempts` and `created_at`. ACK and RELEASE
+//! match `WHERE id = $1 AND attempts = $2 AND created_at = $3` and nothing else — in particular NOT
+//! `reserved_at`, so a token survives its lease's expiry until someone else reserves the job (a late
+//! ACK is honoured when nobody took the job), and an unreserve (§24.8, M7-G3), which restores
+//! `attempts` only for a token nobody received, never invalidates a delivered one. Shape verification
+//! has proven `id` unique, so the fence names at most one row.
+//!
+//! **EXTEND additionally requires `reserved_at IS NOT NULL` (M7-G3, carried from the G1b review).**
+//! Unreserve sets `reserved_at = NULL, attempts = attempts − 1`, so the row's token becomes the
+//! PREVIOUS reservation's again. For ACK and RELEASE that is equivalent to the pre-reservation state:
+//! their fence never reads `reserved_at`, the previous holder's late verb is honoured "when nobody else
+//! took the job", and the undelivered reservation took it from nobody. (The restore itself is exact
+//! only for a row that was PENDING; one taken through the expired-lease branch comes back with
+//! `reserved_at = NULL`, not the previous holder's stamp — review F4 — so SIZE counts it pending.)
+//! EXTEND is different: it renews a LEASE, and an unreserved row has
+//! none — it is PENDING, visible to every RESERVE (and to SIZE as pending). Without the predicate the
+//! previous holder's EXTEND would re-reserve a pending job with no delivery counted, out from under the
+//! RESERVE about to take it. With it, that EXTEND is `LeaseLost` — "the job is or will be
+//! redelivered", which it is. A job's current holder always has `reserved_at` set (only an unreserve,
+//! or a row nobody ever reserved, carries NULL), so no legitimate EXTEND is refused, and an EXTEND of
+//! an EXPIRED lease nobody re-took still retakes it, as §24.4 says.
 //!
 //! When a fenced ACK or RELEASE matches nothing, the same statement PROBES the id ([`probe_verdict`]):
 //! absent → `gone`; present with another token → `LeaseLost`; present with the SAME token → `gone`
@@ -188,7 +203,10 @@ pub fn ack(t: &TableName, id: JobId, token: Token) -> Statement {
 
 /// RELEASE (§24.4): one statement — the fenced DELETE feeds an INSERT of the same job under a NEW id,
 /// `attempts` kept, `reserved_at = NULL`, `created_at = now` (as stock's `pushToDatabase`),
-/// `available_at` per the delay rule — plus the probe of the old id, for the no-match answer.
+/// `available_at` per the delay rule — plus the probe of the old id, for the no-match answer. It also
+/// returns the new row's QUEUE (M7-G3): the request carries none — the queue is in the row — and an
+/// autocommit RELEASE with `delay_s = 0` wakes that queue's waiters (§24.8 trigger 1), exactly as
+/// [`release_in_tx`] carries it to COMMIT.
 pub fn release(t: &TableName, id: JobId, token: Token, delay_s: u32) -> Statement {
     let t = table(t);
     let sql = format!(
@@ -196,8 +214,8 @@ pub fn release(t: &TableName, id: JobId, token: Token, delay_s: u32) -> Statemen
          d AS (DELETE FROM {t} WHERE {FENCE} RETURNING queue, payload, attempts), \
          i AS (INSERT INTO {t} (queue, payload, attempts, reserved_at, available_at, created_at) \
                SELECT d.queue, d.payload, d.attempts, NULL::integer, {avail}, n.s \
-               FROM d, n RETURNING id) \
-         SELECT (SELECT i.id FROM i), p.attempts, p.created_at {probe}",
+               FROM d, n RETURNING id, queue) \
+         SELECT (SELECT i.id FROM i), (SELECT i.queue FROM i), p.attempts, p.created_at {probe}",
         avail = available_at("$4::bigint"),
         probe = probe_from(&t),
     );
@@ -206,13 +224,18 @@ pub fn release(t: &TableName, id: JobId, token: Token, delay_s: u32) -> Statemen
     Statement { sql, params }
 }
 
+/// EXTEND's extra predicate (M7-G3): only a row that HAS a lease is extended — never one an unreserve
+/// made pending again (see the module doc's fence section).
+pub const EXTEND_HELD: &str = "reserved_at IS NOT NULL";
+
 /// EXTEND (§24.4): the fenced `reserved_at = now`, renewing by one full lease; it also retakes a job
-/// whose lease expired when nobody else took it. Returns the new `lease_deadline`.
+/// whose lease expired when nobody else took it. Returns the new `lease_deadline`. A row whose
+/// `reserved_at` is NULL — pending, as an unreserve leaves it — is never extended ([`EXTEND_HELD`]).
 pub fn extend(t: &TableName, id: JobId, token: Token, lease_s: u32) -> Statement {
     let sql = format!(
         "WITH {NOW_CTE} \
          UPDATE {t} AS t SET reserved_at = n.s FROM n \
-         WHERE {FENCE} \
+         WHERE {FENCE} AND {EXTEND_HELD} \
          RETURNING n.s + $4::bigint + 1",
         t = table(t),
     );
@@ -435,22 +458,116 @@ pub fn decode_ack(rows: &[Vec<Value>], token: Token) -> Result<Result<(), NoMatc
     }
 }
 
-/// RELEASE's outcome: `Ok(new id)` released, `Err(NoMatch)` otherwise.
+/// RELEASE's outcome: `Ok((new id, its queue))` released, `Err(NoMatch)` otherwise.
 pub fn decode_release(
     rows: &[Vec<Value>],
     token: Token,
-) -> Result<Result<JobId, NoMatch>, Malformed> {
+) -> Result<Result<(JobId, String), NoMatch>, Malformed> {
     let [row] = rows else { return Err(Malformed) };
-    let [new_id, attempts, created_at] = row.as_slice() else {
+    let [new_id, queue, attempts, created_at] = row.as_slice() else {
         return Err(Malformed);
     };
-    match new_id {
-        Value::Null => Ok(Err(probe_verdict(
+    match (new_id, queue) {
+        (Value::Null, Value::Null) => Ok(Err(probe_verdict(
             probe_cells(attempts, created_at)?,
             token,
         ))),
-        v => Ok(Ok(JobId(int(v)?))),
+        (v, Value::Text(q)) => Ok(Ok((JobId(int(v)?), q.clone()))),
+        _ => Err(Malformed),
     }
+}
+
+/// One reservation the engine made for a request whose terminal was never handed to a live session's
+/// writer (SPEC §24.8 "Unreserve"), identified exactly: the row, the token THIS reservation minted,
+/// and the `reserved_at` it stamped. No client ever received the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unreserve {
+    pub id: JobId,
+    pub token: Token,
+    pub reserved_at: i64,
+}
+
+impl Reserved {
+    /// The `reserved_at` this reservation stamped: `lease_deadline` is `reserved_at + lease_s + 1`
+    /// (§24.3), so it is recovered exactly without changing the RESERVE statement §24.4 writes.
+    pub fn reserved_at(&self, lease_s: u32) -> i64 {
+        self.lease_deadline - i64::from(lease_s) - 1
+    }
+
+    /// What an unreserve of this reservation fences on.
+    pub fn unreserve(&self, lease_s: u32) -> Unreserve {
+        Unreserve {
+            id: self.id,
+            token: self.token,
+            reserved_at: self.reserved_at(lease_s),
+        }
+    }
+}
+
+/// UNRESERVE (SPEC §24.8, M7-G3): restore undelivered reservations — `reserved_at = NULL,
+/// attempts = attempts − 1`; exactly the pre-reservation state for a row that was pending, and for one
+/// taken through the expired-lease branch the same minus the previous holder's stamp (review F4) — each row FENCED on `id`, the `attempts` and
+/// `created_at` its reservation minted, AND the `reserved_at` it stamped. Any later reservation of the
+/// row changes `attempts` and `reserved_at`, so a delayed unreserve is a no-op rather than an attack on
+/// someone else's lease; a row acked or released meanwhile is simply not matched. The rows of one
+/// sweep go in ONE statement, each fenced individually (one statement per job would multiply the
+/// checkouts a vanished batch costs). It returns each restored row's id and queue — the queue so its
+/// waiters are woken (§24.8 trigger 1). The engine never re-sends it (§24.2 I4): a failure leaves the
+/// job for its `lease_deadline`.
+pub fn unreserve(t: &TableName, jobs: &[Unreserve]) -> Statement {
+    let mut rows = Vec::with_capacity(jobs.len().max(1));
+    let mut params = Vec::with_capacity(jobs.len() * 4);
+    for (i, j) in jobs.iter().enumerate() {
+        let b = i * 4;
+        rows.push(format!(
+            "(${}::bigint, ${}::smallint, ${}::integer, ${}::integer)",
+            b + 1,
+            b + 2,
+            b + 3,
+            b + 4
+        ));
+        params.push(Value::I64(j.id.0));
+        params.push(Value::I64(i64::from(j.token.pg_attempts())));
+        params.push(Value::I64(i64::from(j.token.pg_created_at())));
+        params.push(Value::I64(j.reserved_at));
+    }
+    if rows.is_empty() {
+        // Matches nothing; never built by `ferrod`, which unreserves only a non-empty set.
+        rows.push("(NULL::bigint, NULL::smallint, NULL::integer, NULL::integer)".to_string());
+    }
+    let sql = format!(
+        "UPDATE {t} AS t SET reserved_at = NULL, attempts = t.attempts - 1 \
+         FROM (VALUES {rows}) AS u(id, a, c, r) \
+         WHERE t.id = u.id AND t.attempts = u.a AND t.created_at = u.c AND t.reserved_at = u.r \
+         RETURNING t.id, t.queue",
+        t = table(t),
+        rows = rows.join(", "),
+    );
+    Statement { sql, params }
+}
+
+/// [`unreserve`]'s rows: the restored jobs' ids and queues — at most `asked` of them (one per fenced
+/// row; `id` is verified unique), each id at most once.
+pub fn decode_unreserve(
+    rows: &[Vec<Value>],
+    asked: usize,
+) -> Result<Vec<(JobId, String)>, Malformed> {
+    if rows.len() > asked {
+        return Err(Malformed);
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let [id, Value::Text(queue)] = row.as_slice() else {
+            return Err(Malformed);
+        };
+        out.push((JobId(int(id)?), queue.clone()));
+    }
+    let mut ids: Vec<i64> = out.iter().map(|(id, _)| id.0).collect();
+    ids.sort_unstable();
+    if ids.windows(2).any(|w| w[0] == w[1]) {
+        return Err(Malformed);
+    }
+    Ok(out)
 }
 
 /// [`ack_in_tx`]'s outcome from the DELETE's rows and command-tag count: `true` acked, `false`
@@ -657,9 +774,9 @@ mod tests {
                  queue, payload, attempts), i AS (INSERT INTO \"app\".\"ferro_jobs\" (queue, \
                  payload, attempts, reserved_at, available_at, created_at) SELECT d.queue, \
                  d.payload, d.attempts, NULL::integer, CASE WHEN $4::bigint = 0 THEN n.s ELSE n.s + \
-                 1 + $4::bigint END, n.s FROM d, n RETURNING id) SELECT (SELECT i.id FROM i), \
-                 p.attempts, p.created_at FROM (SELECT 1) AS one LEFT JOIN \"app\".\"ferro_jobs\" AS \
-                 p ON p.id = $1::bigint"
+                 1 + $4::bigint END, n.s FROM d, n RETURNING id, queue) SELECT (SELECT i.id FROM \
+                 i), (SELECT i.queue FROM i), p.attempts, p.created_at FROM (SELECT 1) AS one LEFT \
+                 JOIN \"app\".\"ferro_jobs\" AS p ON p.id = $1::bigint"
             )
         );
         assert_eq!(r.params, vec![i(9), i(-2), i(-5), i(30)]);
@@ -668,16 +785,103 @@ mod tests {
             e.sql,
             format!(
                 "WITH {NOW_CTE} UPDATE \"app\".\"ferro_jobs\" AS t SET reserved_at = n.s FROM n \
-                 WHERE {fence} RETURNING n.s + $4::bigint + 1"
+                 WHERE {fence} AND reserved_at IS NOT NULL RETURNING n.s + $4::bigint + 1"
             )
         );
         assert_eq!(e.params, vec![i(9), i(-2), i(-5), i(45)]);
-        // The fence never reads `reserved_at`: a token outlives its lease until someone re-leases.
-        for s in [&a, &r, &e] {
+        // ACK's and RELEASE's fence never reads `reserved_at`: a token outlives its lease until
+        // someone re-leases. EXTEND's adds exactly one predicate (M7-G3): the row must HAVE a lease,
+        // so an unreserved — pending — row is never re-reserved by the previous holder's token.
+        for (s, want) in [
+            (&a, fence.to_string()),
+            (&r, fence.to_string()),
+            (&e, format!("{fence} AND reserved_at IS NOT NULL")),
+        ] {
             let after = s.sql.split(" WHERE ").nth(1).unwrap();
             let where_ = after.split(" RETURNING ").next().unwrap();
-            assert_eq!(where_, fence, "{}", s.sql);
+            assert_eq!(where_, want, "{}", s.sql);
         }
+    }
+
+    /// M7-G3: the unreserve statement restores each row fenced on all FOUR of the reservation's
+    /// values — `id`, the minted `attempts`, `created_at` AND the stamped `reserved_at` — and
+    /// decrements `attempts`, in one statement for the batch.
+    #[test]
+    fn unreserve_is_fenced_on_the_reservation_it_undoes() {
+        let jobs = [
+            Unreserve {
+                id: JobId(9),
+                token: Token::from_pg(100, 3),
+                reserved_at: 1_000,
+            },
+            Unreserve {
+                id: JobId(12),
+                token: Token::from_pg(101, 1),
+                reserved_at: 1_001,
+            },
+        ];
+        let s = unreserve(&t(), &jobs);
+        assert_eq!(
+            s.sql,
+            "UPDATE \"app\".\"ferro_jobs\" AS t SET reserved_at = NULL, attempts = t.attempts - 1 \
+             FROM (VALUES ($1::bigint, $2::smallint, $3::integer, $4::integer), ($5::bigint, \
+             $6::smallint, $7::integer, $8::integer)) AS u(id, a, c, r) WHERE t.id = u.id AND \
+             t.attempts = u.a AND t.created_at = u.c AND t.reserved_at = u.r RETURNING t.id, t.queue"
+        );
+        assert_eq!(
+            s.params,
+            vec![i(9), i(3), i(100), i(1_000), i(12), i(1), i(101), i(1_001)]
+        );
+        assert!(!s.sql.contains("statement_timestamp"), "no clock is read");
+        let empty = unreserve(&t(), &[]);
+        assert!(empty.params.is_empty());
+        assert!(empty.sql.contains("(NULL::bigint"), "{}", empty.sql);
+    }
+
+    #[test]
+    fn unreserve_results_decode_and_a_reservations_stamp_is_recovered() {
+        assert_eq!(
+            decode_unreserve(&[vec![i(9), txt("a")], vec![i(12), txt("b")]], 2),
+            Ok(vec![
+                (JobId(9), "a".to_string()),
+                (JobId(12), "b".to_string())
+            ])
+        );
+        assert_eq!(decode_unreserve(&[], 2), Ok(vec![]), "fenced out: a no-op");
+        assert_eq!(
+            decode_unreserve(&[vec![i(9), txt("a")], vec![i(12), txt("b")]], 1),
+            Err(Malformed),
+            "more rows than asked"
+        );
+        assert_eq!(
+            decode_unreserve(&[vec![i(9), txt("a")], vec![i(9), txt("a")]], 2),
+            Err(Malformed),
+            "a row twice"
+        );
+        assert_eq!(decode_unreserve(&[vec![i(9)]], 1), Err(Malformed));
+        assert_eq!(decode_unreserve(&[vec![i(9), i(1)]], 1), Err(Malformed));
+        let r = Reserved {
+            id: JobId(9),
+            token: Token::from_pg(100, 3),
+            attempts: 3,
+            queue: "q".into(),
+            payload: "p".into(),
+            created_at: 100,
+            lease_deadline: 1_091,
+        };
+        assert_eq!(
+            r.reserved_at(90),
+            1_000,
+            "lease_deadline = reserved_at + L + 1"
+        );
+        assert_eq!(
+            r.unreserve(90),
+            Unreserve {
+                id: JobId(9),
+                token: Token::from_pg(100, 3),
+                reserved_at: 1_000
+            }
+        );
     }
 
     #[test]
@@ -742,22 +946,37 @@ mod tests {
         );
 
         assert_eq!(
-            decode_release(&[vec![i(55), i(2), i(100)]], tok),
-            Ok(Ok(JobId(55)))
+            decode_release(&[vec![i(55), txt("emails"), i(2), i(100)]], tok),
+            Ok(Ok((JobId(55), "emails".to_string())))
         );
+        let null = || Value::Null;
         assert_eq!(
-            decode_release(&[vec![Value::Null, Value::Null, Value::Null]], tok),
+            decode_release(&[vec![null(), null(), null(), null()]], tok),
             Ok(Err(NoMatch::Gone))
         );
         assert_eq!(
-            decode_release(&[vec![Value::Null, i(2), i(100)]], tok),
+            decode_release(&[vec![null(), null(), i(2), i(100)]], tok),
             Ok(Err(NoMatch::Gone))
         );
         assert_eq!(
-            decode_release(&[vec![Value::Null, i(2), i(99)]], tok),
+            decode_release(&[vec![null(), null(), i(2), i(99)]], tok),
             Ok(Err(NoMatch::LeaseLost))
         );
         assert_eq!(decode_release(&[], tok), Err(Malformed));
+        // M7-G3: a released row's queue is returned with its id — one without the other is malformed.
+        assert_eq!(
+            decode_release(&[vec![i(55), null(), i(2), i(100)]], tok),
+            Err(Malformed)
+        );
+        assert_eq!(
+            decode_release(&[vec![null(), txt("q"), i(2), i(100)]], tok),
+            Err(Malformed)
+        );
+        assert_eq!(
+            decode_release(&[vec![i(55), i(2), i(100)]], tok),
+            Err(Malformed),
+            "the G1b shape"
+        );
     }
 
     #[test]

@@ -289,6 +289,9 @@ pub fn render(registry: &PoolRegistry, boot_epoch: u64) -> String {
         let _ = writeln!(out, "# TYPE {name} counter");
         let _ = writeln!(out, "{name} {value}");
     }
+    // SPEC §24.9 (M7-G3): Ferro Queue's families, every enabled store's series — zeroes included.
+    let stores = registry.queue().map(|q| q.metrics()).unwrap_or_default();
+    crate::services::queue_metrics::render(&mut out, &stores);
     // M3-D4 COPY. Present — as zeroes — on a daemon that never ran one.
     let copy = &crate::services::copy::COUNTERS;
     for (name, help, value) in [
