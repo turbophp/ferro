@@ -12,7 +12,7 @@
 //!   slot and leaves the breaker half-open, so the slot can never leak.
 //! - [`Hold`] (§23.8.7, `HONOR_RETRY_AFTER=1`): a 429 or 503 head carrying a `Retry-After` of at
 //!   most `RETRY_AFTER_MAX_MS` holds the upstream; later admissions fail fast (`retry_after_hold`).
-//! - [`RateBucket`] (§23.8.7): one token bucket per upstream (GCRA, exact integer arithmetic).
+//! - [`RateBucket`] (§23.8.7): one token bucket per upstream (GCRA in integer nanoseconds, its interval rounded UP).
 //!   With no token, `RATE_MAX_WAIT_MS=0` fails fast (`rate_limited` and the time to the next
 //!   token); otherwise the request waits up to `min(RATE_MAX_WAIT_MS, remaining deadline)`.
 //! - [`RequestGate`] (§23.6 step 4 (e)): `MAX_REQUESTS` in flight, at most `MAX_QUEUED` waiting
@@ -95,6 +95,9 @@ pub struct Breaker {
     failures: u32,
     counts: BreakerCounts,
     open_for: Duration,
+    /// `BREAKER_TIMEOUT_MS`: under `connect+timeout`, how long after its send a request must have
+    /// gone unanswered for its `timeout` to count (review round 2, decision 1).
+    timeout_window: Duration,
     inner: Mutex<BreakerInner>,
 }
 
@@ -132,6 +135,7 @@ impl Breaker {
             failures: cfg.failures.max(1),
             counts: cfg.counts,
             open_for: Duration::from_millis(u64::from(cfg.open_ms)),
+            timeout_window: Duration::from_millis(u64::from(cfg.timeout_ms)),
             inner: Mutex::new(BreakerInner {
                 st: St::Closed { failures: 0 },
                 generation: 0,
@@ -269,13 +273,15 @@ impl BreakerTicket {
         self.0.record_at(outcome, now);
     }
 
-    /// The REQUESTER's evidence from a classified failure (§23.8.6 as amended at the F6 review):
-    /// only a counted "sent, no head" `timeout` whose bound the ENGINE set. Dial failures are the
-    /// dial's to record ([`BreakerTicket::record_dial`]), and "any other terminal" is recorded by
-    /// the last handle's drop, never here — recording it here would consume the ticket before a
-    /// detached dial could report.
-    pub fn record_failure(&self, s: &Situation, engine_bound: bool) {
-        if failure_outcome(s, self.0.breaker.counts, engine_bound) == BreakerOutcome::Counted {
+    /// The REQUESTER's evidence from a classified failure (§23.8.6 as amended at the F6 review
+    /// rounds): only a counted "sent, no head" `timeout` that came at least `BREAKER_TIMEOUT_MS`
+    /// after the request was SENT (`sent_for`). Dial failures are the dial's to record
+    /// ([`BreakerTicket::record_dial`]), and "any other terminal" is recorded by the last handle's
+    /// drop, never here — recording it here would consume the ticket before a detached dial could
+    /// report.
+    pub fn record_failure(&self, s: &Situation, sent_for: Option<Duration>) {
+        let b = &self.0.breaker;
+        if failure_outcome(s, b.counts, sent_for, b.timeout_window) == BreakerOutcome::Counted {
             self.record(BreakerOutcome::Counted);
         }
     }
@@ -311,21 +317,35 @@ impl BreakerTicket {
             St::Open { until } if now < until => Err(BreakerRefusal::Open {
                 retry_after_ms: ms_until(until, now),
             }),
-            St::Open { .. } | St::HalfOpen { .. } => Err(BreakerRefusal::ProbeBusy),
+            St::HalfOpen { probing: true } => Err(BreakerRefusal::ProbeBusy),
+            // Half-open (or open with its time up) and NO probe in flight (review round 2): the
+            // slot is not busy, so `breaker_probe_busy` would be false. This request was admitted
+            // as an ordinary request and is not made the probe here; it is refused `breaker_open`
+            // with the least `retry_after_ms`, so its retry is admitted afresh — and is the probe.
+            St::Open { .. } | St::HalfOpen { probing: false } => {
+                Err(BreakerRefusal::Open { retry_after_ms: 1 })
+            }
         }
     }
 }
 
 /// What a REQUESTER's classified failure means to the breaker (§23.8.6, as amended at the M6-F6
-/// review). `connect+timeout` adds the `timeout` of the "sent, no head" row — the upstream took
-/// the request and produced no head by the deadline — but ONLY when that deadline was the
-/// upstream's configured `TIMEOUT_MS` (`engine_bound`): a bound the caller shortened is the
-/// caller's choice, not evidence about the upstream (review R2). Everything else is "any other
-/// terminal" from the requester's side; the connect class is the dial's evidence.
-pub fn failure_outcome(s: &Situation, counts: BreakerCounts, engine_bound: bool) -> BreakerOutcome {
+/// review rounds). `connect+timeout` adds the `timeout` of the "sent, no head" row — the upstream
+/// took the request and produced no head — but ONLY when that timeout came at least `window`
+/// (`BREAKER_TIMEOUT_MS`) after the request was SENT (`sent_for`): measured from the send, the
+/// engine's own waits before it (rate, queue, connection) cannot make a healthy upstream look slow
+/// (review round 2, N1), and a caller deadline that ends earlier is the caller's choice, not
+/// evidence (review R2). Everything else is "any other terminal" from the requester's side; the
+/// connect class is the dial's evidence.
+pub fn failure_outcome(
+    s: &Situation,
+    counts: BreakerCounts,
+    sent_for: Option<Duration>,
+    window: Duration,
+) -> BreakerOutcome {
     match s {
         Situation::SentNoHead(SentNoHead::Timeout)
-            if counts != BreakerCounts::Connect && engine_bound =>
+            if counts != BreakerCounts::Connect && sent_for.is_some_and(|t| t >= window) =>
         {
             BreakerOutcome::Counted
         }
@@ -451,8 +471,9 @@ pub fn hold_for<'v>(
 // The rate bucket
 // =================================================================================================
 
-/// One upstream's token bucket (§23.8.7), as GCRA in exact integer nanoseconds: one token every
-/// `interval`, and a burst of `RATE_BURST` tokens from a full bucket.
+/// One upstream's token bucket (§23.8.7), as GCRA in integer nanoseconds: one token every
+/// `interval` (rounded UP, so it never over-admits), and a burst of `RATE_BURST` tokens from a full
+/// bucket.
 #[derive(Debug)]
 pub struct RateBucket {
     base: Instant,
@@ -511,7 +532,10 @@ pub enum RateDecision {
 
 impl RateBucket {
     pub fn new(rate: &config::Rate, base: Instant) -> Arc<Self> {
-        let interval = 1_000_000_000_000u128 / u128::from(rate.per_sec_milli.max(1));
+        // The CEILING of 1e12 / milli ns (review round 2): rounding can only lengthen the
+        // interval, so the bucket never over-admits; it may under-admit by under 1 ns per
+        // interval (above 5e8 per second that is up to half the rate: 2 ns, not 1.67 ns).
+        let interval = 1_000_000_000_000u128.div_ceil(u128::from(rate.per_sec_milli.max(1)));
         Arc::new(RateBucket {
             base,
             interval,
@@ -690,6 +714,7 @@ mod tests {
             failures: k,
             counts,
             open_ms,
+            timeout_ms: 5_000,
         })
     }
 
@@ -846,15 +871,19 @@ mod tests {
                     Some(BreakerOutcome::Counted),
                     "{s:?}"
                 );
-                for bound in [true, false] {
-                    assert_eq!(failure_outcome(s, c, bound), BreakerOutcome::Other, "{s:?}");
+                for sent_for in [None, Some(ms(1)), Some(ms(60_000))] {
+                    assert_eq!(
+                        failure_outcome(s, c, sent_for, ms(5_000)),
+                        BreakerOutcome::Other,
+                        "{s:?}"
+                    );
                 }
             }
             for s in &never {
                 assert!(!is_connect_class(s), "{s:?}");
                 assert_eq!(dial_outcome(Err(s), c), None, "{s:?}");
                 assert_eq!(
-                    failure_outcome(s, c, true),
+                    failure_outcome(s, c, Some(ms(60_000)), ms(5_000)),
                     BreakerOutcome::Other,
                     "{s:?} {c:?}"
                 );
@@ -865,14 +894,32 @@ mod tests {
         assert_eq!(dial_outcome(Ok(()), ConnectTimeout), None);
         assert_eq!(dial_outcome(Ok(()), ConnectTimeout5xx), None);
         let timeout = Situation::SentNoHead(SentNoHead::Timeout);
+        let window = ms(5_000);
         assert_eq!(
-            failure_outcome(&timeout, Connect, true),
+            failure_outcome(&timeout, Connect, Some(ms(60_000)), window),
             BreakerOutcome::Other
         );
         for c in [ConnectTimeout, ConnectTimeout5xx] {
-            assert_eq!(failure_outcome(&timeout, c, true), BreakerOutcome::Counted);
-            // Review R2: a deadline the caller shortened is not evidence.
-            assert_eq!(failure_outcome(&timeout, c, false), BreakerOutcome::Other);
+            // Review round 2: measured from the SEND, against BREAKER_TIMEOUT_MS — at the bound
+            // exactly it counts (`>=`, the reviewer's M7), a nanosecond short it does not.
+            assert_eq!(
+                failure_outcome(&timeout, c, Some(window), window),
+                BreakerOutcome::Counted
+            );
+            assert_eq!(
+                failure_outcome(&timeout, c, Some(ms(60_000)), window),
+                BreakerOutcome::Counted
+            );
+            assert_eq!(
+                failure_outcome(&timeout, c, Some(window - Duration::from_nanos(1)), window),
+                BreakerOutcome::Other,
+                "a caller deadline (or anything) that ended sooner after the send is not evidence"
+            );
+            assert_eq!(
+                failure_outcome(&timeout, c, None, window),
+                BreakerOutcome::Other,
+                "never sent"
+            );
         }
         for s in [200, 429, 500, 501, 505, 599] {
             assert_eq!(head_outcome(s, ConnectTimeout5xx), BreakerOutcome::Success);
@@ -915,7 +962,7 @@ mod tests {
         let dial = t.clone();
         t.record_failure(
             &Situation::BeforeDispatch(BeforeDispatch::ConnectTimeout),
-            true,
+            Some(ms(60_000)),
         );
         drop(t);
         dial.record_dial(Err(&Situation::BeforeDispatch(
@@ -939,12 +986,19 @@ mod tests {
                 retry_after_ms: 600
             })
         );
+        // Review round 2: half-open with NO probe in flight — the slot is not busy, so the refusal
+        // is `breaker_open` with the least retry_after_ms (the retry is admitted afresh: the probe).
+        assert_eq!(
+            waiting.recheck(t0 + ms(1_000)),
+            Err(BreakerRefusal::Open { retry_after_ms: 1 }),
+            "half-open, no probe yet, and it was not admitted as one"
+        );
+        let probe = b.admit(t0 + ms(1_000)).unwrap();
         assert_eq!(
             waiting.recheck(t0 + ms(1_000)),
             Err(BreakerRefusal::ProbeBusy),
-            "half-open, and it is not the probe"
+            "half-open, and the probe is in flight"
         );
-        let probe = b.admit(t0 + ms(1_000)).unwrap();
         assert_eq!(
             probe.recheck(t0 + ms(1_000)),
             Ok(()),
@@ -1081,6 +1135,30 @@ mod tests {
             RateDecision::Refuse { retry_after_ms } => assert_eq!(retry_after_ms, 3_004),
             d => panic!("{d:?}"),
         }
+    }
+
+    /// Review round 2: the interval is the CEILING of 1e12/milli ns, so rounding never over-admits.
+    /// At 6e8 per second the exact interval is 1.67 ns: the bucket uses 2 ns (5e8 per second, an
+    /// under-admission), never 1 ns (1e9 per second, which the floor gave). 1e9 per second is 1 ns.
+    #[test]
+    fn the_interval_rounds_up_so_the_bucket_never_over_admits() {
+        let t0 = Instant::now();
+        let far = Duration::from_secs(60);
+        let b = bucket(600_000_000_000, 1, 0, t0);
+        assert!(admit(b.take(t0, far)));
+        assert!(
+            !admit(b.take(t0 + Duration::from_nanos(1), far)),
+            "1 ns later is too soon at 6e8/s"
+        );
+        assert!(admit(b.take(t0 + Duration::from_nanos(2), far)));
+        let b = bucket(1_000_000_000_000, 1, 0, t0);
+        assert!(admit(b.take(t0, far)));
+        assert!(admit(b.take(t0 + Duration::from_nanos(1), far)));
+        // 3 per second: 333 333 333.33 ns, rounded up to …334.
+        let b = bucket(3_000, 1, 0, t0);
+        assert!(admit(b.take(t0, far)));
+        assert!(!admit(b.take(t0 + Duration::from_nanos(333_333_333), far)));
+        assert!(admit(b.take(t0 + Duration::from_nanos(333_333_334), far)));
     }
 
     /// A wait is allowed up to min(RATE_MAX_WAIT_MS, remaining deadline); a waiter dropped before

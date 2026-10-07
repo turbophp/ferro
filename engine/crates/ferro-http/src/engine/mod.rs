@@ -543,8 +543,10 @@ impl HttpEngine {
         let up = v.upstream;
         let idem = v.idempotent;
         // The breaker's evidence comes only from bounds the ENGINE sets (§23.8.6 as amended at the
-        // F6 review): a total deadline the caller shortened is not evidence about the upstream.
-        let engine_deadline = req.timeout_ms.is_none_or(|t| t >= up.limits.timeout_ms);
+        // F6 review rounds): a post-send `timeout` counts only when it came at least
+        // `BREAKER_TIMEOUT_MS` after the SEND, measured from this instant, set at dispatch — so
+        // neither the engine's own waits before it nor a caller's shorter deadline can count.
+        let sent_at: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None);
         let bounds = Bounds {
             deadline: tokio::time::Instant::from_std(started)
                 + ms(req
@@ -616,7 +618,7 @@ impl HttpEngine {
         };
         // Every terminal from here on settles the ticket with what it means to the breaker.
         let fin = |s: Situation| {
-            ticket.record_failure(&s, engine_deadline);
+            ticket.record_failure(&s, sent_at.get().map(|t| t.elapsed()));
             classify(s, idem)
         };
         if let Some(hold) = &lim.hold
@@ -710,24 +712,43 @@ impl HttpEngine {
                 return fin(Situation::BeforeDispatch(on_expiry));
             }
         };
+        let max_idle = usize::try_from(up.limits.max_connections).unwrap_or(usize::MAX);
+        let refused = |r: BreakerRefusal| {
+            Situation::BeforeDispatch(match r {
+                BreakerRefusal::Open { retry_after_ms } => {
+                    BeforeDispatch::BreakerOpen { retry_after_ms }
+                }
+                BreakerRefusal::ProbeBusy => BeforeDispatch::BreakerProbeBusy,
+            })
+        };
         let (mut conn, reused, connect_us, tls_us) = match taken {
-            Take::Idle(c) => (c, true, 0, 0),
+            Take::Idle(c) => {
+                // Review round 2, N2: the breaker may have opened while this request waited — it is
+                // asked again before ANY send, on a reused connection too, which goes back unused.
+                if let Err(r) = ticket.recheck(tokio::time::Instant::now()) {
+                    self.pools.return_unused(key, c, max_idle);
+                    return fin(refused(r));
+                }
+                (c, true, 0, 0)
+            }
             Take::Dial(slot) => {
                 // Review R1: the breaker may have opened while this request waited for a dial
                 // slot. Asked again here, immediately before the dial, so an open breaker makes
                 // no connection attempt, whoever was admitted before it opened.
                 if let Err(r) = ticket.recheck(tokio::time::Instant::now()) {
                     drop(slot);
-                    return fin(Situation::BeforeDispatch(match r {
-                        BreakerRefusal::Open { retry_after_ms } => {
-                            BeforeDispatch::BreakerOpen { retry_after_ms }
-                        }
-                        BreakerRefusal::ProbeBusy => BeforeDispatch::BreakerProbeBusy,
-                    }));
+                    return fin(refused(r));
                 }
                 // Review R3: the dial runs DETACHED, to the engine's own connect bound, and records
                 // its own outcome; this request only waits for it, within its own bounds.
-                let dialled = self.spawn_dial(slot, &key, up, ticket.clone());
+                let mut dialled = self.spawn_dial(slot, &key, up, ticket.clone());
+                // Review round 2, N3: a dial that finished in the same poll as the branch that ends
+                // this wait has its connection in the channel; it is pooled, not dropped.
+                let rescue = |dialled: &mut tokio::sync::oneshot::Receiver<DialResult>| {
+                    if let Ok(Ok((c, ..))) = dialled.try_recv() {
+                        self.pools.checkin(key.clone(), c, max_idle);
+                    }
+                };
                 let engine_connect = ms(up.limits.connect_timeout_ms);
                 // The caller's own, shorter, connect bound (§23.8.4). When it ends the wait the
                 // request is `connect_timeout` as before, and the dial runs on.
@@ -736,15 +757,18 @@ impl HttpEngine {
                 tokio::select! {
                     biased;
                     () = stop.token.cancelled() => {
+                        rescue(&mut dialled);
                         return fin(Situation::BeforeDispatch(before_dispatch_stop(stop)));
                     }
                     () = tokio::time::sleep_until(bounds.deadline) => {
+                        rescue(&mut dialled);
                         return fin(Situation::BeforeDispatch(BeforeDispatch::Deadline));
                     }
                     () = sleep_until_some(own_connect) => {
+                        rescue(&mut dialled);
                         return fin(Situation::BeforeDispatch(BeforeDispatch::ConnectTimeout));
                     }
-                    r = dialled => match r {
+                    r = &mut dialled => match r {
                         Ok(Ok(c)) => c,
                         Ok(Err(f)) => return fin(Situation::BeforeDispatch(dial_situation(f))),
                         // The dial task is gone without an answer (it panicked): nothing was sent.
@@ -778,6 +802,7 @@ impl HttpEngine {
             return fin(Situation::BeforeDispatch(event));
         }
         let dispatched = Instant::now();
+        sent_at.set(Some(dispatched));
         let queue_us = micros(dispatched.saturating_duration_since(admitted))
             .saturating_sub(connect_us + tls_us);
         conn.track.arm();
@@ -1052,7 +1077,7 @@ impl HttpEngine {
         key: &PoolKey,
         up: &Upstream,
         ticket: BreakerTicket,
-    ) -> tokio::sync::oneshot::Receiver<Result<(HttpConn, bool, u64, u64), DialFailure>> {
+    ) -> tokio::sync::oneshot::Receiver<DialResult> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let job = DialJob {
             config: Arc::clone(&self.config),
@@ -1096,6 +1121,9 @@ impl HttpEngine {
         rx
     }
 }
+
+/// A dial's answer: the connection, `false` (not reused), its `connect_us` and its `tls_us`.
+type DialResult = Result<(HttpConn, bool, u64, u64), DialFailure>;
 
 /// Everything a detached dial needs, owned (it outlives the request that started it).
 struct DialJob {

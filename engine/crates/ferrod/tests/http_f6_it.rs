@@ -143,6 +143,8 @@ enum Act {
     Close,
     /// Never answer; hold the connection until the engine closes it.
     Hold,
+    /// Answer `OK` after a delay (review).
+    Delay(u64),
 }
 
 /// An upstream that reads each whole request (recording it) and then does `acts[n]` for the n-th
@@ -171,6 +173,12 @@ async fn scripted(acts: Vec<Act>) -> (Upstream, Arc<Semaphore>) {
                         }
                     }
                     Act::Close => return,
+                    Act::Delay(ms) => {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        if rec.write(&mut s, OK).await.is_err() {
+                            return;
+                        }
+                    }
                     Act::Hold => {
                         rec.hold_until_closed(&mut s, Duration::from_secs(60)).await;
                         return;
@@ -1627,4 +1635,184 @@ async fn under_partition_uid_the_connection_caps_are_per_partition() {
     }
     assert_eq!(d.engine.idle_connections_for("p", 1001), 1);
     assert_eq!(d.engine.idle_connections_for("p", 1002), 1);
+}
+
+// ================================ REVIEW F6b probes ================================
+
+/// N1: engine-side waits (here the rate limit) consume the engine's TIMEOUT_MS before send, so a
+/// healthy upstream (600 ms TTFB << 1500 ms TIMEOUT_MS) gets counted `timeout`s and the breaker opens.
+#[tokio::test]
+async fn review_n1_engine_waits_make_a_healthy_upstream_count_timeouts() {
+    let (up, _g) = scripted(vec![Act::Delay(600); 8]).await;
+    let d = daemon_on(
+        upstreams(
+            &[("r", up.addr)],
+            &[
+                ("r", "BREAKER_FAILURES", "2"),
+                ("r", "BREAKER_COUNTS", "connect+timeout"),
+                ("r", "TIMEOUT_MS", "1500"),
+                ("r", "RATE_PER_SEC", "1"),
+                ("r", "RATE_BURST", "1"),
+                ("r", "RATE_MAX_WAIT_MS", "5000"),
+            ],
+        ),
+        ScriptConnect::new(TCP),
+    );
+    let mut a = start(&d, &idempotent_get("r")).await;
+    let mut b = start(&d, &idempotent_get("r")).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let mut c = start(&d, &idempotent_get("r")).await;
+    let ra = collect(&mut a, 1).await;
+    eprintln!("A: {:?}", ra.head.as_ref().map(|h| h.status));
+    let rb = collect(&mut b, 1).await;
+    eprintln!("B: {:?}", rb.error());
+    let rc = collect(&mut c, 1).await;
+    eprintln!("C: {:?}", rc.error());
+    eprintln!("breaker: {:?}", d.engine.breaker_state("r"));
+    let r = one(&d, &idempotent_get("r")).await;
+    eprintln!("D (well-behaved): {:?}", r.error());
+    assert_eq!(
+        d.engine.breaker_state("r"),
+        Some(BreakerState::Open),
+        "healthy upstream opened"
+    );
+}
+
+/// N2: a request waiting for a dial slot (MAX_DIALS held by a hanging dial) is handed an IDLE
+/// connection after the breaker OPENED, and is sent.
+#[tokio::test]
+async fn review_n2_a_waiter_is_sent_on_an_idle_connection_while_open() {
+    let (up, gate) = scripted(vec![Act::Hold, Act::Gated, Act::Answer(OK)]).await;
+    let conn = ScriptConnect::new(TCP);
+    let d = daemon_on(
+        upstreams(
+            &[("w", up.addr)],
+            &[
+                ("w", "BREAKER_FAILURES", "1"),
+                ("w", "BREAKER_OPEN_MS", "60000"),
+                ("w", "BREAKER_COUNTS", "connect+timeout"),
+                ("w", "TIMEOUT_MS", "1000"),
+                ("w", "MAX_DIALS", "1"),
+                ("w", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "60000"),
+            ],
+        ),
+        Arc::clone(&conn),
+    );
+    let mut h = start(&d, &post("w", b"h")).await;
+    wait_for("h at upstream", || received(&up) == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut x = start(&d, &post("w", b"x")).await;
+    wait_for("x at upstream", || received(&up) == 2).await;
+    conn.set(HANG);
+    let mut dd = start(&d, &idempotent_get("w")).await;
+    wait_for("hanging dial", || d.engine.dials_in_progress("w") == 1).await;
+    let mut w = start(&d, &post("w", b"w")).await;
+    let rh = collect(&mut h, 1).await;
+    eprintln!("H: {:?}", rh.error());
+    assert_eq!(d.engine.breaker_state("w"), Some(BreakerState::Open));
+    gate.add_permits(1);
+    let rx = collect(&mut x, 1).await;
+    eprintln!("X: {:?}", rx.head.as_ref().map(|h| h.status));
+    let rw = collect(&mut w, 1).await;
+    eprintln!(
+        "W: head={:?} err={:?}",
+        rw.head.as_ref().map(|h| h.status),
+        rw.head.is_none().then(|| rw.error())
+    );
+    eprintln!(
+        "received={} breaker={:?}",
+        received(&up),
+        d.engine.breaker_state("w")
+    );
+    let _ = collect(&mut dd, 1).await;
+    assert_eq!(
+        received(&up),
+        3,
+        "DEFECT N2: W was SENT while the breaker was open"
+    );
+    let _ = rx;
+}
+
+/// Partition preserved across a detached dial's hand-off.
+#[tokio::test]
+async fn review_detached_dial_is_pooled_in_its_own_partition() {
+    let (up, _g) = scripted(vec![]).await;
+    let conn = ScriptConnect::new(DELAY_TCP);
+    conn.delay(100);
+    let d = daemon_on(
+        upstreams(&[("p", up.addr)], &[("p", "PARTITION", "uid")]),
+        Arc::clone(&conn),
+    );
+    let t = d
+        .engine
+        .exchange(
+            &HttpRequest {
+                connect_timeout_ms: Some(1),
+                ..idempotent_get("p")
+            },
+            Some(1001),
+            Instant::now(),
+            &CancellationToken::new(),
+            &Accept,
+        )
+        .await;
+    assert!(matches!(t, Terminal::Error(_)), "{t:?}");
+    wait_for("pooled for 1001", || {
+        d.engine.idle_connections_for("p", 1001) == 1
+    })
+    .await;
+    assert_eq!(d.engine.idle_connections_for("p", 1002), 0);
+    assert_eq!(
+        d.engine.idle_connections("p"),
+        0,
+        "not in the unpartitioned pool"
+    );
+}
+
+/// Starvation by abandoned dials is bounded by CONNECT_TIMEOUT_MS (the stated cost).
+#[tokio::test]
+async fn review_abandoned_dials_starve_for_at_most_connect_timeout() {
+    let (up, _g) = scripted(vec![]).await;
+    let conn = ScriptConnect::new(HANG);
+    let d = daemon_on(
+        upstreams(
+            &[("s", up.addr)],
+            &[
+                ("s", "MAX_DIALS", "1"),
+                ("s", "CONNECT_TIMEOUT_MS", "600"),
+                ("s", "BREAKER_FAILURES", "100"),
+            ],
+        ),
+        Arc::clone(&conn),
+    );
+    let t0 = Instant::now();
+    for _ in 0..3 {
+        let r = one(
+            &d,
+            &HttpRequest {
+                timeout_ms: Some(50),
+                ..idempotent_get("s")
+            },
+        )
+        .await;
+        r.assert_error(errc::POOL_TIMEOUT, branch::RETRYABLE, http_cause::DEADLINE);
+    }
+    assert_eq!(conn.attempts(), 1, "only one detached dial holds the slot");
+    conn.set(TCP);
+    let t1 = Instant::now();
+    let r = one(&d, &idempotent_get("s")).await;
+    assert_eq!(status(&r), 200);
+    let waited = t1.elapsed();
+    eprintln!(
+        "t1-t0={:?} waited={:?} total since first={:?}",
+        t1 - t0,
+        waited,
+        t0.elapsed()
+    );
+    assert!(
+        t0.elapsed() < Duration::from_millis(600 + 400),
+        "{:?}",
+        t0.elapsed()
+    );
+    assert_eq!(conn.attempts(), 2);
 }
