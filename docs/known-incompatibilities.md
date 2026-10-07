@@ -952,6 +952,13 @@ is Retryable, carries a cause token, and is never retried by the engine itself.
   connection is established. A dial outlives a caller that stops waiting for it, so its connection
   is pooled rather than wasted, and it holds a `MAX_DIALS` slot for up to `CONNECT_TIMEOUT_MS`. One tenant's failures can open the
   breaker for every app on the host. That is the design (SPEC §23.1), and the cost.
+- **Counting timeouts, opt-in, and inert until you size it.** `BREAKER_COUNTS=connect+timeout` also
+  counts a request that was sent and produced no response head for at least `BREAKER_TIMEOUT_MS`
+  after its send — time spent waiting for a token, a queue slot or a connection never counts. The
+  window defaults to `TIMEOUT_MS` (600 s), and Laravel's `Http` client gives up at 30 s by default,
+  so with the defaults no Laravel timeout is ever counted: set `BREAKER_TIMEOUT_MS` at or below your
+  apps' own timeouts. Under this class a probe holds `breaker_probe_busy` until its response head,
+  not only its connection.
 - **The rate limit and the Retry-After hold, opt-in.** `RATE_PER_SEC` shares one token bucket among
   every worker on the host (`rate_limited`); a `RATE_PER_SEC` above 1e9 is refused at start. `HONOR_RETRY_AFTER=1` makes one 429 or 503 that carries a
   `Retry-After` of at most `RETRY_AFTER_MAX_MS` hold the upstream for every app until the delay

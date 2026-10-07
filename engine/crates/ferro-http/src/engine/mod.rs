@@ -743,8 +743,11 @@ impl HttpEngine {
                 // its own outcome; this request only waits for it, within its own bounds.
                 let mut dialled = self.spawn_dial(slot, &key, up, ticket.clone());
                 // Review round 2, N3: a dial that finished in the same poll as the branch that ends
-                // this wait has its connection in the channel; it is pooled, not dropped.
+                // this wait has its connection in the channel; it is pooled, not dropped. Closing
+                // the receiver first makes it race-free: a result sent before the close is taken
+                // here, and a send after it fails, so the dial task pools the connection itself.
                 let rescue = |dialled: &mut tokio::sync::oneshot::Receiver<DialResult>| {
+                    dialled.close();
                     if let Ok(Ok((c, ..))) = dialled.try_recv() {
                         self.pools.checkin(key.clone(), c, max_idle);
                     }
