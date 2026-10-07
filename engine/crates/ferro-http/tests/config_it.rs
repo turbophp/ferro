@@ -85,6 +85,26 @@ fn rate_defaults_burst_to_the_rate() {
     assert_eq!((b.per_sec_milli, b.burst, b.max_wait_ms), (12_500, 13, 250));
 }
 
+/// M6-F6 review: a `RATE_PER_SEC` above 1e9 would make the token interval 0 ns — no limit at all —
+/// so it disables the upstream; 1e9 itself (one token per ns) is the largest accepted.
+#[test]
+fn a_rate_above_one_per_nanosecond_is_refused() {
+    let cfg = load(&[
+        ("FERRO_UPSTREAMS", "a,b"),
+        ("FERRO_UPSTREAM_A_ORIGIN", "https://a.example"),
+        ("FERRO_UPSTREAM_A_RATE_PER_SEC", "1000000000.001"),
+        ("FERRO_UPSTREAM_B_ORIGIN", "https://b.example"),
+        ("FERRO_UPSTREAM_B_RATE_PER_SEC", "1000000000"),
+    ]);
+    assert!(!enabled(&cfg, "a"), "{:?}", shown(&cfg));
+    assert!(
+        shown(&cfg).iter().any(|e| e.contains("RATE_PER_SEC")),
+        "{:?}",
+        shown(&cfg)
+    );
+    assert!(enabled(&cfg, "b"), "{:?}", shown(&cfg));
+}
+
 #[test]
 fn names_sharing_an_env_prefix_resolve_by_exact_key() {
     // `api` and `api_http`: FERRO_UPSTREAM_API_HTTP is api's `HTTP` key, and

@@ -574,6 +574,27 @@ mod tests {
         ));
     }
 
+    /// Review MH: below `MAX_CONNECTIONS` an idle connection is NEVER closed to make room — a
+    /// request that cannot dial only because `MAX_DIALS` is taken waits, and the idle pool is kept.
+    #[tokio::test]
+    async fn below_max_connections_no_idle_connection_is_closed_for_room() {
+        let pools = Pools::default();
+        let key = key();
+        let caps = Caps {
+            max_connections: 8,
+            max_dials: 1,
+        };
+        let Take::Dial(d) = pools.take(&key, policy(true), caps).await else {
+            panic!("dial")
+        };
+        let (old, _far) = conn_in(&pools, &key, Duration::from_secs(9)).await;
+        pools.return_unused(key.clone(), old, 8);
+        // A POST cannot use the 9 s idle connection, and the one dial slot is taken: it waits.
+        assert!(pending(pools.take(&key, policy(false), caps)).await);
+        assert_eq!(pools.idle_count(&key), 1, "the idle connection was kept");
+        drop(d);
+    }
+
     /// Stale connections found on the way are closed, and their slots reused.
     #[tokio::test]
     async fn stale_connections_free_their_slots() {

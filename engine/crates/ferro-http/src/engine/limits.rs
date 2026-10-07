@@ -20,7 +20,7 @@
 //!
 //! The state machines take `now` as an argument, so their rules are tested without a clock.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -106,13 +106,23 @@ enum TicketKind {
     Probe,
 }
 
-/// A request's admission by the breaker, held until its outcome is known. **An RAII guard:**
-/// dropping it without [`BreakerTicket::record`] reports [`BreakerOutcome::Other`], so a probe that
-/// is refused later, cancelled, dropped or unwound by a panic releases the half-open slot.
+/// A request's admission by the breaker, held until its outcome is known. **An RAII guard:** when
+/// its LAST handle is dropped without an outcome it reports [`BreakerOutcome::Other`], so a probe
+/// that is refused later, cancelled, dropped or unwound by a panic releases the half-open slot.
+///
+/// It is shared (M6-F6 review R3): the request holds one handle and the dial it started holds
+/// another, because a dial runs to the ENGINE's connect bound even after its requester has left,
+/// and records its own outcome. A probe's slot is therefore held until both are done.
+#[derive(Clone, Debug)]
+pub struct BreakerTicket(Arc<TicketInner>);
+
 #[derive(Debug)]
-pub struct BreakerTicket {
+struct TicketInner {
     breaker: Arc<Breaker>,
-    kind: TicketKind,
+    probe: bool,
+    /// The closed period it was admitted in (unused for the probe); refreshed by
+    /// [`BreakerTicket::recheck`] when the breaker has closed again since.
+    generation: AtomicU64,
     recorded: AtomicBool,
 }
 
@@ -169,11 +179,16 @@ impl Breaker {
             St::Open { .. } => unreachable!("an elapsed open state was made half-open above"),
         };
         drop(g);
-        Ok(BreakerTicket {
+        let (probe, generation) = match kind {
+            TicketKind::Probe => (true, 0),
+            TicketKind::Closed(g) => (false, g),
+        };
+        Ok(BreakerTicket(Arc::new(TicketInner {
             breaker: Arc::clone(self),
-            kind,
+            probe,
+            generation: AtomicU64::new(generation),
             recorded: AtomicBool::new(false),
-        })
+        })))
     }
 
     fn settle(&self, kind: TicketKind, outcome: BreakerOutcome, now: Instant) {
@@ -215,59 +230,137 @@ impl Breaker {
     }
 }
 
+impl TicketInner {
+    fn kind(&self) -> TicketKind {
+        if self.probe {
+            TicketKind::Probe
+        } else {
+            TicketKind::Closed(self.generation.load(Ordering::SeqCst))
+        }
+    }
+
+    fn record_at(&self, outcome: BreakerOutcome, now: Instant) {
+        if !self.recorded.swap(true, Ordering::SeqCst) {
+            self.breaker.settle(self.kind(), outcome, now);
+        }
+    }
+}
+
+impl Drop for TicketInner {
+    fn drop(&mut self) {
+        self.record_at(BreakerOutcome::Other, Instant::now());
+    }
+}
+
 impl BreakerTicket {
     /// Whether this request is the half-open probe.
     pub fn is_probe(&self) -> bool {
-        self.kind == TicketKind::Probe
+        self.0.probe
     }
 
-    /// Settle this request's outcome. The FIRST record wins: a probe whose head arrived has closed
-    /// the breaker, and a body failure after it does not reopen it.
+    /// Settle this request's outcome. The FIRST record wins: a probe whose evidence arrived has
+    /// closed the breaker, and a later failure does not reopen it.
     pub fn record(&self, outcome: BreakerOutcome) {
         self.record_at(outcome, Instant::now());
     }
 
     /// [`record`](Self::record) at `now` (the unit tests' clock).
     pub fn record_at(&self, outcome: BreakerOutcome, now: Instant) {
-        if !self.recorded.swap(true, Ordering::SeqCst) {
-            self.breaker.settle(self.kind, outcome, now);
-        }
+        self.0.record_at(outcome, now);
     }
 
-    /// [`record`](Self::record) with the outcome a classified failure means (§23.8.6).
-    pub fn record_failure(&self, s: &Situation) {
-        self.record(failure_outcome(s, self.breaker.counts));
+    /// The REQUESTER's evidence from a classified failure (§23.8.6 as amended at the F6 review):
+    /// only a counted "sent, no head" `timeout` whose bound the ENGINE set. Dial failures are the
+    /// dial's to record ([`BreakerTicket::record_dial`]), and "any other terminal" is recorded by
+    /// the last handle's drop, never here — recording it here would consume the ticket before a
+    /// detached dial could report.
+    pub fn record_failure(&self, s: &Situation, engine_bound: bool) {
+        if failure_outcome(s, self.0.breaker.counts, engine_bound) == BreakerOutcome::Counted {
+            self.record(BreakerOutcome::Counted);
+        }
     }
 
     /// [`record`](Self::record) for a final head with `status`.
     pub fn record_head(&self, status: u16) {
-        self.record(head_outcome(status, self.breaker.counts));
+        self.record(head_outcome(status, self.0.breaker.counts));
+    }
+
+    /// The dial's evidence: `Ok(())` when its connection was established (TCP + TLS), or the
+    /// situation its failure maps to. A dial is always bounded by the ENGINE's connect bound.
+    pub fn record_dial(&self, result: Result<(), &Situation>) {
+        if let Some(o) = dial_outcome(result, self.0.breaker.counts) {
+            self.record(o);
+        }
+    }
+
+    /// The breaker's admission, checked again immediately before a dial (M6-F6 review R1): a
+    /// request admitted while closed may have waited for a dial slot while the breaker opened. The
+    /// probe passes; a closed-period ticket passes while the breaker is closed (and is moved to
+    /// the current closed period if the breaker opened and closed again meanwhile); otherwise the
+    /// request is refused as an admission would be now.
+    pub fn recheck(&self, now: Instant) -> Result<(), BreakerRefusal> {
+        if self.0.probe {
+            return Ok(());
+        }
+        let g = self.0.breaker.lock();
+        match g.st {
+            St::Closed { .. } => {
+                self.0.generation.store(g.generation, Ordering::SeqCst);
+                Ok(())
+            }
+            St::Open { until } if now < until => Err(BreakerRefusal::Open {
+                retry_after_ms: ms_until(until, now),
+            }),
+            St::Open { .. } | St::HalfOpen { .. } => Err(BreakerRefusal::ProbeBusy),
+        }
     }
 }
 
-impl Drop for BreakerTicket {
-    fn drop(&mut self) {
-        self.record(BreakerOutcome::Other);
-    }
-}
-
-/// What a classified failure means to the breaker. `connect` (the default class) is `dns`,
-/// `connect_*` and `tls_handshake` — all not sent (§23.8.6). `connect+timeout` adds the `timeout`
-/// of the "sent, no head" row: the upstream took the request and produced no head by the deadline
-/// (SPEC §22.2 (dk)). Everything else is "any other terminal".
-pub fn failure_outcome(s: &Situation, counts: BreakerCounts) -> BreakerOutcome {
+/// What a REQUESTER's classified failure means to the breaker (§23.8.6, as amended at the M6-F6
+/// review). `connect+timeout` adds the `timeout` of the "sent, no head" row — the upstream took
+/// the request and produced no head by the deadline — but ONLY when that deadline was the
+/// upstream's configured `TIMEOUT_MS` (`engine_bound`): a bound the caller shortened is the
+/// caller's choice, not evidence about the upstream (review R2). Everything else is "any other
+/// terminal" from the requester's side; the connect class is the dial's evidence.
+pub fn failure_outcome(s: &Situation, counts: BreakerCounts, engine_bound: bool) -> BreakerOutcome {
     match s {
-        Situation::BeforeDispatch(
-            BeforeDispatch::Dns
-            | BeforeDispatch::ConnectRefused
-            | BeforeDispatch::ConnectUnreachable
-            | BeforeDispatch::ConnectTimeout
-            | BeforeDispatch::TlsHandshake,
-        ) => BreakerOutcome::Counted,
-        Situation::SentNoHead(SentNoHead::Timeout) if counts != BreakerCounts::Connect => {
+        Situation::SentNoHead(SentNoHead::Timeout)
+            if counts != BreakerCounts::Connect && engine_bound =>
+        {
             BreakerOutcome::Counted
         }
         _ => BreakerOutcome::Other,
+    }
+}
+
+/// Whether a dial failure is in the counted `connect` class: `dns`, `connect_*` and
+/// `tls_handshake`, all before dispatch.
+pub fn is_connect_class(s: &Situation) -> bool {
+    matches!(
+        s,
+        Situation::BeforeDispatch(
+            BeforeDispatch::Dns
+                | BeforeDispatch::ConnectRefused
+                | BeforeDispatch::ConnectUnreachable
+                | BeforeDispatch::ConnectTimeout
+                | BeforeDispatch::TlsHandshake,
+        )
+    )
+}
+
+/// What a dial's result means to the breaker: a connect-class failure is counted under every
+/// class; an ESTABLISHED connection is the answer under the default `connect` class (the evidence
+/// that class measures — so a probe no longer holds its slot for the upstream's time to first
+/// byte), and nothing yet under the other classes, whose answer is the head. Any other dial
+/// failure (the address guard, a certificate refusal) is no evidence.
+pub fn dial_outcome(
+    result: Result<(), &Situation>,
+    counts: BreakerCounts,
+) -> Option<BreakerOutcome> {
+    match result {
+        Ok(()) => (counts == BreakerCounts::Connect).then_some(BreakerOutcome::Success),
+        Err(s) if is_connect_class(s) => Some(BreakerOutcome::Counted),
+        Err(_) => None,
     }
 }
 
@@ -373,11 +466,17 @@ pub struct RateBucket {
 }
 
 /// A token taken ahead of its time: the request waits until the token is due. Dropped before
-/// [`RateWait::keep`] (a `CANCEL` or the drain cap while waiting), the token is given back.
+/// [`RateWait::keep`] (a `CANCEL` or the drain cap while waiting), the token is given back ONLY if
+/// no later request has been scheduled after it (M6-F6 review R5): giving back a middle slot would
+/// let a newcomer take the slot of the last waiter, so two requests would fire at one instant.
+/// Otherwise the slot is lost — conservative, it may under-admit, never over-admit.
 #[derive(Debug)]
 pub struct RateWait {
     bucket: Arc<RateBucket>,
     pub wait: Duration,
+    /// The bucket's `tat` right after this reservation: if it is still that when the wait is
+    /// abandoned, this was the LAST slot scheduled and can be given back.
+    after: u128,
     kept: bool,
 }
 
@@ -392,7 +491,9 @@ impl Drop for RateWait {
     fn drop(&mut self) {
         if !self.kept {
             let mut tat = self.bucket.tat.lock().unwrap_or_else(|p| p.into_inner());
-            *tat = tat.saturating_sub(self.bucket.interval);
+            if *tat == self.after {
+                *tat = self.after - self.bucket.interval;
+            }
         }
     }
 }
@@ -439,10 +540,12 @@ impl RateBucket {
             };
         }
         *tat = next + self.interval;
+        let after = *tat;
         drop(tat);
         RateDecision::Wait(RateWait {
             bucket: Arc::clone(self),
             wait,
+            after,
             kept: false,
         })
     }
@@ -736,26 +839,41 @@ mod tests {
         ];
         for c in [Connect, ConnectTimeout, ConnectTimeout5xx] {
             for s in &counted {
+                // The dial's evidence under every class; never the requester's (review R2/R3).
+                assert!(is_connect_class(s), "{s:?}");
                 assert_eq!(
-                    failure_outcome(s, c),
-                    BreakerOutcome::Counted,
+                    dial_outcome(Err(s), c),
+                    Some(BreakerOutcome::Counted),
+                    "{s:?}"
+                );
+                for bound in [true, false] {
+                    assert_eq!(failure_outcome(s, c, bound), BreakerOutcome::Other, "{s:?}");
+                }
+            }
+            for s in &never {
+                assert!(!is_connect_class(s), "{s:?}");
+                assert_eq!(dial_outcome(Err(s), c), None, "{s:?}");
+                assert_eq!(
+                    failure_outcome(s, c, true),
+                    BreakerOutcome::Other,
                     "{s:?} {c:?}"
                 );
             }
-            for s in &never {
-                assert_eq!(failure_outcome(s, c), BreakerOutcome::Other, "{s:?} {c:?}");
-            }
         }
+        // An established connection is the answer under `connect` only.
+        assert_eq!(dial_outcome(Ok(()), Connect), Some(BreakerOutcome::Success));
+        assert_eq!(dial_outcome(Ok(()), ConnectTimeout), None);
+        assert_eq!(dial_outcome(Ok(()), ConnectTimeout5xx), None);
         let timeout = Situation::SentNoHead(SentNoHead::Timeout);
-        assert_eq!(failure_outcome(&timeout, Connect), BreakerOutcome::Other);
         assert_eq!(
-            failure_outcome(&timeout, ConnectTimeout),
-            BreakerOutcome::Counted
+            failure_outcome(&timeout, Connect, true),
+            BreakerOutcome::Other
         );
-        assert_eq!(
-            failure_outcome(&timeout, ConnectTimeout5xx),
-            BreakerOutcome::Counted
-        );
+        for c in [ConnectTimeout, ConnectTimeout5xx] {
+            assert_eq!(failure_outcome(&timeout, c, true), BreakerOutcome::Counted);
+            // Review R2: a deadline the caller shortened is not evidence.
+            assert_eq!(failure_outcome(&timeout, c, false), BreakerOutcome::Other);
+        }
         for s in [200, 429, 500, 501, 505, 599] {
             assert_eq!(head_outcome(s, ConnectTimeout5xx), BreakerOutcome::Success);
         }
@@ -764,6 +882,108 @@ mod tests {
             assert_eq!(head_outcome(s, ConnectTimeout), BreakerOutcome::Success);
             assert_eq!(head_outcome(s, Connect), BreakerOutcome::Success);
         }
+    }
+
+    /// Review R2/R3: a ticket is shared by the request and its detached dial, and reports "any
+    /// other terminal" only when the LAST handle goes — so a probe whose requester has left keeps
+    /// its slot until its dial has reported, and the dial's outcome decides.
+    #[test]
+    fn a_shared_ticket_settles_on_its_first_record_or_its_last_drop() {
+        let b = breaker(1, BreakerCounts::Connect, 100);
+        let t0 = Instant::now();
+        b.admit(t0).unwrap().record_at(BreakerOutcome::Counted, t0);
+        let t1 = t0 + ms(100);
+        let probe = b.admit(t1).unwrap();
+        let dial = probe.clone();
+        drop(probe); // the requester leaves
+        assert_eq!(
+            b.admit(t1).unwrap_err(),
+            BreakerRefusal::ProbeBusy,
+            "still probing"
+        );
+        dial.record_dial(Err(&Situation::BeforeDispatch(
+            BeforeDispatch::ConnectTimeout,
+        )));
+        drop(dial);
+        assert!(
+            matches!(b.admit(t1).unwrap_err(), BreakerRefusal::Open { .. }),
+            "the detached dial's counted failure reopened it"
+        );
+        // A requester-side failure outside the counted class does not consume the ticket.
+        let b = breaker(1, BreakerCounts::Connect, 100);
+        let t = b.admit(t0).unwrap();
+        let dial = t.clone();
+        t.record_failure(
+            &Situation::BeforeDispatch(BeforeDispatch::ConnectTimeout),
+            true,
+        );
+        drop(t);
+        dial.record_dial(Err(&Situation::BeforeDispatch(
+            BeforeDispatch::ConnectRefused,
+        )));
+        drop(dial);
+        assert_eq!(b.state(t0), BreakerState::Open);
+    }
+
+    /// Review R1: the breaker is asked again immediately before a dial.
+    #[test]
+    fn recheck_refuses_a_closed_period_ticket_once_the_breaker_has_opened() {
+        let b = breaker(1, BreakerCounts::Connect, 1_000);
+        let t0 = Instant::now();
+        let waiting = b.admit(t0).unwrap();
+        assert_eq!(waiting.recheck(t0), Ok(()));
+        b.admit(t0).unwrap().record_at(BreakerOutcome::Counted, t0);
+        assert_eq!(
+            waiting.recheck(t0 + ms(400)),
+            Err(BreakerRefusal::Open {
+                retry_after_ms: 600
+            })
+        );
+        assert_eq!(
+            waiting.recheck(t0 + ms(1_000)),
+            Err(BreakerRefusal::ProbeBusy),
+            "half-open, and it is not the probe"
+        );
+        let probe = b.admit(t0 + ms(1_000)).unwrap();
+        assert_eq!(
+            probe.recheck(t0 + ms(1_000)),
+            Ok(()),
+            "the probe always dials"
+        );
+        probe.record_at(BreakerOutcome::Success, t0 + ms(1_000));
+        // Closed again: the waiting request is moved to the current closed period and dials; its
+        // outcome counts there.
+        assert_eq!(waiting.recheck(t0 + ms(1_000)), Ok(()));
+        waiting.record_at(BreakerOutcome::Counted, t0 + ms(1_000));
+        assert_eq!(b.state(t0 + ms(1_000)), BreakerState::Open);
+    }
+
+    /// Review R5: a refund only of the LAST scheduled slot — refunding a middle one let a newcomer
+    /// share the last waiter's instant ([2 s, 3 s, 3 s]).
+    #[test]
+    fn a_refund_never_double_books_a_slot() {
+        let t0 = Instant::now();
+        let b = bucket(1_000, 1, 10_000, t0);
+        let far = Duration::from_secs(60);
+        let wait = |d: RateDecision| match d {
+            RateDecision::Wait(w) => w,
+            d => panic!("{d:?}"),
+        };
+        assert!(admit(b.take(t0, far)));
+        let w1 = wait(b.take(t0, far)); // 1 s
+        let w2 = wait(b.take(t0, far)); // 2 s
+        let w3 = wait(b.take(t0, far)); // 3 s
+        drop(w1); // a middle slot: not refunded
+        let n = wait(b.take(t0, far));
+        let fire: Vec<Duration> = [&w2, &w3, &n].iter().map(|w| w.wait).collect();
+        assert_eq!(
+            fire,
+            vec![ms(2_000), ms(3_000), ms(4_000)],
+            "one request per slot"
+        );
+        drop(n); // the last slot: refunded
+        let m = wait(b.take(t0, far));
+        assert_eq!(m.wait, ms(4_000), "the refunded last slot is taken again");
     }
 
     fn hold(status: u16, values: &[&str]) -> Option<Duration> {

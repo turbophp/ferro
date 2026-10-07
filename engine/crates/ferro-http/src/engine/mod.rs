@@ -102,7 +102,7 @@ pub use tls::{OsRoots, TlsCause, TlsSetupError};
 use body::OneChunk;
 use budget::Budgets;
 use dial::{DialFailure, DnsCache};
-use limits::{BreakerRefusal, BreakerState, Limits, RateDecision};
+use limits::{BreakerRefusal, BreakerState, BreakerTicket, Limits, RateDecision};
 use pool::{Caps, DialSlot, HttpConn, LiveConn, PoolKey, Pools, ReusePolicy, Take};
 use tls::TlsContexts;
 use track::{CipherTap, Tracker};
@@ -249,8 +249,8 @@ pub struct HttpEngine {
     config: Arc<HttpConfig>,
     resolver: Arc<dyn Resolve>,
     connector: Arc<dyn Connect>,
-    dns: DnsCache,
-    pools: Pools,
+    dns: Arc<DnsCache>,
+    pools: Arc<Pools>,
     budgets: Budgets,
     limits: Limits,
     in_flight: InFlight,
@@ -328,8 +328,8 @@ impl HttpEngine {
             config,
             resolver,
             connector,
-            dns: DnsCache::default(),
-            pools: Pools::default(),
+            dns: Arc::new(DnsCache::default()),
+            pools: Arc::new(Pools::default()),
             budgets,
             limits,
             in_flight: InFlight(watch::Sender::new(0)),
@@ -542,6 +542,9 @@ impl HttpEngine {
         };
         let up = v.upstream;
         let idem = v.idempotent;
+        // The breaker's evidence comes only from bounds the ENGINE sets (§23.8.6 as amended at the
+        // F6 review): a total deadline the caller shortened is not evidence about the upstream.
+        let engine_deadline = req.timeout_ms.is_none_or(|t| t >= up.limits.timeout_ms);
         let bounds = Bounds {
             deadline: tokio::time::Instant::from_std(started)
                 + ms(req
@@ -613,7 +616,7 @@ impl HttpEngine {
         };
         // Every terminal from here on settles the ticket with what it means to the breaker.
         let fin = |s: Situation| {
-            ticket.record_failure(&s);
+            ticket.record_failure(&s, engine_deadline);
             classify(s, idem)
         };
         if let Some(hold) = &lim.hold
@@ -709,19 +712,50 @@ impl HttpEngine {
         };
         let (mut conn, reused, connect_us, tls_us) = match taken {
             Take::Idle(c) => (c, true, 0, 0),
-            Take::Dial(slot) => tokio::select! {
-                biased;
-                () = stop.token.cancelled() => {
-                    return fin(Situation::BeforeDispatch(before_dispatch_stop(stop)));
+            Take::Dial(slot) => {
+                // Review R1: the breaker may have opened while this request waited for a dial
+                // slot. Asked again here, immediately before the dial, so an open breaker makes
+                // no connection attempt, whoever was admitted before it opened.
+                if let Err(r) = ticket.recheck(tokio::time::Instant::now()) {
+                    drop(slot);
+                    return fin(Situation::BeforeDispatch(match r {
+                        BreakerRefusal::Open { retry_after_ms } => {
+                            BeforeDispatch::BreakerOpen { retry_after_ms }
+                        }
+                        BreakerRefusal::ProbeBusy => BeforeDispatch::BreakerProbeBusy,
+                    }));
                 }
-                () = tokio::time::sleep_until(bounds.deadline) => {
-                    return fin(Situation::BeforeDispatch(BeforeDispatch::Deadline));
+                // Review R3: the dial runs DETACHED, to the engine's own connect bound, and records
+                // its own outcome; this request only waits for it, within its own bounds.
+                let dialled = self.spawn_dial(slot, &key, up, ticket.clone());
+                let engine_connect = ms(up.limits.connect_timeout_ms);
+                // The caller's own, shorter, connect bound (§23.8.4). When it ends the wait the
+                // request is `connect_timeout` as before, and the dial runs on.
+                let own_connect = (bounds.connect < engine_connect)
+                    .then(|| tokio::time::Instant::now() + bounds.connect);
+                tokio::select! {
+                    biased;
+                    () = stop.token.cancelled() => {
+                        return fin(Situation::BeforeDispatch(before_dispatch_stop(stop)));
+                    }
+                    () = tokio::time::sleep_until(bounds.deadline) => {
+                        return fin(Situation::BeforeDispatch(BeforeDispatch::Deadline));
+                    }
+                    () = sleep_until_some(own_connect) => {
+                        return fin(Situation::BeforeDispatch(BeforeDispatch::ConnectTimeout));
+                    }
+                    r = dialled => match r {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(f)) => return fin(Situation::BeforeDispatch(dial_situation(f))),
+                        // The dial task is gone without an answer (it panicked): nothing was sent.
+                        Err(_) => {
+                            return fin(Situation::BeforeDispatch(
+                                BeforeDispatch::ConnectUnreachable,
+                            ));
+                        }
+                    },
                 }
-                r = self.dial(slot, &key, up, bounds.connect) => match r {
-                    Ok(c) => c,
-                    Err(f) => return fin(Situation::BeforeDispatch(dial_situation(f))),
-                },
-            },
+            }
         };
 
         // ---- dispatch -----------------------------------------------------------------------------
@@ -1002,17 +1036,103 @@ impl HttpEngine {
         Terminal::Done(HttpDone { trailers, stats })
     }
 
-    /// Dial (§23.8.5) into a reserved slot, then — on `https` — the TLS handshake (§23.8.8), all
-    /// within the one connect bound (§23.8.4: DNS + TCP + TLS). Returns the connection, `false`
-    /// (not reused), its `connect_us` (DNS + TCP) and its `tls_us` (the handshake). The slot is
-    /// freed if the dial fails or is dropped, and becomes the connection's if it succeeds.
-    async fn dial(
+    /// Start a dial into a reserved slot (§23.8.5), DETACHED from the request that asked for it
+    /// (M6-F6 review R3). The dial runs to the upstream's own `CONNECT_TIMEOUT_MS` — the engine's
+    /// bound, never a caller's shorter one — and records its outcome to the breaker through its
+    /// handle of the requester's ticket, so a black-holed upstream is counted whatever the callers'
+    /// deadlines. If the requester has left by the time the connection is established, the
+    /// connection goes to the idle pool (or to a waiter) instead of being closed. The receiver
+    /// yields the connection, its `connect_us` (DNS + TCP) and its `tls_us` (the handshake).
+    ///
+    /// **Cost, stated:** a dial whose requester has gone holds a `MAX_DIALS` slot (and a
+    /// `MAX_CONNECTIONS` one) for up to `CONNECT_TIMEOUT_MS`.
+    fn spawn_dial(
         &self,
         slot: DialSlot,
         key: &PoolKey,
         up: &Upstream,
-        connect: Duration,
+        ticket: BreakerTicket,
+    ) -> tokio::sync::oneshot::Receiver<Result<(HttpConn, bool, u64, u64), DialFailure>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let job = DialJob {
+            config: Arc::clone(&self.config),
+            upstream: up.name.clone(),
+            key: key.clone(),
+            resolver: Arc::clone(&self.resolver),
+            connector: Arc::clone(&self.connector),
+            dns: Arc::clone(&self.dns),
+            pools: Arc::clone(&self.pools),
+            live: Arc::clone(&self.live),
+            tls: match self.tls.get(&up.name) {
+                Some(Ok(ctx)) => Some(Arc::clone(ctx)),
+                _ => None,
+            },
+            #[cfg(test)]
+            pause_after_h1: self.pause_after_h1,
+        };
+        tokio::spawn(async move {
+            let mut slot = Some(slot);
+            let result = job.run(&mut slot).await;
+            // The evidence is recorded BEFORE a failed dial's slot is freed, so a request woken by
+            // the freed slot finds the breaker as this dial left it (review R1).
+            ticket.record_dial(
+                result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|f| Situation::BeforeDispatch(dial_situation(*f)))
+                    .as_ref()
+                    .map(|_| ()),
+            );
+            drop(slot);
+            drop(ticket);
+            if let Err(Ok((conn, ..))) = tx.send(result) {
+                // The requester has gone: keep the connection for the next request.
+                let max = job.upstream().map_or(0, |u| {
+                    usize::try_from(u.limits.max_connections).unwrap_or(usize::MAX)
+                });
+                job.pools.checkin(job.key.clone(), conn, max);
+            }
+        });
+        rx
+    }
+}
+
+/// Everything a detached dial needs, owned (it outlives the request that started it).
+struct DialJob {
+    config: Arc<HttpConfig>,
+    upstream: String,
+    key: PoolKey,
+    resolver: Arc<dyn Resolve>,
+    connector: Arc<dyn Connect>,
+    dns: Arc<DnsCache>,
+    pools: Arc<Pools>,
+    live: Arc<AtomicUsize>,
+    tls: Option<Arc<tls::UpstreamTls>>,
+    #[cfg(test)]
+    pause_after_h1: Option<Duration>,
+}
+
+impl DialJob {
+    fn upstream(&self) -> Option<&Upstream> {
+        self.config.entries().find_map(|(n, e)| match e {
+            crate::config::UpstreamEntry::Enabled(up) if n == self.upstream => Some(&**up),
+            _ => None,
+        })
+    }
+
+    /// DNS, the address guard, TCP to the checked address and — on `https` — the TLS handshake,
+    /// all within the upstream's `CONNECT_TIMEOUT_MS` (§23.8.4). The slot becomes the connection's
+    /// on success; on failure it is left in `slot` for the caller to free after recording.
+    async fn run(
+        &self,
+        slot: &mut Option<DialSlot>,
     ) -> Result<(HttpConn, bool, u64, u64), DialFailure> {
+        // The configuration is fixed for the daemon's life, and the request was validated against
+        // this upstream, so it is there; an absent one is the safe dial failure.
+        let Some(up) = self.upstream() else {
+            return Err(DialFailure::ConnectUnreachable);
+        };
+        let connect = ms(up.limits.connect_timeout_ms);
         let started = tokio::time::Instant::now();
         let d = dial::dial(
             up,
@@ -1024,17 +1144,16 @@ impl HttpEngine {
         )
         .await?;
         let (sender, task, track, tls_us) = if up.origin.scheme() == Scheme::Https {
-            let ctx = match self.tls.get(&up.name) {
-                Some(Ok(ctx)) => ctx.clone(),
+            let Some(ctx) = self.tls.clone() else {
                 // `run` refuses an upstream whose TLS material failed before it gets here, and every
                 // enabled `https` upstream has a context; an absent one is an engine invariant
                 // violation, made the safe dial failure (nothing has been sent).
-                _ => return Err(DialFailure::Tls(TlsCause::Handshake)),
+                return Err(DialFailure::Tls(TlsCause::Handshake));
             };
             // The ciphertext half sits on the socket, BELOW TLS; it is unarmed during the handshake,
             // whose bytes therefore never count as `sent` (§23.7.1).
             let (tap, track) = CipherTap::new(d.stream);
-            let connector = tokio_rustls::TlsConnector::from(ctx.config_for(key.1));
+            let connector = tokio_rustls::TlsConnector::from(ctx.config_for(self.key.1));
             let tls_start = Instant::now();
             let handshake = connector.connect(ctx.server_name(), tap);
             let tls = match tokio::time::timeout_at(started + connect, handshake).await {
@@ -1055,6 +1174,9 @@ impl HttpEngine {
             let (sender, task) = h1_handshake(tracked).await?;
             (sender, task, track, 0)
         };
+        let Some(slot) = slot.take() else {
+            return Err(DialFailure::ConnectUnreachable);
+        };
         let now = Instant::now();
         Ok((
             HttpConn {
@@ -1072,6 +1194,14 @@ impl HttpEngine {
             micros(d.elapsed),
             tls_us,
         ))
+    }
+}
+
+/// Sleeps until `at`, or for ever when there is none.
+async fn sleep_until_some(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 

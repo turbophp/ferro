@@ -334,9 +334,10 @@ impl fmt::Display for Reason {
                     "entry {n} is not an IPv6 /96 prefix with zero low 32 bits"
                 )
             }
-            Reason::BadRate => {
-                f.write_str("must be a positive decimal with at most three fractional digits")
-            }
+            Reason::BadRate => f.write_str(
+                "must be a positive decimal with at most three fractional digits, at most \
+                     1000000000",
+            ),
             Reason::Conflict(why) => f.write_str(why),
             Reason::Unknown => f.write_str("is not a known key"),
             Reason::Ambiguous => f.write_str("could belong to more than one declared upstream"),
@@ -785,6 +786,9 @@ fn one_of<T: Copy>(raw: &str, opts: &'static [&'static str], vals: &[T]) -> Resu
 }
 
 /// `RATE_PER_SEC`: `\d+(\.\d{1,3})?`, positive, in milli-units.
+/// The largest `RATE_PER_SEC`, in milli-requests per second: 1e9 per second, one token per ns.
+pub const MAX_RATE_MILLI: u64 = 1_000_000_000_000;
+
 fn parse_rate(raw: &str) -> Result<u64, Reason> {
     let (int, frac) = match raw.split_once('.') {
         Some((i, f)) if !f.is_empty() && f.len() <= 3 => (i, f),
@@ -804,7 +808,9 @@ fn parse_rate(raw: &str) -> Result<u64, Reason> {
         .checked_mul(1000)
         .and_then(|v| v.checked_add(f))
         .ok_or(Reason::BadRate)?;
-    if milli == 0 {
+    // Above 1e9 per second the engine's token interval (1e12 / milli ns) would be 0 ns, i.e. no
+    // limit at all — refused rather than silently unlimited (M6-F6 review).
+    if milli == 0 || milli > MAX_RATE_MILLI {
         return Err(Reason::BadRate);
     }
     Ok(milli)
