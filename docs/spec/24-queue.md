@@ -525,6 +525,8 @@ checkout, as the "queue name" refusal below says. Until the slices that build th
 *[Amended M7-G2 (SPEC §22.2 (di)): tx-scoped ENQUEUE, ACK, RELEASE, EXTEND, SIZE and CLEAR are SERVED
 (§24.5); a tx-scoped RESERVE stays refused `Unsupported`, for good, and is refused before its `tx_id` is
 even resolved.]*
+*[Amended M7-G3 (SPEC §22.2 (dl)): a RESERVE with `wait_ms > 0` is SERVED (the waker, §24.8), its
+`wait_ms` clamped silently to the store's `MAX_WAIT_MS`; nothing is refused for waiting.]*
 
 **Verb semantics.**
 
@@ -615,6 +617,16 @@ even resolved.]*
 - **EXTEND.** `UPDATE … SET reserved_at = now`, fenced. It renews by one full `lease_s`. It also
   retakes a job whose lease expired when nobody else took it, because the holder is evidently
   alive. No match → `LeaseLost`.
+  *[Amended M7-G3 (SPEC §22.2 (dl); carried from the G1b review): **EXTEND also requires
+  `reserved_at IS NOT NULL`.** An unreserve (§24.8) sets `reserved_at = NULL, attempts = attempts − 1`,
+  so the PREVIOUS reservation's token names the row again. For ACK and RELEASE that is the
+  pre-reservation state exactly — the previous holder's late verb is honoured "when nobody else took
+  the job", and the undelivered reservation took it from nobody — so their fence is unchanged and a
+  late ACK by that holder is honoured (pinned live). EXTEND renews a LEASE, and an unreserved row has
+  none: it is pending, and without the predicate the previous holder's EXTEND would re-reserve it with
+  no delivery counted, out from under the RESERVE about to take it. It is `LeaseLost` now, and the row
+  stays pending (pinned live, mutation-proven). A current holder's row always has `reserved_at` set,
+  so no legitimate EXTEND is refused; an EXTEND of an EXPIRED lease nobody re-took still retakes it.]*
 - **SIZE** counts by state. Laravel's `size()` returns the sum.
   *[Amended M7-G1b (SPEC §22.2 (dg)): the states are Laravel 12's exactly (illuminate/queue v12.69.3,
   read from source): `pending` = `reserved_at IS NULL AND available_at <= now`, `delayed` =
@@ -655,6 +667,19 @@ even resolved.]*
   case of a CANCEL that has arrived before a later statement is sent — between two queues — is pinned
   by a unit test on a fake backend, which a review showed was possible where this text first said it
   was not); the `Cancelled` terminal above is the parked case, G3's.]*
+- *[Amended M7-G3 (SPEC §22.2 (dl)): **unreserve is built, and "handed to a live session's writer" is
+  decided under a lock.** A RESERVE declares a terminal carrying jobs through the session's liveness
+  handle, whose lock the session's teardown takes FIRST (before it cancels its in-flight requests):
+  either the declaration happened while the session was live — delivered, and a session that dies
+  before the bytes reach the worker is §24.7's stock-equivalent residual — or teardown had begun, the
+  terminal is `Cancelled` and the jobs are unreserved (cause `teardown`). This holds for a non-waiting
+  RESERVE too: its statement is interrupted by a client CANCEL (G1b's rule, unchanged) but NOT by its
+  session's teardown, which lets it finish (bounded by `WAKER_STMT_TIMEOUT_MS`) so the jobs it took are
+  KNOWN and restorable rather than an `Indeterminate` phantom. **A client CANCEL of a waiting RESERVE
+  whose sweep is in flight** answers `Cancelled` at once — no reservation statement has completed for
+  it — and the jobs that sweep then brings back for it go to another waiting RESERVE of the queue or
+  are unreserved (cause `cancel`, a third cause beside §24.9's two). A CANCEL that finds jobs already
+  deposited for it gets the raced result: the jobs.]*
 
 **No push or STREAM delivery in v1.** The seam pulls. Streaming would lease jobs ahead of
 consumption, and the leases would run down in a client buffer.
@@ -1064,6 +1089,65 @@ are never told the daemon is draining. Workers finish their fenced verbs on the 
 (no engine DDL) and a dedicated listening connection per pool (M5 machinery, built after M7). It is a
 post-v1 option, triggered by measured cross-host latency.
 
+*[Amended M7-G3 (SPEC §22.2 (dl)): **built on PostgreSQL** (`ferrod`'s `services::queue_waker`), with
+these choices the text above left open or the implementation forced:*
+
+- ***Every waiting statement is the waker's.*** *A RESERVE with a non-zero (clamped) `wait_ms` never
+  runs a statement itself: it registers, and the waker runs the ONE statement per `(store, queue)` that
+  serves every eligible waiter of that queue, on a checkout taken for that statement alone and bounded
+  — checkout wait included — by `WAKER_STMT_TIMEOUT_MS`. No request's CANCEL interrupts it (it serves
+  others), so its fate is always known to the waker. A RESERVE with `wait_ms = 0` (or clamped to 0)
+  is served as at G1b.*
+- ***"Register, then sweep", with priority at arrival.*** *A new waiter is registered in the FIFO of
+  each of its queues (duplicates removed) and is then eligible for ONE queue at a time in the order it
+  gave: its first sweep is of its first queue (trigger `arrival`), and only when that brought it
+  nothing is it eligible for the next. After its last queue it is parked and eligible for all of them,
+  and whichever yields first serves it — Redis `BLPOP`'s semantics: priority at the call, first come
+  while blocked. A hint that fires while its arrival sweep is in flight leaves that queue's follow-up
+  sweep pending, so no wake-up is lost.*
+- ***The batch, and a byte budget §24.8 did not have.*** *A sweep serves the longest FIFO prefix of
+  the queue's eligible waiters whose summed frame clamps fit `checks::sweep_cap` — 64 MiB of
+  maximum-size payloads (15 jobs at the 4 MiB default), never fewer than the head waiter's clamp —
+  so 200 waiters cannot make one statement return 2.4 GB. `LIMIT k` is that sum. A sweep that comes
+  back FULL is followed by one more (trigger `refill`) for the waiters it could not cover; a short one
+  is not. Jobs are handed out FIFO by id, each waiter up to its clamp.*
+- ***A job a finished waiter cannot take*** *(cancelled, torn down, past its grace bound while the
+  sweep ran) is offered to the queue's other eligible waiters first, and only the rest is unreserved:
+  ONE fenced statement for the sweep's leftovers (each row fenced on `id`, minted `attempts`,
+  `created_at` and the `reserved_at` it stamped, which is `lease_deadline − lease_s − 1`, so the
+  RESERVE statement is unchanged). The restored queues are woken (trigger 1, source `unreserve`).*
+- ***The wait bound and the request deadline.*** *A waiter's `hard_end` is `received + wait_ms +
+  queue_wait_grace_ms`; when the request carries `timeout_ms`, both its wait end and its `hard_end` are
+  capped by that deadline. Past either it is answered `Ok{jobs: []}` — known fate: anything a late
+  sweep reserves for it is unreserved — never an error, and the handler answers on its own timer,
+  never waiting for the waker.*
+- ***Exactly-once finish.*** *Each waiter has a slot. The waker deposits jobs, a failed sweep's
+  terminal or "nothing" into it only if nobody has finished it; the handler finishes it (deadline,
+  CANCEL, teardown, drain) under the same lock. Whichever comes first wins; the other side's jobs are
+  offered on or unreserved. Lock order is waker state, then slot; the handler takes only the slot.*
+- ***A failed sweep*** *ends the waiters it served with its classified terminal (`Indeterminate` under
+  the `57014` override, counted in `reserve_unconfirmed_total`) and the queue's other idle waiters
+  with `Ok{jobs: []}`; its pending follow-up is dropped, never re-sent.*
+- ***The poll*** *is one store-level ticker every `POLL_MS`; each tick sweeps each queue that has an
+  eligible waiter and no sweep in flight (a tick during a sweep adds nothing — the sweep in flight is
+  that poll). Delayed jobs coming due and expired leases are found by it, as written.*
+- ***Wake hints*** *(trigger 1): an autocommit ENQUEUE wakes each of its distinct queues, at any delay
+  (G2's in-transaction rule, kept for symmetry — a delayed job's hint costs one empty sweep); an
+  autocommit RELEASE with `delay_s = 0` wakes the queue its statement now returns; an unreserve wakes
+  its queues; the after-commit hints of §24.5 are routed here. A hint for a queue nobody waits on is
+  counted and does nothing.*
+- ***Drain.*** *The daemon's drain reaches every session (§23.6.1). A parked waiter is answered
+  `Ok{jobs: []}` at once; one whose sweep is in flight waits for it (bounded by its grace) and gets its
+  jobs — a drain delivers, it does not release; a RESERVE that arrives during the drain is served as a
+  non-waiting one. Nothing is released (pinned live: a delivered job keeps its lease and its holder's
+  ACK lands).*
+- ***Measured locally, not the D17 bench:*** *200 parked RESERVEs on one queue at `POLL_MS = 200` cost
+  15 statements in 3.0 s (5.0/s), every one a poll's sweep, with at most one pool connection in use
+  and none pinned; stock's `database` driver costs 200 / `--sleep 3` = 66.7 pinned transactions/s
+  for the same idle workers. The arrival sweeps are per RESERVE, as stock's pop is: an idle worker
+  re-asking every `block_for` costs one coalesced arrival sweep per re-ask on top of the poll. The
+  recorded admission-A number belongs to the D17 runner (carried to the E-phase bench, ledger).]*
+
 ### 24.9 Observability (§13, product-vision §5)
 
 **Redaction carries over.**
@@ -1104,6 +1188,28 @@ post-v1 option, triggered by measured cross-host latency.
 
 **Slow log.** Queue verbs above the threshold, with `op`, store, labelled queue, count and
 `queue_us`/`exec_us`. A parked wait never counts as slow.
+
+*[Amended M7-G3 (SPEC §22.2 (dl)): **built, with three labels the text did not name and four series
+carried.** Exported per store, every series from the first scrape (zeroes included): `ops_total`
+(`outcome` as above; a CANCELLED terminal counts as `error`), `enqueued_total` (mode `tx` counts jobs its
+statements inserted), `unreserved_total{cause}` with a third cause, **`cancel`** (§24.4 as amended),
+`unreserve_failed_total`, `reserve_unconfirmed_total` (every RESERVE statement whose fate was
+`Indeterminate`, a non-waiting RESERVE's included), `polls_total{trigger}` with two more triggers,
+**`arrival`** and **`refill`** (§24.8 as amended), a new **`ferro_queue_wake_hints_total{source=
+"autocommit|after_commit|unreserve"}`**, the `waiters` gauge, and the
+`enqueue_duration_seconds`, `ack_duration_seconds` and `wait_duration_seconds` histograms (per store).
+**Queue labels:** ACK and EXTEND name no queue — not the request, not their statement — so they are
+labelled `_other`; RELEASE is labelled by the queue its statement returns, RESERVE by the queue its jobs
+came from (else its first queue), ENQUEUE by its first job's queue. **Carried, named rather than
+exported as zeroes:** `redeliveries_total` and `pickup_latency_seconds` need the RESERVE statement to
+report the row's previous `reserved_at` and its `available_at`, which changes the statement §24.4 writes
+verbatim; the sampled depth gauges (`depth`, `oldest_pending_age_seconds`, `stuck_jobs`) need the
+per-store sampler statement. All three are a ledger follow-up. **Spans:** one per QUEUE request,
+opened before any refusal, with `ferro.queue.op`, `ferro.queue.store`, `ferro.queue.queue` (the label),
+`ferro.in_tx`, and on success `ferro.queue.jobs`, `ferro.queue.attempts` (a reservation's first job's),
+the `queue_us`/`exec_us` split and `error.type` on failure. **Slow log:** a separate record shape
+(`target ferro::slow_log`, message `slow queue verb`) with `op`, `store`, `queue`, `count`, `queue_us`,
+`exec_us`; its time is the statements' only, so a parked wait never counts.]*
 
 ### 24.10 Security (§12)
 
@@ -1340,11 +1446,26 @@ every duplicate and every phantom attempt is attributable to a counted or docume
     attributed to stock workers.
 11. **Parked-waiter cost.** 200 parked RESERVEs hold zero pool connections, asserted on the pin and
     idle gauges.
+    *[Built M7-G3 (SPEC §22.2 (dl)), `ferrod`'s `queue_g3_it`: 200 sessions each parked on one queue at
+    `POLL_MS = 200`; sampled every 3 ms for 3 s, no connection pinned, no checkout waiting, at most one
+    in use (a poll's sweep, plus the pool's own liveness reaper — 200 waiters holding connections would
+    read 200); sweeps ≤ one per tick (15 in 3.0 s) and every checkout one of them.]*
 12. **No engine-made phantoms (F5).** Under `--tries=1`, race thousands of RESERVE waits against
     cancels, `wait_ms` expiries and waiter SIGKILLs. Assert that **no job reaches `failed_jobs`
     without its handler having run**, except jobs counted by
     `reserve_unconfirmed`/`unreserve_failed`. Plus the CANCEL race (F16): no job is ever both
     delivered and available.
+    *[Built M7-G3 (SPEC §22.2 (dl)), engine side; the `failed_jobs` half needs the Laravel tier (G5).
+    30 workers race 2 100 waits — plain, CANCELled after 0–40 ms, `wait_ms` of 1–30 ms, and abandoned by
+    GOODBYE — against 600 jobs enqueued meanwhile, every reservation held 40 ms by a trigger; half the
+    queues have one waiter (a vanished waiter's job is unreserved), half two (it goes to the partner).
+    Read back against the rows: no job lost; every job a client received was received once and is
+    reserved with `attempts = 1`; every other job is available with `attempts = 0`; zero unreserve
+    failures and zero unconfirmed reservations, so nothing is excused; the run must unreserve at least
+    one job. The SIGKILL half drops connections mid-wait: no job lost, none delivered twice or carrying
+    two attempts, and the jobs handed to a writer whose peer had already gone (§24.7's residual) never
+    outnumber the drops. Dedicated tests pin each unreserve cause deterministically — `cancel`,
+    `deadline`, `teardown` (waiting and non-waiting), GOODBYE — and the fence on all four values.]*
 13. **Stale-holder fail path (F1).** The job times out (SIGALRM) or throws after its lease was taken.
     0 `failed_jobs` rows for it, `failed()` not called, and the second holder's run unaffected.
     Control: stock writes the row.
@@ -1376,7 +1497,7 @@ one reviewable slice (the HTTP precedent: `/proto` alone was F2). `/proto` is co
 | **G1a** *(BUILT M7-G1a, SPEC §22.2 (df); DONE when merged)* | `/proto`: `[services] QUEUE = 7`, `[methods.queue]`, `LeaseLost`/`PoolMismatch` and the new `InvalidHandle` (`0x3011`), `queue_wait_grace_ms`, the `[ack_outcome]` table and three shape bounds; PROTOCOL.md §1 and a new **§14**; golden vectors (every handle position at its `sql` size and at 1 024 bytes) and refusal vectors (0 and 1 025 bytes for every handle position; 0 and max + 1 jobs and queues) in both codecs; **all shapes frozen**; §24.3's G1 prerequisites (the canonical decimal `job_id`, the 8-byte token, both with strict decodes; `InvalidHandle`); store config with every refusal; the version gate and shape verification at first use (PostgreSQL; cached per process, an absent table excepted); `ferrod` routing and a QUEUE handler that makes every pre-checkout refusal and the first-use verification, then answers `Unsupported` for every verb | an undecodable handle is `InvalidHandle` before any statement; a wrong shape names its column; a view is refused and a partitioned table passes; an unqualified table follows `search_path`; the gate and the verdict caching (including the absent-table TTL, counted) are wired; mutation-proven |
 | **G1b** *(BUILT M7-G1b, SPEC §22.2 (dg); DONE when merged)* | ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules; the statement builders in `ferro-queue`. *Carried from the G1a review:* shape verification must also require `id` to be UNIQUE (the primary key or a unique index) — a fence `WHERE id = $1 AND …` over duplicate ids would match several rows; and `now + 1 + delay_s` must be pre-checked against PG `integer` before send, since a `delay_s` near `u32::MAX` otherwise overflows `available_at` as a post-send `22003` (refuse it `Unsupported`, nothing sent); SIZE fills `oldest_pending_at` | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
 | **G2** *(BUILT M7-G2, SPEC §22.2 (di); DONE when merged)* | tx path: `resolve_active` made `pub(crate)`, `PoolMismatch`, `TxCommand::Queue` + `after_commit`, in-tx `LeaseLost` semantics (R1), refused tx-scoped RESERVE | atomicity both ways; mismatch leaves the transaction usable; chaos rows 2 and 7 |
-| **G3** | the waker (per queue, `LIMIT k`, statement deadlines, register-then-sweep), long-poll, the wait bound, **unreserve**, wake hints, coalesced polls, drain; queue metrics and spans | cost bound (row 11); one END under every CANCEL/deadline race and the deliver-xor-unreserve rule (row 12); idle-polling bench vs stock (A's number); R4 reproduced on the real transport |
+| **G3** *(BUILT M7-G3, SPEC §22.2 (dl); DONE when merged)* | the waker (per queue, `LIMIT k`, statement deadlines, register-then-sweep), long-poll, the wait bound, **unreserve**, wake hints, coalesced polls, drain; queue metrics and spans | cost bound (row 11); one END under every CANCEL/deadline race and the deliver-xor-unreserve rule (row 12); idle-polling bench vs stock (A's number); R4 reproduced on the real transport |
 | **G4** | native PHP API, `queueWorker()`, wait clamp, client fate and licensed re-sends; dedup table and purge **after** the dedup spike reproduces §24.6's three paths | chaos rows 1, 3–6, 8, 9 and 15 through the client |
 | **G5** | Laravel driver: `FerroQueue` (dedicated reserve session), `FerroJob` (`delete`/`release` rules, the `fail()` override); the `ferro_jobs` migration and the rule for a stock `'table'` key (§24.11); pin what `push()`/`FerroJob::getJobId()` return for an opaque `job_id` (D24); demo engine column; the three-column upstream run on PG | D18 on PostgreSQL; chaos rows 13, 14 and 16; the SIGALRM reentrancy premise |
 | **G6** | MySQL/MariaDB stores (engine-owned RC transactions, actor-command steps, MySQL dedup spike) and their D18 columns | D18 and chaos on MySQL 8.4 and MariaDB 11.8; rows 17 and 19 |
@@ -1536,12 +1657,16 @@ measures it; a false one changes the plan, not the evidence.
   `MATERIALIZED` changes nothing on PostgreSQL 16 (a `FOR UPDATE` CTE is never inlined), while the
   `WHERE id IN (… LIMIT k FOR UPDATE SKIP LOCKED)` form over-reserves even in one session.
 - Dedup statement sequence on PG (G4) and its MySQL counterpart (G6).
-- R4 on the real `Transport`, and the SIGTERM-while-parked exit bound (G3/G5).
+- ~~R4 on the real `Transport`~~ **REPRODUCED at G3** (SPEC §22.2 (dl), `php/client`'s
+  `TransportSignalTest`): a 1.5 s read with SIGTERM at 0.5 s returned after ≥ 2.0 s, timed out, and the
+  async handler had run — a signal only lengthens the tolerance. The SIGTERM-while-parked exit bound is
+  G5's.
 - Sync and async client reentrancy when Laravel's SIGALRM handler runs `FerroJob::fail()` while a
   request is in flight on the DB session. ACKing on the idle queue session narrows this; G5 measures
   it.
 - Whether PHP fake time breaks any upstream queue test in the Ferro column (G5).
-- The index plan for deep queues (G3).
+- The index plan for deep queues — **carried from G3** to the E-phase bench with the D17 runner (SPEC
+  §22.2 (dl)): it is a bench question (charter rule 5), and no bench ran in G3.
 - MariaDB 10.6's `SKIP LOCKED` inside the engine transaction, and the RR-versus-RC footprint (G6).
 - Which client rule G4 builds against (§24.8: the D1c deadline, or the `ioTimeout` clamp), and that
   chaos row 15 holds for it (G4).

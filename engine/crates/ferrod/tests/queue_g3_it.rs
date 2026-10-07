@@ -26,8 +26,8 @@ use common::{TestClient, pg_url};
 use ferro_proto::consts::{ack_outcome, branch, errc, flags, method_queue, method_tx, service};
 use ferro_proto::messages::{
     AckResponse, BeginRequest, BeginResponse, EnqueueJob, EnqueueRequest, EnqueueResponse,
-    ErrorPayload, FencedRequest, Outcome, QueueCommon, ReserveRequest, ReserveResponse,
-    ReservedJob, TxControl,
+    ErrorPayload, FencedRequest, Outcome, QueueCommon, QueueScopeRequest, ReserveRequest,
+    ReserveResponse, ReservedJob, TxControl,
 };
 use ferro_queue::sql::JobId;
 use ferrod::config::{Config, PoolSpec};
@@ -162,7 +162,7 @@ impl World {
         let app = schema.clone();
         let drain = Drain::new();
         let (socket, registry) = queue_server(&with_app(&url, &app), &vars, drain.clone());
-        Some(World {
+        let w = World {
             socket,
             registry,
             raw,
@@ -170,7 +170,37 @@ impl World {
             table,
             app,
             drain,
-        })
+        };
+        w.warm().await;
+        Some(w)
+    }
+
+    /// The store's first use — the version gate and shape verification — done before the test
+    /// starts, so a test that holds a sweep in flight is not racing the version probe of a loaded
+    /// database (a failed probe refuses the verb `ConnectionLost` and backs off for 5 s, §24.3).
+    async fn warm(&self) {
+        let mut q = self.session().await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let req = QueueScopeRequest {
+                store: "jobs".into(),
+                queue: "warm".into(),
+                common: QueueCommon::default(),
+            };
+            match q
+                .call(service::QUEUE, method_queue::SIZE, req.encode())
+                .await
+            {
+                Outcome::Ok(_) => return,
+                other => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the store never became usable: {other:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
     }
 
     async fn session(&self) -> Q {
@@ -259,7 +289,12 @@ impl World {
             if n > 0 {
                 return;
             }
-            assert!(Instant::now() < deadline, "no sweep reached the trigger");
+            assert!(
+                Instant::now() < deadline,
+                "no sweep reached the trigger (waiters {}, polls {})",
+                self.waker().waiters(),
+                self.waker().metrics().polls_total()
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -1186,11 +1221,11 @@ async fn chaos_row_12_every_job_is_delivered_once_or_still_available() {
     const JOBS: usize = 600;
     let mut tasks = Vec::new();
     for i in 0..WORKERS {
-        // Two workers per queue: a job a vanished waiter cannot take goes to its partner when the
-        // partner is waiting (§24.8's hand-out) and is UNRESERVED when it is not.
+        // Workers 0..20 share a queue in pairs: a job a vanished waiter cannot take goes to its
+        // partner when the partner is waiting (§24.8's hand-out). Workers 20..30 are alone, so theirs is UNRESERVED.
         tasks.push(tokio::spawn(worker_loop(
             w.socket.clone(),
-            format!("chaos{}", i / 2),
+            format!("chaos{}", if i < 20 { i / 2 } else { i - 10 }),
             ITERATIONS,
             0x9E37_79B9_7F4A_7C15 ^ (i as u64 + 1),
         )));
@@ -1203,8 +1238,7 @@ async fn chaos_row_12_every_job_is_delivered_once_or_still_available() {
             p.hello(1).await;
             let mut p = Q { c: p, rid: 10 };
             for j in 0..JOBS / 3 {
-                p.enqueue(&format!("chaos{}", (n + j * 3) % (WORKERS / 2)), None)
-                    .await;
+                p.enqueue(&format!("chaos{}", (n + j * 3) % 20), None).await;
                 tokio::time::sleep(Duration::from_millis(8)).await;
             }
         }));
