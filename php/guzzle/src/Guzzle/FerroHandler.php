@@ -5,6 +5,7 @@ namespace Ferro\Guzzle;
 use Ferro\Client\Connection;
 use Ferro\Future;
 use Ferro\Http\Adapter\BodyStream;
+use Ferro\Http\Adapter\ConnectionProvider;
 use Ferro\Http\Adapter\Failure;
 use Ferro\Http\Adapter\OriginMap;
 use Ferro\Http\Adapter\OutboundRequest;
@@ -88,6 +89,10 @@ use Psr\Http\Message\StreamInterface;
  */
 final class FerroHandler
 {
+    /** libcurl's option numbers, spelled here so the check needs no ext-curl (Guzzle does not require it). */
+    private const CURLOPT_HTTPAUTH = 107;
+    private const CURLOPT_USERPWD = 10005;
+
     private OriginMap $origins;
     /** @var \Closure(): Connection */
     private \Closure $connection;
@@ -120,7 +125,7 @@ final class FerroHandler
     public function __construct(Connection|\Closure $connection, array $upstreams, ?callable $fallback = null)
     {
         $this->origins = new OriginMap($upstreams);
-        $this->connection = $connection instanceof Connection ? static fn (): Connection => $connection : $connection;
+        $this->connection = ConnectionProvider::memoise($connection);
         $this->fallback = $fallback;
     }
 
@@ -596,6 +601,17 @@ final class FerroHandler
         // upstream honouring, is refused.
         if (isset($options['crypto_method']) && $options['crypto_method'] === STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT) {
             return 'the "crypto_method" option asks for TLS 1.3, which the client cannot verify: the TLS floor is the daemon\'s upstream setting MIN_TLS (SPEC §23.3.1)';
+        }
+        // `auth => [user, pass, 'digest'|'ntlm']`: GuzzleHttp\Client applies only Basic itself; any
+        // other scheme rides the `curl` option (CURLOPT_HTTPAUTH/USERPWD), which no Ferro path can
+        // honour. Ignoring it would send the request UNAUTHENTICATED — refused instead (review).
+        $auth = $options['auth'] ?? null;
+        if (is_array($auth) && $auth !== [] && isset($auth[2]) && is_string($auth[2]) && strtolower($auth[2]) !== 'basic') {
+            return sprintf('the "auth" option\'s "%s" scheme is refused: Guzzle applies it through curl, which Ferro HTTP does not use, so the request would go out unauthenticated; send the Authorization header yourself, or attach it daemon-side (ATTACH_HEADERS_FILE, SPEC §23.3.1)', $auth[2]);
+        }
+        $curl = $options['curl'] ?? null;
+        if (is_array($curl) && (array_key_exists(self::CURLOPT_HTTPAUTH, $curl) || array_key_exists(self::CURLOPT_USERPWD, $curl))) {
+            return 'the "curl" option carries HTTP authentication (CURLOPT_HTTPAUTH/CURLOPT_USERPWD), which Ferro HTTP cannot apply, so the request would go out unauthenticated; refused';
         }
         if (isset($options['force_ip_resolve'])) {
             return 'the "force_ip_resolve" option is refused: the engine resolves the upstream and checks every address (SPEC §23.8.5)';

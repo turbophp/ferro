@@ -148,6 +148,10 @@ final class FerroHandlerTest extends HandlerTestCase
             'force_ip_resolve' => [['force_ip_resolve' => 'v4'], 'force_ip_resolve'],
             'proxy' => [['proxy' => 'http://proxy.internal:3128'], 'no outbound proxy'],
             'multiplex require' => [['multiplex' => 'require_eager'], 'HTTP/2'],
+            'auth digest' => [['auth' => ['u', 'p', 'digest']], 'scheme is refused'],
+            'auth DIGEST' => [['auth' => ['u', 'p', 'DIGEST']], 'scheme is refused'],
+            'curl httpauth' => [['curl' => [107 => 2]], 'unauthenticated'],
+            'curl userpwd' => [['curl' => [10005 => 'u:p']], 'unauthenticated'],
         ];
     }
 
@@ -179,6 +183,51 @@ final class FerroHandlerTest extends HandlerTestCase
         } finally {
             unset($_SERVER['HTTPS_PROXY']);
         }
+    }
+
+    public function testBasicAuthIsAppliedByTheClientAndReachesTheWire(): void
+    {
+        // Guzzle applies Basic itself, as a header: it needs nothing from curl, so it is not refused.
+        $t = new FakeTransport();
+        $client = $this->client($this->handler($t));
+        $t->feed(self::head(1, 200) . F::done(1) . self::head(2, 200) . F::done(2));
+        $client->get('/a', ['auth' => ['u', 'p']]);
+        $client->get('/b', ['auth' => ['u', 'p', 'basic']]);
+        foreach ([1, 2] as $rid) {
+            $this->assertContains(['Authorization', 'Basic ' . base64_encode('u:p')], F::requests($t->written)[$rid]['headers']);
+        }
+    }
+
+    /**
+     * One connection for every upstream (M6-F9 review F-B): a closure provider is dialled once, on the
+     * first request, not once per upstream — and a provider that throws is asked again next time.
+     */
+    public function testAClosureProviderIsDialledOnceForEveryUpstream(): void
+    {
+        $connects = 0;
+        $fail = true;
+        $t = new FakeTransport();
+        $handler = new FerroHandler(function () use (&$connects, &$fail, $t) {
+            if ($fail) {
+                $fail = false;
+                throw new \RuntimeException('engine not up yet');
+            }
+            ++$connects;
+            $conn = $this->conn($t);
+            $t->feed(self::head(1, 200) . F::done(1) . self::head(2, 200) . F::done(2) . self::head(3, 200) . F::done(3));
+            return $conn;
+        }, ['https://a.example' => 'a', 'https://b.example' => 'b', 'https://c.example:8443' => 'c']);
+        $client = new \GuzzleHttp\Client(['handler' => \GuzzleHttp\HandlerStack::create($handler)]);
+        try {
+            $client->get('https://a.example/');
+            $this->fail('expected the dial failure');
+        } catch (RetryableConnectException) {
+        }
+        foreach (['https://a.example/', 'https://b.example/', 'https://c.example:8443/'] as $url) {
+            $this->assertSame(200, $client->get($url)->getStatusCode());
+        }
+        $this->assertSame(1, $connects, 'three upstreams, one ferrod session; a provider that threw is asked again');
+        $this->assertSame(['a', 'b', 'c'], array_column(F::requests($t->written), 'upstream'));
     }
 
     public function testVerifyTrueOrACaPathAndTheVersionAreIgnored(): void

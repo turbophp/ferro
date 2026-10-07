@@ -4,6 +4,7 @@ namespace Ferro\Psr18;
 
 use Ferro\Client\Connection;
 use Ferro\Http\Adapter\BodyStream;
+use Ferro\Http\Adapter\ConnectionProvider;
 use Ferro\Http\Adapter\Failure;
 use Ferro\Http\Adapter\OriginMap;
 use Ferro\Http\Adapter\OutboundRequest;
@@ -85,7 +86,7 @@ final class Client implements ClientInterface
         private bool $stream = true,
     ) {
         $this->origins = new OriginMap($upstreams);
-        $this->connection = $connection instanceof Connection ? static fn (): Connection => $connection : $connection;
+        $this->connection = ConnectionProvider::memoise($connection);
     }
 
     /** A client whose requests carry this idempotency declaration (§23.7.2). */

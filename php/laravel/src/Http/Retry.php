@@ -25,10 +25,17 @@ final class Retry
 {
     private function __construct() {}
 
-    /** @return \Closure(\Throwable, mixed=): bool */
+    /**
+     * The `when` callback. Its argument is NULLABLE: on a response that is not `successful()` but not
+     * a failure either — a 304, or any 3xx under `withoutRedirecting()` — Laravel passes
+     * `$response->toException()`, which is null below 4xx, so a callback typed `\Throwable` threw a
+     * TypeError on every such response (M6-F9 review F-A). Null is not a failure: not retried.
+     *
+     * @return \Closure(?\Throwable, mixed=): bool
+     */
     public static function when(): \Closure
     {
-        return static fn (\Throwable $exception, mixed $request = null): bool
-            => Fate::of($exception)?->fate === FateClass::Retryable;
+        return static fn (?\Throwable $exception, mixed $request = null): bool
+            => $exception !== null && Fate::of($exception)?->fate === FateClass::Retryable;
     }
 }

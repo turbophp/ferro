@@ -85,6 +85,40 @@ final class RetryTest extends HandlerTestCase
         $this->assertCount(3, F::requests($t->written), 'one attempt and two retries');
     }
 
+    /**
+     * The review's MA: a retried request is the SAME PSR-7 object, its body stream already read to the
+     * end by the first attempt; the adapter must rewind it, or the retry sends an empty body.
+     */
+    public function testARetriedRequestSendsItsWholeBodyAgain(): void
+    {
+        $t = new FakeTransport();
+        $client = $this->retrying($t);
+        $t->feed(F::error(1, C::ERR_UPSTREAM_UNAVAILABLE, C::BRANCH_RETRYABLE, 'connect_refused'));
+        $t->feed(self::head(2, 201) . F::done(2));
+        $this->assertSame(201, $client->post('/x', ['body' => 'payload'])->getStatusCode());
+        $requests = F::requests($t->written);
+        $this->assertSame(['payload', 'payload'], [$requests[1]['body'], $requests[2]['body']]);
+    }
+
+    /**
+     * The review's MP: the SYNCHRONOUS path (every `Client::request()`) sleeps a request's `delay`, so
+     * `Retry::middleware()`'s backoff — here the engine's own `retry_after_ms` — is honoured there too,
+     * not only by the async wait loop.
+     */
+    public function testASynchronousRetryHonoursTheEnginesRetryAfter(): void
+    {
+        $t = new FakeTransport();
+        $client = $this->client($this->handler($t), static function (HandlerStack $s): void {
+            $s->push(Retry::middleware(2, 0, 10_000));
+        });
+        $t->feed(F::error(1, C::ERR_RATE_LIMITED, C::BRANCH_RETRYABLE, 'rate_limited', 400));
+        $t->feed(self::head(2, 200) . F::done(2));
+        $start = microtime(true);
+        $this->assertSame(200, $client->get('/x')->getStatusCode());
+        $this->assertGreaterThan(0.35, microtime(true) - $start, 'retry_after_ms 400 waited out before the retry');
+        $this->assertCount(2, F::requests($t->written));
+    }
+
     public function testStatusesAreRetriedByTheirFate(): void
     {
         // POST 500: Indeterminate — never. GET declared idempotent 500: Retryable. POST 503 with

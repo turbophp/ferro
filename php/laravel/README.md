@@ -71,9 +71,22 @@ The provider rebinds the `Illuminate\Http\Client\Factory` singleton to
 `Ferro\Laravel\Http\FerroHttpFactory`, which hands every pending request `Ferro\Guzzle\FerroHandler`.
 Laravel's own stub, recorder and before-sending handlers stay ABOVE it, so `Http::fake()`,
 `Http::assertSent()` and the request events behave as stock, and a faked request never reaches the
-engine. `Http::pool()` goes through Ferro too. For retries, use `Http::retry(3, 100,
-when: Ferro\Laravel\Http\Retry::when())`: it never re-sends a POST whose fate is unknown, where a
-bare `Http::retry(3)` would. Differences from curl: `docs/known-incompatibilities.md` (*Ferro HTTP*).
+engine. `Http::pool()` goes through Ferro too.
+
+**Retries — the recommended recipe:**
+
+```php
+Http::retry(3, 100, when: Ferro\Laravel\Http\Retry::when())->post($url, $body);
+```
+
+It retries only what is safe to send again and never a request whose fate is unknown. A bare
+`Http::retry(3)` is Laravel's own policy and re-sends a POST whose connection died after sending,
+exactly as it does under curl; retrying is the client's policy, so Ferro leaves that choice to you.
+
+`http.ferro` makes Ferro the facade's DEFAULT transport; it is not an egress control. A request-level
+handler (`withOptions(['handler' => …])`, `globalOptions`, `setHandler`, `setClient`) routes that
+request around Ferro and its SSRF confinement. Differences from curl:
+`docs/known-incompatibilities.md` (*Ferro HTTP*).
 
 ## What this tier changes, and what it does not
 

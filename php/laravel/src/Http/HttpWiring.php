@@ -2,8 +2,10 @@
 declare(strict_types=1);
 namespace Ferro\Laravel\Http;
 
+use Ferro\Client\Connection;
 use Ferro\Ferro;
 use Ferro\Guzzle\FerroHandler;
+use Ferro\Http\Adapter\ConnectionProvider;
 use Illuminate\Contracts\Container\Container;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Http\Client\Factory;
@@ -49,39 +51,55 @@ final class HttpWiring
         }
         $settings = self::settings($ferro);
         self::assertSeam();
+        $connect = self::connectArguments($settings);
 
-        $app->singleton(Factory::class, static function (Container $app) use ($settings): Factory {
+        $app->singleton(Factory::class, static function (Container $app) use ($settings, $connect): Factory {
             $events = $app->bound(Dispatcher::class) ? $app->make(Dispatcher::class) : null;
+            // ONE connection for every upstream this worker calls (review F-B): memoised here, and
+            // again by the handler.
+            $connection = ConnectionProvider::memoise(static fn (): Connection => Ferro::connect(...$connect));
             return new FerroHttpFactory(
-                static fn (): FerroHandler => new FerroHandler(
-                    static fn () => Ferro::connect(
-                        $settings['socket'],
-                        $settings['pool'],
-                        $settings['connect_timeout'],
-                        $settings['io_timeout'],
-                    ),
-                    $settings['upstreams'],
-                ),
+                static fn (): FerroHandler => new FerroHandler($connection, $settings['upstreams']),
                 $events instanceof Dispatcher ? $events : null,
             );
         });
     }
 
     /**
-     * Refuse to wire when the seam is not there to override.
+     * The `Ferro::connect()` arguments an `http.ferro` block names, BY PARAMETER NAME — so a swapped
+     * timeout or an ignored `pool` cannot pass for wiring (both survived the review's mutation round
+     * while the call was positional).
+     *
+     * @param array{socket: string, pool: string, upstreams: array<string, string>, io_timeout: float, connect_timeout: float} $settings
+     * @return array{socketPath: string, pool: string, connectTimeout: float, ioTimeout: float}
+     */
+    public static function connectArguments(array $settings): array
+    {
+        return [
+            'socketPath' => $settings['socket'],
+            'pool' => $settings['pool'],
+            'connectTimeout' => $settings['connect_timeout'],
+            'ioTimeout' => $settings['io_timeout'],
+        ];
+    }
+
+    /**
+     * Refuse to wire when the seam is not there to override. `$factory` is the class whose seam is
+     * checked — `Illuminate\Http\Client\Factory` in production; a test passes a stand-in to prove
+     * the refusal.
      *
      * @throws \LogicException
      */
-    public static function assertSeam(): void
+    public static function assertSeam(string $factory = Factory::class): void
     {
-        if (!class_exists(Factory::class)) {
+        if (!class_exists($factory)) {
             throw new \LogicException('http.ferro is configured, but illuminate/http is not installed');
         }
         if (!class_exists(FerroHandler::class)) {
             throw new \LogicException('http.ferro is configured, but ferro/guzzle is not installed (composer require ferro/guzzle)');
         }
-        $seam = new \ReflectionClass(Factory::class);
-        if (!$seam->hasMethod('newPendingRequest') || $seam->getMethod('newPendingRequest')->getDeclaringClass()->getName() !== Factory::class) {
+        $seam = new \ReflectionClass($factory);
+        if (!$seam->hasMethod('newPendingRequest') || $seam->getMethod('newPendingRequest')->getDeclaringClass()->getName() !== $factory) {
             throw new \LogicException(
                 'http.ferro is configured, but this Laravel version\'s Illuminate\\Http\\Client\\Factory has no '
                     . 'newPendingRequest() for Ferro to override (SPEC §23.11.6); refusing to wire rather than '
@@ -93,7 +111,7 @@ final class HttpWiring
     /**
      * @return array{socket: string, pool: string, upstreams: array<string, string>, io_timeout: float, connect_timeout: float}
      */
-    private static function settings(mixed $ferro): array
+    public static function settings(mixed $ferro): array
     {
         if (!is_array($ferro)) {
             throw new \InvalidArgumentException('http.ferro must be an array');

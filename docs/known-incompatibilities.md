@@ -826,13 +826,28 @@ SPEC §23.16 C9's list, measured and written up by slice F10.
   origin to an upstream name) makes the package's auto-discovered provider rebind the `Http` factory
   (`Ferro\Laravel\Http\HttpWiring`). Without the block the facade is untouched. The seam is a
   PROTECTED framework method, `Factory::newPendingRequest()`; a Laravel release that renames it makes
-  the wiring refuse at boot rather than route around Ferro (`HttpFactoryTest::testTheSeamIsAsserted`).
+  the wiring refuse at boot rather than route around Ferro
+  (`HttpFactoryTest::testAFactoryWithoutTheSeamIsRefusedLoudly`).
   Measured on Laravel 11.51; 12.x is not yet run.
 - **An origin with no upstream is refused, never sent** (`Ferro\Guzzle\UnmappedOriginException`, a
-  `RequestException` with no response, so in Laravel it escapes `Http::get()` unwrapped;
-  `Ferro\Psr18\UnmappedOriginException` in PSR-18). There is no curl fallback unless the handler is
+  `RequestException` with no response; `Ferro\Psr18\UnmappedOriginException` in PSR-18). In Laravel a
+  SYNCHRONOUS call (`Http::get()`) lets it escape unwrapped, as Laravel wraps only `ConnectException`
+  there; through `Http::pool()` or `async()` it arrives as an `Illuminate\Http\Client\ConnectionException`
+  with the Ferro exception as `getPrevious()`, because Laravel's promise path wraps every responseless
+  `RequestException`. There is no curl fallback unless the handler is
   built with an explicit `fallback:` handler, which gives up the SSRF guarantee for every origin it
   serves. A non-ASCII host is never mapped: use punycode on both sides.
+
+### `http.ferro` is not an egress-enforcement control
+
+The Laravel wiring makes Ferro the DEFAULT transport of the `Http` facade; it does not stop
+application code choosing another. A request-level handler — `Http::withOptions(['handler' => …])`,
+`Http::globalOptions(['handler' => …])`, a `PendingRequest`'s own `setHandler()`, `setClient()` —
+replaces the whole Guzzle stack for that request, so it goes out through whatever that handler is
+(curl, for `HandlerStack::create()` with no argument) and NOT through the engine or its SSRF
+confinement (SPEC §22.2 (dj), review round; measured with a `MockHandler`). The same holds for any
+`new GuzzleHttp\Client()` built without the Ferro handler. Enforcing egress is the job of the
+network (a host firewall that lets only `ferrod` reach the outside), not of this package.
 
 ### Laravel's `Http::pool()` and a factory-level `setHandler()`
 
@@ -851,9 +866,11 @@ pending request's own `setHandler()` is untouched.
 | Option | Through Ferro |
 |---|---|
 | `verify => false`, `cert`, `ssl_key`, `crypto_method_max`, `force_ip_resolve`, a `REQUIRE_*` `multiplex` | **Refused** (a rejected promise, nothing sent), naming the daemon setting that replaces it: trust (`CA_FILE`), client certificates and the TLS floor are the operator's, and v1 has no HTTP/2. Laravel's `withoutVerifying()` is therefore refused. |
+| `verify => '/path/to/ca.pem'` | **Silently ignored**: the upstream's trust is the daemon's `CA_FILE` (or the OS store), whatever path the request names. `verify => true` is likewise a no-op. |
+| `auth => [user, pass, 'digest']` (or `'ntlm'`), or a `curl` option carrying `CURLOPT_HTTPAUTH`/`CURLOPT_USERPWD` | **Refused**, nothing sent. Guzzle applies those schemes through curl, which Ferro does not use, so honouring the rest of the request would send it UNAUTHENTICATED (`FerroHandlerTest::testAnOptionTheDaemonOwnsIsRefusedNamingWhatReplacesIt`). Basic auth (`auth => [user, pass]`) is a header Guzzle sets itself and works unchanged. |
 | `crypto_method` | A TLS 1.2 (or lower) floor — which Laravel sets on every request — passes, because the daemon's `MIN_TLS` is never below 1.2. A TLS 1.3 floor is refused: the client cannot see an upstream honour it. |
 | `proxy` | The value `GuzzleHttp\Client` derives from `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` is **ignored** (the engine sends to the upstream directly); any other value is refused. |
-| `version`, `curl`, `stream_context`, `debug`, `expect` | Ignored. The upstream's `HTTP` setting decides the version, not the request. |
+| `version`, `curl` (other than authentication), `stream_context`, `debug`, `expect` | Ignored. The upstream's `HTTP` setting decides the version, not the request. |
 | `progress` | Upload progress is reported ONCE, when the response head arrives (the request is wholly sent by then), then per received chunk. |
 | `on_stats` | Handler stats are a subset of curl's names (`total_time`, `connect_time`, `appconnect_time`, `starttransfer_time`, `size_upload`, `size_download`) plus `ferro`, the engine's raw `HttpStats`. |
 | `decode_content` | The ENGINE decodes `gzip`/`deflate` only; the removed headers come back as `x-encoded-content-encoding`/`-length`, as Guzzle's handlers rename them. With no `Accept-Encoding` of the application's own, the engine asks for `gzip, deflate`, where curl asks for every decoder it has. |
@@ -892,16 +909,19 @@ pending request's own `setHandler()` is untouched.
 
 ### Errors and retries
 
+- **Retry with Ferro's deciders — the recommended recipe:** `Ferro\Guzzle\Retry::middleware(n)` on a
+  Guzzle stack, and `Http::retry(n, 100, when: Ferro\Laravel\Http\Retry::when())` in Laravel. Both
+  retry only what is safe to send again and never a request whose fate is unknown. A bare
+  `Http::retry(3)` with no `when` is Laravel's own retry policy and re-sends an Indeterminate POST,
+  exactly as it does under curl; Ferro leaves it alone, because retrying is the client's policy
+  (charter rule 3) — choose the recipe above
+  (`HttpFactoryTest::testRetryWhenNeverResendsAnIndeterminateAndDoesResendARetryable`).
 - **The exception CLASS is curl's for the same event; a marker interface says the fate.** A
   `timeout` or `eof_empty` after sending is a `ConnectException`, as curl's 28 and 52 are; a reset
   after sending is a `RequestException`, as curl's 56 is. Each also implements
   `Ferro\Http\Fate\Retryable`, `NonRetryable` or `Indeterminate`, and `Ferro\Http\Fate::of()` reads it.
   So a hand-written `instanceof ConnectException` decider re-sends exactly what it re-sends under curl
   — **including a POST whose fate is unknown** — and Ferro's own deciders never do.
-- **Use Ferro's deciders for retries:** `Ferro\Guzzle\Retry::middleware(n)` for Guzzle and
-  `Http::retry(n, when: Ferro\Laravel\Http\Retry::when())` for Laravel. Stock `Http::retry(3)` with no
-  `when` re-sends an Indeterminate POST, as it does under curl
-  (`HttpFactoryTest::testRetryWhenNeverResendsAnIndeterminateAndDoesResendARetryable`).
 - **A body that fails after its head carries the response the upstream sent**, even for an idle-read
   timeout that curl reports as a responseless 28 `ConnectException`.
 - **A response a middleware REBUILDS loses its fate**, and the deciders then treat it as

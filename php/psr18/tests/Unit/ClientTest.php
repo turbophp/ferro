@@ -252,6 +252,28 @@ final class ClientTest extends TestCase
         $this->assertSame([1], F::cancels($t->written));
     }
 
+    /** One connection for every upstream and every configured copy (M6-F9 review F-B). */
+    public function testAClosureProviderIsDialledOnceForEveryUpstreamAndEveryCopy(): void
+    {
+        $connects = 0;
+        $t = new FakeTransport();
+        $t->feed(F::helloAck(C::FEATURE_ENGINE_HTTP));
+        $provider = function () use (&$connects, $t): Connection {
+            ++$connects;
+            $session = new Session($t, new RequestIdAllocator(0));
+            $session->hello();
+            return new Connection($session, 'default');
+        };
+        $factory = new HttpFactory();
+        $client = new Client($provider, $factory, $factory, ['https://a.example' => 'a', 'https://b.example' => 'b']);
+        $t->feed(self::head(1, 200) . F::done(1) . self::head(2, 200) . F::done(2) . self::head(3, 200) . F::done(3));
+        $client->sendRequest(new Request('GET', 'https://a.example/'))->getBody()->getContents();
+        $client->sendRequest(new Request('GET', 'https://b.example/'))->getBody()->getContents();
+        $client->withIdempotent(true)->sendRequest(new Request('GET', 'https://a.example/'))->getBody()->getContents();
+        $this->assertSame(1, $connects);
+        $this->assertSame(['a', 'b', 'a'], array_column(F::requests($t->written), 'upstream'));
+    }
+
     public function testAConnectionThatCannotBeOpenedIsARetryableNetworkException(): void
     {
         $factory = new HttpFactory();

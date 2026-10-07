@@ -175,6 +175,48 @@ final class HttpFactoryTest extends TestCase
         }
     }
 
+    /**
+     * The review's F-A: on a 3xx that is not `successful()` (a 304, or any 3xx under
+     * `withoutRedirecting()`), Laravel hands `when` the NULL `toException()`; a callback typed
+     * `\Throwable` threw a TypeError there. Sync and pool, with the stock-closure control the review
+     * used to show the trap is Laravel's.
+     */
+    public function testRetryWhenAcceptsTheNullLaravelPassesOnA3xx(): void
+    {
+        foreach ([[304, []], [302, [['location', '/elsewhere']]]] as [$status, $headers]) {
+            $t = new FakeTransport();
+            $http = $this->factory($t);
+            $t->feed(F::head(1, $status, $headers) . F::done(1));
+            $res = $http->withoutRedirecting()->retry(3, 0, Retry::when(), throw: false)->get(self::ORIGIN . '/etag');
+            $this->assertSame($status, $res->status());
+            $this->assertCount(1, F::requests($t->written), 'a 3xx is not retried');
+        }
+
+        $t = new FakeTransport();
+        $http = $this->factory($t);
+        $t->feed(F::head(1, 304) . F::done(1));
+        // throw: false — with Laravel's default `throw: true` a non-failed 3xx pool slot is
+        // `toException()`, i.e. null, which is stock Laravel's own behaviour for any `when`.
+        $r = $http->pool(static fn ($p) => [$p->withoutRedirecting()->retry(3, 0, Retry::when(), throw: false)->get(self::ORIGIN . '/etag')]);
+        $this->assertInstanceOf(\Illuminate\Http\Client\Response::class, $r[0], 'the pool slot is a response, not a TypeError');
+        $this->assertSame(304, $r[0]->status());
+
+        $this->assertFalse(Retry::when()(null));
+    }
+
+    /**
+     * The review's MAA: an UNREADABLE fate is never retried — here an `Http::fake()` 500, a stock psr7
+     * response with no Ferro fate on a POST.
+     */
+    public function testRetryWhenNeverRetriesAnUnreadableFate(): void
+    {
+        $http = new FerroHttpFactory(static fn () => new FerroHandler(static fn () => throw new \LogicException('no engine'), [self::ORIGIN => 'up']));
+        $http->fake(['*' => $http->sequence()->push('boom', 500)->push('ok', 200)]);
+        $res = $http->retry(3, 0, Retry::when(), throw: false)->post(self::ORIGIN . '/charge');
+        $this->assertSame(500, $res->status(), 'a fate-less 500 POST is not re-sent');
+        $http->assertSentCount(1);
+    }
+
     public function testThePoolRunsConcurrentlyThroughOneHandler(): void
     {
         $t = new FakeTransport();
@@ -199,6 +241,9 @@ final class HttpFactoryTest extends TestCase
     {
         $this->assertTrue(FerroHttpFactory::isStockTransport(\GuzzleHttp\Utils::chooseHandler()));
         $this->assertTrue(FerroHttpFactory::isStockTransport(new \GuzzleHttp\Handler\StreamHandler()));
+        // What chooseHandler() returns when there is no curl_multi_exec and no allow_url_fopen (MJ).
+        $this->assertTrue(FerroHttpFactory::isStockTransport(new \GuzzleHttp\Handler\CurlHandler()));
+        $this->assertTrue(FerroHttpFactory::isStockTransport(new \GuzzleHttp\Handler\CurlMultiHandler()));
         $this->assertFalse(FerroHttpFactory::isStockTransport(new \GuzzleHttp\Handler\MockHandler()));
         $this->assertFalse(FerroHttpFactory::isStockTransport(static fn () => null));
 
@@ -249,6 +294,45 @@ final class HttpFactoryTest extends TestCase
         HttpWiring::register($app);
     }
 
+    /**
+     * The review's MB: the refusal itself. A Laravel whose factory no longer DECLARES
+     * `newPendingRequest()` (renamed, or only inherited) must refuse to wire, loudly.
+     */
+    public function testAFactoryWithoutTheSeamIsRefusedLoudly(): void
+    {
+        foreach ([\stdClass::class, SeamInherited::class] as $factory) {
+            try {
+                HttpWiring::assertSeam($factory);
+                $this->fail("{$factory}: expected the refusal");
+            } catch (\LogicException $e) {
+                $this->assertStringContainsString('newPendingRequest()', $e->getMessage());
+                $this->assertStringContainsString('refusing to wire', $e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * The review's MR/MS: the `http.ferro` block's `pool` and timeouts reach `Ferro::connect()` under
+     * the right parameter, and the defaults are `Ferro::connect()`'s own.
+     */
+    public function testTheConnectArgumentsAreTheBlocksByParameterName(): void
+    {
+        $args = HttpWiring::connectArguments(HttpWiring::settings([
+            'socket' => '/run/ferro/app.sock',
+            'upstreams' => [self::ORIGIN => 'up'],
+            'pool' => 'reports',
+            'io_timeout' => 9,
+            'connect_timeout' => 0.5,
+        ]));
+        $this->assertSame(['socketPath' => '/run/ferro/app.sock', 'pool' => 'reports', 'connectTimeout' => 0.5, 'ioTimeout' => 9.0], $args);
+        $params = array_map(static fn (\ReflectionParameter $p): string => $p->getName(), (new \ReflectionMethod(\Ferro\Ferro::class, 'connect'))->getParameters());
+        foreach (array_keys($args) as $name) {
+            $this->assertContains($name, $params, "{$name} is a Ferro::connect() parameter");
+        }
+        $defaults = HttpWiring::connectArguments(HttpWiring::settings(['socket' => '/s', 'upstreams' => [self::ORIGIN => 'up']]));
+        $this->assertSame(['socketPath' => '/s', 'pool' => 'default', 'connectTimeout' => 2.0, 'ioTimeout' => 5.0], $defaults);
+    }
+
     public function testTheSeamIsAsserted(): void
     {
         HttpWiring::assertSeam(); // illuminate/http v11: newPendingRequest() is declared on Factory
@@ -256,4 +340,9 @@ final class HttpFactoryTest extends TestCase
         $this->assertTrue($m->isProtected(), 'the seam is protected, which is why it is pinned (§23.11.6)');
         $this->assertSame(FerroHttpFactory::class, (new \ReflectionMethod(FerroHttpFactory::class, 'newPendingRequest'))->getDeclaringClass()->getName());
     }
+}
+
+/** A factory that INHERITS `newPendingRequest()` instead of declaring it: not the seam's owner. */
+final class SeamInherited extends \Illuminate\Http\Client\Factory
+{
 }
