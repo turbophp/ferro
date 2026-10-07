@@ -13,7 +13,9 @@
 //!    waiter registered (busy or not) and the queue marked for another sweep.
 //! 2. **Arrival: priority order.** A new waiter is eligible for ONE queue at a time, in the order it
 //!    gave (`--queue=high,default`): its first sweep is of `high`, and only when that brought it
-//!    nothing does it become eligible for `default`. Each of those is an ordinary per-queue sweep
+//!    nothing does it become eligible for `default`. A trigger for a queue whose only owed waiters
+//!    are busy in another queue's sweep is KEPT and runs when that sweep frees one of them (review
+//!    F3), so no hint is lost to a momentarily busy waiter. Each of those is an ordinary per-queue sweep
 //!    (trigger `arrival`), coalesced with every other waiter eligible for that queue. After the last,
 //!    the waiter is PARKED and eligible for all its queues: whichever of them yields first serves it —
 //!    BLPOP's semantics, priority at the call and first-come while blocked (§22.2 (dl)).
@@ -168,8 +170,13 @@ impl Waiter {
     /// Eligible for a sweep of `queue` started now: not finished, not already in a sweep, inside its
     /// wait, and — while arriving — this is the queue its priority order has reached.
     fn eligible(&self, s: &Slot, queue: &str, now: Instant) -> bool {
+        !s.busy && self.owed(s, queue, now)
+    }
+
+    /// Would be eligible for `queue` but for a sweep of ANOTHER queue serving it right now (review
+    /// F3): such a waiter is still owed this queue's sweep the moment that one returns.
+    fn owed(&self, s: &Slot, queue: &str, now: Instant) -> bool {
         s.ended.is_none()
-            && !s.busy
             && now < self.wait_end
             && (s.arrival >= self.queues.len() || self.queues[s.arrival] == queue)
     }
@@ -470,10 +477,12 @@ impl Waker {
         qs.pending = None;
         let mut batch: Vec<Arc<Waiter>> = Vec::new();
         let mut k: u32 = 0;
+        let mut owed = false;
         for id in &qs.fifo {
             let Some(w) = waiters.get(id) else { continue };
             let mut s = w.lock();
             if !w.eligible(&s, queue, now) {
+                owed |= s.busy && w.owed(&s, queue, now);
                 continue;
             }
             if !batch.is_empty() && k + u32::from(w.clamp) > u32::from(self.cap) {
@@ -484,6 +493,12 @@ impl Waker {
             batch.push(Arc::clone(w));
         }
         if batch.is_empty() {
+            // Review F3: the queue's only owed waiters are busy in another queue's sweep. Keep the
+            // trigger: that sweep's completion runs it as soon as one of them is free, so a hint is
+            // never lost to a waiter that was momentarily busy.
+            if owed {
+                qs.pending = Some(trigger);
+            }
             return;
         }
         qs.in_flight = true;
@@ -513,6 +528,8 @@ impl Waker {
         let now = Instant::now();
         let mut st = self.lock();
         let mut next_arrivals: Vec<String> = Vec::new();
+        // Queues a waiter freed by this sweep is owed a deferred trigger on (review F3).
+        let mut freed: Vec<String> = Vec::new();
         let mut leftovers: Vec<Reserved> = Vec::new();
         let mut cause = None;
         match outcome {
@@ -541,6 +558,7 @@ impl Waker {
                             next_arrivals.push(q.clone());
                         }
                     }
+                    freed.extend(w.queues.iter().filter(|q| q.as_str() != queue).cloned());
                     // Wake it: past its wait it now finishes; otherwise it keeps waiting.
                     w.notify.notify_one();
                 }
@@ -602,6 +620,18 @@ impl Waker {
         }
         for q in next_arrivals {
             self.trigger_locked(&mut st, &q, Trigger::Arrival);
+        }
+        freed.sort();
+        freed.dedup();
+        for q in freed {
+            let deferred = st
+                .queues
+                .get_mut(&q)
+                .filter(|qs| !qs.in_flight)
+                .and_then(|qs| qs.pending.take());
+            if let Some(t) = deferred {
+                self.start_sweep_locked(&mut st, &q, t);
+            }
         }
         if st
             .queues

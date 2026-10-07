@@ -554,6 +554,15 @@ impl<B: PoolBackend> Checkout<B> {
         self.tainted
     }
 
+    /// Never return this connection to the pool (FB-3b's latch, for a caller outside this crate,
+    /// M7-G3 review F1): `Drop` closes it instead. For a connection that is alive but whose session
+    /// state is unknown — Ferro Queue's waker abandons a statement that did not answer within its
+    /// bound even after a cancel, and a connection still running a statement handed to the next
+    /// tenant is the M1-S8a cross-tenant hazard. The permit is released as on any drop.
+    pub fn discard(&mut self) {
+        self.discard = true;
+    }
+
     /// The pin hook: opens a transaction on the underlying connection with an ENGINE-COMPOSED
     /// `begin_sql` (e.g. `BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY`) and pins this `Checkout`
     /// to `tx_id` (S6). Drives the RAW, unguarded `PoolBackend::simple_query` (never

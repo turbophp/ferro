@@ -67,7 +67,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use ferro_pool::backend::{PoolBackend, QueryResult};
+use ferro_pool::backend::{Cancel, PoolBackend, QueryResult};
 use ferro_pool::error::PoolError;
 use ferro_pool::pool::{Checkout, Pool};
 use ferro_proto::consts::{ack_outcome, branch, errc, method_queue};
@@ -549,10 +549,25 @@ struct AutocommitCtx<'a> {
     waker: &'a Arc<Waker>,
 }
 
+/// How long the waker waits for a statement to answer AFTER its timeout fired and the backend was
+/// asked to cancel it (and, separately, for the cancel request itself). Past it the statement is
+/// ABANDONED (M7-G3 review F1).
+pub const WAKER_CANCEL_DRAIN: Duration = Duration::from_secs(1);
+
 /// The waker's statement runner on a PostgreSQL pool (M7-G3, SPEC §24.8): its own checkout per
-/// statement, the guarded, interruptible [`run_autocommit_exec`], everything — the checkout wait
-/// included — bounded by the store's `WAKER_STMT_TIMEOUT_MS`. No request's CANCEL reaches it: a waker
+/// statement, run through the guarded `Checkout::query`. No request's CANCEL reaches it: a waker
 /// statement serves every waiter in its batch.
+///
+/// **What is bounded, exactly (review F1).** The checkout wait and the statement share the store's
+/// `WAKER_STMT_TIMEOUT_MS`. When it fires, the backend is asked to cancel the statement (that request
+/// bounded by [`WAKER_CANCEL_DRAIN`]) and the statement's answer is awaited for at most
+/// [`WAKER_CANCEL_DRAIN`] more. A backend that answers neither — a black-holed link, a failover, a
+/// dropped NAT entry — no longer holds the `(store, queue)` in flight until TCP gives up: the statement
+/// is ABANDONED, its connection is DISCARDED (closed, never returned to the pool: a connection still
+/// running a statement handed to the next tenant is the M1-S8a hazard), and the outcome is a
+/// sent-and-unconfirmed cancel — `Indeterminate` for the waiters it served, counted in
+/// `reserve_unconfirmed_total`, its possible reservations left to their leases (they cannot be
+/// unreserved without being known). Worst case: `WAKER_STMT_TIMEOUT_MS + 2 × WAKER_CANCEL_DRAIN`.
 fn pg_runner<B: PoolBackend + 'static>(pool: Pool<B>) -> Runner {
     Arc::new(move |stmt: Statement, timeout: Duration| {
         let pool = pool.clone();
@@ -565,25 +580,61 @@ fn pg_runner<B: PoolBackend + 'static>(pool: Pool<B>) -> Runner {
             };
             let mut co = co.map_err(|e| (e, false))?;
             let queue_us = co.stats().queue_us;
-            let left = deadline
-                .saturating_duration_since(tokio::time::Instant::now())
-                .as_millis();
-            if left == 0 {
+            if deadline <= tokio::time::Instant::now() {
                 return Err((PoolError::Timeout, false));
             }
-            let never = CancellationToken::new();
-            let (r, exec_us) = run_autocommit_exec(
-                &mut co,
-                &stmt.sql,
-                &stmt.params,
-                Some(u32::try_from(left).unwrap_or(u32::MAX)),
-                &never,
-            )
-            .await;
-            r.map(|qr| (qr, queue_us, exec_us)).map_err(|e| (e, true))
+            let (answer, exec_us) = bounded_query(&mut co, &stmt, deadline).await;
+            match answer {
+                Some(r) => r.map(|qr| (qr, queue_us, exec_us)).map_err(|e| (e, true)),
+                None => {
+                    co.discard();
+                    Err((abandoned(), true))
+                }
+            }
         }
         .boxed()
     })
+}
+
+/// Run `stmt` on `co` until `deadline`; then cancel it and wait [`WAKER_CANCEL_DRAIN`] for its
+/// answer. `None`: no answer came — the caller must discard the connection.
+async fn bounded_query<B: PoolBackend>(
+    co: &mut Checkout<B>,
+    stmt: &Statement,
+    deadline: tokio::time::Instant,
+) -> (Option<Result<QueryResult, PoolError>>, u64) {
+    let cancel_handle = co.cancel_handle();
+    let started = Instant::now();
+    let fut = co.query(&stmt.sql, &stmt.params);
+    tokio::pin!(fut);
+    let answer = tokio::select! {
+        biased;
+        r = &mut fut => Some(r),
+        () = tokio::time::sleep_until(deadline) => {
+            let _ = tokio::time::timeout(WAKER_CANCEL_DRAIN, cancel_handle.cancel()).await;
+            tokio::select! {
+                biased;
+                r = &mut fut => Some(r),
+                () = tokio::time::sleep(WAKER_CANCEL_DRAIN) => None,
+            }
+        }
+    };
+    (answer, u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
+}
+
+/// The error of an ABANDONED waker statement: a cancel sent and never confirmed. Keyed as a cancel
+/// (`errc::CANCELLED`), so the shared fate matrix's `57014` override classifies a sent write
+/// `Indeterminate`, as for a statement that timed out and answered.
+fn abandoned() -> PoolError {
+    PoolError::Sql {
+        code: errc::CANCELLED,
+        branch: errc::CANCELLED_BRANCH,
+        sqlstate: None,
+        errno: None,
+        message: "the waker's statement did not answer within WAKER_STMT_TIMEOUT_MS, nor after it \
+                  was cancelled; its connection was discarded and its effect is unconfirmed"
+            .to_string(),
+    }
 }
 
 /// A request's statement CANCEL that a client CANCEL fires and session TEARDOWN does not (M7-G3).

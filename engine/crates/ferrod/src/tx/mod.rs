@@ -334,6 +334,8 @@ struct Inner {
     txs: Mutex<TxTable>,
     /// Bounds [`TxRegistry::abort_session`]'s teardown wait — wired to `config.drain_deadline`.
     abort_deadline: Duration,
+    /// See [`TxRegistry::delay_abort_for_test`]; 0 in production.
+    abort_delay_ms: AtomicU64,
 }
 
 /// A cloneable, `Arc`-backed handle to the process-global transaction registry. Cloning shares the
@@ -352,8 +354,21 @@ impl TxRegistry {
                 next_session_id: AtomicU64::new(0),
                 txs: Mutex::new(TxTable::default()),
                 abort_deadline,
+                abort_delay_ms: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// TEST SEAM (M7-G3 review F2): make every [`TxRegistry::abort_session`] wait `delay` before it
+    /// starts. A session's teardown runs `liveness.end()`, `cancel_all()`, then `abort_session` —
+    /// and that ORDER is load-bearing for Ferro Queue (a handler woken by `cancel_all` must already
+    /// see the session as torn down). With an `abort_session` that returns at once, a teardown that
+    /// ended liveness AFTER it would still win every race; a slow one makes the order observable. Zero
+    /// (the default) in production.
+    pub fn delay_abort_for_test(&self, delay: Duration) {
+        self.inner
+            .abort_delay_ms
+            .store(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// Draw the next session id: monotonic, distinct per call, never reused. One per accepted
@@ -432,6 +447,10 @@ impl TxRegistry {
     /// The final purge (`retain`) drops both any aborted-active entry that has not yet finished
     /// deregistering AND any deadline tombstone from this session — so nothing leaks per session.
     pub async fn abort_session(&self, sid: SessionId) {
+        let delay = self.inner.abort_delay_ms.load(Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         // Collect the owned live handles under the lock, then release it BEFORE any await (never
         // hold a std::sync::Mutex across an await point).
         let handles: Vec<TxHandle> = {
