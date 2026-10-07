@@ -461,6 +461,14 @@ impl ExecSpan {
         }
     }
 
+    /// Add one attribute (M7-G3: a QUEUE request's store, queue label and job count, known only
+    /// after the span was opened). A no-op on an unsampled request.
+    pub fn push_attr(&mut self, attr: Attr) {
+        if let Some(p) = self.inner.as_mut() {
+            p.attrs.push(attr);
+        }
+    }
+
     /// The span's id — for tests that need to tell spans apart.
     pub fn span_id(&self) -> Option<[u8; 8]> {
         self.inner.as_ref().map(|p| p.span_id)

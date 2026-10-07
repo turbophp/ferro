@@ -352,6 +352,13 @@ impl Responder {
         }
     }
 
+    /// Add one attribute to the request's span, if it has one (M7-G3).
+    pub fn push_span_attr(&mut self, attr: crate::otlp::Attr) {
+        if let Some(span) = self.span.as_mut() {
+            span.push_attr(attr);
+        }
+    }
+
     /// Declare success with `body` — the method-specific opaque result bytes (must already be a
     /// single complete MessagePack value, or empty; see `Outcome::encode`'s contract).
     pub fn end_ok(mut self, body: Bytes) {

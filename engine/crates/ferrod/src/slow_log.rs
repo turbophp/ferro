@@ -101,6 +101,45 @@ pub fn record(stmt: &SlowStatement<'_>, threshold_ms: Option<u64>, log_params: L
     true
 }
 
+/// One QUEUE verb's slow-log record (SPEC §24.9; M7-G3). A queue verb has no user SQL to fingerprint:
+/// the record names the VERB, the store, the queue's §24.9 label (`_other` unless the operator listed
+/// it) and a count — never a payload, a token, a job id or an unlisted queue name.
+#[derive(Debug)]
+pub struct SlowQueueVerb<'a> {
+    pub op: &'a str,
+    pub store: &'a str,
+    pub queue: &'a str,
+    /// Jobs reserved, inserted or deleted — whichever the verb produced.
+    pub count: u64,
+    pub queue_us: u64,
+    pub exec_us: u64,
+}
+
+/// Emit `v` if its `queue_us + exec_us` is at or above `threshold_ms`. Those are the verb's
+/// STATEMENT times, so a waiting RESERVE's parked time never counts as slow (§24.9). Returns whether
+/// it logged.
+pub fn record_queue(v: &SlowQueueVerb<'_>, threshold_ms: Option<u64>) -> bool {
+    let Some(threshold_ms) = threshold_ms else {
+        return false;
+    };
+    let total_us = v.queue_us.saturating_add(v.exec_us);
+    if total_us / 1_000 < threshold_ms {
+        return false;
+    }
+    tracing::info!(
+        target: "ferro::slow_log",
+        op = %v.op,
+        store = %v.store,
+        queue = %v.queue,
+        count = v.count,
+        queue_us = v.queue_us,
+        exec_us = v.exec_us,
+        total_us,
+        "slow queue verb",
+    );
+    true
+}
+
 /// Build the fingerprint for a statement about to be recorded.
 ///
 /// A thin re-export so the call sites never touch raw SQL for longer than this one expression.

@@ -9,4 +9,6 @@ pub mod fate;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod queue;
+pub mod queue_metrics;
+pub mod queue_waker;
 pub mod sql;

@@ -70,7 +70,7 @@ use bytes::Bytes;
 use ferro_pool::backend::{PoolBackend, QueryResult};
 use ferro_pool::error::PoolError;
 use ferro_pool::pool::{Checkout, Pool};
-use ferro_proto::consts::{ack_outcome, errc, method_queue};
+use ferro_proto::consts::{ack_outcome, branch, errc, method_queue};
 use ferro_proto::messages::{
     AckResponse, ClearResponse, EnqueueRequest, EnqueueResponse, ErrorPayload, ExtendResponse,
     FencedRequest, QueueCommon, QueueScopeRequest, QueueStats, ReleaseRequest, ReleaseResponse,
@@ -85,6 +85,10 @@ use ferro_queue::{PoolFamily, checks, version};
 use tokio_util::sync::CancellationToken;
 
 use crate::pools::{AnyPool, PoolRegistry};
+use crate::services::queue_metrics::{HintSource, Outcome as MetricOutcome, QueueMetrics, UnreserveCause};
+use crate::services::queue_waker::{Offer, Runner, WaitOutcome, Waker};
+use crate::session::{Liveness, SessionInfo};
+use futures::FutureExt;
 use crate::services::fate::{self, OpContext};
 use crate::services::sql::{
     actor_gone_terminal, cancelled_before_dispatch, protocol, resolve_active, run_autocommit_exec,
@@ -133,6 +137,35 @@ impl QueueRequest {
             QueueRequest::Extend(_) => "EXTEND",
             QueueRequest::Size(_) => "SIZE",
             QueueRequest::Clear(_) => "CLEAR",
+        }
+    }
+
+    /// `ops_total`'s `op` label index (`queue_metrics::OPS`).
+    fn op_index(&self) -> usize {
+        match self {
+            QueueRequest::Enqueue(_) => 0,
+            QueueRequest::Reserve(_) => 1,
+            QueueRequest::Ack(_) => 2,
+            QueueRequest::Release(_) => 3,
+            QueueRequest::Extend(_) => 4,
+            QueueRequest::Size(_) => 5,
+            QueueRequest::Clear(_) => 6,
+        }
+    }
+
+    fn op_label(&self) -> &'static str {
+        crate::services::queue_metrics::OPS[self.op_index()]
+    }
+
+    /// The queue a request names, for its metric label before any statement: an ENQUEUE's first job's,
+    /// a RESERVE's first queue, SIZE's and CLEAR's. The fenced verbs name none — the queue is in the
+    /// row — so ACK and EXTEND are labelled `_other`, and RELEASE by the queue its statement returns.
+    fn queue_hint(&self) -> Option<&str> {
+        match self {
+            QueueRequest::Enqueue(r) => r.jobs.first().map(|j| j.queue.as_str()),
+            QueueRequest::Reserve(r) => r.queues.first().map(String::as_str),
+            QueueRequest::Size(r) | QueueRequest::Clear(r) => Some(&r.queue),
+            QueueRequest::Ack(_) | QueueRequest::Release(_) | QueueRequest::Extend(_) => None,
         }
     }
 
@@ -202,10 +235,10 @@ pub struct QueueStores {
     verifications: AtomicU64,
     /// When each store last warned that its pool's version is unknown (review L3).
     unknown_version_warned: std::sync::Mutex<HashMap<String, Instant>>,
-    /// Wake hints FIRED (M7-G2: by a tx-scoped verb's successful COMMIT, SPEC §24.5 step 4). The hint
-    /// has no consumer until slice G3 builds the waker (§24.8), so today this count is all a hint
-    /// does — and it is what makes "fired only on a successful COMMIT" a counted claim.
-    wake_hints: AtomicU64,
+    /// One waker per ENABLED store (M7-G3, SPEC §24.8): its wait sets, its poll schedule, and the
+    /// sink every wake hint is routed to. Built here, off-runtime; it spawns nothing until a waiting
+    /// RESERVE first registers.
+    wakers: HashMap<String, Arc<Waker>>,
 }
 
 impl QueueStores {
@@ -215,6 +248,14 @@ impl QueueStores {
             .filter_map(|(name, _)| config.store(name).map(|s| s.name.clone()))
             .map(|name| (name, tokio::sync::Mutex::new(Verdict::Unverified)))
             .collect();
+        let wakers = config
+            .entries()
+            .filter_map(|(name, _)| config.store(name))
+            .map(|s| {
+                let metrics = Arc::new(QueueMetrics::new(&s.name, &s.labelled_queues));
+                (s.name.clone(), Waker::new(s, metrics))
+            })
+            .collect();
         QueueStores {
             config,
             verdicts,
@@ -222,19 +263,41 @@ impl QueueStores {
             gate_recheck: None,
             verifications: AtomicU64::new(0),
             unknown_version_warned: std::sync::Mutex::new(HashMap::new()),
-            wake_hints: AtomicU64::new(0),
+            wakers,
         }
     }
 
-    /// How many wake hints have fired since boot (see the field).
+    /// How many AFTER-COMMIT wake hints have fired since boot, over every store (M7-G2's counter,
+    /// kept: "fired only on a successful COMMIT" stays a counted claim). The hints of every source
+    /// are `ferro_queue_wake_hints_total{source}` (§24.9).
     pub fn wake_hints(&self) -> u64 {
-        self.wake_hints.load(Ordering::Relaxed)
+        self.wakers
+            .values()
+            .map(|w| w.metrics().hints(HintSource::AfterCommit))
+            .sum()
     }
 
-    /// Fire one wake hint for `(store, queue)` (SPEC §24.8 trigger 1). Counted only, until slice G3
-    /// routes it to the store's waker; a hint is never correctness (§24.5).
-    fn wake(&self, _store: &str, _queue: &str) {
-        self.wake_hints.fetch_add(1, Ordering::Relaxed);
+    /// The store's waker (an enabled store always has one).
+    pub fn waker(&self, store: &str) -> Option<&Arc<Waker>> {
+        self.wakers.get(store)
+    }
+
+    /// Every enabled store's metrics, sorted by store name (for the §13 exposition).
+    pub fn metrics(&self) -> Vec<&QueueMetrics> {
+        let mut names: Vec<&String> = self.wakers.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .filter_map(|n| self.wakers.get(n).map(|w| &**w.metrics()))
+            .collect()
+    }
+
+    /// Fire one after-commit wake hint for `(store, queue)` (SPEC §24.5 step 4, §24.8 trigger 1),
+    /// routed to the store's waker since M7-G3. A hint is never correctness (§24.5).
+    fn wake(&self, store: &str, queue: &str) {
+        if let Some(w) = self.wakers.get(store) {
+            w.hint(queue, HintSource::AfterCommit);
+        }
     }
 
     pub fn config(&self) -> &QueueConfig {
@@ -355,12 +418,14 @@ fn refuse_before_checkout(
 }
 
 /// Serve one QUEUE frame and declare its ONE terminal.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle(
     frame: InFrame,
     responder: Responder,
     registry: &PoolRegistry,
     tx_registry: &TxRegistry,
     session_id: SessionId,
+    info: SessionInfo,
     cancel: CancellationToken,
 ) {
     let method = frame.header.method;
@@ -377,11 +442,21 @@ pub async fn handle(
     };
     drop(frame);
     // `ExecRequest` field 9's rule: interpreted once, a malformed value dropped and counted. Its
-    // consumers (the span and the slow log, §24.9) land with the verbs.
-    let _trace = crate::trace::from_request(req.common().traceparent.as_deref());
+    // consumer is the request's SPEC §13 span (M7-G3, §24.9), opened HERE so a refused request is a
+    // span too: one QUEUE request, one END, one span.
+    let trace = crate::trace::from_request(req.common().traceparent.as_deref());
+    let responder = responder.with_span(registry.tracer().and_then(|t| {
+        t.begin(trace, || {
+            vec![(
+                "ferro.queue.op",
+                crate::otlp::AttrValue::Str(req.op_label().to_string()),
+            )]
+        })
+    }));
+    let mut reply = Reply::bare(responder);
 
     let Some(stores) = registry.queue() else {
-        responder.end_error(unsupported(
+        reply.error(unsupported(
             "Ferro Queue is not configured on this daemon (FERRO_QUEUE_STORES is unset)",
         ));
         return;
@@ -389,13 +464,25 @@ pub async fn handle(
     let Some(store) = stores.config.store(req.store()) else {
         // One answer for an unknown store and one refused at configuration (the store's name is the
         // client's own; the reason is in the daemon's log).
-        responder.end_error(unsupported(
+        reply.error(unsupported(
             "unknown queue store (or one refused at configuration; see the ferrod log)",
         ));
         return;
     };
+    let Some(waker) = stores.waker(&store.name).cloned() else {
+        reply.error(unsupported("unknown queue store"));
+        return;
+    };
+    reply.observe(
+        store,
+        waker.metrics(),
+        req.op_index(),
+        req.queue_hint(),
+        req.common().tx_id.is_some(),
+        registry.slow_log(),
+    );
     if let Err(ep) = refuse_before_checkout(&req, store, engine_now()) {
-        responder.end_error(ep);
+        reply.error(ep);
         return;
     }
     // ONE deadline for the whole request — the first-use verification, the checkout and every
@@ -407,29 +494,177 @@ pub async fn handle(
             session_id,
             tx_id,
         };
-        serve_tx(
-            stores, store, registry, tx, req, deadline, cancel, responder,
-        )
-        .await;
+        serve_tx(stores, store, registry, tx, req, deadline, cancel, reply).await;
         return;
     }
     let table = match ensure_verified(stores, store, registry, deadline, &cancel).await {
         Ok(t) => t,
         Err(ep) => {
-            responder.end_error(ep);
+            reply.error(ep);
             return;
         }
     };
     match registry.get(&store.pool) {
         Some(AnyPool::Pg(pool)) => {
-            serve_pg(pool, req, store, &table, deadline, &cancel, responder).await
+            // The waker's statements run on the same verified relation (M7-G3), bound once.
+            waker.bind(&table, || pg_runner(pool.clone()));
+            let ctx = AutocommitCtx {
+                store,
+                table: &table,
+                deadline,
+                cancel: &cancel,
+                info: &info,
+                waker: &waker,
+            };
+            match req {
+                // SPEC §24.8: a WAITING RESERVE parks on the waker. A daemon that is draining serves
+                // it as a non-waiting one (one sweep, then its answer): a drain never parks anyone.
+                QueueRequest::Reserve(r)
+                    if checks::wait_clamp(r.wait_ms, store.max_wait_ms) > 0
+                        && !info.drain.is_draining() =>
+                {
+                    serve_waiting(&ctx, &r, reply).await
+                }
+                req => serve_pg(pool, req, &ctx, reply).await,
+            }
         }
         // Unreachable: verification passed, so the pool is PostgreSQL (`ensure_verified` answers
         // every other family). Answered rather than asserted.
-        Some(_) | None => responder.end_error(unsupported(format!(
+        Some(_) | None => reply.error(unsupported(format!(
             "queue store {}: its pool cannot serve QUEUE verbs in this build",
             store.name
         ))),
+    }
+}
+
+/// The autocommit path's per-request context (M7-G3).
+struct AutocommitCtx<'a> {
+    store: &'a StoreConfig,
+    table: &'a TableName,
+    deadline: Option<tokio::time::Instant>,
+    cancel: &'a CancellationToken,
+    info: &'a SessionInfo,
+    waker: &'a Arc<Waker>,
+}
+
+/// The waker's statement runner on a PostgreSQL pool (M7-G3, SPEC §24.8): its own checkout per
+/// statement, the guarded, interruptible [`run_autocommit_exec`], everything — the checkout wait
+/// included — bounded by the store's `WAKER_STMT_TIMEOUT_MS`. No request's CANCEL reaches it: a waker
+/// statement serves every waiter in its batch.
+fn pg_runner<B: PoolBackend + 'static>(pool: Pool<B>) -> Runner {
+    Arc::new(move |stmt: Statement, timeout: Duration| {
+        let pool = pool.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + timeout;
+            let co = tokio::select! {
+                biased;
+                r = pool.checkout() => r,
+                () = tokio::time::sleep_until(deadline) => Err(PoolError::Timeout),
+            };
+            let mut co = co.map_err(|e| (e, false))?;
+            let queue_us = co.stats().queue_us;
+            let left = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis();
+            if left == 0 {
+                return Err((PoolError::Timeout, false));
+            }
+            let never = CancellationToken::new();
+            let (r, exec_us) = run_autocommit_exec(
+                &mut co,
+                &stmt.sql,
+                &stmt.params,
+                Some(u32::try_from(left).unwrap_or(u32::MAX)),
+                &never,
+            )
+            .await;
+            r.map(|qr| (qr, queue_us, exec_us)).map_err(|e| (e, true))
+        }
+        .boxed()
+    })
+}
+
+/// A request's statement CANCEL that a client CANCEL fires and session TEARDOWN does not (M7-G3).
+/// Teardown fires the same per-request token (`cancel_all`), but a RESERVE whose session is going
+/// away must not be interrupted: SPEC §24.4 has its jobs UNRESERVED, and only a statement that
+/// finishes says which jobs those are (an interrupted one is `Indeterminate`, a phantom attempt).
+/// After teardown the statement is still bounded, by `bound` (the store's waker statement timeout).
+fn client_cancel(
+    cancel: &CancellationToken,
+    liveness: &Liveness,
+    bound: Duration,
+) -> (CancellationToken, AbortOnDrop) {
+    let child = CancellationToken::new();
+    let (c, l, ch) = (cancel.clone(), liveness.clone(), child.clone());
+    let task = tokio::spawn(async move {
+        c.cancelled().await;
+        if !l.is_live() {
+            tokio::time::sleep(bound).await;
+        }
+        ch.cancel();
+    });
+    (child, AbortOnDrop(task))
+}
+
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A waiting RESERVE (SPEC §24.8, M7-G3): register on the store's waker, wait for its outcome within
+/// the wait bound, and declare the terminal. Holds no connection while it waits.
+async fn serve_waiting(ctx: &AutocommitCtx<'_>, r: &ReserveRequest, reply: Reply) {
+    let received = tokio::time::Instant::now();
+    let wait = Duration::from_millis(u64::from(checks::wait_clamp(
+        r.wait_ms,
+        ctx.store.max_wait_ms,
+    )));
+    let grace = Duration::from_millis(u64::from(ferro_proto::consts::QUEUE_WAIT_GRACE_MS));
+    // §24.8's normative wait bound — and the request's own deadline, when it set one.
+    let mut wait_end = received + wait;
+    let mut hard_end = wait_end + grace;
+    if let Some(d) = ctx.deadline {
+        wait_end = wait_end.min(d);
+        hard_end = hard_end.min(d);
+    }
+    let clamp = checks::reserve_limit(r.max_jobs, ctx.store.max_payload_bytes);
+    let Some(guard) = ctx.waker.register(&r.queues, clamp, wait_end) else {
+        reply.error(unsupported("queue store: its waker is gone"));
+        return;
+    };
+    let outcome = guard
+        .wait(hard_end, ctx.cancel, &ctx.info.drain, &ctx.info.liveness)
+        .await;
+    let stats = guard.stats();
+    drop(guard);
+    ctx.waker
+        .metrics()
+        .observe_wait_us(u64::try_from(received.elapsed().as_micros()).unwrap_or(u64::MAX));
+    match outcome {
+        WaitOutcome::Offer(Offer::Jobs(jobs)) => hand_off_jobs(ctx, reply, jobs, stats),
+        WaitOutcome::Offer(Offer::Failed(ep)) => reply.error(ep),
+        WaitOutcome::Offer(Offer::Empty) | WaitOutcome::Expired | WaitOutcome::Drained => {
+            reply.ok(VerbOk::Reserve(Vec::new()), stats)
+        }
+        WaitOutcome::Cancelled | WaitOutcome::Teardown => reply.cancelled(),
+    }
+}
+
+/// SPEC §24.4: "a job is DELIVERED iff the terminal carrying it is handed to a live session's
+/// writer". The declaration happens under the session's liveness lock; a session whose teardown has
+/// begun gets nothing, and the jobs are UNRESERVED (cause `teardown`) — deliver xor unreserve.
+fn hand_off_jobs(ctx: &AutocommitCtx<'_>, reply: Reply, jobs: Vec<pgq::Reserved>, stats: QueueStats) {
+    if let Err((reply, jobs)) = ctx
+        .info
+        .liveness
+        .hand_off((reply, jobs), |(r, j)| r.ok(VerbOk::Reserve(j), stats))
+    {
+        ctx.waker.unreserve(jobs, UnreserveCause::Teardown);
+        reply.cancelled();
     }
 }
 
@@ -528,16 +763,15 @@ async fn run_verb_statement<B: PoolBackend>(
     result.map_err(|e| fate::classify_fate(e, ctx(true)))
 }
 
-/// The verb, autocommit, on a verified PostgreSQL store (step 8 of the module doc).
+/// The verb, autocommit, on a verified PostgreSQL store (step 8 of the module doc). A RESERVE here
+/// does not wait (its `wait_ms` is 0, clamped to 0, or the daemon is draining).
 async fn serve_pg<B: PoolBackend>(
     pool: &Pool<B>,
     req: QueueRequest,
-    store: &StoreConfig,
-    table: &TableName,
-    deadline: Option<tokio::time::Instant>,
-    cancel: &CancellationToken,
-    responder: Responder,
+    ctx: &AutocommitCtx<'_>,
+    reply: Reply,
 ) {
+    let (store, cancel, deadline) = (ctx.store, ctx.cancel, ctx.deadline);
     let readonly = verb_context(&req, false).readonly;
     let checkout = pool.checkout_declared(readonly);
     tokio::pin!(checkout);
@@ -551,19 +785,208 @@ async fn serve_pg<B: PoolBackend>(
         Ok(co) => co,
         Err(e) => {
             // No connection: nothing was sent.
-            responder.end_error(fate::classify_fate(e, verb_context(&req, false)));
+            reply.error(fate::classify_fate(e, verb_context(&req, false)));
             return;
         }
     };
     let queue_us = co.stats().queue_us;
     let mut exec_us = 0u64;
-    let outcome = run_pg_verb(&mut co, &req, store, table, deadline, cancel, &mut exec_us).await;
+    // A RESERVE's statement is interrupted by a client CANCEL (G1b's rule) but NOT by its session's
+    // teardown, which instead lets it finish and unreserves what it took (M7-G3, §24.4).
+    let reserve_cancel = matches!(req, QueueRequest::Reserve(_)).then(|| {
+        client_cancel(
+            cancel,
+            &ctx.info.liveness,
+            Duration::from_millis(u64::from(store.waker_stmt_timeout_ms)),
+        )
+    });
+    let stmt_cancel = reserve_cancel.as_ref().map_or(cancel, |(c, _)| c);
+    let outcome = run_pg_verb(
+        &mut co,
+        &req,
+        store,
+        ctx.table,
+        deadline,
+        stmt_cancel,
+        &mut exec_us,
+    )
+    .await;
+    drop(reserve_cancel);
     // Release the connection before framing the terminal (as EXEC does): held only for the verb.
     drop(co);
     let stats = QueueStats { queue_us, exec_us };
     match outcome {
-        Ok(body) => responder.end_ok(Bytes::from(body.encode(stats))),
-        Err(ep) => responder.end_error(ep),
+        Ok(VerbOk::Reserve(jobs)) if !jobs.is_empty() => hand_off_jobs(ctx, reply, jobs, stats),
+        Ok(ok) => {
+            // SPEC §24.8 trigger 1, the AUTOCOMMIT hints (M7-G3): an ENQUEUE wakes each of its
+            // queues, a RELEASE with `delay_s = 0` the queue its row is in.
+            for q in autocommit_hints(&req, &ok) {
+                ctx.waker.hint(&q, HintSource::Autocommit);
+            }
+            reply.ok(ok, stats)
+        }
+        Err(ep) => {
+            if matches!(req, QueueRequest::Reserve(_)) && ep.branch == branch::INDETERMINATE {
+                ctx.waker.metrics().reserve_unconfirmed();
+            }
+            reply.error(ep)
+        }
+    }
+}
+
+/// The queues an applied AUTOCOMMIT verb wakes (§24.8 trigger 1): an ENQUEUE's distinct queues — any
+/// delay, as the in-transaction rule G2 pinned — and a `delay_s = 0` RELEASE's row's queue.
+fn autocommit_hints(req: &QueueRequest, ok: &VerbOk) -> Vec<String> {
+    match (req, ok) {
+        (QueueRequest::Enqueue(r), VerbOk::Enqueue(_)) => {
+            let mut q: Vec<String> = r.jobs.iter().map(|j| j.queue.clone()).collect();
+            q.sort();
+            q.dedup();
+            q
+        }
+        (QueueRequest::Release(r), VerbOk::Release(Some((_, queue)))) if r.delay_s == 0 => {
+            vec![queue.clone()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The ONE funnel a QUEUE request's terminal is declared through (M7-G3): every success, error and
+/// cancel passes here, so SPEC §24.9's `ops_total`, the request's span and the slow log each see every
+/// terminal exactly once. Before the store is known it only declares (no store, no series).
+pub(crate) struct Reply {
+    responder: Responder,
+    obs: Option<Obs>,
+}
+
+struct Obs {
+    metrics: Arc<QueueMetrics>,
+    store: String,
+    op: usize,
+    label: usize,
+    in_tx: bool,
+    slow: crate::pools::SlowLogConfig,
+}
+
+impl Reply {
+    fn bare(responder: Responder) -> Reply {
+        Reply {
+            responder,
+            obs: None,
+        }
+    }
+
+    /// The store is known: label the span, and count from here on.
+    fn observe(
+        &mut self,
+        store: &StoreConfig,
+        metrics: &Arc<QueueMetrics>,
+        op: usize,
+        queue: Option<&str>,
+        in_tx: bool,
+        slow: crate::pools::SlowLogConfig,
+    ) {
+        use crate::otlp::AttrValue::{Bool, Str};
+        let label = metrics.label_of(queue);
+        self.responder
+            .push_span_attr(("ferro.queue.store", Str(store.name.clone())));
+        self.responder
+            .push_span_attr(("ferro.queue.queue", Str(metrics.label(label).to_string())));
+        self.responder.push_span_attr(("ferro.in_tx", Bool(in_tx)));
+        self.obs = Some(Obs {
+            metrics: Arc::clone(metrics),
+            store: store.name.clone(),
+            op,
+            label,
+            in_tx,
+            slow,
+        });
+    }
+
+    fn error(self, ep: ErrorPayload) {
+        if let Some(o) = &self.obs {
+            let outcome = if ep.code == errc::LEASE_LOST {
+                MetricOutcome::LeaseLost
+            } else {
+                MetricOutcome::Error
+            };
+            o.metrics.op(o.label, o.op, outcome);
+        }
+        self.responder.end_error(ep);
+    }
+
+    fn cancelled(self) {
+        if let Some(o) = &self.obs {
+            o.metrics.op(o.label, o.op, MetricOutcome::Error);
+        }
+        self.responder.end_cancelled();
+    }
+
+    fn ok(mut self, ok: VerbOk, stats: QueueStats) {
+        use crate::otlp::AttrValue::Int;
+        let (outcome, queue, jobs, attempts, affected) = match &ok {
+            VerbOk::Enqueue(e) => (MetricOutcome::Ok, None, 0, None, u64::from(e.inserted)),
+            VerbOk::Reserve(jobs) => match jobs.first() {
+                Some(j) => (
+                    MetricOutcome::Ok,
+                    Some(j.queue.clone()),
+                    jobs.len() as u64,
+                    Some(j.attempts),
+                    jobs.len() as u64,
+                ),
+                None => (MetricOutcome::Empty, None, 0, None, 0),
+            },
+            VerbOk::Ack { gone: true } => (MetricOutcome::Gone, None, 0, None, 0),
+            VerbOk::Ack { gone: false } => (MetricOutcome::Ok, None, 0, None, 1),
+            VerbOk::Release(Some((_, q))) => (MetricOutcome::Ok, Some(q.clone()), 0, None, 1),
+            VerbOk::Release(None) => (MetricOutcome::Gone, None, 0, None, 0),
+            VerbOk::Extend(_) => (MetricOutcome::Ok, None, 0, None, 1),
+            VerbOk::Size(_) => (MetricOutcome::Ok, None, 0, None, 0),
+            VerbOk::Clear(n) => (MetricOutcome::Ok, None, 0, None, *n),
+        };
+        let (is_enqueue, is_ack) = (
+            matches!(ok, VerbOk::Enqueue(_)),
+            matches!(ok, VerbOk::Ack { .. }),
+        );
+        let body = ok.encode(stats);
+        if let Some(o) = &self.obs {
+            let label = queue
+                .as_deref()
+                .map_or(o.label, |q| o.metrics.label_of(Some(q)));
+            o.metrics.op(label, o.op, outcome);
+            let us = stats.queue_us.saturating_add(stats.exec_us);
+            if is_enqueue {
+                o.metrics.enqueued(label, o.in_tx, affected);
+                o.metrics.observe_enqueue_us(us);
+            }
+            if is_ack {
+                o.metrics.observe_ack_us(us);
+            }
+            self.responder.record_exec(crate::otlp::ExecResult {
+                rows_returned: jobs,
+                rows_affected: affected,
+                queue_us: stats.queue_us,
+                exec_us: stats.exec_us,
+                response_bytes: body.len() as u64,
+            });
+            self.responder.push_span_attr(("ferro.queue.jobs", Int(jobs)));
+            if let Some(a) = attempts {
+                self.responder
+                    .push_span_attr(("ferro.queue.attempts", Int(u64::from(a))));
+            }
+            crate::slow_log::record_queue(
+                &crate::slow_log::SlowQueueVerb {
+                    op: crate::services::queue_metrics::OPS[o.op.min(6)],
+                    store: &o.store,
+                    queue: o.metrics.label(label),
+                    count: jobs.max(affected),
+                    queue_us: stats.queue_us,
+                    exec_us: stats.exec_us,
+                },
+                o.slow.threshold_ms,
+            );
+        }
+        self.responder.end_ok(Bytes::from(body));
     }
 }
 
@@ -573,7 +996,9 @@ pub enum VerbOk {
     Enqueue(pgq::Enqueued),
     Reserve(Vec<pgq::Reserved>),
     Ack { gone: bool },
-    Release(Option<JobId>),
+    /// The new row's id and its QUEUE (M7-G3: the label and the `delay_s = 0` wake hint), or `None`
+    /// (`gone`).
+    Release(Option<(JobId, String)>),
     Extend(i64),
     Size(pgq::Sizes),
     Clear(u64),
@@ -630,7 +1055,7 @@ impl VerbOk {
             }
             .encode(),
             VerbOk::Release(new_id) => ReleaseResponse {
-                new_job_id: new_id.map(JobId::encode),
+                new_job_id: new_id.map(|(id, _)| id.encode()),
                 stats,
             }
             .encode(),
@@ -702,7 +1127,7 @@ async fn run_pg_verb<B: PoolBackend>(
             let stmt = pgq::release(t, id, token, r.delay_s);
             let qr = run_verb_statement(co, &stmt, deadline, cancel, ctx, exec_us).await?;
             match pgq::decode_release(&qr.rows, token).map_err(bad)? {
-                Ok(new_id) => Ok(VerbOk::Release(Some(new_id))),
+                Ok(released) => Ok(VerbOk::Release(Some(released))),
                 Err(NoMatch::Gone) => Ok(VerbOk::Release(None)),
                 Err(NoMatch::LeaseLost) => Err(lease_lost(&store.name, req.verb(), false)),
             }
@@ -791,25 +1216,25 @@ async fn serve_tx(
     req: QueueRequest,
     deadline: Option<tokio::time::Instant>,
     cancel: CancellationToken,
-    responder: Responder,
+    reply: Reply,
 ) {
     // 1. The transaction, exactly as a tx-scoped EXEC resolves it (R2).
     let handle = match resolve_active(tx.tx_registry, tx.tx_id, tx.session_id) {
         Ok(h) => h,
         Err(ep) => {
-            responder.end_error(ep);
+            reply.error(ep);
             return;
         }
     };
     // 2. Its pool against the store's — before anything is sent (D22 (b)).
     if *handle.pool != *store.pool {
-        responder.end_error(pool_mismatch(store, &handle.pool));
+        reply.error(pool_mismatch(store, &handle.pool));
         return;
     }
     let table = match ensure_verified(stores, store, registry, deadline, &cancel).await {
         Ok(t) => t,
         Err(ep) => {
-            responder.end_error(ep);
+            reply.error(ep);
             return;
         }
     };
@@ -822,7 +1247,7 @@ async fn serve_tx(
                 .saturating_duration_since(tokio::time::Instant::now())
                 .as_millis();
             if left == 0 {
-                responder.end_error(fate::classify_fate(
+                reply.error(fate::classify_fate(
                     PoolError::Timeout,
                     tx_verb_context(&req, false),
                 ));
@@ -834,7 +1259,7 @@ async fn serve_tx(
     let verb = match TxVerb::new(&req, store, &table, Arc::clone(stores)) {
         Ok(v) => v,
         Err(ep) => {
-            responder.end_error(ep);
+            reply.error(ep);
             return;
         }
     };
@@ -847,7 +1272,7 @@ async fn serve_tx(
         reply: reply_tx,
     };
     if handle.cmd_tx.send(cmd).await.is_err() {
-        responder.end_error(actor_gone_terminal(tx.tx_registry, tx.tx_id, tx.session_id));
+        reply.error(actor_gone_terminal(tx.tx_registry, tx.tx_id, tx.session_id));
         return;
     }
     match reply_rx.await {
@@ -855,20 +1280,23 @@ async fn serve_tx(
         Ok(QueueReply::Done {
             outcome: Ok(ok),
             exec_us,
-        }) => responder.end_ok(Bytes::from(ok.encode(QueueStats {
-            queue_us: 0,
-            exec_us,
-        }))),
+        }) => reply.ok(
+            ok,
+            QueueStats {
+                queue_us: 0,
+                exec_us,
+            },
+        ),
         Ok(QueueReply::Done {
             outcome: Err(ep), ..
         })
-        | Ok(QueueReply::RolledBack(ep)) => responder.end_error(ep),
+        | Ok(QueueReply::RolledBack(ep)) => reply.error(ep),
         // The statement WAS sent on the pinned connection, inside the transaction.
         Ok(QueueReply::Failed { error, .. }) => {
-            responder.end_error(fate::classify_fate(error, tx_verb_context(&req, true)))
+            reply.error(fate::classify_fate(error, tx_verb_context(&req, true)))
         }
         // The actor dropped the reply: a session abort, or a teardown that raced the command.
-        Err(_) => responder.end_error(actor_gone_terminal(tx.tx_registry, tx.tx_id, tx.session_id)),
+        Err(_) => reply.error(actor_gone_terminal(tx.tx_registry, tx.tx_id, tx.session_id)),
     }
 }
 
@@ -1042,7 +1470,7 @@ impl TxVerb {
             TxDecode::Release { delay_s } => match pgq::decode_release_in_tx(&qr.rows) {
                 // §24.8: only a RELEASE with `delay_s = 0` makes a job available now.
                 Ok(Some((new_id, queue))) => TxVerdict::Applied {
-                    ok: VerbOk::Release(Some(new_id)),
+                    ok: VerbOk::Release(Some((new_id, queue.clone()))),
                     wake: if *delay_s == 0 {
                         vec![self.hint(&queue)]
                     } else {
