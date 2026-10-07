@@ -1551,14 +1551,27 @@ async fn relay(
 /// `WAKER_CANCEL_DRAIN` — so the statement is ABANDONED: its waiter is answered without the job (and,
 /// if the answer comes before its grace bound, `Indeterminate`, counted unconfirmed), its connection is
 /// discarded rather than leaked or recycled, the `(store, queue)` is no longer in flight, and the next
-/// waiter on the same queue is served the job over a fresh connection. Before the fix the queue stayed
+/// waiter on the same queue is served the job. Before the fix the queue stayed
 /// in flight until TCP gave up, and every waiter got `Ok{jobs: []}` for hours.
 #[tokio::test]
 async fn a_silent_backend_does_not_wedge_the_queue() {
+    silent_backend_case("silent", false).await;
+}
+
+/// The same with a SECOND, idle pool connection frozen too (review round 2, T1): recovery may first
+/// check that one out, and its recycle hygiene hangs inside the checkout until the sweep's bound, a
+/// known non-execution (`PoolTimeout`, Retryable) — checkout eviction, not abandonment. A later
+/// waiter is served.
+#[tokio::test]
+async fn a_silent_backend_with_two_idle_connections_recovers() {
+    silent_backend_case("silent2", true).await;
+}
+
+async fn silent_backend_case(tag: &str, second_idle: bool) {
     let Some(url) = pg_url() else { return };
     let proxy = FreezeProxy::start(&url).await;
     let Some(w) = World::via(
-        "silent",
+        tag,
         &[
             ("FERRO_QUEUE_JOBS_WAKER_STMT_TIMEOUT_MS", "300"),
             ("FERRO_QUEUE_JOBS_POLL_MS", "200"),
@@ -1569,12 +1582,29 @@ async fn a_silent_backend_does_not_wedge_the_queue() {
     else {
         return;
     };
+    let pool = w.registry.get("default").unwrap();
+    if second_idle {
+        // Two pooled connections: a transaction pins one while an ENQUEUE takes another.
+        let mut t = w.session().await;
+        let tx = t.begin().await;
+        let mut s = w.session().await;
+        s.enqueue("other", None).await;
+        t.end_tx(tx, method_tx::ROLLBACK).await;
+        let pool2 = w.registry.get("default").unwrap();
+        eventually(|| pool2.gauges().idle >= 2, "two idle connections").await;
+    }
     w.slow(1_500).await;
     let id = w.put("wq").await;
     let mut c = w.session().await;
     let rid = c.reserve_send(&["wq"], 2_000).await;
     w.sweep_in_flight().await;
-    assert!(proxy.freeze() > 0);
+    // The sweep holds one connection; the rest are idle, and frozen with it.
+    let idle_at_freeze = pool.gauges().idle;
+    assert_eq!(
+        proxy.freeze(),
+        idle_at_freeze + 1,
+        "every pooled connection frozen"
+    );
     let o = c.reserve_result(rid, Duration::from_secs(8)).await;
     match &o {
         Outcome::Ok(_) => assert!(jobs_of(&o).is_empty(), "{o:?}"),
@@ -1592,17 +1622,29 @@ async fn a_silent_backend_does_not_wedge_the_queue() {
         1,
         "counted unconfirmed"
     );
-    let pool = w.registry.get("default").unwrap();
-    eventually(|| pool.gauges().in_use == 0, "no checkout leaked").await;
+    // DISCARD, pinned directly (review round 2, T1): the abandoned connection left the pool — it is
+    // neither in use nor back on the idle stack, where the next checkout would reuse a connection
+    // still running a statement.
+    let g = pool.gauges();
+    assert_eq!(
+        (g.in_use, g.idle),
+        (0, idle_at_freeze),
+        "the abandoned connection was discarded, not recycled"
+    );
     w.slow(0).await;
-    // The backend cancelled the statement, so the job is available; the queue serves it. (An idle
-    // connection frozen with the rest may be checked out first: its sweep is abandoned and discarded
-    // the same way — its bytes never reached the backend — so a later waiter is served.)
+    // The backend cancelled the statement, so the job is available; the queue serves it. A frozen
+    // IDLE connection may be checked out first: its recycle hygiene hangs inside the checkout until
+    // the sweep's bound, which is a known non-execution (`PoolTimeout`, Retryable) — checkout
+    // eviction, not abandonment — and a later waiter is served.
     let mut served = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..6 {
         let rid = c.reserve_send(&["wq"], 5_000).await;
         match c.reserve_result(rid, Duration::from_secs(10)).await {
-            Outcome::Error(ep) => assert_eq!(ep.branch, branch::INDETERMINATE, "{ep:?}"),
+            Outcome::Error(ep) => assert!(
+                ep.branch == branch::INDETERMINATE
+                    || (ep.code, ep.branch) == (errc::POOL_TIMEOUT, errc::POOL_TIMEOUT_BRANCH),
+                "{ep:?}"
+            ),
             o => {
                 served = jobs_of(&o).iter().map(id_of).collect();
                 if !served.is_empty() {
@@ -1612,6 +1654,40 @@ async fn a_silent_backend_does_not_wedge_the_queue() {
         }
     }
     assert_eq!(served, vec![id], "the queue recovered");
+    w.drop_schema().await;
+}
+
+/// Review round 2 (T3): a statement whose cancel the backend ANSWERS is not abandoned — its answer is
+/// awaited (`WAKER_CANCEL_DRAIN`) and its healthy connection goes back to the pool. Abandoning it at
+/// once would discard a good connection, and report an answer that lost the race to the cancel as
+/// `Indeterminate` with its jobs stranded until their leases.
+#[tokio::test]
+async fn an_answered_cancel_keeps_its_connection() {
+    let Some(w) = World::new(
+        "keepconn",
+        &[("FERRO_QUEUE_JOBS_WAKER_STMT_TIMEOUT_MS", "300")],
+    )
+    .await
+    else {
+        return;
+    };
+    w.slow(1_500).await;
+    w.put("default").await;
+    let pool = w.registry.get("default").unwrap();
+    let mut c = w.session().await;
+    let rid = c.reserve_send(&["default"], 5_000).await;
+    let o = c.reserve_result(rid, Duration::from_secs(8)).await;
+    let Outcome::Error(ep) = &o else {
+        panic!("{o:?}")
+    };
+    assert_eq!(ep.branch, branch::INDETERMINATE);
+    let waker = Arc::clone(w.waker());
+    eventually(|| waker.settled(), "settled").await;
+    assert!(
+        pool.gauges().idle >= 1,
+        "the answered statement's connection was recycled, not discarded: {:?}",
+        pool.gauges()
+    );
     w.drop_schema().await;
 }
 

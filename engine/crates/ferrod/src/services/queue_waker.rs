@@ -780,6 +780,19 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::atomic::AtomicUsize;
 
+    /// Yield until `cond` turns false — BOUNDED (review round 2, T2): a mutation that never makes
+    /// progress must FAIL the test, not spin it forever.
+    async fn spin_while(cond: impl Fn() -> bool, what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never progressed: {what}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
     fn store(poll_ms: &str) -> StoreConfig {
         let cfg = ferro_queue::config::QueueConfig::load(
             [
@@ -982,9 +995,11 @@ mod tests {
             let fake = Arc::clone(&fake);
             let gate = Arc::clone(&gate);
             async move {
-                while fake.reserves.load(Ordering::SeqCst) < n {
-                    tokio::task::yield_now().await;
-                }
+                spin_while(
+                    || fake.reserves.load(Ordering::SeqCst) < n,
+                    "fake.reserves.load(Ordering::SeqCst) < n",
+                )
+                .await;
                 gate.notify_one();
             }
         };
@@ -993,14 +1008,14 @@ mod tests {
         let wb = w.register(&qs(&["a", "b"]), 1, far).unwrap();
         step(2).await; // W's arrival sweep of `a`: empty
         step(3).await; // W's arrival sweep of `b`: empty — W is parked
-        while w.idle_waiters() < 2 {
-            tokio::task::yield_now().await;
-        }
+        spin_while(|| w.idle_waiters() < 2, "w.idle_waiters() < 2").await;
         put(&fake, "a", &[1]);
         w.hint("a", HintSource::Autocommit); // sweep 4: `a` for X and W, held
-        while fake.reserves.load(Ordering::SeqCst) < 4 {
-            tokio::task::yield_now().await;
-        }
+        spin_while(
+            || fake.reserves.load(Ordering::SeqCst) < 4,
+            "fake.reserves.load(Ordering::SeqCst) < 4",
+        )
+        .await;
         put(&fake, "b", &[2]);
         w.hint("b", HintSource::Autocommit); // W is busy in `a`: kept, not lost
         for _ in 0..20 {
@@ -1035,9 +1050,11 @@ mod tests {
         let w = waker(&fake, "60000");
         let far = Instant::now() + Duration::from_secs(5);
         let a = w.register(&qs(&["high"]), 1, far).unwrap();
-        while fake.reserves.load(Ordering::SeqCst) < 1 {
-            tokio::task::yield_now().await;
-        }
+        spin_while(
+            || fake.reserves.load(Ordering::SeqCst) < 1,
+            "fake.reserves.load(Ordering::SeqCst) < 1",
+        )
+        .await;
         let b = w.register(&qs(&["high", "default"]), 1, far).unwrap();
         put(&fake, "default", &[9]);
         w.hint("default", HintSource::Autocommit);
@@ -1051,9 +1068,11 @@ mod tests {
         );
         gate.notify_one(); // A's sweep: job 1
         assert_eq!(ids(&wait(&a, 5_000).await), vec![1]);
-        while fake.reserves.load(Ordering::SeqCst) < 2 {
-            tokio::task::yield_now().await;
-        }
+        spin_while(
+            || fake.reserves.load(Ordering::SeqCst) < 2,
+            "fake.reserves.load(Ordering::SeqCst) < 2",
+        )
+        .await;
         gate.notify_one(); // B's arrival sweep of `high`: job 2
         assert_eq!(ids(&wait(&b, 5_000).await), vec![2], "high before default");
     }
@@ -1103,9 +1122,11 @@ mod tests {
             )
             .unwrap();
         // Let the arrival sweep come back empty.
-        while w.metrics().polls(Trigger::Arrival) == 0 || g.lock().busy {
-            tokio::task::yield_now().await;
-        }
+        spin_while(
+            || w.metrics().polls(Trigger::Arrival) == 0 || g.lock().busy,
+            "w.metrics().polls(Trigger::Arrival) == 0 || g.lock().busy",
+        )
+        .await;
         let before = fake.reserves.load(Ordering::SeqCst);
         w.hint("other", HintSource::Autocommit);
         assert_eq!(
@@ -1137,15 +1158,19 @@ mod tests {
         for _ in 0..20 {
             w.hint("default", HintSource::Autocommit);
         }
-        while fake.reserves.load(Ordering::SeqCst) < 1 {
-            tokio::task::yield_now().await;
-        }
+        spin_while(
+            || fake.reserves.load(Ordering::SeqCst) < 1,
+            "fake.reserves.load(Ordering::SeqCst) < 1",
+        )
+        .await;
         assert_eq!(fake.reserves.load(Ordering::SeqCst), 1, "single flight");
         put(&fake, "default", &[1, 2, 3]);
         gate.notify_one(); // the first sweep: it served the FIRST waiter only (registered alone)
-        while fake.reserves.load(Ordering::SeqCst) < 2 {
-            tokio::task::yield_now().await;
-        }
+        spin_while(
+            || fake.reserves.load(Ordering::SeqCst) < 2,
+            "fake.reserves.load(Ordering::SeqCst) < 2",
+        )
+        .await;
         gate.notify_one(); // the one follow-up: every other waiter, k = 49
         for _ in 0..50 {
             tokio::task::yield_now().await;
@@ -1213,9 +1238,11 @@ mod tests {
         let w = waker(&fake, "60000");
         let far = Instant::now() + Duration::from_secs(5);
         let a = w.register(&qs(&["default"]), 2, far).unwrap();
-        while fake.reserves.load(Ordering::SeqCst) < 1 {
-            tokio::task::yield_now().await;
-        }
+        spin_while(
+            || fake.reserves.load(Ordering::SeqCst) < 1,
+            "fake.reserves.load(Ordering::SeqCst) < 1",
+        )
+        .await;
         let b = w.register(&qs(&["default"]), 1, far).unwrap(); // arrives while A's sweep runs
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -1246,9 +1273,11 @@ mod tests {
         let w = waker(&fake, "60000");
         let far = Instant::now() + Duration::from_secs(5);
         let a = w.register(&qs(&["default"]), 1, far).unwrap();
-        while fake.reserves.load(Ordering::SeqCst) < 1 {
-            tokio::task::yield_now().await;
-        }
+        spin_while(
+            || fake.reserves.load(Ordering::SeqCst) < 1,
+            "fake.reserves.load(Ordering::SeqCst) < 1",
+        )
+        .await;
         let b = w.register(&qs(&["default"]), 1, far).unwrap();
         *fake.fail.lock().unwrap() = Some(PoolError::Sql {
             code: ferro_proto::consts::errc::QUERY_TIMEOUT,
@@ -1313,9 +1342,11 @@ mod tests {
         let o = g.wait(far, &cancel, &Drain::new(), &live).await;
         assert!(matches!(o, WaitOutcome::Teardown), "{o:?}");
         let g = w.register(&qs(&["default"]), 1, far).unwrap();
-        while g.lock().busy || w.metrics().polls(Trigger::Arrival) < 2 {
-            tokio::task::yield_now().await;
-        }
+        spin_while(
+            || g.lock().busy || w.metrics().polls(Trigger::Arrival) < 2,
+            "g.lock().busy || w.metrics().polls(Trigger::Arrival) < 2",
+        )
+        .await;
         let drain = Drain::new();
         drain.trigger();
         let o = g
