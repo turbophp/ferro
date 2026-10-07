@@ -142,7 +142,8 @@ pub enum BreakerCounts {
     ConnectTimeout5xx,
 }
 
-/// TLS file locations. They are only *named* here; slice F5 reads them.
+/// TLS file locations. They are only *named* here; `engine::tls` reads them once, at start (`CA_FILE`
+/// since M6-F5a; `CLIENT_CERT_FILE`/`CLIENT_KEY_FILE`, mTLS, since M6-F5c).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TlsFiles {
     pub ca_file: Option<PathBuf>,
@@ -268,6 +269,8 @@ pub enum Reason {
     OriginAddress(AddressRefusal),
     Attach(AttachError),
     FileUnreadable(std::io::ErrorKind),
+    /// A FIFO, a device or a directory where a file was expected (M6-F5c review F6).
+    FileNotRegular,
     /// A list entry (1-based) that is not a method token, or is `CONNECT`/`TRACE`/`TRACK`.
     BadMethod(usize),
     AlwaysRefusedMethod(usize),
@@ -306,6 +309,7 @@ impl fmt::Display for Reason {
             ),
             Reason::Attach(e) => write!(f, "{e}"),
             Reason::FileUnreadable(k) => write!(f, "file cannot be read ({k})"),
+            Reason::FileNotRegular => write!(f, "is not a regular file"),
             Reason::BadMethod(n) => write!(f, "entry {n} is not an RFC 9110 token of 1-32 bytes"),
             Reason::AlwaysRefusedMethod(n) => {
                 write!(
@@ -650,14 +654,17 @@ impl HttpConfig {
         &self.orphan_keys
     }
 
-    /// §23.3.3: the upstreams carrying attached headers whose credential isolation is void,
-    /// given `FERRO_ALLOW_UIDS` and `ferrod`'s own uid. Names only — never values.
+    /// §23.3.3: the upstreams carrying credential material — attached headers, or (since M6-F5c)
+    /// a `CLIENT_KEY_FILE`, which is credential material too (§23.3.1) — whose credential isolation
+    /// is void, given `FERRO_ALLOW_UIDS` and `ferrod`'s own uid. Names only — never values.
     pub fn isolation_void(&self, ferro_allow_uids: &[u32], own_uid: u32) -> Vec<&str> {
         let daemon_void = ferro_allow_uids.is_empty() || ferro_allow_uids.contains(&own_uid);
         self.upstreams
             .iter()
             .filter_map(|(n, e)| match e {
-                UpstreamEntry::Enabled(up) if !up.attached.is_empty() => {
+                UpstreamEntry::Enabled(up)
+                    if !up.attached.is_empty() || up.tls.client_key_file.is_some() =>
+                {
                     let up_void = up.allow_uids.as_ref().is_some_and(|u| u.contains(&own_uid));
                     (daemon_void || up_void).then_some(n.as_str())
                 }
@@ -671,10 +678,43 @@ impl HttpConfig {
 /// so an oversize file is REFUSED by the parser instead of being silently truncated to fit.
 pub fn read_capped(p: &Path) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    std::fs::File::open(p)?
+    open_regular(p)?
+        .0
         .take(attach::MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// A file the daemon reads at start that is not a regular file — a FIFO, a device, a directory.
+/// It is refused BEFORE it is opened, because opening a FIFO for reading blocks until a writer
+/// appears, which at start is forever (M6-F5c review F6).
+#[derive(Debug)]
+pub struct NotRegularFile;
+
+impl fmt::Display for NotRegularFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("not a regular file")
+    }
+}
+
+impl std::error::Error for NotRegularFile {}
+
+/// Open `p` for reading only if it is a regular file, and return it with its length. The check is
+/// made on the path (`stat`, following symlinks) before the open, and again on the opened handle,
+/// so a FIFO is never opened and a swap between the two checks is still caught once opened (a
+/// FIFO swapped in after the first check would block the open itself: a race only whoever can
+/// write the configured path can run).
+pub fn open_regular(p: &Path) -> std::io::Result<(std::fs::File, u64)> {
+    let refuse = || std::io::Error::new(std::io::ErrorKind::InvalidInput, NotRegularFile);
+    if !std::fs::metadata(p)?.is_file() {
+        return Err(refuse());
+    }
+    let f = std::fs::File::open(p)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(refuse());
+    }
+    Ok((f, meta.len()))
 }
 
 /// The env-var form of a name: ASCII-uppercased, every other byte `_` — `ferrod`'s `env_name`
@@ -900,7 +940,13 @@ fn parse_upstream(
         "ATTACH_HEADERS_FILE",
         AttachedHeaders::default(),
         |r: &str| {
-            let bytes = read_file(Path::new(r)).map_err(|e| Reason::FileUnreadable(e.kind()))?;
+            let bytes = read_file(Path::new(r)).map_err(|e| {
+                if e.get_ref().is_some_and(|x| x.is::<NotRegularFile>()) {
+                    Reason::FileNotRegular
+                } else {
+                    Reason::FileUnreadable(e.kind())
+                }
+            })?;
             attach::parse(&bytes).map_err(Reason::Attach)
         }
     );

@@ -366,7 +366,12 @@ final class HttpLiveTest extends HttpLiveTestCase
         // is the state the bound is about: the upstream has written all it ever will without credit.
         $written = $this->writtenPlateau(minSeconds: 1.5, quietSeconds: 0.75, maxSeconds: 20.0);
         $this->assertLessThan(28 * 1024 * 1024, $written, sprintf('the upstream wrote %d bytes against one 16 MiB window', $written));
-        $this->assertGreaterThan(8 * 1024 * 1024, $written, 'control: it did write ahead into the window');
+        // Control: the upstream was not stalled from the start — it wrote far past the one chunk
+        // consumed. NOT "it filled 8 MiB": the window is 64 frames OR 16 MiB, whichever binds
+        // first, and a frame is only as large as the engine's read from the upstream socket
+        // (<= 256 KiB), so the frame count usually binds first and the plateau varies by run
+        // and read path (CI measured 7.86 MB on the fread lane at the plateau).
+        $this->assertGreaterThan(2 * 1024 * 1024, $written, sprintf('control: the upstream wrote ahead of the %d bytes consumed', $read));
         for ($it->next(); $it->valid(); $it->next()) {
             $read += strlen($it->current());
         }
