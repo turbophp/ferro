@@ -735,13 +735,16 @@ async fn a_cancel_during_the_sweep_unreserves_its_job() {
         started.elapsed() < Duration::from_millis(700),
         "not held by the sweep"
     );
-    w.until_row(id, Some((0, None))).await;
+    // The counter first: it moves only once the unreserve statement restored a row, which proves
+    // the reservation it undid was COMMITTED. (A row read while the sweep still sleeps in the trigger
+    // shows the uncommitted pre-reservation state and would prove nothing.)
     let m = w.waker().metrics();
     eventually(
         || m.unreserved_count(UnreserveCause::Cancel) == 1,
         "counted: cancel",
     )
     .await;
+    assert_eq!(w.row(id).await, Some((0, None)), "restored exactly");
     assert_eq!(m.unreserve_failed_count(), 0);
     w.drop_schema().await;
 }
@@ -765,13 +768,16 @@ async fn a_sweep_past_the_grace_bound_is_answered_empty_and_unreserved() {
         took < Duration::from_millis(2_500),
         "within wait + grace: {took:?}"
     );
-    w.until_row(id, Some((0, None))).await;
+    // The counter first: it moves only once the unreserve statement restored a row, which proves
+    // the reservation it undid was COMMITTED. (A row read while the sweep still sleeps in the trigger
+    // shows the uncommitted pre-reservation state and would prove nothing.)
     let m = w.waker().metrics();
     eventually(
         || m.unreserved_count(UnreserveCause::Deadline) == 1,
         "counted: deadline",
     )
     .await;
+    assert_eq!(w.row(id).await, Some((0, None)), "restored exactly");
     w.drop_schema().await;
 }
 
@@ -795,12 +801,12 @@ async fn a_dropped_session_never_keeps_its_reservation() {
         c.reserve_send(&[queue], wait_ms).await;
         w.sweep_in_flight().await;
         drop(c);
-        w.until_row(id, Some((0, None))).await;
         eventually(
             || m.unreserved_count(UnreserveCause::Teardown) == n as u64 + 1,
             "counted: teardown",
         )
         .await;
+        assert_eq!(w.row(id).await, Some((0, None)), "restored exactly");
     }
     assert_eq!(w.waker().metrics().reserve_unconfirmed_count(), 0);
     w.drop_schema().await;
@@ -822,7 +828,13 @@ async fn a_goodbye_during_the_sweep_is_answered_without_the_job() {
     c.c.goodbye().await;
     let o = c.reserve_result(rid, Duration::from_secs(5)).await;
     assert!(matches!(o, Outcome::Cancelled), "{o:?}");
-    w.until_row(id, Some((0, None))).await;
+    let m = w.waker().metrics();
+    eventually(
+        || m.unreserved_count(UnreserveCause::Teardown) == 1,
+        "counted: teardown",
+    )
+    .await;
+    assert_eq!(w.row(id).await, Some((0, None)), "restored exactly");
     w.drop_schema().await;
 }
 
@@ -1265,19 +1277,12 @@ async fn chaos_row_12_every_job_is_delivered_once_or_still_available() {
             *received.entry(id).or_default() += 1;
         }
     }
-    // Every waiter has ended; let spawned unreserves land.
+    // Every waiter has ended; wait until no sweep and no unreserve is outstanding, so the rows read
+    // next are final (a sweep still in its trigger shows uncommitted, pre-reservation rows).
     let m = Arc::clone(w.waker().metrics());
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let rows = loop {
-        let rows = w.all_rows().await;
-        let settled = rows
-            .iter()
-            .all(|(id, (a, r))| received.contains_key(id) || (*a == 0 && r.is_none()));
-        if settled || Instant::now() > deadline {
-            break rows;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let waker = Arc::clone(w.waker());
+    eventually(|| waker.settled(), "the waker settles").await;
+    let rows = w.all_rows().await;
     assert_eq!(rows.len(), JOBS, "no job lost");
     for (id, n) in &received {
         assert_eq!(*n, 1, "job {id} delivered {n} times");
@@ -1373,16 +1378,10 @@ async fn chaos_row_12_dropped_sessions_lose_nothing() {
             *received.entry(id).or_default() += 1;
         }
     }
-    // Unreserves are spawned after the terminals they follow: read until the rows stop changing.
-    let mut rows = w.all_rows().await;
-    let mut stable = 0;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while stable < 5 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let again = w.all_rows().await;
-        stable = if again == rows { stable + 1 } else { 0 };
-        rows = again;
-    }
+    // Wait until no sweep and no unreserve is outstanding, so the rows read next are final.
+    let waker = Arc::clone(w.waker());
+    eventually(|| waker.settled(), "the waker settles").await;
+    let rows = w.all_rows().await;
     assert_eq!(rows.len(), JOBS, "no job lost");
     let mut phantoms = 0;
     for (id, (attempts, reserved_at)) in &rows {

@@ -296,6 +296,8 @@ pub struct Waker {
     bound: OnceLock<Bound>,
     state: Mutex<State>,
     next_id: AtomicU64,
+    /// Sweep and unreserve statements spawned and not yet finished (diagnostics: [`Waker::settled`]).
+    outstanding: AtomicU64,
     ticker: OnceLock<()>,
     weak: Weak<Waker>,
 }
@@ -321,6 +323,7 @@ impl Waker {
             bound: OnceLock::new(),
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(1),
+            outstanding: AtomicU64::new(0),
             ticker: OnceLock::new(),
             weak: weak.clone(),
         })
@@ -354,6 +357,16 @@ impl Waker {
 
     /// Registered waiters that are parked right now — in no sweep, not finished (diagnostics; what a
     /// test waits for before it fires a hint, instead of sleeping).
+    /// No sweep in flight on any queue and no unreserve statement outstanding: every reservation
+    /// this waker made has reached its end — a slot, or the rows (diagnostics; what a test waits for
+    /// before it reads the rows back, since a row read while a sweep is still uncommitted shows the
+    /// pre-reservation state).
+    pub fn settled(&self) -> bool {
+        // A sweep task counts until `complete` has handed out its jobs and spawned (and counted) any
+        // unreserve, so there is no instant at which a reservation is in neither count.
+        self.outstanding.load(Ordering::SeqCst) == 0
+    }
+
     pub fn idle_waiters(&self) -> usize {
         let st = self.lock();
         st.waiters
@@ -480,7 +493,9 @@ impl Waker {
         let runner = Arc::clone(&bound.runner);
         let timeout = self.stmt_timeout;
         let queue = queue.to_string();
+        self.outstanding.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
+            let _done = Settle(&me.outstanding);
             let outcome = sweep_outcome(runner(stmt, timeout).await, k);
             me.complete(&queue, batch, k, outcome);
         });
@@ -618,7 +633,9 @@ impl Waker {
         let runner = Arc::clone(&bound.runner);
         let timeout = self.stmt_timeout;
         let n = keys.len();
+        self.outstanding.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
+            let _done = Settle(&me.outstanding);
             match runner(stmt, timeout).await {
                 Ok((qr, _, _)) => match pgq::decode_unreserve(&qr.rows, n) {
                     Ok(restored) => {
@@ -682,6 +699,15 @@ impl Waker {
         for q in due {
             self.start_sweep_locked(&mut st, &q, Trigger::Interval);
         }
+    }
+}
+
+/// Decrements an outstanding-work counter when dropped (the unreserve task ends however it ends).
+struct Settle<'a>(&'a AtomicU64);
+
+impl Drop for Settle<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -842,14 +868,20 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A waiter's outcome with its grace bound `ms` from now. Bounded on the TEST's side too, so a
+    /// handler that waited on the waker past its bound fails here instead of hanging the suite.
     async fn wait(g: &WaitGuard, ms: u64) -> WaitOutcome {
-        g.wait(
-            Instant::now() + Duration::from_millis(ms),
-            &CancellationToken::new(),
-            &Drain::new(),
-            &Liveness::new(),
+        tokio::time::timeout(
+            Duration::from_millis(ms) + Duration::from_secs(5),
+            g.wait(
+                Instant::now() + Duration::from_millis(ms),
+                &CancellationToken::new(),
+                &Drain::new(),
+                &Liveness::new(),
+            ),
         )
         .await
+        .expect("the handler answers by its own bound, never waiting on the waker")
     }
 
     fn ids(o: &WaitOutcome) -> Vec<i64> {
