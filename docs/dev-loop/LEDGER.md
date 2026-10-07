@@ -313,12 +313,20 @@ The rows follow SPEC §24.14's slice plan (replaced at G0). Pre-G0 rows map as: 
 - Deferred perf slices (§7.2 pipelined hygiene, the B4 two-channel split) — only against
   recorded bench numbers, per charter rule 5.
 - Every 4th iteration: the adversarial/bug-hunt pass (protocol step 4).
-- **RECOMMENDED TO THE OWNER, not yet scheduled — a D12 perf canary.** The §16 v1 targets (E8) have
-  not been measured since M0, and E8 sits at the very END of the plan while charter rule 5 forbids
-  optimizing before then. If M1's additions (streaming, the full type layer, the fate matrix) cost
-  boundary latency, that is discovered at the most expensive possible moment. Re-running the
-  existing D12 bench against current `main` is cheap and would turn that unknown into a number
-  now. The loop has NOT taken this on its own initiative — it is out of the current phase order.
+- **D12 perf canary — RUN (owner-requested, 2026-10-07); the §16 boundary target is MISSED on the
+  D17 runner.** `bench.yml --scenario trivial` on `main` `b5e434f`, two runners
+  (`bench/results/20261007T03{0903,1102}Z-gh-ubuntu-latest.json`, run 37565118419). Added p50 over
+  PDO is **+125–129 µs** (runner 2) and **+262–274 µs** (runner 1) against the 60 µs target; added
+  p99 **+189–345 µs** against 200 µs (only runner 2, JIT off, under it). Ferro is 1.7–1.9× PDO's
+  p50 on both runners; the two runners differ ~1.6× from each other, so compare within a record.
+  **Read from the code, not yet profiled:** a recycled PG checkout runs an awaited `Targeted` reset
+  batch (one round trip, §7.2's pipelining deferred at M1-S3), then the statement is `prepare`d and
+  executed (two more; §7.3's statement cache is unbuilt), against PDO's one unprepared round trip;
+  and the client measured `PurePacker` although `ext-msgpack` was loaded (`PackerFactory` always
+  returns it, deliberately). This is the recorded number charter rule 5 asked for before
+  optimizing; the perf slice it names (profile the breakdown first, then pipelined/skipped hygiene,
+  the statement cache, the codec) is **E-phase work ahead of E8**, scheduled after M7 per the build
+  order unless the owner moves it.
 - Keep CLAUDE.md's "Current state" truthful when a slice changes it.
 
 ## Found bugs (open; found by the loop, not yet fixed)
@@ -614,6 +622,7 @@ failed iteration — a silent iteration is indistinguishable from a dead loop.
 
 | When (UTC) | Iteration | Item(s) | Outcome | PR | Gates run |
 |------------|-----------|---------|---------|----|-----------|
+| 2026-10-07 | D12 perf canary (owner-requested) | **Ferro vs PDO on the D17 runner: +125–274 µs p50, the §16 60 µs target missed** | `bench.yml --scenario trivial` dispatched on `main` `b5e434f` (run 37565118419, both jobs green); two records committed. Runner 2 (EPYC 9V45): Ferro p50 311–314 µs / p99 405–547 µs, PDO 185 / 216 µs. Runner 1 (EPYC 9V74): Ferro 564–576 / 734–750 µs, PDO 302 / 406 µs. Not established: where the overhead goes (unprofiled; the round-trip count is read from the code). No code changed. | (branch `claude/dev-loop/20261007-0315-d12-canary`) | none (records only) |
 | 2026-10-07 | M7-G2 review round | **The adversarial review of dac0b80: no HIGH; one MED bypass of the verified relation fixed; O-G2 decided as D25** | F5 MED (an in-tx verb steered off the verified relation by an app's `search_path`) fixed by schema-qualifying every verb; F1 (hint on an aborted block's COMMIT) fixed via the RFQ status; F2's surviving mA/mS killed by new live tests; F3's CANCEL-arm coverage added to `chaos_fate_it` and the actor unit test made non-vacuous; F4 pre-dispatch CANCEL for queue verbs (EXEC → FB-15); O-G2 decided as D25 (NonRetryable, plus the post-send non-SQL arm). 40 mutations, 40 killed. Re-lettered (dh) → (di). The container restart and PG going down twice were recovered from; the 4 false kills recorded with PG down were discarded. | — (coordinator pushes) | fmt; clippy `-p ferrod -p ferro-queue --all-targets`, `-p ferrod --no-default-features --all-targets`, `-p ferro-pool --all-targets`; `ferro-queue`, `ferrod --lib`, `queue_g2_it`, `queue_g1b_it`, `queue_g1a_it`, `tx_it`, `chaos_fate_it` live; incompatibilities doc check |
 | 2026-10-07 | M7-G2 (owner-resumed) | **Ferro Queue's transactional path on PostgreSQL** | Tx-scoped ENQUEUE/ACK/RELEASE/EXTEND/SIZE/CLEAR on the pinned connection as one `TxCommand::Queue`; `PoolMismatch` before any checkout; probe-less in-tx ACK/RELEASE (R1); after-commit hints (counted until G3); chaos rows 2 (incl. a real `ferrod` SIGKILLed) and 7. 29 mutations, all killed after two added cases. The disk filled twice on the shared target (once from this builder's `--tests` build). SPEC §22.2 (di). | — (coordinator pushes) | fmt; clippy (scoped); `ferro-queue` 50, `ferrod` lib 249, `queue_g2_it` 14, `queue_g1a_it` 12, `queue_g1b_it` 19 + 1, `tx_it` 15, `chaos_fate_it` 9 |
 | 2026-10-07 | M6-F9 review round | **The review of 9ec64a3: no HIGH; two MEDIUM-LOW fixed, an unauthenticated-request path closed, seven survivors killed** | F-A: `Ferro\Laravel\Http\Retry::when()` threw a TypeError on every 3xx (Laravel passes the null `toException()`) — now `?\Throwable`, null not retried (the reviewer's `WhenTest` adopted). F-B: a closure connection provider was dialled once per distinct upstream — `ConnectionProvider::memoise()` in `FerroHandler`, `Psr18\Client` and `HttpWiring`; three origins → one connect (`ConnTest` adopted, plus a throw-then-retry case). `auth` digest/ntlm (and curl-option auth) REFUSED rather than sent unauthenticated. Survivors MP (sync `delay`), MAA (`when()` null fate), MB (seam refusal), MR/MS (`http.ferro` timeouts/pool, now named `Ferro::connect()` arguments), MA (retried body rewind, now offline), MJ killed; MV recorded near-equivalent. Docs: `http.ferro` is not an egress control; `verify` path ignored; unmapped origin through pool/async is a `ConnectionException`; retry recipe first. FB-16 records the async limits; Laravel 12.x CI and `ci/local-gate.sh` carried to F10. Container restarted mid-round: PG 16 restarted with `pg_ctl` (crash recovery). | (same branch, not pushed) | PHPStan L9 on psr18/guzzle/laravel; offline guzzle 99/1097, psr18 39/1401, laravel 101/263; live (PG 16, `--fail-on-skipped`) guzzle 10/116 + chaos 3/3, psr18 4/40, both read paths, Laravel HTTP 5/24, `php/laravel` whole suite 247/1151 (55 MySQL-gated skips); `ci/check-incompatibilities-doc.sh`; `ci/check-suite-triage.sh`; mutations: the original 34 all killed, the reviewer's 7 + 6 new all killed (N3/N5 after their test asserted which refusal fired); MV recorded near-equivalent. |
