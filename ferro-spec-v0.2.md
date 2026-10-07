@@ -630,6 +630,13 @@ Rust: latest stable pinned in `rust-toolchain.toml`, edition 2024, tokio multi-t
 
 **Open items (maintainer):** license selection; naming (D7); security review scheduling before any public beta. *(Reference-hardware sign-off for §16 was settled by D17.)*
 
+- **O-G2 (fate; raised at M7-G2, §22.2 (dh)): an in-transaction Ferro Queue WRITE whose statement ran but whose result the engine cannot read.**
+  - **Why it is open.** §24.6 decided this row for autocommit only: there it is `Indeterminate{WriteUnconfirmed}`, because the effect is real and cannot be reported. It said nothing for a verb inside a client transaction.
+  - **What G2 implements, as an interim the owner may overturn.** The TX actor rolls the transaction back and tombstones it, and answers `TxDeadline{Retryable}`. The claim is true: the transaction will never commit. It is also the only answer under which an effect nobody can report can never commit.
+  - **The alternative.** Answer `Indeterminate` and leave the transaction open, as autocommit does. A client could then COMMIT the unseen effect.
+  - **Reachability.** Only a table altered after shape verification, or an engine defect, reaches this row.
+  - **Cost of changing it.** One arm of `TxVerb::decode` and one actor break, plus `ferrod`'s `the_actor_fires_hints_only_on_commit_and_rolls_back_an_unreadable_write`.
+
 *(Settled by the owner on 2026-10-06 (§22.2 (de)) and removed from this list: **the D18 reading**, raised at E9 (§22.2 (da)), was settled as clause 3, and D18's text was amended in place to say only that. **O-F5c**, raised at M6-F5a (§22.2 (dc)), was settled as option (a) and recorded as D23. **O-G1**, raised while these decisions were being recorded (the `job_id` width for a non-SQL store kind), was settled the same day as D24.)*
 
 ## 22. Changelog v0.1 → v0.2
@@ -1818,6 +1825,85 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
   - **Review round (adversarial, of 8938061; journal in the builder's scratchpad).** No HIGH finding. The reviewer's live chaos probe — 40 Ferro sessions (lease 2 s, multi-queue RESERVE, ACK/RELEASE/EXTEND, sleeps past the lease, abandoned jobs) plus raw stock-Laravel workers with a DIFFERENT `retry_after` on the same table, about 710 deliveries per run, three runs — found no `(id, attempts)` delivered twice, no stale ACK/RELEASE honoured, no re-reservation inside an EXTENDed lease, every payload removed exactly once. Fixed, each with a test that fails without the fix: **F1 (MEDIUM) — inheritance children defeated the uniqueness check:** a parent with `PRIMARY KEY (id)` plus `CREATE TABLE child () INHERITS (parent)` passed, and one ACK deleted parent AND child rows and then answered `Indeterminate`; the catalog read gains a cell and an ordinary table with inheritance children is refused by name (§24.3 amended), pinned live for SIZE, RESERVE, CLEAR and ENQUEUE with the child's row untouched. Partitioned tables stay accepted, with the reason measured (PostgreSQL requires a partitioned table's unique index to include the partition key, so a unique index on `id` alone is global). **F2 — T7/T8 are killable:** two `FakeBackend` unit tests drive a two-queue RESERVE with a cancelled token and with a past deadline. **F3 — a multi-queue RESERVE is N statements with N clocks**, contradicting §24.3's binding rule and this entry's "ONE statement": §24.3 is amended rather than the statement restructured (an empty statement cannot report its `now` without changing the statement the rescan premise was measured on), and the live priority test asserts that one reply's jobs share one `lease_deadline`. **F4:** §24.17's premise list marks the `MATERIALIZED` premise asserted. **RV3** (`indisvalid` neutralised) survived the reviewer's round: a live case now builds an INVALID index with a failed `CREATE UNIQUE INDEX CONCURRENTLY` over duplicate ids. **Carried to G3:** EXTEND's fence does not require `reserved_at IS NOT NULL` — harmless today (nothing unreserves), but §24.8's unreserve decrements `attempts`, so the previous reservation's token matches an unreserved row again and its EXTEND would re-reserve it (ledger G3 row). **Mutation round re-run on the fixed tree** (the whole set plus RV3 and three for the inheritance refusal — the check removed, the catalog cell forced false, the `relkind = 'r'` gate dropped): **64 distinct mutations, 63 killed, 1 equivalent (T9)**; T7 and T8 are killed by the new unit tests, RV3 by the live INVALID-index case, the removed check and the forced-false cell by the live inheritance test, and the dropped gate by the unit pin (the live partitioned-table test in `queue_g1a_it` is its second line). The nine live-suite-only re-runs repeat pass 2: B4, B7 (equivalent), F4, U5 (redundant), R1 and R2 survive the live tier alone and are killed by the unit tier.
   - **Not established.** The tx path (G2); waiting, unreserve, wake hints, the waker, queue metrics/spans/slow log (G3); dedup and the PHP native API (G4); the Laravel driver and the D18 columns (G5); MySQL/MariaDB stores (G6). The stock `jobs` (queue) index is the only index used; whether RESERVE's plan stays good on a large table is G3's bench question. Concurrency was proven at 16 sessions on one PG 16 instance, not across hosts. The real-Laravel mixed-mode test is not in CI. No PHP API sends QUEUE frames yet. `ferro queue schema` (CLI) is unbuilt.
   - **Gates:** fmt; clippy `--workspace --all-targets -D warnings` and `-p ferrod --no-default-features --all-targets`; tests per target (each executable deleted after its run; the shared target at 90%+ disk hit ENOSPC once when every `ferrod` test target was built together): `ferro-queue` 47 and `ferro-proto` (registry sync included); EVERY `ferrod` target, default features and `--no-default-features` (lib 242, `queue_g1b_it` 18 + 1 ignored, `queue_g1a_it` 12, the other 30 targets green) with `FERRO_TEST_PG_URL` set — `FERRO_TEST_MYSQL_URL` was NOT set, so `mysql_it`/`mysql_chaos_it`/`types_e2e_it`'s MySQL cases returned early (this branch touches no MySQL code); the other workspace crates are untouched and were not re-run; `/proto` regeneration zero-diff; `ci/check-incompatibilities-doc.sh`.
+  **(dh) M7-G2 — Ferro Queue's transactional path on PostgreSQL: tx-scoped verbs on the transaction's pinned connection, `PoolMismatch`, in-transaction `LeaseLost`, the after-commit wake hint, and chaos rows 2 and 7 (2026-10-07).** The third code slice of Ferro Queue (§24.14). The "until G2" `Unsupported` refusal is gone. A tx-scoped ENQUEUE, ACK, RELEASE, EXTEND, SIZE or CLEAR now runs on the transaction's pinned connection as ONE `TxCommand::Queue` to its actor, and its outcome is the transaction's. A tx-scoped RESERVE stays refused `Unsupported`, for good, before its `tx_id` is even resolved. No `/proto` change: `PoolMismatch` and `LeaseLost` were keyed at G1a, and `PROTOCOL.md` §14 gained one corrected sentence and nothing else. Built on `main` at `abf2bad`. *(Letter note: (dh). M6-F5c was being built in parallel and may claim the same letter; whichever merges second re-letters.)*
+  - **The mechanism (§24.5), as built.** The steps, in order:
+    - the per-request refusals (a tx-scoped RESERVE first);
+    - step 1, `resolve_active`, unchanged (it was already `pub(crate)`, so R2 needed no change): a missing or foreign `tx_id` is `TxNotFound`, the owner's tombstoned one `TxDeadline`;
+    - step 2, the store's pool against `TxHandle.pool`: a mismatch is `PoolMismatch` before ANY checkout;
+    - the store's first-use verification, on a SEPARATE checkout, never inside the application's transaction (a failed catalog statement there would abort it, and at REPEATABLE READ its snapshot is the application's);
+    - step 3: one actor command, bounded by what is left of the request's one deadline.
+
+    The actor runs each step through the SAME interruptible statement run as `TxCommand::Exec`. That run was extracted from the `Exec` arm as `run_interruptible`, unchanged; the existing `tx_it`, `chaos_fate_it` and actor unit tests cover it. So everything §24.5 says holds for `Exec` holds unchanged: `timeout_ms`, CANCEL, `max_tx` and a `57014` the backend returns itself roll the transaction back and tombstone it (`TxDeadline{Retryable}`), and a session abort drops the reply. Every PostgreSQL verb is ONE step, so no per-step stop condition is built yet: the actor stops at the first failing step, and a stop condition lands with the first multi-step verb (G4's dedup ENQUEUE, G6's MySQL RELEASE). §24.5 is amended.
+  - **The actor decodes the result itself, and that is the design's one structural choice.** Two outcomes act on the transaction, and no other command — a Fiber's `ROLLBACK_TO` or COMMIT — may slip in between the verb and its consequence:
+    - an applied verb keeps its wake hint for COMMIT;
+    - an unreadable WRITE result rolls the transaction back.
+
+    The precedent is `ExecStreamed`/`Copy`, whose producers also run inside the actor.
+  - **In-transaction `LeaseLost` (R1).** In a transaction an unmatched fence is ALWAYS `LeaseLost` — an absent row included — and the transaction stays open, because no SQL error occurred and the caller rolls back. `ferro-queue` gains `pg::ack_in_tx` (the fenced DELETE alone, outcome from the command tag) and `pg::release_in_tx` (the fenced DELETE → INSERT, returning the new id AND its queue), both without the probe ("The probe is not run", §24.4). ENQUEUE, EXTEND, SIZE and CLEAR run their autocommit statements unchanged. The `LeaseLost` message says "the transaction is still open: roll it back".
+  - **The after-commit hint (§24.5 step 4) is produced by the decode, not the request**, because a RELEASE request carries no queue (the queue is in the row). It yields:
+    - one hint per DISTINCT queue of an ENQUEUE (§24.8 names "an ENQUEUE", any delay);
+    - one for a RELEASE, only at `delay_s = 0`;
+    - none for anything else, for a failed verb, or for a `LeaseLost`.
+
+    The hints are kept in the actor and fired only after `commit_tx()` returns `Ok`. ROLLBACK, a failed or lost COMMIT, abort and deadline drop them; a `ROLLBACK_TO` leaves a stale one (§24.5: one empty poll). **The hint has no consumer until G3**: firing it increments `QueueStores::wake_hints`, which is what makes "fired only on a successful COMMIT" a counted, pinned claim. Autocommit verbs fire no hint yet; that is G3's.
+  - **Fate (§24.6), pinned live with read-back.** Every case runs through the shared matrix with `in_tx: true` (`readonly` still SIZE only):
+    - timed out, CANCELled once provably blocked on a lock, or killed by an application's own `SET LOCAL statement_timeout`: `TxDeadline{Retryable}`. The next touch of the `tx_id` is `TxDeadline` (tombstoned), never a `25P02` from an aborted block. Neither the job nor the business write exists, and nothing was re-sent.
+    - the backend link killed under an in-transaction ENQUEUE: `Retryable{ConnectionLost}`, never `Indeterminate`, neither row.
+    - a statement error (`25006` in a READ ONLY transaction): its known fate, the transaction left registered.
+    - the link killed inside the COMMIT (a deferred constraint trigger sleeping 300 ms holds it open, observed in `pg_stat_activity` before the kill): `Indeterminate{WriteUnconfirmed}`, both or neither, and that COMMIT fired no hint.
+    - session death: rolled back.
+  - **One fate row §24.6 did not have, decided conservatively and RAISED as open item O-G2 (§21).** An in-transaction WRITE whose statement ran but whose result is unreadable. The actor rolls the transaction back and tombstones it, answering `TxDeadline{Retryable}`: a TRUE claim, and the only answer under which an effect nobody can report can never commit. Autocommit's `Indeterminate` with the transaction left open would let a client COMMIT it unseen. An unreadable SIZE is `Unsupported` and leaves the transaction open. Only a table altered after verification, or a defect, reaches it; pinned on a `FakeBackend` through the real actor.
+  - **Chaos row 2 (§24.13), including a REAL `ferrod` process.** The suite spawns the `ferrod` binary (the `oob_it`/`http_tls_it` pattern) and SIGKILLs it:
+    - before COMMIT, 3 iterations: neither row. The read-back waits until `pg_stat_activity` shows the pool's transaction GONE, so it proves a rollback, not invisibility.
+    - during COMMIT, 12 iterations per run: half provably inside the deferred trigger, half killed 0–30 ms after the COMMIT was sent. Every iteration was both or neither, never one.
+
+    The first version used 30–330 ms delays and recorded 12/12 "both", so the "neither" side was never exercised. With the shortened delays, three runs gave 0/12, 1/11 and 0/12 (neither/both). The client-side `Retryable`/`Indeterminate` classification of a SIGKILLed engine is the existing §19.3 client rule, re-proven through the queue API at G4.
+  - **Chaos row 7 (§24.13).** Transactional ack under induced lease loss: the lease is moved 60 s into the past, and a second session re-reserves. 40 iterations, each the worker of §24.5 (business write + ACK in one transaction, ROLLBACK on anything but `acked`):
+    - (a) the stale and the new holder race concurrently;
+    - (b) the absent row (R1), whose autocommit control answers `gone`;
+    - (c) the new holder rolls back, and the job stays under its token;
+    - (d) REPEATABLE READ with a snapshot older than the re-reservation, which answers `40001` (Retryable).
+
+    The stale holder never committed, and no job has more than one business row. The `business` table has no unique constraint, so that is the fence's doing. The control: an expired lease that NOBODY re-reserved is honoured inside a transaction.
+  - **Also pinned live.** Atomicity both ways:
+    - an in-transaction ENQUEUE (single and batch) is invisible until COMMIT, visible to its own transaction (SIZE), and gone after ROLLBACK;
+    - ACK, RELEASE (old row intact or replaced; attempts kept; the delay rule), EXTEND and CLEAR commit or roll back with the business write;
+    - a rolled-back ACK leaves the token valid.
+
+    Refusals: `PoolMismatch` is pinned both ways, against a store whose pool NOBODY listens on (so the refusal coming back as itself, not a connection failure, proves no checkout), and against a transaction on a second live pool. In both, the transaction then commits its business write. A tx-scoped RESERVE is refused even for an unknown `tx_id`. A store with an absent or wrong-shaped table is refused naming why, and the transaction stays usable.
+  - **Tests.**
+    - `ferro-queue`: 50 unit tests (+2: the in-transaction builders pinned literally, with no probe, and their decoders).
+    - `ferrod` lib: 249 (5 new, in `services::queue`: the step per verb, the decode matrix, the in-transaction `OpContext`, `PoolMismatch`, and the actor test above).
+    - `queue_g2_it`: 14 live.
+    - `queue_g1a_it`: 12. Its value-refusal case for a tx-scoped ENQUEUE now asserts `TxNotFound` before any checkout.
+    - `queue_g1b_it`: 19 + 1 ignored.
+  - **Mutation round.** 29 distinct mutations of this slice's own code: 15 in `services::queue`, 10 in the actor, 4 in the builders. A script (`mutate_g2.py`, the builder's scratchpad) applies each to the committed tree and runs `ferro-queue`, the `ferrod` lib, `queue_g2_it` and `queue_g1a_it` until one fails. **First pass: 28 killed, none by a compile error; 1 survived.** The survivor was Q5, the "no time left after verification" check on the tx path. Dispatching with `timeout_ms = 0` would send the statement, cancel it and roll the application's transaction back, where the check answers `PoolTimeout` unsent. A live case (`timeout_ms = 0` on a verified store; the transaction then commits its business write) now KILLS it.
+    - **Second pass: the builder mutations against the LIVE suite alone.**
+      - P2 (`decode_ack_in_tx` 0 → acked) and P4 (`release_in_tx` keeps the old lease) are killed live.
+      - P1 (the in-transaction ACK fence drops `created_at`) SURVIVED live at first, because no live case forged `created_at` inside a transaction (G1b's F1 lesson, for autocommit). A forged-token case now kills it live.
+      - P3 (the hint's queue dropped) survives the live tier BY CONSTRUCTION — nothing reads a hint's queue until G3's waker — and is killed by the unit tier.
+    - **Final: 29 distinct, 29 killed, 0 equivalent.** Q5, and P1 on the live tier, are killed since the two added cases.
+    - **Kills worth naming.**
+      - A1 (hints fire on any COMMIT outcome) is killed only by the live link-killed-during-COMMIT case.
+      - A7 (a self-returned `57014` not rolled back) is killed only by the live `SET LOCAL statement_timeout` case, written for it before the round.
+      - A8 (CANCEL takes the abort exit) is killed by the EXISTING actor unit test: `run_interruptible` is shared with `Exec`, so a mutation there is also an `Exec` regression.
+      - Q2 (verification skipped on the tx path) and Q1 (the pool check removed) are killed only by the live suite.
+  - **Process note.** The shared target hit 100% disk twice: once from this builder's own `cargo build -p ferrod --tests`, which builds every test target at ~170 MB each, and once from the shared target's incremental directory. The coordinator freed space both times. The slice then ran with `CARGO_INCREMENTAL=0`, building one test target at a time and deleting each executable after its run.
+  - **Not established.**
+    - MySQL/MariaDB in a transaction (G6, with the multi-step actor commands and their stop conditions).
+    - A dedup-keyed ENQUEUE in a transaction (G4).
+    - The hint's real consumer, the waker (G3).
+    - The client's queue API and its fate handling (G4).
+    - The Laravel tier's tx-scoped producers and `FerroJob::delete()` in a transaction (G5).
+    - Chaos row 2 through a PHP client.
+    - O-G2's owner decision.
+  - **Gates:**
+    - fmt;
+    - clippy `-p ferrod -p ferro-queue --all-targets -D warnings` (scoped at the coordinator's request, because a workspace clippy was running concurrently) and `-p ferrod --no-default-features --all-targets`;
+    - `ferro-queue` 50; `ferrod` lib 249; `queue_g2_it` 14, `queue_g1a_it` 12 and `queue_g1b_it` 19 + 1 ignored, live on PostgreSQL 16;
+    - `ci/check-incompatibilities-doc.sh`.
+
+    `/proto`'s registry, vectors and codecs are untouched; the only `/proto` edit is one prose sentence in `PROTOCOL.md` §14, so no regeneration or PHP run was needed.
 
 ### 22.3 M2 exit record (2026-10-02)
 

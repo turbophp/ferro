@@ -809,6 +809,31 @@ verification, or a defect, does that) is `Indeterminate{WriteUnconfirmed}` for a
 real and cannot be reported, so no known-fate code may claim it did nothing — and `Unsupported` for
 SIZE.]*
 
+*[Amended M7-G2 (SPEC §22.2 (dh)): **the tx-scoped rows are built on PostgreSQL and pinned live**,
+through the same `fate::classify_fate` with `in_tx: true` (`readonly` still SIZE only):*
+
+- *`PoolMismatch` and a tx-scoped RESERVE (`Unsupported`) are refused before anything is sent and leave
+  the transaction usable. An unknown or another session's `tx_id` is `TxNotFound`, and the owner's
+  tombstoned one is `TxDeadline`, as on EXEC.*
+- *A verb sent and then timed out (`timeout_ms`), CANCELled, past the transaction's `max_tx`, or
+  answered `57014` by the backend itself (an application's `SET LOCAL statement_timeout`) rolls the
+  transaction back and tombstones it: `TxDeadline{Retryable}`. A backend link lost under it is
+  `Retryable{ConnectionLost}`. In both cases the transaction is dead, neither the job nor the business
+  write exists, and nothing was re-sent (read back).*
+- *A plain statement error (for example `25006` in a READ ONLY transaction) is its known fate, and
+  the transaction stays registered for the client's ROLLBACK, as for a failed EXEC.*
+- *A lost COMMIT is `Indeterminate{WriteUnconfirmed}`, covering the job and the business write
+  together (both or neither, read back). That COMMIT fires no wake hint.*
+- *An unmatched fence is `LeaseLost`, an absent row included (R1); the transaction stays open.*
+- ***One row this table did not have: an in-transaction WRITE whose statement ran but whose result
+  is unreadable.*** *Autocommit answers `Indeterminate` (above). Inside a transaction the engine
+  instead ROLLS THE TRANSACTION BACK and tombstones it, answering `TxDeadline{Retryable}`. That claim
+  is true (the transaction will never commit), and it is the only answer under which an effect the
+  engine cannot report can never commit. `Indeterminate` with the transaction left open would let a
+  client COMMIT it unseen. An unreadable SIZE is `Unsupported` and leaves the transaction open. Only a
+  table altered after verification, or a defect, reaches this row. **The choice is recorded as open
+  item O-G2 (SPEC §21) for the owner to confirm**, because §24.6 did not decide it.]*
+
 **The new retry licences (D21).** All three are client-policy licences in §9.2's sense, and the
 engine never re-sends. Each is a protocol-defined property of a verb whose statements the engine
 itself composes, or (the dedup key) a caller's declaration; none is inferred from user SQL.
@@ -1237,6 +1262,14 @@ every duplicate and every phantom attempt is attributable to a counted or docume
    `dedup_key`, the licensed re-send yields exactly 1.
 2. **SIGKILL in a transaction holding an ENQUEUE, before COMMIT.** `Retryable`, and neither row
    exists. Killed during COMMIT: `Indeterminate`, and **both or neither**, over many iterations.
+   *[Built M7-G2 (SPEC §22.2 (dh)), `ferrod`'s `queue_g2_it`. The engine-side half: the backend link
+   killed under an in-transaction ENQUEUE answers `Retryable{ConnectionLost}`, neither row exists. The
+   link killed inside the COMMIT (a deferred trigger holds it open) answers `Indeterminate`, both or
+   neither. A REAL `ferrod` process is SIGKILLed before COMMIT (neither row, read back only after the
+   server ended the transaction) and during COMMIT, 12 iterations per run: half provably inside it,
+   half at 0–30 ms after it was sent. Every iteration was both or neither, and both outcomes occurred.
+   The client's own `Retryable`/`Indeterminate` classification of a SIGKILLed engine is the existing
+   §19.3 client rule, re-proven through the queue API at G4.]*
 3. **SIGKILL `ferrod` while a RESERVE is parked, and while one is mid-statement.** Nothing is lost; a
    leased job reappears after `lease_deadline`.
 4. **SIGKILL `ferrod` mid-ACK.** `Indeterminate`; the licensed re-send answers `acked`, `gone` or
@@ -1247,6 +1280,16 @@ every duplicate and every phantom attempt is attributable to a counted or docume
    proves the second holder's row survived. Control: stock deletes it.
 7. **Transactional ack under induced lease loss.** The worker rolls back; business rows per job ≤ 1
    over N iterations, including the absent-row case (R1).
+   *[Built M7-G2 (SPEC §22.2 (dh)), 40 iterations plus a control, each a different shape:*
+   - *the stale and the new holder race concurrently;*
+   - *the stale holder arrives after the new holder committed (the absent row, R1; its autocommit
+     control answers `gone`);*
+   - *the new holder rolls back;*
+   - *REPEATABLE READ with a snapshot older than the re-reservation, which answers `40001`
+     (Retryable).*
+
+   *The stale holder never commits, and no job has more than one business row. The control: a
+   lease that expired with nobody re-reserving is honoured.]*
 8. **Backend connection killed mid-ENQUEUE, mid-RESERVE and mid-ACK.** The engine-side mirror of rows
    1, 3 and 4.
 9. **`ferrod` SIGTERM drain with leases outstanding.** Nothing is released; ACKs succeed on the
@@ -1290,7 +1333,7 @@ one reviewable slice (the HTTP precedent: `/proto` alone was F2). `/proto` is co
 | **G0** *(DONE, §22.2 (cn))* | this section; `QUEUE = 7`, `LeaseLost`, `PoolMismatch` and `queue_wait_grace_ms` allocated in the spec (their `/proto` entries land at G1); §21 D21/D22; the §24.16 amendments | review attacked §24.5–§24.8 before any code |
 | **G1a** *(BUILT M7-G1a, SPEC §22.2 (df); DONE when merged)* | `/proto`: `[services] QUEUE = 7`, `[methods.queue]`, `LeaseLost`/`PoolMismatch` and the new `InvalidHandle` (`0x3011`), `queue_wait_grace_ms`, the `[ack_outcome]` table and three shape bounds; PROTOCOL.md §1 and a new **§14**; golden vectors (every handle position at its `sql` size and at 1 024 bytes) and refusal vectors (0 and 1 025 bytes for every handle position; 0 and max + 1 jobs and queues) in both codecs; **all shapes frozen**; §24.3's G1 prerequisites (the canonical decimal `job_id`, the 8-byte token, both with strict decodes; `InvalidHandle`); store config with every refusal; the version gate and shape verification at first use (PostgreSQL; cached per process, an absent table excepted); `ferrod` routing and a QUEUE handler that makes every pre-checkout refusal and the first-use verification, then answers `Unsupported` for every verb | an undecodable handle is `InvalidHandle` before any statement; a wrong shape names its column; a view is refused and a partitioned table passes; an unqualified table follows `search_path`; the gate and the verdict caching (including the absent-table TTL, counted) are wired; mutation-proven |
 | **G1b** *(BUILT M7-G1b, SPEC §22.2 (dg); DONE when merged)* | ENQUEUE (single/batch) / RESERVE (no wait) / ACK / RELEASE / EXTEND / SIZE / CLEAR autocommit on PG; the widened fence; the clock and rounding rules; the statement builders in `ferro-queue`. *Carried from the G1a review:* shape verification must also require `id` to be UNIQUE (the primary key or a unique index) — a fence `WHERE id = $1 AND …` over duplicate ids would match several rows; and `now + 1 + delay_s` must be pre-checked against PG `integer` before send, since a `delay_s` near `u32::MAX` otherwise overflows `available_at` as a post-send `22003` (refuse it `Unsupported`, nothing sent); SIZE fills `oldest_pending_at` | stale token → `LeaseLost`; late-but-uncontended ACK honoured; RELEASE to the back; **affected ≤ LIMIT under concurrent reservers** (F12a); never-early delays and lease ≥ L, at second boundaries; NUL refused; mutation-proven |
-| **G2** | tx path: `resolve_active` made `pub(crate)`, `PoolMismatch`, `TxCommand::Queue` + `after_commit`, in-tx `LeaseLost` semantics (R1), refused tx-scoped RESERVE | atomicity both ways; mismatch leaves the transaction usable; chaos rows 2 and 7 |
+| **G2** *(BUILT M7-G2, SPEC §22.2 (dh); DONE when merged)* | tx path: `resolve_active` made `pub(crate)`, `PoolMismatch`, `TxCommand::Queue` + `after_commit`, in-tx `LeaseLost` semantics (R1), refused tx-scoped RESERVE | atomicity both ways; mismatch leaves the transaction usable; chaos rows 2 and 7 |
 | **G3** | the waker (per queue, `LIMIT k`, statement deadlines, register-then-sweep), long-poll, the wait bound, **unreserve**, wake hints, coalesced polls, drain; queue metrics and spans | cost bound (row 11); one END under every CANCEL/deadline race and the deliver-xor-unreserve rule (row 12); idle-polling bench vs stock (A's number); R4 reproduced on the real transport |
 | **G4** | native PHP API, `queueWorker()`, wait clamp, client fate and licensed re-sends; dedup table and purge **after** the dedup spike reproduces §24.6's three paths | chaos rows 1, 3–6, 8, 9 and 15 through the client |
 | **G5** | Laravel driver: `FerroQueue` (dedicated reserve session), `FerroJob` (`delete`/`release` rules, the `fail()` override); the `ferro_jobs` migration and the rule for a stock `'table'` key (§24.11); pin what `push()`/`FerroJob::getJobId()` return for an opaque `job_id` (D24); demo engine column; the three-column upstream run on PG | D18 on PostgreSQL; chaos rows 13, 14 and 16; the SIGALRM reentrancy premise |
