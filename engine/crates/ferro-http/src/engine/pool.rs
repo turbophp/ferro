@@ -18,9 +18,16 @@
 //! the connection is discarded: [`HttpConn::discard`] aborts `hyper`'s connection task and AWAITS it,
 //! which drops the I/O — the point after which `sent` may be read (§23.7.1).
 //!
-//! **Not here (slice F6, §23.15):** `MAX_CONNECTIONS` / `MAX_REQUESTS` / `MAX_DIALS` as concurrency
-//! limits and the `MAX_QUEUED` queue. F4a bounds only what the pool RETAINS: at most
-//! `MAX_CONNECTIONS` idle connections per sub-pool; a surplus one is discarded on return.
+//! **Connection limits (slice M6-F6, §23.6 step 5).** Each sub-pool holds at most `MAX_CONNECTIONS`
+//! connections — idle, in use and being dialled together — and runs at most `MAX_DIALS` dials at
+//! once; both are per SUB-POOL, so under `PARTITION=uid` per (upstream, uid), because that key
+//! "partitions *connections*" (§23.8.1; SPEC §22.2 (dk)). A request that finds no usable idle
+//! connection and no room to dial WAITS in [`Pools::take`] until a connection is returned, closed
+//! or a dial ends; the caller bounds that wait (`QUEUE_TIMEOUT_MS`, the deadline, `CANCEL`). When
+//! the sub-pool is full and every idle connection is unusable FOR THIS REQUEST (too idle for a
+//! non-idempotent one), the idlest is closed to make room, so such a request never waits behind
+//! connections it may not use. Every connection counts from the moment its dial is reserved
+//! ([`DialSlot`]) to the moment it is dropped ([`ConnSlot`]), so the count cannot leak.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -30,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use hyper::client::conn::http1;
 use rustls::AlertDescription;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::body::OneChunk;
@@ -53,6 +61,8 @@ pub struct HttpConn {
     pub idle_limit: Duration,
     /// Counts this connection in the engine's live-connection gauge for exactly its life.
     pub live: LiveConn,
+    /// Counts this connection against its sub-pool's `MAX_CONNECTIONS` for exactly its life (F6).
+    pub slot: ConnSlot,
 }
 
 impl HttpConn {
@@ -98,6 +108,57 @@ impl Drop for LiveConn {
     }
 }
 
+/// A sub-pool's connection counts, shared by its connections so a drop anywhere frees the slot.
+#[derive(Debug, Default)]
+pub struct SubShared {
+    /// Connections that exist (idle, in use, being torn down) or are being dialled.
+    live: AtomicUsize,
+    /// Dials in progress.
+    dialing: AtomicUsize,
+    /// Woken whenever a slot frees or a connection is returned.
+    changed: Notify,
+}
+
+/// A connection's place under `MAX_CONNECTIONS`; dropped with the connection.
+#[derive(Debug)]
+pub struct ConnSlot(Arc<SubShared>);
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+        self.0.changed.notify_waiters();
+    }
+}
+
+/// A dial in progress under `MAX_DIALS`: counted until the dial ends.
+#[derive(Debug)]
+struct Dialing(Arc<SubShared>);
+
+impl Drop for Dialing {
+    fn drop(&mut self) {
+        self.0.dialing.fetch_sub(1, Ordering::SeqCst);
+        self.0.changed.notify_waiters();
+    }
+}
+
+/// A reserved dial: one place under `MAX_CONNECTIONS` and one under `MAX_DIALS`. A dial that fails,
+/// or is dropped (a `CANCEL`, the deadline), frees both; one that succeeds keeps the connection's
+/// place ([`DialSlot::connected`]) and frees the dial's.
+#[derive(Debug)]
+pub struct DialSlot {
+    conn: Option<ConnSlot>,
+    _dialing: Dialing,
+}
+
+impl DialSlot {
+    /// The dial succeeded: the connection keeps its slot, and the dial slot is freed.
+    pub fn connected(mut self) -> ConnSlot {
+        self.conn
+            .take()
+            .expect("a DialSlot holds its ConnSlot until connected")
+    }
+}
+
 /// The sub-pool key: the upstream, and the peer uid under `PARTITION=uid`.
 pub type PoolKey = (String, Option<u32>);
 
@@ -109,77 +170,172 @@ pub struct ReusePolicy {
     pub unsafe_reuse_max_idle: Duration,
 }
 
-/// Every sub-pool's idle stack.
+/// A sub-pool's connection limits (§23.3.1: `MAX_CONNECTIONS`, `MAX_DIALS`).
+#[derive(Clone, Copy, Debug)]
+pub struct Caps {
+    pub max_connections: usize,
+    pub max_dials: usize,
+}
+
+/// What [`Pools::take`] hands a request.
+#[derive(Debug)]
+pub enum Take {
+    /// A usable idle connection (reuse).
+    Idle(HttpConn),
+    /// Room to dial a new one.
+    Dial(DialSlot),
+}
+
+impl std::fmt::Debug for HttpConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpConn")
+            .field("peer", &self.peer)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Default)]
+struct Sub {
+    idle: Vec<HttpConn>,
+    shared: Arc<SubShared>,
+}
+
+/// Every sub-pool's idle stack and counts.
 #[derive(Default)]
 pub struct Pools {
-    idle: Mutex<HashMap<PoolKey, Vec<HttpConn>>>,
+    subs: Mutex<HashMap<PoolKey, Sub>>,
+}
+
+/// One decision under the lock.
+enum Step {
+    Got(Take),
+    /// Something was closed to make room: decide again.
+    Again,
+    /// Nothing usable and no room: wait for a change.
+    Wait,
 }
 
 impl Pools {
-    /// Take the most recently returned usable connection, discarding every stale one found on the
-    /// way. `None`: dial fresh.
-    pub fn checkout(&self, key: &PoolKey, policy: ReusePolicy) -> Option<HttpConn> {
-        let mut stale = Vec::new();
-        let picked = {
-            let mut map = self.idle.lock().unwrap_or_else(|p| p.into_inner());
-            let stack = map.get_mut(key)?;
-            let now = Instant::now();
-            let mut picked = None;
-            while let Some(c) = stack.pop() {
-                let idle = now.saturating_duration_since(c.idle_since);
-                let unusable = c.sender.is_closed()
-                    || c.task.is_finished()
-                    || now.saturating_duration_since(c.created) >= policy.max_lifetime
-                    || idle >= c.idle_limit;
-                if unusable {
-                    stale.push(c);
-                    continue;
-                }
-                if !policy.idempotent && idle > policy.unsafe_reuse_max_idle {
-                    // §23.8.2: too idle for a non-idempotent request. Left for idempotent ones; the
-                    // ones below it are idler still (LIFO), so dial fresh.
-                    stack.push(c);
-                    break;
-                }
-                picked = Some(c);
+    fn shared(&self, key: &PoolKey) -> Arc<SubShared> {
+        let mut map = self.subs.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(&map.entry(key.clone()).or_default().shared)
+    }
+
+    /// The most recently returned usable connection, or room to dial one — waiting for either if
+    /// the sub-pool is at `MAX_CONNECTIONS` or `MAX_DIALS`. Stale connections found on the way are
+    /// closed. The caller bounds the wait; dropping the future abandons it with nothing reserved.
+    pub async fn take(&self, key: &PoolKey, policy: ReusePolicy, caps: Caps) -> Take {
+        let shared = self.shared(key);
+        loop {
+            // Registered BEFORE the decision, so a slot freed after it wakes this request.
+            let changed = shared.changed.notified();
+            let mut closed = Vec::new();
+            let step = {
+                let mut map = self.subs.lock().unwrap_or_else(|p| p.into_inner());
+                let sub = map.entry(key.clone()).or_default();
+                Self::decide(sub, policy, caps, &mut closed)
+            };
+            drop(closed); // each drop aborts its connection task and frees its slot
+            match step {
+                Step::Got(t) => return t,
+                Step::Again => {}
+                Step::Wait => changed.await,
+            }
+        }
+    }
+
+    fn decide(sub: &mut Sub, policy: ReusePolicy, caps: Caps, closed: &mut Vec<HttpConn>) -> Step {
+        let now = Instant::now();
+        while let Some(c) = sub.idle.pop() {
+            let idle = now.saturating_duration_since(c.idle_since);
+            let unusable = c.sender.is_closed()
+                || c.task.is_finished()
+                || now.saturating_duration_since(c.created) >= policy.max_lifetime
+                || idle >= c.idle_limit;
+            if unusable {
+                closed.push(c);
+                continue;
+            }
+            if !policy.idempotent && idle > policy.unsafe_reuse_max_idle {
+                // §23.8.2: too idle for a non-idempotent request. Left for idempotent ones; the
+                // ones below it are idler still (LIFO), so dial fresh.
+                sub.idle.push(c);
                 break;
             }
-            picked
-        };
-        drop(stale); // each drop aborts its connection task
-        picked
+            return Step::Got(Take::Idle(c));
+        }
+        if !closed.is_empty() {
+            // Their slots free only once they are dropped, outside the lock.
+            return Step::Again;
+        }
+        let s = &sub.shared;
+        if s.live.load(Ordering::SeqCst) < caps.max_connections
+            && s.dialing.load(Ordering::SeqCst) < caps.max_dials
+        {
+            // Every increment happens under the pool lock, so the limits are never over-committed.
+            s.live.fetch_add(1, Ordering::SeqCst);
+            s.dialing.fetch_add(1, Ordering::SeqCst);
+            return Step::Got(Take::Dial(DialSlot {
+                conn: Some(ConnSlot(Arc::clone(s))),
+                _dialing: Dialing(Arc::clone(s)),
+            }));
+        }
+        if s.live.load(Ordering::SeqCst) >= caps.max_connections && !sub.idle.is_empty() {
+            // Full, and every idle connection is unusable for THIS request: close the idlest
+            // (the bottom of the LIFO stack) to make room.
+            closed.push(sub.idle.remove(0));
+            return Step::Again;
+        }
+        Step::Wait
     }
 
     /// Return a connection after a completed exchange. `max_idle` bounds what the sub-pool retains
     /// (`MAX_CONNECTIONS`); a surplus connection is discarded.
     pub fn checkin(&self, key: PoolKey, mut conn: HttpConn, max_idle: usize) {
         conn.idle_since = Instant::now();
-        let mut map = self.idle.lock().unwrap_or_else(|p| p.into_inner());
-        let stack = map.entry(key).or_default();
-        if stack.len() >= max_idle {
-            drop(conn); // aborts its connection task
-            return;
-        }
-        stack.push(conn);
+        self.put_back(key, conn, max_idle);
     }
 
     /// Return a connection that was checked out but never used (a `CANCEL` or deadline caught
     /// before dispatch). Unlike [`Pools::checkin`] it keeps `idle_since`, so the reuse rules —
     /// above all `H1_UNSAFE_REUSE_MAX_IDLE_MS` — keep seeing how long it has really been idle.
     pub fn return_unused(&self, key: PoolKey, conn: HttpConn, max_idle: usize) {
-        let mut map = self.idle.lock().unwrap_or_else(|p| p.into_inner());
-        let stack = map.entry(key).or_default();
-        if stack.len() >= max_idle {
-            drop(conn); // aborts its connection task
-            return;
-        }
-        stack.push(conn);
+        self.put_back(key, conn, max_idle);
+    }
+
+    fn put_back(&self, key: PoolKey, conn: HttpConn, max_idle: usize) {
+        let surplus = {
+            let mut map = self.subs.lock().unwrap_or_else(|p| p.into_inner());
+            let sub = map.entry(key).or_default();
+            if sub.idle.len() >= max_idle {
+                Some(conn)
+            } else {
+                sub.idle.push(conn);
+                sub.shared.changed.notify_waiters();
+                None
+            }
+        };
+        drop(surplus); // aborts its connection task and frees its slot
     }
 
     /// Idle connections currently held for `key` (diagnostics and tests).
     pub fn idle_count(&self, key: &PoolKey) -> usize {
-        let map = self.idle.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(key).map_or(0, Vec::len)
+        let map = self.subs.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(key).map_or(0, |s| s.idle.len())
+    }
+
+    /// Connections counted against `key`'s `MAX_CONNECTIONS` (idle, in use, dialling).
+    pub fn connection_count(&self, key: &PoolKey) -> usize {
+        let map = self.subs.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(key)
+            .map_or(0, |s| s.shared.live.load(Ordering::SeqCst))
+    }
+
+    /// Dials in progress for `key` (against `MAX_DIALS`).
+    pub fn dial_count(&self, key: &PoolKey) -> usize {
+        let map = self.subs.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(key)
+            .map_or(0, |s| s.shared.dialing.load(Ordering::SeqCst))
     }
 }
 
@@ -208,9 +364,18 @@ mod tests {
     use crate::engine::track::Tracker;
     use hyper_util::rt::TokioIo;
 
-    /// A live `HttpConn` over an in-memory pipe whose far end is kept open (returned), idle for
-    /// `idle_ago` already.
-    async fn conn(idle_ago: Duration) -> (HttpConn, tokio::io::DuplexStream) {
+    const CAPS: Caps = Caps {
+        max_connections: 8,
+        max_dials: 8,
+    };
+
+    /// A live `HttpConn` in `key`'s sub-pool (counted against its `MAX_CONNECTIONS`) over an
+    /// in-memory pipe whose far end is kept open (returned), idle for `idle_ago` already.
+    async fn conn_in(
+        pools: &Pools,
+        key: &PoolKey,
+        idle_ago: Duration,
+    ) -> (HttpConn, tokio::io::DuplexStream) {
         let (a, b) = tokio::io::duplex(4096);
         let (tracked, track) = Tracker::new(a);
         let (sender, c) = http1::handshake::<_, OneChunk>(TokioIo::new(tracked))
@@ -220,6 +385,8 @@ mod tests {
             let _ = c.await;
             None
         });
+        let shared = pools.shared(key);
+        shared.live.fetch_add(1, Ordering::SeqCst);
         let now = Instant::now();
         let conn = HttpConn {
             sender,
@@ -230,6 +397,7 @@ mod tests {
             idle_since: now.checked_sub(idle_ago).unwrap(),
             idle_limit: Duration::from_secs(60),
             live: LiveConn::new(&Arc::new(AtomicUsize::new(0))),
+            slot: ConnSlot(shared),
         };
         (conn, b)
     }
@@ -242,27 +410,170 @@ mod tests {
         }
     }
 
+    fn key() -> PoolKey {
+        ("u".into(), None)
+    }
+
+    /// Still waiting after a generous grace: a wait that never ends under correct code.
+    async fn pending<F: std::future::Future>(f: F) -> bool {
+        tokio::time::timeout(Duration::from_millis(100), f)
+            .await
+            .is_err()
+    }
+
     /// Review minor of M6-F4a: a connection handed back UNUSED (a `CANCEL` or deadline caught
     /// before dispatch) keeps its true idleness, so `H1_UNSAFE_REUSE_MAX_IDLE_MS` still refuses it
     /// to a non-idempotent request; a connection returned after an exchange is fresh again.
     #[tokio::test]
     async fn an_unused_return_keeps_idle_since_and_a_checkin_resets_it() {
-        let key: PoolKey = ("u".into(), None);
+        let key = key();
         let pools = Pools::default();
-        let (c, _far) = conn(Duration::from_secs(5)).await;
+        let (c, _far) = conn_in(&pools, &key, Duration::from_secs(5)).await;
         pools.return_unused(key.clone(), c, 8);
         assert!(
-            pools.checkout(&key, policy(false)).is_none(),
+            matches!(pools.take(&key, policy(false), CAPS).await, Take::Dial(_)),
             "5 s idle is past the 2 s unsafe-reuse bound"
         );
-        assert!(pools.checkout(&key, policy(true)).is_some());
+        assert!(matches!(
+            pools.take(&key, policy(true), CAPS).await,
+            Take::Idle(_)
+        ));
 
-        let (c, _far2) = conn(Duration::from_secs(5)).await;
+        let (c, _far2) = conn_in(&pools, &key, Duration::from_secs(5)).await;
         pools.checkin(key.clone(), c, 8);
         assert!(
-            pools.checkout(&key, policy(false)).is_some(),
+            matches!(pools.take(&key, policy(false), CAPS).await, Take::Idle(_)),
             "checkin resets idleness"
         );
+    }
+
+    /// `MAX_CONNECTIONS` counts every connection from its dial's reservation to its drop: at the
+    /// limit a request waits, and a dropped (or failed) one frees the slot.
+    #[tokio::test]
+    async fn max_connections_bounds_live_connections_and_a_drop_frees_the_slot() {
+        let pools = Pools::default();
+        let key = key();
+        let caps = Caps {
+            max_connections: 2,
+            max_dials: 8,
+        };
+        let Take::Dial(d1) = pools.take(&key, policy(true), caps).await else {
+            panic!("dial")
+        };
+        let (c2, _far) = conn_in(&pools, &key, Duration::ZERO).await;
+        assert_eq!(pools.connection_count(&key), 2);
+        assert!(pending(pools.take(&key, policy(true), caps)).await);
+        drop(d1); // a failed dial frees its slot
+        assert_eq!(pools.connection_count(&key), 1);
+        let Take::Dial(d3) = pools.take(&key, policy(true), caps).await else {
+            panic!("dial")
+        };
+        let s3 = d3.connected();
+        assert_eq!(pools.connection_count(&key), 2, "a connected dial keeps its slot");
+        let waiter = pools.take(&key, policy(true), caps);
+        tokio::pin!(waiter);
+        assert!(pending(&mut waiter).await);
+        drop(c2); // a connection dropped anywhere frees its slot and wakes the waiter
+        assert!(matches!(waiter.await, Take::Dial(_)));
+        drop(s3);
+    }
+
+    /// `MAX_DIALS` bounds dials in progress, not connections.
+    #[tokio::test]
+    async fn max_dials_bounds_dials_in_progress() {
+        let pools = Pools::default();
+        let key = key();
+        let caps = Caps {
+            max_connections: 8,
+            max_dials: 1,
+        };
+        let Take::Dial(d1) = pools.take(&key, policy(true), caps).await else {
+            panic!("dial")
+        };
+        assert_eq!(pools.dial_count(&key), 1);
+        let waiter = pools.take(&key, policy(true), caps);
+        tokio::pin!(waiter);
+        assert!(pending(&mut waiter).await);
+        let s1 = d1.connected();
+        assert_eq!(pools.dial_count(&key), 0);
+        let Take::Dial(d2) = waiter.await else {
+            panic!("dial")
+        };
+        assert_eq!(pools.connection_count(&key), 2);
+        drop((s1, d2));
+    }
+
+    /// A connection returned to a full sub-pool wakes a waiter, which reuses it.
+    #[tokio::test]
+    async fn a_returned_connection_wakes_a_waiter() {
+        let pools = Pools::default();
+        let key = key();
+        let caps = Caps {
+            max_connections: 1,
+            max_dials: 1,
+        };
+        let (c, _far) = conn_in(&pools, &key, Duration::ZERO).await;
+        let waiter = pools.take(&key, policy(true), caps);
+        tokio::pin!(waiter);
+        assert!(pending(&mut waiter).await);
+        pools.checkin(key.clone(), c, 1);
+        assert!(matches!(waiter.await, Take::Idle(_)));
+    }
+
+    /// Full, with only connections too idle for a non-idempotent request: the idlest is closed to
+    /// make room, so such a request never waits behind connections it may not use.
+    #[tokio::test]
+    async fn a_full_pool_of_unusable_idle_connections_makes_room() {
+        let pools = Pools::default();
+        let key = key();
+        let caps = Caps {
+            max_connections: 2,
+            max_dials: 2,
+        };
+        let (old, mut far_old) = conn_in(&pools, &key, Duration::from_secs(9)).await;
+        let (newer, _far_new) = conn_in(&pools, &key, Duration::from_secs(5)).await;
+        pools.return_unused(key.clone(), old, 2);
+        pools.return_unused(key.clone(), newer, 2);
+        let Take::Dial(d) = pools.take(&key, policy(false), caps).await else {
+            panic!("room is made to dial")
+        };
+        assert_eq!(pools.connection_count(&key), 2);
+        assert_eq!(pools.idle_count(&key), 1, "one idle connection was closed");
+        // The idlest one (the bottom of the stack) went: its far end sees EOF.
+        let mut b = [0u8; 1];
+        let n = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut far_old, &mut b),
+        )
+        .await
+        .expect("closed")
+        .unwrap();
+        assert_eq!(n, 0);
+        // An idempotent request still reuses the one left.
+        drop(d);
+        assert!(matches!(
+            pools.take(&key, policy(true), caps).await,
+            Take::Idle(_)
+        ));
+    }
+
+    /// Stale connections found on the way are closed, and their slots reused.
+    #[tokio::test]
+    async fn stale_connections_free_their_slots() {
+        let pools = Pools::default();
+        let key = key();
+        let caps = Caps {
+            max_connections: 1,
+            max_dials: 1,
+        };
+        let (c, _far) = conn_in(&pools, &key, Duration::ZERO).await;
+        let p = ReusePolicy {
+            max_lifetime: Duration::ZERO, // every connection is past its lifetime
+            ..policy(true)
+        };
+        pools.checkin(key.clone(), c, 1);
+        assert!(matches!(pools.take(&key, p, caps).await, Take::Dial(_)));
+        assert_eq!(pools.idle_count(&key), 0);
     }
 
     #[test]

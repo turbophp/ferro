@@ -63,6 +63,7 @@ pub mod budget;
 pub mod decode;
 pub mod dial;
 pub mod head;
+pub mod limits;
 pub mod pool;
 pub mod tls;
 pub mod track;
@@ -96,7 +97,8 @@ pub use tls::{OsRoots, TlsCause, TlsSetupError};
 use body::OneChunk;
 use budget::Budgets;
 use dial::{DialFailure, DnsCache};
-use pool::{HttpConn, LiveConn, PoolKey, Pools, ReusePolicy};
+use limits::{BreakerRefusal, BreakerState, Limits, RateDecision};
+use pool::{Caps, DialSlot, HttpConn, LiveConn, PoolKey, Pools, ReusePolicy, Take};
 use tls::TlsContexts;
 use track::{CipherTap, Tracker};
 
@@ -245,6 +247,7 @@ pub struct HttpEngine {
     dns: DnsCache,
     pools: Pools,
     budgets: Budgets,
+    limits: Limits,
     in_flight: InFlight,
     live: Arc<AtomicUsize>,
     tls: TlsContexts,
@@ -311,6 +314,7 @@ impl HttpEngine {
         read_file: &dyn Fn(&std::path::Path) -> std::io::Result<Vec<u8>>,
     ) -> Self {
         let budgets = Budgets::new(&config);
+        let limits = Limits::new(&config);
         let tls = TlsContexts::build(&config, os_roots, read_file);
         for e in tls.errors() {
             tracing::error!(error = %e, "http: TLS configuration refused");
@@ -322,6 +326,7 @@ impl HttpEngine {
             dns: DnsCache::default(),
             pools: Pools::default(),
             budgets,
+            limits,
             in_flight: InFlight(watch::Sender::new(0)),
             live: Arc::new(AtomicUsize::new(0)),
             tls,
@@ -381,6 +386,36 @@ impl HttpEngine {
     /// Body bytes currently charged to the daemon-wide budget.
     pub fn body_budget_daemon_in_use(&self) -> u64 {
         self.budgets.daemon_in_use()
+    }
+
+    /// `upstream`'s breaker state now (§23.8.6; the `ferro_http_breaker_state` gauge is F7's).
+    /// `None`: not an enabled upstream.
+    pub fn breaker_state(&self, upstream: &str) -> Option<BreakerState> {
+        self.limits
+            .get(upstream)
+            .map(|l| l.breaker.state(tokio::time::Instant::now()))
+    }
+
+    /// Requests waiting in `upstream`'s queue for a `MAX_REQUESTS` slot (§23.6 step 4 (e); the
+    /// `ferro_http_waiting` gauge is F7's).
+    pub fn queue_waiting(&self, upstream: &str) -> usize {
+        self.limits.get(upstream).map_or(0, |l| l.gate.waiting())
+    }
+
+    /// Requests holding one of `upstream`'s `MAX_REQUESTS` slots.
+    pub fn requests_in_flight(&self, upstream: &str) -> usize {
+        self.limits.get(upstream).map_or(0, |l| l.gate.in_flight())
+    }
+
+    /// Connections counted against `upstream`'s `MAX_CONNECTIONS` (no partition): idle, in use and
+    /// being dialled.
+    pub fn connections(&self, upstream: &str) -> usize {
+        self.pools.connection_count(&(upstream.to_string(), None))
+    }
+
+    /// Dials in progress for `upstream` (no partition), against `MAX_DIALS`.
+    pub fn dials_in_progress(&self, upstream: &str) -> usize {
+        self.pools.dial_count(&(upstream.to_string(), None))
     }
 
     /// Requests currently inside [`HttpEngine::serve_request`].
@@ -541,10 +576,66 @@ impl HttpEngine {
             },
         );
 
-        // ---- admission (§23.6 step 4; F4b: (a) and (d)) -------------------------------------------
+        // ---- admission (§23.6 step 4, in its order; F4b: (a) and (d); F6: (b), (c) and (e)) ------
+        // Every refusal here is before anything is sent: Retryable, with its cause token.
         // (a) The drain: a request that arrives while the daemon drains is refused, unsent.
         if drain.is_draining() {
             return classify(Situation::BeforeDispatch(BeforeDispatch::Draining), idem);
+        }
+        // Every enabled upstream has its admission state; a missing one would be an engine defect,
+        // made the safe refusal (nothing is sent).
+        let Some(lim) = self.limits.get(&up.name) else {
+            return policy(PolicyCause::Upstream, None);
+        };
+        // (b) The breaker, then the Retry-After hold. The breaker's ticket is held to the terminal:
+        // it carries this request's outcome back (§23.8.6), and as an RAII guard it releases a
+        // half-open probe slot on every path that does not settle it — a refusal below, a
+        // `CANCEL`, the session dying, a panic.
+        let ticket = match lim.breaker.admit(tokio::time::Instant::now()) {
+            Ok(t) => t,
+            Err(BreakerRefusal::Open { retry_after_ms }) => {
+                return classify(
+                    Situation::BeforeDispatch(BeforeDispatch::BreakerOpen { retry_after_ms }),
+                    idem,
+                );
+            }
+            Err(BreakerRefusal::ProbeBusy) => {
+                return classify(Situation::BeforeDispatch(BeforeDispatch::BreakerProbeBusy), idem);
+            }
+        };
+        // Every terminal from here on settles the ticket with what it means to the breaker.
+        let fin = |s: Situation| {
+            ticket.record_failure(&s);
+            classify(s, idem)
+        };
+        if let Some(hold) = &lim.hold
+            && let Err(retry_after_ms) = hold.admit(tokio::time::Instant::now())
+        {
+            return fin(Situation::BeforeDispatch(
+                BeforeDispatch::RetryAfterHold { retry_after_ms },
+            ));
+        }
+        // (c) The rate limit: a token now, or within min(RATE_MAX_WAIT_MS, the time left).
+        if let Some(rate) = &lim.rate {
+            let now = tokio::time::Instant::now();
+            match rate.take(now, bounds.deadline.saturating_duration_since(now)) {
+                RateDecision::Admit => {}
+                RateDecision::Refuse { retry_after_ms } => {
+                    return fin(Situation::BeforeDispatch(BeforeDispatch::RateLimited {
+                        retry_after_ms,
+                    }));
+                }
+                RateDecision::Wait(w) => {
+                    tokio::select! {
+                        biased;
+                        // Dropped unkept: the token is given back.
+                        () = stop.token.cancelled() => {
+                            return fin(Situation::BeforeDispatch(before_dispatch_stop(stop)));
+                        }
+                        () = tokio::time::sleep(w.wait) => w.keep(),
+                    }
+                }
+            }
         }
         // (d) The body budget: charged now, released when the body is fully written or at this
         // request's terminal, whichever is first (`budget`'s module docs).
@@ -553,7 +644,7 @@ impl HttpEngine {
         let charge = match self.budgets.charge(&up.name, body_len) {
             Ok(c) => c,
             Err(()) => {
-                return classify(Situation::BeforeDispatch(BeforeDispatch::BodyBudget), idem);
+                return fin(Situation::BeforeDispatch(BeforeDispatch::BodyBudget));
             }
         };
         let body = match (body, &charge) {
@@ -564,21 +655,64 @@ impl HttpEngine {
         let hreq = http::Request::from_parts(parts, body);
         // This holder drops when `run` returns: the "at its terminal" half of the release rule.
         let _charge = charge;
+        // (e) The queue: a `MAX_REQUESTS` slot, held to the terminal, waiting (at most `MAX_QUEUED`
+        // of us) for at most `QUEUE_TIMEOUT_MS` — or the request's own deadline when that is
+        // nearer. The same bound covers waiting for a connection in step 5 (SPEC §22.2 (dk)).
         let admitted = Instant::now();
-
-        // ---- before dispatch: acquire a connection ------------------------------------------------
-        let acquire = self.acquire(&key, up, idem, bounds.connect);
-        let (mut conn, reused, connect_us, tls_us) = tokio::select! {
+        let queue_deadline =
+            tokio::time::Instant::from_std(admitted) + ms(up.limits.queue_timeout_ms);
+        let (wait_until, on_expiry) = if bounds.deadline <= queue_deadline {
+            (bounds.deadline, BeforeDispatch::Deadline)
+        } else {
+            (queue_deadline, BeforeDispatch::QueueTimeout)
+        };
+        let _slot = tokio::select! {
             biased;
             () = stop.token.cancelled() => {
-                return classify(Situation::BeforeDispatch(before_dispatch_stop(stop)), idem)
+                return fin(Situation::BeforeDispatch(before_dispatch_stop(stop)));
             }
-            () = tokio::time::sleep_until(bounds.deadline) => {
-                return classify(Situation::BeforeDispatch(BeforeDispatch::Deadline), idem)
+            r = lim.gate.acquire(wait_until, on_expiry) => match r {
+                Ok(p) => p,
+                Err(event) => return fin(Situation::BeforeDispatch(event)),
+            },
+        };
+
+        // ---- before dispatch: acquire a connection (step 5) --------------------------------------
+        // Reuse an idle connection, or wait for room under `MAX_CONNECTIONS`/`MAX_DIALS`, within
+        // the queue's bound; then dial within the connect bound and the deadline.
+        let reuse = ReusePolicy {
+            max_lifetime: ms(up.limits.max_lifetime_ms),
+            idempotent: idem,
+            unsafe_reuse_max_idle: ms(up.limits.h1_unsafe_reuse_max_idle_ms),
+        };
+        let caps = Caps {
+            max_connections: usize::try_from(up.limits.max_connections).unwrap_or(usize::MAX),
+            max_dials: usize::try_from(up.limits.max_dials).unwrap_or(usize::MAX),
+        };
+        let taken = tokio::select! {
+            biased;
+            () = stop.token.cancelled() => {
+                return fin(Situation::BeforeDispatch(before_dispatch_stop(stop)));
             }
-            r = acquire => match r {
-                Ok(c) => c,
-                Err(f) => return classify(Situation::BeforeDispatch(dial_situation(f)), idem),
+            t = self.pools.take(&key, reuse, caps) => t,
+            () = tokio::time::sleep_until(wait_until) => {
+                return fin(Situation::BeforeDispatch(on_expiry));
+            }
+        };
+        let (mut conn, reused, connect_us, tls_us) = match taken {
+            Take::Idle(c) => (c, true, 0, 0),
+            Take::Dial(slot) => tokio::select! {
+                biased;
+                () = stop.token.cancelled() => {
+                    return fin(Situation::BeforeDispatch(before_dispatch_stop(stop)));
+                }
+                () = tokio::time::sleep_until(bounds.deadline) => {
+                    return fin(Situation::BeforeDispatch(BeforeDispatch::Deadline));
+                }
+                r = self.dial(slot, &key, up, bounds.connect) => match r {
+                    Ok(c) => c,
+                    Err(f) => return fin(Situation::BeforeDispatch(dial_situation(f))),
+                },
             },
         };
 
@@ -599,7 +733,7 @@ impl HttpEngine {
                 conn,
                 usize::try_from(up.limits.max_connections).unwrap_or(usize::MAX),
             );
-            return classify(Situation::BeforeDispatch(event), idem);
+            return fin(Situation::BeforeDispatch(event));
         }
         let dispatched = Instant::now();
         let queue_us = micros(dispatched.saturating_duration_since(admitted))
@@ -630,7 +764,7 @@ impl HttpEngine {
                 if !track.sent() {
                     return name_client_auth_refusal(
                         &self.refusal_warnings,
-                        classify(Situation::DispatchedNotSent(head::not_sent(&track)), idem),
+                        fin(Situation::DispatchedNotSent(head::not_sent(&track))),
                         refusal,
                         &up.name,
                     );
@@ -645,10 +779,7 @@ impl HttpEngine {
                 }
                 return name_client_auth_refusal(
                     &self.refusal_warnings,
-                    classify(
-                        Situation::SentNoHead(head::sent_no_head(&err, &track)),
-                        idem,
-                    ),
+                    fin(Situation::SentNoHead(head::sent_no_head(&err, &track))),
                     refusal,
                     &up.name,
                 );
@@ -658,8 +789,7 @@ impl HttpEngine {
                 let drained = stopped && stop.drained();
                 let track = conn.track.clone();
                 conn.discard().await;
-                return classify(
-                    match (track.sent(), stopped, drained) {
+                return fin(match (track.sent(), stopped, drained) {
                         (false, true, true) => {
                             Situation::DispatchedNotSent(DispatchedNotSent::Drain)
                         }
@@ -672,9 +802,7 @@ impl HttpEngine {
                         (true, true, true) => Situation::SentNoHead(SentNoHead::Drain),
                         (true, true, false) => Situation::SentNoHead(SentNoHead::Cancel),
                         (true, false, _) => Situation::SentNoHead(SentNoHead::Timeout),
-                    },
-                    idem,
-                );
+                    });
             }
         };
         let ttfb_us = micros(dispatched.elapsed());
@@ -692,34 +820,45 @@ impl HttpEngine {
         if !conn.track.sent() {
             let track = conn.track.clone();
             conn.discard().await;
-            return classify(
-                if track.sent() {
+            return fin(if track.sent() {
                     Situation::SentNoHead(SentNoHead::MalformedHead)
                 } else {
                     Situation::DispatchedNotSent(DispatchedNotSent::UnsentClosed)
-                },
-                idem,
-            );
+                });
         }
         let (parts, mut body) = resp.into_parts();
         if parts.status == http::StatusCode::SWITCHING_PROTOCOLS {
             // `hyper` returns a 101 as an ordinary head (P14); §23.5.2 calls it malformed.
             conn.discard().await;
-            return classify(Situation::SentNoHead(SentNoHead::Informational101), idem);
+            return fin(Situation::SentNoHead(SentNoHead::Informational101));
         }
         let reason = head::reason_phrase(&parts.extensions, parts.status);
         if head::head_size(&reason, &parts.headers) > MAX_HEAD_BYTES {
             conn.discard().await;
-            return classify(Situation::SentNoHead(SentNoHead::OversizeHead), idem);
+            return fin(Situation::SentNoHead(SentNoHead::OversizeHead));
+        }
+        // A final head: the upstream answered (§23.6 step 7). The breaker learns it now — a probe
+        // closes it whatever happens to the body (§23.8.6) — and a 429/503 may hold the upstream
+        // (§23.8.7, `HONOR_RETRY_AFTER=1`).
+        ticket.record_head(parts.status.as_u16());
+        if let Some(hold) = &lim.hold
+            && let Some(d) = hold.observe(
+                parts.status.as_u16(),
+                parts
+                    .headers
+                    .get_all(http::header::RETRY_AFTER)
+                    .iter()
+                    .map(http::HeaderValue::as_bytes),
+                tokio::time::Instant::now(),
+            )
+        {
+            tracing::debug!(upstream = %up.name, hold_ms = d.as_millis(), "http: Retry-After hold");
         }
         let max_response = up.limits.max_response_bytes;
         let over_max = |read: u64| max_response.is_some_and(|m| read > m);
         if over_max(conn.track.read()) {
             conn.discard().await;
-            return classify(
-                Situation::HeadReceived(HeadReceived::MaxResponseBytes),
-                idem,
-            );
+            return fin(Situation::HeadReceived(HeadReceived::MaxResponseBytes));
         }
         let keep_alive = parts
             .headers
@@ -762,7 +901,7 @@ impl HttpEngine {
         {
             let event = sink_failure(e, stop);
             conn.discard().await;
-            return classify(Situation::HeadReceived(event), idem);
+            return fin(Situation::HeadReceived(event));
         }
 
         // ---- body ---------------------------------------------------------------------------------
@@ -788,29 +927,26 @@ impl HttpEngine {
             let frame = match polled {
                 Err(e) => {
                     conn.discard().await;
-                    return classify(Situation::HeadReceived(e), idem);
+                    return fin(Situation::HeadReceived(e));
                 }
                 Ok(None) => {
                     // The body's end: a decoded stream must end cleanly too.
                     if decoder.as_ref().is_some_and(|d| d.finish().is_err()) {
                         conn.discard().await;
-                        return classify(Situation::HeadReceived(HeadReceived::Decode), idem);
+                        return fin(Situation::HeadReceived(HeadReceived::Decode));
                     }
                     break;
                 }
                 Ok(Some(Err(e))) => {
                     let cause = head::after_head(&e);
                     conn.discard().await;
-                    return classify(Situation::HeadReceived(cause), idem);
+                    return fin(Situation::HeadReceived(cause));
                 }
                 Ok(Some(Ok(frame))) => frame,
             };
             if over_max(conn.track.read()) {
                 conn.discard().await;
-                return classify(
-                    Situation::HeadReceived(HeadReceived::MaxResponseBytes),
-                    idem,
-                );
+                return fin(Situation::HeadReceived(HeadReceived::MaxResponseBytes));
             }
             match frame.into_data() {
                 Ok(data) => {
@@ -823,7 +959,7 @@ impl HttpEngine {
                     };
                     if let Err(event) = sent {
                         conn.discard().await;
-                        return classify(Situation::HeadReceived(event), idem);
+                        return fin(Situation::HeadReceived(event));
                     }
                 }
                 Err(frame) => {
@@ -864,24 +1000,17 @@ impl HttpEngine {
         Terminal::Done(HttpDone { trailers, stats })
     }
 
-    /// Reuse (§23.8.2) or dial (§23.8.5), then — on `https` — the TLS handshake (§23.8.8), all
-    /// within the one connect bound (§23.8.4: DNS + TCP + TLS). Returns the connection, whether it
-    /// was reused, its `connect_us` (DNS + TCP) and its `tls_us` (the handshake).
-    async fn acquire(
+    /// Dial (§23.8.5) into a reserved slot, then — on `https` — the TLS handshake (§23.8.8), all
+    /// within the one connect bound (§23.8.4: DNS + TCP + TLS). Returns the connection, `false`
+    /// (not reused), its `connect_us` (DNS + TCP) and its `tls_us` (the handshake). The slot is
+    /// freed if the dial fails or is dropped, and becomes the connection's if it succeeds.
+    async fn dial(
         &self,
+        slot: DialSlot,
         key: &PoolKey,
         up: &Upstream,
-        idempotent: bool,
         connect: Duration,
     ) -> Result<(HttpConn, bool, u64, u64), DialFailure> {
-        let policy = ReusePolicy {
-            max_lifetime: ms(up.limits.max_lifetime_ms),
-            idempotent,
-            unsafe_reuse_max_idle: ms(up.limits.h1_unsafe_reuse_max_idle_ms),
-        };
-        if let Some(c) = self.pools.checkout(key, policy) {
-            return Ok((c, true, 0, 0));
-        }
         let started = tokio::time::Instant::now();
         let d = dial::dial(
             up,
@@ -935,6 +1064,7 @@ impl HttpEngine {
                 idle_since: now,
                 idle_limit: ms(up.limits.idle_timeout_ms),
                 live: LiveConn::new(&self.live),
+                slot: slot.connected(),
             },
             false,
             micros(d.elapsed),
