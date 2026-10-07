@@ -838,7 +838,10 @@ mod tests {
     fn unreserve_results_decode_and_a_reservations_stamp_is_recovered() {
         assert_eq!(
             decode_unreserve(&[vec![i(9), txt("a")], vec![i(12), txt("b")]], 2),
-            Ok(vec![(JobId(9), "a".to_string()), (JobId(12), "b".to_string())])
+            Ok(vec![
+                (JobId(9), "a".to_string()),
+                (JobId(12), "b".to_string())
+            ])
         );
         assert_eq!(decode_unreserve(&[], 2), Ok(vec![]), "fenced out: a no-op");
         assert_eq!(
@@ -862,7 +865,11 @@ mod tests {
             created_at: 100,
             lease_deadline: 1_091,
         };
-        assert_eq!(r.reserved_at(90), 1_000, "lease_deadline = reserved_at + L + 1");
+        assert_eq!(
+            r.reserved_at(90),
+            1_000,
+            "lease_deadline = reserved_at + L + 1"
+        );
         assert_eq!(
             r.unreserve(90),
             Unreserve {

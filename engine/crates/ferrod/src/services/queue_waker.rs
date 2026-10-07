@@ -62,11 +62,11 @@ use ferro_pool::backend::QueryResult;
 use ferro_pool::error::PoolError;
 use ferro_proto::consts::branch;
 use ferro_proto::messages::{ErrorPayload, QueueStats};
+use ferro_queue::checks;
 use ferro_queue::config::StoreConfig;
 use ferro_queue::ident::TableName;
 use ferro_queue::pg::{self as pgq, Reserved};
 use ferro_queue::shape::Statement;
-use ferro_queue::checks;
 
 use super::fate::{self, OpContext};
 use super::queue_metrics::{HintSource, QueueMetrics, Trigger, UnreserveCause};
@@ -187,7 +187,7 @@ impl Waiter {
 
     /// The statements that served this waiter so far.
     pub fn stats(&self) -> QueueStats {
-        self.lock().stats.clone()
+        self.lock().stats
     }
 
     /// Wait for this waiter's outcome (see the module doc). `hard_end` is the wait bound plus grace,
@@ -352,6 +352,19 @@ impl Waker {
         self.lock().waiters.len()
     }
 
+    /// Registered waiters that are parked right now — in no sweep, not finished (diagnostics; what a
+    /// test waits for before it fires a hint, instead of sleeping).
+    pub fn idle_waiters(&self) -> usize {
+        let st = self.lock();
+        st.waiters
+            .values()
+            .filter(|w| {
+                let s = w.lock();
+                s.ended.is_none() && !s.busy
+            })
+            .count()
+    }
+
     /// Register a waiting RESERVE (§24.8 "register, then sweep") and trigger its first sweep.
     pub fn register(&self, queues: &[String], clamp: u16, wait_end: Instant) -> Option<WaitGuard> {
         let me = self.arc()?;
@@ -378,7 +391,11 @@ impl Waker {
         });
         let mut st = self.lock();
         for q in &waiter.queues {
-            st.queues.entry(q.clone()).or_default().fifo.push_back(waiter.id);
+            st.queues
+                .entry(q.clone())
+                .or_default()
+                .fifo
+                .push_back(waiter.id);
         }
         st.waiters.insert(waiter.id, Arc::clone(&waiter));
         self.metrics.set_waiters(st.waiters.len());
@@ -459,13 +476,7 @@ impl Waker {
         qs.in_flight = true;
         self.metrics.poll(trigger);
         let k = u16::try_from(k).unwrap_or(u16::MAX);
-        let stmt = pgq::reserve(
-            &bound.table,
-            queue,
-            self.lease_s,
-            self.max_payload_bytes,
-            k,
-        );
+        let stmt = pgq::reserve(&bound.table, queue, self.lease_s, self.max_payload_bytes, k);
         let runner = Arc::clone(&bound.runner);
         let timeout = self.stmt_timeout;
         let queue = queue.to_string();
@@ -526,7 +537,9 @@ impl Waker {
                         if jobs.is_empty() {
                             break;
                         }
-                        let Some(w) = st.waiters.get(id) else { continue };
+                        let Some(w) = st.waiters.get(id) else {
+                            continue;
+                        };
                         let mut s = w.lock();
                         if !w.eligible(&s, queue, now) {
                             continue;
@@ -575,7 +588,11 @@ impl Waker {
         for q in next_arrivals {
             self.trigger_locked(&mut st, &q, Trigger::Arrival);
         }
-        if st.queues.get(queue).is_some_and(|qs| qs.fifo.is_empty() && !qs.in_flight) {
+        if st
+            .queues
+            .get(queue)
+            .is_some_and(|qs| qs.fifo.is_empty() && !qs.in_flight)
+        {
             st.queues.remove(queue);
         }
         drop(st);
@@ -606,7 +623,8 @@ impl Waker {
                 Ok((qr, _, _)) => match pgq::decode_unreserve(&qr.rows, n) {
                     Ok(restored) => {
                         me.metrics.unreserved(cause, restored.len() as u64);
-                        let mut queues: Vec<String> = restored.into_iter().map(|(_, q)| q).collect();
+                        let mut queues: Vec<String> =
+                            restored.into_iter().map(|(_, q)| q).collect();
                         queues.sort();
                         queues.dedup();
                         for q in queues {
@@ -848,7 +866,11 @@ mod tests {
         put(&fake, "default", &[5]);
         let w = waker(&fake, "60000");
         let g = w
-            .register(&qs(&["default"]), 1, Instant::now() + Duration::from_secs(5))
+            .register(
+                &qs(&["default"]),
+                1,
+                Instant::now() + Duration::from_secs(5),
+            )
             .unwrap();
         let o = wait(&g, 6_000).await;
         assert_eq!(ids(&o), vec![5]);
@@ -865,14 +887,26 @@ mod tests {
         put(&fake, "high", &[9]);
         let w = waker(&fake, "60000");
         let g = w
-            .register(&qs(&["high", "default"]), 1, Instant::now() + Duration::from_secs(5))
+            .register(
+                &qs(&["high", "default"]),
+                1,
+                Instant::now() + Duration::from_secs(5),
+            )
             .unwrap();
         assert_eq!(ids(&wait(&g, 6_000).await), vec![9]);
         drop(g);
         let g = w
-            .register(&qs(&["high", "default"]), 1, Instant::now() + Duration::from_secs(5))
+            .register(
+                &qs(&["high", "default"]),
+                1,
+                Instant::now() + Duration::from_secs(5),
+            )
             .unwrap();
-        assert_eq!(ids(&wait(&g, 6_000).await), vec![1], "high empty: default next");
+        assert_eq!(
+            ids(&wait(&g, 6_000).await),
+            vec![1],
+            "high empty: default next"
+        );
         assert_eq!(fake.reserves.load(Ordering::SeqCst), 3);
     }
 
@@ -882,7 +916,11 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let w = waker(&fake, "60000");
         let g = w
-            .register(&qs(&["default"]), 1, Instant::now() + Duration::from_secs(5))
+            .register(
+                &qs(&["default"]),
+                1,
+                Instant::now() + Duration::from_secs(5),
+            )
             .unwrap();
         // Let the arrival sweep come back empty.
         while w.metrics().polls(Trigger::Arrival) == 0 || g.lock().busy {
@@ -890,7 +928,11 @@ mod tests {
         }
         let before = fake.reserves.load(Ordering::SeqCst);
         w.hint("other", HintSource::Autocommit);
-        assert_eq!(fake.reserves.load(Ordering::SeqCst), before, "nobody waits on `other`");
+        assert_eq!(
+            fake.reserves.load(Ordering::SeqCst),
+            before,
+            "nobody waits on `other`"
+        );
         put(&fake, "default", &[4]);
         w.hint("default", HintSource::Autocommit);
         assert_eq!(ids(&wait(&g, 6_000).await), vec![4]);
@@ -928,7 +970,11 @@ mod tests {
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(fake.reserves.load(Ordering::SeqCst), 2, "one follow-up, not 69");
+        assert_eq!(
+            fake.reserves.load(Ordering::SeqCst),
+            2,
+            "one follow-up, not 69"
+        );
         let mut got = Vec::new();
         for g in &guards {
             if let Some(Offer::Jobs(j)) = g.lock().offer.take() {
@@ -952,7 +998,11 @@ mod tests {
         put(&fake, "default", &[8]);
         let w = waker(&fake, "60000");
         let g = w
-            .register(&qs(&["default"]), 1, Instant::now() + Duration::from_millis(20))
+            .register(
+                &qs(&["default"]),
+                1,
+                Instant::now() + Duration::from_millis(20),
+            )
             .unwrap();
         let o = wait(&g, 60).await;
         assert!(matches!(o, WaitOutcome::Expired), "{o:?}");
@@ -989,9 +1039,7 @@ mod tests {
         let b = w.register(&qs(&["default"]), 1, far).unwrap(); // arrives while A's sweep runs
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let o = a
-            .wait(far, &cancel, &Drain::new(), &Liveness::new())
-            .await;
+        let o = a.wait(far, &cancel, &Drain::new(), &Liveness::new()).await;
         assert!(matches!(o, WaitOutcome::Cancelled), "{o:?}");
         gate.notify_one(); // A's sweep returns [1, 2]
         let ob = wait(&b, 5_000).await;
@@ -1035,7 +1083,10 @@ mod tests {
             panic!("{oa:?}")
         };
         assert_eq!(ep.branch, branch::INDETERMINATE, "57014 on a sent RESERVE");
-        assert!(matches!(wait(&b, 5_000).await, WaitOutcome::Offer(Offer::Empty)));
+        assert!(matches!(
+            wait(&b, 5_000).await,
+            WaitOutcome::Offer(Offer::Empty)
+        ));
         assert_eq!(w.metrics().reserve_unconfirmed_count(), 1);
         assert_eq!(fake.reserves.load(Ordering::SeqCst), 1, "not re-sent");
     }
@@ -1057,7 +1108,10 @@ mod tests {
         let interval = w.metrics().polls(Trigger::Interval);
         // The cost bound: never more than one sweep per tick for the queue, however many waiters
         // (<= 11 ticks fit 400 ms at 40 ms). The floor is loose so a slow runner cannot flip it.
-        assert!((2..=11).contains(&interval), "one poll per tick per queue: {interval}");
+        assert!(
+            (2..=11).contains(&interval),
+            "one poll per tick per queue: {interval}"
+        );
         assert_eq!(w.waiters(), 100);
         drop(guards);
         assert_eq!(w.waiters(), 0);

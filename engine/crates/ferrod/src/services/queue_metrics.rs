@@ -88,8 +88,18 @@ pub const VERB_BOUNDS_US: [u64; 14] = [
 /// Bounds for `wait_duration_seconds`: how long a RESERVE stayed parked, up to the 30 s default
 /// `MAX_WAIT_MS` and its grace.
 pub const WAIT_BOUNDS_US: [u64; 12] = [
-    1_000, 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000,
-    31_000_000, 120_000_000,
+    1_000,
+    10_000,
+    50_000,
+    100_000,
+    250_000,
+    500_000,
+    1_000_000,
+    2_500_000,
+    5_000_000,
+    10_000_000,
+    31_000_000,
+    120_000_000,
 ];
 
 type Hist14 = ferro_pool::histogram::Histogram<14>;
@@ -279,7 +289,8 @@ pub fn render(out: &mut String, stores: &[&QueueMetrics]) {
             let q = esc(label);
             for (oi, op) in OPS.iter().enumerate() {
                 for (ui, outcome) in OUTCOMES.iter().enumerate() {
-                    let v = m.ops[(li * OPS.len() + oi) * OUTCOMES.len() + ui].load(Ordering::Relaxed);
+                    let v =
+                        m.ops[(li * OPS.len() + oi) * OUTCOMES.len() + ui].load(Ordering::Relaxed);
                     let _ = writeln!(
                         out,
                         "ferro_queue_ops_total{{store=\"{s}\",queue=\"{q}\",op=\"{op}\",outcome=\"{outcome}\"}} {v}"
@@ -390,7 +401,8 @@ pub fn render(out: &mut String, stores: &[&QueueMetrics]) {
         (
             "ferro_queue_enqueue_duration_seconds",
             "ENQUEUE queue + exec time (SPEC §24.9).",
-            (|m: &QueueMetrics| m.enqueue_duration.snapshot()) as fn(&QueueMetrics) -> HistogramSnapshot,
+            (|m: &QueueMetrics| m.enqueue_duration.snapshot())
+                as fn(&QueueMetrics) -> HistogramSnapshot,
         ),
         (
             "ferro_queue_ack_duration_seconds",
@@ -411,7 +423,11 @@ pub fn render(out: &mut String, stores: &[&QueueMetrics]) {
                 let le = le.map_or_else(|| "+Inf".to_string(), fmt_seconds);
                 let _ = writeln!(out, "{name}_bucket{{store=\"{s}\",le=\"{le}\"}} {cum}");
             }
-            let _ = writeln!(out, "{name}_sum{{store=\"{s}\"}} {}", fmt_seconds(snap.sum_us));
+            let _ = writeln!(
+                out,
+                "{name}_sum{{store=\"{s}\"}} {}",
+                fmt_seconds(snap.sum_us)
+            );
             let _ = writeln!(out, "{name}_count{{store=\"{s}\"}} {}", snap.count);
         }
     }
@@ -462,10 +478,16 @@ mod tests {
         assert!(out.contains("ferro_queue_unreserved_total{store=\"jobs\",cause=\"cancel\"} 2"));
         assert!(out.contains("ferro_queue_unreserved_total{store=\"jobs\",cause=\"teardown\"} 0"));
         assert!(out.contains("ferro_queue_polls_total{store=\"jobs\",trigger=\"arrival\"} 1"));
-        assert!(out.contains("ferro_queue_wake_hints_total{store=\"jobs\",source=\"unreserve\"} 1"));
+        assert!(
+            out.contains("ferro_queue_wake_hints_total{store=\"jobs\",source=\"unreserve\"} 1")
+        );
         assert!(out.contains("ferro_queue_waiters{store=\"jobs\"} 7"));
-        assert!(out.contains("ferro_queue_wait_duration_seconds_bucket{store=\"jobs\",le=\"2.5\"} 1"));
-        assert!(out.contains("ferro_queue_wait_duration_seconds_bucket{store=\"jobs\",le=\"1\"} 0"));
+        assert!(
+            out.contains("ferro_queue_wait_duration_seconds_bucket{store=\"jobs\",le=\"2.5\"} 1")
+        );
+        assert!(
+            out.contains("ferro_queue_wait_duration_seconds_bucket{store=\"jobs\",le=\"1\"} 0")
+        );
         assert!(out.contains("ferro_queue_wait_duration_seconds_sum{store=\"jobs\"} 1.5"));
         assert!(out.contains("ferro_queue_reserve_unconfirmed_total{store=\"jobs\"} 0"));
         assert_eq!(

@@ -85,11 +85,11 @@ use ferro_queue::{PoolFamily, checks, version};
 use tokio_util::sync::CancellationToken;
 
 use crate::pools::{AnyPool, PoolRegistry};
-use crate::services::queue_metrics::{HintSource, Outcome as MetricOutcome, QueueMetrics, UnreserveCause};
-use crate::services::queue_waker::{Offer, Runner, WaitOutcome, Waker};
-use crate::session::{Liveness, SessionInfo};
-use futures::FutureExt;
 use crate::services::fate::{self, OpContext};
+use crate::services::queue_metrics::{
+    HintSource, Outcome as MetricOutcome, QueueMetrics, UnreserveCause,
+};
+use crate::services::queue_waker::{Offer, Runner, WaitOutcome, Waker};
 use crate::services::sql::{
     actor_gone_terminal, cancelled_before_dispatch, protocol, resolve_active, run_autocommit_exec,
     sleep_until_opt, unsupported,
@@ -97,7 +97,9 @@ use crate::services::sql::{
 use crate::session::SessionId;
 use crate::session::codec::InFrame;
 use crate::session::responder::Responder;
+use crate::session::{Liveness, SessionInfo};
 use crate::tx::{QueueReply, TxCommand, TxRegistry};
+use futures::FutureExt;
 
 /// One decoded QUEUE request.
 #[derive(Debug)]
@@ -657,7 +659,12 @@ async fn serve_waiting(ctx: &AutocommitCtx<'_>, r: &ReserveRequest, reply: Reply
 /// SPEC §24.4: "a job is DELIVERED iff the terminal carrying it is handed to a live session's
 /// writer". The declaration happens under the session's liveness lock; a session whose teardown has
 /// begun gets nothing, and the jobs are UNRESERVED (cause `teardown`) — deliver xor unreserve.
-fn hand_off_jobs(ctx: &AutocommitCtx<'_>, reply: Reply, jobs: Vec<pgq::Reserved>, stats: QueueStats) {
+fn hand_off_jobs(
+    ctx: &AutocommitCtx<'_>,
+    reply: Reply,
+    jobs: Vec<pgq::Reserved>,
+    stats: QueueStats,
+) {
     if let Err((reply, jobs)) = ctx
         .info
         .liveness
@@ -969,7 +976,8 @@ impl Reply {
                 exec_us: stats.exec_us,
                 response_bytes: body.len() as u64,
             });
-            self.responder.push_span_attr(("ferro.queue.jobs", Int(jobs)));
+            self.responder
+                .push_span_attr(("ferro.queue.jobs", Int(jobs)));
             if let Some(a) = attempts {
                 self.responder
                     .push_span_attr(("ferro.queue.attempts", Int(u64::from(a))));
@@ -995,7 +1003,9 @@ impl Reply {
 pub enum VerbOk {
     Enqueue(pgq::Enqueued),
     Reserve(Vec<pgq::Reserved>),
-    Ack { gone: bool },
+    Ack {
+        gone: bool,
+    },
     /// The new row's id and its QUEUE (M7-G3: the label and the `delay_s = 0` wake hint), or `None`
     /// (`gone`).
     Release(Option<(JobId, String)>),
