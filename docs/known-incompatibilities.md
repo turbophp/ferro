@@ -8,6 +8,12 @@ Ferro is a drop-in by CONFIGURATION for two framework tiers:
 - **`ferro/laravel`** — Illuminate's `Connection` execution layer, via one driver name in the
   connection config, with the stock Grammar, Processor and Schema builder untouched (SPEC §15).
 
+And for outbound HTTP (Ferro HTTP, SPEC §23), as TRANSPORTS under stock clients:
+
+- **`ferro/guzzle`** — a Guzzle handler at the `HandlerStack` seam; **`ferro/psr18`** — a synchronous
+  PSR-18 client; and, in `ferro/laravel`, the `Http` facade's factory rebound by configuration. See
+  *Ferro HTTP* below.
+
 These are the places where a real application can still notice the difference. Almost every one is a
 deliberate consequence of the engine's model — a per-host daemon that pools upstream connections in
 **transaction mode** and holds the only database credentials — rather than a defect waiting to be
@@ -796,6 +802,112 @@ resets, the `database` queue and batches, the `database` cache), not the suite. 
 the `database` queue worker processing nothing on any Ferro family (`PDO::ATTR_DRIVER_NAME`, fixed).
 The Eloquent ORM's own test suite is not run on any family. The recorded MySQL-family numbers are in the
 C1f and C1g results docs.
+
+---
+
+## Ferro HTTP: Guzzle, PSR-18 and Laravel's `Http` (`ferro/guzzle`, `ferro/psr18`)
+
+Ferro HTTP's drop-in seams are a Guzzle handler (`Ferro\Guzzle\FerroHandler`), a PSR-18 client
+(`Ferro\Psr18\Client`) and, in `ferro/laravel`, a rebinding of Laravel's `Http` factory. They change
+the TRANSPORT only: Guzzle's middleware (redirects, cookies, `http_errors`, auth, retries) and
+Laravel's `Http::fake()`, recording and events all run unchanged above the handler. These are the
+differences an application can notice through them (SPEC §22.2 (dj)). The engine-level differences
+that every adapter inherits — `TRACE`/`TRACK`/`CONNECT` refused, override and forwarding headers
+refused by default, title-cased request header names, the 600 s default ceiling, no brotli — are
+SPEC §23.16 C9's list, measured and written up by slice F10.
+
+### Getting in
+
+- **Guzzle has no process-global handler.** A `new GuzzleHttp\Client()` constructed without a
+  `handler` uses curl. Adopting Ferro there is one line of CODE per client construction —
+  `['handler' => HandlerStack::create(new FerroHandler($conn, upstreams: [...]))]` — not
+  configuration (SPEC §23.16 C9 item 15).
+- **Laravel is configuration only:** an `http.ferro` block (`socket`, and `upstreams` mapping each
+  origin to an upstream name) makes the package's auto-discovered provider rebind the `Http` factory
+  (`Ferro\Laravel\Http\HttpWiring`). Without the block the facade is untouched. The seam is a
+  PROTECTED framework method, `Factory::newPendingRequest()`; a Laravel release that renames it makes
+  the wiring refuse at boot rather than route around Ferro (`HttpFactoryTest::testTheSeamIsAsserted`).
+  Measured on Laravel 11.51; 12.x is not yet run.
+- **An origin with no upstream is refused, never sent** (`Ferro\Guzzle\UnmappedOriginException`, a
+  `RequestException` with no response, so in Laravel it escapes `Http::get()` unwrapped;
+  `Ferro\Psr18\UnmappedOriginException` in PSR-18). There is no curl fallback unless the handler is
+  built with an explicit `fallback:` handler, which gives up the SSRF guarantee for every origin it
+  serves. A non-ASCII host is never mapped: use punycode on both sides.
+
+### Laravel's `Http::pool()` and a factory-level `setHandler()`
+
+Laravel's `Http\Client\Pool` hands the factory Guzzle's stock transport
+(`Utils::chooseHandler()`) for every pooled request. Unhandled, that silently replaced the Ferro
+handler — pooled requests went to curl, around the engine's SSRF confinement, with no error. A stock
+Guzzle transport handed to the FACTORY therefore keeps the Ferro handler
+(`HttpFactoryTest::testAStockTransportHandedToTheFactoryKeepsFerroAnApplicationsHandlerDoesNot`,
+`HttpFacadeLiveTest::testHttpPoolGoesThroughFerroAndRunsConcurrently`). **Cost:** an application that
+deliberately passes `Http::setHandler(new CurlHandler())` to bypass Ferro gets Ferro anyway; use a
+separate Guzzle client for that. Any other handler (a `MockHandler`) is honoured as stock, and a
+pending request's own `setHandler()` is untouched.
+
+### Request options
+
+| Option | Through Ferro |
+|---|---|
+| `verify => false`, `cert`, `ssl_key`, `crypto_method_max`, `force_ip_resolve`, a `REQUIRE_*` `multiplex` | **Refused** (a rejected promise, nothing sent), naming the daemon setting that replaces it: trust (`CA_FILE`), client certificates and the TLS floor are the operator's, and v1 has no HTTP/2. Laravel's `withoutVerifying()` is therefore refused. |
+| `crypto_method` | A TLS 1.2 (or lower) floor — which Laravel sets on every request — passes, because the daemon's `MIN_TLS` is never below 1.2. A TLS 1.3 floor is refused: the client cannot see an upstream honour it. |
+| `proxy` | The value `GuzzleHttp\Client` derives from `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` is **ignored** (the engine sends to the upstream directly); any other value is refused. |
+| `version`, `curl`, `stream_context`, `debug`, `expect` | Ignored. The upstream's `HTTP` setting decides the version, not the request. |
+| `progress` | Upload progress is reported ONCE, when the response head arrives (the request is wholly sent by then), then per received chunk. |
+| `on_stats` | Handler stats are a subset of curl's names (`total_time`, `connect_time`, `appconnect_time`, `starttransfer_time`, `size_upload`, `size_download`) plus `ferro`, the engine's raw `HttpStats`. |
+| `decode_content` | The ENGINE decodes `gzip`/`deflate` only; the removed headers come back as `x-encoded-content-encoding`/`-length`, as Guzzle's handlers rename them. With no `Accept-Encoding` of the application's own, the engine asks for `gzip, deflate`, where curl asks for every decoder it has. |
+| `delay` | Scheduled, never slept, off the synchronous path (see below). |
+| `ferro` | `['idempotent' => bool, 'route' => string]`: the request's idempotency declaration and its observability route. |
+
+### Responses
+
+- **Response header names are lowercase** — `getHeaders()` keys differ from curl's; every
+  case-insensitive accessor behaves as stock (SPEC §23.16 C9 item 5;
+  `FerroHandlerTest::testASynchronousRequestRoundTripsEveryFieldAndOption`).
+- **A status of 600–999 is rejected exactly as stock Guzzle rejects it** — measured against curl:
+  a `RequestException` "An error was encountered while creating the response", because
+  `guzzlehttp/psr7` cannot represent it — but the rejection carries the status's fate: Indeterminate
+  for a non-idempotent request, which the upstream DID receive
+  (`GuzzleLiveTest::testA600StatusIsRejectedExactlyAsStockGuzzleRejectsIt`). PSR-18 throws
+  `Ferro\Psr18\UnrepresentableResponseException`.
+- **An ASYNCHRONOUS buffered response is held in PHP memory until its promise settles**
+  (`getAsync()`, `Pool`, `Http::pool()`), where curl writes to `php://temp`. A synchronous request
+  (`$client->get()`, `Http::get()`) streams into the sink as stock does, and `stream => true` is lazy;
+  both hold at most one credit window (16 MiB). Recorded, with its remedy, in SPEC §22.2 (dj).
+- **PSR-18 response bodies are lazy by default:** `sendRequest()` returns when the head arrives and
+  the body is read from the engine as the caller reads it, so a body failure is thrown from `read()`
+  (a `RuntimeException` carrying the fate). `stream: false` reads the body first. Every response is a
+  `Ferro\Psr18\FatedResponse` wrapping the factory's own object (`inner()` returns it).
+
+### Timing
+
+- **`delay` is scheduled by the handler's wait loop**, as `CurlMultiHandler` schedules it, so a `Pool`
+  of delayed requests overlaps (`GuzzleLiveTest::testAPoolOfDelayedRequestsCompletesInAboutOneDelay`).
+  While the loop is blocked awaiting a slow in-flight response, a delayed request that falls due
+  waits for that response to finish before it is sent.
+- **An asynchronous `stream => true` request is opened when its promise is waited**, and waits for
+  its head before the next one opens: streamed async requests do not overlap their time-to-first-byte.
+  Buffered async requests do (all are written at `__invoke`).
+
+### Errors and retries
+
+- **The exception CLASS is curl's for the same event; a marker interface says the fate.** A
+  `timeout` or `eof_empty` after sending is a `ConnectException`, as curl's 28 and 52 are; a reset
+  after sending is a `RequestException`, as curl's 56 is. Each also implements
+  `Ferro\Http\Fate\Retryable`, `NonRetryable` or `Indeterminate`, and `Ferro\Http\Fate::of()` reads it.
+  So a hand-written `instanceof ConnectException` decider re-sends exactly what it re-sends under curl
+  — **including a POST whose fate is unknown** — and Ferro's own deciders never do.
+- **Use Ferro's deciders for retries:** `Ferro\Guzzle\Retry::middleware(n)` for Guzzle and
+  `Http::retry(n, when: Ferro\Laravel\Http\Retry::when())` for Laravel. Stock `Http::retry(3)` with no
+  `when` re-sends an Indeterminate POST, as it does under curl
+  (`HttpFactoryTest::testRetryWhenNeverResendsAnIndeterminateAndDoesResendARetryable`).
+- **A body that fails after its head carries the response the upstream sent**, even for an idle-read
+  timeout that curl reports as a responseless 28 `ConnectException`.
+- **A response a middleware REBUILDS loses its fate**, and the deciders then treat it as
+  non-idempotent: it is not retried (`RetryTest::testAResponseAMiddlewareRebuiltHasNoFateAndIsNotRetried`).
+- **Request bodies above about 16 MiB are refused before anything is sent** (SPEC §23.16 C9 item 7),
+  as a `RequestException` (Guzzle) or `RequestExceptionInterface` (PSR-18) naming the limit.
 
 ---
 

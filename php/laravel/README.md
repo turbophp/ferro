@@ -54,6 +54,27 @@ is that name — but some code branches on the name (upstream's own tests do, th
 `#[RequiresDatabase('mysql')]` and `$this->driver`), and only the alias makes such code take the
 same branch it takes on PDO.
 
+## Outbound HTTP: the `Http` facade (Ferro HTTP, SPEC §23.11.6)
+
+With `ferro/guzzle` installed, an `http.ferro` block routes Laravel's `Http` facade through Ferro HTTP
+— the per-host engine's pooled, credential-holding HTTP transport — with nothing else changed:
+
+```php
+// config/http.php
+return ['ferro' => [
+    'socket'    => '/run/ferro/app.sock',
+    'upstreams' => ['https://api.openai.com' => 'openai'],   // origin => the upstream ferrod declares
+]];
+```
+
+The provider rebinds the `Illuminate\Http\Client\Factory` singleton to
+`Ferro\Laravel\Http\FerroHttpFactory`, which hands every pending request `Ferro\Guzzle\FerroHandler`.
+Laravel's own stub, recorder and before-sending handlers stay ABOVE it, so `Http::fake()`,
+`Http::assertSent()` and the request events behave as stock, and a faked request never reaches the
+engine. `Http::pool()` goes through Ferro too. For retries, use `Http::retry(3, 100,
+when: Ferro\Laravel\Http\Retry::when())`: it never re-sends a POST whose fate is unknown, where a
+bare `Http::retry(3)` would. Differences from curl: `docs/known-incompatibilities.md` (*Ferro HTTP*).
+
 ## What this tier changes, and what it does not
 
 Only the **execution layer**. The stock Grammar, Processor and Schema builder are inherited
