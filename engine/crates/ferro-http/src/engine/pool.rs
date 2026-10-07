@@ -589,7 +589,10 @@ mod tests {
             ..policy(true)
         };
         pools.checkin(key.clone(), c, 1);
-        assert!(matches!(pools.take(&key, p, caps).await, Take::Dial(_)));
+        assert!(matches!(
+            within(pools.take(&key, p, caps)).await,
+            Take::Dial(_)
+        ));
         assert_eq!(pools.idle_count(&key), 0);
     }
 
