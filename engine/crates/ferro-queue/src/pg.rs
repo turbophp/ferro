@@ -43,9 +43,12 @@
 //!
 //! **EXTEND additionally requires `reserved_at IS NOT NULL` (M7-G3, carried from the G1b review).**
 //! Unreserve sets `reserved_at = NULL, attempts = attempts − 1`, so the row's token becomes the
-//! PREVIOUS reservation's again. For ACK and RELEASE that is the pre-reservation state exactly: the
-//! previous holder's late verb is honoured "when nobody else took the job", and the undelivered
-//! reservation took it from nobody. EXTEND is different: it renews a LEASE, and an unreserved row has
+//! PREVIOUS reservation's again. For ACK and RELEASE that is equivalent to the pre-reservation state:
+//! their fence never reads `reserved_at`, the previous holder's late verb is honoured "when nobody else
+//! took the job", and the undelivered reservation took it from nobody. (The restore itself is exact
+//! only for a row that was PENDING; one taken through the expired-lease branch comes back with
+//! `reserved_at = NULL`, not the previous holder's stamp — review F4 — so SIZE counts it pending.)
+//! EXTEND is different: it renews a LEASE, and an unreserved row has
 //! none — it is PENDING, visible to every RESERVE (and to SIZE as pending). Without the predicate the
 //! previous holder's EXTEND would re-reserve a pending job with no delivery counted, out from under the
 //! RESERVE about to take it. With it, that EXTEND is `LeaseLost` — "the job is or will be
@@ -501,8 +504,9 @@ impl Reserved {
     }
 }
 
-/// UNRESERVE (SPEC §24.8, M7-G3): restore undelivered reservations to their pre-reservation state —
-/// `reserved_at = NULL, attempts = attempts − 1` — each row FENCED on `id`, the `attempts` and
+/// UNRESERVE (SPEC §24.8, M7-G3): restore undelivered reservations — `reserved_at = NULL,
+/// attempts = attempts − 1`; exactly the pre-reservation state for a row that was pending, and for one
+/// taken through the expired-lease branch the same minus the previous holder's stamp (review F4) — each row FENCED on `id`, the `attempts` and
 /// `created_at` its reservation minted, AND the `reserved_at` it stamped. Any later reservation of the
 /// row changes `attempts` and `reserved_at`, so a delayed unreserve is a no-op rather than an attack on
 /// someone else's lease; a row acked or released meanwhile is simply not matched. The rows of one

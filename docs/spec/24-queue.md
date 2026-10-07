@@ -619,10 +619,11 @@ even resolved.]*
   alive. No match → `LeaseLost`.
   *[Amended M7-G3 (SPEC §22.2 (dl); carried from the G1b review): **EXTEND also requires
   `reserved_at IS NOT NULL`.** An unreserve (§24.8) sets `reserved_at = NULL, attempts = attempts − 1`,
-  so the PREVIOUS reservation's token names the row again. For ACK and RELEASE that is the
-  pre-reservation state exactly — the previous holder's late verb is honoured "when nobody else took
-  the job", and the undelivered reservation took it from nobody — so their fence is unchanged and a
-  late ACK by that holder is honoured (pinned live). EXTEND renews a LEASE, and an unreserved row has
+  so the PREVIOUS reservation's token names the row again. For ACK and RELEASE that is equivalent to
+  the pre-reservation state — their fence never reads `reserved_at`, the previous holder's late verb is
+  honoured "when nobody else took the job", and the undelivered reservation took it from nobody — so
+  their fence is unchanged and a late ACK by that holder is honoured (pinned live). *Review round
+  (F4):* The restore is exact for a row that was PENDING before the undone reservation. For a row taken through the EXPIRED-lease branch it is not literal: the previous holder's stamp is not restored (`reserved_at` becomes NULL), so the row reads as pending to SIZE and to stock workers, and the previous holder's EXTEND is `LeaseLost` (below) where before the undone reservation it would have retaken the job; its ACK and RELEASE are unaffected (their fence never reads `reserved_at`). EXTEND renews a LEASE, and an unreserved row has
   none: it is pending, and without the predicate the previous holder's EXTEND would re-reserve it with
   no delivery counted, out from under the RESERVE about to take it. It is `LeaseLost` now, and the row
   stays pending (pinned live, mutation-proven). A current holder's row always has `reserved_at` set,
@@ -1094,9 +1095,17 @@ these choices the text above left open or the implementation forced:*
 
 - ***Every waiting statement is the waker's.*** *A RESERVE with a non-zero (clamped) `wait_ms` never
   runs a statement itself: it registers, and the waker runs the ONE statement per `(store, queue)` that
-  serves every eligible waiter of that queue, on a checkout taken for that statement alone and bounded
-  — checkout wait included — by `WAKER_STMT_TIMEOUT_MS`. No request's CANCEL interrupts it (it serves
-  others), so its fate is always known to the waker. A RESERVE with `wait_ms = 0` (or clamped to 0)
+  serves every eligible waiter of that queue, on a checkout taken for that statement alone. **What is
+  bounded, exactly** (corrected at the review round, F1): the checkout wait and the statement share
+  `WAKER_STMT_TIMEOUT_MS`; when it fires the backend is asked to cancel the statement (that request
+  bounded by `WAKER_CANCEL_DRAIN`, 1 s) and the answer is awaited `WAKER_CANCEL_DRAIN` more; a statement
+  that answers neither is ABANDONED — its connection DISCARDED, never returned to the pool (a
+  connection still running a statement is the M1-S8a hazard), the waiters it served answered
+  `Indeterminate` and counted in `reserve_unconfirmed_total`, its possible reservations left to their
+  leases — and the queue is free for its next trigger. Worst case `WAKER_STMT_TIMEOUT_MS + 2 s`. (The
+  first version let a silent backend hold the queue in flight until TCP gave up, answering every
+  waiter `Ok{jobs: []}` for hours; reproduced live through a freezing proxy, now pinned.) No request's
+  CANCEL interrupts the statement (it serves others). A RESERVE with `wait_ms = 0` (or clamped to 0)
   is served as at G1b.*
 - ***"Register, then sweep", with priority at arrival.*** *A new waiter is registered in the FIFO of
   each of its queues (duplicates removed) and is then eligible for ONE queue at a time in the order it
@@ -1104,20 +1113,25 @@ these choices the text above left open or the implementation forced:*
   nothing is it eligible for the next. After its last queue it is parked and eligible for all of them,
   and whichever yields first serves it — Redis `BLPOP`'s semantics: priority at the call, first come
   while blocked. A hint that fires while its arrival sweep is in flight leaves that queue's follow-up
-  sweep pending, so no wake-up is lost.*
+  sweep pending; and (review round, F3) a trigger for a queue whose only owed waiters are busy in
+  ANOTHER queue's sweep is kept and runs the moment that sweep frees one of them — so no hint is lost
+  to a momentarily busy waiter (the first version dropped it, leaving the job to the poll).*
 - ***The batch, and a byte budget §24.8 did not have.*** *A sweep serves the longest FIFO prefix of
   the queue's eligible waiters whose summed frame clamps fit `checks::sweep_cap` — 64 MiB of
   maximum-size payloads (15 jobs at the 4 MiB default), never fewer than the head waiter's clamp —
   so 200 waiters cannot make one statement return 2.4 GB. `LIMIT k` is that sum. A sweep that comes
   back FULL is followed by one more (trigger `refill`) for the waiters it could not cover; a short one
-  is not. Jobs are handed out FIFO by id, each waiter up to its clamp.*
+  is not. Jobs are handed out FIFO by id, each waiter up to its clamp. No statement is started for a
+  waiter past its wait end (pinned by a unit test at review).*
 - ***A job a finished waiter cannot take*** *(cancelled, torn down, past its grace bound while the
   sweep ran) is offered to the queue's other eligible waiters first, and only the rest is unreserved:
   ONE fenced statement for the sweep's leftovers (each row fenced on `id`, minted `attempts`,
   `created_at` and the `reserved_at` it stamped, which is `lease_deadline − lease_s − 1`, so the
-  RESERVE statement is unchanged). The restored queues are woken (trigger 1, source `unreserve`).*
+  RESERVE statement is unchanged). The restored queues are woken (trigger 1, source `unreserve`). A
+  waiter served from another's leftovers reports `stats {0, 0}`: it was in no statement's batch.*
 - ***The wait bound and the request deadline.*** *A waiter's `hard_end` is `received + wait_ms +
-  queue_wait_grace_ms`; when the request carries `timeout_ms`, both its wait end and its `hard_end` are
+  queue_wait_grace_ms`, where `received` is the instant it registers — AFTER the store's first-use
+  verification (§24.3), whose time the request's own `timeout_ms` bounds; when the request carries `timeout_ms`, both its wait end and its `hard_end` are
   capped by that deadline. Past either it is answered `Ok{jobs: []}` — known fate: anything a late
   sweep reserves for it is unreserved — never an error, and the handler answers on its own timer,
   never waiting for the waker.*
@@ -1139,7 +1153,8 @@ these choices the text above left open or the implementation forced:*
 - ***Drain.*** *The daemon's drain reaches every session (§23.6.1). A parked waiter is answered
   `Ok{jobs: []}` at once; one whose sweep is in flight waits for it (bounded by its grace) and gets its
   jobs — a drain delivers, it does not release; a RESERVE that arrives during the drain is served as a
-  non-waiting one. Nothing is released (pinned live: a delivered job keeps its lease and its holder's
+  non-waiting one, by its own statement (pinned at review: with a sweep of the queue in flight it
+  reaches past the held row; parking it instead would answer `Ok{jobs: []}` with no statement at all). Nothing is released (pinned live: a delivered job keeps its lease and its holder's
   ACK lands).*
 - ***Measured locally, not the D17 bench:*** *200 parked RESERVEs on one queue at `POLL_MS = 200` cost
   15 statements in 3.0 s (5.0/s), every one a poll's sweep, with at most one pool connection in use
@@ -1661,9 +1676,11 @@ measures it; a false one changes the plan, not the evidence.
   `WHERE id IN (… LIMIT k FOR UPDATE SKIP LOCKED)` form over-reserves even in one session.
 - Dedup statement sequence on PG (G4) and its MySQL counterpart (G6).
 - ~~R4 on the real `Transport`~~ **REPRODUCED at G3** (SPEC §22.2 (dl), `php/client`'s
-  `TransportSignalTest`): a 1.5 s read with SIGTERM at 0.5 s returned after ≥ 2.0 s, timed out, and the
-  async handler had run — a signal only lengthens the tolerance. The SIGTERM-while-parked exit bound is
-  G5's.
+  `TransportSignalTest`, on BOTH read paths): a 1.5 s read with SIGTERM at 0.5 s returned only after
+  its timeout restarted (asserted ≥ 1.9 s; 2.0 s expected) and timed out — a signal only lengthens the
+  tolerance. The handler's timing differs by path: on `fread` it runs after the read returned (as
+  measured at drafting); on `recvmsg` it runs at the signal and the read resumes, still not cut short.
+  The SIGTERM-while-parked exit bound is G5's.
 - Sync and async client reentrancy when Laravel's SIGALRM handler runs `FerroJob::fail()` while a
   request is in flight on the DB session. ACKing on the idle queue session narrows this; G5 measures
   it.
