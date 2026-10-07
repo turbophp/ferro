@@ -92,6 +92,11 @@ abstract class HttpLiveTestCase extends LiveTestCase
             'FERRO_UPSTREAMS' => 'up,ops,dead,tls',
             'FERRO_UPSTREAM_UP_ORIGIN' => $origin,
             'FERRO_UPSTREAM_UP_ADDRESS_CLASSES' => 'loopback',
+            // The F8 slot tests park 256 streams on `up` to reach the CLIENT's own 256-request cap.
+            // M6-F6's engine limits (MAX_CONNECTIONS 32, MAX_REQUESTS 128 by default) would refuse
+            // first, so `up` is sized for that concurrency, as §23.8.2 tells operators to do.
+            'FERRO_UPSTREAM_UP_MAX_CONNECTIONS' => '512',
+            'FERRO_UPSTREAM_UP_MAX_REQUESTS' => '512',
             'FERRO_UPSTREAM_OPS_ORIGIN' => $origin,
             'FERRO_UPSTREAM_OPS_ADDRESS_CLASSES' => 'loopback',
             'FERRO_UPSTREAM_OPS_IDEMPOTENT_METHODS' => 'GET',
