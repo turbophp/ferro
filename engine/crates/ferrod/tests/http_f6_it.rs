@@ -27,12 +27,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ferro_http::engine::limits::BreakerState;
-use ferro_http::engine::{BoxIo, Connect};
+use ferro_http::engine::{BoxIo, Connect, ResponseSink, SinkError, SinkFrame, Terminal};
 use ferro_proto::consts::{branch, errc, http_cause};
 use ferro_proto::messages::{HttpRequest, Outcome};
 use http_support::*;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use crate::common::TestClient;
 
@@ -198,7 +199,7 @@ async fn chaos9_k_connect_failures_open_the_breaker_and_a_probe_closes_it() {
             &[("b", up.addr)],
             &[
                 ("b", "BREAKER_FAILURES", "3"),
-                ("b", "BREAKER_OPEN_MS", "600"),
+                ("b", "BREAKER_OPEN_MS", "3000"),
             ],
         ),
         Arc::clone(&conn),
@@ -226,7 +227,7 @@ async fn chaos9_k_connect_failures_open_the_breaker_and_a_probe_closes_it() {
         let left = assert_unavailable(&reply, http_cause::BREAKER_OPEN)
             .expect("breaker_open carries retry_after_ms");
         assert!(left >= 1, "never 0");
-        let upper = 600u128.saturating_sub(before.duration_since(opened).as_millis()) + 1;
+        let upper = 3_000u128.saturating_sub(before.duration_since(opened).as_millis()) + 1;
         assert!(
             u128::from(left) <= upper,
             "the time left, at most {upper} ms: {left}"
@@ -310,7 +311,7 @@ async fn chaos9_an_indeterminate_probe_leaves_half_open_with_the_slot_released()
             &[("b", up.addr)],
             &[
                 ("b", "BREAKER_FAILURES", "1"),
-                ("b", "BREAKER_OPEN_MS", "200"),
+                ("b", "BREAKER_OPEN_MS", "1000"),
                 ("b", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "0"),
             ],
         ),
@@ -343,7 +344,7 @@ async fn the_probe_slot_is_released_however_the_probe_ends() {
             &[("b", up.addr)],
             &[
                 ("b", "BREAKER_FAILURES", "1"),
-                ("b", "BREAKER_OPEN_MS", "100"),
+                ("b", "BREAKER_OPEN_MS", "1000"),
                 ("b", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "0"),
             ],
         ),
@@ -405,10 +406,10 @@ async fn a_probe_refused_by_a_later_admission_step_releases_the_slot() {
             &[
                 ("", "MAX_BODY_BYTES", "8"),
                 ("b", "BREAKER_FAILURES", "1"),
-                ("b", "BREAKER_OPEN_MS", "100"),
+                ("b", "BREAKER_OPEN_MS", "1000"),
                 ("b", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "0"),
                 ("r", "BREAKER_FAILURES", "1"),
-                ("r", "BREAKER_OPEN_MS", "100"),
+                ("r", "BREAKER_OPEN_MS", "1000"),
                 ("r", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "0"),
                 // One token per 100 s, burst 1: the refused connect below takes the only one.
                 ("r", "RATE_PER_SEC", "0.01"),
@@ -468,7 +469,7 @@ async fn a_counted_probe_failure_opens_the_breaker_again() {
             &[("b", up.addr)],
             &[
                 ("b", "BREAKER_FAILURES", "1"),
-                ("b", "BREAKER_OPEN_MS", "300"),
+                ("b", "BREAKER_OPEN_MS", "3000"),
             ],
         ),
         Arc::clone(&conn),
@@ -481,10 +482,7 @@ async fn a_counted_probe_failure_opens_the_breaker_again() {
     let before = Instant::now();
     let r = one(&d, &post("b", b"x")).await;
     let left = assert_unavailable(&r, http_cause::BREAKER_OPEN).unwrap();
-    assert!(
-        u128::from(left) <= 300 && u128::from(left) + before.elapsed().as_millis() + 1 >= 1,
-        "{left}"
-    );
+    assert!(u128::from(left) <= 3_000, "{left}");
     assert_eq!(conn.attempts(), attempts, "no dial while open");
     assert_eq!(received(&up), 0);
 }
@@ -560,7 +558,7 @@ async fn the_queue_refuses_unsent_and_serves_its_waiter() {
             &[
                 ("q", "MAX_REQUESTS", "1"),
                 ("q", "MAX_QUEUED", "1"),
-                ("q", "QUEUE_TIMEOUT_MS", "300"),
+                ("q", "QUEUE_TIMEOUT_MS", "2000"),
             ],
         ),
         ScriptConnect::new(TCP),
@@ -569,7 +567,7 @@ async fn the_queue_refuses_unsent_and_serves_its_waiter() {
     wait_for("the first request at the upstream", || received(&up) == 1).await;
     assert_eq!(d.engine.requests_in_flight("q"), 1);
 
-    // queue_timeout: waits its 300 ms, then refused.
+    // queue_timeout: waits its 2 s, then refused.
     let queued_at = Instant::now();
     let mut waiter = start(&d, &post("q", b"2")).await;
     wait_for("a waiter", || d.engine.queue_waiting("q") == 1).await;
@@ -586,7 +584,7 @@ async fn the_queue_refuses_unsent_and_serves_its_waiter() {
         branch::RETRYABLE,
         http_cause::QUEUE_TIMEOUT,
     );
-    assert!(queued_at.elapsed() >= Duration::from_millis(300));
+    assert!(queued_at.elapsed() >= Duration::from_millis(2_000));
     assert_eq!(d.engine.queue_waiting("q"), 0);
 
     // deadline: the request's own bound is nearer than the queue's.
@@ -842,7 +840,7 @@ async fn a_rate_wait_is_bounded_by_the_max_wait_and_the_deadline() {
         upstreams(
             &[("w", up.addr), ("slow", up.addr)],
             &[
-                ("w", "RATE_PER_SEC", "1"),
+                ("w", "RATE_PER_SEC", "0.5"),
                 ("w", "RATE_MAX_WAIT_MS", "5000"),
                 // One token per 5 s, burst 1.
                 ("slow", "RATE_PER_SEC", "0.2"),
@@ -853,7 +851,7 @@ async fn a_rate_wait_is_bounded_by_the_max_wait_and_the_deadline() {
     );
     let t1_before = Instant::now();
     assert_eq!(status(&one(&d, &idempotent_get("w")).await), 200);
-    // The next token is ~1 s away; a 300 ms deadline cannot wait for it.
+    // The next token is ~2 s away; a 300 ms deadline cannot wait for it.
     let r = one(
         &d,
         &HttpRequest {
@@ -871,7 +869,7 @@ async fn a_rate_wait_is_bounded_by_the_max_wait_and_the_deadline() {
     // This one waits for the token.
     assert_eq!(status(&one(&d, &idempotent_get("w")).await), 200);
     assert!(
-        t1_before.elapsed() >= Duration::from_millis(1_000),
+        t1_before.elapsed() >= Duration::from_millis(2_000),
         "admitted no earlier than its token: {:?}",
         t1_before.elapsed()
     );
@@ -895,16 +893,16 @@ async fn a_rate_wait_is_bounded_by_the_max_wait_and_the_deadline() {
 // The Retry-After hold (§23.8.7)
 // =================================================================================================
 
-/// **`HONOR_RETRY_AFTER=1`.** A completed 429 with `Retry-After: 1` is delivered to its caller as
+/// **`HONOR_RETRY_AFTER=1`.** A completed 429 with `Retry-After: 2` is delivered to its caller as
 /// the response it is, and HOLDS the upstream: later requests — on any session — are refused at
-/// once (`RateLimited`, `retry_after_hold`, `retry_after_ms` ≤ 1000), unsent; once the hold has
+/// once (`RateLimited`, `retry_after_hold`, `retry_after_ms` ≤ 2000), unsent; once the hold has
 /// passed, requests flow again. A 503 with a `Retry-After` holds too.
 #[tokio::test]
 async fn the_retry_after_hold_is_honoured_and_expires() {
     const LIMITED: &[u8] =
-        b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n";
+        b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nContent-Length: 0\r\n\r\n";
     const UNAVAILABLE: &[u8] =
-        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n";
+        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nContent-Length: 0\r\n\r\n";
     let (up, _gate) = scripted(vec![
         Act::Answer(LIMITED),
         Act::Answer(OK),
@@ -928,7 +926,7 @@ async fn the_retry_after_hold_is_honoured_and_expires() {
             )
             .retry_after_ms
             .expect("retry_after_hold carries retry_after_ms");
-        assert!((1..=1_000).contains(&left), "{left}");
+        assert!((1..=2_000).contains(&left), "{left}");
         let n = received(&up);
         assert_eq!(
             n,
@@ -993,7 +991,7 @@ async fn what_does_not_hold() {
 #[tokio::test]
 async fn the_admission_order_is_breaker_hold_then_rate() {
     const LIMITED: &[u8] =
-        b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n";
+        b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nContent-Length: 0\r\n\r\n";
     let (up, _gate) = scripted(vec![Act::Answer(LIMITED)]).await;
     let conn = ScriptConnect::new(TCP);
     let d = daemon_on(
@@ -1001,24 +999,28 @@ async fn the_admission_order_is_breaker_hold_then_rate() {
             &[("o", up.addr)],
             &[
                 ("o", "HONOR_RETRY_AFTER", "1"),
-                // Burst 2, one token per 100 s: the 429 and the refused connect below take both.
+                // Burst 3, one token per 100 s: the 429 and the refused connect take two.
                 ("o", "RATE_PER_SEC", "0.01"),
                 ("o", "RATE_BURST", "3"),
                 ("o", "BREAKER_FAILURES", "1"),
-                ("o", "BREAKER_OPEN_MS", "300"),
+                ("o", "BREAKER_OPEN_MS", "2000"),
                 ("o", "H1_UNSAFE_REUSE_MAX_IDLE_MS", "0"),
             ],
         ),
         Arc::clone(&conn),
     );
-    assert_eq!(status(&one(&d, &post("o", b"x")).await), 429); // token 1; holds 1 s
+    assert_eq!(status(&one(&d, &post("o", b"x")).await), 429); // token 1; holds 2 s
     let r = one(&d, &post("o", b"x")).await;
-    r.assert_error(
-        errc::RATE_LIMITED,
-        branch::RETRYABLE,
-        http_cause::RETRY_AFTER_HOLD,
-    );
-    tokio::time::sleep(Duration::from_millis(1_050)).await;
+    let left = r
+        .assert_error(
+            errc::RATE_LIMITED,
+            branch::RETRYABLE,
+            http_cause::RETRY_AFTER_HOLD,
+        )
+        .retry_after_ms
+        .unwrap();
+    // Wait at least the time named: the hold has then passed.
+    tokio::time::sleep(Duration::from_millis(u64::from(left) + 50)).await;
     conn.set(REFUSE);
     let r = one(&d, &post("o", b"x")).await; // token 2; opens the breaker
     assert_unavailable(&r, http_cause::CONNECT_REFUSED);
@@ -1040,4 +1042,81 @@ async fn the_admission_order_is_breaker_hold_then_rate() {
         http_cause::RATE_LIMITED,
     );
     assert_eq!(received(&up), 2);
+}
+
+// =================================================================================================
+// PARTITION=uid
+// =================================================================================================
+
+/// A sink that takes every frame at once (an engine-level exchange with no session).
+struct Accept;
+
+impl ResponseSink for Accept {
+    fn send<'a>(
+        &'a self,
+        _: SinkFrame,
+        _: Vec<u8>,
+        _: tokio::time::Instant,
+        _: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// **Under `PARTITION=uid` the connection caps are per partition** (§23.8.1: the key partitions
+/// connections), while the queue stays per upstream. With `MAX_CONNECTIONS=1`, a request from a
+/// second uid dials its own connection beside the first uid's held one, and a second request from
+/// the first uid waits for that uid's one connection and ends `queue_timeout`, unsent. Driven on the
+/// engine, because every session of this test process carries the same uid.
+#[tokio::test]
+async fn under_partition_uid_the_connection_caps_are_per_partition() {
+    let (up, gate) = scripted(vec![Act::Gated; 2]).await;
+    let d = daemon_on(
+        upstreams(
+            &[("p", up.addr)],
+            &[
+                ("p", "PARTITION", "uid"),
+                ("p", "MAX_CONNECTIONS", "1"),
+                ("p", "QUEUE_TIMEOUT_MS", "300"),
+            ],
+        ),
+        ScriptConnect::new(TCP),
+    );
+    let run = |uid: u32| {
+        let e = Arc::clone(&d.engine);
+        tokio::spawn(async move {
+            e.exchange(
+                &idempotent_get("p"),
+                Some(uid),
+                Instant::now(),
+                &CancellationToken::new(),
+                &Accept,
+            )
+            .await
+        })
+    };
+    let first = run(1001);
+    wait_for("uid 1001 at the upstream", || received(&up) == 1).await;
+    let other = run(1002);
+    wait_for("uid 1002 at the upstream", || received(&up) == 2).await;
+    assert_eq!(up.rec.conns(), 2, "one connection per partition");
+    match run(1001).await.unwrap() {
+        Terminal::Error(ep) => assert_eq!(
+            (ep.code, ep.branch, ep.detail.as_deref()),
+            (
+                errc::POOL_TIMEOUT,
+                branch::RETRYABLE,
+                Some(http_cause::QUEUE_TIMEOUT)
+            ),
+            "{ep:?}"
+        ),
+        t => panic!("expected queue_timeout, got {t:?}"),
+    }
+    assert_eq!(received(&up), 2);
+    gate.add_permits(2);
+    for t in [first.await.unwrap(), other.await.unwrap()] {
+        assert!(matches!(t, Terminal::Done(_)), "{t:?}");
+    }
+    assert_eq!(d.engine.idle_connections_for("p", 1001), 1);
+    assert_eq!(d.engine.idle_connections_for("p", 1002), 1);
 }

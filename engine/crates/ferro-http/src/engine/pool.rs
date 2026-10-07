@@ -414,6 +414,13 @@ mod tests {
         ("u".into(), None)
     }
 
+    /// A wait that must end, bounded so a mutant that never wakes it fails instead of hanging.
+    async fn within<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(5), f)
+            .await
+            .expect("a wait that must end did not end within 5 s")
+    }
+
     /// Still waiting after a generous grace: a wait that never ends under correct code.
     async fn pending<F: std::future::Future>(f: F) -> bool {
         tokio::time::timeout(Duration::from_millis(100), f)
@@ -465,7 +472,7 @@ mod tests {
         assert!(pending(pools.take(&key, policy(true), caps)).await);
         drop(d1); // a failed dial frees its slot
         assert_eq!(pools.connection_count(&key), 1);
-        let Take::Dial(d3) = pools.take(&key, policy(true), caps).await else {
+        let Take::Dial(d3) = within(pools.take(&key, policy(true), caps)).await else {
             panic!("dial")
         };
         let s3 = d3.connected();
@@ -478,7 +485,7 @@ mod tests {
         tokio::pin!(waiter);
         assert!(pending(&mut waiter).await);
         drop(c2); // a connection dropped anywhere frees its slot and wakes the waiter
-        assert!(matches!(waiter.await, Take::Dial(_)));
+        assert!(matches!(within(waiter).await, Take::Dial(_)));
         drop(s3);
     }
 
@@ -500,7 +507,7 @@ mod tests {
         assert!(pending(&mut waiter).await);
         let s1 = d1.connected();
         assert_eq!(pools.dial_count(&key), 0);
-        let Take::Dial(d2) = waiter.await else {
+        let Take::Dial(d2) = within(waiter).await else {
             panic!("dial")
         };
         assert_eq!(pools.connection_count(&key), 2);
@@ -521,7 +528,7 @@ mod tests {
         tokio::pin!(waiter);
         assert!(pending(&mut waiter).await);
         pools.checkin(key.clone(), c, 1);
-        assert!(matches!(waiter.await, Take::Idle(_)));
+        assert!(matches!(within(waiter).await, Take::Idle(_)));
     }
 
     /// Full, with only connections too idle for a non-idempotent request: the idlest is closed to
@@ -562,7 +569,7 @@ mod tests {
         // An idempotent request still reuses the one left.
         drop(d);
         assert!(matches!(
-            pools.take(&key, policy(true), caps).await,
+            within(pools.take(&key, policy(true), caps)).await,
             Take::Idle(_)
         ));
     }

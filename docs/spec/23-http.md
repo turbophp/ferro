@@ -458,7 +458,7 @@ Not terminal and not flagged `STREAM`. It debits the request's credit like `STRE
 
    Time from (e) to step 6 is `queue_us`. The request's total deadline runs from step 1. A deadline that elapses before dispatch, or after dispatch while nothing has been sent (§23.7.1, "dispatched, not sent"), is Retryable `PoolTimeout` (`deadline`).
 
-   *[Amended M6-F4b (SPEC §22.2 (db)): (a) and (d) are built; (b), (c) and (e) are slice F6's.]*
+   *[Amended M6-F4b (SPEC §22.2 (db)): (a) and (d) are built; (b), (c) and (e) are slice F6's.]* *[Amended M6-F6 (SPEC §22.2 (dk)): (b), (c) and (e) are built, in this order, after validation, and so are step 5's `MAX_REQUESTS`, `MAX_CONNECTIONS` and `MAX_DIALS`. The queue's bound (`QUEUE_TIMEOUT_MS`, or the request's deadline when that is nearer) also covers step 5's wait for a connection, and `queue_us` covers both waits.]*
 5. **Acquire a connection** under `MAX_REQUESTS`, `MAX_CONNECTIONS` and `MAX_DIALS`. Reuse an idle one (§23.8.2), or dial: DNS, the address guard, TCP to the checked `SocketAddr`, TLS. Dialling another address after a failed dial is not a retry, because no byte of the request exists anywhere yet.
 6. **Dispatch.** Arm the write tracker (§23.7.1) and hand the request to `hyper`.
 7. **Head.** On a final response head, send `HEAD`. **The transport's part of the fate is now settled:** the upstream answered, and no transport outcome after this point can be "maybe not received". What the status means (applied? retry?) is §23.7.4's, and lives in PHP.
@@ -655,6 +655,8 @@ After a cancel, a timeout, or an abandoned body, an HTTP/1.1 connection is **dis
 
 *[Amended M6-F4a (SPEC §22.2 (cz)): under `PARTITION=uid` a peer the transport did not attest is REFUSED (`forbidden_upstream`), as an `ALLOW_UIDS` upstream refuses it — pooling every unattested peer together is the cross-tenant sharing the key exists to prevent. A connection checked out and handed back UNUSED (a `CANCEL` or deadline caught just before dispatch) keeps its idle time. Also: a connection whose exchange COMPLETED is returned to the pool before the request's terminal is declared, and only once `hyper` reports it ready for its next request (bounded at 250 ms; otherwise it is discarded), so a request the client sends after the `END` finds it. A response carrying `Connection: close` is discarded. Until slice F6, `MAX_CONNECTIONS` bounds only how many IDLE connections a sub-pool retains; `MAX_REQUESTS`, `MAX_DIALS` and the queue are F6's.]*
 
+*[Amended M6-F6 (SPEC §22.2 (dk)): **`MAX_CONNECTIONS` bounds the connections that exist** in a sub-pool — idle, in use and being dialled — and `MAX_DIALS` the dials in progress. Both are per sub-pool, so per (upstream, uid) under `PARTITION=uid`, which partitions connections (§23.8.1). A request that finds neither a usable idle connection nor room to dial waits for one, within the queue's bound (§23.6 step 4 (e)). When the sub-pool is full and every idle connection is unusable for THIS request (too idle for a non-idempotent one), the idlest is closed to make room, so such a request never waits behind connections it may not use. **Cost, stated:** an exchange holds its HTTP/1.1 connection until its terminal, so with the defaults at most 32 exchanges per upstream (per partition) run at once on the host. A 33rd concurrent request — behind 32 long LLM streams, say — waits up to `QUEUE_TIMEOUT_MS` (5 s) and then fails Retryable `queue_timeout`, unsent, where curl in each worker would have opened another connection. Operators size `MAX_CONNECTIONS` and `MAX_REQUESTS` for their streaming concurrency.]*
+
 #### 23.8.3 HTTP versions (review F1, F16 a)
 
 *[Amended 2026-10-06 (owner decision, SPEC §22.2 (de)): **HTTP/2 is deferred past v1.** In v1 every request uses HTTP/1.1, whatever its idempotency, and `HTTP=auto` is refused, disabling that upstream at config load (§23.3.1). The `HTTP=auto` bullet, the two bullets on what HTTP/2 does and costs, and the post-v1 gate below describe slice F5b and the HTTP/2-writes slice after it, both post-v1. **Cost:** no host-wide HTTP/2 multiplexing in v1, even for declared reads. Admission point A rests on the HTTP/1.1 keep-alive pool and TLS session resumption alone (§23.1).]*
@@ -744,6 +746,16 @@ An IP-literal `ORIGIN` implicitly admits its own literal, unless that literal is
   | **Any other terminal:** Indeterminate, non-counted timeout, `Cancelled`, a refusal, or the session dying or the request being cancelled before dispatch | **half-open**, with the slot released, so the next request probes |
 
   The slot can never leak.
+
+  *[Amended M6-F6 (SPEC §22.2 (dk)), as built:*
+
+  - ***The queue.** `MAX_REQUESTS` slots per upstream, held from admission step (e) to the terminal. At most `MAX_QUEUED` requests wait for one, first come first served; one more is refused at once (`queue_full`), and `MAX_QUEUED=0` means nothing waits. A waiter is refused after `QUEUE_TIMEOUT_MS` (`queue_timeout`), or at its own deadline when that is nearer (`deadline`). All three are Retryable `PoolTimeout`, unsent. The queue is per upstream, under `PARTITION=uid` too.*
+  - ***Counted failures.** `connect` is the "before dispatch" `dns`, `connect_refused`, `connect_unreachable`, `connect_timeout` and `tls_handshake`. The timeout that `connect+timeout` adds is the "sent, no head" `timeout` only: the upstream took the request and produced no head by the deadline. A deadline before dispatch, `read_idle` and a timeout after the head are not counted; the first never reached the upstream, and the others had its answer. `connect+timeout+5xx` adds a final head of 502, 503 or 504, which the client still receives as the `Ok` exchange it is (§23.7.4).*
+  - ***What resets the count:** a final head that is not counted. Any other terminal neither counts nor resets. A request admitted while the breaker was closed, before it opened, moves nothing when it ends later.*
+  - ***When the outcome is taken:** at the final head (§23.6 step 7), so a probe whose head arrived closes the breaker even if its body then fails. Only the probe moves a half-open breaker.*
+  - ***The RAII guard** is the request's breaker ticket, held to its terminal. A probe that a later admission step refuses (the rate limit, the body budget, the queue), that is `CANCEL`led, whose session dies, or whose exchange is dropped or unwound by a panic, releases the slot by being dropped. Each case is pinned by a test.*
+  - *`breaker_probe_busy` carries no `retry_after_ms`. Only `breaker_open` has a time to name; how long the probe takes is unknown. This is the classifier F4a built (§23.7.1's table names `retry_after_ms` "for the breaker").*
+  - *Within step (b) the breaker is consulted first, then the hold.]*
 - **Why only connect failures count by default:** that is where the stampede happens (§19.4), and they are never Indeterminate.
 
 #### 23.8.7 Host-level rate limits
@@ -751,6 +763,16 @@ An IP-literal `ORIGIN` implicitly admits its own literal, unless that literal is
 - **The bucket.** One token bucket per upstream (`RATE_PER_SEC`, `RATE_BURST`), shared host-wide. This is the AI-gateway feature. It approximates a per-key provider limit, and the documentation says so.
 - **No token.** `RATE_MAX_WAIT_MS=0` (the default) fails fast with `RateLimited` and the time to the next token. Otherwise the request waits up to `min(RATE_MAX_WAIT_MS, remaining deadline)`.
 - **Retry-After hold** (`HONOR_RETRY_AFTER=1`, opt-in). A completed 429, or a 503 with `Retry-After` ≤ `RETRY_AFTER_MAX_MS`, holds the upstream. Later admissions fail fast (`retry_after_hold`). The hold is off by default, because one tenant's 429 would throttle every app on the upstream.
+
+*[Amended M6-F6 (SPEC §22.2 (dk)), as built:*
+
+- ***The bucket** is GCRA in exact integer nanoseconds: one token every `1 / RATE_PER_SEC` s, and `RATE_BURST` tokens from a full bucket. A token is taken at step (c), so a request refused later (by the budget or the queue) has used one, and a request refused at (a) or (b) takes none. A request stopped while it WAITS for its token (`CANCEL`, the drain cap) gives the token back. `retry_after_ms` is the time to the next token, rounded up, and at least 1. A wait longer than `min(RATE_MAX_WAIT_MS, remaining deadline)` is refused at once rather than waited out.*
+- ***The hold is taken at the head.** "A completed 429" is read as a 429 head: the hold applies when the head arrives (§23.6 step 7), as the breaker's outcome does, and the response is still delivered as the `Ok` exchange it is. Both statuses need a `Retry-After`: exactly one field, whose value is `delta-seconds`, greater than 0 and at most `RETRY_AFTER_MAX_MS`. The upstream is then held for that delay. Each of these holds nothing:*
+  - *a 429 with no `Retry-After`, which names no duration;*
+  - *a delay above the ceiling (the ceiling bounds what one response can do to every app on the host);*
+  - *an HTTP-date `Retry-After`, which v1 does not interpret.*
+
+  *A later, shorter hold never shortens a longer one. A `retry_after_hold` refusal is Retryable `RateLimited`, with `retry_after_ms` the time left.]*
 
 #### 23.8.8 TLS
 
@@ -1305,6 +1327,8 @@ All cases run in `ferrod`'s tests against a Rust fault-injecting upstream that *
 
 *Every cell is client-synthesised, cause `link_lost`. After a relaunch the same connection serves again, and the upstream received each request exactly once and the unsent one never.]*
 
+*[Amended M6-F6 (SPEC §22.2 (dk)): **cases 9 and 10 are `ferrod`'s `http_f6_it`.** Case 9 counts dials at a connector seam. Three refused connects open a `BREAKER_FAILURES=3` breaker; a POST and two GETs are then refused `breaker_open` with zero dials and nothing received, and the probe's head closes the breaker while a request beside it is `breaker_probe_busy`. The test asserts that a probe which ends without an answer leaves the breaker half-open with the slot released (the next request is the probe, and a request beside THAT one is `breaker_probe_busy`) in every way it can end: Indeterminate (`eof_empty`), `CANCEL` before dispatch and after sending, session death, and a refusal by the rate limit and by the body budget. A counted probe failure opens the breaker again. Case 10 spends a burst of 3 across two sessions, refuses the fourth request with a `retry_after_ms` checked against bounds taken from the test's own instants, and checks the refill.]*
+
 ---
 
 ### 23.15 Slice plan
@@ -1341,7 +1365,7 @@ Every slice runs the adversarial review before push (D15's process note). Every 
   - *A FIFO is refused.*
   - *Mutations re-run: 21 distinct, all killed, including the reviewer's two survivors.]* | A client-certificate refusal is never `Indeterminate`, or the cost is stated. *[D23 states the cost.]* |
 | **F5b** *(DEFERRED post-v1, owner decision 2026-10-06, SPEC §22.2 (de))* | `HTTP=auto`: the HTTP/2 sub-pool for effectively-idempotent requests. Chaos 7. **Cuttable** without touching anything else. *[Cut, as this row allowed. In v1 `HTTP=auto` is refused, disabling that upstream at config load (§23.3.1).]* | Multiplexing for declared reads; writes provably stay on HTTP/1.1. |
-| **F6** | Limits: concurrency, queue, breaker (with the RAII probe), rate limit, hold. Chaos 9, 10. | Host-level coordination, every refusal unsent. |
+| **F6** *(BUILT, §22.2 (dk); DONE when merged)* | Limits: concurrency, queue, breaker (with the RAII probe), rate limit, hold. Chaos 9, 10. *[As built (§22.2 (dk)): no `/proto` change, because every admission cause, code and fate cell was already keyed (F2) and classified (F4a). `MAX_CONNECTIONS` now bounds live connections rather than idle retention (§23.8.2 as amended). The choices §23 left open are recorded in §23.8.6 and §23.8.7 as amended.]* | Host-level coordination, every refusal unsent. *[Every admission cause is now reachable and asserted end to end with its upstream's receive count unchanged: `breaker_open`, `breaker_probe_busy`, `rate_limited`, `retry_after_hold`, `queue_full`, `queue_timeout`, and `deadline` in the queue.]* |
 | **F7** | Observability: spans from `otelcol`, metrics, slow log, the canary gate. | The redaction contract, mutation-proven. |
 | **F8** *(BUILT, §22.2 (dd); DONE when merged)* | The native PHP API: `upstream()`, Futures, streams, §23.7.3, (cj) lifted for HTTP. Chaos 8. **Requires D1c.** | DB and HTTP fan-out on one socket, including a 30 s-TTFB call beside a DB write. *[As built, §22.2 (dd): built whole, with no `/proto` or engine change. Both claims are measured live: two 400 ms calls, a 400 ms query and an INSERT take about 0.4 s, against ~1.2 s sequential; and a 30 s TTFB beside a DB write passes under the default configuration. Chaos 8 is asserted cell by cell. Every exchange here is plaintext `http`; F5a's TLS merged while it was built.]* |
 | **F9** | `ferro/guzzle` (cause mapping, `delay` scheduling, `FerroResponse`, decider), `ferro/psr18`, the Laravel Factory rebinding with the `Http::fake()` proof. | The seams, config-only where the ecosystem allows it. |

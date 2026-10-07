@@ -10,11 +10,17 @@
 //! 2. **Bounds** (§23.8.4): the total deadline runs from DECODE (`started`); each bound is
 //!    `min(request field ?? upstream default, upstream ceiling)` — `read_timeout_ms` has no ceiling,
 //!    `READ_TIMEOUT_MS` being only its default.
-//! 3. **Admit** (§23.6 step 4, F4b): (a) the daemon's drain — a request that arrives while it is
-//!    draining is refused `draining`; (d) the body budget ([`budget`]) — over either account,
-//!    `body_budget`. Breaker, rate limit and the queue (b, c, e) are slice F6's.
+//! 3. **Admit** (§23.6 step 4, in its order; F4b and F6): (a) the daemon's drain — a request that
+//!    arrives while it is draining is refused `draining`; (b) the breaker, then the Retry-After
+//!    hold, and (c) the rate limit ([`limits`]); (d) the body budget ([`budget`]) — over either
+//!    account, `body_budget`; (e) the queue — a `MAX_REQUESTS` slot held to the terminal, at most
+//!    `MAX_QUEUED` waiting, each for at most `QUEUE_TIMEOUT_MS`. Every refusal is "before dispatch":
+//!    unsent and Retryable. The breaker's ticket is held to the terminal and settled by it — an RAII
+//!    guard, so a probe that ends any other way releases the half-open slot.
 //! 4. **Acquire** (step 5): reuse an idle connection (§23.8.2) or dial: DNS, the address guard,
-//!    TCP to the checked `SocketAddr` (§23.8.5). A deadline or `CANCEL` here is "before dispatch".
+//!    TCP to the checked `SocketAddr` (§23.8.5) — under the sub-pool's `MAX_CONNECTIONS` and
+//!    `MAX_DIALS`, waiting for room within the queue's bound ([`pool`]). A deadline or `CANCEL`
+//!    here is "before dispatch".
 //! 5. **Dispatch** (step 6): arm the write tracker, hand the request to `hyper`.
 //! 6. **Head** (step 7): a 101 is `informational_101`, a head over [`MAX_HEAD_BYTES`] by the engine's
 //!    exact measure is `oversize_head`; both are "sent, no head". Otherwise one `HEAD` frame — with
@@ -55,8 +61,7 @@
 //! the refusal ([`tls::client_auth_alert`]: the terminal's message and a `warn`), so an operator
 //! can tell a rejected certificate from a dropped link; it never changes the fate or the token.
 //!
-//! **Slice F6:** concurrency limits, the queue, breaker and rate limits. **F7:** metrics, spans and
-//! the slow log.
+//! **Slice F6** (SPEC §22.2 (dk)): the limits above. **F7:** metrics, spans and the slow log.
 
 pub mod body;
 pub mod budget;

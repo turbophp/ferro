@@ -799,6 +799,41 @@ C1f and C1g results docs.
 
 ---
 
+## Ferro HTTP (outbound requests through `ferrod`)
+
+Ferro HTTP's own drop-in surfaces (the Guzzle handler, PSR-18, the Laravel `Http` wiring) are not
+built yet, so this section is short. It records behaviour of the engine that any of them will show,
+measured against what curl in each PHP worker would have done.
+
+### The engine refuses a request curl would have sent: host-wide limits
+
+The engine enforces each upstream's limits **once for the whole host**, where curl in each worker
+knows only about its own requests (SPEC §22.2 (dk)). Each refusal comes before anything is sent. It
+is Retryable, carries a cause token, and is never retried by the engine itself.
+
+- **Concurrency and queueing, on by default.** An HTTP/1.1 exchange holds its connection until it
+  ends, and an upstream has at most `MAX_CONNECTIONS` connections (default 32) and `MAX_REQUESTS`
+  requests in flight (128). A request beyond those limits waits up to `QUEUE_TIMEOUT_MS` (5 s), and
+  then fails `queue_timeout`. When `MAX_QUEUED` requests (256) are already waiting, it fails
+  `queue_full` at once. Thirty-two long LLM streams therefore make the 33rd concurrent call to that
+  upstream wait and then fail, where curl would have opened a 33rd connection. Size the two limits for
+  your streaming concurrency.
+- **The circuit breaker, on by default.** After `BREAKER_FAILURES` consecutive connect failures (5:
+  DNS, TCP connect, TLS handshake), every request to the upstream fails at once, `breaker_open`, for
+  `BREAKER_OPEN_MS` (5 s), with no connection attempt. Then one request probes the upstream, and any
+  other request in the meantime fails `breaker_probe_busy`. One tenant's failures can open the
+  breaker for every app on the host. That is the design (SPEC §23.1), and the cost.
+- **The rate limit and the Retry-After hold, opt-in.** `RATE_PER_SEC` shares one token bucket among
+  every worker on the host (`rate_limited`). `HONOR_RETRY_AFTER=1` makes one 429 or 503 that carries a
+  `Retry-After` of at most `RETRY_AFTER_MAX_MS` hold the upstream for every app until the delay
+  passes (`retry_after_hold`). A `Retry-After` given as an HTTP date does not hold, because v1 does not
+  interpret it.
+
+Every refusal carries a `retry_after_ms` where the engine knows a time (an open breaker, a rate limit,
+a hold), and none where it does not (a busy probe, a full queue).
+
+---
+
 ## Not supported, and where it went
 
 - **SQLite: supported since M2/C3.** A pool is spelled `sqlite:///path/to/file.db` on `ferrod` —

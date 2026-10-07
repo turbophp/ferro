@@ -928,12 +928,20 @@ mod tests {
             BeforeDispatch::QueueFull
         );
         drop(p);
-        let p2 = waiter.await.unwrap().unwrap();
+        let p2 = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter got the freed slot")
+            .unwrap()
+            .unwrap();
         assert_eq!(g.waiting(), 0);
         assert_eq!(
-            g.acquire(Instant::now() + ms(20), BeforeDispatch::Deadline)
-                .await
-                .unwrap_err(),
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                g.acquire(Instant::now() + ms(20), BeforeDispatch::Deadline)
+            )
+            .await
+            .expect("a waiter is refused at its bound, never left waiting")
+            .unwrap_err(),
             BeforeDispatch::Deadline
         );
         assert_eq!(g.waiting(), 0, "a timed-out waiter leaves the queue");
