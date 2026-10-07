@@ -1951,7 +1951,10 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
     - fmt;
     - clippy `-p ferrod -p ferro-queue --all-targets -D warnings` (scoped at the coordinator's request, because a workspace clippy was running concurrently) and `-p ferrod --no-default-features --all-targets`;
     - `ferro-queue` 50; `ferrod` lib 249; `queue_g2_it` 14, `queue_g1a_it` 12 and `queue_g1b_it` 19 + 1 ignored, live on PostgreSQL 16;
+    - `tx_it` 15 and `chaos_fate_it` 9, because the actor's `Exec` arm now runs through the extracted `run_interruptible`;
     - `ci/check-incompatibilities-doc.sh`.
+
+    All of the above were re-run on the tree with `main` merged in.
 
     `/proto`'s registry, vectors and codecs are untouched; the only `/proto` edit is one prose sentence in `PROTOCOL.md` §14, so no regeneration or PHP run was needed.
 
