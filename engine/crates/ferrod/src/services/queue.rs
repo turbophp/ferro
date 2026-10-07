@@ -619,7 +619,10 @@ async fn bounded_query<B: PoolBackend>(
             }
         }
     };
-    (answer, u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
+    (
+        answer,
+        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+    )
 }
 
 /// The error of an ABANDONED waker statement: a cancel sent and never confirmed. Keyed as a cancel

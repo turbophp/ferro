@@ -366,9 +366,10 @@ impl TxRegistry {
     /// ended liveness AFTER it would still win every race; a slow one makes the order observable. Zero
     /// (the default) in production.
     pub fn delay_abort_for_test(&self, delay: Duration) {
-        self.inner
-            .abort_delay_ms
-            .store(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.inner.abort_delay_ms.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Draw the next session id: monotonic, distinct per call, never reused. One per accepted

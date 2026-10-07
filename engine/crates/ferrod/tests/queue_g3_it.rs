@@ -58,7 +58,11 @@ fn tmp_socket() -> PathBuf {
 }
 
 /// A real `serve` accept loop (so its `Drain` reaches every session, §23.6.1) with the `jobs` store.
-fn queue_server(dsn: &str, vars: &[(&str, &str)], drain: Drain) -> (PathBuf, Arc<PoolRegistry>) {
+fn queue_server(
+    dsn: &str,
+    vars: &[(&str, &str)],
+    drain: Drain,
+) -> (PathBuf, Arc<PoolRegistry>, Arc<TxRegistry>) {
     let socket = tmp_socket();
     let mut config = Config {
         socket_path: socket.clone(),
@@ -95,10 +99,10 @@ fn queue_server(dsn: &str, vars: &[(&str, &str)], drain: Drain) -> (PathBuf, Arc
         BootEpoch(1),
         drain,
         registry.clone(),
-        tx_registry,
+        tx_registry.clone(),
         factory,
     ));
-    (socket, registry)
+    (socket, registry, tx_registry)
 }
 
 async fn raw_connect(url: &str) -> tokio_postgres::Client {
@@ -115,6 +119,7 @@ async fn raw_connect(url: &str) -> tokio_postgres::Client {
 struct World {
     socket: PathBuf,
     registry: Arc<PoolRegistry>,
+    tx: Arc<TxRegistry>,
     raw: tokio_postgres::Client,
     schema: String,
     table: String,
@@ -124,6 +129,12 @@ struct World {
 
 impl World {
     async fn new(tag: &str, extra: &[(&str, &str)]) -> Option<World> {
+        World::via(tag, extra, None).await
+    }
+
+    /// A world whose POOL reaches PostgreSQL through `pool_url` (a proxy), while the raw side
+    /// connection goes direct.
+    async fn via(tag: &str, extra: &[(&str, &str)], pool_url: Option<String>) -> Option<World> {
         let url = pg_url()?;
         let raw = raw_connect(&url).await;
         let schema = next_tag(tag);
@@ -161,10 +172,12 @@ impl World {
         vars.extend_from_slice(extra);
         let app = schema.clone();
         let drain = Drain::new();
-        let (socket, registry) = queue_server(&with_app(&url, &app), &vars, drain.clone());
+        let pool_url = pool_url.unwrap_or_else(|| url.clone());
+        let (socket, registry, tx) = queue_server(&with_app(&pool_url, &app), &vars, drain.clone());
         let w = World {
             socket,
             registry,
+            tx,
             raw,
             schema,
             table,
@@ -828,6 +841,12 @@ async fn a_dropped_session_never_keeps_its_reservation() {
         return;
     };
     w.slow(800).await;
+    // Review F2: a slow `abort_session` makes the teardown ORDER observable — `liveness.end()` must
+    // come BEFORE `cancel_all()`, or a handler woken by the cancel sees a live session: the
+    // non-waiting RESERVE is then interrupted (an `Indeterminate` phantom, no unreserve) and the
+    // waiting one is unreserved as a CANCEL. With an instant `abort_session` the wrong order still
+    // wins every race, which is how mutation M4 survived the first suite.
+    w.tx.delay_abort_for_test(Duration::from_millis(1_500));
     let m = Arc::clone(w.waker().metrics());
     for (n, (wait_ms, queue)) in [(20_000u32, "waiting"), (0, "immediate")]
         .into_iter()
@@ -845,7 +864,16 @@ async fn a_dropped_session_never_keeps_its_reservation() {
         .await;
         assert_eq!(w.row(id).await, Some((0, None)), "restored exactly");
     }
-    assert_eq!(w.waker().metrics().reserve_unconfirmed_count(), 0);
+    assert_eq!(
+        w.waker().metrics().reserve_unconfirmed_count(),
+        0,
+        "never interrupted"
+    );
+    assert_eq!(
+        m.unreserved_count(UnreserveCause::Cancel),
+        0,
+        "never taken for a CANCEL"
+    );
     w.drop_schema().await;
 }
 
@@ -1441,5 +1469,313 @@ async fn chaos_row_12_dropped_sessions_lose_nothing() {
             .unreserved_count(UnreserveCause::Teardown)
     );
     assert!(phantoms <= drops, "{phantoms} > {drops}");
+    w.drop_schema().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round (adopted from the adversarial review of 3e8a19e)
+// ---------------------------------------------------------------------------------------------
+
+/// A TCP proxy to PostgreSQL that can FREEZE every connection open at that instant: it stops
+/// relaying in both directions and keeps the sockets open, as a black-holed link, a failover or a
+/// dropped NAT entry does. Connections opened later relay normally.
+struct FreezeProxy {
+    url: String,
+    conns: Arc<std::sync::Mutex<Vec<Arc<std::sync::atomic::AtomicBool>>>>,
+}
+
+impl FreezeProxy {
+    async fn start(pg_url: &str) -> FreezeProxy {
+        let at = pg_url.find('@').expect("a DSN with credentials") + 1;
+        let end = at + pg_url[at..].find('/').expect("a DSN with a database");
+        let upstream = pg_url[at..end].to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "{}{}{}",
+            &pg_url[..at],
+            listener.local_addr().unwrap(),
+            &pg_url[end..]
+        );
+        let conns: Arc<std::sync::Mutex<Vec<Arc<std::sync::atomic::AtomicBool>>>> = Arc::default();
+        let list = Arc::clone(&conns);
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                list.lock().unwrap().push(Arc::clone(&frozen));
+                let (cr, cw) = client.into_split();
+                let (sr, sw) = server.into_split();
+                tokio::spawn(relay(cr, sw, Arc::clone(&frozen)));
+                tokio::spawn(relay(sr, cw, frozen));
+            }
+        });
+        FreezeProxy { url, conns }
+    }
+
+    fn freeze(&self) -> usize {
+        let conns = self.conns.lock().unwrap();
+        for c in conns.iter() {
+            c.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        conns.len()
+    }
+}
+
+async fn relay(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    frozen: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 65_536];
+    loop {
+        let n = match from.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        if frozen.load(std::sync::atomic::Ordering::SeqCst) {
+            // Silent forever, sockets held open: nothing is relayed and nothing is closed.
+            std::future::pending::<()>().await;
+        }
+        if to.write_all(&buf[..n]).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// **Review F1 — a silent backend must not wedge the queue.** A sweep's connection goes silent
+/// mid-statement (the frozen proxy; the cancel side-dial still gets through, its answer never comes
+/// back). The waker's statement is bounded — `WAKER_STMT_TIMEOUT_MS`, then the cancel, then
+/// `WAKER_CANCEL_DRAIN` — so the statement is ABANDONED: its waiter is answered without the job (and,
+/// if the answer comes before its grace bound, `Indeterminate`, counted unconfirmed), its connection is
+/// discarded rather than leaked or recycled, the `(store, queue)` is no longer in flight, and the next
+/// waiter on the same queue is served the job over a fresh connection. Before the fix the queue stayed
+/// in flight until TCP gave up, and every waiter got `Ok{jobs: []}` for hours.
+#[tokio::test]
+async fn a_silent_backend_does_not_wedge_the_queue() {
+    let Some(url) = pg_url() else { return };
+    let proxy = FreezeProxy::start(&url).await;
+    let Some(w) = World::via(
+        "silent",
+        &[
+            ("FERRO_QUEUE_JOBS_WAKER_STMT_TIMEOUT_MS", "300"),
+            ("FERRO_QUEUE_JOBS_POLL_MS", "200"),
+        ],
+        Some(proxy.url.clone()),
+    )
+    .await
+    else {
+        return;
+    };
+    w.slow(1_500).await;
+    let id = w.put("wq").await;
+    let mut c = w.session().await;
+    let rid = c.reserve_send(&["wq"], 2_000).await;
+    w.sweep_in_flight().await;
+    assert!(proxy.freeze() > 0);
+    let o = c.reserve_result(rid, Duration::from_secs(8)).await;
+    match &o {
+        Outcome::Ok(_) => assert!(jobs_of(&o).is_empty(), "{o:?}"),
+        Outcome::Error(ep) => assert_eq!(ep.branch, branch::INDETERMINATE, "{ep:?}"),
+        other => panic!("{other:?}"),
+    }
+    let waker = Arc::clone(w.waker());
+    eventually(
+        || waker.settled(),
+        "the abandoned sweep is no longer in flight",
+    )
+    .await;
+    assert_eq!(
+        waker.metrics().reserve_unconfirmed_count(),
+        1,
+        "counted unconfirmed"
+    );
+    let pool = w.registry.get("default").unwrap();
+    eventually(|| pool.gauges().in_use == 0, "no checkout leaked").await;
+    w.slow(0).await;
+    // The backend cancelled the statement, so the job is available; the queue serves it. (An idle
+    // connection frozen with the rest may be checked out first: its sweep is abandoned and discarded
+    // the same way — its bytes never reached the backend — so a later waiter is served.)
+    let mut served = Vec::new();
+    for _ in 0..4 {
+        let rid = c.reserve_send(&["wq"], 5_000).await;
+        match c.reserve_result(rid, Duration::from_secs(10)).await {
+            Outcome::Error(ep) => assert_eq!(ep.branch, branch::INDETERMINATE, "{ep:?}"),
+            o => {
+                served = jobs_of(&o).iter().map(id_of).collect();
+                if !served.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    assert_eq!(served, vec![id], "the queue recovered");
+    w.drop_schema().await;
+}
+
+/// The waker's statement timeout with a backend that ANSWERS (review R1): the waiter it served is
+/// told `Indeterminate` (a sent RESERVE cancelled, §24.8), it is counted unconfirmed, the backend's
+/// cancel left the row available, and the queue serves the next waiter.
+#[tokio::test]
+async fn a_waker_statement_timeout_is_indeterminate_and_the_queue_recovers() {
+    let Some(w) = World::new(
+        "stmt_timeout",
+        &[("FERRO_QUEUE_JOBS_WAKER_STMT_TIMEOUT_MS", "300")],
+    )
+    .await
+    else {
+        return;
+    };
+    w.slow(1_500).await;
+    let id = w.put("default").await;
+    let mut c = w.session().await;
+    let rid = c.reserve_send(&["default"], 5_000).await;
+    let o = c.reserve_result(rid, Duration::from_secs(8)).await;
+    let Outcome::Error(ep) = &o else {
+        panic!("{o:?}")
+    };
+    assert_eq!(ep.branch, branch::INDETERMINATE, "{ep:?}");
+    let waker = Arc::clone(w.waker());
+    eventually(|| waker.settled(), "settled").await;
+    assert_eq!(waker.metrics().reserve_unconfirmed_count(), 1);
+    assert_eq!(
+        w.row(id).await,
+        Some((0, None)),
+        "the cancel left it available"
+    );
+    w.slow(0).await;
+    let rid = c.reserve_send(&["default"], 2_000).await;
+    let o = c.reserve_result(rid, Duration::from_secs(5)).await;
+    assert_eq!(jobs_of(&o).iter().map(id_of).collect::<Vec<_>>(), vec![id]);
+    w.drop_schema().await;
+}
+
+/// A sweep brings back more jobs than its remaining live waiters (review R2): a waiter registered
+/// DURING the sweep takes a leftover, the rest are unreserved — exactly once, against the rows.
+#[tokio::test]
+async fn leftovers_go_to_a_late_waiter_then_are_unreserved() {
+    let Some(w) = World::new("leftovers", &[]).await else {
+        return;
+    };
+    w.slow(300).await;
+    let ids = [w.put("q").await, w.put("q").await, w.put("q").await];
+    let mut a = w.session().await;
+    let mut b = w.session().await;
+    let mut cc = w.session().await;
+    let ra = a.reserve_send(&["q"], 20_000).await;
+    let rb = b.reserve_send(&["q"], 20_000).await;
+    let rc = cc.reserve_send(&["q"], 20_000).await;
+    w.sweep_in_flight().await;
+    b.c.cancel(rb).await;
+    cc.c.cancel(rc).await;
+    let mut d = w.session().await;
+    let rd = d.reserve_send(&["q"], 20_000).await;
+    let outcomes = [
+        a.reserve_result(ra, Duration::from_secs(10)).await,
+        b.reserve_result(rb, Duration::from_secs(10)).await,
+        cc.reserve_result(rc, Duration::from_secs(10)).await,
+        d.reserve_result(rd, Duration::from_secs(10)).await,
+    ];
+    let waker = Arc::clone(w.waker());
+    eventually(|| waker.settled(), "settled").await;
+    let mut got = Vec::new();
+    for o in &outcomes {
+        if let Outcome::Ok(_) = o {
+            got.extend(jobs_of(o).iter().map(id_of));
+        }
+    }
+    let rows = w.all_rows().await;
+    for id in ids {
+        let (attempts, reserved_at) = rows[&id];
+        if got.contains(&id) {
+            assert_eq!((attempts, reserved_at.is_some()), (1, true), "{id}");
+        } else {
+            assert_eq!((attempts, reserved_at), (0, None), "{id}");
+        }
+    }
+    let mut unique = got.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), got.len(), "no job delivered twice");
+    w.drop_schema().await;
+}
+
+/// **Review F3 — a hint is not lost to a waiter busy on another queue.** W waits on `[A, B]` and is
+/// in a sweep of `A` (held in the trigger) that will bring it nothing (X, ahead of it, takes A's one
+/// job). A job then lands on `B` and its hint finds W busy. The trigger is kept and runs as soon as
+/// A's sweep frees W, so W gets B's job within its 3 s wait — the poll is ten minutes away. The
+/// control: the same hint with W idle serves it at once.
+#[tokio::test]
+async fn a_hint_waits_for_a_waiter_busy_on_another_queue() {
+    let Some(w) = World::new("hint_busy", &[]).await else {
+        return;
+    };
+    for control in [true, false] {
+        let mut x = w.session().await;
+        let mut wq = w.session().await;
+        let mut p = w.session().await;
+        let rx = x.reserve_send(&["A"], 20_000).await;
+        w.parked(1).await;
+        let rw = wq.reserve_send(&["A", "B"], 3_000).await;
+        w.parked(2).await;
+        if !control {
+            w.slow(800).await;
+            w.put("A").await;
+            // A delayed ENQUEUE on A fires A's hint: one sweep serving X and W, held in the trigger.
+            let o = p
+                .call(
+                    service::QUEUE,
+                    method_queue::ENQUEUE,
+                    enqueue_req("A", 600, None),
+                )
+                .await;
+            assert!(matches!(o, Outcome::Ok(_)), "{o:?}");
+            w.sweep_in_flight().await;
+        }
+        let b = p.enqueue("B", None).await;
+        let o = wq.reserve_result(rw, Duration::from_secs(6)).await;
+        assert_eq!(
+            jobs_of(&o).iter().map(id_of).collect::<Vec<_>>(),
+            vec![b],
+            "control={control}"
+        );
+        w.slow(0).await;
+        x.c.cancel(rx).await;
+        let _ = x.reserve_result(rx, Duration::from_secs(6)).await;
+        w.raw
+            .batch_execute(&format!("DELETE FROM {}", w.table))
+            .await
+            .unwrap();
+        let waker = Arc::clone(w.waker());
+        eventually(|| waker.settled() && waker.waiters() == 0, "settled").await;
+    }
+    w.drop_schema().await;
+}
+
+/// **Review F5 (M17) — a RESERVE arriving during a drain takes the NON-waiting path.** A sweep of the
+/// queue is in flight (holding job 1 for a parked waiter) when the drain begins; a waiting RESERVE that
+/// arrives then is served at once by its own statement (job 2, which `SKIP LOCKED` reaches past the
+/// held row) — not parked, which would answer `Ok{jobs: []}` without any statement. And the waiter
+/// whose sweep was in flight gets its job: a drain delivers, it does not release.
+#[tokio::test]
+async fn a_reserve_arriving_during_a_drain_is_served_without_waiting() {
+    let Some(w) = World::new("drain_arrival", &[]).await else {
+        return;
+    };
+    let j1 = w.put("d").await;
+    let j2 = w.put("d").await;
+    w.slow(800).await;
+    let mut c1 = w.session().await;
+    let mut c2 = w.session().await;
+    let r1 = c1.reserve_send(&["d"], 20_000).await;
+    w.sweep_in_flight().await;
+    w.drain.trigger();
+    let r2 = c2.reserve_send(&["d"], 20_000).await;
+    let o2 = c2.reserve_result(r2, Duration::from_secs(5)).await;
+    assert_eq!(jobs_of(&o2).iter().map(id_of).collect::<Vec<_>>(), vec![j2]);
+    let o1 = c1.reserve_result(r1, Duration::from_secs(5)).await;
+    assert_eq!(jobs_of(&o1).iter().map(id_of).collect::<Vec<_>>(), vec![j1]);
     w.drop_schema().await;
 }
