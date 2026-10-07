@@ -1464,8 +1464,11 @@ every duplicate and every phantom attempt is attributable to a counted or docume
     failures and zero unconfirmed reservations, so nothing is excused; the run must unreserve at least
     one job. The SIGKILL half drops connections mid-wait: no job lost, none delivered twice or carrying
     two attempts, and the jobs handed to a writer whose peer had already gone (§24.7's residual) never
-    outnumber the drops. Dedicated tests pin each unreserve cause deterministically — `cancel`,
-    `deadline`, `teardown` (waiting and non-waiting), GOODBYE — and the fence on all four values.]*
+    outnumber the drops. Rows are read back only once the waker reports no sweep and no unreserve
+    outstanding (a row read while a sweep sleeps uncommitted shows the pre-reservation state — a
+    mutation proved such a check vacuous). Dedicated tests pin each unreserve cause deterministically —
+    `cancel`, `deadline` (the grace bound and the request's own `timeout_ms`), `teardown` (waiting and
+    non-waiting), GOODBYE — and the fence on all four values.]*
 13. **Stale-holder fail path (F1).** The job times out (SIGALRM) or throws after its lease was taken.
     0 `failed_jobs` rows for it, `failed()` not called, and the second holder's run unaffected.
     Control: stock writes the row.
