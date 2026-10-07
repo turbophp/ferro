@@ -1379,4 +1379,96 @@ mod tests {
         assert_eq!(got.len(), usize::from(cap) + 5);
         assert!(w.metrics().polls(Trigger::Refill) >= 1);
     }
+
+    /// Review round 2 (R-c): a hint that arrives DURING a sweep that then fails is dropped with the
+    /// failure (I4: a failed poll is not retried), and stays dropped when a busy waiter of that queue
+    /// is later freed by another queue's sweep — F3's kept-trigger path must not resurrect it. X waits
+    /// on `a`; W on `[a, b]` and is busy in a held `b` sweep while a held `a` sweep (with a hint
+    /// queued behind it) fails. Freeing W must start no second `a` statement.
+    #[tokio::test]
+    async fn a_hint_during_a_failed_sweep_is_not_re_sent_when_a_busy_waiter_is_freed() {
+        type Map<T> = Arc<Mutex<HashMap<String, T>>>;
+        let gates: Map<Arc<Notify>> = Arc::default();
+        let fails: Map<bool> = Arc::default();
+        let counts: Map<usize> = Arc::default();
+        let jobs: Map<VecDeque<i64>> = Arc::default();
+        for q in ["a", "b"] {
+            gates
+                .lock()
+                .unwrap()
+                .insert(q.into(), Arc::new(Notify::new()));
+        }
+        let (g2, f2, c2, j2) = (gates.clone(), fails.clone(), counts.clone(), jobs.clone());
+        let r: Runner = Arc::new(move |stmt: Statement, _t: Duration| {
+            let (g2, f2, c2, j2) = (g2.clone(), f2.clone(), c2.clone(), j2.clone());
+            async move {
+                let queue = match &stmt.params[0] {
+                    Value::Text(q) => q.clone(),
+                    _ => unreachable!(),
+                };
+                *c2.lock().unwrap().entry(queue.clone()).or_default() += 1;
+                let gate = Arc::clone(&g2.lock().unwrap()[&queue]);
+                gate.notified().await;
+                if f2.lock().unwrap().remove(&queue).is_some() {
+                    return Err((PoolError::ConnectionLost, true));
+                }
+                let mut all = j2.lock().unwrap();
+                let list = all.entry(queue.clone()).or_default();
+                let rows = list.drain(..).map(|id| row(id, &queue)).collect();
+                Ok((
+                    QueryResult {
+                        rows,
+                        ..QueryResult::default()
+                    },
+                    0,
+                    0,
+                ))
+            }
+            .boxed()
+        });
+        let s = store("600000");
+        let w = Waker::new(&s, Arc::new(QueueMetrics::new("jobs", &[])));
+        w.bind(&s.table, || r);
+        let cnt = |q: &str| counts.lock().unwrap().get(q).copied().unwrap_or(0);
+        let gate = |q: &str| Arc::clone(&gates.lock().unwrap()[q]);
+        let far = Instant::now() + Duration::from_secs(5);
+        let x = w.register(&qs(&["a"]), 1, far).unwrap();
+        spin_while(|| cnt("a") < 1, "X's arrival sweep of a").await;
+        gate("a").notify_one();
+        let wb = w.register(&qs(&["a", "b"]), 1, far).unwrap();
+        spin_while(|| cnt("a") < 2, "W's arrival sweep of a").await;
+        gate("a").notify_one();
+        spin_while(|| cnt("b") < 1, "W's arrival sweep of b").await;
+        gate("b").notify_one();
+        spin_while(|| w.idle_waiters() < 2, "both parked").await;
+        w.hint("b", HintSource::Autocommit); // W busy in `b`, held
+        spin_while(|| cnt("b") < 2, "the b sweep").await;
+        w.hint("a", HintSource::Autocommit); // X in `a`, held
+        spin_while(|| cnt("a") < 3, "the a sweep").await;
+        w.hint("a", HintSource::Autocommit); // coalesced behind the held `a` sweep
+        fails.lock().unwrap().insert("a".into(), true);
+        gate("a").notify_one(); // the `a` sweep fails: X gets the failure
+        let ox = wait(&x, 2_000).await;
+        assert!(matches!(ox, WaitOutcome::Offer(Offer::Failed(_))), "{ox:?}");
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let a_before = cnt("a");
+        jobs.lock()
+            .unwrap()
+            .entry("a".into())
+            .or_default()
+            .push_back(9);
+        gate("b").notify_one(); // `b` brings W nothing: W is freed
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        let a_after = cnt("a");
+        gate("a").notify_one(); // release anything that did start, so nothing is left parked
+        let _ = wait(&wb, 300).await;
+        assert_eq!(
+            a_after, a_before,
+            "no `a` statement after the failure for a hint that arrived during it"
+        );
+    }
 }

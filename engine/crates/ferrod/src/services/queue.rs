@@ -563,11 +563,24 @@ pub const WAKER_CANCEL_DRAIN: Duration = Duration::from_secs(1);
 /// bounded by [`WAKER_CANCEL_DRAIN`]) and the statement's answer is awaited for at most
 /// [`WAKER_CANCEL_DRAIN`] more. A backend that answers neither — a black-holed link, a failover, a
 /// dropped NAT entry — no longer holds the `(store, queue)` in flight until TCP gives up: the statement
-/// is ABANDONED, its connection is DISCARDED (closed, never returned to the pool: a connection still
-/// running a statement handed to the next tenant is the M1-S8a hazard), and the outcome is a
-/// sent-and-unconfirmed cancel — `Indeterminate` for the waiters it served, counted in
-/// `reserve_unconfirmed_total`, its possible reservations left to their leases (they cannot be
-/// unreserved without being known). Worst case: `WAKER_STMT_TIMEOUT_MS + 2 × WAKER_CANCEL_DRAIN`.
+/// is ABANDONED, its connection is DISCARDED (never returned to the pool: a connection still running
+/// a statement handed to the next tenant is the M1-S8a hazard), and the outcome is a
+/// sent-and-unconfirmed cancel — `Indeterminate` for the waiters still waiting on it (one already
+/// past its grace bound has had its own `Ok{jobs:[]}`), counted in `reserve_unconfirmed_total`, its
+/// possible reservations left to their leases (they cannot be unreserved without being known).
+/// Worst case: `WAKER_STMT_TIMEOUT_MS + 2 × WAKER_CANCEL_DRAIN`; the bound on the cancel request
+/// itself is untested (review round 2, MC), and without it the worst case is
+/// `WAKER_STMT_TIMEOUT_MS + 3 s` (the PG cancel's own 2 s side-connection bound, §22.2 (aj), plus one
+/// drain).
+///
+/// **What a discard costs (review round 2, R-a).** Discarding drops the connection; it does not
+/// close it. `tokio-postgres` sends `Terminate` only once no response is pending, and the backend
+/// holds no handle on the driver task, so an abandoned connection's socket, driver task and server
+/// session — still running the RESERVE — live on until the backend answers or TCP gives up. Until
+/// then the server holds more sessions for the pool than `max_size`, by the number abandoned, and a
+/// black-holed link can abandon one per `WAKER_STMT_TIMEOUT_MS` per queue in flight. Closing the
+/// socket would need a driver abort handle on `PgConn` and a backend method for it — a pool change,
+/// not taken here.
 fn pg_runner<B: PoolBackend + 'static>(pool: Pool<B>) -> Runner {
     Arc::new(move |stmt: Statement, timeout: Duration| {
         let pool = pool.clone();

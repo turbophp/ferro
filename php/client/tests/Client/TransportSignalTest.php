@@ -10,14 +10,17 @@ use PHPUnit\Framework\TestCase;
 
 /**
  * SPEC §24.8 / §24.17 premise R4, reproduced on the REAL {@see Transport} (M7-G3): a signal delivered
- * while a read is blocked does not end the read early — PHP restarts the read with its FULL timeout,
- * and the async handler runs only after the read returns. So a signal can only LENGTHEN the
- * transport's tolerance, never make §24.8's wait bound unsafe: a worker SIGTERMed while its RESERVE
- * is parked keeps reading until the engine's terminal (bounded by `wait_ms + queue_wait_grace_ms`)
- * arrives.
+ * while a read is blocked does not end the read early. So a signal can only LENGTHEN the transport's
+ * tolerance, never make §24.8's wait bound unsafe: a worker SIGTERMed while its RESERVE is parked
+ * keeps reading until the engine's terminal (bounded by `wait_ms + queue_wait_grace_ms`) arrives.
  *
- * Measured when §24 was drafted (PHP 8.4.19, a bare socketpair): a 3 s timeout with SIGTERM at 1 s
- * returned at 4.00 s, timed out, and the handler had run. Both of the transport's read paths are
+ * On both read paths the read restarts with its FULL timeout at the signal. WHEN the async handler
+ * runs differs by path, and each is asserted (review round 2): on the `fread` path only after the
+ * read returns; on the `recvmsg` path DURING the read — the syscall returns EINTR, the client's loop
+ * ticks the VM (running the handler) and re-enters `recvmsg`.
+ *
+ * Measured when §24 was drafted (PHP 8.4.19, a bare socketpair, `fread`): a 3 s timeout with SIGTERM
+ * at 1 s returned at 4.00 s, timed out, and the handler had run. Both of the transport's read paths are
  * exercised — `fread` and, where ext-sockets offers it, `recvmsg` — in the default suite, so CI gates
  * both (its fread-only lane runs only `tests/Live`; review F5).
  */
