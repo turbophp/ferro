@@ -644,15 +644,28 @@ async fn a_waiting_reserve_honours_queue_priority_at_arrival() {
 /// `timeout_ms` below the wait bounds it too. Nothing is reserved by any of them.
 #[tokio::test]
 async fn the_wait_bound_holds_and_an_expired_wait_reserves_nothing() {
-    let Some(w) = World::new("bound", &[("FERRO_QUEUE_JOBS_MAX_WAIT_MS", "700")]).await else {
+    let Some(w) = World::new("bound", &[("FERRO_QUEUE_JOBS_MAX_WAIT_MS", "3000")]).await else {
         return;
     };
     let mut c = w.session().await;
     let grace = Duration::from_millis(u64::from(ferro_proto::consts::QUEUE_WAIT_GRACE_MS));
-    for (wait_ms, timeout_ms, floor) in [
-        (400u32, None, 400u64),
-        (60_000, None, 700),         // clamped to MAX_WAIT_MS
-        (60_000, Some(300u32), 300), // the request deadline
+    let slack = Duration::from_millis(1_500);
+    for (wait_ms, timeout_ms, floor, ceiling) in [
+        (
+            400u32,
+            None,
+            400u64,
+            Duration::from_millis(400) + grace + slack,
+        ),
+        // Clamped to MAX_WAIT_MS (60 s unclamped would outlast the read below).
+        (
+            60_000,
+            None,
+            3_000,
+            Duration::from_millis(3_000) + grace + slack,
+        ),
+        // The request deadline caps the wait AND its grace: well before MAX_WAIT_MS.
+        (60_000, Some(300u32), 300, Duration::from_millis(1_500)),
     ] {
         let started = Instant::now();
         let rid = c
@@ -669,10 +682,7 @@ async fn the_wait_bound_holds_and_an_expired_wait_reserves_nothing() {
             took >= Duration::from_millis(floor),
             "{wait_ms}: answered early {took:?}"
         );
-        assert!(
-            took < Duration::from_millis(floor) + grace + Duration::from_millis(1_500),
-            "{wait_ms}: past the bound {took:?}"
-        );
+        assert!(took < ceiling, "{wait_ms}: past the bound {took:?}");
     }
     let id = w.put("empty").await;
     assert_eq!(w.row(id).await, Some((0, None)));
