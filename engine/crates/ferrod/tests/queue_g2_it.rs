@@ -1525,8 +1525,8 @@ async fn the_verbs_timeout_is_what_verification_left_of_the_requests_deadline() 
 }
 
 /// Review F4, both sides of the race. A CANCEL that arrives while the verb waits behind the
-/// transaction's earlier command (a 600 ms in-tx EXEC) is answered `Cancelled` BEFORE anything is
-/// dispatched. Nothing is sent, the transaction is intact, and it commits its business write. The
+/// transaction's earlier command (a 1.5 s in-tx EXEC: the window the CANCEL must land in, inside
+/// the harness's 2 s frame bound) is answered `Cancelled` BEFORE anything is dispatched. Nothing is sent, the transaction is intact, and it commits its business write. The
 /// other side is a CANCEL after dispatch: it rolls the transaction back (`TxDeadline`); see
 /// `a_timed_out_or_cancelled_in_tx_verb_rolls_the_transaction_back`. EXEC itself still dispatches
 /// and then rolls back (the ledger records the asymmetry).
@@ -1543,7 +1543,7 @@ async fn a_cancel_before_the_verb_is_dispatched_leaves_the_tx_intact() {
     w.c.business(tx, &s, 1, "kept").await;
     let slow = ExecRequest {
         pool: "default".into(),
-        sql: Some("SELECT 1 FROM pg_sleep(0.6)".into()),
+        sql: Some("SELECT 1 FROM pg_sleep(1.5)".into()),
         query_id: None,
         params: vec![],
         timeout_ms: None,
