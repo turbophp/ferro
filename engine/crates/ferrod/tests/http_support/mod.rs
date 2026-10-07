@@ -271,9 +271,10 @@ impl StallConnect {
     }
 }
 
-struct StallIo {
-    inner: TcpStream,
-    budget: Option<usize>,
+pub struct StallIo {
+    pub inner: TcpStream,
+    /// `Some(n)`: accept `n` more bytes, then never another.
+    pub budget: Option<usize>,
 }
 
 impl AsyncRead for StallIo {

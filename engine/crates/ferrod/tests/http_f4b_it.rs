@@ -1825,10 +1825,13 @@ async fn a_forbidden_request_during_the_drain_is_refused_forbidden() {
 }
 
 /// **R10: the extension's hard end is measured from the DRAIN's start**, not from when `serve`
-/// entered the extension. An exchange the cap cannot stop on time (its connector blocks its
-/// thread for 4 s, past the cap) keeps the in-flight count up; `serve` must still end at
+/// entered the extension. An exchange the cap cannot stop on time keeps the in-flight count up:
+/// its connection's first write blocks `hyper`'s connection thread for 4 s, past the cap, and the
+/// teardown the cap starts must await that task. `serve` must still end at
 /// `FERRO_HTTP_DRAIN_MS + drain_deadline` = 1.2 s after the drain began — measured from the
-/// extension's entry it would be 1.8 s.
+/// extension's entry it would be 1.8 s. (Until the M6-F6 review round the blocked thread was the
+/// CONNECTOR's; a dial is now detached from its request — §22.2 (dk), review R3 — so a blocked
+/// dial no longer holds an exchange past the cap, and the block moved to the first write.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_extension_hard_end_is_measured_from_the_drain_start() {
     let up = reads_and_holds().await;
@@ -1838,13 +1841,13 @@ async fn the_extension_hard_end_is_measured_from_the_drain_start() {
         Duration::from_millis(600),
         Arc::new(BlockConnect {
             entered: in_connect.clone(),
-            block: Duration::ZERO,
-            connect_block: Duration::from_secs(4),
+            block: Duration::from_secs(4),
+            connect_block: Duration::ZERO,
         }),
     );
     let mut c = s.client().await;
-    send(&mut c, 2, &post("u", b"stuck-in-connect")).await;
-    wait_for("the connector blocking its thread", || {
+    send(&mut c, 2, &post("u", b"stuck-in-write")).await;
+    wait_for("the first write blocking its thread", || {
         in_connect.load(Ordering::SeqCst)
     })
     .await;
