@@ -47,6 +47,14 @@
 //! fenced DELETE the latest committed version). A race can misreport `LeaseLost` as `gone` — a
 //! concurrent RESERVE that re-leased the row after our snapshot makes the probe read the old token —
 //! and both outcomes mean "did nothing", so the race affects only a counter (§24.4).
+//!
+//! # Inside a client transaction (M7-G2, §24.5)
+//!
+//! ENQUEUE, EXTEND, SIZE and CLEAR run their autocommit statements unchanged on the transaction's
+//! pinned connection. ACK and RELEASE do not: in a transaction an unmatched fence is ALWAYS
+//! `LeaseLost` — an absent row included (R1) — so the probe is not run ([`ack_in_tx`],
+//! [`release_in_tx`]). `now` is still statement time, so an in-transaction ENQUEUE's `created_at` is
+//! when its statement ran, not when the transaction committed.
 
 use crate::Dialect;
 use crate::ident::TableName;
@@ -241,6 +249,39 @@ pub fn clear(t: &TableName, queue: &str) -> Statement {
     }
 }
 
+/// ACK inside a client transaction (§24.4, R1; M7-G2): the fenced DELETE and NOTHING ELSE. In a
+/// transaction an unmatched fence is ALWAYS `LeaseLost` — an absent row included, because the job
+/// the worker's business writes are about is not the worker's to treat as done — so the probe
+/// [`ack`] carries is not run (§24.4: "The probe is not run"). The outcome is the command tag's
+/// count: 1 acked, 0 `LeaseLost`.
+pub fn ack_in_tx(t: &TableName, id: JobId, token: Token) -> Statement {
+    Statement {
+        sql: format!("DELETE FROM {} WHERE {FENCE}", table(t)),
+        params: fence_params(id, token),
+    }
+}
+
+/// RELEASE inside a client transaction (§24.4; M7-G2): [`release`]'s fenced DELETE → INSERT of the
+/// same job under a NEW id, WITHOUT the probe (an unmatched fence is `LeaseLost` in a transaction,
+/// never `gone`), returning the new row's id AND its queue. The queue is returned because it is in
+/// the ROW, not in the request, and a RELEASE with `delay_s = 0` carries the queue's wake hint to
+/// COMMIT (§24.5 step 4, §24.8). One row when the fence matched, none otherwise.
+pub fn release_in_tx(t: &TableName, id: JobId, token: Token, delay_s: u32) -> Statement {
+    let t = table(t);
+    let sql = format!(
+        "WITH {NOW_CTE}, \
+         d AS (DELETE FROM {t} WHERE {FENCE} RETURNING queue, payload, attempts), \
+         i AS (INSERT INTO {t} (queue, payload, attempts, reserved_at, available_at, created_at) \
+               SELECT d.queue, d.payload, d.attempts, NULL::integer, {avail}, n.s \
+               FROM d, n RETURNING id, queue) \
+         SELECT i.id, i.queue FROM i",
+        avail = available_at("$4::bigint"),
+    );
+    let mut params = fence_params(id, token);
+    params.push(Value::I64(i64::from(delay_s)));
+    Statement { sql, params }
+}
+
 /// A statement's result did not have the shape its builder produces. Only a table changed after
 /// verification (no reload in v1, §24.3) or a defect produces one; `ferrod` reports it without
 /// claiming the verb did nothing.
@@ -409,6 +450,33 @@ pub fn decode_release(
             token,
         ))),
         v => Ok(Ok(JobId(int(v)?))),
+    }
+}
+
+/// [`ack_in_tx`]'s outcome from the DELETE's rows and command-tag count: `true` acked, `false`
+/// `LeaseLost` (in a transaction there is no `gone`, R1). The statement returns no rows; any row, or
+/// a count above 1 (`id` is verified unique), is malformed.
+pub fn decode_ack_in_tx(rows: &[Vec<Value>], affected: u64) -> Result<bool, Malformed> {
+    if !rows.is_empty() {
+        return Err(Malformed);
+    }
+    match affected {
+        1 => Ok(true),
+        0 => Ok(false),
+        _ => Err(Malformed),
+    }
+}
+
+/// [`release_in_tx`]'s outcome: `Some((new id, queue))` released, `None` the fence matched nothing
+/// (`LeaseLost` in a transaction — never `gone`, R1).
+pub fn decode_release_in_tx(rows: &[Vec<Value>]) -> Result<Option<(JobId, String)>, Malformed> {
+    match rows {
+        [] => Ok(None),
+        [row] => match row.as_slice() {
+            [id, Value::Text(queue)] => Ok(Some((JobId(int(id)?), queue.clone()))),
+            _ => Err(Malformed),
+        },
+        _ => Err(Malformed),
     }
 }
 
@@ -757,5 +825,64 @@ mod tests {
             decode_size(&[vec![i(-1), i(0), i(0), Value::Null]]),
             Err(Malformed)
         );
+    }
+
+    /// M7-G2: the in-transaction ACK and RELEASE carry the SAME fence and NO probe (§24.4: "The probe
+    /// is not run" — in a transaction an unmatched fence is always `LeaseLost`, R1), and RELEASE's
+    /// statement returns the new row's queue for the after-commit wake hint.
+    #[test]
+    fn the_in_tx_fenced_statements_carry_the_fence_and_no_probe() {
+        let tok = Token::from_pg(-5, -2);
+        let fence = "id = $1::bigint AND attempts = $2::smallint AND created_at = $3::integer";
+        let a = ack_in_tx(&t(), JobId(9), tok);
+        assert_eq!(
+            a.sql,
+            format!("DELETE FROM \"app\".\"ferro_jobs\" WHERE {fence}")
+        );
+        assert_eq!(a.params, vec![i(9), i(-2), i(-5)]);
+        let r = release_in_tx(&t(), JobId(9), tok, 30);
+        assert_eq!(
+            r.sql,
+            format!(
+                "WITH {NOW_CTE}, d AS (DELETE FROM \"app\".\"ferro_jobs\" WHERE {fence} RETURNING \
+                 queue, payload, attempts), i AS (INSERT INTO \"app\".\"ferro_jobs\" (queue, \
+                 payload, attempts, reserved_at, available_at, created_at) SELECT d.queue, \
+                 d.payload, d.attempts, NULL::integer, CASE WHEN $4::bigint = 0 THEN n.s ELSE n.s + \
+                 1 + $4::bigint END, n.s FROM d, n RETURNING id, queue) SELECT i.id, i.queue FROM i"
+            )
+        );
+        assert_eq!(r.params, vec![i(9), i(-2), i(-5), i(30)]);
+        for s in [&a, &r] {
+            assert!(!s.sql.contains("LEFT JOIN"), "no probe: {}", s.sql);
+            assert!(!s.sql.contains(" AS p "), "no probe: {}", s.sql);
+            let after = s.sql.split(" WHERE ").nth(1).unwrap();
+            let where_ = after.split(" RETURNING ").next().unwrap();
+            assert_eq!(where_, fence, "{}", s.sql);
+        }
+        assert!(r.sql.starts_with(&format!("WITH {NOW_CTE}")));
+        assert_eq!(r.sql.matches("statement_timestamp()").count(), 1);
+    }
+
+    #[test]
+    fn in_tx_ack_and_release_decode_without_a_gone() {
+        assert_eq!(decode_ack_in_tx(&[], 1), Ok(true));
+        assert_eq!(decode_ack_in_tx(&[], 0), Ok(false), "absent → LeaseLost");
+        assert_eq!(decode_ack_in_tx(&[], 2), Err(Malformed));
+        assert_eq!(decode_ack_in_tx(&[vec![i(1)]], 1), Err(Malformed));
+        assert_eq!(
+            decode_release_in_tx(&[vec![i(55), txt("emails")]]),
+            Ok(Some((JobId(55), "emails".to_string())))
+        );
+        assert_eq!(decode_release_in_tx(&[]), Ok(None), "no match → LeaseLost");
+        assert_eq!(
+            decode_release_in_tx(&[vec![i(55), txt("a")], vec![i(56), txt("a")]]),
+            Err(Malformed)
+        );
+        assert_eq!(decode_release_in_tx(&[vec![i(55)]]), Err(Malformed));
+        assert_eq!(
+            decode_release_in_tx(&[vec![Value::Null, txt("a")]]),
+            Err(Malformed)
+        );
+        assert_eq!(decode_release_in_tx(&[vec![i(55), i(1)]]), Err(Malformed));
     }
 }

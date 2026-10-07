@@ -750,6 +750,15 @@ impl<B: PoolBackend> Checkout<B> {
         r.map(|_| ())
     }
 
+    /// The backend's own transaction signal for this connection, read NOW (no round trip): PG's
+    /// RFQ status byte (`I`/`T`/`E`), MySQL's status flags (never `Failed`), SQLite's autocommit
+    /// flag. The same authority `apply_tx_status` reads after every statement; exposed so a caller
+    /// can tell an ABORTED block (`Failed`) — whose COMMIT PostgreSQL answers with the tag
+    /// `ROLLBACK` and no error — from an open one (M7-G2 review F1).
+    pub fn tx_status(&self) -> crate::backend::TxStatus {
+        self.pool.backend.tx_status(self.conn())
+    }
+
     /// Current pin state (`Unpinned` or `PinnedTx(tx_id)`).
     pub fn pin_state(&self) -> PinState {
         self.pin.state()

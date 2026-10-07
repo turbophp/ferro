@@ -607,6 +607,68 @@ async fn statement_timeout_tx_scoped_write_rolls_back_to_retryable() {
 }
 
 // -------------------------------------------------------------------------------------------------
+// 4b. a per-request CANCEL of a tx-scoped write PROVABLY in flight -> rollback + tombstone ->
+//     Retryable (TxDeadline), counter == 0. M7-G2 review F3: the tx actor's interruptible statement
+//     run (`run_interruptible`, shared by EXEC and the QUEUE verbs) had its CANCEL arm pinned only by
+//     the queue suite; this pins it for EXEC, where it was born. Without the arm the statement would
+//     run its whole pg_sleep(3), past the harness's 2 s per-frame bound.
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_mid_tx_scoped_write_rolls_back_to_retryable() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let server = exec_server(url.clone());
+    let mut client = server.connect().await;
+    client.hello(1).await;
+    let raw = raw_connect(&url).await;
+
+    let key = unique_key("tx_cancel_write");
+    ensure_ctr_table(&mut client, 140).await;
+    seed_ctr(&mut client, 141, &key).await;
+    let tx_id = begin(&mut client, 142, "default", None, false).await;
+
+    let marker = format!("chaos_tx_cancel_{key}");
+    let sql = format!(
+        "/* {marker} */ UPDATE {CTR_TABLE} SET n = n + 1 WHERE key = ? AND pg_sleep(3) IS NOT NULL RETURNING n"
+    );
+    let mut w = req(&sql);
+    w.tx_id = Some(tx_id);
+    w.readonly = false;
+    w.params = vec![Value::Text(key.clone())];
+    let rid = 143;
+    client
+        .send_request(rid, service::SQL, method_sql::EXEC, w.encode())
+        .await;
+    wait_for_backend_inside_pg_sleep(&raw, &marker).await;
+    client.cancel(rid).await;
+
+    let ep = match recv_terminal(&mut client, rid, service::SQL, method_sql::EXEC).await {
+        Outcome::Error(ep) => ep,
+        other => panic!("a cancelled in-tx statement must error, got {other:?}"),
+    };
+    assert_eq!(
+        (ep.code, ep.branch),
+        (errc::TX_DEADLINE, branch::RETRYABLE),
+        "a cancelled in-tx statement rolls the tx back -> TxDeadline/Retryable, got {ep:?}"
+    );
+    let mut probe = req("SELECT 1");
+    probe.tx_id = Some(tx_id);
+    match exec(&mut client, 144, &probe).await {
+        Outcome::Error(ep2) => assert_eq!(ep2.code, errc::TX_DEADLINE, "tombstoned"),
+        other => panic!("expected TxDeadline on the dead tx_id, got {other:?}"),
+    }
+    assert_eq!(
+        read_ctr(&mut client, 145, &key).await,
+        0,
+        "rolled back, never re-run"
+    );
+    cleanup_ctr(&mut client, 146, &key).await;
+    assert_session_alive(&mut client, 147).await;
+}
+
+// -------------------------------------------------------------------------------------------------
 // 5. CANCEL race mid-write -> Indeterminate (cancel won) OR Ok (cancel lost the race); either way
 //    the counter is consistent and never re-dispatched.
 // -------------------------------------------------------------------------------------------------

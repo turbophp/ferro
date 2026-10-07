@@ -328,11 +328,6 @@ async fn value_refusals_are_unsupported_before_any_checkout() {
         (method_queue::RESERVE, reserve(false, 1, None), "G3"),
         (method_queue::RESERVE, reserve(false, 0, Some(7)), "§24.5"),
         (
-            method_queue::ENQUEUE,
-            enqueue("{}", "default", None, Some(7)),
-            "G2",
-        ),
-        (
             method_queue::CLEAR,
             QueueScopeRequest {
                 store: "jobs".into(),
@@ -347,6 +342,20 @@ async fn value_refusals_are_unsupported_before_any_checkout() {
         let ep = queue_err(&mut c, 20 + i as u32, method, payload).await;
         assert_code(&ep, errc::UNSUPPORTED, needle);
     }
+    // M7-G2: a tx-scoped ENQUEUE is no longer refused `Unsupported` — its `tx_id` is RESOLVED, and an
+    // unknown one is `TxNotFound`, still before any checkout (the pool is unreachable).
+    let ep = queue_err(
+        &mut c,
+        40,
+        method_queue::ENQUEUE,
+        enqueue("{}", "default", None, Some(7)),
+    )
+    .await;
+    assert_eq!(
+        (ep.code, ep.branch),
+        (errc::TX_NOT_FOUND, errc::TX_NOT_FOUND_BRANCH),
+        "{ep:?}"
+    );
     // MAX_PAYLOAD_BYTES is the store's: one byte over it is refused, by size, not by content.
     let (server, _) = queue_server(
         DEAD_PG,
