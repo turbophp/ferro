@@ -87,12 +87,26 @@ impl TableName {
         }
     }
 
-    /// The identifier quoted for `dialect`. Injection-free because [`TableName::parse`] admits no
-    /// quote character into any part.
+    /// The relation shape verification RESOLVED (M7-G2 review F5): the catalog's `schema` and the
+    /// configured table name. Every verb's statement names this, so no session's `search_path`
+    /// can steer a verb to a relation that was never verified. The schema comes from the catalog,
+    /// not from configuration, so it is NOT held to [`TableName::parse`]'s character rule;
+    /// [`TableName::quoted`] escapes it.
+    pub fn resolved(schema: &str, configured: &TableName) -> TableName {
+        TableName {
+            schema: Some(schema.to_string()),
+            table: configured.table.clone(),
+        }
+    }
+
+    /// The identifier quoted for `dialect`, each part's own quote character doubled. A part
+    /// [`TableName::parse`] admitted contains none; a schema name the catalog resolved
+    /// ([`TableName::resolved`]) may, and doubling is each dialect's own escape inside a quoted
+    /// identifier.
     pub fn quoted(&self, dialect: Dialect) -> String {
         let q = |p: &str| match dialect {
-            Dialect::Postgres => format!("\"{p}\""),
-            Dialect::Mysql => format!("`{p}`"),
+            Dialect::Postgres => format!("\"{}\"", p.replace('"', "\"\"")),
+            Dialect::Mysql => format!("`{}`", p.replace('`', "``")),
         };
         match &self.schema {
             None => q(&self.table),
@@ -143,6 +157,23 @@ mod tests {
         for bad in ["jobs$1", "$jobs", "app$.jobs", "app.jo$bs"] {
             assert_eq!(TableName::parse(bad), Err(IdentError::Characters), "{bad}");
         }
+    }
+
+    /// M7-G2 review F5: the RESOLVED relation names the catalog's schema, which no configuration
+    /// rule constrains, so a quote character inside it is doubled — never able to close the quoted
+    /// identifier.
+    #[test]
+    fn a_resolved_schema_is_quoted_with_its_quotes_doubled() {
+        let configured = TableName::parse("ferro_jobs").unwrap();
+        let r = TableName::resolved("public", &configured);
+        assert_eq!(r.quoted(Dialect::Postgres), "\"public\".\"ferro_jobs\"");
+        let odd = TableName::resolved("we\"ird`s", &configured);
+        assert_eq!(
+            odd.quoted(Dialect::Postgres),
+            "\"we\"\"ird`s\".\"ferro_jobs\""
+        );
+        assert_eq!(odd.quoted(Dialect::Mysql), "`we\"ird``s`.`ferro_jobs`");
+        assert_eq!(r.table, configured.table);
     }
 
     #[test]

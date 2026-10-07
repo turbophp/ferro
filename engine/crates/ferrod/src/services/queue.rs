@@ -77,6 +77,7 @@ use ferro_proto::messages::{
     ReserveRequest, ReserveResponse, ReservedJob, SizeResponse,
 };
 use ferro_queue::config::{QueueConfig, StoreConfig, StoreKind};
+use ferro_queue::ident::TableName;
 use ferro_queue::pg::{self as pgq, NoMatch};
 use ferro_queue::shape::{self, PgRelation, ShapeError, Statement};
 use ferro_queue::sql::{JobId, Token, Undecodable};
@@ -87,7 +88,7 @@ use crate::pools::{AnyPool, PoolRegistry};
 use crate::services::fate::{self, OpContext};
 use crate::services::sql::{
     actor_gone_terminal, cancelled_before_dispatch, protocol, resolve_active, run_autocommit_exec,
-    sleep_until_opt, tx_deadline, unsupported,
+    sleep_until_opt, unsupported,
 };
 use crate::session::SessionId;
 use crate::session::codec::InFrame;
@@ -167,7 +168,9 @@ pub const ABSENT_RECHECK: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone)]
 enum Verdict {
     Unverified,
-    Verified,
+    /// Verified, and the relation it RESOLVED — schema-qualified — which every verb's statement
+    /// names (review F5: never the configured bare name a session's `search_path` could steer).
+    Verified(TableName),
     /// A table that exists in the wrong form: every verb on the store answers `Unsupported` with
     /// this message until the next restart (§24.3).
     Refused(String),
@@ -410,12 +413,17 @@ pub async fn handle(
         .await;
         return;
     }
-    if let Err(ep) = ensure_verified(stores, store, registry, deadline, &cancel).await {
-        responder.end_error(ep);
-        return;
-    }
+    let table = match ensure_verified(stores, store, registry, deadline, &cancel).await {
+        Ok(t) => t,
+        Err(ep) => {
+            responder.end_error(ep);
+            return;
+        }
+    };
     match registry.get(&store.pool) {
-        Some(AnyPool::Pg(pool)) => serve_pg(pool, req, store, deadline, &cancel, responder).await,
+        Some(AnyPool::Pg(pool)) => {
+            serve_pg(pool, req, store, &table, deadline, &cancel, responder).await
+        }
         // Unreachable: verification passed, so the pool is PostgreSQL (`ensure_verified` answers
         // every other family). Answered rather than asserted.
         Some(_) | None => responder.end_error(unsupported(format!(
@@ -525,6 +533,7 @@ async fn serve_pg<B: PoolBackend>(
     pool: &Pool<B>,
     req: QueueRequest,
     store: &StoreConfig,
+    table: &TableName,
     deadline: Option<tokio::time::Instant>,
     cancel: &CancellationToken,
     responder: Responder,
@@ -548,7 +557,7 @@ async fn serve_pg<B: PoolBackend>(
     };
     let queue_us = co.stats().queue_us;
     let mut exec_us = 0u64;
-    let outcome = run_pg_verb(&mut co, &req, store, deadline, cancel, &mut exec_us).await;
+    let outcome = run_pg_verb(&mut co, &req, store, table, deadline, cancel, &mut exec_us).await;
     // Release the connection before framing the terminal (as EXEC does): held only for the verb.
     drop(co);
     let stats = QueueStats { queue_us, exec_us };
@@ -648,13 +657,13 @@ async fn run_pg_verb<B: PoolBackend>(
     co: &mut Checkout<B>,
     req: &QueueRequest,
     store: &StoreConfig,
+    t: &TableName,
     deadline: Option<tokio::time::Instant>,
     cancel: &CancellationToken,
     exec_us: &mut u64,
 ) -> Result<VerbOk, ErrorPayload> {
     let ctx = |sent| verb_context(req, sent);
     let bad = |_: pgq::Malformed| malformed(req, store);
-    let t = &store.table;
     match req {
         QueueRequest::Enqueue(r) => {
             let n = r.jobs.len();
@@ -797,10 +806,13 @@ async fn serve_tx(
         responder.end_error(pool_mismatch(store, &handle.pool));
         return;
     }
-    if let Err(ep) = ensure_verified(stores, store, registry, deadline, &cancel).await {
-        responder.end_error(ep);
-        return;
-    }
+    let table = match ensure_verified(stores, store, registry, deadline, &cancel).await {
+        Ok(t) => t,
+        Err(ep) => {
+            responder.end_error(ep);
+            return;
+        }
+    };
     // What is left of the request's ONE deadline bounds the verb on the actor. None left: answered
     // unsent (the transaction untouched), never dispatched with no time.
     let timeout_ms = match deadline {
@@ -819,7 +831,7 @@ async fn serve_tx(
             Some(u32::try_from(left).unwrap_or(u32::MAX))
         }
     };
-    let verb = match TxVerb::new(&req, store, Arc::clone(stores)) {
+    let verb = match TxVerb::new(&req, store, &table, Arc::clone(stores)) {
         Ok(v) => v,
         Err(ep) => {
             responder.end_error(ep);
@@ -945,9 +957,9 @@ impl TxVerb {
     fn new(
         req: &QueueRequest,
         store: &StoreConfig,
+        t: &TableName,
         stores: Arc<QueueStores>,
     ) -> Result<TxVerb, ErrorPayload> {
-        let t = &store.table;
         let (step, decode) = match req {
             QueueRequest::Enqueue(r) => {
                 let mut queues: Vec<String> = r.jobs.iter().map(|j| j.queue.clone()).collect();
@@ -1054,26 +1066,54 @@ impl TxVerb {
     }
 
     /// The statement ran but its rows do not have the builder's shape. SIZE (a read, no effect) is a
-    /// plain refusal and the transaction stays open; a WRITE's effect is real and unreportable, so
-    /// the actor rolls the transaction back — the one in-transaction way to make that effect's fate
-    /// KNOWN (it will never commit) — and the answer is `TxDeadline{Retryable}`, never a known-fate
-    /// code claiming the verb did nothing and never an `Indeterminate` the client could follow with
-    /// a COMMIT of the unseen effect.
+    /// plain refusal and the transaction stays open. A WRITE's effect is real and unreportable, so the
+    /// actor rolls the transaction back and tombstones it — the one in-transaction way to make that
+    /// effect's fate KNOWN (it will never commit) — and the terminal is SPEC D25's: NonRetryable
+    /// (`Unsupported`), because the cause is a table changed after the once-per-process verification,
+    /// so every retry would fail identically (redoing the business work each time) until the table is
+    /// fixed and `ferrod` restarts. Never a known-fate code claiming the verb did nothing, never an
+    /// `Indeterminate` the client could follow with a COMMIT of the unseen effect, and never
+    /// `Retryable`.
     fn unreadable(&self) -> TxVerdict {
-        let message = format!(
-            "queue store {}: the tx-scoped QUEUE {} statement ran but its result did not have the \
-             expected shape (was the table altered after it was verified? ferrod re-verifies at \
-             restart)",
-            self.store, self.verb
-        );
         if self.decode == TxDecode::Size {
-            TxVerdict::NoEffect(Err(unsupported(message)))
-        } else {
-            TxVerdict::Unreadable(tx_deadline(format!(
-                "{message}; the transaction was rolled back so the unreported effect cannot commit \
-                 (retryable — the engine never re-runs)"
-            )))
+            return TxVerdict::NoEffect(Err(unsupported(format!(
+                "queue store {}: the tx-scoped QUEUE SIZE statement ran but its result did not have \
+                 the expected shape (was the table altered after it was verified? ferrod re-verifies \
+                 at restart); the transaction is unaffected",
+                self.store
+            ))));
         }
+        TxVerdict::Unreadable(self.write_rolled_back("its result did not have the expected shape"))
+    }
+
+    /// D25's terminal for a WRITE whose effect cannot be reported: the transaction was rolled back
+    /// and tombstoned, and retrying cannot help until the store is fixed and `ferrod` restarts.
+    fn write_rolled_back(&self, what: &str) -> ErrorPayload {
+        unsupported(format!(
+            "queue store {}: the tx-scoped QUEUE {} statement ran but {what} (was the table altered \
+             after it was verified?). The transaction was rolled back, so the unreported effect can \
+             never commit, and this transaction id is finished. Retrying cannot help until the \
+             store's table is fixed and ferrod is restarted (it re-verifies at restart); the engine \
+             re-runs nothing (SPEC D25)",
+            self.store, self.verb
+        ))
+    }
+
+    /// SPEC D25, the second half: a statement that FAILED after it was sent, with an error that is
+    /// neither the backend's SQL answer (`PoolError::Sql`, a known fate the transaction survives)
+    /// nor a lost link (`ConnectionLost`: the backend rolls the transaction back with the link, the
+    /// established `Retryable` of §24.6). For a WRITE, anything else — a result the driver could
+    /// not decode AFTER the statement executed (`PoolError::Backend`), an `Unsupported` result type —
+    /// may leave the write applied inside the open transaction. So it takes the unreadable arm:
+    /// `Some(terminal)`, and the actor rolls back and tombstones. `None` for a READ, and for the two
+    /// known-fate errors, which take the `Failed` arm.
+    pub fn rolls_back_on(&self, e: &PoolError) -> Option<ErrorPayload> {
+        if self.decode == TxDecode::Size
+            || matches!(e, PoolError::Sql { .. } | PoolError::ConnectionLost)
+        {
+            return None;
+        }
+        Some(self.write_rolled_back("the result could not be read"))
     }
 }
 
@@ -1084,7 +1124,7 @@ async fn ensure_verified(
     registry: &PoolRegistry,
     deadline: Option<tokio::time::Instant>,
     cancel: &CancellationToken,
-) -> Result<(), ErrorPayload> {
+) -> Result<TableName, ErrorPayload> {
     let Some(cell) = stores.verdicts.get(&store.name) else {
         return Err(unsupported("unknown queue store"));
     };
@@ -1098,7 +1138,7 @@ async fn ensure_verified(
         () = cancel.cancelled() => return Err(not_sent(cancelled_before_dispatch())),
     };
     match &*verdict {
-        Verdict::Verified => return Ok(()),
+        Verdict::Verified(table) => return Ok(table.clone()),
         Verdict::Refused(m) => return Err(unsupported(m.clone())),
         Verdict::GateRefused { message, at }
             if at.elapsed()
@@ -1167,10 +1207,10 @@ async fn ensure_verified(
         )))),
     };
     match outcome {
-        Ok(schema) => {
-            tracing::info!(store = %store.name, table = %store.table, schema = %schema, "ferrod: queue store verified");
-            *verdict = Verdict::Verified;
-            Ok(())
+        Ok(resolved) => {
+            tracing::info!(store = %store.name, table = %store.table, resolved = %resolved, "ferrod: queue store verified");
+            *verdict = Verdict::Verified(resolved.clone());
+            Ok(resolved)
         }
         Err(Verification::Shape(e)) => {
             let message = format!("queue store {}: {e}", store.name);
@@ -1215,7 +1255,7 @@ async fn verify_pg<B: PoolBackend>(
     store: &StoreConfig,
     deadline: Option<tokio::time::Instant>,
     cancel: &CancellationToken,
-) -> Result<String, Verification> {
+) -> Result<TableName, Verification> {
     let ctx = verification_context;
     // A declared read: on a backend that can enforce the declaration it does (C3-4).
     let checkout = pool.checkout_declared(true);
@@ -1265,11 +1305,13 @@ async fn verify_pg<B: PoolBackend>(
         ))));
     };
     shape::verify_pg(&store.table, relation.as_ref()).map_err(Verification::Shape)?;
+    // `verify_pg` passed, so the relation exists: it resolved in `schema`.
     let schema = relation.map(|r| r.schema).unwrap_or_default();
+    let resolved = TableName::resolved(&schema, &store.table);
 
     // Diagnostics only (SPEC §24.3): a table whose `id` has no sequence default is logged, never
     // refused — ENQUEUE would then fail with `NotNull`, classified like any statement.
-    let serial = shape::pg_serial_statement(&store.table);
+    let serial = shape::pg_serial_statement(&resolved);
     if let Ok(left) = remaining(deadline) {
         let (r, _) = run_autocommit_exec(&mut co, &serial.sql, &serial.params, left, cancel).await;
         match r
@@ -1284,7 +1326,7 @@ async fn verify_pg<B: PoolBackend>(
             Err(_) => tracing::debug!(store = %store.name, "ferrod: queue identity probe failed"),
         }
     }
-    Ok(schema)
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -1757,7 +1799,8 @@ mod tests {
             common: QueueCommon::default(),
         });
         let mut exec_us = 0;
-        run_pg_verb(&mut co, &req, &store(), deadline, cancel, &mut exec_us).await
+        let s = store();
+        run_pg_verb(&mut co, &req, &s, &s.table, deadline, cancel, &mut exec_us).await
     }
 
     /// Review F2 (mutation T7): a CANCEL that arrived before a statement is SENT answers the verb
@@ -2019,7 +2062,7 @@ mod tests {
             (QueueRequest::Clear(scope), pgq::clear(t, "q")),
         ];
         for (req, want) in cases {
-            let verb = TxVerb::new(&req, &s, stores_arc()).unwrap();
+            let verb = TxVerb::new(&req, &s, &s.table, stores_arc()).unwrap();
             assert_eq!(verb.steps, vec![want], "{}", req.verb());
             // The Debug never prints a statement (a payload is a parameter).
             assert!(!format!("{verb:?}").contains("{}"), "{verb:?}");
@@ -2033,8 +2076,26 @@ mod tests {
             common: in_tx(QueueCommon::default()),
         });
         assert_eq!(
-            TxVerb::new(&reserve, &s, stores_arc()).unwrap_err().code,
+            TxVerb::new(&reserve, &s, &s.table, stores_arc())
+                .unwrap_err()
+                .code,
             errc::UNSUPPORTED
+        );
+    }
+
+    /// SPEC D25: an in-transaction write whose effect cannot be reported is rolled back and its
+    /// terminal is NonRetryable, saying plainly that retrying cannot help.
+    fn assert_d25(ep: &ErrorPayload) {
+        assert_eq!(
+            (ep.code, ep.branch),
+            (errc::UNSUPPORTED, errc::UNSUPPORTED_BRANCH),
+            "{ep:?}"
+        );
+        assert_eq!(ep.branch, ferro_proto::consts::branch::NON_RETRYABLE);
+        assert!(
+            ep.message.contains("Retrying cannot help") && ep.message.contains("rolled back"),
+            "{}",
+            ep.message
         );
     }
 
@@ -2046,11 +2107,7 @@ mod tests {
             TxVerdict::NoEffect(Err(ep)) if ep.code == errc::UNSUPPORTED => ("refused", 0),
             TxVerdict::NoEffect(Err(_)) => ("other", 0),
             TxVerdict::Unreadable(ep) => {
-                assert_eq!(
-                    (ep.code, ep.branch),
-                    (errc::TX_DEADLINE, errc::TX_DEADLINE_BRANCH)
-                );
-                assert_eq!(ep.branch, ferro_proto::consts::branch::RETRYABLE);
+                assert_d25(ep);
                 ("rolled_back", 0)
             }
         }
@@ -2063,7 +2120,7 @@ mod tests {
     #[test]
     fn a_tx_verbs_decode_keeps_hints_only_when_applied_and_never_answers_gone() {
         let s = store();
-        let verb = |req: QueueRequest| TxVerb::new(&req, &s, stores_arc()).unwrap();
+        let verb = |req: QueueRequest| TxVerb::new(&req, &s, &s.table, stores_arc()).unwrap();
         let fenced = |ack: bool| {
             let r = FencedRequest {
                 store: "jobs".into(),
@@ -2258,7 +2315,10 @@ mod tests {
         let (reply, rx) = tokio::sync::oneshot::channel();
         cmd_tx
             .send(TxCommand::Queue {
-                verb: Box::new(TxVerb::new(req, &store(), Arc::clone(stores)).unwrap()),
+                verb: Box::new({
+                    let s = store();
+                    TxVerb::new(req, &s, &s.table, Arc::clone(stores)).unwrap()
+                }),
                 timeout_ms: None,
                 cancel: CancellationToken::new(),
                 reply,
@@ -2367,10 +2427,19 @@ mod tests {
         let QueueReply::RolledBack(ep) = r else {
             panic!("expected RolledBack, got {r:?}")
         };
-        assert_eq!(
-            (ep.code, ep.branch),
-            (errc::TX_DEADLINE, errc::TX_DEADLINE_BRANCH)
+        assert_d25(&ep);
+        wait_tombstoned(&registry, tx_id, owner).await;
+        let co = pool.checkout().await.expect("the connection came back");
+        assert!(
+            co.conn().recorded.iter().any(|s| s == "ROLLBACK"),
+            "{:?}",
+            co.conn().recorded
         );
+        drop(co);
+        assert_eq!(stores.wake_hints(), 1);
+    }
+
+    async fn wait_tombstoned(registry: &TxRegistry, tx_id: u64, owner: SessionId) {
         let mut waited = 0;
         while registry.lookup(tx_id, owner).is_ok() && waited < 200 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2380,13 +2449,123 @@ mod tests {
             registry.lookup(tx_id, owner).unwrap_err(),
             crate::tx::TxLookupErr::Tombstoned
         );
-        let co = pool.checkout().await.expect("the connection came back");
+    }
+
+    fn one_conn_pool() -> Pool<ferro_pool::fake::FakeBackend> {
+        Pool::new(
+            ferro_pool::fake::FakeBackend::new(),
+            ferro_pool::config::PoolConfig {
+                max_size: 1,
+                reap_interval: None,
+                ..ferro_pool::config::PoolConfig::default()
+            },
+        )
+    }
+
+    fn size_in_tx() -> QueueRequest {
+        QueueRequest::Size(QueueScopeRequest {
+            store: "jobs".into(),
+            queue: "q".into(),
+            common: in_tx(QueueCommon::default()),
+        })
+    }
+
+    /// SPEC D25, second half (review F2/O-G2): a WRITE that failed AFTER it was sent with an error
+    /// that is not the backend's SQL answer — here a result the driver could not decode
+    /// (`PoolError::Backend`) — may be applied inside the open transaction, so it is rolled back and
+    /// tombstoned with D25's NonRetryable terminal, never answered `Failed` with the transaction open.
+    /// The controls: the same error on SIZE (a read) and a lost link on a write (the backend ends
+    /// the transaction itself) take the `Failed` arm and leave the transaction registered.
+    #[tokio::test]
+    async fn a_non_sql_error_after_a_write_was_sent_rolls_back_never_leaves_the_tx_open() {
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let stores = stores_arc();
+        let backend_err = || PoolError::Backend("row decode failed".into());
+
+        let pool = one_conn_pool();
+        let (tx_id, tx) = spawn_fake_tx(&pool, &registry, owner).await;
+        pool.backend().arm_next_query_err(backend_err());
+        let r = queue_cmd(&tx, &enqueue_of(&["a"]), &stores).await;
+        let QueueReply::RolledBack(ep) = r else {
+            panic!("expected RolledBack, got {r:?}")
+        };
+        assert_d25(&ep);
+        wait_tombstoned(&registry, tx_id, owner).await;
+        let co = pool.checkout().await.unwrap();
+        assert!(co.conn().recorded.iter().any(|s| s == "ROLLBACK"));
+        drop(co);
+
+        let pool = one_conn_pool();
+        let (tx_id, tx) = spawn_fake_tx(&pool, &registry, owner).await;
+        pool.backend().arm_next_query_err(backend_err());
+        let r = queue_cmd(&tx, &size_in_tx(), &stores).await;
+        assert!(matches!(r, QueueReply::Failed { .. }), "a read: {r:?}");
         assert!(
-            co.conn().recorded.iter().any(|s| s == "ROLLBACK"),
-            "{:?}",
+            registry.lookup(tx_id, owner).is_ok(),
+            "a read leaves the tx open"
+        );
+        assert!(ctl(&tx, false).await);
+
+        let pool = one_conn_pool();
+        let (tx_id, tx) = spawn_fake_tx(&pool, &registry, owner).await;
+        pool.backend().arm_next_query_err(PoolError::ConnectionLost);
+        let r = queue_cmd(&tx, &enqueue_of(&["a"]), &stores).await;
+        assert!(
+            matches!(
+                r,
+                QueueReply::Failed {
+                    error: PoolError::ConnectionLost,
+                    ..
+                }
+            ),
+            "a lost link keeps §24.6's Retryable: {r:?}"
+        );
+        assert!(registry.lookup(tx_id, owner).is_ok());
+        assert_eq!(stores.wake_hints(), 0);
+    }
+
+    /// Review F4: a CANCEL observed before the verb is dispatched answers `Cancelled` with NOTHING
+    /// sent and the transaction intact (it commits afterwards, the verb's hint never kept).
+    #[tokio::test]
+    async fn a_cancel_before_dispatch_answers_cancelled_and_leaves_the_tx_intact() {
+        let registry = TxRegistry::new(Duration::from_secs(5));
+        let owner = registry.next_session_id();
+        let stores = stores_arc();
+        let pool = one_conn_pool();
+        pool.backend().set_query_result(qr(vec![vec![int(41)]], 1));
+        let (tx_id, tx) = spawn_fake_tx(&pool, &registry, owner).await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        tx.send(TxCommand::Queue {
+            verb: Box::new({
+                let s = store();
+                TxVerb::new(&enqueue_of(&["a"]), &s, &s.table, Arc::clone(&stores)).unwrap()
+            }),
+            timeout_ms: None,
+            cancel,
+            reply,
+        })
+        .await
+        .unwrap();
+        let r = rx.await.unwrap();
+        assert!(
+            matches!(r, QueueReply::Done { outcome: Err(ref ep), exec_us: 0 }
+                if ep.code == errc::CANCELLED && ep.branch == errc::CANCELLED_BRANCH),
+            "{r:?}"
+        );
+        assert!(
+            registry.lookup(tx_id, owner).is_ok(),
+            "the transaction is intact"
+        );
+        assert!(ctl(&tx, true).await, "and commits");
+        assert_eq!(stores.wake_hints(), 0);
+        let co = pool.checkout().await.unwrap();
+        assert!(
+            !co.conn().recorded.iter().any(|s| s.contains("INSERT")),
+            "nothing was sent: {:?}",
             co.conn().recorded
         );
-        drop(co);
-        assert_eq!(stores.wake_hints(), 1);
     }
 }

@@ -299,11 +299,21 @@ pub async fn run<B: PoolBackend>(
 
         match cmd {
             TxCommand::Commit { reply } => {
+                // M7-G2 review F1: PostgreSQL answers a COMMIT of an ABORTED block (`E`) with the
+                // tag `ROLLBACK` and no error, so `commit_tx` returns `Ok` for a transaction that
+                // committed nothing. The tag is not exposed (the backend's `simple_query` discards
+                // it), so the signal is the pin authority itself: the RFQ status byte read BEFORE
+                // the COMMIT is sent. It reflects every earlier statement's ReadyForQuery, since a
+                // COMMIT reaches the actor at least one client round trip after the reply to the
+                // statement that failed. A stale byte could only fire a spurious hint (one empty
+                // poll), never lose a committed job's.
+                let aborted = co.tx_status() == ferro_pool::backend::TxStatus::Failed;
                 let committed = co.commit_tx().await;
                 // SPEC §24.5 step 4: the wake hints of the verbs that applied fire only on a
-                // successful COMMIT. A failed or lost COMMIT drops them with the actor (a hint is
-                // never correctness: a missing one costs at most a poll interval).
-                if committed.is_ok() {
+                // COMMIT that committed. A failed or lost COMMIT, or one of an aborted block, drops
+                // them with the actor (a hint is never correctness: a missing one costs at most a
+                // poll interval).
+                if committed.is_ok() && !aborted {
                     for hint in after_commit.drain(..) {
                         hint.fire();
                     }
@@ -419,6 +429,22 @@ pub async fn run<B: PoolBackend>(
                 // actor starts the verb — as `Exec`'s per-statement timer starts when the actor
                 // runs the statement.
                 let bound = stop_at(timeout_ms);
+                // M7-G2 review F4: a CANCEL that arrived while this verb waited behind the
+                // transaction's earlier commands is answered BEFORE anything is dispatched —
+                // `Cancelled`, nothing sent, the transaction intact — the no-time-left rule's
+                // reasoning applied to a cancel. (`Exec` still dispatches and then rolls back; the
+                // asymmetry is recorded in the ledger.) A CANCEL that arrives after dispatch is the
+                // in-flight case below: rollback and tombstone.
+                if cancel.is_cancelled() {
+                    let _ = reply.send(QueueReply::Done {
+                        outcome: Err(queue_cancelled_unsent()),
+                        exec_us: 0,
+                    });
+                    idle_deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + idle_timeout);
+                    continue 'actor;
+                }
                 let mut results = Vec::with_capacity(verb.steps.len());
                 let mut exec_us = 0u64;
                 let mut failed = None;
@@ -443,6 +469,13 @@ pub async fn run<B: PoolBackend>(
                             // The same 57014 rule as `Exec` above: PG aborted the block.
                             if fate::is_57014(&e) {
                                 let _ = reply.send(QueueReply::RolledBack(queue_rolled_back()));
+                                break 'actor TxEnd::Deadline;
+                            }
+                            // SPEC D25: a WRITE that failed after it was sent with an error that is
+                            // neither the backend's SQL answer nor a lost link may be applied in the
+                            // open transaction: roll back and tombstone, never leave it open.
+                            if let Some(ep) = verb.rolls_back_on(&e) {
+                                let _ = reply.send(QueueReply::RolledBack(ep));
                                 break 'actor TxEnd::Deadline;
                             }
                             // A plain statement error stops the verb: no later step runs.
@@ -689,6 +722,23 @@ fn queue_rolled_back() -> ErrorPayload {
         "a tx-scoped QUEUE verb's statement was cancelled or timed out (or the transaction's \
          deadline passed); the transaction was rolled back (retryable — the engine never re-runs)",
     )
+}
+
+/// The terminal of a tx-scoped QUEUE verb CANCELled before it was dispatched (review F4): a known
+/// non-execution with the transaction intact, so `Cancelled` (NonRetryable, as a cancelled read is),
+/// never `TxDeadline` — the transaction was not touched.
+fn queue_cancelled_unsent() -> ErrorPayload {
+    ErrorPayload {
+        code: ferro_proto::consts::errc::CANCELLED,
+        branch: ferro_proto::consts::errc::CANCELLED_BRANCH,
+        sqlstate: None,
+        errno: None,
+        message: "the tx-scoped QUEUE verb was cancelled before it was sent: nothing was sent and \
+                  the transaction is unaffected"
+            .to_string(),
+        detail: None,
+        retry_after_ms: None,
+    }
 }
 
 /// Run ONE in-transaction statement INTERRUPTIBLY on the pinned `co` — the shape this module's doc
@@ -1229,6 +1279,11 @@ mod tests {
     /// timer) races an in-flight tx-scoped statement: fired only once the statement is PROVABLY in
     /// flight (parked on the query gate), proving the cancel ARM itself — not a lucky pre-dispatch
     /// race — is what unblocks it. Same rollback+tombstone+TxDeadline exit as a deadline.
+    ///
+    /// M7-G2 review F3: `max_tx` is SHORT (3 s) and the reply must arrive within 1 s of the CANCEL.
+    /// Before, a 600 s `max_tx` RESCUED this test when the cancel arm was removed (mutation mF1): the
+    /// deadline arm answers the same `TxDeadline`, so the test passed after ten minutes. Now that
+    /// mutation fails it at the 1 s bound, and the 3 s `max_tx` keeps it from hanging.
     #[tokio::test]
     async fn per_request_cancel_races_in_flight_stmt_rolls_back_and_tombstones() {
         let backend = FakeBackend::new();
@@ -1242,7 +1297,7 @@ mod tests {
             &registry,
             owner,
             Duration::from_secs(600),
-            Duration::from_secs(600),
+            Duration::from_secs(3),
         )
         .await;
 
@@ -1267,8 +1322,9 @@ mod tests {
         }
         cancel.cancel();
 
-        let reply = reply_rx
+        let reply = tokio::time::timeout(Duration::from_secs(1), reply_rx)
             .await
+            .expect("the CANCEL arm itself answers, well before the 3 s max_tx would")
             .expect("the actor replies, never drops silently");
         assert!(
             matches!(reply, ExecReply::Deadline),

@@ -86,10 +86,19 @@ fn pool(name: &str, dsn: &str) -> PoolSpec {
 }
 
 fn queue_server(pools: Vec<PoolSpec>, vars: &[(&str, &str)]) -> (TestServer, Arc<PoolRegistry>) {
+    queue_server_tuned(pools, vars, |_| {})
+}
+
+fn queue_server_tuned(
+    pools: Vec<PoolSpec>,
+    vars: &[(&str, &str)],
+    tune: impl FnOnce(&mut Config),
+) -> (TestServer, Arc<PoolRegistry>) {
     let mut config = Config {
         pools,
         ..Config::default()
     };
+    tune(&mut config);
     let loaded = ferrod::queue_config::load(
         vars.iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v))),
@@ -1276,6 +1285,365 @@ async fn session_death_rolls_an_in_tx_enqueue_back() {
     assert_eq!(w.jobs().await, 0);
     assert!(w.business(1).await.is_empty());
     assert_eq!(w.hints(), 0);
+    w.drop_schema().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round (M7-G2 review F1–F5, D25)
+// ---------------------------------------------------------------------------------------------
+
+/// Review F5: verification runs on its OWN connection, through the POOL's `search_path`, and every
+/// verb names the schema-qualified relation it resolved, so an application's session state cannot
+/// steer a verb to a relation that was never verified. Two schemas each hold a jobs-layout
+/// `ferro_jobs`; the pool's `search_path` is A and the store's `TABLE` is the unqualified default.
+/// Inside a transaction that ran `SET LOCAL search_path TO B`, the ENQUEUE still lands in A. Before
+/// the fix it landed in B, stranded where no worker serves it. The control: an autocommit verb hits
+/// A too, and an autocommit RESERVE (a worker) serves both jobs.
+#[tokio::test]
+async fn a_session_search_path_cannot_steer_a_verb_off_the_verified_relation() {
+    let Some(url) = pg_url() else { return };
+    let a = next_tag("spa");
+    let b = next_tag("spb");
+    let app = a.clone();
+    let raw = raw_connect(&url).await;
+    raw.batch_execute(&schema_sql(&a)).await.unwrap();
+    raw.batch_execute(&schema_sql(&b)).await.unwrap();
+    let dsn = format!("{}&options=-c%20search_path%3D{a}", with_app(&url, &app));
+    let (server, _registry) = queue_server(
+        vec![pool("default", &dsn)],
+        &[
+            ("FERRO_QUEUE_STORES", "jobs"),
+            ("FERRO_QUEUE_JOBS_POOL", "default"),
+            ("FERRO_QUEUE_JOBS_TABLE", "ferro_jobs"),
+        ],
+    );
+    let mut q = Q::connect(&server).await;
+    q.enqueue_one("default", "auto", None).await;
+    let tx = q.begin(None, false).await;
+    let o = q
+        .exec_tx(tx, &format!("SET LOCAL search_path TO {b}"), vec![])
+        .await;
+    assert!(matches!(o, Outcome::Ok(_)), "{o:?}");
+    q.enqueue_one("default", "intx", Some(tx)).await;
+    let size = SizeResponse::decode(
+        &q.queue(method_queue::SIZE, scope_req("default", Some(tx)))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        size.pending, 2,
+        "SIZE in the transaction reads the verified relation too"
+    );
+    q.commit(tx).await;
+    let n = |sql: String| {
+        let raw = &raw;
+        async move { raw.query_one(&sql, &[]).await.unwrap().get::<_, i64>(0) }
+    };
+    assert_eq!(
+        n(format!("SELECT count(*) FROM {b}.ferro_jobs")).await,
+        0,
+        "nothing in B"
+    );
+    assert_eq!(
+        n(format!(
+            "SELECT count(*) FROM {a}.ferro_jobs WHERE payload IN ('auto', 'intx')"
+        ))
+        .await,
+        2,
+        "both jobs in the verified relation"
+    );
+    for _ in 0..2 {
+        q.reserve_one("default").await;
+    }
+    raw.batch_execute(&format!("DROP SCHEMA {a} CASCADE; DROP SCHEMA {b} CASCADE"))
+        .await
+        .unwrap();
+}
+
+/// Review F1: PostgreSQL answers a COMMIT of an ABORTED block with the tag `ROLLBACK` and no error.
+/// Such a COMMIT committed nothing, so the hints of the verbs it undid must not fire. The client is
+/// told the COMMIT succeeded, as `pdo_pgsql` does; that predates G2 and is recorded, not changed.
+/// Two shapes: an applied ENQUEUE then a failing EXEC; and a failing EXEC then an ENQUEUE refused
+/// in the aborted block (`25P02`). The control: a block RECOVERED with `ROLLBACK TO` commits, and
+/// its hint fires.
+#[tokio::test]
+async fn a_commit_of_an_aborted_block_fires_no_hint() {
+    let Some(mut w) = World::new("aborted").await else {
+        return;
+    };
+    let tx = w.c.begin(None, false).await;
+    w.c.enqueue_one("default", "undone", Some(tx)).await;
+    let o = w.c.exec_tx(tx, "SELECT 1/0", vec![]).await;
+    assert_eq!(outcome_err(o).sqlstate.as_deref(), Some("22012"));
+    let o = w.c.ctl(tx, method_tx::COMMIT).await;
+    assert!(
+        matches!(o, Outcome::Ok(_)),
+        "the pre-existing pdo-equivalent answer: {o:?}"
+    );
+    w.wait_no_open_tx().await;
+    assert_eq!(w.jobs().await, 0, "the COMMIT committed nothing");
+    assert_eq!(w.hints(), 0, "so no hint fires");
+
+    let tx = w.c.begin(None, false).await;
+    let o = w.c.exec_tx(tx, "SELECT 'x'::int", vec![]).await;
+    assert_eq!(outcome_err(o).sqlstate.as_deref(), Some("22P02"));
+    let ep =
+        w.c.enqueue(&[("default", "refused", 0)], Some(tx))
+            .await
+            .unwrap_err();
+    assert_eq!(ep.sqlstate.as_deref(), Some("25P02"), "{ep:?}");
+    w.c.ctl(tx, method_tx::COMMIT).await;
+    assert_eq!(w.hints(), 0);
+
+    // The control: an error undone by ROLLBACK TO leaves a live block, and its COMMIT commits.
+    let tx = w.c.begin(None, false).await;
+    w.c.savepoint(tx, method_tx::SAVEPOINT).await;
+    let o = w.c.exec_tx(tx, "SELECT 1/0", vec![]).await;
+    assert!(matches!(o, Outcome::Error(_)));
+    w.c.savepoint(tx, method_tx::ROLLBACK_TO).await;
+    w.c.enqueue_one("default", "recovered", Some(tx)).await;
+    w.c.commit(tx).await;
+    assert_eq!(w.jobs_with_payload("recovered").await, 1);
+    assert_eq!(
+        w.hints(),
+        1,
+        "a recovered block commits, and its hint fires"
+    );
+    w.drop_schema().await;
+}
+
+/// Review F2 (mutation mS): the transaction's own `max_tx` bounds a QUEUE verb MID-statement, not
+/// only between commands. With `max_tx` = 800 ms and the verb blocked on a lock, the verb answers
+/// `TxDeadline{Retryable}` at about 800 ms after BEGIN. Without the bound it would wait on the lock
+/// until the harness's 2 s frame bound. Nothing applied (read back), and no hint.
+#[tokio::test]
+async fn max_tx_bounds_an_in_tx_verb_mid_statement() {
+    let Some(url) = pg_url() else { return };
+    let schema = next_tag("maxtx");
+    let app = schema.clone();
+    let raw = raw_connect(&url).await;
+    raw.batch_execute(&schema_sql(&schema)).await.unwrap();
+    let table = format!("{schema}.ferro_jobs");
+    let (server, registry) = queue_server_tuned(
+        vec![pool("default", &with_app(&url, &app))],
+        &[
+            ("FERRO_QUEUE_STORES", "jobs"),
+            ("FERRO_QUEUE_JOBS_POOL", "default"),
+            ("FERRO_QUEUE_JOBS_TABLE", table.as_str()),
+        ],
+        |c| c.max_tx = Duration::from_millis(800),
+    );
+    let mut q = Q::connect(&server).await;
+    q.queue(method_queue::SIZE, scope_req("default", None))
+        .await
+        .unwrap(); // verified
+    let holder = raw_connect(&url).await;
+    holder
+        .batch_execute(&format!(
+            "BEGIN; LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"
+        ))
+        .await
+        .unwrap();
+    let t0 = Instant::now();
+    let tx = q.begin(None, false).await;
+    q.business(tx, &schema, 1, "maxtx").await;
+    let ep = q
+        .enqueue(&[("default", "maxtx", 0)], Some(tx))
+        .await
+        .unwrap_err();
+    let took = t0.elapsed();
+    assert_tx_deadline(&ep);
+    assert!(
+        took >= Duration::from_millis(700) && took < Duration::from_millis(1_600),
+        "max_tx (800 ms) ended it: {took:?}"
+    );
+    holder.batch_execute("ROLLBACK").await.unwrap();
+    wait_no_open_tx(&raw, &app).await;
+    let jobs: i64 = raw
+        .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(jobs, 0);
+    let business: i64 = raw
+        .query_one(&format!("SELECT count(*) FROM {schema}.business"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(business, 0);
+    assert_eq!(registry.queue().unwrap().wake_hints(), 0);
+    raw.batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+/// Review F2 (mutation mA): the request's ONE deadline covers the store's first-use verification
+/// AND the verb. Verification here waits ~500 ms for a pool connection (every other connection is
+/// held, and released after 500 ms), then the verb blocks on a lock. The verb times out at the
+/// REQUEST's 1 200 ms, not 1 200 ms after it reached the actor (which would be ~1 700 ms). The
+/// transaction is rolled back (`TxDeadline`) and nothing applied.
+#[tokio::test]
+async fn the_verbs_timeout_is_what_verification_left_of_the_requests_deadline() {
+    let Some(mut w) = World::new("remain").await else {
+        return;
+    };
+    let tx = w.c.begin(None, false).await;
+    let ferrod::pools::AnyPool::Pg(pg) = w.registry.get("default").unwrap() else {
+        unreachable!()
+    };
+    let mut held = Vec::new();
+    while let Ok(Ok(co)) = tokio::time::timeout(Duration::from_millis(300), pg.checkout()).await {
+        held.push(co);
+    }
+    assert!(!held.is_empty(), "the pool's other connections are held");
+    let holder = w.lock_jobs().await;
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(held);
+    });
+    let t0 = Instant::now();
+    let ep =
+        w.c.queue(
+            method_queue::ENQUEUE,
+            enqueue_req(&[("default", "late", 0)], Some(tx), Some(1_200)),
+        )
+        .await
+        .unwrap_err();
+    let took = t0.elapsed();
+    release.await.unwrap();
+    assert_tx_deadline(&ep);
+    eprintln!("verb behind a ~500 ms verification wait, timeout_ms 1200: answered after {took:?}");
+    assert!(
+        took >= Duration::from_millis(1_100) && took < Duration::from_millis(1_450),
+        "the verb ran on what was LEFT of the request's 1 200 ms: {took:?}"
+    );
+    holder.batch_execute("ROLLBACK").await.unwrap();
+    w.wait_no_open_tx().await;
+    assert_eq!(w.jobs().await, 0);
+    w.drop_schema().await;
+}
+
+/// Review F4, both sides of the race. A CANCEL that arrives while the verb waits behind the
+/// transaction's earlier command (a 600 ms in-tx EXEC) is answered `Cancelled` BEFORE anything is
+/// dispatched. Nothing is sent, the transaction is intact, and it commits its business write. The
+/// other side is a CANCEL after dispatch: it rolls the transaction back (`TxDeadline`); see
+/// `a_timed_out_or_cancelled_in_tx_verb_rolls_the_transaction_back`. EXEC itself still dispatches
+/// and then rolls back (the ledger records the asymmetry).
+#[tokio::test]
+async fn a_cancel_before_the_verb_is_dispatched_leaves_the_tx_intact() {
+    let Some(mut w) = World::new("cancelq").await else {
+        return;
+    };
+    let s = w.schema.clone();
+    w.c.queue(method_queue::SIZE, scope_req("default", None))
+        .await
+        .unwrap(); // verified
+    let tx = w.c.begin(None, false).await;
+    w.c.business(tx, &s, 1, "kept").await;
+    let slow = ExecRequest {
+        pool: "default".into(),
+        sql: Some("SELECT 1 FROM pg_sleep(0.6)".into()),
+        query_id: None,
+        params: vec![],
+        timeout_ms: None,
+        readonly: true,
+        fetch: 0,
+        tx_id: Some(tx),
+        traceparent: None,
+    };
+    let r1 = w.c.next();
+    w.c.c
+        .send_request(r1, service::SQL, method_sql::EXEC, slow.encode())
+        .await;
+    w.wait_for_backend("wait_event = 'PgSleep'").await;
+    let r2 = w.c.next();
+    w.c.c
+        .send_request(
+            r2,
+            service::QUEUE,
+            method_queue::ENQUEUE,
+            enqueue_req(&[("default", "queued", 0)], Some(tx), None),
+        )
+        .await;
+    w.c.c.cancel(r2).await;
+    let mut got = std::collections::HashMap::new();
+    for _ in 0..2 {
+        let t = w.c.c.recv().await;
+        assert_eq!(t.header.flags, flags::END);
+        got.insert(t.header.request_id, Outcome::decode(&t.payload).unwrap());
+    }
+    assert!(matches!(got[&r1], Outcome::Ok(_)), "{:?}", got[&r1]);
+    let Outcome::Error(ep) = &got[&r2] else {
+        panic!("{:?}", got[&r2])
+    };
+    assert_eq!(
+        (ep.code, ep.branch),
+        (errc::CANCELLED, errc::CANCELLED_BRANCH),
+        "{ep:?}"
+    );
+    assert!(
+        ep.message.contains("transaction is unaffected"),
+        "{}",
+        ep.message
+    );
+    w.c.commit(tx).await;
+    assert_eq!(w.business(1).await.len(), 1, "the transaction was intact");
+    assert_eq!(w.jobs().await, 0, "nothing was sent");
+    w.drop_schema().await;
+}
+
+/// SPEC D25, live (the review's O-G2 probe, promoted). The table is altered AFTER verification: a
+/// BEFORE INSERT trigger skips the row, so the in-transaction ENQUEUE's `RETURNING id` comes back
+/// empty. The actor rolls back and tombstones, and the terminal is NonRetryable (`Unsupported`),
+/// saying retrying cannot help. A later COMMIT on the tombstoned `tx_id` answers as tombstones do
+/// (`TxDeadline`). The business write is gone and no hint fires. The control: the same verb in
+/// autocommit is `Indeterminate` (§24.6's autocommit row).
+#[tokio::test]
+async fn an_unreadable_in_tx_write_rolls_back_with_a_non_retryable_terminal() {
+    let Some(mut w) = World::new("d25").await else {
+        return;
+    };
+    let s = w.schema.clone();
+    w.c.queue(method_queue::SIZE, scope_req("default", None))
+        .await
+        .unwrap(); // verified before the alteration
+    w.raw
+        .batch_execute(&format!(
+            "CREATE FUNCTION {s}.skip() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RETURN NULL; END $$; \
+             CREATE TRIGGER skip BEFORE INSERT ON {s}.ferro_jobs FOR EACH ROW \
+             EXECUTE FUNCTION {s}.skip()"
+        ))
+        .await
+        .unwrap();
+    let tx = w.c.begin(None, false).await;
+    w.c.business(tx, &s, 1, "biz").await;
+    let ep =
+        w.c.enqueue(&[("default", "x", 0)], Some(tx))
+            .await
+            .unwrap_err();
+    assert_eq!(
+        (ep.code, ep.branch),
+        (errc::UNSUPPORTED, errc::UNSUPPORTED_BRANCH),
+        "{ep:?}"
+    );
+    assert_eq!(ep.branch, branch::NON_RETRYABLE);
+    assert!(
+        ep.message.contains("Retrying cannot help"),
+        "{}",
+        ep.message
+    );
+    assert_tx_deadline(&outcome_err(w.c.ctl(tx, method_tx::COMMIT).await));
+    w.wait_no_open_tx().await;
+    assert!(w.business(1).await.is_empty(), "rolled back");
+    assert_eq!(w.hints(), 0);
+    let ep = w.c.enqueue(&[("default", "y", 0)], None).await.unwrap_err();
+    assert_eq!(
+        (ep.code, ep.branch),
+        (errc::WRITE_UNCONFIRMED, branch::INDETERMINATE),
+        "the autocommit control: {ep:?}"
+    );
     w.drop_schema().await;
 }
 
