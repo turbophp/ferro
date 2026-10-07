@@ -16,7 +16,8 @@
 //! feature, [`engine`]: the HTTP/1.1 plaintext request lifecycle `ferrod` serves service `HTTP`
 //! with (DNS, the address guard with pinning, the keep-alive pool, the write tracker, `HEAD`/`BODY`
 //! under credit, `CANCEL` and deadlines). Choices §23 left open are recorded in SPEC §22.2 (cw) and
-//! (cz).
+//! (cz). Later slices extend the engine: budgets and the drain (F4b), TLS (F5a, F5c) and the
+//! host-level limits — breaker, Retry-After hold, rate limit, queue, connection caps (F6, (dk)).
 
 pub mod address;
 pub mod attach;

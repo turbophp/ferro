@@ -85,6 +85,60 @@ fn rate_defaults_burst_to_the_rate() {
     assert_eq!((b.per_sec_milli, b.burst, b.max_wait_ms), (12_500, 13, 250));
 }
 
+/// M6-F6 review round 2: `BREAKER_TIMEOUT_MS` defaults to `TIMEOUT_MS`; 0 is refused, and so is a
+/// value above `TIMEOUT_MS` (a post-send window the total deadline could never reach).
+#[test]
+fn breaker_timeout_defaults_to_timeout_and_cannot_exceed_it() {
+    let cfg = load(&[
+        ("FERRO_UPSTREAMS", "a,b,c,d"),
+        ("FERRO_UPSTREAM_A_ORIGIN", "https://a.example"),
+        ("FERRO_UPSTREAM_A_TIMEOUT_MS", "30000"),
+        ("FERRO_UPSTREAM_B_ORIGIN", "https://b.example"),
+        ("FERRO_UPSTREAM_B_TIMEOUT_MS", "30000"),
+        ("FERRO_UPSTREAM_B_BREAKER_TIMEOUT_MS", "30000"),
+        ("FERRO_UPSTREAM_C_ORIGIN", "https://c.example"),
+        ("FERRO_UPSTREAM_C_TIMEOUT_MS", "30000"),
+        ("FERRO_UPSTREAM_C_BREAKER_TIMEOUT_MS", "30001"),
+        ("FERRO_UPSTREAM_D_ORIGIN", "https://d.example"),
+        ("FERRO_UPSTREAM_D_BREAKER_TIMEOUT_MS", "0"),
+    ]);
+    let timeout_of = |n: &str| cfg.upstream_for(n, None).unwrap().breaker.timeout_ms;
+    assert_eq!(timeout_of("a"), 30_000, "defaults to TIMEOUT_MS");
+    assert_eq!(timeout_of("b"), 30_000, "equal is allowed");
+    for n in ["c", "d"] {
+        assert!(!enabled(&cfg, n), "{n}: {:?}", shown(&cfg));
+    }
+    assert!(
+        shown(&cfg)
+            .iter()
+            .filter(|e| e.contains("BREAKER_TIMEOUT_MS"))
+            .count()
+            >= 2,
+        "{:?}",
+        shown(&cfg)
+    );
+}
+
+/// M6-F6 review: a `RATE_PER_SEC` above 1e9 would make the token interval 0 ns — no limit at all —
+/// so it disables the upstream; 1e9 itself (one token per ns) is the largest accepted.
+#[test]
+fn a_rate_above_one_per_nanosecond_is_refused() {
+    let cfg = load(&[
+        ("FERRO_UPSTREAMS", "a,b"),
+        ("FERRO_UPSTREAM_A_ORIGIN", "https://a.example"),
+        ("FERRO_UPSTREAM_A_RATE_PER_SEC", "1000000000.001"),
+        ("FERRO_UPSTREAM_B_ORIGIN", "https://b.example"),
+        ("FERRO_UPSTREAM_B_RATE_PER_SEC", "1000000000"),
+    ]);
+    assert!(!enabled(&cfg, "a"), "{:?}", shown(&cfg));
+    assert!(
+        shown(&cfg).iter().any(|e| e.contains("RATE_PER_SEC")),
+        "{:?}",
+        shown(&cfg)
+    );
+    assert!(enabled(&cfg, "b"), "{:?}", shown(&cfg));
+}
+
 #[test]
 fn names_sharing_an_env_prefix_resolve_by_exact_key() {
     // `api` and `api_http`: FERRO_UPSTREAM_API_HTTP is api's `HTTP` key, and

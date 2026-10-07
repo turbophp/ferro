@@ -2742,9 +2742,10 @@ async fn lifetime_idle_limit_and_the_keep_alive_clamp_each_retire_a_connection()
     );
 }
 
-/// **Idle retention is bounded by `MAX_CONNECTIONS`, and reuse is LIFO (§23.8.2).** Two concurrent
-/// requests open two connections; with `MAX_CONNECTIONS=1` only one is kept. With room for both,
-/// the one returned LAST (the slow exchange's) is the one the next request takes.
+/// **`MAX_CONNECTIONS` bounds the connections that exist, and reuse is LIFO (§23.8.2).** With
+/// `MAX_CONNECTIONS=1` two concurrent requests share ONE connection — the second waits for the
+/// first's (M6-F6; until F6 the key bounded only idle retention, and the two opened two). With room
+/// for both, the one returned LAST (the slow exchange's) is the one the next request takes.
 #[tokio::test]
 async fn idle_retention_is_bounded_and_reuse_is_lifo() {
     let (addr, count) = numbered("").await;
@@ -2760,12 +2761,14 @@ async fn idle_retention_is_bounded_and_reuse_is_lifo() {
     };
     let (r1, r2) = (slow("one"), idempotent_get("one"));
     let (a, b) = tokio::join!(on_engine(&e, &r1, None), on_engine(&e, &r2, None));
-    assert_ne!(conn_of(a), conn_of(b));
     assert_eq!(
-        e.idle_connections("one"),
-        1,
-        "MAX_CONNECTIONS bounds idle retention"
+        conn_of(a),
+        conn_of(b),
+        "the second waited for the one connection"
     );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(e.idle_connections("one"), 1);
+    assert_eq!(e.connections("one"), 1);
 
     let before = count.load(Ordering::SeqCst);
     let (r1, r2) = (slow("many"), idempotent_get("many"));

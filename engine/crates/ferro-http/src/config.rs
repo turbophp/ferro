@@ -74,6 +74,7 @@ pub const UPSTREAM_KEYS: &[&str] = &[
     "BREAKER_FAILURES",
     "BREAKER_COUNTS",
     "BREAKER_OPEN_MS",
+    "BREAKER_TIMEOUT_MS",
     "RATE_PER_SEC",
     "RATE_BURST",
     "RATE_MAX_WAIT_MS",
@@ -175,6 +176,9 @@ pub struct Breaker {
     pub failures: u32,
     pub counts: BreakerCounts,
     pub open_ms: u32,
+    /// Under `connect+timeout`: how long after its SEND a request must have gone unanswered for
+    /// its `timeout` to count (M6-F6 review round 2). Default `TIMEOUT_MS`; at most `TIMEOUT_MS`.
+    pub timeout_ms: u32,
 }
 
 /// `RATE_PER_SEC` is a positive decimal with at most three fractional digits, held exactly in
@@ -334,9 +338,10 @@ impl fmt::Display for Reason {
                     "entry {n} is not an IPv6 /96 prefix with zero low 32 bits"
                 )
             }
-            Reason::BadRate => {
-                f.write_str("must be a positive decimal with at most three fractional digits")
-            }
+            Reason::BadRate => f.write_str(
+                "must be a positive decimal with at most three fractional digits, at most \
+                     1000000000",
+            ),
             Reason::Conflict(why) => f.write_str(why),
             Reason::Unknown => f.write_str("is not a known key"),
             Reason::Ambiguous => f.write_str("could belong to more than one declared upstream"),
@@ -784,6 +789,9 @@ fn one_of<T: Copy>(raw: &str, opts: &'static [&'static str], vals: &[T]) -> Resu
         .ok_or(Reason::OneOf(opts))
 }
 
+/// The largest `RATE_PER_SEC`, in milli-requests per second: 1e9 per second, one token per ns.
+pub const MAX_RATE_MILLI: u64 = 1_000_000_000_000;
+
 /// `RATE_PER_SEC`: `\d+(\.\d{1,3})?`, positive, in milli-units.
 fn parse_rate(raw: &str) -> Result<u64, Reason> {
     let (int, frac) = match raw.split_once('.') {
@@ -804,7 +812,9 @@ fn parse_rate(raw: &str) -> Result<u64, Reason> {
         .checked_mul(1000)
         .and_then(|v| v.checked_add(f))
         .ok_or(Reason::BadRate)?;
-    if milli == 0 {
+    // Above 1e9 per second the engine's token interval (1e12 / milli ns) would be 0 ns, i.e. no
+    // limit at all — refused rather than silently unlimited (M6-F6 review).
+    if milli == 0 || milli > MAX_RATE_MILLI {
         return Err(Reason::BadRate);
     }
     Ok(milli)
@@ -1060,7 +1070,15 @@ fn parse_upstream(
             ]
         )),
         open_ms: parse!("BREAKER_OPEN_MS", 5_000, |r| num_u32(r, 1)),
+        timeout_ms: parse!("BREAKER_TIMEOUT_MS", limits.timeout_ms, |r| num_u32(r, 1)),
     };
+    // A post-send window longer than the total deadline could never be reached.
+    if breaker.timeout_ms > limits.timeout_ms {
+        fail(
+            "BREAKER_TIMEOUT_MS",
+            Reason::Conflict("is larger than TIMEOUT_MS, so it could never be reached"),
+        );
+    }
     let per_sec = parse!("RATE_PER_SEC", None, |r| parse_rate(r).map(Some));
     let burst = parse!("RATE_BURST", None, |r| num_u32(r, 1).map(Some));
     let max_wait = parse!("RATE_MAX_WAIT_MS", None, |r| num_u32(r, 0).map(Some));
