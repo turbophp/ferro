@@ -840,10 +840,13 @@ async fn a_rate_wait_is_bounded_by_the_max_wait_and_the_deadline() {
     let (up, _gate) = scripted(vec![]).await;
     let d = daemon_on(
         upstreams(
-            &[("w", up.addr)],
+            &[("w", up.addr), ("slow", up.addr)],
             &[
                 ("w", "RATE_PER_SEC", "1"),
                 ("w", "RATE_MAX_WAIT_MS", "5000"),
+                // One token per 5 s, burst 1.
+                ("slow", "RATE_PER_SEC", "0.2"),
+                ("slow", "RATE_MAX_WAIT_MS", "10000"),
             ],
         ),
         ScriptConnect::new(TCP),
@@ -872,12 +875,20 @@ async fn a_rate_wait_is_bounded_by_the_max_wait_and_the_deadline() {
         "admitted no earlier than its token: {:?}",
         t1_before.elapsed()
     );
-    // CANCEL while waiting for the next token (~1 s away).
-    let mut c = start(&d, &post("w", b"x")).await;
+    // CANCEL while waiting for the next token (~5 s away): answered at once, not when the token
+    // would have been due, and never sent.
+    assert_eq!(status(&one(&d, &idempotent_get("slow")).await), 200);
+    let mut c = start(&d, &post("slow", b"x")).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
+    let cancelled_at = Instant::now();
     c.cancel(1).await;
     assert!(matches!(collect(&mut c, 1).await.end, Outcome::Cancelled));
-    assert_eq!(received(&up), 2, "the cancelled waiter was not sent");
+    assert!(
+        cancelled_at.elapsed() < Duration::from_millis(2_500),
+        "the wait is abandoned on CANCEL: {:?}",
+        cancelled_at.elapsed()
+    );
+    assert_eq!(received(&up), 3, "the cancelled waiter was not sent");
 }
 
 // =================================================================================================

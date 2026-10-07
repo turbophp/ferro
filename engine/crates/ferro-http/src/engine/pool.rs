@@ -538,7 +538,13 @@ mod tests {
         let (newer, _far_new) = conn_in(&pools, &key, Duration::from_secs(5)).await;
         pools.return_unused(key.clone(), old, 2);
         pools.return_unused(key.clone(), newer, 2);
-        let Take::Dial(d) = pools.take(&key, policy(false), caps).await else {
+        let taken = tokio::time::timeout(
+            Duration::from_secs(5),
+            pools.take(&key, policy(false), caps),
+        )
+        .await
+        .expect("room is made, never a wait behind unusable connections");
+        let Take::Dial(d) = taken else {
             panic!("room is made to dial")
         };
         assert_eq!(pools.connection_count(&key), 2);
