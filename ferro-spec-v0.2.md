@@ -1931,7 +1931,7 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
       - `ferrod`: `http_tls_it` 30/0, `http_engine_it` 31/0, `http_f4b_it` 26/0;
       - `cargo test -p ferro-proto`;
       - `ci/check-incompatibilities-doc.sh`.
-  **(di) M7-G2 — Ferro Queue's transactional path on PostgreSQL: tx-scoped verbs on the transaction's pinned connection, `PoolMismatch`, in-transaction `LeaseLost`, the after-commit wake hint, and chaos rows 2 and 7 (2026-10-07).** The third code slice of Ferro Queue (§24.14). The "until G2" `Unsupported` refusal is gone. A tx-scoped ENQUEUE, ACK, RELEASE, EXTEND, SIZE or CLEAR now runs on the transaction's pinned connection as ONE `TxCommand::Queue` to its actor, and its outcome is the transaction's. A tx-scoped RESERVE stays refused `Unsupported`, for good, before its `tx_id` is even resolved. No `/proto` change: `PoolMismatch` and `LeaseLost` were keyed at G1a, and `PROTOCOL.md` §14 gained one corrected sentence and nothing else. Built on `main` at `abf2bad`, with `main` at `b209c5c` (M6-F8) merged in before the final gates. *(Letter note: (di). M6-F5c (PR #106) holds (dh); this entry was re-lettered from (dh) at the review round.)*
+  **(di) M7-G2 — Ferro Queue's transactional path on PostgreSQL: tx-scoped verbs on the transaction's pinned connection, `PoolMismatch`, in-transaction `LeaseLost`, the after-commit wake hint, and chaos rows 2 and 7 (2026-10-07).** The third code slice of Ferro Queue (§24.14). The "until G2" `Unsupported` refusal is gone. A tx-scoped ENQUEUE, ACK, RELEASE, EXTEND, SIZE or CLEAR now runs on the transaction's pinned connection as ONE `TxCommand::Queue` to its actor, and its outcome is the transaction's. A tx-scoped RESERVE stays refused `Unsupported`, for good, before its `tx_id` is even resolved. No `/proto` change: `PoolMismatch` and `LeaseLost` were keyed at G1a, and `PROTOCOL.md` §14 gained one corrected sentence and nothing else. Built on `main` at `abf2bad`, with `main` at `b209c5c` (M6-F8) merged in before the final gates, and `a493f35` (M6-F5c) after the review round. *(Letter note: (di). M6-F5c (PR #106) holds (dh); this entry was re-lettered from (dh) at the review round.)*
   - **The mechanism (§24.5), as built.** The steps, in order:
     - the per-request refusals (a tx-scoped RESERVE first);
     - step 1, `resolve_active`, unchanged (it was already `pub(crate)`, so R2 needed no change): a missing or foreign `tx_id` is `TxNotFound`, the owner's tombstoned one `TxDeadline`;
@@ -2022,9 +2022,11 @@ The taint was never load-bearing: `tx_control` has always issued the identical t
     - **Gates after the round:**
       - fmt;
       - clippy `-p ferrod -p ferro-queue --all-targets -D warnings`, `-p ferrod --no-default-features --all-targets`, and `-p ferro-pool --all-targets` (it gained `Checkout::tx_status()`);
-      - `ferro-queue` 51, `ferrod` lib 251;
+      - `ferro-queue` 51, `ferro-pool` lib 33, `ferrod` lib 251;
       - `queue_g2_it` 20, `queue_g1b_it` 19 + 1 ignored, `queue_g1a_it` 12, `tx_it` 15 and `chaos_fate_it` 10, live on PostgreSQL 16;
       - `ci/check-incompatibilities-doc.sh`.
+
+      All re-run on the tree with `main` at `a493f35` (M6-F5c) merged in.
   - **Process note.** The shared target hit 100% disk twice: once from this builder's own `cargo build -p ferrod --tests`, which builds every test target at ~170 MB each, and once from the shared target's incremental directory. The coordinator freed space both times. The slice then ran with `CARGO_INCREMENTAL=0`, building one test target at a time and deleting each executable after its run. During the review round the container restarted (killing a clippy run), and PostgreSQL went down twice; it was restarted with `pg_ctl` and every interrupted gate was re-run.
   - **Not established.**
     - MySQL/MariaDB in a transaction (G6, with the multi-step actor commands and their stop conditions).
