@@ -946,7 +946,8 @@ is Retryable, carries a cause token, and is never retried by the engine itself.
   DNS, TCP connect, TLS handshake — of the engine's own dials, bounded by the upstream's
   `CONNECT_TIMEOUT_MS`; a caller's shorter `connect_timeout` or deadline is never counted), every
   request to the upstream fails at once, `breaker_open`, for `BREAKER_OPEN_MS` (5 s), with no
-  connection attempt — requests that were already waiting to dial included. Then one request probes
+  connection attempt and nothing sent — requests that were already waiting to dial or to reuse a
+  connection included. Then one request probes
   the upstream, and any other request in the meantime fails `breaker_probe_busy` until the probe's
   connection is established. A dial outlives a caller that stops waiting for it, so its connection
   is pooled rather than wasted, and it holds a `MAX_DIALS` slot for up to `CONNECT_TIMEOUT_MS`. One tenant's failures can open the
