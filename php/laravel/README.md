@@ -54,6 +54,40 @@ is that name — but some code branches on the name (upstream's own tests do, th
 `#[RequiresDatabase('mysql')]` and `$this->driver`), and only the alias makes such code take the
 same branch it takes on PDO.
 
+## Outbound HTTP: the `Http` facade (Ferro HTTP, SPEC §23.11.6)
+
+With `ferro/guzzle` installed, an `http.ferro` block routes Laravel's `Http` facade through Ferro HTTP
+— the per-host engine's pooled, credential-holding HTTP transport — with nothing else changed:
+
+```php
+// config/http.php
+return ['ferro' => [
+    'socket'    => '/run/ferro/app.sock',
+    'upstreams' => ['https://api.openai.com' => 'openai'],   // origin => the upstream ferrod declares
+]];
+```
+
+The provider rebinds the `Illuminate\Http\Client\Factory` singleton to
+`Ferro\Laravel\Http\FerroHttpFactory`, which hands every pending request `Ferro\Guzzle\FerroHandler`.
+Laravel's own stub, recorder and before-sending handlers stay ABOVE it, so `Http::fake()`,
+`Http::assertSent()` and the request events behave as stock, and a faked request never reaches the
+engine. `Http::pool()` goes through Ferro too.
+
+**Retries — the recommended recipe:**
+
+```php
+Http::retry(3, 100, when: Ferro\Laravel\Http\Retry::when())->post($url, $body);
+```
+
+It retries only what is safe to send again and never a request whose fate is unknown. A bare
+`Http::retry(3)` is Laravel's own policy and re-sends a POST whose connection died after sending,
+exactly as it does under curl; retrying is the client's policy, so Ferro leaves that choice to you.
+
+`http.ferro` makes Ferro the facade's DEFAULT transport; it is not an egress control. A request-level
+handler (`withOptions(['handler' => …])`, `globalOptions`, `setHandler`, `setClient`) routes that
+request around Ferro and its SSRF confinement. Differences from curl:
+`docs/known-incompatibilities.md` (*Ferro HTTP*).
+
 ## What this tier changes, and what it does not
 
 Only the **execution layer**. The stock Grammar, Processor and Schema builder are inherited

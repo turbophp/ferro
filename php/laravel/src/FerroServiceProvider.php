@@ -22,11 +22,19 @@ use Illuminate\Support\ServiceProvider;
  * `illuminate/support` (where `ServiceProvider` lives) is already required by `illuminate/database`,
  * so this adds no dependency. Registration happens in `register()`, not `boot()`, because a service
  * provider's `boot()` may run after another provider has already resolved a database connection.
+ *
+ * It also wires Laravel's `Http` facade to Ferro HTTP — but only when the application configures an
+ * `http.ferro` block ({@see Http\HttpWiring}, SPEC §23.11.6); without one the facade is untouched
+ * and neither `ferro/guzzle` nor `illuminate/http` is loaded.
  */
 final class FerroServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
         FerroConnections::register();
+        // Ferro HTTP (SPEC §23.11.6): only when the application configured an `http.ferro` block —
+        // without one the `Http` facade is untouched, and neither ferro/guzzle nor illuminate/http
+        // is loaded.
+        Http\HttpWiring::register($this->app);
     }
 }

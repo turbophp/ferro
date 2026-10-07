@@ -188,6 +188,20 @@ jobs:
       - run: (cd php/laravel && ./vendor/bin/phpunit)
       - run: (cd php/laravel && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
       - run: (cd php/laravel && ./vendor/bin/phpstan analyse src --level 9)
+      # M6-F9: the Ferro HTTP adapters (SPEC §23.11.2, §23.11.5). Each has its own vendor/, so each gets
+      # its own install/test/stan lanes, in the shape of the Eloquent tier's — without them the packages
+      # are a silent no-op in CI. The live re-runs are `--fail-on-skipped` for the same reason: their
+      # tests launch a real ferrod and the recording upstream through php/client's HttpLiveTestCase and
+      # self-skip without FERRO_TEST_PG_URL + a ferrod binary, both of which this job provides.
+      # ferro/psr18 first: it holds the fate layer ferro/guzzle builds on.
+      - run: (cd php/psr18 && composer install --no-interaction)
+      - run: (cd php/psr18 && ./vendor/bin/phpunit)
+      - run: (cd php/psr18 && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
+      - run: (cd php/psr18 && ./vendor/bin/phpstan analyse src --level 9)
+      - run: (cd php/guzzle && composer install --no-interaction)
+      - run: (cd php/guzzle && ./vendor/bin/phpunit)
+      - run: (cd php/guzzle && ./vendor/bin/phpunit tests/Live --fail-on-skipped)
+      - run: (cd php/guzzle && ./vendor/bin/phpstan analyse src --level 9)
       - if: always()
         run: docker compose -f testkit/docker-compose.yml logs --no-color --tail=80 pg mysql
 
