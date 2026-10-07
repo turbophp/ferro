@@ -299,11 +299,12 @@ impl BreakerTicket {
         }
     }
 
-    /// The breaker's admission, checked again immediately before a dial (M6-F6 review R1): a
-    /// request admitted while closed may have waited for a dial slot while the breaker opened. The
-    /// probe passes; a closed-period ticket passes while the breaker is closed (and is moved to
-    /// the current closed period if the breaker opened and closed again meanwhile); otherwise the
-    /// request is refused as an admission would be now.
+    /// The breaker's admission, checked again immediately before every send — before a dial (M6-F6
+    /// review R1) and before a reused idle connection is used (review round 2, N2): a request
+    /// admitted while closed may have waited for a connection or a dial slot while the breaker
+    /// opened. The probe passes; a closed-period ticket passes while the breaker is closed (and is
+    /// moved to the current closed period if the breaker opened and closed again meanwhile);
+    /// otherwise the request is refused, `breaker_probe_busy` only while a probe is in flight.
     pub fn recheck(&self, now: Instant) -> Result<(), BreakerRefusal> {
         if self.0.probe {
             return Ok(());

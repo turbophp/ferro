@@ -1646,21 +1646,23 @@ async fn under_partition_uid_the_connection_caps_are_per_partition() {
 // =================================================================================================
 
 /// **Review round 2, N1 (the reviewer's repro, inverted): the engine's own waits are not evidence.**
-/// A healthy upstream answers in 600 ms; `TIMEOUT_MS` is 1.5 s and the rate limit (1/s, burst 1)
-/// makes B and C wait for their tokens, so they are SENT with little of their deadline left and
-/// time out. Measured from the send, neither waited `BREAKER_TIMEOUT_MS` (default: `TIMEOUT_MS`), so
-/// neither counts: the breaker stays closed and a well-behaved caller is served.
+/// A healthy upstream answers in 800 ms; `TIMEOUT_MS` is 1 s and the rate limit (3/s, burst 1)
+/// makes B and C wait ~333 and ~667 ms for their tokens, so they are SENT with ~667 and ~333 ms of
+/// their deadline left and both time out. Measured from DECODE each waited the whole `TIMEOUT_MS`
+/// (round 1's rule, and the mutant that measures from decode, open the breaker here); measured from
+/// the SEND neither reached `BREAKER_TIMEOUT_MS` (default: `TIMEOUT_MS`), so neither counts: the
+/// breaker stays closed and a well-behaved caller is served.
 #[tokio::test]
 async fn engine_waits_before_the_send_do_not_count_as_timeouts() {
-    let (up, _g) = scripted(vec![Act::Delay(600); 8]).await;
+    let (up, _g) = scripted(vec![Act::Delay(800); 8]).await;
     let d = daemon_on(
         upstreams(
             &[("r", up.addr)],
             &[
                 ("r", "BREAKER_FAILURES", "2"),
                 ("r", "BREAKER_COUNTS", "connect+timeout"),
-                ("r", "TIMEOUT_MS", "1500"),
-                ("r", "RATE_PER_SEC", "1"),
+                ("r", "TIMEOUT_MS", "1000"),
+                ("r", "RATE_PER_SEC", "3"),
                 ("r", "RATE_BURST", "1"),
                 ("r", "RATE_MAX_WAIT_MS", "5000"),
             ],
@@ -1675,16 +1677,15 @@ async fn engine_waits_before_the_send_do_not_count_as_timeouts() {
         ("b", collect(&mut b, 1).await),
         ("c", collect(&mut c, 1).await),
     ] {
-        // Each either completed or timed out after being sent late; neither is evidence.
-        if r.head.is_none() {
-            let ep = r.error();
-            assert!(
-                ep.detail.as_deref() == Some(http_cause::TIMEOUT)
-                    || ep.detail.as_deref() == Some(http_cause::RATE_LIMITED),
-                "{name}: {ep:?}"
-            );
-        }
+        // Each was sent late (after its rate wait) and timed out: the case under test.
+        assert!(r.head.is_none(), "{name} was answered");
+        assert_eq!(
+            r.error().detail.as_deref(),
+            Some(http_cause::TIMEOUT),
+            "{name}"
+        );
     }
+    assert_eq!(received(&up), 3, "all three were sent");
     assert_eq!(d.engine.breaker_state("r"), Some(BreakerState::Closed));
     // A well-behaved caller, once the bucket has refilled, is served.
     let mut served = false;
