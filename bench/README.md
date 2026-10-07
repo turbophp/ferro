@@ -134,6 +134,29 @@ release ferrod, required manifest fields, and the provisional/reference tags —
 never written). The `fanout` field is an explicit `{placeholder:true, blocked_on:"M3-fibers"}`
 until Fibers multiplexing lands.
 
+## The D12 canary on the D17 runner (2026-10-07) — `results/20261007T03{0903,1102}Z-gh-ubuntu-latest.json`
+
+Owner-requested re-run of the trivial scenario on `main` `b5e434f` (everything through M7-G2),
+`bench.yml --scenario trivial`, run 37565118419, two `ubuntu-latest` runners, `reference: true`.
+Postgres is the testkit container on the same runner; the client measured `PurePacker` (see
+`PackerFactory`) although `ext-msgpack` was loaded.
+
+| runner | run | p50 | p99 | added p50 vs PDO | added p99 vs PDO |
+|---|---|---|---|---|---|
+| EPYC 9V45 | ferro-jit-off | 314.3 µs | 404.9 µs | +128.9 µs | +188.6 µs |
+| EPYC 9V45 | ferro-jit-on | 310.8 µs | 547.4 µs | +125.3 µs | +331.1 µs |
+| EPYC 9V45 | pdo | 185.5 µs | 216.3 µs | — | — |
+| EPYC 9V74 | ferro-jit-off | 576.1 µs | 750.5 µs | +274.2 µs | +344.9 µs |
+| EPYC 9V74 | ferro-jit-on | 563.7 µs | 733.8 µs | +261.8 µs | +328.2 µs |
+| EPYC 9V74 | pdo | 301.9 µs | 405.6 µs | — | — |
+
+**The §16.1 boundary target (added p50 < 60 µs, p99 < 200 µs) is missed** on both runners, by
+2–4.5× at p50. The runners differ from each other by ~1.6×, so compare within a record. What this
+record does NOT establish is WHERE the overhead goes; read from the code (unprofiled), a Ferro call
+costs three PostgreSQL round trips — the awaited hygiene reset on a recycled connection (§7.2's
+pipelining is deferred), a `prepare`, and the execute (§7.3's statement cache is unbuilt) — against
+PDO's one unprepared query. The ledger records the follow-up.
+
 ## The §16 fan-out result (M3-D1e) — `results/*-gh-ubuntu-latest-fanout.json`
 
 `cargo run --release -p ferro-bench -- --scenario fanout` (or the `bench` workflow, which runs it on
