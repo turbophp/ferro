@@ -1100,10 +1100,18 @@ these choices the text above left open or the implementation forced:*
   `WAKER_STMT_TIMEOUT_MS`; when it fires the backend is asked to cancel the statement (that request
   bounded by `WAKER_CANCEL_DRAIN`, 1 s) and the answer is awaited `WAKER_CANCEL_DRAIN` more; a statement
   that answers neither is ABANDONED — its connection DISCARDED, never returned to the pool (a
-  connection still running a statement is the M1-S8a hazard), the waiters it served answered
-  `Indeterminate` and counted in `reserve_unconfirmed_total`, its possible reservations left to their
-  leases — and the queue is free for its next trigger. Worst case `WAKER_STMT_TIMEOUT_MS + 2 s`. (The
-  first version let a silent backend hold the queue in flight until TCP gave up, answering every
+  connection still running a statement is the M1-S8a hazard), the waiters still waiting on it
+  answered `Indeterminate` (one already past its grace bound has had its own `Ok{jobs: []}`) and
+  counted in `reserve_unconfirmed_total`, its possible reservations left to their leases — and the
+  queue is free for its next trigger. Worst case `WAKER_STMT_TIMEOUT_MS + 2 s`; the bound on the
+  cancel request itself is untested (review round 2), and without it the worst case is
+  `WAKER_STMT_TIMEOUT_MS + 3 s` (the PostgreSQL cancel's own 2 s bound, §22.2 (aj), plus the drain).
+  **Discarding is not closing** (review round 2): the pool forgets the connection, but
+  `tokio-postgres` sends `Terminate` only once no response is pending, so an abandoned connection's
+  socket, driver task and server session — still running the RESERVE — live on until the backend
+  answers or TCP gives up, and the server can hold more sessions for the pool than `max_size`, by the
+  number abandoned. Closing the socket needs a driver abort handle the PG backend does not keep; not
+  built. (The first version let a silent backend hold the queue in flight until TCP gave up, answering every
   waiter `Ok{jobs: []}` for hours; reproduced live through a freezing proxy, now pinned.) No request's
   CANCEL interrupts the statement (it serves others). A RESERVE with `wait_ms = 0` (or clamped to 0)
   is served as at G1b.*
