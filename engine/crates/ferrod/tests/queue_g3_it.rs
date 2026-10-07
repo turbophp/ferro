@@ -749,6 +749,43 @@ async fn a_cancel_during_the_sweep_unreserves_its_job() {
     w.drop_schema().await;
 }
 
+/// The request's own deadline bounds a sweep in flight too: with `timeout_ms` far below
+/// `wait_ms + grace`, the waiter is answered `Ok{jobs: []}` AT its deadline while the sweep that is
+/// serving it still sleeps in the trigger, and the job that sweep reserved is unreserved (`deadline`).
+#[tokio::test]
+async fn the_request_deadline_bounds_a_sweep_in_flight() {
+    let Some(w) = World::new("unr_req_deadline", &[]).await else {
+        return;
+    };
+    w.slow(2_000).await;
+    let id = w.put("default").await;
+    let mut c = w.session().await;
+    let started = Instant::now();
+    let rid = c
+        .send(
+            service::QUEUE,
+            method_queue::RESERVE,
+            reserve_req(&["default"], 1, 20_000, Some(400)),
+        )
+        .await;
+    let o = c.reserve_result(rid, Duration::from_secs(5)).await;
+    let took = started.elapsed();
+    assert!(jobs_of(&o).is_empty(), "{o:?}");
+    assert!(took >= Duration::from_millis(400), "{took:?}");
+    assert!(
+        took < Duration::from_millis(1_500),
+        "at the deadline, not the sweep: {took:?}"
+    );
+    let m = w.waker().metrics();
+    eventually(
+        || m.unreserved_count(UnreserveCause::Deadline) == 1,
+        "counted: deadline",
+    )
+    .await;
+    assert_eq!(w.row(id).await, Some((0, None)), "restored exactly");
+    w.drop_schema().await;
+}
+
 /// The grace bound: a sweep still running at `wait_ms + grace` does not hold the answer. The waiter
 /// gets `Ok{jobs: []}` on time, and the job the late sweep reserved is unreserved (cause `deadline`).
 #[tokio::test]

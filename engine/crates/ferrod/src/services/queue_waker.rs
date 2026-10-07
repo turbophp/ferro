@@ -910,6 +910,43 @@ mod tests {
         assert_eq!(g.stats().exec_us, 7);
     }
 
+    /// Priority at arrival holds against a HINT too: a waiter still waiting for its first sweep of
+    /// `high` (one is in flight for another waiter) is not eligible for `default`, so a hint for
+    /// `default` starts nothing, and the waiter gets `high`'s second job, not `default`'s.
+    #[tokio::test]
+    async fn a_hint_for_a_lower_queue_waits_for_the_arrival_sweep_of_a_higher_one() {
+        let gate = Arc::new(Notify::new());
+        let fake = Arc::new(Fake {
+            gate: Some(Arc::clone(&gate)),
+            ..Fake::default()
+        });
+        put(&fake, "high", &[1, 2]);
+        let w = waker(&fake, "60000");
+        let far = Instant::now() + Duration::from_secs(5);
+        let a = w.register(&qs(&["high"]), 1, far).unwrap();
+        while fake.reserves.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        let b = w.register(&qs(&["high", "default"]), 1, far).unwrap();
+        put(&fake, "default", &[9]);
+        w.hint("default", HintSource::Autocommit);
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.reserves.load(Ordering::SeqCst),
+            1,
+            "B is still owed its sweep of `high`: the `default` hint sweeps nobody"
+        );
+        gate.notify_one(); // A's sweep: job 1
+        assert_eq!(ids(&wait(&a, 5_000).await), vec![1]);
+        while fake.reserves.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        gate.notify_one(); // B's arrival sweep of `high`: job 2
+        assert_eq!(ids(&wait(&b, 5_000).await), vec![2], "high before default");
+    }
+
     /// Priority at arrival: `high` is swept before `default`, and `default` only when `high`
     /// brought nothing.
     #[tokio::test]
