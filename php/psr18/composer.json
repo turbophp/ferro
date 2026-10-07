@@ -1,0 +1,35 @@
+{
+    "name": "ferro/psr18",
+    "description": "Ferro HTTP as a synchronous PSR-18 client, and the PSR-level fate layer the Ferro HTTP adapters share",
+    "type": "library",
+    "license": "Apache-2.0",
+    "repositories": [
+        { "type": "path", "url": "../client" }
+    ],
+    "require": {
+        "php": ">=8.2",
+        "ferro/client": "@dev",
+        "psr/http-client": "^1.0",
+        "psr/http-factory": "^1.0",
+        "psr/http-message": "^1.1 || ^2.0"
+    },
+    "require-dev": {
+        "guzzlehttp/psr7": "^2.6",
+        "phpstan/phpstan": "2.2.8",
+        "phpunit/phpunit": "^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Ferro\\Psr18\\": "src/Psr18/",
+            "Ferro\\Http\\": "src/Http/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ferro\\Psr18\\Tests\\": "tests/",
+            "Ferro\\Tests\\": "../client/tests/"
+        }
+    },
+    "scripts": { "test": "phpunit", "stan": "phpstan analyse src --level 9" },
+    "config": { "sort-packages": true }
+}

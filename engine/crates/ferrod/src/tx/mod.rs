@@ -24,7 +24,8 @@
 //! a *pipelined* command out of order and interleave it with the running statement). So a teardown
 //! signal that must interrupt an in-flight statement (session death) cannot ride the command
 //! channel; it is a dedicated `abort: CancellationToken` observed in BOTH the idle and the
-//! interruptible `select!`. `TxCommand` therefore carries only the six real commands.
+//! interruptible `select!`. `TxCommand` therefore carries only real commands — the SQL/TX ones plus
+//! `Queue` (M7-G2: a tx-scoped Ferro Queue verb, SPEC §24.5).
 
 pub mod actor;
 
@@ -138,6 +139,28 @@ pub enum TxCommand {
         responder: Responder,
         done: oneshot::Sender<()>,
     },
+    /// A tx-scoped Ferro Queue verb (SPEC §24.5, M7-G2): ENQUEUE, ACK, RELEASE, EXTEND, SIZE or CLEAR
+    /// on a store whose pool is this transaction's (the forwarding handler has checked that, and
+    /// refused a RESERVE, before sending). `verb` carries the verb's whole engine-authored statement
+    /// list (`steps`, built by `ferro_queue`'s pure builders) and how to decode it. The actor runs the
+    /// steps BACK TO BACK — no other command of this transaction interleaves, because the actor
+    /// serves one command at a time — each through the SAME interruptible statement run as
+    /// [`TxCommand::Exec`], so everything that holds for `Exec` holds unchanged: `timeout_ms` and
+    /// `cancel` (and the actor's own `max_tx`) roll the transaction back and tombstone it
+    /// (`TxDeadline{Retryable}`), a session `abort` drops the reply, and a plain statement error is
+    /// classified by the handler with `in_tx: true`.
+    ///
+    /// The actor DECODES the results itself (`verb.decode`), because two outcomes act on the
+    /// transaction and must not let another command in between: a verb that applied keeps its wake
+    /// hint for COMMIT (§24.5 step 4 — fired only on a successful COMMIT, dropped on rollback, abort
+    /// or deadline), and a WRITE whose result is unreadable rolls the transaction back and tombstones
+    /// it, so an effect the engine cannot report can never commit.
+    Queue {
+        verb: Box<crate::services::queue::TxVerb>,
+        timeout_ms: Option<u32>,
+        cancel: CancellationToken,
+        reply: oneshot::Sender<QueueReply>,
+    },
     /// Establish a savepoint. `name` is an optional client alias; the engine composes the ACTUAL
     /// savepoint name (`sp_N`) it runs on the wire (never a client string — no injection surface).
     Savepoint {
@@ -180,6 +203,28 @@ pub enum ExecReply {
     /// tombstoning. The handler declares ONE `TxDeadline{Retryable}` terminal — the statement is
     /// NEVER re-run (charter rule 3).
     Deadline,
+}
+
+/// The actor's reply to a [`TxCommand::Queue`].
+#[derive(Debug)]
+pub enum QueueReply {
+    /// Every step ran and the verb's result was decoded: the verb's success, its known-fate
+    /// "did nothing" (`LeaseLost`), or a READ's refusal of an unreadable result. The transaction
+    /// stays open. `exec_us` sums the steps' DB time.
+    Done {
+        outcome: Result<crate::services::queue::VerbOk, ferro_proto::messages::ErrorPayload>,
+        exec_us: u64,
+    },
+    /// A step failed with a statement error that is not a cancel (`57014`): the handler classifies
+    /// it with `in_tx: true`, exactly as a failed [`TxCommand::Exec`] statement; the transaction
+    /// stays registered (the backend may have aborted it — the client rolls back). No later step
+    /// ran.
+    Failed { error: PoolError, exec_us: u64 },
+    /// The actor rolled the transaction back and tombstoned it: a deadline, the request's
+    /// `timeout_ms` or CANCEL, a `57014` the statement itself returned, or a WRITE whose result was
+    /// unreadable. The payload is the ONE terminal (`TxDeadline{Retryable}`): the transaction will
+    /// never commit, and the engine re-runs nothing (charter rule 3).
+    RolledBack(ferro_proto::messages::ErrorPayload),
 }
 
 /// The actor's reply to a tx-control [`TxCommand`] (`Commit`/`Rollback`/`Savepoint`/`Release`/
