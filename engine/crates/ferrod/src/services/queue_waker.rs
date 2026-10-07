@@ -940,6 +940,87 @@ mod tests {
         assert_eq!(g.stats().exec_us, 7);
     }
 
+    /// §24.8 (normative): "the waker starts no statement for a waiter past its `wait_ms`". A waiter
+    /// whose wait has already ended when its sweep would start costs no statement; it is answered
+    /// empty by its own timer.
+    #[tokio::test]
+    async fn a_waiter_past_its_wait_starts_no_statement() {
+        let fake = Arc::new(Fake::default());
+        put(&fake, "default", &[1]);
+        let w = waker(&fake, "60000");
+        let g = w.register(&qs(&["default"]), 1, Instant::now()).unwrap();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.reserves.load(Ordering::SeqCst),
+            0,
+            "no statement for it"
+        );
+        assert!(matches!(wait(&g, 1_000).await, WaitOutcome::Expired));
+        assert_eq!(
+            fake.jobs.lock().unwrap()["default"].len(),
+            1,
+            "nothing reserved"
+        );
+    }
+
+    /// Review F3: a hint for a queue whose only owed waiter is busy in ANOTHER queue's sweep is kept,
+    /// and runs the moment that sweep frees the waiter. X waits on `a`; W on `[a, b]`. A sweep of `a`
+    /// serves both and brings one job (X's); meanwhile `b` gets a job and a hint that finds W busy. W
+    /// must get `b`'s job from the deferred sweep, not wait for the ten-minute poll.
+    #[tokio::test]
+    async fn a_hint_for_a_busy_waiters_other_queue_is_kept() {
+        let gate = Arc::new(Notify::new());
+        let fake = Arc::new(Fake {
+            gate: Some(Arc::clone(&gate)),
+            ..Fake::default()
+        });
+        let w = waker(&fake, "600000");
+        let far = Instant::now() + Duration::from_secs(5);
+        let step = |n: usize| {
+            let fake = Arc::clone(&fake);
+            let gate = Arc::clone(&gate);
+            async move {
+                while fake.reserves.load(Ordering::SeqCst) < n {
+                    tokio::task::yield_now().await;
+                }
+                gate.notify_one();
+            }
+        };
+        let x = w.register(&qs(&["a"]), 1, far).unwrap();
+        step(1).await; // X's arrival sweep of `a`: empty
+        let wb = w.register(&qs(&["a", "b"]), 1, far).unwrap();
+        step(2).await; // W's arrival sweep of `a`: empty
+        step(3).await; // W's arrival sweep of `b`: empty — W is parked
+        while w.idle_waiters() < 2 {
+            tokio::task::yield_now().await;
+        }
+        put(&fake, "a", &[1]);
+        w.hint("a", HintSource::Autocommit); // sweep 4: `a` for X and W, held
+        while fake.reserves.load(Ordering::SeqCst) < 4 {
+            tokio::task::yield_now().await;
+        }
+        put(&fake, "b", &[2]);
+        w.hint("b", HintSource::Autocommit); // W is busy in `a`: kept, not lost
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.reserves.load(Ordering::SeqCst),
+            4,
+            "nothing to sweep `b` for yet"
+        );
+        gate.notify_one(); // `a` returns job 1 → X; W is freed → the kept `b` sweep starts
+        assert_eq!(ids(&wait(&x, 5_000).await), vec![1]);
+        step(5).await;
+        assert_eq!(
+            ids(&wait(&wb, 5_000).await),
+            vec![2],
+            "the kept hint served W"
+        );
+    }
+
     /// Priority at arrival holds against a HINT too: a waiter still waiting for its first sweep of
     /// `high` (one is in flight for another waiter) is not eligible for `default`, so a hint for
     /// `default` starts nothing, and the waiter gets `high`'s second job, not `default`'s.
